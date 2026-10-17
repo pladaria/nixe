@@ -160,20 +160,22 @@ impl VulkanResidency {
         let mut dirty = image.contents.invalid.clone();
         let encoded = image.decoded.as_ref().unwrap().clone();
         let native = image.planes.clone();
-        for (offset, bytes) in self.cpu_snapshots(&backing, &dependency, &[])? {
+        let imports = self.cpu_imports(&backing, &dependency, &[])?;
+        dirty.extend(imports.gpu_invalidated);
+        for (offset, bytes) in imports.snapshots {
             dirty.push((offset, bytes.len() as u64));
         }
         normalize(&mut dirty);
         // Encoded blocks produced by GPU storage writes must become visible to
         // the exact CPU decoder. This is a host-format limitation, not a segment
         // switch or a CPU shader execution fallback. Unchanged imports do no work.
-        if backing.segments().iter().any(|s| {
+        if backing.pages().any(|page| {
             self.index
                 .pages
-                .get(&s.page())
+                .get(&page.identity())
                 .is_some_and(|p| p.has_writes())
         }) {
-            self.flush()?;
+            self.accept_recording()?;
         }
         let mut decoder = std::mem::take(&mut self.decoder);
         let result = (|| {
@@ -237,7 +239,7 @@ impl VulkanResidency {
         rect: vk::Rect2D,
         pixels: &[u8],
     ) -> Result<(), VulkanError> {
-        let (slot, slice) = self.device.submission.reserve_upload(pixels)?;
+        let (slot, slice) = self.reserve_upload(pixels, 4)?;
         let (image, layout) = self.image_access_subresources(
             id,
             commands::plane_range(p),

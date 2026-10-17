@@ -95,7 +95,7 @@ impl Host {
                 let image = cache.allocate_host_image(extent, vk::Format::R8G8B8A8_UNORM)?;
                 let view = render::view(cache.device(), image, vk::Format::R8G8B8A8_UNORM)?;
                 cache.device_mut().end_rendering();
-                let slot = cache.device_mut().submission.begin()?;
+                let slot = cache.device_mut().begin_recording()?;
                 let command = cache.device().submission.slots[slot].command;
                 render::transition(
                     cache.device(),
@@ -174,7 +174,7 @@ impl Host {
             None
         };
         cache.device_mut().end_rendering();
-        let slot = cache.device_mut().submission.begin()?;
+        let slot = cache.device_mut().begin_recording()?;
         self.pending_surface = Some(acquired);
         let command = cache.device().submission.slots[slot].command;
         render::transition(

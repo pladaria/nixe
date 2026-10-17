@@ -616,68 +616,68 @@ pub struct MaxwellGpuProfile {
 
 impl MaxwellGpuProfile {
     #[must_use]
-    pub const fn id(self) -> GpuProfileId {
+    pub const fn id(&self) -> GpuProfileId {
         self.id
     }
 
     #[must_use]
-    pub const fn chipset(self) -> MaxwellChipsetIdentity {
+    pub const fn chipset(&self) -> MaxwellChipsetIdentity {
         self.chipset
     }
 
     #[must_use]
-    pub const fn topology(self) -> MaxwellTopology {
+    pub const fn topology(&self) -> MaxwellTopology {
         self.topology
     }
 
     #[must_use]
-    pub const fn classes(self) -> MaxwellClassCapabilities {
+    pub const fn classes(&self) -> MaxwellClassCapabilities {
         self.classes
     }
 
     #[must_use]
-    pub const fn virtual_address(self) -> MaxwellVirtualAddressCapabilities {
+    pub const fn virtual_address(&self) -> MaxwellVirtualAddressCapabilities {
         self.virtual_address
     }
 
     #[must_use]
-    pub const fn memory(self) -> MaxwellMemoryCapabilities {
+    pub const fn memory(&self) -> MaxwellMemoryCapabilities {
         self.memory
     }
 
     #[must_use]
-    pub const fn cache(self) -> MaxwellCacheCapabilities {
+    pub const fn cache(&self) -> MaxwellCacheCapabilities {
         self.cache
     }
 
     #[must_use]
-    pub const fn interconnect(self) -> MaxwellInterconnectCapabilities {
+    pub const fn interconnect(&self) -> MaxwellInterconnectCapabilities {
         self.interconnect
     }
 
     #[must_use]
-    pub const fn z_cull(self) -> MaxwellZCullCapabilities {
+    pub const fn z_cull(&self) -> MaxwellZCullCapabilities {
         self.z_cull
     }
 
     #[must_use]
-    pub const fn shader(self) -> MaxwellShaderCapabilities {
+    pub const fn shader(&self) -> MaxwellShaderCapabilities {
         self.shader
     }
 
     #[must_use]
-    pub const fn aam_versions(self) -> MaxwellAamVersionRange {
+    pub const fn aam_versions(&self) -> MaxwellAamVersionRange {
         self.aam_versions
     }
 
     #[must_use]
-    pub const fn feature_flags(self) -> GpuFeatureFlags {
+    pub const fn feature_flags(&self) -> GpuFeatureFlags {
         self.feature_flags
     }
 
     /// Checks relationships which cannot be represented by individual field
     /// types alone.
-    pub const fn validate(self) -> Result<(), MaxwellProfileValidationError> {
+    pub const fn validate(&self) -> Result<(), MaxwellProfileValidationError> {
         let topology = self.topology;
         let maximum_gpc_count = topology.maximum_gpc_count;
         if maximum_gpc_count == 0 || maximum_gpc_count > u32::BITS {

@@ -123,7 +123,7 @@ impl VulkanResidency {
         let program = self.helpers.compute(&owner, binding)?;
         let (pipeline, layout, set_layout) = (program.pipeline, program.layout, program.set_layout);
         let buffer = self.buffer(id)?.native.handle;
-        let index = self.device.submission.begin()?;
+        let index = self.device.begin_recording()?;
         let range = self.buffer(id)?.native.size();
         let key = (set_layout, buffer, range);
         let descriptors = &self.device.submission.slots[index].descriptors;

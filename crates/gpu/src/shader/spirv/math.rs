@@ -1,6 +1,22 @@
 //! Shared numerical SPIR-V primitives. No guest register state or old IR.
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum Repair {
+    PreservingAdd,
+    PreservingMultiply,
+    PreservingFma,
+    FtzMultiply,
+    FtzFma,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Denorm32 {
+    Preserve,
+    Unspecified,
+    Flush,
+}
+
 pub(crate) struct Math {
     pub(crate) b: Builder,
     pub(crate) options: SpirvShaderOptions,
@@ -17,9 +33,13 @@ pub(crate) struct Math {
     pub(crate) block: u32,
     pub(crate) source: ShaderSourceLocation,
     pub(crate) float_modes: bool,
+    pub(crate) denorm32: Denorm32,
+    pub(crate) rounding32: ShaderRoundingMode,
     pub(crate) repair_float: Option<u32>,
     pub(crate) fma_extension: bool,
     pub(crate) glsl_import: Option<u32>,
+    repairs: HashMap<Repair, u32>,
+    pub(super) native_half: Option<u32>,
 }
 
 impl Math {
@@ -54,10 +74,54 @@ impl Math {
             block: 0,
             source: ShaderSourceLocation::new(0),
             float_modes: false,
+            denorm32: if options.float32.denorm_preserve {
+                Denorm32::Preserve
+            } else {
+                Denorm32::Unspecified
+            },
+            rounding32: ShaderRoundingMode::NearestEven,
             repair_float: None,
             fma_extension: false,
             glsl_import: None,
+            repairs: HashMap::new(),
+            native_half: None,
         }
+    }
+    /// Share only the exceptional repair body. Native arithmetic and the guard
+    /// stay inline, so ordinary values never pay a GPU function-call cost.
+    /// DontInline is a hint; correctness does not depend on driver inlining.
+    pub(super) fn repair_call<const N: usize>(
+        &mut self,
+        kind: Repair,
+        arguments: [u32; N],
+        emit: impl FnOnce(&mut Self, [u32; N]) -> Result<u32>,
+    ) -> Result<u32> {
+        let function = if let Some(&function) = self.repairs.get(&kind) {
+            function
+        } else {
+            let caller = self.b.selected_function();
+            let caller_block = self.b.selected_block();
+            let label = self.block;
+            self.b.select_function(None)?;
+            let ty = self.b.type_function(self.uint, [self.float; N]);
+            let function =
+                self.b
+                    .begin_function(self.uint, None, spv::FunctionControl::DONT_INLINE, ty)?;
+            let mut parameters = [0; N];
+            for parameter in &mut parameters {
+                *parameter = self.b.function_parameter(self.float)?;
+            }
+            self.block = self.b.begin_block(None)?;
+            let result = emit(self, parameters)?;
+            self.b.ret_value(result)?;
+            self.b.end_function()?;
+            self.b.select_function(caller)?;
+            self.b.select_block(caller_block)?;
+            self.block = label;
+            self.repairs.insert(kind, function);
+            function
+        };
+        Ok(self.b.function_call(self.uint, None, function, arguments)?)
     }
     pub(crate) fn unsupported(&self, reason: &'static str) -> SpirvShaderError {
         SpirvShaderError::Instruction {
@@ -73,8 +137,11 @@ impl Math {
             .entry(bits)
             .or_insert_with(|| self.b.constant_bit32(self.uint, bits))
     }
+    pub(crate) fn preserves_float32(&self) -> bool {
+        self.denorm32 == Denorm32::Preserve
+    }
     pub(crate) fn require_float(&mut self, control: ShaderFloatControl) -> Result<()> {
-        if !self.options.float32.denorm_preserve
+        if !self.preserves_float32()
             && !(control.denormals_are_zero && control.flush_denormals_to_zero)
         {
             return Err(self.unsupported(
@@ -84,22 +151,33 @@ impl Math {
         self.require_repaired_float(control)
     }
     pub(crate) fn require_repaired_float(&mut self, control: ShaderFloatControl) -> Result<()> {
-        if control.rounding != ShaderRoundingMode::NearestEven {
-            return Err(self.unsupported("native float arithmetic requires nearest-even rounding"));
+        if control.rounding != self.rounding32 {
+            return Err(self
+                .unsupported("arithmetic rounding differs from the selected shader environment"));
         }
         let caps = self.options.float32;
-        if !caps.rounding_mode_rte || !caps.signed_zero_inf_nan_preserve {
-            return Err(self.unsupported(
-                "float32 requires RoundingModeRTE and SignedZeroInfNanPreserve host guarantees",
-            ));
+        let rounding = match self.rounding32 {
+            ShaderRoundingMode::NearestEven if caps.rounding_mode_rte => (
+                spv::Capability::RoundingModeRTE,
+                spv::ExecutionMode::RoundingModeRTE,
+            ),
+            ShaderRoundingMode::TowardZero if caps.rounding_mode_rtz => (
+                spv::Capability::RoundingModeRTZ,
+                spv::ExecutionMode::RoundingModeRTZ,
+            ),
+            _ => {
+                return Err(
+                    self.unsupported("selected float32 rounding mode is not enabled on the host")
+                );
+            }
+        };
+        if !caps.signed_zero_inf_nan_preserve {
+            return Err(self.unsupported("float32 requires SignedZeroInfNanPreserve"));
         }
         if !self.float_modes {
             self.b.extension("SPV_KHR_float_controls");
             for (capability, mode) in [
-                (
-                    spv::Capability::RoundingModeRTE,
-                    spv::ExecutionMode::RoundingModeRTE,
-                ),
+                rounding,
                 (
                     spv::Capability::SignedZeroInfNanPreserve,
                     spv::ExecutionMode::SignedZeroInfNanPreserve,
@@ -108,10 +186,15 @@ impl Math {
                 self.b.capability(capability);
                 self.b.execution_mode(self.entry, mode, [32]);
             }
-            if caps.denorm_preserve {
+            if self.preserves_float32() {
                 self.b.capability(spv::Capability::DenormPreserve);
                 self.b
                     .execution_mode(self.entry, spv::ExecutionMode::DenormPreserve, [32]);
+            }
+            if self.denorm32 == Denorm32::Flush {
+                self.b.capability(spv::Capability::DenormFlushToZero);
+                self.b
+                    .execution_mode(self.entry, spv::ExecutionMode::DenormFlushToZero, [32]);
             }
             self.float_modes = true;
         }
@@ -136,11 +219,32 @@ impl Math {
         control: ShaderFloatControl,
         multiply: bool,
     ) -> Result<u32> {
+        self.float_binary_known_normal(left, right, control, multiply, false)
+    }
+    pub(crate) fn float_binary_known_normal(
+        &mut self,
+        left: u32,
+        right: u32,
+        mut control: ShaderFloatControl,
+        multiply: bool,
+        known_normal: bool,
+    ) -> Result<u32> {
+        if known_normal {
+            control.denormals_are_zero = false;
+            control.flush_denormals_to_zero = false;
+        }
         if multiply
             && control.rounding == ShaderRoundingMode::TowardZero
-            && control.denormals_are_zero
-            && control.flush_denormals_to_zero
+            && (known_normal || control.denormals_are_zero && control.flush_denormals_to_zero)
         {
+            if self.rounding32 == ShaderRoundingMode::TowardZero {
+                self.require_repaired_float(control)?;
+                let a = self.float_operand(left, control)?;
+                let b = self.float_operand(right, control)?;
+                let value = self.b.f_mul(self.float, None, a, b)?;
+                self.b.decorate(value, spv::Decoration::NoContraction, []);
+                return self.float_result(value, control);
+            }
             let bits = self.multiply_rz_ftz(left, right)?;
             let value = self.b.bitcast(self.float, None, bits)?;
             return self.float_result(value, control);
@@ -154,7 +258,13 @@ impl Math {
             self.b.f_add(self.float, None, left, right)?
         };
         self.b.decorate(value, spv::Decoration::NoContraction, []);
-        let value = if self.options.float32.denorm_preserve {
+        let value = if known_normal
+            || self.preserves_float32()
+            || (!multiply
+                && self.denorm32 == Denorm32::Flush
+                && control.denormals_are_zero
+                && control.flush_denormals_to_zero)
+        {
             value
         } else {
             if control.denormals_are_zero && control.flush_denormals_to_zero {
@@ -198,7 +308,7 @@ impl Math {
             let nan = self.constant(f32::NAN.to_bits());
             bits = self.b.select(self.uint, None, is_nan, nan, bits)?;
         }
-        if control.flush_denormals_to_zero {
+        if control.flush_denormals_to_zero && self.denorm32 != Denorm32::Flush {
             bits = self.flush_denormal(bits)?;
         }
         if control.saturate {
@@ -217,6 +327,14 @@ impl Math {
         }
         Ok(bits)
     }
+    pub(crate) fn enable_fma(&mut self) {
+        // https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_shader_fma.html
+        if !self.fma_extension {
+            self.b.extension("SPV_KHR_fma");
+            self.b.capability(spv::Capability::FMAKHR);
+            self.fma_extension = true;
+        }
+    }
     pub(crate) fn fma(
         &mut self,
         left: u32,
@@ -224,24 +342,33 @@ impl Math {
         addend: u32,
         control: ShaderFloatControl,
     ) -> Result<u32> {
+        self.fma_known_normal(left, right, addend, control, false)
+    }
+    pub(crate) fn fma_known_normal(
+        &mut self,
+        left: u32,
+        right: u32,
+        addend: u32,
+        mut control: ShaderFloatControl,
+        known_normal: bool,
+    ) -> Result<u32> {
+        if known_normal {
+            control.denormals_are_zero = false;
+            control.flush_denormals_to_zero = false;
+        }
         self.require_repaired_float(control)?;
         if !self.options.float32.fused_multiply_add {
             return Err(self.unsupported(
                 "correctly rounded float32 FMA requires VK_KHR_shader_fma / shaderFmaFloat32",
             ));
         }
-        // https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_shader_fma.html
-        if !self.fma_extension {
-            self.b.extension("SPV_KHR_fma");
-            self.b.capability(spv::Capability::FMAKHR);
-            self.fma_extension = true;
-        }
+        self.enable_fma();
         let left = self.float_operand(left, control)?;
         let right = self.float_operand(right, control)?;
         let addend = self.float_operand(addend, control)?;
         let value = self.b.fma_khr(self.float, None, left, right, addend)?;
         self.b.decorate(value, spv::Decoration::NoContraction, []);
-        let value = if self.options.float32.denorm_preserve {
+        let value = if known_normal || self.preserves_float32() {
             value
         } else {
             if control.denormals_are_zero && control.flush_denormals_to_zero {

@@ -197,6 +197,7 @@ pub(super) fn merge(a: &Function, z: &Function) -> Result<Function, MaxwellShade
         }
     }
     let mut result = b.finish()?;
+    result.local_memory_bytes = a.local_memory_bytes.max(z.local_memory_bytes);
     let mut inputs = BTreeMap::new();
     let mut outputs = BTreeMap::new();
     let mut resources = BTreeMap::new();

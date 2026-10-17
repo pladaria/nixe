@@ -8,6 +8,7 @@ use std::ffi::c_void;
 
 pub struct Context<'a> {
     pub memory: &'a ExecutionMemory,
+    pub native_memory: NativeMemorySession<'a>,
     pub arena: DirectAddressSpaceView,
     pub cpu: ProcessCpuContext,
     pub timer: &'a dyn ArchitecturalTimer,
@@ -70,7 +71,15 @@ unsafe extern "C" fn memory(
     expected: *const u64,
 ) -> bool {
     let context = unsafe { &mut *context.cast::<Context<'_>>() };
-    crate::metrics::record(crate::metrics::Counter::MemoryCallbacks, 1);
+    crate::metrics::record(
+        match op {
+            0 => crate::metrics::Counter::ReadCallbacks,
+            1 => crate::metrics::Counter::WriteCallbacks,
+            _ => crate::metrics::Counter::AtomicCallbacks,
+        },
+        1,
+    );
+    nixe_memory::trace::detail_event("cpu_callback", address, u64::from(op), u64::from(bytes));
     let size = match bytes {
         1 => MemoryAccessSize::Byte,
         2 => MemoryAccessSize::Halfword,
@@ -105,8 +114,7 @@ unsafe extern "C" fn memory(
     let input = unsafe { u128::from(*value) | (u128::from(*value.add(1)) << 64) };
     let result = if op == 2 {
         let expected = unsafe { u128::from(*expected) | (u128::from(*expected.add(1)) << 64) };
-        match context.memory.try_native_compare_exchange(
-            space,
+        match context.native_memory.compare_exchange(
             address,
             access,
             MemoryValue::from_bits(size, expected),
@@ -120,10 +128,7 @@ unsafe extern "C" fn memory(
             Err(fault) => Err(fault),
         }
     } else {
-        let resolution = match context
-            .memory
-            .resolve_native_access(space, address, access, kind)
-        {
+        let resolution = match context.native_memory.resolve_access(address, access, kind) {
             Ok(NativeMemoryAccess::Ram) => DirectFaultResolution::Retry,
             Ok(NativeMemoryAccess::CheckedRam) => DirectFaultResolution::Cold,
             Ok(NativeMemoryAccess::Fatal(message)) => {

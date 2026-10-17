@@ -69,10 +69,14 @@ pub struct MaxwellSsaSource {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellSsaProgram {
-    pub function: Function,
+    pub function: std::sync::Arc<Function>,
     pub bindings: Box<[MaxwellSsaBinding]>,
     pub stage: MaxwellShaderStage,
     pub sources: Box<[MaxwellSsaSource]>,
+    // Bounds already proved while capturing a dominating BRX jump table.
+    // Keyed by source PC so linking can retain the proof without guest ISA
+    // metadata or speculative uniform-buffer reads in the host backend.
+    constant_reads: Box<[(ShaderSourceLocation, u64)]>,
     global_buffers: Box<
         [(
             Option<u8>,
@@ -142,7 +146,7 @@ impl MaxwellSsaProgram {
         let global_buffers = decoded.global_buffers.clone();
         let function = lower_decoded(binary, decoded)?;
         let mut result = Self {
-            function,
+            function: std::sync::Arc::new(function),
             bindings: bindings.into_boxed_slice(),
             stage: binary.stage(),
             sources: vec![MaxwellSsaSource {
@@ -151,6 +155,16 @@ impl MaxwellSsaProgram {
                 pc_base: 0,
             }]
             .into_boxed_slice(),
+            constant_reads: binary
+                .indirect_tables
+                .iter()
+                .map(|table| {
+                    (
+                        ShaderSourceLocation::new(table.load_offset),
+                        u64::from(table.read_end),
+                    )
+                })
+                .collect(),
             global_buffers: vec![(None, global_buffers)].into_boxed_slice(),
         };
         result.retain_live_bindings();
@@ -172,7 +186,13 @@ impl MaxwellSsaProgram {
             location.byte_offset() - source.pc_base,
         ))
     }
-    pub(super) fn append_buffers(&mut self, other: &Self) {
+    pub(super) fn append_buffers(&mut self, other: &Self, pc_base: u32) {
+        self.constant_reads = self
+            .constant_reads
+            .iter()
+            .map(|&(pc, end)| (ShaderSourceLocation::new(pc.byte_offset() + pc_base), end))
+            .chain(other.constant_reads.iter().copied())
+            .collect();
         self.global_buffers = self
             .global_buffers
             .iter()
@@ -180,7 +200,7 @@ impl MaxwellSsaProgram {
             .cloned()
             .collect();
     }
-    pub(super) fn retain_live_bindings(&mut self) {
+    pub(crate) fn retain_live_bindings(&mut self) {
         let mut live = std::collections::BTreeSet::new();
         let mut inputs = std::collections::BTreeSet::new();
         for block in &self.function.blocks {
@@ -207,7 +227,7 @@ impl MaxwellSsaProgram {
                 }
             }
         }
-        self.function
+        std::sync::Arc::make_mut(&mut self.function)
             .inputs
             .retain(|e| inputs.contains(&(e.location(), u32::from(e.component()))));
         for block in &self.function.blocks {
@@ -255,7 +275,9 @@ impl MaxwellSsaProgram {
             }
         }
         self.bindings = bindings.into_values().collect();
-        self.function.resources.retain(|r| live.contains(&r.id));
+        std::sync::Arc::make_mut(&mut self.function)
+            .resources
+            .retain(|r| live.contains(&r.id));
     }
     /// Captured affine LDG/STG bounds, evaluated for the consumed dispatch.
     /// Descriptor-backed buffers retain their declared guest extent.
@@ -329,6 +351,16 @@ impl MaxwellSsaProgram {
             let Some(extent) = extents.get_mut(&resource) else {
                 continue;
             };
+            if let Some((_, end)) = self
+                .constant_reads
+                .iter()
+                .find(|(pc, _)| *pc == instruction.source)
+            {
+                if let Some(old) = extent {
+                    *old = (*old).max(*end);
+                }
+                continue;
+            }
             let nixe_gpu::ssa::Definition::Instruction { block, index, .. } =
                 self.function.values[instruction.arguments[0].index()].definition
             else {
@@ -386,8 +418,12 @@ pub fn compile_maxwell_pipeline_ssa(
 ) -> Result<MaxwellSsaPipeline, MaxwellShaderTranslationError> {
     let source =
         super::super::source::prepare_maxwell_shader_translation_source(state)?.materialize();
-    let inputs =
-        super::super::source::capture_maxwell_shader_snapshot(&source, address_space, writes)?;
+    let inputs = super::super::source::capture_maxwell_shader_snapshot(
+        &source,
+        state.shader_bindings(),
+        address_space,
+        writes,
+    )?;
     compile_snapshot(inputs)
 }
 pub(super) fn compile_snapshot(
@@ -401,7 +437,17 @@ pub(super) fn compile_snapshot(
             input.register_count,
             &types,
             input.y_negate,
-        )?;
+        ).inspect_err(|error| {
+            let offset = match error {
+                MaxwellShaderTranslationError::UnsupportedInstruction { instruction_offset, .. }
+                | MaxwellShaderTranslationError::MalformedInstruction { instruction_offset, .. }
+                | MaxwellShaderTranslationError::UnsupportedSemanticDetail { instruction_offset, .. } => *instruction_offset,
+                _ => return,
+            };
+            for bundle in input.binary.bundles().iter().filter(|bundle| bundle.offset < 256 || bundle.offset.abs_diff(offset) <= 256) {
+                log::debug!("shader failure context: stage={:?} gpu-va={:#x} offset={:#x} instructions={:016x?}", input.binary.stage(), input.binary.address, bundle.offset, bundle.instructions);
+            }
+        })?;
         programs.push(MaxwellSsaProgram::new(&input.binary, decoded)?);
     }
     // Namespace live resource identities by actual guest binding group and
@@ -445,7 +491,7 @@ pub(super) fn compile_snapshot(
             remap.insert(binding.resource, id);
             binding.resource = id;
         }
-        for block in &mut program.function.blocks {
+        for block in &mut std::sync::Arc::make_mut(&mut program.function).blocks {
             for inst in &mut block.instructions {
                 match &mut inst.op {
                     Op::Load {
@@ -465,7 +511,7 @@ pub(super) fn compile_snapshot(
                 }
             }
         }
-        for resource in &mut program.function.resources {
+        for resource in &mut std::sync::Arc::make_mut(&mut program.function).resources {
             resource.id = remap[&resource.id];
         }
     }

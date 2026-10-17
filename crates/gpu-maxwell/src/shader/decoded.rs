@@ -89,6 +89,21 @@ pub(super) enum Operation {
         builtin: ShaderComputeBuiltin,
         component: u8,
     },
+    /// Guest address operation, legalized after CFG-wide pointer analysis.
+    GlobalMemory {
+        encoding: u64,
+        address: [ShaderRegister; 2],
+        data: Box<[ShaderRegister]>,
+        load: bool,
+    },
+    LoadLocal32 {
+        destination: Register,
+        address: Register,
+    },
+    StoreLocal32 {
+        source: Register,
+        address: Register,
+    },
     /// Word-aligned storage access; the index is an unsigned 32-bit word index.
     LoadStorageBuffer32 {
         destination: ShaderRegister,
@@ -453,6 +468,7 @@ fn visit_operation_destinations(operation: &Operation, mut visit: impl FnMut(Sha
         | Operation::Select32 { destination, .. }
         | Operation::FloatAbsolute32 { destination, .. }
         | Operation::FloatNegate32 { destination, .. }
+        | Operation::LoadLocal32 { destination, .. }
         | Operation::UnpackHalf32 { destination, .. }
         | Operation::PackHalf32 { destination, .. }
         | Operation::FusedMultiplyAddHalf32 { destination, .. }
@@ -479,6 +495,9 @@ fn visit_operation_destinations(operation: &Operation, mut visit: impl FnMut(Sha
         | Operation::InterpolateInput { destination, .. }
         | Operation::LoadConstantBuffer32 { destination, .. }
         | Operation::LoadConstantBufferIndexed32 { destination, .. } => visit(*destination),
+        Operation::GlobalMemory {
+            data, load: true, ..
+        } => data.iter().copied().for_each(visit),
         Operation::LoadInput { destinations, .. } => destinations.iter().copied().for_each(visit),
         Operation::SampleDepthCompare2D { outputs, .. }
         | Operation::SampleTexture2D { outputs, .. }
@@ -493,6 +512,20 @@ fn visit_operation_destinations(operation: &Operation, mut visit: impl FnMut(Sha
 }
 fn operation_sources(operation: &Operation) -> Vec<ShaderRegister> {
     match operation {
+        Operation::LoadLocal32 { address, .. } => vec![*address],
+        Operation::StoreLocal32 { source, address } => vec![*address, *source],
+        Operation::GlobalMemory {
+            address,
+            data,
+            load,
+            ..
+        } => {
+            let mut sources = address.to_vec();
+            if !load {
+                sources.extend_from_slice(data);
+            }
+            sources
+        }
         Operation::Select32 {
             condition,
             when_true,
@@ -646,6 +679,12 @@ impl Instruction {
 impl From<Operation> for nixe_gpu::ShaderOperation {
     fn from(op: Operation) -> Self {
         match op {
+            Operation::LoadLocal32 { .. } | Operation::StoreLocal32 { .. } => {
+                unreachable!("private memory is native SSA only; oracle export rejects it")
+            }
+            Operation::GlobalMemory { .. } => {
+                unreachable!("guest global accesses must be legalized before oracle export")
+            }
             Operation::Nop => Self::Nop,
             Operation::QuadShuffle32 {
                 destination,

@@ -31,7 +31,7 @@ impl Emitter<'_> {
                     }
                 }
                 Type::U32 => self.math.constant(c.bits as u32),
-                Type::I32 | Type::F32 => self.math.b.constant_bit32(ty, c.bits as u32),
+                Type::I32 | Type::F32 | Type::F16 => self.math.b.constant_bit32(ty, c.bits as u32),
                 Type::U64 | Type::I64 | Type::F64 => self.math.b.constant_bit64(ty, c.bits),
                 Type::Effect => return Err(self.error("effect constant is invalid")),
             }),
@@ -85,7 +85,9 @@ impl Emitter<'_> {
                 ty: scalar,
                 float_control,
             } => {
-                if scalar == Type::F32 && matches!(op, Binary::Add | Binary::Multiply) {
+                if scalar == Type::F16 {
+                    Some(self.half_binary(op, args[0], args[1], float_control)?)
+                } else if scalar == Type::F32 && matches!(op, Binary::Add | Binary::Multiply) {
                     let a = self
                         .math
                         .b
@@ -98,7 +100,14 @@ impl Emitter<'_> {
                         .map_err(|e| self.error(e.to_string()))?;
                     let bits = self
                         .math
-                        .float_binary(a, b, float_control, op == Binary::Multiply)
+                        .float_binary_known_normal(
+                            a,
+                            b,
+                            float_control,
+                            op == Binary::Multiply,
+                            float_control.rounding == ShaderRoundingMode::NearestEven
+                                && self.float_facts.normal(inst),
+                        )
                         .map_err(|e| self.error(e.to_string()))?;
                     Some(
                         self.math
@@ -162,7 +171,13 @@ impl Emitter<'_> {
                 }
                 let value = self
                     .math
-                    .fma(bits[0], bits[1], bits[2], float_control)
+                    .fma_known_normal(
+                        bits[0],
+                        bits[1],
+                        bits[2],
+                        float_control,
+                        self.float_facts.normal(inst),
+                    )
                     .map_err(|e| self.error(e.to_string()))?;
                 Some(
                     self.math
@@ -586,7 +601,7 @@ impl Emitter<'_> {
                 spv::StorageClass::Workgroup,
                 self.options.shared_memory_bytes,
             ),
-            MemorySpace::Local => (spv::StorageClass::Private, self.options.local_memory_bytes),
+            MemorySpace::Local => (spv::StorageClass::Private, self.function.local_memory_bytes),
             _ => return Err(self.error("descriptor-backed memory has no resource")),
         };
         if bytes == 0 || !bytes.is_multiple_of(4) {
@@ -639,6 +654,33 @@ impl Emitter<'_> {
                 .get(&resource)
                 .ok_or_else(|| self.error("missing live buffer binding"))?;
             let zero = self.math.constant(0);
+            if buffer.space == MemorySpace::Constant {
+                let three = if address_type == Type::U64 {
+                    self.math.b.constant_bit64(address_ty, 3)
+                } else {
+                    self.math.constant(3)
+                };
+                let vector = self
+                    .math
+                    .b
+                    .shift_right_logical(address_ty, None, index, two)
+                    .map_err(|e| self.error(e.to_string()))?;
+                let component = self
+                    .math
+                    .b
+                    .bitwise_and(address_ty, None, index, three)
+                    .map_err(|e| self.error(e.to_string()))?;
+                return self
+                    .math
+                    .b
+                    .access_chain(
+                        buffer.pointer,
+                        None,
+                        buffer.variable,
+                        [zero, vector, component],
+                    )
+                    .map_err(|e| self.error(e.to_string()));
+            }
             return self
                 .math
                 .b

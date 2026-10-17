@@ -611,7 +611,16 @@ impl Presenter {
                             }
                             Some(Command::Submit(frame, work, sequence)) => {
                                 let accepted = chains.present(&context, frame, work)?;
-                                if accepted && sequence.is_some() && sequence != last_sequence {
+                                if accepted
+                                    && sequence != last_sequence
+                                    && let Some(fresh_sequence) = sequence
+                                {
+                                    nixe_gpu::trace::event(
+                                        "host_present",
+                                        fresh_sequence,
+                                        work.tick(),
+                                        0,
+                                    );
                                     last_sequence = sequence;
                                     client.record_presented();
                                 }

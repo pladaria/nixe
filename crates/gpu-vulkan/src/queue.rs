@@ -4,6 +4,9 @@ use crate::{
     device::DeviceOwner, memory::allocate_buffer,
 };
 use ash::vk;
+#[cfg(feature = "performance-counters")]
+mod timing;
+mod visibility;
 use nixe_gpu::{BackendInstanceId, BackendSubmissionToken};
 use std::{
     sync::{
@@ -123,6 +126,9 @@ pub(crate) struct Slice {
     pub size: u64,
 }
 pub(crate) struct Slot {
+    pub stream_descriptors: Option<crate::cache::DescriptorCache>,
+    #[cfg(feature = "performance-counters")]
+    timing: Option<timing::Queries>,
     owner: Arc<DeviceOwner>,
     pub pool: vk::CommandPool,
     pub command: vk::CommandBuffer,
@@ -131,8 +137,8 @@ pub(crate) struct Slot {
     pending_stream_read: bool,
     pub upload: Option<Arena>,
     pub readback: Option<Arena>,
-    pub upload_overflow: Vec<Arc<AllocatedBuffer>>,
-    pub readback_overflow: Vec<Arc<AllocatedBuffer>>,
+    pub upload_overflow: Vec<Arena>,
+    pub readback_overflow: Vec<Arena>,
     pub readbacks: Vec<Option<Slice>>,
     unread_count: usize,
     pub retired_buffers: Vec<Arc<AllocatedBuffer>>,
@@ -143,6 +149,8 @@ pub(crate) struct Slot {
     pub pipeline_handles: std::collections::HashSet<vk::Pipeline>,
     pub binding_handles: std::collections::HashSet<vk::DescriptorSet>,
     pub bound_graphics_set: vk::DescriptorSet,
+    pub bound_compute_offsets: Vec<u32>,
+    pub bound_graphics_offsets: Vec<u32>,
     pub bound_compute_layout: vk::PipelineLayout,
     pub bound_graphics_layout: vk::PipelineLayout,
     #[cfg(feature = "binding-probe")]
@@ -179,6 +187,9 @@ impl Slot {
         }
         .map_err(|e| VulkanError::vk("vkCreateCommandPool", e))?;
         let mut slot = Self {
+            stream_descriptors: None,
+            #[cfg(feature = "performance-counters")]
+            timing: timing::Queries::new(Arc::clone(&owner), family)?,
             owner,
             pool,
             command: vk::CommandBuffer::null(),
@@ -199,6 +210,8 @@ impl Slot {
             pipeline_handles: Default::default(),
             binding_handles: Default::default(),
             bound_graphics_set: vk::DescriptorSet::null(),
+            bound_compute_offsets: Vec::new(),
+            bound_graphics_offsets: Vec::new(),
             bound_compute_layout: vk::PipelineLayout::null(),
             bound_graphics_layout: vk::PipelineLayout::null(),
             #[cfg(feature = "binding-probe")]
@@ -238,19 +251,19 @@ impl Slot {
     }
     pub fn upload_buffer(&self, slice: Slice) -> &AllocatedBuffer {
         match slice.overflow {
-            Some(i) => &self.upload_overflow[i],
+            Some(i) => &self.upload_overflow[i].buffer,
             None => &self.upload.as_ref().expect("upload arena").buffer,
         }
     }
     pub(crate) fn upload_lease(&self, slice: Slice) -> Arc<AllocatedBuffer> {
         match slice.overflow {
-            Some(index) => Arc::clone(&self.upload_overflow[index]),
+            Some(index) => Arc::clone(&self.upload_overflow[index].buffer),
             None => Arc::clone(&self.upload.as_ref().expect("upload arena").buffer),
         }
     }
     pub fn readback_buffer(&self, slice: Slice) -> &AllocatedBuffer {
         match slice.overflow {
-            Some(i) => &self.readback_overflow[i],
+            Some(i) => &self.readback_overflow[i].buffer,
             None => &self.readback.as_ref().expect("readback arena").buffer,
         }
     }
@@ -275,6 +288,8 @@ impl Drop for Slot {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RecordingStatistics {
+    pub stream_descriptor_hits: u64,
+    pub stream_descriptor_allocations: u64,
     pub pipeline_binds: u64,
     pub descriptor_binds: u64,
     pub vertex_binds: u64,
@@ -294,6 +309,8 @@ pub(crate) struct QueueState {
     pub recording: Option<usize>,
     pub submitted: u64,
     pub completed: u64,
+    visibility: visibility::VisibilityTimeline,
+    visibility_scope: Option<(u64, nixe_memory::DeviceVisibilityPoint)>,
     overflow_capacity: u64,
     pending_stream_reads: Vec<usize>,
     stopped: bool,
@@ -333,6 +350,8 @@ impl QueueState {
             statistics: Default::default(),
             submitted: 0,
             completed: 0,
+            visibility: Default::default(),
+            visibility_scope: None,
             overflow_capacity: 0,
             pending_stream_reads: Vec::new(),
             stopped: false,
@@ -373,15 +392,35 @@ impl QueueState {
     }
     pub fn poll(&mut self) -> Result<u64, VulkanError> {
         self.check_running()?;
+        if self.completed == self.submitted {
+            return Ok(self.completed);
+        }
         let completed = unsafe { self.owner.device.get_semaphore_counter_value(self.timeline) }
             .map_err(|e| self.error("vkGetSemaphoreCounterValue", e))?;
         if completed.min(self.submitted) > self.completed {
+            #[cfg(feature = "performance-counters")]
+            self.retire_timings(completed.min(self.submitted))?;
             self.reclaim(completed.min(self.submitted));
         }
         Ok(self.completed)
     }
+    #[cfg(feature = "performance-counters")]
+    fn retire_timings(&mut self, completed: u64) -> Result<(), VulkanError> {
+        for slot in &mut self.slots {
+            if slot.tick <= completed
+                && let Some(timing) = &mut slot.timing
+            {
+                timing.retire()?;
+            }
+        }
+        Ok(())
+    }
     fn reclaim(&mut self, completed: u64) {
+        if completed > self.completed {
+            nixe_gpu::trace::detail_event("queue_complete", completed, self.completed, 0);
+        }
         self.completed = self.completed.max(completed);
+        self.visibility.complete(self.completed);
         for slot in &mut self.slots {
             if !slot.pending_stream_read && slot.tick.max(slot.stream_read_until) <= self.completed
             {
@@ -400,14 +439,14 @@ impl QueueState {
                 self.overflow_capacity -= slot
                     .upload_overflow
                     .iter()
-                    .map(|buffer| buffer.size())
+                    .map(|arena| arena.buffer.size())
                     .sum::<u64>();
                 slot.upload_overflow.clear();
                 if slot.unread() == 0 {
                     self.overflow_capacity -= slot
                         .readback_overflow
                         .iter()
-                        .map(|buffer| buffer.size())
+                        .map(|arena| arena.buffer.size())
                         .sum::<u64>();
                     slot.readback_overflow.clear();
                 }
@@ -495,6 +534,10 @@ impl QueueState {
         }
         .map_err(|e| self.error("vkBeginCommandBuffer", e))?;
         let slot = &mut self.slots[index];
+        #[cfg(feature = "performance-counters")]
+        if let Some(timing) = &mut slot.timing {
+            timing.begin(slot.command);
+        }
         slot.tick = tick;
         if let Some(arena) = &mut slot.upload {
             arena.cursor = 0;
@@ -514,6 +557,8 @@ impl QueueState {
         slot.graphics_parameters = None;
         slot.bound_set = vk::DescriptorSet::null();
         slot.bound_graphics_set = vk::DescriptorSet::null();
+        slot.bound_compute_offsets.clear();
+        slot.bound_graphics_offsets.clear();
         slot.bound_compute_layout = vk::PipelineLayout::null();
         slot.bound_graphics_layout = vk::PipelineLayout::null();
         #[cfg(feature = "binding-probe")]
@@ -522,6 +567,9 @@ impl QueueState {
             slot.bound_descriptor_offset = u64::MAX;
         }
         slot.readbacks.clear();
+        // Immutable descriptors remain valid across command-buffer reuse.
+        // Their bounded cache recycles unleased pages on pressure; clearing it
+        // here would discard unchanged streaming bindings on every submission.
         self.recording = Some(index);
         Ok(index)
     }
@@ -552,7 +600,8 @@ impl QueueState {
                 vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::VERTEX_BUFFER
                     | vk::BufferUsageFlags::INDEX_BUFFER
-                    | vk::BufferUsageFlags::STORAGE_BUFFER,
+                    | vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::UNIFORM_BUFFER,
                 "nixe upload arena",
             ),
             (
@@ -617,7 +666,8 @@ impl QueueState {
                 vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::VERTEX_BUFFER
                     | vk::BufferUsageFlags::INDEX_BUFFER
-                    | vk::BufferUsageFlags::STORAGE_BUFFER,
+                    | vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::UNIFORM_BUFFER,
                 MemoryLocation::CpuToGpu,
                 AllocationMode::Dedicated,
                 "nixe upload overflow",
@@ -633,8 +683,14 @@ impl QueueState {
             let slot = &mut self.slots[index];
             let a = slot.upload_overflow.len();
             let b = slot.readback_overflow.len();
-            slot.upload_overflow.push(Arc::new(source));
-            slot.readback_overflow.push(Arc::new(destination));
+            slot.upload_overflow.push(Arena {
+                buffer: Arc::new(source),
+                cursor: capacity,
+            });
+            slot.readback_overflow.push(Arena {
+                buffer: Arc::new(destination),
+                cursor: capacity,
+            });
             self.overflow_capacity += extra;
             (
                 Slice {
@@ -651,7 +707,7 @@ impl QueueState {
         };
         let slot = &mut self.slots[index];
         let buffer = match source.overflow {
-            Some(i) => &mut slot.upload_overflow[i],
+            Some(i) => &mut slot.upload_overflow[i].buffer,
             None => &mut slot.upload.as_mut().expect("upload arena").buffer,
         };
         // SAFETY: the recording slot has no earlier in-flight uses; allocations
@@ -689,7 +745,7 @@ impl QueueState {
         let (index, slice) = self.reserve_slice(bytes.len() as u64, true, alignment)?;
         let slot = &mut self.slots[index];
         let buffer = match slice.overflow {
-            Some(i) => &mut slot.upload_overflow[i],
+            Some(i) => &mut slot.upload_overflow[i].buffer,
             None => &mut slot.upload.as_mut().expect("upload arena").buffer,
         };
         unsafe { buffer.write_range(slice.offset, bytes) }?;
@@ -752,7 +808,8 @@ impl QueueState {
                 vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::VERTEX_BUFFER
                     | vk::BufferUsageFlags::INDEX_BUFFER
-                    | vk::BufferUsageFlags::STORAGE_BUFFER,
+                    | vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::UNIFORM_BUFFER,
                 "nixe upload arena",
             )
         } else {
@@ -795,15 +852,32 @@ impl QueueState {
                 },
             ));
         }
-        let capacity = align_up(size, self.owner.non_coherent_atom_size.max(4))
-            .ok_or(VulkanError::InvalidResource("staging capacity overflow"))?;
-        if self
-            .overflow_capacity
-            .checked_add(capacity)
-            .is_none_or(|total| total > self.configuration.overflow_bytes)
+        let overflow = if upload {
+            &mut slot.upload_overflow
+        } else {
+            &mut slot.readback_overflow
+        };
+        // Suballocate the current overflow arena as well. Small texture rows
+        // must not create one VkBuffer/VkDeviceMemory allocation per request.
+        if let Some(arena) = overflow.last_mut()
+            && let Some(offset) = arena.reserve_aligned(size, alignment)
         {
+            return Ok((
+                index,
+                Slice {
+                    overflow: Some(overflow.len() - 1),
+                    offset,
+                    size,
+                },
+            ));
+        }
+        let minimum = align_up(size, self.owner.non_coherent_atom_size.max(4))
+            .ok_or(VulkanError::InvalidResource("staging capacity overflow"))?;
+        let remaining = self.configuration.overflow_bytes - self.overflow_capacity;
+        if minimum > remaining {
             return Err(self.pressure());
         }
+        let capacity = minimum.max(self.configuration.arena_bytes).min(remaining);
         let buffer = allocate_buffer(
             &self.owner,
             capacity,
@@ -819,7 +893,10 @@ impl QueueState {
             &mut slot.readback_overflow
         };
         let entry = overflow.len();
-        overflow.push(Arc::new(buffer));
+        overflow.push(Arena {
+            buffer: Arc::new(buffer),
+            cursor: minimum,
+        });
         self.overflow_capacity += capacity;
         Ok((
             index,
@@ -844,6 +921,14 @@ impl QueueState {
         self.end_rendering(dispatch);
         let slot = &self.slots[index];
         let tick = slot.tick;
+        #[cfg(feature = "performance-counters")]
+        {
+            let slot = &mut self.slots[index];
+            if let Some(timing) = &mut slot.timing {
+                timing.end(slot.command);
+            }
+        }
+        let slot = &self.slots[index];
         unsafe { self.owner.device.end_command_buffer(slot.command) }
             .map_err(|e| self.error("vkEndCommandBuffer", e))?;
         let commands =
@@ -866,15 +951,24 @@ impl QueueState {
             .signal_semaphore_infos(&signals[..1 + extra_signals.len()]);
         // SAFETY: sole owner serializes queue; slots retain every referenced
         // allocation. Extra waits are internal WSI/external ownership dependencies.
+        #[cfg(feature = "performance-counters")]
+        let submitted_at = std::time::Instant::now();
         unsafe { dispatch.submit(queue, &info, vk::Fence::null()) }.inspect_err(|e| {
             self.stopped = true;
             if let VulkanError::Vulkan { result, .. } = e {
                 self.lost |= *result == vk::Result::ERROR_DEVICE_LOST;
             }
         })?;
+        #[cfg(feature = "performance-counters")]
+        nixe_gpu::metrics::record(
+            nixe_gpu::metrics::Counter::HostQueueSubmitNanoseconds,
+            submitted_at.elapsed().as_nanos() as u64,
+        );
         nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::HostQueueSubmissions, 1);
+        nixe_gpu::trace::detail_event("queue_submit", tick, 0, 0);
         self.submitted = tick;
         self.recording = None;
+        self.visibility_scope = None;
         Ok(Some(self.ticket(tick)))
     }
     fn wait_submitted(
@@ -882,6 +976,12 @@ impl QueueState {
         ticket: WorkTicket,
         timeout: Duration,
     ) -> Result<bool, VulkanError> {
+        let _trace = nixe_gpu::trace::span(
+            "timeline_wait",
+            ticket.tick,
+            timeout.as_nanos().min(u128::from(u64::MAX)) as u64,
+            self.completed,
+        );
         self.check_running()?;
         self.check_ticket(ticket)?;
         if ticket.tick > self.submitted {
@@ -899,12 +999,25 @@ impl QueueState {
             .values(&values);
         // A timeout never establishes completion or releases any in-flight use.
         // https://docs.vulkan.org/refpages/latest/refpages/source/vkWaitSemaphores.html
-        match unsafe {
+        #[cfg(feature = "performance-counters")]
+        let waited_at = std::time::Instant::now();
+        let result = unsafe {
             self.owner
                 .device
                 .wait_semaphores(&info, timeout.as_nanos().min(u128::from(u64::MAX)) as u64)
-        } {
+        };
+        #[cfg(feature = "performance-counters")]
+        {
+            nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::HostQueueWaits, 1);
+            nixe_gpu::metrics::record(
+                nixe_gpu::metrics::Counter::HostQueueWaitNanoseconds,
+                waited_at.elapsed().as_nanos() as u64,
+            );
+        }
+        match result {
             Ok(()) => {
+                #[cfg(feature = "performance-counters")]
+                self.retire_timings(ticket.tick)?;
                 self.reclaim(ticket.tick);
                 Ok(true)
             }
@@ -965,13 +1078,89 @@ impl Drop for QueueState {
 }
 
 impl VulkanDevice {
+    /// Ordering queries must not assemble diagnostic resource-usage totals.
+    #[inline]
+    pub(crate) fn submitted_tick(&self) -> u64 {
+        self.submission.submitted
+    }
+    #[inline]
+    pub(crate) fn completed_tick(&self) -> u64 {
+        self.submission.completed
+    }
+    pub(crate) fn preceding_work(&self) -> Option<WorkTicket> {
+        let tick = self
+            .submission
+            .recording
+            .map_or(self.submission.submitted, |slot| {
+                self.submission.slots[slot].tick
+            });
+        (tick != 0).then(|| self.submission.ticket(tick))
+    }
+    pub(crate) fn submission_instance(&self) -> BackendInstanceId {
+        self.submission.instance
+    }
+    pub(crate) fn visibility_point(
+        &mut self,
+    ) -> Result<nixe_memory::DeviceVisibilityPoint, VulkanError> {
+        let required = self.preceding_work().map_or(0, WorkTicket::tick);
+        if let Some((work, point)) = self.submission.visibility_scope
+            && work == required
+        {
+            return Ok(point);
+        }
+        let point = self
+            .submission
+            .visibility
+            .issue(required, self.submission.completed)?;
+        self.submission.visibility_scope = Some((required, point));
+        Ok(point)
+    }
+    pub(crate) fn end_visibility_scope(&mut self) {
+        self.submission.visibility_scope = None;
+    }
+    pub(crate) fn visibility_work(
+        &self,
+        point: nixe_memory::DeviceVisibilityPoint,
+    ) -> Result<Option<WorkTicket>, VulkanError> {
+        self.submission
+            .visibility
+            .required(point)
+            .map(|work| work.map(|tick| self.submission.ticket(tick)))
+    }
+    pub(crate) fn completed_visibility(&self) -> u64 {
+        self.submission.visibility.completed()
+    }
+    pub(crate) fn submitted_visibility(&self) -> u64 {
+        self.submission
+            .visibility
+            .through(self.submission.submitted)
+    }
     pub(crate) fn end_rendering(&mut self) {
         self.submission.end_rendering(&self.dispatch);
     }
+    /// Acquire recording capacity with bounded storage. The queue's low-level
+    /// begin remains nonblocking; native recording waits only for a submitted
+    /// use that can free a slot. Unconsumed readbacks still report pressure.
+    pub(crate) fn begin_recording(&mut self) -> Result<usize, VulkanError> {
+        loop {
+            match self.submission.begin() {
+                Ok(index) => return Ok(index),
+                Err(VulkanError::QueuePressure {
+                    pending: Some(work),
+                    ..
+                }) => {
+                    let _trace = nixe_gpu::trace::span("resource_pressure_wait", work.tick(), 0, 0);
+                    self.wait_for_work(work, Duration::MAX)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Reserve an ordered completion point, including a real signal for work
     /// with no commands. A flush accepts it; host polling alone is not guest success.
     pub fn work_ticket(&mut self) -> Result<WorkTicket, VulkanError> {
-        self.submission.begin()?;
+        self.begin_recording()?;
         Ok(self.submission.ticket(self.submission.submitted + 1))
     }
     /// Submit recorded commands and signal the single timeline, without waiting.

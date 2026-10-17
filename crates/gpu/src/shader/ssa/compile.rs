@@ -2,7 +2,11 @@
 use rustc_hash::FxHashMap as HashMap;
 use std::{
     hash::Hash,
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -83,9 +87,14 @@ type Job = Box<dyn FnOnce(usize) + Send + 'static>;
 pub struct CompilePool {
     sender: Option<mpsc::SyncSender<Job>>,
     threads: Vec<thread::JoinHandle<()>>,
+    queued: Arc<AtomicUsize>,
+    capacity: usize,
 }
 impl CompilePool {
     pub fn new(workers: usize, queue: usize) -> std::io::Result<Self> {
+        Self::with_name(workers, queue, "shader-compile")
+    }
+    pub fn with_name(workers: usize, queue: usize, name: &str) -> std::io::Result<Self> {
         if workers == 0 || queue == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -94,21 +103,26 @@ impl CompilePool {
         }
         let (tx, rx) = mpsc::sync_channel::<Job>(queue);
         let rx = Arc::new(Mutex::new(rx));
+        let queued = Arc::new(AtomicUsize::new(0));
         let mut pool = Self {
             sender: Some(tx),
             threads: Vec::new(),
+            queued: Arc::clone(&queued),
+            capacity: queue,
         };
         for index in 0..workers {
             let rx = Arc::clone(&rx);
+            let queued = Arc::clone(&queued);
             pool.threads.push(
                 thread::Builder::new()
-                    .name(format!("vulkan-compile-{index}"))
+                    .name(format!("{name}-{index}"))
                     .spawn(move || {
                         loop {
                             let job = rx.lock().unwrap().recv();
                             let Ok(job) = job else {
                                 break;
                             };
+                            queued.fetch_sub(1, Ordering::Relaxed);
                             job(index);
                         }
                     })?,
@@ -120,14 +134,16 @@ impl CompilePool {
         self.threads.len()
     }
     fn submit(&self, job: Job) -> std::result::Result<(), CompileError> {
-        self.sender
-            .as_ref()
-            .ok_or(CompileError::Stopped)?
-            .try_send(job)
-            .map_err(|e| match e {
-                mpsc::TrySendError::Full(_) => CompileError::Backpressure,
-                mpsc::TrySendError::Disconnected(_) => CompileError::Stopped,
-            })
+        let sender = self.sender.as_ref().ok_or(CompileError::Stopped)?;
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        let result = sender.try_send(job).map_err(|e| match e {
+            mpsc::TrySendError::Full(_) => CompileError::Backpressure,
+            mpsc::TrySendError::Disconnected(_) => CompileError::Stopped,
+        });
+        if result.is_err() {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+        result
     }
 }
 impl Drop for CompilePool {
@@ -185,6 +201,8 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
         weigh: impl FnOnce(&T) -> usize + Send + 'static,
         compile: impl FnOnce(usize) -> std::result::Result<T, CompileError> + Send + 'static,
     ) -> std::result::Result<Pending<T>, CompileError> {
+        #[cfg(feature = "performance-counters")]
+        let capture_key = crate::compilation_capture::Key::new(&key);
         let mut state = self.state.lock().unwrap();
         state.clock = state.clock.wrapping_add(1);
         let clock = state.clock;
@@ -192,6 +210,16 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
             if !entry.pending.poll().is_some_and(|r| {
                 r.is_err_and(|e| matches!(*e, CompileError::Budget | CompileError::Backpressure))
             }) {
+                #[cfg(feature = "performance-counters")]
+                capture_key.event(
+                    if entry.pending.poll().is_some() {
+                        "hit_ready"
+                    } else {
+                        "hit_pending"
+                    },
+                    usize::MAX,
+                    entry.weight as u64,
+                );
                 entry.touched = clock;
                 return Ok(entry.pending.clone());
             }
@@ -200,6 +228,12 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
         }
         if weight > self.bytes || self.entries == 0 {
             return Err(CompileError::Budget);
+        }
+        // Avoid allocating pending cells or evicting useful entries on each
+        // readiness poll while the queue has no room. The bounded channel still
+        // arbitrates racing producers; cache hits remain available at pressure.
+        if pool.queued.load(Ordering::Relaxed) >= pool.capacity {
+            return Err(CompileError::Backpressure);
         }
         while state.entries.len() >= self.entries || state.weight > self.bytes - weight {
             let candidate = state
@@ -211,6 +245,8 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
             let Some(candidate) = candidate else {
                 return Err(CompileError::Budget);
             };
+            #[cfg(feature = "performance-counters")]
+            crate::compilation_capture::Key::new(&candidate).event("evict", usize::MAX, 0);
             let old = state.entries.remove(&candidate).unwrap();
             state.weight -= old.weight;
         }
@@ -222,7 +258,15 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
         let state_owner = Arc::clone(&self.state);
         let publish_key = key.clone();
         let byte_budget = self.bytes;
+        #[cfg(feature = "performance-counters")]
+        let queued = std::time::Instant::now();
+        #[cfg(feature = "performance-counters")]
+        capture_key.event("miss", usize::MAX, weight as u64);
         pool.submit(Box::new(move |worker| {
+            #[cfg(feature = "performance-counters")]
+            capture_key.event("begin", worker, queued.elapsed().as_nanos() as u64);
+            #[cfg(feature = "performance-counters")]
+            let started = std::time::Instant::now();
             // A compiler bug must resolve its pending request too, rather than
             // strand every duplicate caller indefinitely.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile(worker)))
@@ -244,6 +288,8 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
                     let Some(candidate) = candidate else {
                         break;
                     };
+                    #[cfg(feature = "performance-counters")]
+                    crate::compilation_capture::Key::new(&candidate).event("evict", worker, 0);
                     let entry = state.entries.remove(&candidate).unwrap();
                     state.weight -= entry.weight;
                 }
@@ -256,6 +302,17 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
                     state.weight = state.weight - old + actual;
                 }
             }
+            #[cfg(feature = "performance-counters")]
+            capture_key.detail(
+                if result.is_ok() { "end" } else { "failed" },
+                worker,
+                started.elapsed().as_nanos() as u64,
+                &result
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            );
             *publish.0.result.lock().unwrap() = Some(result);
             publish.0.ready.notify_all();
         }))?;
@@ -316,7 +373,8 @@ mod tests {
     #[test]
     fn queue_pressure_does_not_drop_a_required_or_duplicate_job() {
         let pool = CompilePool::new(1, 1).unwrap();
-        let cache = CompilationCache::new(8, 64);
+        let cache = CompilationCache::new(3, 12);
+        let warm = ready(cache.request(&pool, 0, 4, |_| Ok(0u32)).unwrap());
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let first = cache
@@ -332,6 +390,12 @@ mod tests {
             cache.request(&pool, 3, 4, |_| Ok(3)),
             Err(CompileError::Backpressure)
         ));
+        let retained = cache
+            .request(&pool, 0, 4, |_| {
+                panic!("pressure evicted a useful warm entry")
+            })
+            .expect("queue pressure must preserve available cached results");
+        assert!(Arc::ptr_eq(&warm, &ready(retained)));
         let duplicate = cache
             .request(&pool, 2, 4, |_| panic!("duplicate must not compile"))
             .unwrap();

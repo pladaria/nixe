@@ -420,7 +420,7 @@ fn stream_method_packet<E>(
     for method in packet.methods() {
         let method = dispatch_method(
             channel_id,
-            profile,
+            &profile,
             submission,
             subchannel,
             *method,
@@ -434,7 +434,7 @@ fn stream_method_packet<E>(
 
 fn dispatch_method(
     channel: MaxwellChannelId,
-    profile: MaxwellGpuProfile,
+    profile: &MaxwellGpuProfile,
     submission: FrontendSubmissionId,
     subchannel: MaxwellPushbufferSubchannel,
     method: MaxwellDecodedMethod,
@@ -544,7 +544,7 @@ fn dispatch_method(
 }
 
 fn preflight_legacy_mem_op_a(
-    profile: MaxwellGpuProfile,
+    profile: &MaxwellGpuProfile,
     source: MaxwellMethodSource,
     frontend: &mut MaxwellChannelFrontendState,
 ) -> Result<MaxwellMethodDispatch, MaxwellMethodDispatchError> {
@@ -571,7 +571,7 @@ fn preflight_legacy_mem_op_a(
 }
 
 fn preflight_legacy_mem_op_b(
-    profile: MaxwellGpuProfile,
+    profile: &MaxwellGpuProfile,
     source: MaxwellMethodSource,
 ) -> Result<MaxwellMethodDispatch, MaxwellMethodDispatchError> {
     if source.argument & !MEM_OP_B_DEFINED_MASK != 0 {
@@ -618,7 +618,7 @@ fn validate_source_identity(
 }
 
 fn preflight_set_object(
-    profile: MaxwellGpuProfile,
+    profile: &MaxwellGpuProfile,
     source: MaxwellMethodSource,
     frontend: &mut MaxwellChannelFrontendState,
 ) -> Result<MaxwellMethodDispatch, MaxwellMethodDispatchError> {
@@ -664,7 +664,7 @@ fn preflight_set_object(
 }
 
 const fn graphics_subchannel_class(
-    profile: MaxwellGpuProfile,
+    profile: &MaxwellGpuProfile,
     subchannel: MaxwellPushbufferSubchannel,
 ) -> Option<GpuClassId> {
     let classes = profile.classes();

@@ -27,6 +27,11 @@ pub enum Counter {
     FrontendLoweringNanoseconds,
     InlineWriteSegmentBreaks,
     HostQueueSubmissions,
+    HostQueueGpuNanoseconds,
+    HostQueueTimedSubmissions,
+    HostQueueWaitNanoseconds,
+    HostQueueWaits,
+    HostQueueSubmitNanoseconds,
     ShaderTranslationMisses,
     ShaderTranslationNanoseconds,
     HostPipelineCompilations,
@@ -37,8 +42,8 @@ pub enum Counter {
 }
 
 #[cfg(feature = "performance-counters")]
-static COUNTERS: [std::sync::atomic::AtomicU64; 31] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 31];
+static COUNTERS: [std::sync::atomic::AtomicU64; 36] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 36];
 
 #[inline]
 pub fn record(counter: Counter, amount: u64) {
@@ -76,6 +81,11 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         "FrontendLoweringNanoseconds",
         "InlineWriteSegmentBreaks",
         "HostQueueSubmissions",
+        "HostQueueGpuNanoseconds",
+        "HostQueueTimedSubmissions",
+        "HostQueueWaitNanoseconds",
+        "HostQueueWaits",
+        "HostQueueSubmitNanoseconds",
         "ShaderTranslationMisses",
         "ShaderTranslationNanoseconds",
         "HostPipelineCompilations",

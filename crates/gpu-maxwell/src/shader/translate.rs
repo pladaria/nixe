@@ -135,9 +135,10 @@ pub(super) fn decode_shader_binary(
     }
     let stack_targets = &flow.stack_targets;
     let mut pending_range_reductions = BTreeMap::<u8, super::special::PendingRangeReduction>::new();
+    let mut opaque_range_uses = Vec::new();
     let mut patch_addresses = patch_address::PatchAddresses::default();
+    let mut local_memory = super::local_memory::LocalMemory::new(binary, &flow);
     let mut integer_flags = integer::IntegerConditionCodes::default();
-    let mut global_memory = global_memory::GlobalMemory::new(stage);
     let code_size = u32::try_from(binary.bundles().len() * MAXWELL_SCHEDULE_BUNDLE_SIZE)
         .expect("bounded Maxwell shader code size fits u32");
 
@@ -178,17 +179,6 @@ pub(super) fn decode_shader_binary(
             let source = ShaderSourceLocation::new(offset);
             let predicate = decode_predicate(encoding);
             let translated_start = instructions.len();
-            if block_targets.contains(&offset)
-                || is_branch(encoding)
-                || is_set_sync_point(encoding)
-                || is_loop_push(encoding)
-                || encoding >> 48 == 0xe250
-                || is_loop_branch(encoding)
-                || is_synchronize(encoding)
-            {
-                global_memory.begin_block();
-            }
-
             if block_targets.contains(&offset)
                 || is_branch(encoding)
                 || is_set_sync_point(encoding)
@@ -366,13 +356,14 @@ pub(super) fn decode_shader_binary(
                 let destination =
                     crate::shader::decoded::Register::new(u32::from(range.destination));
                 patch_addresses.remove(destination);
-                global_memory.observe(
-                    &mut instructions,
-                    translated_start,
-                    encoding,
-                    &mut next_temporary,
-                )?;
-                global_memory.forget(destination);
+                // Native SSA verifies that no observable bit of the opaque
+                // reduced encoding survives. Compatible MUFUs use the frozen
+                // original input; dead partial-register preservation is legal.
+                instructions.push(ShaderInstruction::new(
+                    source,
+                    predicate,
+                    ShaderOperation::Undefined32 { destination },
+                ));
                 pending_range_reductions.insert(range.destination, range);
                 continue;
             }
@@ -393,21 +384,18 @@ pub(super) fn decode_shader_binary(
                 continue;
             }
             'instruction: {
-                let operation = if global_memory::is_store(encoding)
-                    || global_memory::is_load(encoding)
-                {
-                    let operations = if global_memory::is_load(encoding) {
-                        global_memory.load(offset, encoding, register_count, &mut next_temporary)?
-                    } else {
-                        global_memory.store(
-                            offset,
-                            encoding,
-                            register_count,
-                            &mut next_temporary,
-                        )?
-                    };
+                let operation = if super::local_memory::is_access(encoding) {
+                    let operations = local_memory.decode(
+                        binary,
+                        offset,
+                        encoding,
+                        register_count,
+                        &mut next_temporary,
+                    )?;
                     append_expanded_operations(&mut instructions, source, predicate, operations);
                     break 'instruction;
+                } else if global_memory::is_store(encoding) || global_memory::is_load(encoding) {
+                    global_memory::decode_access(stage, offset, encoding, register_count)?
                 } else if is_branch(encoding) {
                     ShaderOperation::Branch {
                         target: decode_shader_control_target(stage, offset, encoding, code_size)?,
@@ -693,17 +681,26 @@ pub(super) fn decode_shader_binary(
                     break 'instruction;
                 } else if is_mufu(encoding) {
                     if let Some(range_reduction) =
-                        pending_range_reductions.get(&((encoding >> 8) as u8))
+                        pending_range_reductions.get_mut(&((encoding >> 8) as u8))
                     {
-                        let operation = decode_range_reduced_mufu(
-                            stage,
-                            offset,
-                            encoding,
-                            register_count,
-                            range_reduction,
-                        )?;
-                        instructions.push(ShaderInstruction::new(source, predicate, operation));
-                        break 'instruction;
+                        if !range_reduction.fusion_valid
+                            && range_reduction.data_valid
+                            && flow.single_entry_region(range_reduction.offset, offset)
+                        {
+                            range_reduction.fusion_valid = true;
+                        }
+                        if super::special::is_compatible_mufu(range_reduction, encoding, predicate)
+                        {
+                            let operation = decode_range_reduced_mufu(
+                                stage,
+                                offset,
+                                encoding,
+                                register_count,
+                                range_reduction,
+                            )?;
+                            instructions.push(ShaderInstruction::new(source, predicate, operation));
+                            break 'instruction;
+                        }
                     }
                     let operations =
                         decode_mufu(stage, offset, encoding, register_count, &mut next_temporary)?;
@@ -988,12 +985,7 @@ pub(super) fn decode_shader_binary(
                     if let Some(range) = pending_range_reductions.get(&(register.index() as u8))
                         && register.index() < u32::from(register_count)
                     {
-                        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
-                            stage,
-                            instruction_offset: offset,
-                            encoding: range.encoding,
-                            detail: "RRO reduced representation is consumed outside a compatible MUFU",
-                        });
+                        opaque_range_uses.push((offset, range.encoding));
                     }
                 }
                 instruction
@@ -1006,6 +998,7 @@ pub(super) fn decode_shader_binary(
                                 pending_range_reductions.get_mut(&(register.index() as u8))
                             {
                                 range.fusion_valid = false;
+                                range.data_valid = false;
                             }
                         }
                     });
@@ -1026,18 +1019,20 @@ pub(super) fn decode_shader_binary(
                     if matches!(range.predicate, ShaderPredicate::Register { register, .. } if written.contains(&register))
                     {
                         range.fusion_valid = false;
+                        range.data_valid = false;
                     }
                 }
             }
             patch_addresses.ordinary(stage, encoding, &instructions[translated_start..])?;
-            global_memory.observe(
-                &mut instructions,
-                translated_start,
-                encoding,
-                &mut next_temporary,
-            )?;
         }
     }
+    let global_buffers = global_memory::lower(
+        binary,
+        &flow,
+        &mut instructions,
+        register_count,
+        &mut next_temporary,
+    )?;
     for instruction in &mut instructions {
         if let ShaderOperation::QueryTextureLevels { destination, .. } = instruction.operation() {
             let destination = *destination;
@@ -1074,7 +1069,7 @@ pub(super) fn decode_shader_binary(
             .expect("read-only constant-buffer access is valid")
         })
         .collect::<Vec<_>>();
-    let mut global_buffers = global_memory.bindings;
+    let mut global_buffers = global_buffers;
     // Texture pairs occupy local bindings starting at 32. Place storage
     // bindings after the complete texture set before verification/linking.
     if !global_buffers.buffers.is_empty() && !texture_bindings.is_empty() {
@@ -1277,6 +1272,8 @@ pub(super) fn decode_shader_binary(
         tessellation_control_points: (stage == MaxwellShaderStage::TessellationInit)
             .then(|| binary.header().bits(88, 8) as u32),
         temporary_count: next_temporary,
+        local_memory_bytes: local_memory.private_bytes(),
+        opaque_range_uses,
         texture_bindings: texture_bindings.values().copied().collect(),
         global_buffers,
     })
@@ -1291,6 +1288,10 @@ pub(super) struct DecodedProgram {
     pub(super) workgroup_size: Option<[u32; 3]>,
     pub(super) tessellation_control_points: Option<u32>,
     pub(super) temporary_count: u32,
+    pub(super) local_memory_bytes: u32,
+    // The retiring register-IR backend cannot prove dead bits. Native SSA
+    // validates actual observability after optimization instead.
+    opaque_range_uses: Vec<(u32, u64)>,
     pub(super) texture_bindings: Box<[MaxwellTextureResourceBinding]>,
     pub(super) global_buffers: global_memory::GlobalBufferBindings,
 }
@@ -1304,6 +1305,42 @@ pub(super) fn translate_shader_binary(
     y_negate: bool,
 ) -> Result<TranslatedShaderIr, MaxwellShaderTranslationError> {
     let mut decoded = decode_shader_binary(binary, register_count, vertex_input_types, y_negate)?;
+    if let Some(&(offset, encoding)) = decoded.opaque_range_uses.first() {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage: binary.stage(),
+            instruction_offset: offset,
+            encoding,
+            detail: "RRO reduced representation is consumed outside a compatible MUFU",
+        });
+    }
+    let ranges: BTreeSet<_> = binary
+        .bundles()
+        .iter()
+        .flat_map(|b| {
+            b.instructions
+                .iter()
+                .enumerate()
+                .filter(|&(_, &encoding)| is_range_reduction(encoding))
+                .map(move |(slot, _)| b.offset + 8 + slot as u32 * 8)
+        })
+        .collect();
+    decoded.instructions.retain(|i| {
+        !matches!(i.operation(), ShaderOperation::Undefined32 { .. })
+            || !ranges.contains(&i.source().byte_offset())
+    });
+    if let Some(instruction) = decoded.instructions.iter().find(|i| {
+        matches!(
+            i.operation(),
+            ShaderOperation::LoadLocal32 { .. } | ShaderOperation::StoreLocal32 { .. }
+        )
+    }) {
+        return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            stage: binary.stage(),
+            instruction_offset: instruction.source().byte_offset(),
+            encoding: 0,
+            detail: "indexed local memory requires native SSA execution",
+        });
+    }
     // Freeze the reference renderer's historical launch bridge only here. It
     // is not an ISA rule and never enters native SSA compilation.
     if decoded.temporary_count > u32::from(u16::MAX) {
@@ -1363,6 +1400,7 @@ const fn is_supported_family(encoding: u64) -> bool {
         || encoding >> 48 == 0xe330
         || global_memory::is_load(encoding)
         || global_memory::is_store(encoding)
+        || super::local_memory::is_access(encoding)
         || tessellation::is_system_register_read(encoding)
         || quad::is_shuffle(encoding)
         || quad::is_swizzle_add(encoding)

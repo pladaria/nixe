@@ -11,6 +11,7 @@ use nixe_runtime::{
     WritableEventObject,
 };
 use std::sync::{Arc, Mutex, Weak};
+mod biquad;
 mod buffer;
 mod effect;
 mod render;

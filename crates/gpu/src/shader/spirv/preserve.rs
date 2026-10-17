@@ -214,6 +214,38 @@ impl Math {
             .selection_merge(merge, spv::SelectionControl::DONT_FLATTEN)?;
         self.b.branch_conditional(repair, body, merge, [])?;
         self.block = self.b.begin_block(Some(body))?;
+        let repaired = if let Some(c) = addend {
+            self.repair_call(
+                math::Repair::PreservingFma,
+                [left, right, c],
+                |m, [a, b, c]| m.preserving_body(a, b, Some(c), true, wide),
+            )?
+        } else {
+            let kind = if multiply {
+                math::Repair::PreservingMultiply
+            } else {
+                math::Repair::PreservingAdd
+            };
+            self.repair_call(kind, [left, right], |m, [a, b]| {
+                m.preserving_body(a, b, None, multiply, wide)
+            })?
+        };
+        let body_end = self.block;
+        self.b.branch(merge)?;
+        self.block = self.b.begin_block(Some(merge))?;
+        let bits = self
+            .b
+            .phi(self.uint, None, [(native, header), (repaired, body_end)])?;
+        Ok(self.b.bitcast(self.float, None, bits)?)
+    }
+    fn preserving_body(
+        &mut self,
+        left: u32,
+        right: u32,
+        addend: Option<u32>,
+        multiply: bool,
+        wide: u32,
+    ) -> Result<u32> {
         let a = self.exact_wide_operand(left, wide)?;
         let b = self.exact_wide_operand(right, wide)?;
         let product = if multiply {
@@ -237,14 +269,7 @@ impl Math {
         } else {
             (product, None)
         };
-        let repaired = self.round_wide32(sum, residual, wide)?;
-        let body_end = self.block;
-        self.b.branch(merge)?;
-        self.block = self.b.begin_block(Some(merge))?;
-        let bits = self
-            .b
-            .phi(self.uint, None, [(native, header), (repaired, body_end)])?;
-        Ok(self.b.bitcast(self.float, None, bits)?)
+        self.round_wide32(sum, residual, wide)
     }
 }
 impl Math {

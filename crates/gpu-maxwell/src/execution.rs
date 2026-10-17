@@ -1,5 +1,7 @@
 //! Ordered streaming lowering and canonical execution for a frontend delivery.
 
+mod accesses;
+use accesses::BufferedAccesses;
 mod lowerer;
 mod work;
 pub use lowerer::MaxwellFrontend;
@@ -326,7 +328,7 @@ impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
         }
         for step in &self.steps[self.ready_scan_start..] {
             self.ready_bytes = self.ready_bytes.saturating_add(step.retained_bytes());
-            self.ready_operations += usize::from(backend_step_emits_operation(step));
+            self.ready_operations += usize::from(backend_step_prepares_work(step));
         }
         self.ready_scan_start = self.steps.len();
         if self.ready_operations <= STREAMED_BATCH_OPERATIONS
@@ -336,7 +338,7 @@ impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
         }
         // Keep a real operation in the tail so an accepted non-final segment
         // can always be closed, including when the suffix contains only WFI.
-        let prefix_end = self.steps.iter().rposition(backend_step_emits_operation)?;
+        let prefix_end = self.steps.iter().rposition(backend_step_prepares_work)?;
         if prefix_end == 0 {
             return None;
         }
@@ -951,21 +953,21 @@ impl MaxwellBackendSegment {
 
 /// Resumable Maxwell execution with ordered host submission boundaries.
 ///
-/// Canonical command-processor writes remain at their exact command-order
-/// boundaries. Host snapshots of read-only inputs may be updated after host
-/// acceptance; writes to device-owned pages still wait. Reports and semaphore
-/// releases wait for preceding host work and publish at their command position,
-/// while guest timeline publication remains with the GPU owner.
+/// Canonical updates follow capture of earlier immutable inputs. Native barriers,
+/// releases and device-owned writes retain device order without a host wait.
+/// CPU transformations resolve their actual byte producers; guest timeline
+/// publication remains with the GPU owner after real completion.
 pub struct MaxwellBackendExecution<W: MaxwellWork = MaxwellLoweredWork> {
     frontend: FrontendSubmissionId,
     predecessors: Box<[FrontendSubmissionId]>,
     steps: Vec<MaxwellSubmissionExecutionStep<W>>,
     next_step: usize,
+    compilation_cursor: usize,
     pre_writes: CanonicalWriteBatch,
     pre_write_source: Option<CanonicalWriteSource>,
     batch: W::Batch,
     buffered_bytes: usize,
-    canonical_accesses: Vec<nixe_gpu::BackingView>,
+    canonical_accesses: BufferedAccesses,
     canonical_records: rustc_hash::FxHashSet<(usize, usize)>,
     unknown_canonical_accesses: bool,
     segments: BackendSegmentCursor,
@@ -983,7 +985,7 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
     /// Completion writes and any unexecuted suffix keep that boundary closed.
     #[must_use]
     pub fn can_prepare_following(&self) -> bool {
-        self.sealed && self.awaiting_resume && self.next_step == self.steps.len()
+        self.sealed && (self.awaiting_resume || self.finished) && self.next_step == self.steps.len()
     }
 
     #[must_use]
@@ -1002,11 +1004,12 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
             predecessors: Box::default(),
             steps: Vec::new(),
             next_step: 0,
+            compilation_cursor: 0,
             pre_writes: CanonicalWriteBatch::new(),
             pre_write_source: None,
             batch: W::Batch::default(),
             buffered_bytes: 0,
-            canonical_accesses: Vec::new(),
+            canonical_accesses: BufferedAccesses::default(),
             canonical_records: rustc_hash::FxHashSet::default(),
             unknown_canonical_accesses: false,
             segments: BackendSegmentCursor {
@@ -1035,11 +1038,24 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
         self.steps.extend(steps);
     }
 
+    /// Visit each captured suffix once, without executing its command-processor
+    /// effects. The existing byte permits bound this lookahead; no guest memory
+    /// is decoded speculatively and no wait/release/copy is advanced.
+    pub fn precompile(&mut self, backend: &mut impl nixe_gpu::GpuExecution) {
+        for step in &self.steps[self.compilation_cursor.max(self.next_step)..] {
+            if let MaxwellSubmissionExecutionStep::Gpu(work) = step {
+                work.precompile(backend);
+            }
+        }
+        self.compilation_cursor = self.steps.len();
+    }
+
     /// Drops source metadata after its effects have been consumed/captured.
     /// The owner uses the count to release byte permits for complete chunks.
     pub fn retire_consumed_steps(&mut self) -> usize {
         let consumed = self.next_step;
         self.steps.drain(..consumed);
+        self.compilation_cursor = self.compilation_cursor.saturating_sub(consumed);
         self.next_step = 0;
         consumed
     }
@@ -1090,11 +1106,18 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
     /// After host acceptance, earlier reads already own their encoded input
     /// snapshots. Updating CPU-visible canonical bytes cannot alter those
     /// reads: later uploads execute after them on the same host queue. Device
-    /// writes consumed by the CPU, explicit WFI, copies and guest completion
-    /// still require waits. A streamed chunk boundary itself is not a wait.
+    /// writes consumed by the CPU still resolve their real producer. Native WFI
+    /// and completion writes remain in device order; a streamed chunk boundary
+    /// itself is not a wait.
     /// https://github.com/eden-emulator/mirror/blob/master/src/video_core/engines/maxwell_3d.cpp
     #[must_use]
     pub fn can_continue_after_submission(&self) -> bool {
+        // Native commands retain device ordering. Canonical CPU consumers resolve
+        // their exact producers when reached; they do not require a blanket wait
+        // before examining the next command. The owner still bounds pending tokens.
+        if W::Batch::DEVICE_MEMORY {
+            return self.awaiting_resume;
+        }
         if self.awaiting_resume && self.waiting_for_input() {
             return true;
         }
@@ -1144,6 +1167,12 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
         resolve: &mut nixe_memory::CpuVisibilityResolver<'_>,
     ) -> Result<Option<<W::Batch as MaxwellWorkBatch<W>>::Segment>, MaxwellBackendExecutionError>
     {
+        let _trace = nixe_gpu::trace::span(
+            "backend_advance",
+            self.frontend.get(),
+            self.next_step as u64,
+            self.steps.len() as u64,
+        );
         assert!(
             !self.awaiting_resume,
             "Maxwell execution must resume its pending segment before advancing"
@@ -1165,23 +1194,56 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
                         1,
                     );
                 }
+                nixe_gpu::trace::detail_event(
+                    "segment_boundary",
+                    self.frontend.get(),
+                    step_kind(&self.steps[self.next_step]),
+                    0,
+                );
                 return Ok(Some(segment));
             }
+            let publishes_completion = W::Batch::DEVICE_MEMORY
+                && matches!(
+                    self.steps[self.next_step],
+                    MaxwellSubmissionExecutionStep::NotificationWrite { .. }
+                        | MaxwellSubmissionExecutionStep::SemaphoreRelease { .. }
+                );
             match &self.steps[self.next_step] {
                 MaxwellSubmissionExecutionStep::NotificationWrite { source, target } => {
-                    stage_notification(
-                        target,
-                        gpu_timestamp,
-                        *source,
-                        &mut self.pre_writes,
-                        resolve,
-                    )
-                    .map_err(|error| MaxwellBackendExecutionError::Canonical(Box::new(error)))?;
-                    self.pre_write_source = Some(CanonicalWriteSource::Inline(*source));
+                    let _trace =
+                        nixe_gpu::trace::span("canonical_notify", self.frontend.get(), 0, 0);
                     commit_pending_backend_writes(
                         &mut self.pre_writes,
                         &mut self.pre_write_source,
                     )?;
+                    if W::Batch::DEVICE_MEMORY {
+                        let mut bytes = [0u8; 16];
+                        bytes[..8].copy_from_slice(&gpu_timestamp.to_le_bytes());
+                        append_device_write::<W>(
+                            &mut self.batch,
+                            &mut self.canonical_accesses,
+                            target,
+                            &bytes,
+                            true,
+                        );
+                        self.segments.remaining_operations -= 1;
+                    } else {
+                        stage_notification(
+                            target,
+                            gpu_timestamp,
+                            *source,
+                            &mut self.pre_writes,
+                            resolve,
+                        )
+                        .map_err(|error| {
+                            MaxwellBackendExecutionError::Canonical(Box::new(error))
+                        })?;
+                        self.pre_write_source = Some(CanonicalWriteSource::Inline(*source));
+                        commit_pending_backend_writes(
+                            &mut self.pre_writes,
+                            &mut self.pre_write_source,
+                        )?;
+                    }
                     self.next_step += 1;
                 }
                 MaxwellSubmissionExecutionStep::SemaphoreRelease {
@@ -1190,21 +1252,43 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
                     payload,
                     short,
                 } => {
-                    stage_semaphore_release(
-                        target,
-                        *payload,
-                        *short,
-                        gpu_timestamp,
-                        *source,
-                        &mut self.pre_writes,
-                        resolve,
-                    )
-                    .map_err(|error| MaxwellBackendExecutionError::Canonical(Box::new(error)))?;
-                    self.pre_write_source = Some(CanonicalWriteSource::Inline(*source));
+                    let _trace =
+                        nixe_gpu::trace::span("canonical_release", self.frontend.get(), 0, 0);
                     commit_pending_backend_writes(
                         &mut self.pre_writes,
                         &mut self.pre_write_source,
                     )?;
+                    if W::Batch::DEVICE_MEMORY {
+                        let mut bytes = [0u8; 16];
+                        bytes[..4].copy_from_slice(&payload.to_le_bytes());
+                        bytes[8..].copy_from_slice(&gpu_timestamp.to_le_bytes());
+                        append_device_write::<W>(
+                            &mut self.batch,
+                            &mut self.canonical_accesses,
+                            target,
+                            &bytes[..if *short { 4 } else { 16 }],
+                            true,
+                        );
+                        self.segments.remaining_operations -= 1;
+                    } else {
+                        stage_semaphore_release(
+                            target,
+                            *payload,
+                            *short,
+                            gpu_timestamp,
+                            *source,
+                            &mut self.pre_writes,
+                            resolve,
+                        )
+                        .map_err(|error| {
+                            MaxwellBackendExecutionError::Canonical(Box::new(error))
+                        })?;
+                        self.pre_write_source = Some(CanonicalWriteSource::Inline(*source));
+                        commit_pending_backend_writes(
+                            &mut self.pre_writes,
+                            &mut self.pre_write_source,
+                        )?;
+                    }
                     self.next_step += 1;
                 }
                 MaxwellSubmissionExecutionStep::WaitForIdle => {
@@ -1212,7 +1296,12 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
                         &mut self.pre_writes,
                         &mut self.pre_write_source,
                     )?;
-                    self.batch.break_rendering();
+                    if W::Batch::DEVICE_MEMORY {
+                        self.batch.wait_for_idle();
+                        self.segments.remaining_operations -= 1;
+                    } else {
+                        self.batch.break_rendering();
+                    }
                     self.next_step += 1;
                 }
                 MaxwellSubmissionExecutionStep::BackendOperation(operation) => {
@@ -1239,16 +1328,37 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
                     target,
                     value,
                 } => {
+                    let _trace =
+                        nixe_gpu::trace::span("canonical_inline", self.frontend.get(), 0, 0);
                     self.buffered_bytes = self.buffered_bytes.saturating_add(value.len());
-                    stage_resolved_inline_write(
-                        target,
-                        value,
-                        *source,
-                        &mut self.pre_writes,
-                        resolve,
-                    )
-                    .map_err(|error| MaxwellBackendExecutionError::Canonical(Box::new(error)))?;
-                    self.pre_write_source = Some(CanonicalWriteSource::Inline(*source));
+                    if W::Batch::DEVICE_MEMORY && self.inline_needs_ordering(target) {
+                        commit_pending_backend_writes(
+                            &mut self.pre_writes,
+                            &mut self.pre_write_source,
+                        )?;
+                        append_device_write::<W>(
+                            &mut self.batch,
+                            &mut self.canonical_accesses,
+                            target,
+                            value,
+                            false,
+                        );
+                    } else {
+                        stage_resolved_inline_write(
+                            target,
+                            value,
+                            *source,
+                            &mut self.pre_writes,
+                            resolve,
+                        )
+                        .map_err(|error| {
+                            MaxwellBackendExecutionError::Canonical(Box::new(error))
+                        })?;
+                        self.pre_write_source = Some(CanonicalWriteSource::Inline(*source));
+                    }
+                    if W::Batch::DEVICE_MEMORY {
+                        self.segments.remaining_operations -= 1;
+                    }
                     self.next_step += 1;
                 }
                 MaxwellSubmissionExecutionStep::MemoryCopy {
@@ -1256,6 +1366,7 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
                     source,
                     destination,
                 } => {
+                    let _trace = nixe_gpu::trace::span("canonical_copy", self.frontend.get(), 0, 0);
                     self.buffered_bytes = self
                         .buffered_bytes
                         .saturating_add(usize::try_from(destination.size()).unwrap_or(usize::MAX));
@@ -1282,13 +1393,19 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
                         .canonical_records
                         .insert((accesses.as_ptr() as usize, accesses.len()))
                     {
-                        self.canonical_accesses.extend_from_slice(accesses);
+                        self.canonical_accesses.insert_views(accesses);
                     }
                     self.unknown_canonical_accesses |= unknown;
                     self.batch.work(work);
                     self.segments.remaining_operations -= 1;
                     self.next_step += 1;
                 }
+            }
+            if publishes_completion {
+                // Seal the producing prefix, not the following unrelated work.
+                // The native owner submits this release without waiting for it;
+                // a CPU consumer can then demand its precise timeline ticket.
+                return self.take_segment();
             }
         }
 
@@ -1311,7 +1428,7 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
         if let Some(segment) = self.take_segment()? {
             return Ok(Some(segment));
         }
-        if self.has_backend_steps && !self.submitted_any {
+        if !W::Batch::DEVICE_MEMORY && self.has_backend_steps && !self.submitted_any {
             return Err(MaxwellBackendExecutionError::InvalidSubmission(
                 CommandDescriptionError::EmptySubmission,
             ));
@@ -1321,9 +1438,38 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
     }
 
     fn step_requires_submission(&self, step: &MaxwellSubmissionExecutionStep<W>) -> bool {
-        let MaxwellSubmissionExecutionStep::InlineWrite { target, .. } = step else {
-            return backend_step_requires_prior_completion(step);
-        };
+        match step {
+            MaxwellSubmissionExecutionStep::InlineWrite { target, .. } => {
+                // Capture earlier readers before changing CPU stream inputs.
+                // Acceptance suffices: the native owner can continue recording
+                // without waiting for completion. Device-owned patches stay on
+                // the GPU and need no capture boundary here.
+                self.inline_needs_ordering(target)
+                    && (!W::Batch::DEVICE_MEMORY
+                        || target.segments().iter().all(|mapping| {
+                            mapping
+                                .mapping()
+                                .backing()
+                                .subrange_is_cpu_visible(mapping.backing_offset(), mapping.size())
+                                == Ok(true)
+                        }))
+            }
+            // These commands have a device implementation in the native stream.
+            MaxwellSubmissionExecutionStep::WaitForIdle
+            | MaxwellSubmissionExecutionStep::SemaphoreRelease { .. }
+            | MaxwellSubmissionExecutionStep::NotificationWrite { .. } => !W::Batch::DEVICE_MEMORY,
+            // Capture earlier consumers/producers before a CPU transformation;
+            // its resolver waits only when actual source/destination bytes need it.
+            MaxwellSubmissionExecutionStep::MemoryCopy {
+                source,
+                destination,
+                ..
+            } => self.inline_needs_ordering(source) || self.inline_needs_ordering(destination),
+            _ => false,
+        }
+    }
+
+    fn inline_needs_ordering(&self, target: &MaxwellResolvedRange) -> bool {
         if self.unknown_canonical_accesses {
             return true;
         }
@@ -1332,25 +1478,27 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
             if range.subrange_is_cpu_visible(mapping.backing_offset(), mapping.size()) != Ok(true) {
                 return true;
             }
-            let Ok(segments) = range.subrange_segments(mapping.backing_offset(), mapping.size())
-            else {
-                return true;
-            };
             let end = mapping.backing_offset() + mapping.size();
-            for (logical_start, segment) in segments {
+            for (logical_start, segment) in range.segments_between(mapping.backing_offset(), end) {
+                // Canonical CPU writes preserve a whole page baseline. An inline
+                // patch to disjoint bytes of a GPU-owned page must stay native;
+                // materializing unrelated texels would introduce a host wait.
+                if W::Batch::DEVICE_MEMORY
+                    && matches!(
+                        segment.visibility_state(),
+                        nixe_memory::VisibilityState::GpuNewer { .. }
+                    )
+                {
+                    return true;
+                }
                 let start =
                     segment.offset() + mapping.backing_offset().saturating_sub(logical_start);
                 let stop = segment.offset() + (end - logical_start).min(segment.size());
-                for access in &self.canonical_accesses {
-                    let spans = access.canonical_spans();
-                    let first =
-                        spans.partition_point(|span| span.ends_before(segment.page(), start));
-                    if spans.get(first).is_some_and(|span| {
-                        span.first_page() <= segment.page()
-                            && (span.first_page() != segment.page() || span.first_offset() < stop)
-                    }) {
-                        return true;
-                    }
+                if self
+                    .canonical_accesses
+                    .overlaps(segment.page(), start, stop)
+                {
+                    return true;
                 }
             }
         }
@@ -1379,6 +1527,31 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
         self.awaiting_resume = true;
         self.submitted_any = true;
         Ok(Some(submission))
+    }
+}
+
+/// Retain the validated mapping and offset. Building a new page topology for
+/// every inline upload discards the stable range identity and allocates per write.
+fn append_device_write<W: MaxwellWork>(
+    batch: &mut W::Batch,
+    coverage: &mut BufferedAccesses,
+    target: &MaxwellResolvedRange,
+    bytes: &[u8],
+    after_prior_work: bool,
+) {
+    let mut copied = 0;
+    for mapping in target.segments() {
+        let range = mapping.mapping().backing();
+        let offset = mapping.backing_offset();
+        coverage.insert_range(range, offset, mapping.size());
+        let size = mapping.size() as usize;
+        batch.write_memory(
+            range.clone(),
+            offset,
+            &bytes[copied..copied + size],
+            after_prior_work,
+        );
+        copied += size;
     }
 }
 
@@ -1413,24 +1586,37 @@ impl BackendSegmentCursor {
     }
 }
 
-fn backend_step_requires_prior_completion<W: MaxwellWork>(
-    step: &MaxwellSubmissionExecutionStep<W>,
-) -> bool {
-    matches!(
-        step,
-        MaxwellSubmissionExecutionStep::WaitForIdle
-            | MaxwellSubmissionExecutionStep::SemaphoreRelease { .. }
-            | MaxwellSubmissionExecutionStep::NotificationWrite { .. }
-            | MaxwellSubmissionExecutionStep::MemoryCopy { .. }
-    )
+fn step_kind<W: MaxwellWork>(step: &MaxwellSubmissionExecutionStep<W>) -> u64 {
+    match step {
+        MaxwellSubmissionExecutionStep::WaitForIdle => 1,
+        MaxwellSubmissionExecutionStep::SemaphoreRelease { .. } => 2,
+        MaxwellSubmissionExecutionStep::NotificationWrite { .. } => 3,
+        MaxwellSubmissionExecutionStep::MemoryCopy { .. } => 4,
+        MaxwellSubmissionExecutionStep::InlineWrite { .. } => 5,
+        _ => 0,
+    }
 }
 
-fn backend_step_emits_operation<W: MaxwellWork>(step: &MaxwellSubmissionExecutionStep<W>) -> bool {
+/// Inline payload bytes have their own budget. Counting each upload word as a
+/// shader/preparation job fragments frontend delivery and repeatedly preempts
+/// guest CPU execution, even when recording can retain one compatible batch.
+fn backend_step_prepares_work<W: MaxwellWork>(step: &MaxwellSubmissionExecutionStep<W>) -> bool {
     matches!(
         step,
         MaxwellSubmissionExecutionStep::BackendOperation(_)
             | MaxwellSubmissionExecutionStep::Gpu(_)
-    )
+    ) || W::Batch::DEVICE_MEMORY
+        && matches!(
+            step,
+            MaxwellSubmissionExecutionStep::WaitForIdle
+                | MaxwellSubmissionExecutionStep::SemaphoreRelease { .. }
+                | MaxwellSubmissionExecutionStep::NotificationWrite { .. }
+        )
+}
+fn backend_step_emits_operation<W: MaxwellWork>(step: &MaxwellSubmissionExecutionStep<W>) -> bool {
+    backend_step_prepares_work(step)
+        || W::Batch::DEVICE_MEMORY
+            && matches!(step, MaxwellSubmissionExecutionStep::InlineWrite { .. })
 }
 
 fn append_batchable_operations(
@@ -3513,6 +3699,195 @@ mod tests {
         assert!(execution.next_segment(0).unwrap().is_none());
         assert!(execution.is_finished());
         assert_eq!(observed, [0xff00_0000, 0x00ff_0000, 0x0000_ff00]);
+    }
+
+    #[test]
+    fn native_inline_writes_preserve_order_and_completion_seals_its_producer() {
+        use nixe_gpu::native::{NativeCommand, NativeWork};
+        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        let mut space = address_space();
+        let address = space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(1),
+                backing: allocation
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap(),
+                backing_offset: 0,
+                size: 4096,
+                allocation_alignment: 4096,
+                page_size: 0,
+                kind: 0,
+                cacheable: true,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap()
+            .offset()
+            .get();
+        let mut channel = MaxwellGpuChannel::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        let plan = lower_test_pushbuffers(
+            &mut channel,
+            &[packet(
+                6,
+                0x10 / 4,
+                &[(address >> 32) as u32, address as u32, 0, 2 | (1 << 24)],
+            )],
+            &space,
+            FrontendSubmissionId::new(2),
+            Vec::new(),
+            None,
+            &mut MaxwellLoweringCache::default(),
+        )
+        .unwrap();
+        let MaxwellSubmissionExecutionStep::SemaphoreRelease { source, target, .. } =
+            &plan.steps[0]
+        else {
+            panic!("release expected")
+        };
+        // Upload words must not repeatedly hand off a partially prepared
+        // graphics delivery. Real GPU preparation work still bounds its prefix.
+        let mut native_cache = crate::engines::MaxwellNativeFrontend::new(Arc::new(
+            nixe_gpu::ssa::compile::CompilePool::new(1, 8).unwrap(),
+        ));
+        let mut planner = MaxwellSubmissionPlanner::new(
+            &space,
+            FrontendSubmissionId::new(2),
+            Vec::new(),
+            None,
+            &mut native_cache,
+        );
+        for _ in 0..STREAMED_BATCH_OPERATIONS * 2 {
+            planner
+                .steps
+                .push(MaxwellSubmissionExecutionStep::InlineWrite {
+                    source: *source,
+                    target: target.clone(),
+                    value: 0x1020u32.to_le_bytes().to_vec(),
+                });
+            assert!(planner.take_ready_steps().is_none());
+        }
+        for _ in 0..=STREAMED_BATCH_OPERATIONS {
+            planner
+                .steps
+                .push(MaxwellSubmissionExecutionStep::BackendOperation(
+                    cache_maintenance_operation(CacheMaintenanceOperation::FlushDirtyDeviceWrites),
+                ));
+        }
+        assert_eq!(
+            planner.take_ready_steps().unwrap().len(),
+            STREAMED_BATCH_OPERATIONS * 3
+        );
+        assert!(planner.take_ready_steps().is_none());
+        let plan = MaxwellSubmissionExecutionPlan::<NativeWork> {
+            frontend: FrontendSubmissionId::new(2),
+            predecessors: Box::default(),
+            completion: None,
+            steps: vec![
+                MaxwellSubmissionExecutionStep::InlineWrite {
+                    source: *source,
+                    target: target.clone(),
+                    value: 0x1020u32.to_le_bytes().to_vec(),
+                },
+                MaxwellSubmissionExecutionStep::Gpu(NativeWork {
+                    frontend: FrontendSubmissionId::new(2),
+                    command: NativeCommand::WaitForIdle,
+                    canonical_accesses: Arc::from([nixe_gpu::BackingView::new(
+                        nixe_gpu::GpuAllocationId::new(1),
+                        nixe_gpu::GpuAllocationDescription::new(4096, 4096).unwrap(),
+                        0,
+                        allocation
+                            .backing_range(MemoryPermissions::READ_WRITE)
+                            .unwrap()
+                            .snapshot_subrange(0, 4)
+                            .unwrap(),
+                    )
+                    .unwrap()]),
+                }),
+                MaxwellSubmissionExecutionStep::InlineWrite {
+                    source: *source,
+                    target: target.clone(),
+                    value: 0x3344u32.to_le_bytes().to_vec(),
+                },
+                MaxwellSubmissionExecutionStep::SemaphoreRelease {
+                    source: *source,
+                    target: target.clone(),
+                    payload: 0x1234,
+                    short: true,
+                },
+                MaxwellSubmissionExecutionStep::InlineWrite {
+                    source: *source,
+                    target: target.clone(),
+                    value: 0x5678u32.to_le_bytes().to_vec(),
+                },
+                MaxwellSubmissionExecutionStep::WaitForIdle,
+            ]
+            .into_boxed_slice(),
+        };
+        let mut execution = MaxwellBackendExecution::new(plan);
+        let segment = execution
+            .next_segment_with_resolver(0x1234, &mut |_, _| {
+                panic!("device ordering must not demand CPU visibility")
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!segment.final_segment);
+        assert!(matches!(
+            segment.commands.as_slice(),
+            [NativeCommand::WaitForIdle]
+        ));
+        let mut actual = [0; 4];
+        allocation.read(0, &mut actual).unwrap();
+        assert_eq!(
+            actual,
+            0x1020u32.to_le_bytes(),
+            "capture the earlier input before changing its bytes"
+        );
+        assert!(execution.can_continue_after_submission());
+        execution.resume_segment();
+        let release = execution
+            .next_segment_with_resolver(0x1234, &mut |_, _| {
+                panic!("accepted immutable inputs do not require GPU completion")
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!release.final_segment);
+        assert!(matches!(
+            release.commands.as_slice(),
+            [NativeCommand::WriteMemory {
+                after_prior_work: true,
+                ..
+            }]
+        ));
+        allocation.read(0, &mut actual).unwrap();
+        assert_eq!(actual, 0x3344u32.to_le_bytes());
+        assert!(execution.can_continue_after_submission());
+        assert!(!execution.can_prepare_following());
+        execution.resume_segment();
+        let tail = execution
+            .next_segment_with_resolver(0x1234, &mut |_, _| {
+                panic!("independent recording must not wait for producer completion")
+            })
+            .unwrap()
+            .unwrap();
+        assert!(tail.final_segment);
+        assert!(matches!(
+            tail.commands.as_slice(),
+            [NativeCommand::WaitForIdle]
+        ));
+        let mut actual = [0; 4];
+        allocation.read(0, &mut actual).unwrap();
+        assert_eq!(
+            actual,
+            0x5678u32.to_le_bytes(),
+            "a following independent CPU upload commits without waiting for completion"
+        );
+        assert!(execution.can_prepare_following());
+        execution.resume_segment();
+        assert!(execution.next_segment(0).unwrap().is_none());
     }
 
     #[test]

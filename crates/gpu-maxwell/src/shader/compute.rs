@@ -43,6 +43,7 @@ pub(crate) fn translate_compute_program(
             register_count,
         },
         None,
+        0,
     )?;
     let translated = translate_shader_binary(&binary, register_count, &BTreeMap::new(), false).inspect_err(|_| {
         for bundle in binary.bundles() {

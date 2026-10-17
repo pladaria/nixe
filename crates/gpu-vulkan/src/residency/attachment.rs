@@ -222,7 +222,6 @@ impl VulkanResidency {
                 "resolve consumes undefined or discarded samples",
             ));
         }
-        self.ensure_image(destination)?;
         self.prepare_image_rect(destination, d, rect)?;
         let source = self.attachment_access(
             source,
@@ -264,7 +263,7 @@ impl VulkanResidency {
                 depth: 1,
             });
         self.barriers.emit(&mut self.device);
-        let slot = self.device.submission.begin()?;
+        let slot = self.device.begin_recording()?;
         unsafe {
             self.device.owner.device.cmd_resolve_image(
                 self.device.submission.slots[slot].command,

@@ -3,6 +3,18 @@ use super::super::test_support::{
     canonical_shader_writes, mapped_memory, preflight_maxwell_shader_translation, program_three_d,
 };
 use super::*;
+
+#[test]
+fn local_allocation_combines_low_high_and_call_stack_header_fields() {
+    let mut words = [0_u32; 20];
+    words[0] = 0x0006_0461;
+    words[1] = 0xab12_3456;
+    words[2] = 0xcd00_0002;
+    words[3] = 0xef00_0020;
+    let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let header = decode_program_header(&bytes).unwrap();
+    assert_eq!(header.local_memory_bytes(), 0x0212_3476);
+}
 use crate::{
     MaxwellChannelId, MaxwellChannelOwner, MaxwellGpuChannel, MaxwellShaderStage,
     SWITCH_1_GM20B_PROFILE,

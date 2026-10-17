@@ -280,11 +280,14 @@ fn perspective_pass_exposes_the_unnormalized_barycentric_numerator() {
             vertex_position_transform: None,
             input_control_points: 0,
             tessellation_mode: None,
+            native_half_conversions: false,
+            native_half_fma: false,
             float32: nixe_gpu::SpirvFloat32Capabilities {
                 denorm_preserve: false,
                 rounding_mode_rte: true,
                 signed_zero_inf_nan_preserve: true,
                 fused_multiply_add: true,
+                ..Default::default()
             },
             float64: nixe_gpu::SpirvFloat64Capabilities {
                 enabled: true,

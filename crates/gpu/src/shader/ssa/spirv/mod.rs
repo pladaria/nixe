@@ -6,7 +6,11 @@ use crate::shader::spirv::{InterfaceLayout, Math, SpirvShaderOptions};
 use rspirv::{binary::Assemble, dr::Operand as SpvOperand, spirv as spv};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+mod canonicalize;
 mod control;
+mod float_control;
+mod float_facts;
+mod half;
 mod legalize;
 mod numeric;
 mod operations;
@@ -16,13 +20,14 @@ pub use quad_geometry::emit_quad_geometry;
 mod texture;
 mod unary;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Options {
     pub shader: SpirvShaderOptions,
     pub integer64: bool,
     pub subgroup_quad: bool,
     pub shared_memory_bytes: u32,
-    pub local_memory_bytes: u32,
+    /// Uniform ABI extent selected from the enabled host descriptor range.
+    pub uniform_buffer_bytes: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,8 +55,31 @@ pub fn emit(function: &Function, options: Options) -> Result<Module, Error> {
 /// identities must already be namespaced by the selected guest frontend.
 /// Every stage uses the same dense binding for a shared logical resource.
 pub fn emit_pipeline(stages: &[(&Function, Options)]) -> Result<Box<[Module]>, Error> {
+    let functions: Vec<_> = stages.iter().map(|&(function, _)| function).collect();
+    let bindings = pipeline_bindings(&functions);
+    let mut modules = Vec::with_capacity(stages.len());
+    let mut kinds = BTreeMap::new();
+    for &(function, options) in stages {
+        let module = emit_with_bindings(function, options, Some(&bindings))
+            .map_err(|e| e.in_stage(function.stage))?;
+        for binding in &module.bindings {
+            if let Some(old) = kinds.insert(binding.resource, binding.kind)
+                && old != binding.kind
+            {
+                return Err(Error::at(
+                    ShaderSourceLocation::new(0),
+                    "pipeline resource has inconsistent stage descriptor classes",
+                ));
+            }
+        }
+        modules.push(module);
+    }
+    Ok(modules.into_boxed_slice())
+}
+/// Construct the dense shared descriptor ABI before emitting any stage.
+pub fn pipeline_bindings(stages: &[&Function]) -> BTreeMap<ResourceId, u32> {
     let mut bindings = BTreeMap::new();
-    for &(function, _) in stages {
+    for &function in stages {
         for block in &function.blocks {
             for inst in &block.instructions {
                 match inst.op {
@@ -78,25 +106,18 @@ pub fn emit_pipeline(stages: &[(&Function, Options)]) -> Result<Box<[Module]>, E
     for (index, binding) in bindings.values_mut().enumerate() {
         *binding = index as u32;
     }
-    let mut modules = Vec::with_capacity(stages.len());
-    let mut kinds = BTreeMap::new();
-    for &(function, options) in stages {
-        let module = emit_with_bindings(function, options, Some(&bindings))
-            .map_err(|e| e.in_stage(function.stage))?;
-        for binding in &module.bindings {
-            if let Some(old) = kinds.insert(binding.resource, binding.kind)
-                && old != binding.kind
-            {
-                return Err(Error::at(
-                    ShaderSourceLocation::new(0),
-                    "pipeline resource has inconsistent stage descriptor classes",
-                ));
-            }
-        }
-        modules.push(module);
-    }
-    Ok(modules.into_boxed_slice())
+    bindings
 }
+/// Emit one stage using its already selected linked descriptor ABI. This can
+/// run as a leaf of a stage cache; it never queues work on another compiler.
+pub fn emit_linked(
+    function: &Function,
+    options: Options,
+    bindings: &BTreeMap<ResourceId, u32>,
+) -> Result<Module, Error> {
+    emit_with_bindings(function, options, Some(bindings)).map_err(|e| e.in_stage(function.stage))
+}
+
 fn emit_with_bindings(
     function: &Function,
     options: Options,
@@ -120,6 +141,7 @@ struct Emitter<'a> {
     math: Math,
     io: InterfaceLayout,
     values: Vec<u32>,
+    float_facts: float_facts::FloatFacts,
     labels: Vec<u32>,
     ends: Vec<u32>,
     buffers: BTreeMap<ResourceId, Buffer>,
@@ -144,6 +166,7 @@ impl<'a> Emitter<'a> {
         binding_map: Option<&'a BTreeMap<ResourceId, u32>>,
     ) -> Self {
         let mut math = Math::new(options.shader);
+        float_control::configure(&mut math, function);
         // The backend baseline is Vulkan 1.2+KHR/1.3; SPIR-V 1.5 also permits
         // precise entry-point declaration of descriptor/workgroup variables.
         math.b.set_version(1, 5);
@@ -159,6 +182,7 @@ impl<'a> Emitter<'a> {
             math,
             io: InterfaceLayout::default(),
             values,
+            float_facts: float_facts::FloatFacts::analyze(function),
             ends: labels.clone(),
             labels,
             buffers: BTreeMap::new(),
@@ -188,6 +212,7 @@ impl<'a> Emitter<'a> {
             Type::U32 => self.math.uint,
             Type::I32 => self.math.int,
             Type::F32 => self.math.float,
+            Type::F16 => self.half_type()?,
             Type::Bool => self.math.boolean,
             Type::U64 | Type::I64 => {
                 if !self.options.integer64 {
@@ -432,6 +457,7 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+        canonicalize::run(&mut module);
         Ok(Module {
             words: module.assemble().into_boxed_slice(),
             bindings: std::mem::take(&mut self.bindings).into_boxed_slice(),
@@ -632,6 +658,7 @@ impl<'a> Emitter<'a> {
         // rspirv interns structurally identical types. Buffer variables share
         // their ABI type, whose layout decorations must be emitted only once.
         let mut storage_block = None;
+        let mut uniform_block = None;
         for block in &self.function.blocks {
             for inst in &block.instructions {
                 self.reflect_texture(inst)?;
@@ -676,31 +703,64 @@ impl<'a> Emitter<'a> {
                     binding.writable |= write;
                     continue;
                 }
-                let block = *storage_block.get_or_insert_with(|| {
-                    let array = self.math.b.type_runtime_array(self.math.uint);
-                    self.math.b.decorate(
-                        array,
-                        spv::Decoration::ArrayStride,
-                        [SpvOperand::LiteralBit32(4)],
+                // std140 uvec4 words retain the guest's byte-addressed ABI
+                // without scalar-layout features or padding between words.
+                // https://docs.vulkan.org/spec/latest/chapters/interfaces.html#interfaces-resources-layout
+                let uniform = space == MemorySpace::Constant;
+                if uniform
+                    && (self.options.uniform_buffer_bytes < 16
+                        || !self.options.uniform_buffer_bytes.is_multiple_of(16))
+                {
+                    return Err(
+                        self.error("uniform ABI extent must be a nonzero multiple of 16 bytes")
                     );
-                    let block = self.math.b.type_struct([array]);
-                    self.math.b.decorate(block, spv::Decoration::Block, []);
-                    self.math.b.member_decorate(
-                        block,
-                        0,
-                        spv::Decoration::Offset,
-                        [SpvOperand::LiteralBit32(0)],
-                    );
-                    block
-                });
-                let ptr = self
-                    .math
-                    .b
-                    .type_pointer(None, spv::StorageClass::StorageBuffer, block);
-                let variable =
-                    self.math
-                        .b
-                        .variable(ptr, None, spv::StorageClass::StorageBuffer, None);
+                }
+                let storage = if uniform {
+                    spv::StorageClass::Uniform
+                } else {
+                    spv::StorageClass::StorageBuffer
+                };
+                let block = if uniform {
+                    *uniform_block.get_or_insert_with(|| {
+                        let vector = self.math.b.type_vector(self.math.uint, 4);
+                        let count = self.math.constant(self.options.uniform_buffer_bytes / 16);
+                        let array = self.math.b.type_array(vector, count);
+                        self.math.b.decorate(
+                            array,
+                            spv::Decoration::ArrayStride,
+                            [SpvOperand::LiteralBit32(16)],
+                        );
+                        let block = self.math.b.type_struct([array]);
+                        self.math.b.decorate(block, spv::Decoration::Block, []);
+                        self.math.b.member_decorate(
+                            block,
+                            0,
+                            spv::Decoration::Offset,
+                            [SpvOperand::LiteralBit32(0)],
+                        );
+                        block
+                    })
+                } else {
+                    *storage_block.get_or_insert_with(|| {
+                        let array = self.math.b.type_runtime_array(self.math.uint);
+                        self.math.b.decorate(
+                            array,
+                            spv::Decoration::ArrayStride,
+                            [SpvOperand::LiteralBit32(4)],
+                        );
+                        let block = self.math.b.type_struct([array]);
+                        self.math.b.decorate(block, spv::Decoration::Block, []);
+                        self.math.b.member_decorate(
+                            block,
+                            0,
+                            spv::Decoration::Offset,
+                            [SpvOperand::LiteralBit32(0)],
+                        );
+                        block
+                    })
+                };
+                let ptr = self.math.b.type_pointer(None, storage, block);
+                let variable = self.math.b.variable(ptr, None, storage, None);
                 let binding = self.binding(resource);
                 self.math.b.decorate(
                     variable,
@@ -713,11 +773,7 @@ impl<'a> Emitter<'a> {
                     [SpvOperand::LiteralBit32(binding)],
                 );
                 self.io.variables.push(variable);
-                let pointer = self.math.b.type_pointer(
-                    None,
-                    spv::StorageClass::StorageBuffer,
-                    self.math.uint,
-                );
+                let pointer = self.math.b.type_pointer(None, storage, self.math.uint);
                 self.buffers.insert(
                     resource,
                     Buffer {

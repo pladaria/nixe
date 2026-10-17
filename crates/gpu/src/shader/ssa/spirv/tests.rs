@@ -7,11 +7,14 @@ pub(super) fn options() -> Options {
             vertex_position_transform: None,
             input_control_points: 0,
             tessellation_mode: None,
+            native_half_conversions: false,
+            native_half_fma: false,
             float32: crate::SpirvFloat32Capabilities {
                 denorm_preserve: true,
                 rounding_mode_rte: true,
                 signed_zero_inf_nan_preserve: true,
                 fused_multiply_add: true,
+                ..Default::default()
             },
             float64: crate::SpirvFloat64Capabilities {
                 enabled: true,
@@ -22,7 +25,7 @@ pub(super) fn options() -> Options {
         integer64: true,
         subgroup_quad: false,
         shared_memory_bytes: 0,
-        local_memory_bytes: 0,
+        uniform_buffer_bytes: 65536,
     }
 }
 fn pc(offset: u32) -> ShaderSourceLocation {
@@ -682,6 +685,12 @@ fn validate_default_control_evaluation_quad_and_workgroup_interfaces() {
     let mut opts = options();
     opts.subgroup_quad = true;
     validate(&validator, "quad-swizzle", emit(&f, opts).unwrap());
+    opts.shader.float32.denorm_preserve = false;
+    validate(
+        &validator,
+        "quad-swizzle-preserving",
+        emit(&f, opts).unwrap(),
+    );
     let mut b = FunctionBuilder::new(ShaderStage::Compute);
     let entry = b.entry();
     let zero = c(&mut b, entry, 0);
@@ -761,4 +770,190 @@ fn pipeline_binding_abi_is_shared_and_independent_of_local_use_order() {
             .binding,
         1
     );
+}
+
+#[test]
+#[ignore = "requires NIXE_SPIRV_VAL pointing to the pinned SPIRV-Tools validator"]
+fn validate_loop_exit_suffix_shared_with_a_continuing_branch() {
+    // The loop headed by block 3 has a shared exit-only suffix (block 5).
+    // It lies outside the natural backedge region but inside the structured
+    // loop. Its two incoming selections require distinct copies of that suffix.
+    let edges: &[&[usize]] = &[&[3], &[3, 5], &[], &[1, 4], &[2, 1], &[2]];
+    let mut b = FunctionBuilder::new(ShaderStage::Compute);
+    let blocks: Vec<_> = (0..edges.len())
+        .map(|i| {
+            if i == 0 {
+                b.entry()
+            } else {
+                b.block(pc(i as u32 * 8))
+            }
+        })
+        .collect();
+    for (i, successors) in edges.iter().enumerate() {
+        let block = blocks[i];
+        let addr = c(&mut b, block, i as u32 * 4);
+        let value = load(&mut b, block, addr);
+        store(&mut b, block, addr, value);
+        let term = match *successors {
+            [] => Terminator::Return,
+            [to] => Terminator::Jump(blocks[*to]),
+            [a, z] => {
+                let zero = c(&mut b, block, 0);
+                let condition = b.emit(
+                    block,
+                    pc(8),
+                    Op::IntegerCompare {
+                        ty: Type::U32,
+                        comparison: ShaderIntegerComparison::Equal,
+                    },
+                    vec![value, zero],
+                )[0];
+                Terminator::Branch {
+                    condition: condition.into(),
+                    when_true: blocks[*a],
+                    when_false: blocks[*z],
+                }
+            }
+            _ => panic!("unsupported graph"),
+        };
+        b.terminate(block, pc(i as u32 * 8), term);
+    }
+    let mut f = b.finish().unwrap();
+    f.workgroup_size = Some([1, 1, 1]);
+    let module = emit(&f, options()).unwrap();
+    validate(
+        &std::env::var_os("NIXE_SPIRV_VAL").unwrap(),
+        "shared-loop-exit",
+        module,
+    );
+}
+
+#[test]
+fn preserving_repairs_are_shared_and_leave_normal_arithmetic_inline() {
+    let mut b = FunctionBuilder::new(ShaderStage::Compute);
+    let entry = b.entry();
+    let address = c(&mut b, entry, 0);
+    let bits = load(&mut b, entry, address);
+    let input = b.emit(
+        entry,
+        pc(24),
+        Op::Bitcast {
+            from: Type::U32,
+            to: Type::F32,
+        },
+        vec![bits],
+    )[0]
+    .into();
+    let mut value = input;
+    for _ in 0..32 {
+        value = b.emit(
+            entry,
+            pc(32),
+            Op::Binary {
+                op: Binary::Multiply,
+                ty: Type::F32,
+                float_control: ShaderFloatControl::PRECISE,
+            },
+            vec![value, input],
+        )[0]
+        .into();
+    }
+    let bits = b.emit(
+        entry,
+        pc(36),
+        Op::Bitcast {
+            from: Type::F32,
+            to: Type::U32,
+        },
+        vec![value],
+    )[0]
+    .into();
+    store(&mut b, entry, address, bits);
+    b.terminate(entry, pc(40), Terminator::Return);
+    let mut f = b.finish().unwrap();
+    f.workgroup_size = Some([1, 1, 1]);
+    let mut opts = options();
+    opts.shader.float32.denorm_preserve = false;
+    let words = emit(&f, opts).unwrap();
+    let module = rspirv::dr::load_words(&words.words).unwrap();
+    assert_eq!(module.functions.len(), 2, "one entry and one shared repair");
+    let entry = &module.functions[0];
+    let instructions: Vec<_> = entry.blocks.iter().flat_map(|b| &b.instructions).collect();
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|i| i.class.opcode == spv::Op::FMul)
+            .count(),
+        32
+    );
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|i| i.class.opcode == spv::Op::FunctionCall)
+            .count(),
+        32
+    );
+    assert!(
+        words.words.len() < 16_000,
+        "repair code must not expand per multiply"
+    );
+}
+
+#[test]
+fn native_half_guarantees_are_part_of_the_shader_artifact_identity() {
+    let base = options();
+    let mut conversions = base;
+    conversions.shader.native_half_conversions = true;
+    let mut fused = conversions;
+    fused.shader.native_half_fma = true;
+    let identities =
+        [base, conversions, fused].map(|o| super::super::artifact::specialization(&[o]));
+    assert_ne!(identities[0], identities[1]);
+    assert_ne!(identities[1], identities[2]);
+    assert_ne!(identities[0], identities[2]);
+}
+
+#[cfg(test)]
+mod stage_tests {
+    use super::*;
+    use crate::ssa::artifact::{ShaderNamespace, StageKey};
+    #[test]
+    fn stage_identity_covers_effective_bindings_options_namespace_and_linked_interfaces() {
+        let mut f = branch_fixture();
+        let opts = options();
+        let ns = ShaderNamespace {
+            guest: *b"stage-key-test01",
+            isa: 1,
+        };
+        let mut bindings = pipeline_bindings(&[&f]);
+        let key = StageKey::new(ns, &f, opts, &bindings);
+        bindings.insert(ResourceId::new(99), 7);
+        assert_eq!(
+            key,
+            StageKey::new(ns, &f, opts, &bindings),
+            "unused stage bindings must not split identity"
+        );
+        bindings.insert(ResourceId::new(42), 1);
+        assert_ne!(key, StageKey::new(ns, &f, opts, &bindings));
+        bindings.insert(ResourceId::new(42), 0);
+        let mut other = opts;
+        other.uniform_buffer_bytes /= 2;
+        assert_ne!(key, StageKey::new(ns, &f, other, &bindings));
+        other = opts;
+        other.shader.float32.rounding_mode_rtz = !other.shader.float32.rounding_mode_rtz;
+        assert_ne!(key, StageKey::new(ns, &f, other, &bindings));
+        let mut other_ns = ns;
+        other_ns.isa += 1;
+        assert_ne!(key, StageKey::new(other_ns, &f, opts, &bindings));
+        f.inputs.push(
+            crate::ShaderInterfaceElement::new(
+                crate::ShaderIoLocation::Generic(0),
+                0,
+                crate::ShaderScalarType::Float32,
+                None,
+            )
+            .unwrap(),
+        );
+        assert_ne!(key, StageKey::new(ns, &f, opts, &bindings));
+    }
 }

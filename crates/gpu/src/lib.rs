@@ -10,6 +10,8 @@ mod address;
 mod allocation;
 mod backend;
 mod cache;
+mod working_set;
+pub use working_set::WorkingSet;
 mod capability;
 mod color;
 mod command;
@@ -19,7 +21,9 @@ pub use color::{
 };
 pub use conversion::{ConversionImage, Nv12ColorTransform, Nv12Conversion};
 mod device_image;
-pub use device_image::{DeviceImageFrame, DeviceImageSource, ExternalImageBuffer};
+pub use device_image::{
+    DeviceImageFrame, DeviceImageSource, DeviceImageTransfer, ExternalImageBuffer,
+};
 mod diagnostics;
 mod execution;
 mod presentation;
@@ -134,7 +138,11 @@ pub use view::{
 
 /// Diagnostic counters compiled only when explicitly enabled.
 pub mod metrics;
+pub use nixe_memory::trace;
 
 pub mod texture_decode;
 
 pub mod native;
+
+#[cfg(feature = "performance-counters")]
+pub mod compilation_capture;

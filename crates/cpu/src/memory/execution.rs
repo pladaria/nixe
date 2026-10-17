@@ -891,6 +891,114 @@ impl ExecutionMemoryLease<'_> {
     }
 }
 
+/// Page proofs retained only while mappings, GPU ownership and tracking rearm
+/// are excluded by the same live native execution lease. No cached bytes or
+/// atomic values are retained. Each vCPU invocation owns its small direct map.
+pub struct NativeMemorySession<'a> {
+    memory: &'a ExecutionMemory,
+    _lease: &'a ExecutionMemoryLease<'a>,
+    space: AddressSpaceId,
+    direct: [Option<(u64, bool)>; 16],
+    atomic: [Option<(u64, CanonicalBackingPage)>; 16],
+}
+
+impl<'a> NativeMemorySession<'a> {
+    pub fn new(
+        memory: &'a ExecutionMemory,
+        lease: &'a ExecutionMemoryLease<'a>,
+        space: AddressSpaceId,
+    ) -> Self {
+        assert!(
+            lease.authorizes(memory),
+            "native memory session requires its own execution lease"
+        );
+        Self {
+            memory,
+            _lease: lease,
+            space,
+            direct: [None; 16],
+            atomic: std::array::from_fn(|_| None),
+        }
+    }
+
+    #[inline]
+    pub fn resolve_access(
+        &mut self,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        kind: DataAccessKind,
+    ) -> Result<NativeMemoryAccess, DataAccessFault> {
+        let page = virtual_page(address);
+        let index = page as usize & 15;
+        let writable = kind == DataAccessKind::Write;
+        // Other access classes and cross-page faults retain the complete
+        // resolver. A proof for one page never authorizes its neighbour.
+        let cacheable = access.class == MemoryAccessClass::Normal
+            && address.is_aligned_to(u64::from(access.alignment.bytes(access.size)))
+            && page_offset(address) + access.size.bytes() <= SYNTHETIC_PAGE_SIZE;
+        if cacheable && self.direct[index].is_some_and(|(p, w)| p == page && (!writable || w)) {
+            return Ok(NativeMemoryAccess::Ram);
+        }
+        let resolved = self
+            .memory
+            .resolve_native_access(self.space, address, access, kind)?;
+        if cacheable && matches!(resolved, NativeMemoryAccess::Ram) {
+            let already_writable = self.direct[index].is_some_and(|(p, w)| p == page && w);
+            self.direct[index] = Some((page, writable || already_writable));
+        }
+        Ok(resolved)
+    }
+
+    #[inline]
+    pub fn compare_exchange(
+        &mut self,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        expected: MemoryValue,
+        replacement: MemoryValue,
+    ) -> Result<NativeAtomicResult, DataAccessFault> {
+        if expected.size() != access.size || replacement.size() != access.size {
+            return Err(DataAccessFault::new(
+                self.space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::ValueSizeMismatch,
+            ));
+        }
+        let page = virtual_page(address);
+        let index = page as usize & 15;
+        let cacheable = access.class == MemoryAccessClass::Atomic
+            && access.alignment == MemoryAlignment::Natural
+            && address.is_aligned_to(access.size.bytes() as u64);
+        if !cacheable || !self.atomic[index].as_ref().is_some_and(|(p, _)| *p == page) {
+            let backing = self
+                .memory
+                .resolve_atomic_backing(self.space, address, access)?;
+            if !cacheable {
+                return ExecutionMemory::try_native_compare_exchange_on_backing(
+                    &backing,
+                    self.space,
+                    address,
+                    access,
+                    expected,
+                    replacement,
+                );
+            }
+            self.atomic[index] = Some((page, backing));
+        }
+        // Retain real hardware atomics and canonical dirty publication. The
+        // cache removes mapping lookup, never the exclusive monitor or CAS.
+        ExecutionMemory::try_native_compare_exchange_on_backing(
+            &self.atomic[index].as_ref().unwrap().1,
+            self.space,
+            address,
+            access,
+            expected,
+            replacement,
+        )
+    }
+}
+
 /// A native CAS either completed or needs visibility outside its execution lease.
 pub enum NativeAtomicResult {
     Complete(bool),
@@ -947,7 +1055,7 @@ impl ExecutionMemory {
     /// No visibility callback or guest operation is performed. Classification
     /// and direct repair share their complete mapping validation.
     #[inline]
-    pub fn resolve_native_access(
+    fn resolve_native_access(
         &self,
         space: AddressSpaceId,
         address: GuestVirtualAddress,
@@ -987,55 +1095,40 @@ impl ExecutionMemory {
         }
     }
 
-    /// Resolves and executes a CAS under the caller's native execution lease.
-    /// Classification shares the transaction's mapping lookup instead of adding
-    /// a second lookup to every exclusive store. No GPU wait happens here.
+    /// Executes a CAS on backing already validated by the native session.
+    /// Visibility, dirty publication and the hardware CAS share one page lock.
+    /// No GPU wait happens while native execution holds its lease.
     #[inline]
-    pub fn try_native_compare_exchange(
-        &self,
+    fn try_native_compare_exchange_on_backing(
+        backing: &CanonicalBackingPage,
         space: AddressSpaceId,
         address: GuestVirtualAddress,
         access: MemoryAccess,
         expected: MemoryValue,
         replacement: MemoryValue,
     ) -> Result<NativeAtomicResult, DataAccessFault> {
-        if expected.size() != access.size || replacement.size() != access.size {
-            return Err(DataAccessFault::new(
-                space,
-                address,
-                DataAccessKind::Write,
-                DataAccessFaultReason::ValueSizeMismatch,
-            ));
-        }
-        let backing = self.resolve_atomic_backing(space, address, access)?;
-        let Some(observed) = backing
-            .try_atomic_load(page_offset(address), access.size.bytes())
+        super::contracts::begin_ordered_write(access.ordering);
+        let result = backing
+            .try_atomic_compare_exchange(
+                page_offset(address),
+                access.size.bytes(),
+                expected.bits(),
+                replacement.bits(),
+            )
             .map_err(|reason| {
                 DataAccessFault::new(
                     space,
                     address,
-                    DataAccessKind::Read,
+                    DataAccessKind::Write,
                     DataAccessFaultReason::HostBacking(reason.to_string().into()),
                 )
-            })?
-        else {
-            return Ok(NativeAtomicResult::Visibility(backing));
-        };
-        Self::atomic_transaction_from_observed(
-            &backing,
-            space,
-            address,
-            access,
-            observed,
-            |previous| {
-                if previous == expected {
-                    (replacement, true)
-                } else {
-                    (previous, false)
-                }
-            },
-        )
-        .map(|result| NativeAtomicResult::Complete(result.stored))
+            })?;
+        if let Some((_, stored)) = result {
+            super::contracts::complete_ordered_read(access.ordering);
+            Ok(NativeAtomicResult::Complete(stored))
+        } else {
+            Ok(NativeAtomicResult::Visibility(backing.clone()))
+        }
     }
 
     fn repair_resolved_direct_access(
@@ -3901,6 +3994,186 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_session_proofs_preserve_permissions_boundaries_and_alias_atomics() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(1);
+        let address = GuestVirtualAddress::new(0x1000);
+        let alias = GuestVirtualAddress::new(0x3000);
+        let page = GuestPhysicalPageId::new(1);
+        assert!(memory.add_ram_page(page));
+        memory
+            .bind_cpu_memory_backend(space, 0x8000, DirectBackendPolicy::Required)
+            .unwrap();
+        assert!(memory.map_page(space, address, page, MemoryPermissions::READ_WRITE));
+        assert!(memory.map_page(space, alias, page, MemoryPermissions::READ));
+        let access = MemoryAccess::normal(MemoryAccessSize::Word);
+        let atomic = MemoryAccess::new(
+            MemoryAccessSize::Word,
+            MemoryAlignment::Natural,
+            MemoryOrdering::SequentiallyConsistent,
+            MemoryAccessClass::Atomic,
+        );
+        {
+            let lease = memory.acquire_execution_lease();
+            let mut session = NativeMemorySession::new(&memory, &lease, space);
+            for _ in 0..2 {
+                assert!(matches!(
+                    session
+                        .resolve_access(address, access, DataAccessKind::Write)
+                        .unwrap(),
+                    NativeMemoryAccess::Ram
+                ));
+                assert!(matches!(
+                    session
+                        .resolve_access(alias, access, DataAccessKind::Read)
+                        .unwrap(),
+                    NativeMemoryAccess::Ram
+                ));
+                assert!(
+                    session
+                        .resolve_access(alias, access, DataAccessKind::Write)
+                        .is_err()
+                );
+                let crossing = MemoryAccess {
+                    alignment: MemoryAlignment::Unaligned,
+                    ..access
+                };
+                let fault = session
+                    .resolve_access(
+                        GuestVirtualAddress::new(0x1fff),
+                        crossing,
+                        DataAccessKind::Read,
+                    )
+                    .err()
+                    .unwrap();
+                assert_eq!(fault.address, GuestVirtualAddress::new(0x2000));
+            }
+            assert!(matches!(
+                session
+                    .compare_exchange(address, atomic, MemoryValue::U32(0), MemoryValue::U32(7))
+                    .unwrap(),
+                NativeAtomicResult::Complete(true)
+            ));
+            assert!(matches!(
+                session
+                    .compare_exchange(address, atomic, MemoryValue::U32(0), MemoryValue::U32(9))
+                    .unwrap(),
+                NativeAtomicResult::Complete(false)
+            ));
+            assert!(matches!(
+                session
+                    .compare_exchange(address, atomic, MemoryValue::U32(7), MemoryValue::U32(11))
+                    .unwrap(),
+                NativeAtomicResult::Complete(true)
+            ));
+            assert!(
+                session
+                    .compare_exchange(
+                        address.checked_add(1).unwrap(),
+                        atomic,
+                        MemoryValue::U32(0),
+                        MemoryValue::U32(1)
+                    )
+                    .is_err()
+            );
+            assert!(
+                session
+                    .compare_exchange(alias, atomic, MemoryValue::U32(11), MemoryValue::U32(12))
+                    .is_err()
+            );
+            assert_eq!(
+                memory.read(space, alias, access).unwrap().value,
+                MemoryValue::U32(11)
+            );
+        }
+        memory
+            .set_permissions(space, address, PAGE_SIZE, MemoryPermissions::READ)
+            .unwrap();
+        let lease = memory.acquire_execution_lease();
+        let mut session = NativeMemorySession::new(&memory, &lease, space);
+        assert!(
+            session
+                .resolve_access(address, access, DataAccessKind::Write)
+                .is_err()
+        );
+        assert!(
+            session
+                .compare_exchange(address, atomic, MemoryValue::U32(11), MemoryValue::U32(12))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_sessions_defer_gpu_visibility_after_the_execution_boundary() {
+        let mut memory = ExecutionMemory::new();
+        let space = AddressSpaceId::new(1);
+        let address = GuestVirtualAddress::new(0x1000);
+        let page = GuestPhysicalPageId::new(1);
+        assert!(memory.add_ram_page(page));
+        memory
+            .bind_cpu_memory_backend(space, 0x8000, DirectBackendPolicy::Required)
+            .unwrap();
+        assert!(memory.map_page(space, address, page, MemoryPermissions::READ_WRITE));
+        let access = MemoryAccess::normal(MemoryAccessSize::Word);
+        {
+            let lease = memory.acquire_execution_lease();
+            let mut session = NativeMemorySession::new(&memory, &lease, space);
+            for _ in 0..2 {
+                assert!(matches!(
+                    session
+                        .resolve_access(address, access, DataAccessKind::Write)
+                        .unwrap(),
+                    NativeMemoryAccess::Ram
+                ));
+            }
+        }
+        let range = memory
+            .translate_canonical_range(space, address, PAGE_SIZE, MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(DeviceWriteback {
+            bytes: vec![0x5a; PAGE_SIZE as usize].into(),
+        });
+        let declaration = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(3),
+            DeviceVisibilityPoint::new(1),
+            DeviceVisibilityPoint::new(2),
+        )
+        .unwrap();
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&range, declaration)],
+            coordinator.clone(),
+        )
+        .unwrap();
+        CanonicalBackingRange::publish_device_writes([(&range, declaration)], coordinator).unwrap();
+        {
+            let lease = memory.acquire_execution_lease();
+            let mut session = NativeMemorySession::new(&memory, &lease, space);
+            assert!(matches!(
+                session
+                    .resolve_access(address, access, DataAccessKind::Read)
+                    .unwrap(),
+                NativeMemoryAccess::Visibility(_)
+            ));
+            let atomic = MemoryAccess::new(
+                MemoryAccessSize::Word,
+                MemoryAlignment::Natural,
+                MemoryOrdering::SequentiallyConsistent,
+                MemoryAccessClass::Atomic,
+            );
+            assert!(matches!(
+                session
+                    .compare_exchange(address, atomic, MemoryValue::U32(0), MemoryValue::U32(1))
+                    .unwrap(),
+                NativeAtomicResult::Visibility(_)
+            ));
+        }
+        assert_eq!(
+            memory.read(space, address, access).unwrap().value,
+            MemoryValue::U32(0x5a5a5a5a)
+        );
+    }
+
+    #[test]
     fn cached_query_extents_follow_mapping_changes_spaces_and_limits() {
         let mut memory = ExecutionMemory::new();
         let space = AddressSpaceId::new(1);
@@ -4156,7 +4429,7 @@ mod tests {
     }
     use std::sync::Arc;
 
-    use crate::memory::{CacheMaintenanceKind, MemoryAccessSize};
+    use crate::memory::{CacheMaintenanceKind, MemoryAccessSize, MemoryOrdering};
     use nixe_memory::{
         CpuVisibilityRequest, DeviceAccessDeclaration, DeviceVisibilityPoint,
         DeviceVisibilityRequest, NonCpuDeviceId, VisibilityCoordinator, VisibilityCoordinatorError,

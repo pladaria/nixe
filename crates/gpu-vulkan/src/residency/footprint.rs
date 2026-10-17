@@ -15,7 +15,7 @@ pub(super) struct ImageWritePlan {
     logical: Box<[(u64, u64)]>,
     repeated: bool,
     aliases: Option<Box<[AliasWindows]>>,
-    queued: Option<WorkTicket>,
+    queued: Option<DeviceVisibilityPoint>,
 }
 struct AliasWindows {
     resource: Resource,
@@ -195,13 +195,11 @@ impl VulkanResidency {
         rect: vk::Rect2D,
     ) -> Result<(), VulkanError> {
         let plan = self.write_plan(id, plane, rect)?;
-        let tick = self.device.work_ticket()?.tick();
-        let declaration = DeviceAccessDeclaration::write(
-            NonCpuDeviceId::new(self.instance.get()),
-            DeviceVisibilityPoint::new(tick),
-            DeviceVisibilityPoint::new(tick),
-        )
-        .map_err(memory_error)?;
+        self.device.work_ticket()?;
+        let point = self.device.visibility_point()?;
+        let declaration =
+            DeviceAccessDeclaration::write(NonCpuDeviceId::new(self.instance.get()), point, point)
+                .map_err(memory_error)?;
         let result = CanonicalBackingRange::prepare_resident_device_accesses(
             [(&plan.ownership, declaration)],
             self.visibility.clone(),
@@ -225,7 +223,7 @@ impl VulkanResidency {
             return Ok(());
         }
         let work = self.device.work_ticket()?;
-        let point = DeviceVisibilityPoint::new(work.tick());
+        let point = self.device.visibility_point()?;
         let source = Resource::Image(id);
         // Layout changes invalidate alias coverage; producer epochs do not.
         // This metadata is owned by the recorder and never rebuilt per unchanged draw.
@@ -327,13 +325,13 @@ impl VulkanResidency {
             }
             contents.invalidate_intervals(&alias.windows);
         }
-        // One accepted recording tick needs this immutable coverage once.
+        // One logical producer cohort needs this immutable coverage once.
         // Exact producer authority above still changes on every write. A CPU
-        // demand necessarily flushes the recorder before materializing bytes,
-        // so a following writer has a new ticket and publishes ownership again.
-        if plan.queued != Some(work) {
-            self.pending_writes.push(plan.ownership.clone());
-            plan.queued = Some(work);
+        // capture ends the cohort before a following writer can change its
+        // bytes, so that writer publishes ownership with a new version.
+        if plan.queued != Some(point) {
+            self.pending_writes.push((plan.ownership.clone(), point));
+            plan.queued = Some(point);
         }
         let entry = self.images[id.slot].entry.as_mut().unwrap();
         entry.contents.last_use = Some(work);

@@ -5,10 +5,10 @@
 # Words are lowercase ASCII. Empty categories are allowed; unknown fields are errors.
 
 [categories.profanity]
-words = ["fuck", "shit", "crap"]
+words = ["fuck"]
 
 [categories.insults]
-words = ["idiot", "fool", "moron"]
+words = ["idiot", "asshole", "bitch", "motherfucker"]
 
 [categories.spam]
 words = ["spam", "scam", "phish"]

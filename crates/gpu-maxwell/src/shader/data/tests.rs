@@ -127,6 +127,8 @@ fn spirv_options() -> nixe_gpu::SpirvShaderOptions {
         vertex_position_transform: None,
         input_control_points: 0,
         tessellation_mode: None,
+        native_half_conversions: false,
+        native_half_fma: false,
         float32: Default::default(),
         float64: Default::default(),
     }

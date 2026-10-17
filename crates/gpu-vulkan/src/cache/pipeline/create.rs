@@ -50,7 +50,7 @@ impl Compiler {
         layout: &PipelineLayout,
         metrics: &mut PipelineMetrics,
     ) -> Result<vk::Pipeline, CompileError> {
-        let stages = [&shader.stages[0]];
+        let stages = [shader.stages[0].as_ref()];
         let modules = self.modules(&stages)?;
         let mut module_info = vk::ShaderModuleCreateInfo::default().code(&stages[0].module.words);
         let mut stage = vk::PipelineShaderStageCreateInfo::default()
@@ -139,6 +139,7 @@ impl Compiler {
         let selected: Vec<_> = shader
             .stages
             .iter()
+            .map(AsRef::as_ref)
             .filter(|s| {
                 if s.stage == ShaderStage::Fragment {
                     fs

@@ -41,7 +41,7 @@ pub struct TessellationMode {
 /// Default levels are dynamic parameters, not part of a shader/pipeline key.
 /// `Shader` means the active control program supplies the levels and output
 /// patch size (the latter belongs to its IR metadata, not input patch assembly).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TessellationControl {
     Shader,
     DefaultLevels {
@@ -54,7 +54,7 @@ pub enum TessellationControl {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TessellationState {
     pub mode: TessellationMode,
     pub input_control_points: u8,

@@ -20,6 +20,7 @@ use nixe_memory::CanonicalWriteBatch;
 use std::collections::BTreeMap;
 
 mod cache;
+mod demand;
 mod link;
 pub use cache::{
     MAXWELL_SHADER_NAMESPACE, MaxwellShaderCode, MaxwellShaderCompiler, MaxwellShaderSnapshot,
@@ -78,6 +79,7 @@ fn read_requested_binary(
                 workgroup_size,
             },
             None,
+            0,
         )?
     } else {
         if request.workgroup_size.is_some() {
@@ -358,8 +360,10 @@ fn lower_decoded(
         })
         .collect();
     function.workgroup_size = decoded.workgroup_size;
+    function.local_memory_bytes = decoded.local_memory_bytes;
     function.tessellation_control_points = decoded.tessellation_control_points;
     function.optimize()?;
+    demand::resolve_range_bits(binary, &mut function)?;
     Ok(function)
 }
 

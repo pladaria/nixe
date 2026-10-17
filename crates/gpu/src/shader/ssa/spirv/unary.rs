@@ -1,6 +1,21 @@
 use super::*;
 impl Emitter<'_> {
     pub(super) fn unary(&mut self, op: Unary, scalar: Type, input: u32) -> Result<u32, Error> {
+        if scalar == Type::F16 && matches!(op, Unary::Negate | Unary::Absolute) {
+            let bits = self.half_pack(input)?;
+            let mask = self.math.constant(if op == Unary::Absolute {
+                0x7fff
+            } else {
+                0x8000
+            });
+            let bits = if op == Unary::Absolute {
+                self.math.b.bitwise_and(self.math.uint, None, bits, mask)
+            } else {
+                self.math.b.bitwise_xor(self.math.uint, None, bits, mask)
+            }
+            .map_err(|e| self.error(e.to_string()))?;
+            return self.half_from_bits(bits);
+        }
         let ty = self.ty(scalar)?;
         let result = match op {
             Unary::Not if scalar == Type::Bool => self.math.b.logical_not(ty, None, input),

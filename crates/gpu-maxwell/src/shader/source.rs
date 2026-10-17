@@ -125,7 +125,6 @@ impl MaxwellShaderSnapshot {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MaxwellShaderTranslationSource {
-    bindings: Arc<crate::MaxwellThreeDShaderBindingState>,
     programs: Box<[MaxwellShaderSourceProgram]>,
     texture_constant_buffer_slot: Option<u8>,
     y_negate: bool,
@@ -160,9 +159,11 @@ impl Hash for MaxwellShaderTranslationSource {
 
 /// Allocation-free semantic lookup key for the frontend shader-source cache.
 /// Owned storage is materialized only after a miss or stale source snapshot.
+/// Runtime bindings are borrowed at capture, never retained by semantic keys:
+/// retaining them would force later register writes to clone binding state.
+/// Captured indirect-code tables keep their actual binding/byte dependencies.
 #[derive(Clone, Debug)]
 pub(crate) struct MaxwellShaderTranslationSourceKey {
-    pub(crate) bindings: Arc<crate::MaxwellThreeDShaderBindingState>,
     programs: [Option<MaxwellShaderSourceProgram>; MAXWELL_PIPELINE_SHADER_COUNT],
     program_count: usize,
     texture_constant_buffer_slot: Option<u8>,
@@ -202,7 +203,6 @@ impl MaxwellShaderTranslationSourceKey {
 
     pub(crate) fn materialize(&self) -> MaxwellShaderTranslationSource {
         MaxwellShaderTranslationSource {
-            bindings: Arc::clone(&self.bindings),
             programs: self.programs().collect(),
             texture_constant_buffer_slot: self.texture_constant_buffer_slot,
             y_negate: self.y_negate,
@@ -351,7 +351,6 @@ pub(crate) fn prepare_maxwell_shader_translation_source(
         // https://github.com/eden-emulator/mirror/blob/master/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
         y_negate: matches!(state.fixed_function().register(crate::MaxwellThreeDFixedFunctionRegister::WindowOrigin).value(),
             Some(crate::MaxwellThreeDFixedFunctionValue::Mask(origin)) if origin & 1 != 0),
-        bindings: state.shader_bindings_snapshot(),
         programs,
         program_count,
         texture_constant_buffer_slot: bindings
@@ -365,10 +364,11 @@ pub(crate) fn prepare_maxwell_shader_translation_source(
 
 pub(crate) fn prepare_maxwell_shader_translation_inputs_from_source(
     source: &MaxwellShaderTranslationSource,
+    bindings: &crate::MaxwellThreeDShaderBindingState,
     address_space: &MaxwellGpuAddressSpace,
     staged_writes: &CanonicalWriteBatch,
 ) -> Result<MaxwellShaderTranslationInputs, MaxwellShaderTranslationError> {
-    let snapshot = capture_maxwell_shader_snapshot(source, address_space, staged_writes)?;
+    let snapshot = capture_maxwell_shader_snapshot(source, bindings, address_space, staged_writes)?;
     Ok(MaxwellShaderTranslationInputs {
         fingerprint: nixe_gpu::cache_fingerprint(&snapshot.programs),
         snapshot,
@@ -377,6 +377,7 @@ pub(crate) fn prepare_maxwell_shader_translation_inputs_from_source(
 
 pub(super) fn capture_maxwell_shader_snapshot(
     source: &MaxwellShaderTranslationSource,
+    bindings: &crate::MaxwellThreeDShaderBindingState,
     address_space: &MaxwellGpuAddressSpace,
     staged_writes: &CanonicalWriteBatch,
 ) -> Result<MaxwellShaderSnapshot, MaxwellShaderTranslationError> {
@@ -385,12 +386,7 @@ pub(super) fn capture_maxwell_shader_snapshot(
     let mut programs = Vec::with_capacity(source.programs.len());
     for program in &source.programs {
         let mut binary = read_shader_binary(&memory, program.stage, program.address)?;
-        super::indirect::capture(
-            &mut binary,
-            &source.bindings,
-            program.effective_group,
-            &memory,
-        )?;
+        super::indirect::capture(&mut binary, bindings, program.effective_group, &memory)?;
         validate_program_header(program.stage, binary.header())?;
         let vertex_input_types: &[(ShaderIoLocation, ShaderScalarType)] =
             if neutral_stage(program.stage) == ShaderStage::Vertex {

@@ -297,9 +297,13 @@ fn native_compute_cache_captures_qmd_geometry_bindings_and_exact_code_dependenci
         register_count: 11,
         workgroup_size: Some([32, 1, 1]),
     };
-    let snapshot =
-        MaxwellShaderSnapshot::capture_compute(&space, &CanonicalWriteBatch::new(), request())
-            .unwrap();
+    let snapshot = MaxwellShaderSnapshot::capture_compute(
+        &space,
+        &CanonicalWriteBatch::new(),
+        request(),
+        |_| Err("unbound test buffer"),
+    )
+    .unwrap();
     let compiler =
         MaxwellShaderCompiler::new(Arc::new(CompilePool::new(2, 8).unwrap()), 8, 1024 * 1024);
     let code = compiler
@@ -336,9 +340,14 @@ fn native_compute_cache_captures_qmd_geometry_bindings_and_exact_code_dependenci
     geometry.workgroup_size = Some([16, 1, 1]);
     assert_ne!(
         snapshot.identity(),
-        MaxwellShaderSnapshot::capture_compute(&space, &CanonicalWriteBatch::new(), geometry)
-            .unwrap()
-            .identity()
+        MaxwellShaderSnapshot::capture_compute(
+            &space,
+            &CanonicalWriteBatch::new(),
+            geometry,
+            |_| Err("unbound test buffer")
+        )
+        .unwrap()
+        .identity()
     );
     let end = words.len() as u64 * 8;
     let outside =
@@ -348,4 +357,114 @@ fn native_compute_cache_captures_qmd_geometry_bindings_and_exact_code_dependenci
     assert!(!snapshot.staged_writes_are_irrelevant(&inside));
     allocation.write(8, &0u64.to_le_bytes()).unwrap();
     assert!(!snapshot.source_is_current(&space));
+}
+
+#[test]
+fn native_compute_indirect_tables_follow_qmd_bindings_and_enter_shader_identity() {
+    use crate::{MaxwellShaderSnapshot, MaxwellSsaRequest};
+    let (allocation, space, address) = super::super::test_support::mapped_memory();
+    // The second case is beyond the first lexical EXIT. Only its captured
+    // table destination proves that the code snapshot must extend further.
+    allocation
+        .write(
+            0,
+            &bytes(&[
+                0,
+                0x3820_0000_0007_0000 | (7 << 39) | (1 << 20),
+                0x3848_0000_0027_0003,
+                0xef94_0000_0007_0303,
+                0,
+                0xe250_0000_0007_030f,
+                0xe300_0000_0007_000f,
+                0xe300_0000_0007_000f,
+                0,
+                0xe300_0000_0007_000f,
+                0xe300_0000_0007_000f,
+                0xe300_0000_0007_000f,
+                0,
+                0xe300_0000_0007_000f,
+                0,
+                0,
+            ]),
+        )
+        .unwrap();
+    let table = [0_u32, 24]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    allocation.write(0x200, &table).unwrap();
+    allocation.write(0x300, &table).unwrap();
+    let request = || MaxwellSsaRequest {
+        stage: MaxwellShaderStage::Compute,
+        address,
+        register_count: 4,
+        workgroup_size: Some([1, 1, 1]),
+    };
+    let writes = CanonicalWriteBatch::new();
+    let binding = |slot| {
+        if slot == 0 {
+            Ok((address + 0x200, 8))
+        } else {
+            Err("unbound test buffer")
+        }
+    };
+    let captured =
+        MaxwellShaderSnapshot::capture_compute(&space, &writes, request(), binding).unwrap();
+    assert!(captured.compute_indirect_bindings_current(binding));
+    assert!(!captured.compute_indirect_bindings_current(|_| Ok((address + 0x200, 4))));
+    assert!(!captured.compute_indirect_bindings_current(|_| Ok((address + 0x300, 8))));
+    assert!(!captured.compute_indirect_bindings_current(|_| Err("disabled QMD slot")));
+    captured.clone().compile().unwrap();
+    let relocated = MaxwellShaderSnapshot::capture_compute(&space, &writes, request(), |_| {
+        Ok((address + 0x300, 8))
+    })
+    .unwrap();
+    assert_eq!(
+        captured.identity(),
+        relocated.identity(),
+        "addresses prove freshness, not shader semantics"
+    );
+    let table_overlay =
+        super::super::test_support::canonical_shader_writes(&space, &[(address + 0x200, 24)]);
+    assert!(!captured.staged_writes_are_irrelevant(&table_overlay));
+    allocation.write(0x200, &24_u32.to_le_bytes()).unwrap();
+    assert!(!captured.source_is_current(&space));
+    let changed =
+        MaxwellShaderSnapshot::capture_compute(&space, &writes, request(), binding).unwrap();
+    assert_ne!(captured.identity(), changed.identity());
+    changed.compile().unwrap();
+    assert!(
+        MaxwellShaderSnapshot::capture_compute(&space, &writes, request(), |_| Ok((
+            address + 0x200,
+            4
+        )))
+        .is_err()
+    );
+    allocation.write(0x200, &65536_u32.to_le_bytes()).unwrap();
+    let error =
+        MaxwellShaderSnapshot::capture_compute(&space, &writes, request(), binding).unwrap_err();
+    assert!(error.to_string().contains("bounded executable domain"));
+    use super::super::binary::{
+        MaxwellShaderMemoryView, MaxwellShaderMetadata, extend_shader_code, read_shader_code,
+    };
+    let memory = MaxwellShaderMemoryView::new(&space, &writes);
+    let mut prefix = read_shader_code(
+        &memory,
+        MaxwellShaderStage::Compute,
+        address,
+        MaxwellShaderMetadata::Compute {
+            register_count: 4,
+            workgroup_size: [1, 1, 1],
+        },
+        None,
+        0,
+    )
+    .unwrap();
+    allocation
+        .write(16, &0x3848_0000_0027_0002_u64.to_le_bytes())
+        .unwrap();
+    assert!(matches!(
+        extend_shader_code(&memory, &mut prefix, 72),
+        Err(MaxwellShaderTranslationError::SourceChangedDuringRead { .. })
+    ));
 }

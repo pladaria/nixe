@@ -274,6 +274,133 @@ fn float_to_float_integral_rounding_covers_directed_modes_and_cbuf() {
 }
 
 #[test]
+fn half_integral_rounding_selects_the_source_half_and_zeros_upper_result_bits() {
+    let mut header = [0; 20];
+    header[0] = 0x0002_5462;
+    header[18] = 1;
+    for (mode, cases) in [
+        (
+            1_u64,
+            [
+                (0x3f00, 0x3c00),
+                (0xbf00, 0xc000),
+                (0x8001, 0xbc00),
+                (0x8000, 0x8000),
+                (0x7c00, 0x7c00),
+            ],
+        ),
+        (
+            2,
+            [
+                (0x3f00, 0x4000),
+                (0xbf00, 0xbc00),
+                (0x8001, 0x8000),
+                (0x8000, 0x8000),
+                (0xfc00, 0xfc00),
+            ],
+        ),
+        (
+            3,
+            [
+                (0x3f00, 0x3c00),
+                (0xbf00, 0xbc00),
+                (0x8001, 0x8000),
+                (0x8000, 0x8000),
+                (0x7c00, 0x7c00),
+            ],
+        ),
+    ] {
+        for high in [false, true] {
+            let encoding = 0x4ca8_0400_0007_0500 | (mode << 39) | (u64::from(high) << 41);
+            let translated = translated_fixture_with_register_count(
+                MaxwellShaderStage::Pixel,
+                header,
+                &[0, encoding, 0xe300_0000_0007_000f, 0],
+                4,
+            );
+            for (input, expected) in cases {
+                let packed = if high {
+                    input << 16 | 0x3c00
+                } else {
+                    0x4000_0000 | input
+                };
+                let inputs = nixe_gpu::ShaderEvaluationInputs::default()
+                    .with_constant_buffer_bits(0, 0, packed);
+                let result = nixe_gpu::evaluate_shader_ir(&translated, &inputs, 32).unwrap();
+                assert_eq!(
+                    result.output_bits(nixe_gpu::ShaderIoLocation::Color(0), 0),
+                    Some(expected),
+                    "mode={mode} high={high} input={input:#x}"
+                );
+            }
+        }
+    }
+    let decoded = decode_float_to_float(
+        MaxwellShaderStage::Vertex,
+        0x3f0,
+        0x5ca8_0480_0197_050c,
+        32,
+        &mut 32,
+    )
+    .unwrap();
+    assert!(
+        matches!(decoded.operations.first(),Some(crate::shader::decoded::Operation::UnpackHalf32{source,high:false,..}) if source.index()==25)
+    );
+    assert!(
+        matches!(decoded.operations.last(),Some(crate::shader::decoded::Operation::PackHalf32{destination,..}) if destination.index()==12)
+    );
+}
+
+#[test]
+fn half_f2f_pass_applies_modifiers_quiets_nans_and_adds_positive_zero() {
+    let mut header = [0; 20];
+    header[0] = 0x0002_5462;
+    header[18] = 1;
+    for pass in [0_u64, 3] {
+        for (modifiers, input, expected) in [
+            (0, 0x3f00, 0x3f00),
+            (0, 0x8000, 0),
+            (0, 0x8001, 0x8001),
+            (0, 0x7c01, 0x7e01),
+            (1_u64 << 49, 0xbf00, 0x3f00),
+            ((1 << 49) | (1 << 45), 0x3f00, 0xbf00),
+        ] {
+            let encoding = 0x4ca8_0200_0007_0500 | (pass << 39) | modifiers;
+            let translated = translated_fixture_with_register_count(
+                MaxwellShaderStage::Pixel,
+                header,
+                &[0, encoding, 0xe300_0000_0007_000f, 0],
+                4,
+            );
+            let inputs = nixe_gpu::ShaderEvaluationInputs::default().with_constant_buffer_bits(
+                0,
+                0,
+                input << 16 | 0x4000,
+            );
+            let result = nixe_gpu::evaluate_shader_ir(&translated, &inputs, 32).unwrap();
+            let actual = result
+                .output_bits(nixe_gpu::ShaderIoLocation::Color(0), 0)
+                .unwrap();
+            if input & 0x7fff > 0x7c00 {
+                // Arithmetic quiets NaNs; the CPU oracle is not a reference
+                // for a GPU arithmetic NaN's payload/sign.
+                assert_eq!(actual & 0xffff_7e00, 0x7e00);
+            } else {
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+    decode_float_to_float(
+        MaxwellShaderStage::Vertex,
+        0x488,
+        0x5caa_2200_00c7_0519,
+        32,
+        &mut 32,
+    )
+    .unwrap();
+}
+
+#[test]
 fn integer_to_float_decodes_register_immediate_and_constant_buffer_forms() {
     let mut next_temporary = 8;
     let register = decode_integer_to_float(

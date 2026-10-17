@@ -25,6 +25,7 @@ struct Channel {
     adpcm: Adpcm,
     history: [i16; 8],
     fraction: u32,
+    biquads: [super::biquad::State; 2],
 }
 #[derive(Debug, Default, Clone, Copy)]
 struct Adpcm {
@@ -101,9 +102,6 @@ impl Voice {
         }
         if raw[11] == 6 && channels != 1 {
             return Err(UpdateError::Invalid);
-        }
-        if raw[0x24] != 0 || raw[0x30] != 0 {
-            return Err(fail("biquad filters are not implemented"));
         }
         if word(raw, 0x5c) != u32::MAX {
             return Err(fail("splitter routing is not implemented"));
@@ -285,6 +283,10 @@ impl Voice {
             }
         }
         let precision = if revision >= 7 { 23 } else { 15 };
+        let biquads = [
+            super::biquad::Parameters::decode(&self.params[0x24..0x30]),
+            super::biquad::Parameters::decode(&self.params[0x30..0x3c]),
+        ];
         for channel in 0..channel_count {
             let c = &mut self.channels[channel];
             if !c.valid.iter().any(|&v| v) {
@@ -373,6 +375,9 @@ impl Voice {
                 );
                 c.history[..history_len]
                     .copy_from_slice(&scratch.decoded[count..count + history_len]);
+            }
+            for (state, params) in c.biquads.iter_mut().zip(biquads) {
+                state.process(params, revision, &mut scratch.output);
             }
             let resource = word(&self.params, 0x140 + channel * 4) as usize;
             let current = &resources[resource];
@@ -693,6 +698,26 @@ mod tests {
             )
             .unwrap();
         mix
+    }
+    #[test]
+    fn voice_applies_both_biquads_in_order_after_source_conversion() {
+        let (mut voice, mut raw, pools) = pcm_voice(true);
+        raw[8] = 0;
+        for offset in [0x24, 0x30] {
+            raw[offset] = 1;
+            raw[offset + 2..offset + 4].copy_from_slice(&8192_i16.to_le_bytes());
+        }
+        voice
+            .update(&raw, 0, 1, 7, &pools, false, &|_, _| panic!(), &mut [0; 16])
+            .unwrap();
+        assert_eq!(play(&mut voice, 6), [25, 50, -75, 100, 25, 50]);
+        // Disabling either stage must restore that stage's unfiltered input.
+        raw[0x30] = 0;
+        raw[0x7a] = 1;
+        voice
+            .update(&raw, 0, 1, 7, &pools, false, &|_, _| panic!(), &mut [0; 16])
+            .unwrap();
+        assert_eq!(play(&mut voice, 2), [-150, 200]);
     }
     #[test]
     fn real_buffer_consumption_status_pause_stop_and_looping_are_stateful() {

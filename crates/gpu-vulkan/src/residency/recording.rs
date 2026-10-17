@@ -124,7 +124,7 @@ impl VulkanResidency {
                     vk::AccessFlags2::TRANSFER_WRITE,
                 ),
             )?;
-            let index = self.device.submission.begin()?;
+            let index = self.device.begin_recording()?;
             let command = self.device.submission.slots[index].command;
             if source == destination {
                 // Vulkan disallows overlapping source/destination memory. A
@@ -189,7 +189,7 @@ impl VulkanResidency {
                     .iter()
                     .map(|piece| piece.region(destination_offset + piece.logical - offset))
                     .collect();
-                let index = self.device.submission.begin()?;
+                let index = self.device.begin_recording()?;
                 self.barriers.emit(&mut self.device);
                 unsafe {
                     self.device.owner.device.cmd_copy_image_to_buffer(
@@ -213,7 +213,7 @@ impl VulkanResidency {
                             .size(piece.length)
                     })
                     .collect();
-                let index = self.device.submission.begin()?;
+                let index = self.device.begin_recording()?;
                 self.barriers.emit(&mut self.device);
                 unsafe {
                     self.device.owner.device.cmd_copy_buffer(
@@ -228,6 +228,93 @@ impl VulkanResidency {
         }
         self.contents_mut(Resource::Buffer(destination))
             .validate_interval(destination_offset, size);
+        Ok(())
+    }
+    /// Bound native command/temporary-allocation count when canonical tiling or
+    /// packed aspects yield many small image-to-buffer intervals. Buffer copies
+    /// scatter exact bytes; unowned padding and other aspect producers survive.
+    /// Destinations must be ordered and disjoint, as in canonical restoration.
+    pub(super) fn copy_image_buffer_regions(
+        &mut self,
+        source: ImageId,
+        destination: BufferId,
+        copies: &[(u64, u64, u64)],
+    ) -> Result<(), VulkanError> {
+        debug_assert!(copies.windows(2).all(|c| c[0].1 + c[0].2 <= c[1].1));
+        if copies.len() == 1 {
+            let (from, to, size) = copies[0];
+            return self.copy_source(Resource::Image(source), from, destination, to, size);
+        }
+        let mut pieces = Vec::new();
+        let mut offsets = Vec::new();
+        for &(from, to, size) in copies {
+            self.check_buffer_range(destination, to, size)?;
+            for piece in self.image_pieces(source, from, size)? {
+                offsets.push(to + piece.logical - from);
+                pieces.push(piece);
+            }
+        }
+        let Some(&start) = offsets.first() else {
+            return Ok(());
+        };
+        let end = offsets.last().unwrap() + pieces.last().unwrap().length;
+        let dst = self.buffer_access_range(
+            destination,
+            start,
+            end - start,
+            AccessScope::new(
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            ),
+        )?;
+        if pieces.iter().zip(&offsets).all(|(p, &to)| p.direct(to)) {
+            let (src, layout) =
+                self.image_regions_access(source, &pieces, vk::AccessFlags2::TRANSFER_READ)?;
+            let regions: Vec<_> = pieces
+                .iter()
+                .zip(&offsets)
+                .map(|(p, &to)| p.region(to))
+                .collect();
+            let slot = self.device.begin_recording()?;
+            self.barriers.emit(&mut self.device);
+            unsafe {
+                self.device.owner.device.cmd_copy_image_to_buffer(
+                    self.device.submission.slots[slot].command,
+                    src,
+                    layout,
+                    dst,
+                    &regions,
+                );
+            }
+        } else {
+            let (scratch, slices) =
+                self.image_pieces_buffer(source, &pieces, &[Resource::Buffer(destination)])?;
+            let regions: Vec<_> = pieces
+                .iter()
+                .zip(&offsets)
+                .zip(slices)
+                .map(|((p, &to), from)| {
+                    vk::BufferCopy::default()
+                        .src_offset(from + p.skip)
+                        .dst_offset(to)
+                        .size(p.length)
+                })
+                .collect();
+            let slot = self.device.begin_recording()?;
+            self.barriers.emit(&mut self.device);
+            unsafe {
+                self.device.owner.device.cmd_copy_buffer(
+                    self.device.submission.slots[slot].command,
+                    scratch,
+                    dst,
+                    &regions,
+                );
+            }
+        }
+        let written: Vec<_> = copies.iter().map(|&(_, to, size)| (to, size)).collect();
+        self.contents_mut(Resource::Buffer(destination))
+            .validate_intervals(&written);
+        self.statistics.gpu_copied_bytes += copies.iter().map(|&(_, _, size)| size).sum::<u64>();
         Ok(())
     }
     pub(super) fn read_buffer_native(
@@ -262,136 +349,156 @@ impl VulkanResidency {
         }
         Ok(result)
     }
-    /// Read each image's transfer blocks in bounded batches. Byte authority is
-    /// applied only when scattering into the preserved CPU page baseline.
-    pub(super) fn read_authorities(
+    /// Record one demanded page's compatible transfers without consuming them.
+    pub(super) fn record_cpu_authorities(
         &mut self,
+        request: CpuVisibilityRequest,
         writes: &[Authority],
-        target: &mut [u8],
     ) -> Result<(), VulkanError> {
-        // A canonical page commonly has one image producer. Consume that
-        // slice directly instead of allocating and hashing every tiled run.
-        if let Some(first) = writes.first()
-            && let Resource::Image(id) = first.source
-            && writes.iter().all(|write| write.source == first.source)
-        {
-            self.read_image_authorities(id, writes, target)?;
-            self.statistics.canonical_readback_bytes += writes
-                .iter()
-                .map(|write| write.end - write.start)
-                .sum::<u64>();
-            return Ok(());
-        }
+        use super::cpu_readback::{Scatter, Transfer};
         let mut images = rustc_hash::FxHashMap::<ImageId, Vec<Authority>>::default();
         let mut buffers = Vec::new();
         let limit = self.device.submission.configuration.arena_bytes;
         for &write in writes {
             match write.source {
-                Resource::Buffer(_) => {
-                    let mut copied = 0;
-                    while copied < write.end - write.start {
-                        let length = (write.end - write.start - copied).min(limit);
-                        buffers.push(Authority {
-                            start: write.start + copied,
-                            end: write.start + copied + length,
-                            offset: write.offset + copied,
-                            ..write
-                        });
-                        copied += length;
+                Resource::Buffer(id) => {
+                    if let Some(known) = &self.buffer(id)?.known {
+                        nixe_gpu::trace::detail_event("readback_kind", 0, write.start, write.end);
+                        let bytes = Arc::clone(&known.bytes);
+                        self.cpu_readbacks.get_mut(&request).unwrap().bytes
+                            [write.start as usize..write.end as usize]
+                            .copy_from_slice(
+                                &bytes[write.offset as usize
+                                    ..(write.offset + write.end - write.start) as usize],
+                            );
+                    } else {
+                        nixe_gpu::trace::detail_event("readback_kind", 1, write.start, write.end);
+                        let mut copied = 0;
+                        while copied < write.end - write.start {
+                            let length = (write.end - write.start - copied).min(limit);
+                            buffers.push(Authority {
+                                start: write.start + copied,
+                                end: write.start + copied + length,
+                                offset: write.offset + copied,
+                                ..write
+                            });
+                            copied += length;
+                        }
                     }
                 }
-                Resource::Image(id) => images.entry(id).or_default().push(write),
+                Resource::Image(id) => {
+                    nixe_gpu::trace::detail_event("readback_kind", 2, write.start, write.end);
+                    images.entry(id).or_default().push(write);
+                }
             }
         }
         let mut next = 0;
         while next < buffers.len() {
-            let begin = next;
+            let first = next;
             let mut bytes = 0;
-            let mut regions = Vec::new();
-            while let Some(write) = buffers.get(next) {
-                let length = write.end - write.start;
-                if bytes + length > limit {
+            while let Some(w) = buffers.get(next) {
+                if bytes + w.end - w.start > limit {
                     break;
                 }
-                let Resource::Buffer(id) = write.source else {
+                bytes += w.end - w.start;
+                next += 1;
+            }
+            let (index, slice, ticket) = self.reserve_cpu_readback(bytes, 4)?;
+            let command = self.device.submission.slots[index].command;
+            let target = self.device.submission.slots[index]
+                .readback_buffer(slice)
+                .handle;
+            let mut copies = Vec::new();
+            let mut packed = 0;
+            for w in &buffers[first..next] {
+                let Resource::Buffer(id) = w.source else {
                     unreachable!()
                 };
+                let length = w.end - w.start;
                 let source = self.buffer_access_range(
                     id,
-                    write.offset,
+                    w.offset,
                     length,
                     AccessScope::new(
                         vk::PipelineStageFlags2::COPY,
                         vk::AccessFlags2::TRANSFER_READ,
                     ),
                 )?;
-                regions.push((
-                    source,
-                    vk::BufferCopy::default()
-                        .src_offset(write.offset)
-                        .dst_offset(bytes)
-                        .size(length),
-                ));
-                bytes += length;
-                next += 1;
-            }
-            let (index, slice, ticket) = self.device.submission.reserve_readback(bytes)?;
-            let command = self.device.submission.slots[index].command;
-            let buffer = self.device.submission.slots[index]
-                .readback_buffer(slice)
-                .handle;
-            self.barriers.emit(&mut self.device);
-            for (source, mut region) in regions {
-                region.dst_offset += slice.offset;
+                self.barriers.emit(&mut self.device);
                 unsafe {
-                    self.device
-                        .owner
-                        .device
-                        .cmd_copy_buffer(command, source, buffer, &[region]);
+                    self.device.owner.device.cmd_copy_buffer(
+                        command,
+                        source,
+                        target,
+                        &[vk::BufferCopy::default()
+                            .src_offset(w.offset)
+                            .dst_offset(slice.offset + packed)
+                            .size(length)],
+                    );
                 }
-            }
-            host_read_barrier(&self.device, command, buffer, slice.offset, bytes);
-            self.flush()?;
-            let data = self.device.readback(ticket)?;
-            self.statistics.native_readback_bytes += bytes;
-            let mut packed = 0;
-            for write in &buffers[begin..next] {
-                let length = (write.end - write.start) as usize;
-                target[write.start as usize..write.end as usize]
-                    .copy_from_slice(&data[packed..packed + length]);
+                copies.push(Scatter {
+                    source: packed as usize,
+                    destination: w.start as usize,
+                    length: length as usize,
+                });
                 packed += length;
             }
+            host_read_barrier(&self.device, command, target, slice.offset, bytes);
+            self.enqueue_cpu_transfer(
+                request,
+                Transfer {
+                    ticket,
+                    bytes,
+                    copies,
+                    windows: Vec::new(),
+                },
+            );
         }
         for (id, writes) in images {
-            self.read_image_authorities(id, &writes, target)?;
+            if self.record_cached_image_authorities(request, id, &writes)? {
+                continue;
+            }
+            let pieces = self.image_read_pieces(id, &writes, limit)?;
+            let mut reads = Vec::new();
+            for piece in pieces {
+                let mut copies = Vec::new();
+                for w in &writes {
+                    let start = w.offset.max(piece.logical);
+                    let end = (w.offset + w.end - w.start).min(piece.logical + piece.length);
+                    if start < end {
+                        copies.push(Scatter {
+                            source: (start - piece.logical) as usize,
+                            destination: (w.start + start - w.offset) as usize,
+                            length: (end - start) as usize,
+                        });
+                    }
+                }
+                reads.push((None, piece, copies));
+            }
+            self.record_image_reads(request, id, reads)?;
         }
-        self.statistics.canonical_readback_bytes += writes
-            .iter()
-            .map(|write| write.end - write.start)
-            .sum::<u64>();
         Ok(())
     }
-    fn read_image_authorities(
+
+    pub(super) fn record_image_reads(
         &mut self,
+        request: CpuVisibilityRequest,
         id: ImageId,
-        writes: &[Authority],
-        target: &mut [u8],
+        reads: Vec<(
+            Option<super::readback::WindowKey>,
+            super::image::ImagePiece,
+            Vec<super::cpu_readback::Scatter>,
+        )>,
     ) -> Result<(), VulkanError> {
-        if self.cached_image_authorities(id, writes, target)? {
-            return Ok(());
-        }
+        use super::cpu_readback::Transfer;
         let limit = self.device.submission.configuration.arena_bytes;
-        let mut writes = writes.to_vec();
-        writes.sort_unstable_by_key(|write| write.offset);
-        let pieces = self.image_read_pieces(id, &writes, limit)?;
-        let mut next = 0;
-        let mut first_write = 0;
-        while next < pieces.len() {
-            let begin = next;
+        let multisample = self.image(id)?.description.samples != vk::SampleCountFlags::TYPE_1;
+        let mut reads = reads.into_iter().peekable();
+        while reads.peek().is_some() {
             let mut bytes = 0;
             let mut alignment = 4;
-            let mut offsets = Vec::new();
-            while let Some(piece) = pieces.get(next) {
+            let mut batch = Vec::new();
+            while let Some((_, piece, _)) = reads.peek() {
                 let align = u64::from(piece.plane.bytes_per_block).max(4);
                 let offset = crate::queue::align_up(bytes, align).ok_or(
                     VulkanError::InvalidResource("image readback alignment overflow"),
@@ -399,62 +506,92 @@ impl VulkanResidency {
                 if offset + piece.length > limit {
                     break;
                 }
-                offsets.push(offset);
                 bytes = offset + piece.length;
                 alignment = alignment.max(align);
-                next += 1;
+                batch.push((offset, reads.next().unwrap()));
             }
-            let batch = &pieces[begin..next];
-            let (image, layout) =
-                self.image_regions_access(id, batch, vk::AccessFlags2::TRANSFER_READ)?;
-            let (index, slice, ticket) = self
-                .device
-                .submission
-                .reserve_readback_aligned(bytes, alignment)?;
+            let mut converted = Vec::new();
+            if multisample {
+                for (_, (_, piece, _)) in &batch {
+                    converted.push(self.sample_readback_window(id, *piece)?);
+                }
+            }
+            let (index, slice, ticket) = self.reserve_cpu_readback(bytes, alignment)?;
             let command = self.device.submission.slots[index].command;
             let buffer = self.device.submission.slots[index]
                 .readback_buffer(slice)
                 .handle;
-            let regions: Vec<_> = batch
-                .iter()
-                .zip(&offsets)
-                .map(|(piece, offset)| piece.region(slice.offset + offset))
-                .collect();
-            self.barriers.emit(&mut self.device);
-            unsafe {
-                self.device
-                    .owner
-                    .device
-                    .cmd_copy_image_to_buffer(command, image, layout, buffer, &regions);
+            if multisample {
+                for ((offset, (_, piece, _)), attachment) in batch.iter().zip(converted) {
+                    let image = self.attachment_access(
+                        attachment,
+                        AccessScope::new(
+                            vk::PipelineStageFlags2::COPY,
+                            vk::AccessFlags2::TRANSFER_READ,
+                        ),
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    )?;
+                    self.barriers.emit(&mut self.device);
+                    let region = vk::BufferImageCopy::default()
+                        .buffer_offset(slice.offset + offset)
+                        .image_subresource(
+                            vk::ImageSubresourceLayers::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .layer_count(1),
+                        )
+                        .image_extent(vk::Extent3D {
+                            width: piece.blocks,
+                            height: piece.rows,
+                            depth: 1,
+                        });
+                    unsafe {
+                        self.device.owner.device.cmd_copy_image_to_buffer(
+                            command,
+                            image,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            buffer,
+                            &[region],
+                        );
+                    }
+                    self.release_attachment(attachment)?;
+                }
+            } else {
+                let pieces: Vec<_> = batch.iter().map(|(_, (_, piece, _))| *piece).collect();
+                let (image, layout) =
+                    self.image_regions_access(id, &pieces, vk::AccessFlags2::TRANSFER_READ)?;
+                let regions: Vec<_> = batch
+                    .iter()
+                    .map(|(offset, (_, piece, _))| piece.region(slice.offset + offset))
+                    .collect();
+                self.barriers.emit(&mut self.device);
+                unsafe {
+                    self.device
+                        .owner
+                        .device
+                        .cmd_copy_image_to_buffer(command, image, layout, buffer, &regions);
+                }
             }
             host_read_barrier(&self.device, command, buffer, slice.offset, bytes);
-            self.flush()?;
-            let data = self.device.readback(ticket)?;
-            self.statistics.native_readback_bytes += bytes;
-            for (piece, offset) in batch.iter().zip(offsets) {
-                let end = piece.logical + piece.length;
-                while first_write < writes.len()
-                    && writes[first_write].offset + writes[first_write].end
-                        - writes[first_write].start
-                        <= piece.logical
-                {
-                    first_write += 1;
-                }
-                for write in &writes[first_write..] {
-                    if write.offset >= end {
-                        break;
-                    }
-                    let begin = write.offset.max(piece.logical);
-                    let stop = (write.offset + write.end - write.start).min(end);
-                    if begin < stop {
-                        let destination = (write.start + begin - write.offset) as usize;
-                        let source = (offset + begin - piece.logical) as usize;
-                        let length = (stop - begin) as usize;
-                        target[destination..destination + length]
-                            .copy_from_slice(&data[source..source + length]);
-                    }
+            let mut copies = Vec::new();
+            let mut windows = Vec::new();
+            for (offset, (key, piece, scatter)) in batch {
+                copies.extend(scatter.into_iter().map(|mut copy| {
+                    copy.source += offset as usize;
+                    copy
+                }));
+                if let Some(key) = key {
+                    windows.push((key, offset as usize, piece.length as usize));
                 }
             }
+            self.enqueue_cpu_transfer(
+                request,
+                Transfer {
+                    ticket,
+                    bytes,
+                    copies,
+                    windows,
+                },
+            );
         }
         Ok(())
     }

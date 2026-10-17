@@ -1550,6 +1550,7 @@ dependencies = [
  "nixe-memory",
  "nixe-video",
  "raw-window-handle",
+ "rspirv",
  "rustc-hash 1.1.0",
  "tempfile",
 ]

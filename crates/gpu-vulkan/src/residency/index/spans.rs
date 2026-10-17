@@ -1,4 +1,4 @@
-//! Exact byte intervals are a demand result, not the storage of an image layout.
+//! Exact byte intervals are a demand result, not the storage of a byte layout.
 use super::*;
 use crate::residency::ImagePlane;
 use ash::vk;
@@ -16,22 +16,45 @@ struct ImageSpans {
     full_page: OnceLock<bool>,
     logical_bounds: OnceLock<(u64, u64)>,
 }
-#[derive(Clone, Default)]
+#[derive(Clone)]
+enum Footprint {
+    Explicit(Vec<Span>),
+    Mapped(CanonicalBackingRange, CanonicalPageId),
+    Image(ImageSpans),
+}
+#[derive(Clone)]
 pub(in crate::residency) struct Spans {
-    buffer: Vec<Span>,
-    image: Option<ImageSpans>,
+    footprint: Footprint,
     pub lanes: u64,
 }
 impl From<Vec<Span>> for Spans {
     fn from(spans: Vec<Span>) -> Self {
         Self {
-            buffer: spans,
-            image: None,
+            footprint: Footprint::Explicit(spans),
             lanes: u64::MAX,
         }
     }
 }
 impl Spans {
+    pub fn mapped(backing: CanonicalBackingRange, page: CanonicalPageId) -> Self {
+        Self {
+            footprint: Footprint::Mapped(backing, page),
+            lanes: u64::MAX,
+        }
+    }
+    fn image_spans(&self) -> Option<&ImageSpans> {
+        match &self.footprint {
+            Footprint::Image(image) => Some(image),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    fn image_spans_mut(&mut self) -> Option<&mut ImageSpans> {
+        match &mut self.footprint {
+            Footprint::Image(image) => Some(image),
+            _ => None,
+        }
+    }
     pub fn image(
         backing: CanonicalBackingRange,
         page: CanonicalPageId,
@@ -50,8 +73,7 @@ impl Spans {
             u64::MAX
         };
         Self {
-            buffer: Vec::new(),
-            image: Some(ImageSpans {
+            footprint: Footprint::Image(ImageSpans {
                 backing,
                 page,
                 plane,
@@ -66,7 +88,7 @@ impl Spans {
         }
     }
     pub fn same_mapping(&self, other: &Self) -> bool {
-        match (&self.image, &other.image) {
+        match (self.image_spans(), other.image_spans()) {
             (Some(a), Some(b)) => a.plane == b.plane && a.backing.same_byte_mapping(&b.backing),
             _ => false,
         }
@@ -74,7 +96,7 @@ impl Spans {
     /// Reject pages outside a rectangle using a retained logical bound before
     /// expanding the page's byte permutation. The bound may be conservative.
     pub fn clipped_image_rect(&self, rect: vk::Rect2D) -> Option<Self> {
-        let image = self.image.as_ref().expect("image footprint");
+        let image = self.image_spans().expect("image footprint");
         let p = image.plane;
         debug_assert_eq!(image.rect, crate::residency::transfers::full_rect(p));
         let (start, end) = *image.logical_bounds.get_or_init(|| {
@@ -101,13 +123,12 @@ impl Spans {
         clipped.rect = rect;
         clipped.full_page = OnceLock::new();
         Some(Self {
-            buffer: Vec::new(),
-            image: Some(clipped),
+            footprint: Footprint::Image(clipped),
             lanes: self.lanes,
         })
     }
     pub fn covers(&self, other: &Self) -> bool {
-        match (&self.image, &other.image) {
+        match (self.image_spans(), other.image_spans()) {
             (Some(a), Some(b)) => {
                 // Prove physical coverage first. Comparing two complete backing
                 // maps once per page makes reinterpretation quadratic in pages.
@@ -125,40 +146,54 @@ impl Spans {
         }
     }
     pub fn covers_physical_page(&self) -> bool {
-        self.image.as_ref().is_some_and(ImageSpans::covers_page)
+        self.image_spans().is_some_and(ImageSpans::covers_page)
     }
     #[cfg(test)]
     pub fn is_compact(&self) -> bool {
-        self.image.is_some() && self.buffer.is_empty()
+        !matches!(self.footprint, Footprint::Explicit(_))
     }
     pub fn push(&mut self, span: Span) {
-        debug_assert!(self.image.is_none());
-        self.buffer.push(span);
+        let Footprint::Explicit(spans) = &mut self.footprint else {
+            unreachable!("explicit buffer footprint")
+        };
+        spans.push(span);
     }
     pub fn sort_buffer(&mut self) {
-        debug_assert!(self.image.is_none());
-        self.buffer
-            .sort_unstable_by_key(|span| (span.start, span.logical));
+        let Footprint::Explicit(spans) = &mut self.footprint else {
+            unreachable!("explicit buffer footprint")
+        };
+        spans.sort_unstable_by_key(|span| (span.start, span.logical));
     }
-    /// Exact intervals exist only for this demand; image storage stays compact.
+    /// Exact intervals exist only for this demand; tiled storage stays compact.
     pub fn exact(&self) -> Cow<'_, [Span]> {
-        if self.image.is_some() {
-            Cow::Owned(self.expand())
-        } else {
-            Cow::Borrowed(&self.buffer)
+        match &self.footprint {
+            Footprint::Explicit(spans) => Cow::Borrowed(spans),
+            _ => Cow::Owned(self.expand()),
         }
     }
     pub fn exact_iter(&self) -> ExactSpans<'_> {
         match self.exact() {
-            Cow::Owned(spans) => ExactSpans::Image(spans.into_iter()),
-            Cow::Borrowed(spans) => ExactSpans::Buffer(spans.iter()),
+            Cow::Owned(spans) => ExactSpans::Owned(spans.into_iter()),
+            Cow::Borrowed(spans) => ExactSpans::Borrowed(spans.iter()),
         }
     }
     pub fn disjoint(&self, other: &Self) -> bool {
         self.lanes & other.lanes == 0
     }
     fn expand(&self) -> Vec<Span> {
-        let Some(image) = &self.image else {
+        if let Footprint::Mapped(backing, page) = &self.footprint {
+            let mut spans = Vec::new();
+            backing.visit_page_mappings(*page, &mut |logical, start, size| {
+                spans.push(Span {
+                    start,
+                    end: start + size,
+                    logical,
+                });
+            });
+            spans.sort_unstable_by_key(|s| (s.start, s.logical));
+            return spans;
+        }
+        let Some(image) = self.image_spans() else {
             return Vec::new();
         };
         let p = image.plane;
@@ -232,15 +267,15 @@ impl Spans {
     }
 }
 pub(in crate::residency) enum ExactSpans<'a> {
-    Image(std::vec::IntoIter<Span>),
-    Buffer(std::slice::Iter<'a, Span>),
+    Owned(std::vec::IntoIter<Span>),
+    Borrowed(std::slice::Iter<'a, Span>),
 }
 impl Iterator for ExactSpans<'_> {
     type Item = Span;
     fn next(&mut self) -> Option<Span> {
         match self {
-            Self::Image(spans) => spans.next(),
-            Self::Buffer(spans) => spans.next().copied(),
+            Self::Owned(spans) => spans.next(),
+            Self::Borrowed(spans) => spans.next().copied(),
         }
     }
 }
@@ -393,7 +428,7 @@ mod tests {
             &candidates[2],
             &candidates[4],
         ] {
-            let p = candidate.image.as_ref().unwrap().plane;
+            let p = candidate.image_spans().unwrap().plane;
             for y in 0..p.extent.height {
                 for x in 0..p.extent.width {
                     let rect = vk::Rect2D {
@@ -407,7 +442,7 @@ mod tests {
                         },
                     };
                     let mut direct = candidate.clone();
-                    direct.image.as_mut().unwrap().rect = rect;
+                    direct.image_spans_mut().unwrap().rect = rect;
                     let tuples = |spans: &[Span]| {
                         spans
                             .iter()
@@ -443,8 +478,8 @@ mod tests {
         }
         // Repeated projections cannot prove full coverage by byte count.
         let mut repeated = candidates[0].clone();
-        repeated.image.as_mut().unwrap().repeated = true;
-        repeated.image.as_mut().unwrap().full_page = OnceLock::new();
-        assert!(!repeated.image.as_ref().unwrap().covers_page());
+        repeated.image_spans_mut().unwrap().repeated = true;
+        repeated.image_spans_mut().unwrap().full_page = OnceLock::new();
+        assert!(!repeated.image_spans().unwrap().covers_page());
     }
 }

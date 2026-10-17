@@ -171,21 +171,29 @@ fn native_cached_compute_deduplicates_persists_and_retains_in_flight_objects() {
             range: 8,
         }]) as Box<[DescriptorResource]>
     };
-    let record = descriptors
-        .get(Arc::clone(&pipeline.layout), resources())
-        .unwrap();
+    let record = descriptors.get(&pipeline.layout, &resources()).unwrap();
     assert!(Arc::ptr_eq(
         &record,
-        &descriptors
-            .get(Arc::clone(&pipeline.layout), resources())
-            .unwrap()
+        &descriptors.get(&pipeline.layout, &resources()).unwrap()
     ));
     device.bind_native_pipeline(&pipeline).unwrap();
-    device.bind_native_descriptors(&pipeline, &record).unwrap();
+    device
+        .bind_native_descriptors(
+            &pipeline,
+            &record,
+            &vec![0; pipeline.layout.dynamic_bindings.len()],
+        )
+        .unwrap();
     let counts = (Arc::strong_count(&pipeline), Arc::strong_count(&record));
     for _ in 0..100 {
         device.bind_native_pipeline(&pipeline).unwrap();
-        device.bind_native_descriptors(&pipeline, &record).unwrap();
+        device
+            .bind_native_descriptors(
+                &pipeline,
+                &record,
+                &vec![0; pipeline.layout.dynamic_bindings.len()],
+            )
+            .unwrap();
     }
     assert_eq!(
         counts,
@@ -589,15 +597,23 @@ fn descriptor_pressure(api: ApiPreference) {
             range: 8,
         }]) as Box<[DescriptorResource]>
     };
-    let first = cache
-        .get(Arc::clone(&pipeline.layout), resources(0))
-        .unwrap();
-    let second = cache
-        .get(Arc::clone(&pipeline.layout), resources(alignment))
-        .unwrap();
+    let first = cache.get(&pipeline.layout, &resources(0)).unwrap();
+    let second = cache.get(&pipeline.layout, &resources(alignment)).unwrap();
     device.bind_native_pipeline(&pipeline).unwrap();
-    device.bind_native_descriptors(&pipeline, &first).unwrap();
-    device.bind_native_descriptors(&pipeline, &second).unwrap();
+    device
+        .bind_native_descriptors(
+            &pipeline,
+            &first,
+            &vec![0; pipeline.layout.dynamic_bindings.len()],
+        )
+        .unwrap();
+    device
+        .bind_native_descriptors(
+            &pipeline,
+            &second,
+            &vec![0; pipeline.layout.dynamic_bindings.len()],
+        )
+        .unwrap();
     let mut gate = gate::Gate::new(&device);
     let waits = [vk::SemaphoreSubmitInfo::default()
         .semaphore(gate.handle)
@@ -614,17 +630,23 @@ fn descriptor_pressure(api: ApiPreference) {
     drop(first);
     drop(second);
     assert!(matches!(
-        cache.get(Arc::clone(&pipeline.layout), resources(alignment * 2)),
+        cache.get(&pipeline.layout, &resources(alignment * 2)),
         Err(VulkanError::DescriptorPressure)
     ));
     gate.signal();
     assert!(device.wait_for_work(work, Duration::from_secs(10)).unwrap());
     let third = cache
-        .get(Arc::clone(&pipeline.layout), resources(alignment * 2))
+        .get(&pipeline.layout, &resources(alignment * 2))
         .unwrap();
     assert_eq!(cache.statistics().resets, 1);
     device.bind_native_pipeline(&pipeline).unwrap();
-    device.bind_native_descriptors(&pipeline, &third).unwrap();
+    device
+        .bind_native_descriptors(
+            &pipeline,
+            &third,
+            &vec![0; pipeline.layout.dynamic_bindings.len()],
+        )
+        .unwrap();
     let next = device.flush().unwrap().unwrap();
     assert!(device.wait_for_work(next, Duration::from_secs(10)).unwrap());
     drop(third);
@@ -675,4 +697,202 @@ fn native_sampler_cache_reuses_semantics_and_evicts_only_cache_ownership() {
     drop(second);
     drop(device);
     validation.check().unwrap();
+}
+
+#[test]
+fn dynamic_offsets_reuse_one_set_and_preserve_bounds_and_gpu_leases() {
+    let Some(mut device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let root = tempfile::tempdir().unwrap();
+    let config = CacheConfiguration {
+        directory: Some(root.path().to_path_buf()),
+        ..Default::default()
+    };
+    let pool = Arc::new(CompilePool::new(config.workers, config.pending_jobs).unwrap());
+    let shaders = ShaderCompiler::new(NS, Arc::clone(&pool), &config);
+    let pipelines = PipelineCompiler::new(&device, Arc::clone(&pool), &config).unwrap();
+    let shader = ready(
+        shaders
+            .request(
+                ContentId::of(b"test-source", &[b"dynamic-increment7"]),
+                Box::new([device.shader_options()]),
+                || Ok(Box::new([kernel(7)])),
+                |fs| fs.iter().collect(),
+            )
+            .unwrap(),
+    );
+    let pipeline = ready(pipelines.request(PipelineRecipe::Compute(shader)).unwrap());
+    assert_eq!(&*pipeline.layout.dynamic_bindings, &[0]);
+    let alignment = device
+        .profile()
+        .limits
+        .min_storage_buffer_offset_alignment
+        .max(8);
+    let buffer = Arc::new(
+        device
+            .allocate_buffer(
+                alignment + 8,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::GpuToCpu,
+                AllocationMode::Managed,
+                "dynamic descriptor windows",
+            )
+            .unwrap(),
+    );
+    unsafe {
+        buffer.write_range(0, &17u32.to_le_bytes()).unwrap();
+        buffer.write_range(alignment, &29u32.to_le_bytes()).unwrap();
+    }
+    let mut descriptors = DescriptorCache::new(&device, 64);
+    let mut resources = [DescriptorResource::Buffer {
+        buffer: Arc::clone(&buffer),
+        offset: 0,
+        range: 8,
+    }];
+    let first_offsets = pipeline
+        .layout
+        .split_dynamic_offsets(&mut resources, &device.profile().limits, Vec::new())
+        .unwrap();
+    let record = descriptors.get(&pipeline.layout, &resources).unwrap();
+    let DescriptorResource::Buffer { offset, .. } = &mut resources[0] else {
+        unreachable!()
+    };
+    *offset = alignment;
+    let second_offsets = pipeline
+        .layout
+        .split_dynamic_offsets(&mut resources, &device.profile().limits, Vec::new())
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &record,
+        &descriptors.get(&pipeline.layout, &resources).unwrap()
+    ));
+    assert_eq!(descriptors.statistics().updates, 1);
+    device.bind_native_pipeline(&pipeline).unwrap();
+    device
+        .bind_native_descriptors(&pipeline, &record, &first_offsets)
+        .unwrap();
+    let slot = device.submission.recording.unwrap();
+    let command = device.submission.slots[slot].command;
+    unsafe { device.owner.device.cmd_dispatch(command, 1, 1, 1) };
+    device
+        .bind_native_descriptors(&pipeline, &record, &second_offsets)
+        .unwrap();
+    let binds = device.recording_statistics().descriptor_binds;
+    device
+        .bind_native_descriptors(&pipeline, &record, &second_offsets)
+        .unwrap();
+    assert_eq!(device.recording_statistics().descriptor_binds, binds);
+    assert!(
+        device
+            .bind_native_descriptors(&pipeline, &record, &[])
+            .is_err()
+    );
+    assert!(
+        device
+            .bind_native_descriptors(&pipeline, &record, &[(alignment * 2) as u32])
+            .is_err()
+    );
+    if device.profile().limits.min_storage_buffer_offset_alignment > 1 {
+        assert!(
+            device
+                .bind_native_descriptors(&pipeline, &record, &[1])
+                .is_err()
+        );
+    }
+    unsafe {
+        device.owner.device.cmd_dispatch(command, 1, 1, 1);
+        let barriers = [vk::BufferMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+            .dst_access_mask(vk::AccessFlags2::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(buffer.handle)
+            .size(buffer.size())];
+        device.dispatch.barrier(
+            command,
+            &vk::DependencyInfo::default().buffer_memory_barriers(&barriers),
+        );
+    }
+    let work = device.flush().unwrap().unwrap();
+    // Command slots retain the immutable set after its cache is destroyed.
+    drop(descriptors);
+    drop(record);
+    drop(resources);
+    assert!(device.wait_for_work(work, Duration::from_secs(10)).unwrap());
+    assert_eq!(
+        unsafe { buffer.read_range(4, 4) }.unwrap(),
+        24u32.to_le_bytes()
+    );
+    assert_eq!(
+        unsafe { buffer.read_range(alignment + 4, 4) }.unwrap(),
+        36u32.to_le_bytes()
+    );
+    drop(buffer);
+    drop(pipeline);
+    drop(pipelines);
+    drop(shaders);
+    drop(pool);
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+fn stage_reuse_precedes_emission_across_programs_and_restored_disk_artifacts() {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let monitor = device.validation_monitor();
+    let root = tempfile::tempdir().unwrap();
+    let config = CacheConfiguration {
+        directory: Some(root.path().to_path_buf()),
+        ..Default::default()
+    };
+    let pool = Arc::new(CompilePool::new(2, 16).unwrap());
+    let shaders = ShaderCompiler::new(NS, Arc::clone(&pool), &config);
+    let opts = device.shader_options();
+    let source = |value| ContentId::of(b"stage-program-test", &[&[value]]);
+    let request = |compiler: &ShaderCompiler, value| {
+        ready(
+            compiler
+                .request(
+                    source(value),
+                    Box::new([opts]),
+                    || Ok(Box::new([kernel(7)])),
+                    |fs| fs.iter().collect(),
+                )
+                .unwrap(),
+        )
+    };
+    let first = request(&shaders, 1);
+    let related = request(&shaders, 2);
+    assert!(!Arc::ptr_eq(&first, &related));
+    assert!(
+        Arc::ptr_eq(&first.stages[0], &related.stages[0]),
+        "different program misses must share the pre-emission stage"
+    );
+    drop(shaders);
+    let restored = ShaderCompiler::new(NS, pool, &config);
+    let disk = ready(
+        restored
+            .request::<Box<[Function; 1]>>(
+                source(1),
+                Box::new([opts]),
+                || panic!("disk hit must not translate"),
+                |fs| fs.iter().collect(),
+            )
+            .unwrap(),
+    );
+    assert!(disk.timings.disk_hit);
+    let fresh = request(&restored, 3);
+    assert!(
+        Arc::ptr_eq(&disk.stages[0], &fresh.stages[0]),
+        "disk hydration must register its semantic stage key"
+    );
+    drop(restored);
+    drop(device);
+    monitor.check().unwrap();
 }

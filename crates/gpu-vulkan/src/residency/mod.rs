@@ -6,6 +6,7 @@ mod buffer;
 pub(crate) mod commands;
 mod conversion;
 pub(crate) use conversion::stage as helper_stage;
+mod cpu_readback;
 mod decoded_texture;
 pub(crate) mod execution;
 mod footprint;
@@ -25,6 +26,7 @@ pub use commands::{AttachmentLoad, AttachmentStore};
 pub use conversion::{PreparedNv12, nv12_pipeline};
 mod sync;
 pub use sync::{AccessScope, BarrierPolicy, BarrierStatistics, LayoutPolicy, RecordingPolicy};
+pub(crate) mod video;
 mod visibility;
 use crate::{
     AllocatedBuffer, AllocatedImage, AllocationMode, MemoryLocation, VulkanDevice, VulkanError,
@@ -153,7 +155,16 @@ pub struct BufferUpload {
     pub work: WorkTicket,
     pub consumed: usize,
 }
+struct KnownBufferBytes {
+    bytes: Arc<[u8]>,
+    /// A completion effect needs no physical transfer until a GPU access.
+    pending_upload: bool,
+}
 struct BufferEntry {
+    /// Immutable host-authored payload, valid until another native producer.
+    /// CPU publication still waits for the actual producing ticket, including
+    /// when the physical buffer has never been consumed by the GPU.
+    known: Option<KnownBufferBytes>,
     streaming_cpu: Option<CanonicalCpuWriteDependency>,
     streamed: Option<buffer::StreamedBuffer>,
     image_import: Option<buffer::ImageBufferImport>,
@@ -271,10 +282,11 @@ pub struct VulkanResidency {
     releases: mpsc::Receiver<PresentationRelease>,
     release_sender: mpsc::Sender<PresentationRelease>,
     budget: AllocationBudget,
-    pending_writes: Vec<CanonicalBackingRange>,
+    pending_writes: Vec<(CanonicalBackingRange, DeviceVisibilityPoint)>,
     published_writes: usize,
     statistics: ResidencyStatistics,
     image_readbacks: readback::ImageReadbacks,
+    cpu_readbacks: rustc_hash::FxHashMap<CpuVisibilityRequest, cpu_readback::CpuReadback>,
     barriers: sync::Barriers,
     decoder: nixe_gpu::texture_decode::BlockDecoder,
     sample_conversion: Option<sample_readback::SampleConversion>,
@@ -286,6 +298,8 @@ pub struct VulkanResidency {
     unified_layouts: bool,
     /// Entries needed by a cold reconstruction cannot be evicted by its allocations.
     constructing: Vec<Resource>,
+    descriptor_resources: Vec<crate::cache::DescriptorResource>,
+    descriptor_offsets: Vec<u32>,
 }
 impl VulkanResidency {
     pub fn new(device: VulkanDevice, bytes: u64) -> Result<Self, VulkanError> {
@@ -321,6 +335,7 @@ impl VulkanResidency {
             published_writes: 0,
             statistics: ResidencyStatistics::default(),
             image_readbacks: readback::ImageReadbacks::default(),
+            cpu_readbacks: Default::default(),
             barriers: sync::Barriers::default(),
             decoder: Default::default(),
             sample_conversion: None,
@@ -331,6 +346,8 @@ impl VulkanResidency {
             barrier_policy: BarrierPolicy::default(),
             unified_layouts,
             constructing: Vec::new(),
+            descriptor_resources: Vec::new(),
+            descriptor_offsets: Vec::new(),
         })
     }
     pub fn device(&self) -> &VulkanDevice {
@@ -363,9 +380,11 @@ impl VulkanResidency {
     }
     fn gpu_owned(&self, page: CanonicalPageId, state: VisibilityState) -> bool {
         matches!(state, VisibilityState::GpuNewer { .. })
-            || self.index.pages.get(&page).is_some_and(|page| {
-                page.has_unsubmitted_write(self.device.queue_usage().submitted_tick)
-            })
+            || self
+                .index
+                .pages
+                .get(&page)
+                .is_some_and(|page| page.has_unsubmitted_write(self.device.submitted_visibility()))
     }
     fn contents(&self, resource: Resource) -> Result<&Contents, VulkanError> {
         match resource {
@@ -437,10 +456,19 @@ impl VulkanResidency {
         }
     }
     fn authoritative(&self, resource: Resource) -> bool {
-        self.index
-            .pages
-            .values()
-            .any(|page| page.has_source(resource))
+        // A resource can produce bytes only on its own canonical backing.
+        // Scanning every resident page for every eviction candidate made large
+        // scene loads quadratic in unrelated resources and image intervals.
+        self.contents(resource)
+            .expect("resident authority candidate")
+            .backing
+            .pages()
+            .any(|backing| {
+                self.index
+                    .pages
+                    .get(&backing.identity())
+                    .is_some_and(|page| page.has_source(resource))
+            })
     }
     fn reserve(&mut self, bytes: u64) -> Result<Option<AllocationCharge>, VulkanError> {
         self.drain_notifications();
@@ -448,6 +476,14 @@ impl VulkanResidency {
             return Ok(Some(charge));
         }
         self.device.poll_progress()?;
+        // Descriptor lookups are reconstructible; completed slot caches must
+        // not pin otherwise evictable resources under residency pressure.
+        // In-flight records retain their leases until actual GPU completion.
+        for slot in &mut self.device.submission.slots {
+            if let Some(descriptors) = &mut slot.stream_descriptors {
+                descriptors.trim();
+            }
+        }
         while self
             .budget
             .used()
@@ -466,7 +502,7 @@ impl VulkanResidency {
     }
     pub fn evict_one(&mut self) -> Result<bool, VulkanError> {
         self.drain_notifications();
-        let candidate = self
+        let mut candidates: Vec<_> = self
             .buffers
             .iter()
             .enumerate()
@@ -508,11 +544,17 @@ impl VulkanResidency {
                         )
                     })
             }))
-            .filter(|(resource, _)| {
-                !self.constructing.contains(resource) && !self.authoritative(*resource)
-            })
-            .min_by_key(|(_, contents)| contents.touched)
-            .map(|(resource, _)| resource);
+            .filter(|(resource, _)| !self.constructing.contains(resource))
+            .map(|(resource, contents)| (contents.touched, resource))
+            .collect();
+        // Under allocation pressure, prove authority only until a usable LRU
+        // candidate is found. Do not resolve every candidate's image footprints
+        // just to select the oldest reconstructible allocation.
+        candidates.sort_unstable_by_key(|&(age, _)| age);
+        let candidate = candidates
+            .into_iter()
+            .map(|(_, resource)| resource)
+            .find(|&resource| !self.authoritative(resource));
         let Some(resource) = candidate else {
             return Ok(false);
         };
@@ -531,14 +573,14 @@ impl VulkanResidency {
                 if self.buffers[id.slot].generation < u32::MAX {
                     self.free_buffers.push(id.slot);
                 }
-                self.index.remove(resource, &entry.contents.backing);
+                self.remove_resident_binding(resource, &entry.contents.backing);
                 if let Some(last_use) = entry.contents.last_use {
                     self.device.retire_buffer(entry.native, last_use)?;
                 }
             }
             Resource::Image(id) => {
                 let entry = self.images[id.slot].entry.take().expect("candidate");
-                self.index.remove(resource, &entry.contents.backing);
+                self.remove_resident_binding(resource, &entry.contents.backing);
                 if let Some(last_use) = entry.contents.last_use {
                     self.device
                         .retire_image_views(entry.native_views, last_use)?;
@@ -548,6 +590,17 @@ impl VulkanResidency {
         }
         self.statistics.evictions += 1;
         Ok(true)
+    }
+    fn remove_resident_binding(&mut self, resource: Resource, range: &CanonicalBackingRange) {
+        self.index.remove(resource, range);
+        // Baselines outlive individual alias imports, but not the last
+        // resident binding. Authoritative producers cannot be evicted.
+        let mut pages = self.visibility.pages.lock().unwrap();
+        for page in range.pages() {
+            if self.index.pages.get(&page.identity()).is_none() {
+                pages.remove(&page.identity());
+            }
+        }
     }
     fn unpin(&mut self, resource: Resource) {
         let index = self
@@ -631,6 +684,21 @@ impl VulkanResidency {
         offset: u64,
         size: u64,
     ) -> Result<(), VulkanError> {
+        let work = self.device.work_ticket()?;
+        let point = self.device.visibility_point()?;
+        self.record_authority_at(resource, offset, size, point, Some(work))
+    }
+    fn record_authority_at(
+        &mut self,
+        resource: Resource,
+        offset: u64,
+        size: u64,
+        point: DeviceVisibilityPoint,
+        work: Option<WorkTicket>,
+    ) -> Result<(), VulkanError> {
+        if let Resource::Buffer(id) = resource {
+            self.buffers[id.slot].entry.as_mut().expect("buffer").known = None;
+        }
         if let Resource::Image(id) = resource
             && self.image(id)?.decoded.is_some()
         {
@@ -643,8 +711,6 @@ impl VulkanResidency {
             .backing
             .snapshot_subrange(offset, size)
             .map_err(memory_error)?;
-        let work = self.device.work_ticket()?;
-        let point = DeviceVisibilityPoint::new(work.tick());
         let mut logical = offset;
         for segment in range.segments() {
             self.invalidate_aliases(
@@ -669,8 +735,10 @@ impl VulkanResidency {
             );
             logical += segment.size();
         }
-        self.pending_writes.push(range);
-        self.contents_mut(resource).last_use = Some(work);
+        self.pending_writes.push((range, point));
+        if let Some(work) = work {
+            self.contents_mut(resource).last_use = Some(work);
+        }
         self.contents_mut(resource).validate_interval(offset, size);
         Ok(())
     }
@@ -680,19 +748,29 @@ impl VulkanResidency {
         offset: u64,
         size: u64,
     ) -> Result<(), VulkanError> {
+        self.device.work_ticket()?;
+        let point = self.device.visibility_point()?;
+        self.prepare_write_at(resource, offset, size, point)
+    }
+    fn prepare_write_at(
+        &mut self,
+        resource: Resource,
+        offset: u64,
+        size: u64,
+        point: DeviceVisibilityPoint,
+    ) -> Result<(), VulkanError> {
         let range = self
             .contents(resource)?
             .backing
             .snapshot_subrange(offset, size)
             .map_err(memory_error)?;
-        let tick = self.device.work_ticket()?.tick();
         CanonicalBackingRange::prepare_resident_device_accesses(
             [(
                 &range,
                 DeviceAccessDeclaration::write(
                     NonCpuDeviceId::new(self.instance.get()),
-                    DeviceVisibilityPoint::new(tick),
-                    DeviceVisibilityPoint::new(tick),
+                    point,
+                    point,
                 )
                 .map_err(memory_error)?,
             )],
@@ -721,6 +799,80 @@ impl VulkanResidency {
             consumed,
         })
     }
+    /// CPU uploads belong at their position in the recorded stream. Prior draws
+    /// already own immutable upload slices there, so no submission boundary is
+    /// required. Device-owned pages retain the native write path, including
+    /// producers recorded earlier in the same unsubmitted command buffer.
+    pub(crate) fn inline_write_is_cpu(
+        &self,
+        target: &CanonicalBackingRange,
+        offset: u64,
+        size: u64,
+    ) -> bool {
+        target
+            .segments_between(offset, offset + size)
+            .all(|(_, segment)| {
+                !self.gpu_owned(segment.page(), segment.visibility_state())
+                    && matches!(
+                        segment.visibility_state(),
+                        VisibilityState::Clean | VisibilityState::CpuNewer
+                    )
+            })
+    }
+
+    /// Completely replace a retained byte view; no old native bytes are read.
+    pub(crate) fn write_memory(
+        &mut self,
+        target: CanonicalBackingRange,
+        offset: u64,
+        bytes: &Arc<[u8]>,
+        after_prior_work: bool,
+    ) -> Result<(), VulkanError> {
+        if bytes.is_empty() {
+            return Err(VulkanError::InvalidResource(
+                "ordered write payload size mismatch",
+            ));
+        }
+        let target = target
+            .snapshot_subrange(offset, bytes.len() as u64)
+            .map_err(memory_error)?;
+        let id = self.buffer_for_deferred_import(target, vk::BufferUsageFlags::TRANSFER_DST)?;
+        let dependency = self.buffer(id)?.contents.cpu.clone();
+        if after_prior_work {
+            if self.device.submission.recording.is_none() {
+                self.device.end_visibility_scope();
+            }
+            self.order_device()?;
+            let point = self.device.visibility_point()?;
+            self.prepare_write_at(Resource::Buffer(id), 0, bytes.len() as u64, point)?;
+        } else {
+            self.prepare_write(Resource::Buffer(id), 0, bytes.len() as u64)?;
+        }
+        dependency.rearm().map_err(memory_error)?;
+        // This replaces the complete retained view, so an unconsumed older
+        // literal is superseded without first uploading it. Earlier GPU readers
+        // have already materialized their version in queue order.
+        self.buffers[id.slot].entry.as_mut().expect("buffer").known = None;
+        if !after_prior_work {
+            self.upload_buffer(id, 0, bytes)?;
+        }
+        if after_prior_work {
+            let point = self.device.visibility_point()?;
+            self.record_authority_at(Resource::Buffer(id), 0, bytes.len() as u64, point, None)?;
+        } else {
+            self.record_authority(Resource::Buffer(id), 0, bytes.len() as u64)?;
+        }
+        self.buffers[id.slot].entry.as_mut().expect("buffer").known = Some(KnownBufferBytes {
+            bytes: Arc::clone(bytes),
+            pending_upload: after_prior_work,
+        });
+        // Host-authored effects with no new GPU commands already have an
+        // accepted producer prefix. Publish ownership without inventing work.
+        if self.device.submission.recording.is_none() {
+            self.accept_recording()?;
+        }
+        Ok(())
+    }
     pub fn copy_buffer(
         &mut self,
         source: BufferId,
@@ -729,8 +881,24 @@ impl VulkanResidency {
         destination_offset: u64,
         size: u64,
     ) -> Result<WorkTicket, VulkanError> {
+        self.check_buffer_range(source, source_offset, size)?;
+        self.check_buffer_range(destination, destination_offset, size)?;
+        if source == destination && source_offset == destination_offset {
+            // A logical no-op must retain a deferred literal and its producer.
+            return self.device.work_ticket();
+        }
         self.ensure_buffer(source)?;
-        self.ensure_buffer(destination)?;
+        if destination_offset == 0 && size == self.buffer(destination)?.contents.backing.size() {
+            // Every destination byte is replaced. Preserve canonical mixed-page
+            // authority below, but do not upload an obsolete native baseline.
+            self.buffers[destination.slot]
+                .entry
+                .as_mut()
+                .expect("buffer")
+                .known = None;
+        } else {
+            self.ensure_buffer(destination)?;
+        }
         self.prepare_write(Resource::Buffer(destination), destination_offset, size)?;
         self.copy_source(
             Resource::Buffer(source),
@@ -751,20 +919,19 @@ impl VulkanResidency {
         if self.published_writes == self.pending_writes.len() {
             return Ok(());
         }
-        let tick = self.device.work_ticket()?.tick();
-        let declaration = DeviceAccessDeclaration::write(
-            NonCpuDeviceId::new(self.instance.get()),
-            DeviceVisibilityPoint::new(tick),
-            DeviceVisibilityPoint::new(tick),
-        )
-        .map_err(memory_error)?;
-        CanonicalBackingRange::publish_device_writes(
+        let device = NonCpuDeviceId::new(self.instance.get());
+        let declarations =
             self.pending_writes[self.published_writes..]
                 .iter()
-                .map(|range| (range, declaration)),
-            self.visibility.clone(),
-        )
-        .map_err(memory_error)?;
+                .map(|(range, point)| {
+                    (
+                        range,
+                        DeviceAccessDeclaration::write(device, *point, *point)
+                            .expect("issued visibility version has a valid device declaration"),
+                    )
+                });
+        CanonicalBackingRange::publish_device_writes(declarations, self.visibility.clone())
+            .map_err(memory_error)?;
         self.published_writes = self.pending_writes.len();
         Ok(())
     }
@@ -777,7 +944,10 @@ impl VulkanResidency {
         waits: &[vk::SemaphoreSubmitInfo<'_>],
         signals: &[vk::SemaphoreSubmitInfo<'_>],
     ) -> Result<Option<WorkTicket>, VulkanError> {
-        self.barriers.emit(&mut self.device);
+        self.accept_recording()?;
+        if self.device.submission.recording.is_some() {
+            self.barriers.emit(&mut self.device);
+        }
         let work = match unsafe {
             self.device
                 .submission
@@ -785,85 +955,15 @@ impl VulkanResidency {
         } {
             Ok(work) => work,
             Err(error) => {
-                let _ =
-                    CanonicalBackingRange::invalidate_visibility_ranges(self.pending_writes.iter());
+                let _ = CanonicalBackingRange::invalidate_visibility_ranges(
+                    self.pending_writes.iter().map(|(range, _)| range),
+                );
                 return Err(error);
             }
         };
-        if let Some(work) = work
-            && self.published_writes != self.pending_writes.len()
-        {
-            let declaration = DeviceAccessDeclaration::write(
-                NonCpuDeviceId::new(self.instance.get()),
-                DeviceVisibilityPoint::new(work.tick()),
-                DeviceVisibilityPoint::new(work.tick()),
-            )
-            .map_err(memory_error)?;
-            CanonicalBackingRange::publish_device_writes(
-                self.pending_writes[self.published_writes..]
-                    .iter()
-                    .map(|range| (range, declaration)),
-                self.visibility.clone(),
-            )
-            .map_err(memory_error)?;
-        }
-        if work.is_some() {
-            self.pending_writes.clear();
-            self.published_writes = 0;
-        }
+        self.pending_writes.clear();
+        self.published_writes = 0;
         Ok(work)
-    }
-    /// Resolves this owner inline. The memory coordinator validates the returned
-    /// version and calls release_cpu_page only after canonical publication.
-    pub fn materialize_cpu_page(
-        &mut self,
-        request: CpuVisibilityRequest,
-    ) -> Result<Box<[u8]>, VulkanError> {
-        if request.device != NonCpuDeviceId::new(self.instance.get()) {
-            return Err(VulkanError::InvalidResource(
-                "CPU visibility requested from foreign Vulkan owner",
-            ));
-        }
-        self.flush()?;
-        let mut bytes = {
-            let pages = self.visibility.pages.lock().unwrap();
-            let page = pages
-                .get(&request.page)
-                .ok_or(VulkanError::InvalidResource(
-                    "CPU visibility has no preserved page baseline",
-                ))?;
-            if page.bytes.len() != request.size {
-                return Err(VulkanError::InvalidResource(
-                    "CPU visibility page size mismatch",
-                ));
-            }
-            if page
-                .completed
-                .is_some_and(|point| point >= request.visible_at)
-            {
-                return Ok(page.bytes.clone());
-            }
-            page.bytes.clone()
-        };
-        let writes = self
-            .index
-            .pages
-            .get(&request.page)
-            .map(|page| page.resolved_writes())
-            .unwrap_or_default();
-        let mut completed = request.visible_at;
-        self.read_authorities(&writes, &mut bytes)?;
-        for write in writes {
-            completed = completed.max(write.point);
-        }
-        self.visibility.pages.lock().unwrap().insert(
-            request.page,
-            visibility::CpuPage {
-                bytes: bytes.clone(),
-                completed: Some(completed),
-            },
-        );
-        Ok(bytes)
     }
     /// Explicit preservation for allocation pressure, distinct from automatic
     /// eviction of reconstructible entries. Only this resource's canonical
@@ -875,7 +975,7 @@ impl VulkanResidency {
         self.preserve(Resource::Image(id))
     }
     fn preserve(&mut self, resource: Resource) -> Result<(), VulkanError> {
-        self.flush()?;
+        self.accept_recording()?;
         let backing = self.contents(resource)?.backing.clone();
         let mut visited = std::collections::HashSet::new();
         let mut logical = 0;
@@ -922,7 +1022,6 @@ impl VulkanResidency {
         size: u64,
     ) -> Result<Vec<u8>, VulkanError> {
         self.ensure_buffer(id)?;
-        self.flush()?;
         self.read_buffer_native(id, offset, size)
     }
 }

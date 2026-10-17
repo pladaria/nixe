@@ -4,11 +4,12 @@ use nixe_gpu::{
     ShaderResourceKind, ShaderStage,
     ssa::{
         Function, ResourceId,
-        artifact::{ArtifactKey, ContentId, ShaderNamespace, specialization},
+        artifact::{ArtifactKey, ContentId, ShaderNamespace, StageKey, specialization},
         spirv,
     },
 };
 use std::{sync::Arc, time::Instant};
+mod stages;
 
 #[derive(Clone, Debug)]
 pub struct CompiledStage {
@@ -18,6 +19,7 @@ pub struct CompiledStage {
     pub workgroup_size: Option<[u32; 3]>,
     pub shared_memory_bytes: u32,
     pub output_control_points: Option<u32>,
+    semantic: Option<StageKey>,
 }
 impl CompiledStage {
     pub fn new(
@@ -36,6 +38,7 @@ impl CompiledStage {
             workgroup_size,
             shared_memory_bytes,
             output_control_points,
+            semantic: None,
         }
     }
 }
@@ -48,12 +51,13 @@ pub struct CompilationTimings {
 #[derive(Debug)]
 pub struct ShaderArtifact {
     pub identity: ContentId,
-    pub stages: Box<[CompiledStage]>,
+    pub stages: Box<[Arc<CompiledStage>]>,
     pub timings: CompilationTimings,
 }
 
 impl ShaderArtifact {
-    pub fn new(stages: Box<[CompiledStage]>) -> Self {
+    pub fn new<S: Into<Arc<CompiledStage>>>(stages: Box<[S]>) -> Self {
+        let stages: Box<_> = stages.into_iter().map(Into::into).collect();
         Self {
             identity: native_identity(&stages),
             stages,
@@ -65,6 +69,7 @@ pub struct ShaderCompiler {
     namespace: ShaderNamespace,
     pool: Arc<CompilePool>,
     cache: CompilationCache<ArtifactKey, ShaderArtifact>,
+    stages: Arc<stages::Stages>,
     store: Option<Arc<persistent::Store>>,
 }
 impl ShaderCompiler {
@@ -77,6 +82,7 @@ impl ShaderCompiler {
             namespace,
             pool,
             cache: CompilationCache::new(config.shader_entries, config.shader_bytes),
+            stages: Arc::new(stages::Stages::new(config.shader_entries)),
             store: persistent::store(
                 config.directory.as_deref(),
                 "spirv-v1",
@@ -94,8 +100,10 @@ impl ShaderCompiler {
         compile: impl FnOnce() -> Result<T, CompileError> + Send + 'static,
         functions: for<'a> fn(&'a T) -> Vec<&'a Function>,
     ) -> Result<Pending<ShaderArtifact>, CompileError> {
-        let key = ArtifactKey::new(self.namespace, source, specialization(&options));
+        let namespace = self.namespace;
+        let key = ArtifactKey::new(namespace, source, specialization(&options));
         let store = self.store.clone();
+        let stage_cache = Arc::clone(&self.stages);
         self.cache.request_sized(
             &self.pool,
             key,
@@ -111,9 +119,33 @@ impl ShaderCompiler {
                     .sum()
             },
             move |_| {
+                #[cfg(feature = "performance-counters")]
+                if nixe_gpu::compilation_capture::enabled() {
+                    nixe_gpu::compilation_capture::Key::new(&key).detail(
+                        "identity",
+                        usize::MAX,
+                        0,
+                        &format!(
+                            "source={} artifact={} options={options:?}",
+                            source.hex(),
+                            key.0.hex()
+                        ),
+                    );
+                }
                 if let Some(data) = store.as_ref().and_then(|s| s.read(key.0))
                     && let Some(stages) = decode(&data)
                 {
+                    let stages: Result<Box<_>, CompileError> = stages
+                        .into_iter()
+                        .map(|stage| {
+                            if let Some(key) = stage.semantic {
+                                stage_cache.get(key, || Ok(stage))
+                            } else {
+                                Ok(stage)
+                            }
+                        })
+                        .collect();
+                    let stages = stages?;
                     return Ok(ShaderArtifact {
                         identity: native_identity(&stages),
                         stages,
@@ -132,28 +164,57 @@ impl ShaderCompiler {
                         "shader stages and emission options differ".into(),
                     ));
                 }
-                let stages: Vec<_> = functions
-                    .iter()
-                    .zip(options.iter())
-                    .map(|(&f, &o)| (f, o))
-                    .collect();
                 let start = Instant::now();
-                let modules = spirv::emit_pipeline(&stages).map_err(CompileError::from)?;
-                let spirv_ns = start.elapsed().as_nanos() as u64;
-                let stages: Box<_> = functions
-                    .iter()
-                    .zip(modules)
-                    .zip(options.iter())
-                    .map(|((f, module), option)| {
-                        CompiledStage::new(
-                            f.stage,
+                let bindings = spirv::pipeline_bindings(&functions);
+                let mut stages = Vec::with_capacity(functions.len());
+                let mut kinds = std::collections::BTreeMap::new();
+                for (&function, &option) in functions.iter().zip(options.iter()) {
+                    let stage_key = StageKey::new(namespace, function, option, &bindings);
+                    let stage = stage_cache.get(stage_key, || {
+                        let module = spirv::emit_linked(function, option, &bindings)
+                            .map_err(CompileError::from)?;
+                        let mut stage = CompiledStage::new(
+                            function.stage,
                             module,
-                            f.workgroup_size,
+                            function.workgroup_size,
                             option.shared_memory_bytes,
-                            f.tessellation_control_points,
-                        )
-                    })
-                    .collect();
+                            function.tessellation_control_points,
+                        );
+                        stage.semantic = Some(stage_key);
+                        Ok(Arc::new(stage))
+                    })?;
+                    for binding in &stage.module.bindings {
+                        if let Some(old) = kinds.insert(binding.resource, binding.kind)
+                            && old != binding.kind
+                        {
+                            return Err(CompileError::Failed(
+                                "pipeline resource has inconsistent stage descriptor classes"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    stages.push(stage);
+                }
+                let stages = stages.into_boxed_slice();
+                let spirv_ns = start.elapsed().as_nanos() as u64;
+                #[cfg(feature = "performance-counters")]
+                if nixe_gpu::compilation_capture::enabled() {
+                    let capture = nixe_gpu::compilation_capture::Key::new(&key);
+                    capture.event("translation_ns", usize::MAX, translation_ns);
+                    capture.event("spirv_ns", usize::MAX, spirv_ns);
+                    for stage in &stages {
+                        capture.detail(
+                            "module",
+                            usize::MAX,
+                            stage.module.words.len() as u64,
+                            &format!("stage={:?} identity={}", stage.stage, stage.identity.hex()),
+                        );
+                        nixe_gpu::compilation_capture::save_module(
+                            &stage.identity.hex(),
+                            &stage.module.words,
+                        );
+                    }
+                }
                 let data = encode(&stages);
                 if let Some(store) = store
                     && let Err(e) = store.write(key.0, &data)
@@ -176,7 +237,7 @@ impl ShaderCompiler {
         self.cache.usage()
     }
 }
-fn native_identity(stages: &[CompiledStage]) -> ContentId {
+fn native_identity(stages: &[Arc<CompiledStage>]) -> ContentId {
     let identities: Vec<_> = stages.iter().map(|s| s.identity.0.as_slice()).collect();
     ContentId::of(b"nixe-native-program-v1", &identities)
 }
@@ -204,11 +265,15 @@ fn kind(value: ShaderResourceKind) -> u32 {
         ShaderResourceKind::SampledImageCube => 9,
     }
 }
-fn encode(stages: &[CompiledStage]) -> Vec<u8> {
+fn encode(stages: &[Arc<CompiledStage>]) -> Vec<u8> {
     let mut b = Vec::new();
     word(&mut b, stages.len() as u32);
     for s in stages {
         word(&mut b, stage(s.stage));
+        word(&mut b, u32::from(s.semantic.is_some()));
+        if let Some(key) = s.semantic {
+            b.extend_from_slice(&key.0.0);
+        }
         word(&mut b, s.module.push_constant_bytes);
         for size in s.workgroup_size.unwrap_or([0; 3]) {
             word(&mut b, size);
@@ -232,7 +297,7 @@ fn encode(stages: &[CompiledStage]) -> Vec<u8> {
     }
     b
 }
-fn decode(bytes: &[u8]) -> Option<Box<[CompiledStage]>> {
+fn decode(bytes: &[u8]) -> Option<Box<[Arc<CompiledStage>]>> {
     let mut r = Reader(bytes);
     let count = r.u32()?;
     if count == 0 || count > 6 {
@@ -249,6 +314,11 @@ fn decode(bytes: &[u8]) -> Option<Box<[CompiledStage]>> {
             ShaderStage::Compute,
         ]
         .get(r.u32()? as usize)?;
+        let semantic = match r.u32()? {
+            0 => None,
+            1 => Some(StageKey(ContentId(r.take(32)?.try_into().ok()?))),
+            _ => return None,
+        };
         let push_constant_bytes = r.u32()?;
         let dimensions = [r.u32()?, r.u32()?, r.u32()?];
         let workgroup_size = if dimensions == [0; 3] {
@@ -310,7 +380,7 @@ fn decode(bytes: &[u8]) -> Option<Box<[CompiledStage]>> {
         if words[0] != 0x07230203 {
             return None;
         }
-        stages.push(CompiledStage::new(
+        let mut compiled = CompiledStage::new(
             stage,
             spirv::Module {
                 words,
@@ -320,7 +390,9 @@ fn decode(bytes: &[u8]) -> Option<Box<[CompiledStage]>> {
             workgroup_size,
             shared_memory_bytes,
             output_control_points,
-        ));
+        );
+        compiled.semantic = semantic;
+        stages.push(Arc::new(compiled));
     }
     r.0.is_empty().then(|| stages.into_boxed_slice())
 }
@@ -337,8 +409,14 @@ impl crate::VulkanDevice {
                 vertex_position_transform: None,
                 input_control_points: 0,
                 tessellation_mode: None,
+                native_half_conversions: f.preserving_half_conversions,
+                native_half_fma: f.preserving_half_conversions && f.fma_float16,
                 float32: nixe_gpu::SpirvFloat32Capabilities {
                     denorm_preserve: f.float32_denorm_preserve,
+                    denorm_flush_to_zero: f.float32_denorm_flush_to_zero,
+                    rounding_mode_rtz: f.float32_round_toward_zero,
+                    independent_denormals: f.independent_denormals,
+                    independent_rounding: f.independent_rounding,
                     rounding_mode_rte: f.float32_round_to_nearest_even,
                     signed_zero_inf_nan_preserve: f.float32_signed_zero_inf_nan_preserve,
                     fused_multiply_add: f.fma_float32,
@@ -358,7 +436,7 @@ impl crate::VulkanDevice {
                     .operations
                     .contains(ash::vk::SubgroupFeatureFlags::QUAD),
             shared_memory_bytes: 0,
-            local_memory_bytes: 0,
+            uniform_buffer_bytes: p.limits.max_uniform_buffer_range,
         }
     }
 }

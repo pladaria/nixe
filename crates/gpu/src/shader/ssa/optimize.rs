@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::HashMap;
+mod constant_loads;
 
 pub(super) fn optimize(function: &mut Function) -> Result<(), Error> {
     optimize_with_cfg(function, true)
@@ -13,10 +14,14 @@ pub(crate) fn optimize_with_cfg(function: &mut Function, merge_blocks: bool) -> 
             .map(|i| ValueId(i as u32))
             .collect();
         let mut constants = vec![None; function.values.len()];
+        let mut bitcasts = vec![None; function.values.len()];
         for block in &function.blocks {
             for inst in &block.instructions {
                 if let Op::Constant(c) = inst.op {
                     constants[inst.results[0].index()] = Some(c);
+                }
+                if let Op::Bitcast { from, .. } = inst.op {
+                    bitcasts[inst.results[0].index()] = Some((from, inst.arguments[0]));
                 }
             }
         }
@@ -78,6 +83,23 @@ pub(crate) fn optimize_with_cfg(function: &mut Function, merge_blocks: bool) -> 
                     changed |= alias(&mut aliases, result, inst.arguments[0]);
                     continue;
                 }
+                // Bit reinterpretation is exact, including NaN payloads and
+                // signed zero. This is not an FP conversion/rounding identity.
+                // https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpBitcast
+                if let Op::Bitcast { from, to } = inst.op {
+                    let source = inst.arguments[0];
+                    let original = if from == to {
+                        Some(source)
+                    } else {
+                        bitcasts[source.index()]
+                            .filter(|&(original_type, _)| original_type == to)
+                            .map(|(_, original)| original)
+                    };
+                    if let Some(original) = original {
+                        changed |= alias(&mut aliases, result, original);
+                        continue;
+                    }
+                }
                 if let Op::Select(_) = inst.op {
                     let selection = if inst.arguments[1] == inst.arguments[2] {
                         Some(inst.arguments[1])
@@ -113,6 +135,7 @@ pub(crate) fn optimize_with_cfg(function: &mut Function, merge_blocks: bool) -> 
                 }
             }
         }
+        changed |= constant_loads::eliminate(function, &mut aliases)?;
         for index in 0..aliases.len() {
             aliases[index] = resolve(&aliases, ValueId(index as u32));
         }
@@ -166,6 +189,7 @@ pub(crate) fn optimize_with_cfg(function: &mut Function, merge_blocks: bool) -> 
             changed |= merge_linear_blocks(function)?;
         }
         prune_blocks(function)?;
+        changed |= half::simplify(function);
         changed |= remove_dead_reads(function);
         let removed = dead_values(function);
         changed |= removed;
@@ -259,7 +283,7 @@ fn map_uses(function: &mut Function, map: impl Fn(ValueId) -> ValueId + Copy) {
     }
 }
 
-fn fold(op: &Op, args: &[ValueId], constants: &[Option<Constant>]) -> Option<Constant> {
+pub(super) fn fold(op: &Op, args: &[ValueId], constants: &[Option<Constant>]) -> Option<Constant> {
     let get = |index: usize| constants[args[index].index()];
     match *op {
         Op::Constant(c) => Some(c),
@@ -342,7 +366,7 @@ fn control_flow(function: &Function) -> Result<(Vec<Vec<BlockId>>, Vec<BlockId>)
     )
 }
 
-fn prune_blocks(function: &mut Function) -> Result<(), Error> {
+pub(super) fn prune_blocks(function: &mut Function) -> Result<(), Error> {
     let (predecessors, order) = control_flow(function)?;
     for (index, block) in function.blocks.iter_mut().enumerate() {
         for phi in &mut block.phis {

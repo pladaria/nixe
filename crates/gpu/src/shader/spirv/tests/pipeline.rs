@@ -144,6 +144,8 @@ fn final_stage_prunes_unconsumed_components_before_arithmetic_and_resource_liven
             vertex_position_transform: None,
             input_control_points: 3,
             tessellation_mode: Some(options().mode),
+            native_half_conversions: false,
+            native_half_fma: false,
             float32: Default::default(),
             float64: Default::default(),
         },

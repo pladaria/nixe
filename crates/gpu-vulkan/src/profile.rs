@@ -74,7 +74,10 @@ pub struct DeviceProfile {
 }
 #[derive(Debug)]
 pub struct FloatControls {
+    pub preserving_half_conversions: bool,
     pub float32_denorm_preserve: bool,
+    pub independent_denormals: bool,
+    pub independent_rounding: bool,
     pub float32_denorm_flush_to_zero: bool,
     pub float32_signed_zero_inf_nan_preserve: bool,
     pub float32_round_to_nearest_even: bool,
@@ -460,7 +463,24 @@ impl FeatureSet {
             limits: properties.limits,
             core: self.core,
             float_controls: FloatControls {
+                // Mixed-width repair may need different denormal modes. Select
+                // native half conversion only with independent host guarantees.
+                // https://docs.vulkan.org/spec/latest/appendices/spirvenv.html
+                preserving_half_conversions: self.v12.shader_float16 != 0
+                    && floats.shader_denorm_preserve_float16 != 0
+                    && floats.shader_rounding_mode_rte_float16 != 0
+                    && floats.shader_signed_zero_inf_nan_preserve_float16 != 0
+                    && floats.shader_rounding_mode_rte_float32 != 0
+                    && floats.shader_signed_zero_inf_nan_preserve_float32 != 0
+                    && floats.denorm_behavior_independence
+                        == vk::ShaderFloatControlsIndependence::ALL
+                    && floats.rounding_mode_independence
+                        == vk::ShaderFloatControlsIndependence::ALL,
                 float32_denorm_preserve: floats.shader_denorm_preserve_float32 != 0,
+                independent_denormals: floats.denorm_behavior_independence
+                    == vk::ShaderFloatControlsIndependence::ALL,
+                independent_rounding: floats.rounding_mode_independence
+                    == vk::ShaderFloatControlsIndependence::ALL,
                 float32_denorm_flush_to_zero: floats.shader_denorm_flush_to_zero_float32 != 0,
                 float32_signed_zero_inf_nan_preserve: floats
                     .shader_signed_zero_inf_nan_preserve_float32

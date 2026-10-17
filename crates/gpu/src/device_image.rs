@@ -1,10 +1,11 @@
 //! Device-resident decoded pixels crossing a host backend boundary.
+use std::any::Any;
 use std::sync::Arc;
 
-/// Exported device-local buffer, borrowed only for the synchronous transfer.
-/// The producer must finish its writes and signal the exported binary semaphore
-/// before returning. The backend consumes that signal before copying the planes.
-/// No CPU pixel mapping.
+/// Exported device-local buffer. Import duplicates these borrowed FDs; the
+/// producer retains its imports until the consumer has completed. Enqueued GPU
+/// writes signal the binary semaphore before Vulkan copies the visible planes.
+/// The synchronous consumer additionally waits for the producer before returning.
 #[derive(Clone, Copy, Debug)]
 pub struct ExternalImageBuffer {
     pub fd: i32,
@@ -17,8 +18,28 @@ pub struct ExternalImageBuffer {
     pub initialize: bool,
 }
 
+/// Producer-owned import retained alongside the renderer's exported allocation.
+/// Enqueued writes are ordered by the exported semaphore. Wait is only needed
+/// when abandoning work, or by the temporary synchronous renderer consumer.
+pub trait DeviceImageTransfer: std::fmt::Debug + Send + Any {
+    fn wait(&mut self) -> Result<(), Box<str>>;
+}
+
 pub trait DeviceImageSource: std::fmt::Debug + Send + Sync {
     fn copy_nv12(&self, destination: ExternalImageBuffer) -> Result<(), Box<str>>;
+    /// Stable while a frame or its imported transfer retains the producer device.
+    fn transfer_context(&self) -> usize {
+        0
+    }
+    fn import_nv12(
+        &self,
+        _destination: ExternalImageBuffer,
+    ) -> Result<Box<dyn DeviceImageTransfer>, Box<str>> {
+        Err("this decoded image source cannot retain external imports".into())
+    }
+    fn enqueue_nv12(&self, _transfer: &mut dyn DeviceImageTransfer) -> Result<(), Box<str>> {
+        Err("this decoded image source cannot enqueue external transfers".into())
+    }
 }
 
 #[derive(Clone, Debug)]

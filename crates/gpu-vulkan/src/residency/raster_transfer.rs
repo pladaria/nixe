@@ -81,7 +81,7 @@ impl VulkanResidency {
             vk::ImageLayout::GENERAL,
         )?;
         self.barriers.emit(&mut self.device);
-        let slot = self.device.submission.begin()?;
+        let slot = self.device.begin_recording()?;
         let command = self.device.submission.slots[slot].command;
         let attachment = vk::RenderingAttachmentInfo::default()
             .image_view(leased.handle)
@@ -132,8 +132,6 @@ impl VulkanResidency {
         destination_rect: vk::Rect2D,
         filter: vk::Filter,
     ) -> Result<WorkTicket, VulkanError> {
-        self.ensure_image(source)?;
-        self.ensure_image(destination)?;
         let src = self.checked_image_rect(source, source_plane, source_rect)?;
         let dst = self.checked_image_rect(destination, destination_plane, destination_rect)?;
         if source == destination
@@ -236,7 +234,7 @@ impl VulkanResidency {
             .src_offsets(corners(source_rect))
             .dst_offsets(corners(destination_rect));
         self.barriers.emit(&mut self.device);
-        let slot = self.device.submission.begin()?;
+        let slot = self.device.begin_recording()?;
         unsafe {
             self.device.owner.device.cmd_blit_image(
                 self.device.submission.slots[slot].command,

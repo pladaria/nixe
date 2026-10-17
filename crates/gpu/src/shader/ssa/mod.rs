@@ -9,7 +9,10 @@ mod builder;
 pub mod compile;
 mod default_control;
 mod dominance;
+mod half;
 mod optimize;
+mod uniform;
+pub use uniform::{UniformControl, UniformSelection};
 mod verify;
 mod vertex;
 pub use default_control::{DefaultControl, default_control};
@@ -55,6 +58,7 @@ pub enum Type {
     U32,
     I32,
     F32,
+    F16,
     U64,
     I64,
     F64,
@@ -65,6 +69,7 @@ impl Type {
     pub(crate) fn bits(self) -> Option<u32> {
         match self {
             Self::Bool => Some(1),
+            Self::F16 => Some(16),
             Self::U32 | Self::I32 | Self::F32 => Some(32),
             Self::U64 | Self::I64 | Self::F64 => Some(64),
             Self::Effect => None,
@@ -200,8 +205,11 @@ pub enum Op {
         float_control: ShaderFloatControl,
     },
     AddCarry,
+    /// Low binary16 lane, with signaling NaNs quieted and payload preserved.
     UnpackHalf,
+    /// Exact binary16 bits in the low lane; upper lane is zero. No rounding.
     PackHalf,
+    /// Single-rounded binary16 FMA; promoted inputs remain explicit F32 FMA.
     HalfFma {
         saturate: bool,
     },
@@ -335,9 +343,9 @@ impl Op {
             Binary { ty, .. } => (vec![ty, ty], vec![ty]),
             Fma { ty, .. } => (vec![ty, ty, ty], vec![ty]),
             AddCarry => (vec![Type::U32; 3], vec![Type::U32; 2]),
-            UnpackHalf => (vec![Type::U32], vec![Type::F32]),
-            PackHalf => (vec![Type::F32], vec![Type::U32]),
-            HalfFma { .. } => (vec![Type::F32; 3], vec![Type::U32]),
+            UnpackHalf => (vec![Type::U32], vec![Type::F16]),
+            PackHalf => (vec![Type::F16], vec![Type::U32]),
+            HalfFma { .. } => (vec![Type::F16; 3], vec![Type::F16]),
             FloatMinMax { .. } => (vec![Type::F32, Type::F32, Type::Bool], vec![Type::F32]),
             Math { .. } | RoundIntegral { .. } => (vec![Type::F32], vec![Type::F32]),
             FloatToInteger { to, .. } => (vec![Type::F32], vec![to]),
@@ -398,7 +406,7 @@ impl Op {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Instruction {
     pub op: Op,
     pub arguments: Box<[ValueId]>,
@@ -406,7 +414,7 @@ pub struct Instruction {
     pub source: ShaderSourceLocation,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Phi {
     pub result: ValueId,
     /// Exactly one incoming value per distinct CFG predecessor.
@@ -414,7 +422,7 @@ pub struct Phi {
     pub source: ShaderSourceLocation,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Terminator<A = ValueId> {
     Jump(BlockId),
     Branch {
@@ -452,7 +460,7 @@ impl<A> Terminator<A> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Block {
     pub source: ShaderSourceLocation,
     pub phis: Vec<Phi>,
@@ -463,7 +471,7 @@ pub struct Block {
     pub effect: ValueId,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Definition {
     Phi {
         block: BlockId,
@@ -474,25 +482,27 @@ pub enum Definition {
         result: u32,
     },
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Value {
     pub ty: Type,
     pub definition: Definition,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Resource {
     pub id: ResourceId,
     pub kind: ShaderResourceKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Function {
     pub stage: ShaderStage,
     pub inputs: Vec<ShaderInterfaceElement>,
     pub outputs: Vec<ShaderInterfaceElement>,
     pub resources: Vec<Resource>,
     pub workgroup_size: Option<[u32; 3]>,
+    /// Private bytes per invocation, belonging to this shader stage.
+    pub local_memory_bytes: u32,
     pub tessellation_control_points: Option<u32>,
     pub blocks: Vec<Block>,
     pub values: Vec<Value>,
@@ -555,7 +565,7 @@ impl Function {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Error {
     pub stage: Option<ShaderStage>,
     pub source: ShaderSourceLocation,

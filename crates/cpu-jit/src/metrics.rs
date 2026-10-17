@@ -13,7 +13,9 @@ pub enum Counter {
     NativeRunNanoseconds,
     FaultDispatches,
     CodeFetches,
-    MemoryCallbacks,
+    ReadCallbacks,
+    WriteCallbacks,
+    AtomicCallbacks,
     InvalidationCalls,
     InvalidationBytes,
     FullInvalidations,
@@ -22,8 +24,8 @@ pub enum Counter {
     ContextSaves,
 }
 #[cfg(feature = "performance-counters")]
-static COUNTERS: [std::sync::atomic::AtomicU64; 16] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+static COUNTERS: [std::sync::atomic::AtomicU64; 18] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 18];
 #[inline]
 pub fn record(counter: Counter, amount: u64) {
     #[cfg(feature = "performance-counters")]
@@ -43,7 +45,9 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         "JitNativeRunNanoseconds",
         "JitFaultDispatches",
         "JitCodeFetches",
-        "JitMemoryCallbacks",
+        "JitReadCallbacks",
+        "JitWriteCallbacks",
+        "JitAtomicCallbacks",
         "JitInvalidationCalls",
         "JitInvalidationBytes",
         "JitFullInvalidations",
@@ -51,11 +55,15 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         "JitContextLoads",
         "JitContextSaves",
     ];
-    NAMES
-        .iter()
-        .zip(&COUNTERS)
-        .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
-        .collect()
+    let values: [u64; 18] =
+        std::array::from_fn(|index| COUNTERS[index].load(std::sync::atomic::Ordering::Relaxed));
+    let total = values[Counter::ReadCallbacks as usize]
+        + values[Counter::WriteCallbacks as usize]
+        + values[Counter::AtomicCallbacks as usize];
+    let mut result = Vec::with_capacity(NAMES.len() + 1);
+    result.extend(NAMES.iter().copied().zip(values));
+    result.push(("JitMemoryCallbacks", total));
+    result
 }
 // Only present in diagnostic builds.
 pub struct Timer {

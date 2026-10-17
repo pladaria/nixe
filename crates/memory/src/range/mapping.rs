@@ -576,6 +576,11 @@ impl CanonicalBackingRange {
             }
         }
     }
+    /// Whether logical bytes use an implicit mapping instead of a segment list.
+    /// Consumers can visit individual pages without materializing the topology.
+    pub fn has_byte_mapping(&self) -> bool {
+        self.layout.mapping.is_some()
+    }
     pub fn byte_mapping_key(&self) -> CanonicalByteMappingKey {
         CanonicalByteMappingKey(self.clone())
     }

@@ -688,3 +688,45 @@ fn switch_edges_are_distinct_even_when_cases_share_a_target() {
         );
     }
 }
+
+#[test]
+fn inverse_bitcasts_across_blocks_preserve_every_input_bit() {
+    let mut b = FunctionBuilder::new(ShaderStage::Fragment);
+    let entry = b.entry();
+    let next = b.block(pc(24));
+    let input = b.variable(Type::U32, InitialValue::Parameter(0));
+    let float = b.emit(
+        entry,
+        pc(8),
+        Op::Bitcast {
+            from: Type::U32,
+            to: Type::F32,
+        },
+        vec![input.into()],
+    )[0];
+    b.terminate(entry, pc(16), Terminator::Jump(next));
+    let bits = b.emit(
+        next,
+        pc(24),
+        Op::Bitcast {
+            from: Type::F32,
+            to: Type::U32,
+        },
+        vec![float.into()],
+    )[0];
+    output(&mut b, next, bits.into());
+    b.terminate(next, pc(32), Terminator::Return);
+    let mut f = b.finish().unwrap();
+    f.optimize().unwrap();
+    assert!(
+        !f.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|i| matches!(i.op, Op::Bitcast { .. }))
+    );
+    for bits in [
+        0, 0x80000000, 1, 0x7f800000, 0xff800000, 0x7fc00001, 0x7fa12345, 0x3f800001,
+    ] {
+        assert_eq!(run(&f, &[bits]).0, vec![bits]);
+    }
+}

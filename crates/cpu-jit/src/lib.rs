@@ -374,6 +374,11 @@ impl JitThread {
             let active = self.control.enter_execution();
             let mut context = callbacks::Context {
                 memory: &process.memory,
+                native_memory: nixe_cpu::memory::NativeMemorySession::new(
+                    &process.memory,
+                    &lease,
+                    process.cpu.address_space_id(),
+                ),
                 arena: process.arena,
                 cpu: process.cpu,
                 timer,
@@ -387,6 +392,7 @@ impl JitThread {
             let mut exit = ffi::Exit::default();
             record(Counter::NativeEntries, 1);
             let native_measurement = Timer::new(Counter::NativeRunNanoseconds);
+            let trace = nixe_memory::trace::span("vcpu_native", 0, 0, 0);
             let ok = invocation::run(
                 worker,
                 process.arena,
@@ -401,6 +407,7 @@ impl JitThread {
                 unavailable_state_fault(e, progress)
             })?;
             drop(native_measurement);
+            drop(trace);
             record(Counter::GuestTicks, exit.ticks);
             if !ok {
                 // A C++ failure does not establish stopped register authority.

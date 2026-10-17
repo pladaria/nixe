@@ -10,7 +10,10 @@ use std::{
 };
 
 pub(super) struct CpuPage {
-    pub bytes: Box<[u8]>,
+    pub bytes: Arc<[u8]>,
+    // Retaining the epoch's original allocation gives an ABA-safe identity
+    // across async reads without another allocation or global generation clock.
+    pub baseline: Arc<[u8]>,
     pub completed: Option<DeviceVisibilityPoint>,
 }
 pub struct VulkanVisibility {
@@ -46,10 +49,12 @@ impl VisibilityCoordinator for VulkanVisibility {
                 "canonical page cache size mismatch",
             ));
         }
+        let bytes: Arc<[u8]> = bytes.into();
         self.pages.lock().unwrap().insert(
             request.page,
             CpuPage {
-                bytes: bytes.into(),
+                baseline: Arc::clone(&bytes),
+                bytes,
                 completed: None,
             },
         );

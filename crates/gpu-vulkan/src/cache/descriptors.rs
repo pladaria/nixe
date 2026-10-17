@@ -4,7 +4,10 @@ use super::*;
 use crate::{AllocatedBuffer, AllocatedImageView, VulkanDevice, VulkanError, device::DeviceOwner};
 use ash::{vk, vk::Handle};
 use rustc_hash::FxHashMap as HashMap;
-use std::sync::Arc;
+use std::{
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 pub struct Sampler {
     owner: Arc<DeviceOwner>,
@@ -77,10 +80,19 @@ impl DescriptorResource {
         }
     }
 }
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct Key {
-    layout: LayoutKey,
-    resources: Box<[ResourceKey]>,
+// Borrowed lookups allocate and retain resources only on a real miss.
+struct Key<'a> {
+    layout: &'a LayoutKey,
+    resources: &'a [DescriptorResource],
+}
+impl Hash for Key<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.layout.hash(state);
+        self.resources.len().hash(state);
+        for resource in self.resources {
+            resource.key().hash(state);
+        }
+    }
 }
 struct Page {
     owner: Arc<DeviceOwner>,
@@ -121,15 +133,22 @@ pub struct DescriptorCache {
     limits: vk::PhysicalDeviceLimits,
     maximum: usize,
     pages: Vec<PageSlot>,
-    records: HashMap<Key, Entry>,
+    records: HashMap<u128, Entry>,
     clock: u64,
     statistics: DescriptorStatistics,
 }
 impl DescriptorCache {
     pub fn new(device: &VulkanDevice, maximum: usize) -> Self {
+        Self::from_limits(Arc::clone(&device.owner), device.profile().limits, maximum)
+    }
+    pub(crate) fn from_limits(
+        owner: Arc<DeviceOwner>,
+        limits: vk::PhysicalDeviceLimits,
+        maximum: usize,
+    ) -> Self {
         Self {
-            owner: Arc::clone(&device.owner),
-            limits: device.profile().limits,
+            owner,
+            limits,
             maximum,
             pages: Vec::new(),
             records: HashMap::default(),
@@ -143,16 +162,16 @@ impl DescriptorCache {
     /// A host texture's allocation has ended. Pending command slots retain
     /// their binding records; remove only the obsolete future-lookup entries.
     pub(crate) fn forget_image(&mut self, view: &AllocatedImageView) {
-        self.records.retain(|key, _| {
-            !key.resources.iter().any(
-                |r| matches!(r, ResourceKey::Image(handle, _) if *handle == view.handle.as_raw()),
+        self.records.retain(|_, entry| {
+            !entry.record.resources.iter().any(
+                |r| matches!(r.key(), ResourceKey::Image(handle, _) if handle == view.handle.as_raw()),
             )
         });
     }
     pub fn get(
         &mut self,
-        layout: Arc<PipelineLayout>,
-        resources: Box<[DescriptorResource]>,
+        layout: &Arc<PipelineLayout>,
+        resources: &[DescriptorResource],
     ) -> Result<Arc<BindingRecord>, VulkanError> {
         if !Arc::ptr_eq(&layout.owner, &self.owner)
             || resources.len() != layout.key.bindings.len()
@@ -168,30 +187,44 @@ impl DescriptorCache {
         {
             return Err(VulkanError::InvalidResource("foreign descriptor resource"));
         }
-        let key = Key {
-            layout: layout.key.clone(),
-            resources: resources.iter().map(DescriptorResource::key).collect(),
-        };
+        let key = nixe_gpu::cache_fingerprint(&Key {
+            layout: &layout.key,
+            resources,
+        });
         self.clock = self.clock.wrapping_add(1);
         if let Some(entry) = self.records.get_mut(&key) {
+            debug_assert!(
+                entry.record.layout.key == layout.key
+                    && entry
+                        .record
+                        .resources
+                        .iter()
+                        .map(DescriptorResource::key)
+                        .eq(resources.iter().map(DescriptorResource::key)),
+                "XXH3-128 collision or incomplete descriptor key"
+            );
             entry.touched = self.clock;
             self.statistics.hits += 1;
             return Ok(Arc::clone(&entry.record));
         }
-        for (b, r) in layout.key.bindings.iter().zip(&resources) {
-            if !Arc::ptr_eq(r.owner(), &self.owner) {
-                return Err(VulkanError::InvalidResource("foreign descriptor resource"));
-            }
+        for (b, r) in layout.key.bindings.iter().zip(resources) {
             match (b.kind, r) {
                 (
-                    vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::UNIFORM_BUFFER,
+                    vk::DescriptorType::STORAGE_BUFFER
+                    | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+                    | vk::DescriptorType::UNIFORM_BUFFER
+                    | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
                     DescriptorResource::Buffer {
                         buffer,
                         offset,
                         range,
                     },
                 ) => {
-                    let usage = if b.kind == vk::DescriptorType::UNIFORM_BUFFER {
+                    let usage = if matches!(
+                        b.kind,
+                        vk::DescriptorType::UNIFORM_BUFFER
+                            | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                    ) {
                         vk::BufferUsageFlags::UNIFORM_BUFFER
                     } else {
                         vk::BufferUsageFlags::STORAGE_BUFFER
@@ -201,7 +234,11 @@ impl DescriptorCache {
                             "buffer descriptor usage is not enabled",
                         ));
                     }
-                    let (alignment, maximum) = if b.kind == vk::DescriptorType::UNIFORM_BUFFER {
+                    let (alignment, maximum) = if matches!(
+                        b.kind,
+                        vk::DescriptorType::UNIFORM_BUFFER
+                            | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                    ) {
                         (
                             self.limits.min_uniform_buffer_offset_alignment,
                             self.limits.max_uniform_buffer_range,
@@ -257,7 +294,7 @@ impl DescriptorCache {
                 }
             }
         }
-        let page = self.page_for(&layout)?;
+        let page = self.page_for(layout)?;
         let layouts = [layout.set];
         let set = unsafe {
             self.owner.device.allocate_descriptor_sets(
@@ -318,9 +355,9 @@ impl DescriptorCache {
         self.statistics.updates += 1;
         let record = Arc::new(BindingRecord {
             set,
-            layout,
+            layout: Arc::clone(layout),
             _page: Arc::clone(&self.pages[page].page),
-            resources,
+            resources: resources.into(),
         });
         self.records.insert(
             key,
@@ -340,11 +377,9 @@ impl DescriptorCache {
             return Ok(i);
         }
         loop {
-            if let Some(i) = self
-                .pages
-                .iter()
-                .position(|p| p.allocated != 0 && Arc::strong_count(&p.page) == 1)
-            {
+            if let Some(i) = self.pages.iter().position(|p| {
+                Arc::strong_count(&p.page) == 1 && (p.allocated != 0 || p.page.key != layout.key)
+            }) {
                 // Every record and GPU batch has released this page. The reset
                 // never depends on a guessed frame count or an idle wait.
                 unsafe {
@@ -412,7 +447,7 @@ impl DescriptorCache {
                 .iter()
                 .filter(|(_, e)| Arc::strong_count(&e.record) == 1)
                 .min_by_key(|(_, e)| e.touched)
-                .map(|(k, _)| k.clone())
+                .map(|(&k, _)| k)
             else {
                 return Err(VulkanError::DescriptorPressure);
             };
@@ -434,7 +469,7 @@ impl VulkanDevice {
         if !Arc::ptr_eq(&self.owner, &pipeline.owner) {
             return Err(VulkanError::InvalidResource("foreign native pipeline"));
         }
-        let index = self.submission.begin()?;
+        let index = self.begin_recording()?;
         let slot = &mut self.submission.slots[index];
         let bound = if pipeline.bind_point == vk::PipelineBindPoint::COMPUTE {
             &mut slot.bound_compute
@@ -460,6 +495,7 @@ impl VulkanDevice {
         &mut self,
         pipeline: &NativePipeline,
         record: &Arc<BindingRecord>,
+        dynamic_offsets: &[u32],
     ) -> Result<(), VulkanError> {
         if !Arc::ptr_eq(&self.owner, &record.layout.owner)
             || !Arc::ptr_eq(&self.owner, &pipeline.owner)
@@ -468,7 +504,8 @@ impl VulkanDevice {
                 "foreign native descriptor/pipeline",
             ));
         }
-        let index = self.submission.begin()?;
+        let limits = self.profile().limits;
+        let index = self.begin_recording()?;
         let slot = &mut self.submission.slots[index];
         let bound = if pipeline.bind_point == vk::PipelineBindPoint::COMPUTE {
             &mut slot.bound_set
@@ -480,13 +517,48 @@ impl VulkanDevice {
         } else {
             &mut slot.bound_graphics_layout
         };
-        if *bound == record.set && *bound_layout == pipeline.layout.handle {
+        let bound_offsets = if pipeline.bind_point == vk::PipelineBindPoint::COMPUTE {
+            &mut slot.bound_compute_offsets
+        } else {
+            &mut slot.bound_graphics_offsets
+        };
+        if *bound == record.set
+            && *bound_layout == pipeline.layout.handle
+            && *bound_offsets == dynamic_offsets
+        {
             return Ok(());
         }
         if record.layout.key != pipeline.layout.key {
             return Err(VulkanError::InvalidResource(
                 "native descriptor/pipeline ABI mismatch",
             ));
+        }
+        if dynamic_offsets.len() != record.layout.dynamic_bindings.len() {
+            return Err(VulkanError::InvalidResource(
+                "native dynamic descriptor offset count mismatch",
+            ));
+        }
+        for (&index, &dynamic) in record.layout.dynamic_bindings.iter().zip(dynamic_offsets) {
+            let DescriptorResource::Buffer {
+                buffer,
+                offset,
+                range,
+            } = &record.resources[index]
+            else {
+                unreachable!()
+            };
+            let alignment =
+                layout::buffer_alignment(record.layout.key.bindings[index].kind, &limits);
+            if !u64::from(dynamic).is_multiple_of(alignment)
+                || offset
+                    .checked_add(u64::from(dynamic))
+                    .and_then(|n| n.checked_add(*range))
+                    .is_none_or(|end| end > buffer.size())
+            {
+                return Err(VulkanError::InvalidResource(
+                    "dynamic descriptor offset exceeds buffer bounds/alignment",
+                ));
+            }
         }
         unsafe {
             self.owner.device.cmd_bind_descriptor_sets(
@@ -495,10 +567,12 @@ impl VulkanDevice {
                 pipeline.layout.handle,
                 0,
                 &[record.set],
-                &[],
+                dynamic_offsets,
             );
         }
         self.submission.statistics.descriptor_binds += 1;
+        bound_offsets.clear();
+        bound_offsets.extend_from_slice(dynamic_offsets);
         *bound = record.set;
         *bound_layout = pipeline.layout.handle;
         if slot.binding_handles.insert(record.set) {

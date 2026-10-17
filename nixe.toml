@@ -36,8 +36,8 @@ preferred_languages = ["Spanish", "AmericanEnglish"]
 # Relative paths are resolved from the directory containing this file.
 keys = "./keys/"
 # TTF supplied to applications requesting a system font; relative to this file.
-# font = "./assets/DejaVuSans.ttf"
-font = "./assets/NotoSans-Regular.ttf"
+font = "./assets/DejaVuSans.ttf"
+# font = "./assets/NotoSans-Regular.ttf"
 # Initial mode reported to applications: "handheld" or "docked".
 initial_operation_mode = "docked"
 

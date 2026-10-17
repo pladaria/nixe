@@ -303,6 +303,7 @@ impl Pages {
     pub fn at_mut(&mut self, slot: PageSlot) -> &mut Page {
         &mut self.slots[slot.0]
     }
+    #[cfg(test)]
     pub fn values(&self) -> impl Iterator<Item = &Page> {
         self.identities.values().map(|slot| self.at(*slot))
     }
@@ -326,6 +327,16 @@ pub(super) struct CanonicalIndex {
 }
 impl CanonicalIndex {
     pub fn insert(&mut self, resource: Resource, range: &CanonicalBackingRange) {
+        if range.has_byte_mapping() {
+            for backing in range.pages() {
+                self.register(backing.identity())
+                    .bindings
+                    .entry(resource)
+                    .or_default()
+                    .push(Arc::new(Spans::mapped(range.clone(), backing.identity())));
+            }
+            return;
+        }
         let mut offset = 0;
         for segment in range.segments() {
             self.insert_span(

@@ -527,6 +527,8 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) @interpolate(f
                 vertex_position_transform: None,
                 input_control_points: 0,
                 tessellation_mode: None,
+                native_half_conversions: false,
+                native_half_fma: false,
                 float32,
                 float64: caps.float64,
             },

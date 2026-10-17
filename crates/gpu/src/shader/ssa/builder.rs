@@ -412,6 +412,7 @@ fn construct(
         outputs: Vec::new(),
         resources: Vec::new(),
         workgroup_size: None,
+        local_memory_bytes: 0,
         tessellation_control_points: None,
         values: value_types
             .iter()

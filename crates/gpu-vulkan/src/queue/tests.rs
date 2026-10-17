@@ -155,6 +155,60 @@ fn khr_timeline_drives_retirement_reuse_and_a_final_fence() {
 }
 
 #[test]
+fn native_recording_waits_for_actual_slot_capacity_without_growing_the_budget() {
+    let Some(mut device) = small_device(
+        crate::ApiPreference::Auto,
+        QueueConfiguration {
+            command_slots: 1,
+            arena_bytes: 512,
+            overflow_bytes: 1024,
+        },
+    ) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let mut gate = Gate::new(&device);
+    let first = device.work_ticket().unwrap();
+    unsafe {
+        device.submission.flush(
+            device.queue,
+            &device.dispatch,
+            &[vk::SemaphoreSubmitInfo::default()
+                .semaphore(gate.handle)
+                .value(1)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)],
+            &[],
+        )
+    }
+    .unwrap()
+    .unwrap();
+    gate.last_use = first.tick();
+    assert!(
+        matches!(device.submission.begin(), Err(VulkanError::QueuePressure { pending: Some(work), .. }) if work == first)
+    );
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = Arc::clone(&released);
+    let producer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(25));
+        signal.store(true, std::sync::atomic::Ordering::Release);
+        gate.signal();
+    });
+    let _slot = device.begin_recording().unwrap();
+    assert!(
+        released.load(std::sync::atomic::Ordering::Acquire),
+        "capacity cannot recycle before the actual GPU dependency"
+    );
+    assert_eq!(device.queue_usage().command_pools, 1);
+    let next = device.work_ticket().unwrap();
+    assert!(next.tick() > first.tick());
+    device.flush().unwrap();
+    device.wait_for_work(next, Duration::from_secs(5)).unwrap();
+    producer.join().unwrap();
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
 fn staging_pressure_is_bounded_and_unread_bytes_survive_completion() {
     let Some(mut device) = small_device(
         crate::ApiPreference::Auto,
@@ -177,6 +231,16 @@ fn staging_pressure_is_bounded_and_unread_bytes_survive_completion() {
     let work = device.flush().unwrap().unwrap();
     assert!(device.wait_for_work(work, Duration::from_secs(5)).unwrap());
     assert_eq!(device.queue_usage().overflow_capacity, 512);
+    assert!(
+        matches!(
+            device.begin_recording(),
+            Err(VulkanError::QueuePressure {
+                pending: None,
+                retained_readbacks: 2
+            })
+        ),
+        "a GPU wait cannot release unread CPU bytes"
+    );
     assert_eq!(device.readback(first).unwrap(), [0x19; 512]);
     assert!(matches!(
         device.enqueue_buffer_readback(&[0x00; 512]),
@@ -243,6 +307,53 @@ fn foreign_tickets_and_terminal_device_errors_never_publish_completion() {
         device.work_ticket(),
         Err(VulkanError::QueueStopped)
     ));
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+fn staging_overflow_suballocates_small_transfers_and_preserves_unread_slices() {
+    let Some(mut device) = small_device(
+        crate::ApiPreference::Auto,
+        QueueConfiguration {
+            command_slots: 1,
+            arena_bytes: 4096,
+            overflow_bytes: 16384,
+        },
+    ) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    // Fill the primary arenas; subsequent small requests must share overflow
+    // arenas rather than allocating one native buffer and memory per request.
+    device.submission.reserve_upload(&[0; 4096]).unwrap();
+    let (_, _, unused) = device.submission.reserve_readback(4096).unwrap();
+    let mut tickets = Vec::new();
+    for value in 0..128u8 {
+        let (index, source) = device.submission.reserve_upload(&[value; 64]).unwrap();
+        let (_, destination, ticket) = device.submission.reserve_readback(64).unwrap();
+        let slot = &device.submission.slots[index];
+        unsafe {
+            device.owner.device.cmd_copy_buffer(
+                slot.command,
+                slot.upload_buffer(source).handle,
+                slot.readback_buffer(destination).handle,
+                &[vk::BufferCopy::default()
+                    .src_offset(source.offset)
+                    .dst_offset(destination.offset)
+                    .size(64)],
+            );
+        }
+        tickets.push(ticket);
+    }
+    assert_eq!(device.submission.slots[0].upload_overflow.len(), 2);
+    assert_eq!(device.submission.slots[0].readback_overflow.len(), 2);
+    assert_eq!(device.queue_usage().overflow_capacity, 16384);
+    device.discard_readback(unused).unwrap();
+    for (value, ticket) in tickets.into_iter().enumerate() {
+        assert_eq!(device.readback(ticket).unwrap(), [value as u8; 64]);
+    }
+    assert_eq!(device.queue_usage().overflow_capacity, 0);
     drop(device);
     validation.check().unwrap();
 }

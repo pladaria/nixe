@@ -15,10 +15,10 @@ pub(super) struct IndirectTable {
     pub targets: Box<[(u32, ShaderSourceLocation)]>,
     pub load_offset: u32,
     pub read_end: u32,
-    group: u8,
+    group: Option<u8>,
     slot: u8,
     buffer_address: u64,
-    buffer_size: u32,
+    buffer_size: u64,
     bytes: Box<[u8]>,
     range: CanonicalBackingRange,
     cpu_writes: CanonicalCpuWriteDependency,
@@ -45,15 +45,24 @@ impl Hash for IndirectTable {
 }
 impl IndirectTable {
     pub fn binding_current(&self, bindings: &MaxwellThreeDShaderBindingState) -> bool {
-        bindings.groups()[self.group as usize].constant_buffers()[self.slot as usize].is_some_and(
+        let Some(group) = self.group else {
+            return false;
+        };
+        bindings.groups()[group as usize].constant_buffers()[self.slot as usize].is_some_and(
             |binding| {
                 binding.enabled()
                     && binding
                         .address()
                         .is_some_and(|address| address.get() == self.buffer_address)
-                    && binding.size() == Some(self.buffer_size)
+                    && binding.size().map(u64::from) == Some(self.buffer_size)
             },
         )
+    }
+    pub fn compute_binding_current(
+        &self,
+        binding: &impl Fn(u8) -> Result<(u64, u64), &'static str>,
+    ) -> bool {
+        self.group.is_none() && binding(self.slot) == Ok((self.buffer_address, self.buffer_size))
     }
     pub fn current(&self, space: &MaxwellGpuAddressSpace) -> bool {
         if !self
@@ -89,6 +98,39 @@ pub(super) fn capture(
     group: Option<u8>,
     memory: &MaxwellShaderMemoryView<'_>,
 ) -> Result<(), MaxwellShaderTranslationError> {
+    capture_bound_tables(binary, group, memory, |slot| {
+        let group = group.ok_or("BRX has no effective constant-buffer group")?;
+        let binding = bindings.groups()[group as usize]
+            .constant_buffers()
+            .get(slot as usize)
+            .copied()
+            .flatten()
+            .filter(|b| b.enabled())
+            .ok_or("BRX constant buffer is unbound")?;
+        Ok((
+            binding
+                .address()
+                .ok_or("BRX constant buffer has no address")?
+                .get(),
+            u64::from(binding.size().ok_or("BRX constant buffer has no size")?),
+        ))
+    })
+}
+
+pub(super) fn capture_compute(
+    binary: &mut MaxwellShaderBinary,
+    memory: &MaxwellShaderMemoryView<'_>,
+    binding: impl Fn(u8) -> Result<(u64, u64), &'static str>,
+) -> Result<(), MaxwellShaderTranslationError> {
+    capture_bound_tables(binary, None, memory, binding)
+}
+
+fn capture_bound_tables(
+    binary: &mut MaxwellShaderBinary,
+    group: Option<u8>,
+    memory: &MaxwellShaderMemoryView<'_>,
+    binding: impl Fn(u8) -> Result<(u64, u64), &'static str>,
+) -> Result<(), MaxwellShaderTranslationError> {
     if !binary
         .bundles
         .iter()
@@ -96,24 +138,31 @@ pub(super) fn capture(
     {
         return Ok(());
     }
-    let code: Vec<_> = binary
-        .bundles
-        .iter()
-        .flat_map(|bundle| {
-            bundle
-                .instructions
-                .iter()
-                .enumerate()
-                .map(move |(slot, &word)| (bundle.offset + 8 + slot as u32 * 8, word))
-        })
-        .collect();
+    let slots = |binary: &MaxwellShaderBinary| -> Vec<_> {
+        binary
+            .bundles
+            .iter()
+            .flat_map(|bundle| {
+                bundle
+                    .instructions
+                    .iter()
+                    .enumerate()
+                    .map(move |(slot, &word)| (bundle.offset + 8 + slot as u32 * 8, word))
+            })
+            .collect()
+    };
+    let mut code = slots(binary);
     let mut tables = Vec::new();
     let mut proof_intervals = Vec::new();
-    for (index, &(offset, word)) in code.iter().enumerate() {
+    let mut cursor = 0;
+    while let Some(&(offset, word)) = code.get(cursor) {
+        let index = cursor;
+        cursor += 1;
         if word >> 48 != 0xe250 {
             continue;
         }
-        let fail = |reason| malformed(binary.stage(), offset, word, reason);
+        let stage = binary.stage();
+        let fail = |reason| malformed(stage, offset, word, reason);
         if word & 0x7f != 15 || decode_predicate(word) != ShaderPredicate::Always {
             return Err(fail(
                 "BRX requires an unconditional relative register target",
@@ -193,27 +242,13 @@ pub(super) fn capture(
             .checked_mul(4)
             .filter(|&size| size <= super::binary::MAXWELL_SHADER_READ_LIMIT as u32)
             .ok_or_else(|| fail("BRX table exceeds the bounded shader read domain"))?;
-        let group = group.ok_or_else(|| fail("BRX has no effective constant-buffer group"))?;
         let slot = ((load >> 36) & 31) as u8;
-        let binding = bindings.groups()[group as usize]
-            .constant_buffers()
-            .get(slot as usize)
-            .copied()
-            .flatten()
-            .filter(|b| b.enabled())
-            .ok_or_else(|| fail("BRX constant buffer is unbound"))?;
-        let buffer_address = binding
-            .address()
-            .ok_or_else(|| fail("BRX constant buffer has no address"))?
-            .get();
-        let buffer_size = binding
-            .size()
-            .ok_or_else(|| fail("BRX constant buffer has no size"))?;
+        let (buffer_address, buffer_size) = binding(slot).map_err(fail)?;
         let table_offset = ((load >> 20) & 0xffff) as u16 as i16 as i32;
         if table_offset < 0
             || (table_offset as u32)
                 .checked_add(byte_count)
-                .is_none_or(|end| end > buffer_size)
+                .is_none_or(|end| u64::from(end) > buffer_size)
         {
             return Err(fail("BRX table exceeds its constant buffer"));
         }
@@ -226,31 +261,39 @@ pub(super) fn capture(
         let base = offset
             .wrapping_add(8)
             .wrapping_add(((raw_displacement << 8) >> 8) as u32);
-        let mut targets = Vec::new();
+        let mut targets = std::collections::BTreeMap::new();
         for bytes in read.bytes.chunks_exact(4) {
             let value = u32::from_le_bytes(bytes.try_into().unwrap());
             let mut target = base.wrapping_add(value);
             if target % 32 == 0 {
                 target = target.wrapping_add(8);
             }
-            if !code.iter().any(|&(address, _)| address == target) {
+            let header = if stage == crate::MaxwellShaderStage::Compute {
+                0
+            } else {
+                super::binary::MAXWELL_SHADER_PROGRAM_HEADER_SIZE
+            };
+            if target % 8 != 0
+                || target as usize >= super::binary::MAXWELL_SHADER_READ_LIMIT - header
+            {
                 return Err(fail(
-                    "BRX table entry is not an executable instruction slot",
+                    "BRX table target is outside the bounded executable domain",
                 ));
             }
-            if !targets.iter().any(|&(old, _)| old == value) {
-                targets.push((value, ShaderSourceLocation::new(target)));
-            }
+            // Bundles are contiguous and the alignment/domain checks above
+            // prove the slot; no linear scan of the shader is needed per entry.
+            targets.insert(value, ShaderSourceLocation::new(target));
         }
-        targets.sort_by_key(|&(value, _)| value);
-        log::debug!(
-            "captured BRX table: stage={:?} offset={offset:#x} register={register} targets={targets:?}",
-            binary.stage()
-        );
+        if let Some(target) = targets.values().map(|target| target.byte_offset()).max()
+            && target as usize >= binary.bundles.len() * 32
+        {
+            super::binary::extend_shader_code(memory, binary, target)?;
+            code = slots(binary);
+        }
         tables.push(IndirectTable {
             offset,
             register,
-            targets: targets.into(),
+            targets: targets.into_iter().collect(),
             load_offset: code[load_index].0,
             read_end: table_offset as u32 + byte_count,
             group,

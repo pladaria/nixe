@@ -1262,6 +1262,7 @@ impl MaxwellLoweringCache {
     pub(crate) fn resolve_shader_translation_source(
         &mut self,
         source: &MaxwellShaderTranslationSourceKey,
+        bindings: &crate::MaxwellThreeDShaderBindingState,
         address_space: &crate::MaxwellGpuAddressSpace,
         staged_writes: &CanonicalWriteBatch,
     ) -> Result<Arc<[MaxwellTranslatedShaderProgram]>, MaxwellShaderTranslationError> {
@@ -1272,7 +1273,7 @@ impl MaxwellLoweringCache {
                 source.matches(&record.source),
                 "XXH3-128 collision or incomplete shader-source cache key"
             );
-            if record.inputs.indirect_bindings_current(&source.bindings)
+            if record.inputs.indirect_bindings_current(bindings)
                 && record.inputs.source_is_current(address_space)
                 && record.inputs.staged_writes_are_irrelevant(staged_writes)
             {
@@ -1287,6 +1288,7 @@ impl MaxwellLoweringCache {
         let source = source.materialize();
         let inputs = prepare_maxwell_shader_translation_inputs_from_source(
             &source,
+            bindings,
             address_space,
             staged_writes,
         )?;
@@ -1329,8 +1331,12 @@ impl MaxwellLoweringCache {
 
         let source = prepare_maxwell_shader_translation_source(state)?;
         let fingerprint = source.fingerprint();
-        let programs =
-            self.resolve_shader_translation_source(&source, address_space, staged_writes)?;
+        let programs = self.resolve_shader_translation_source(
+            &source,
+            state.shader_bindings(),
+            address_space,
+            staged_writes,
+        )?;
         let inputs = self
             .shader_translation_sources
             .get(fingerprint)

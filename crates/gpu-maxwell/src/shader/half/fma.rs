@@ -64,6 +64,8 @@ pub(in crate::shader) fn decode_half_fused_multiply_add(
             (word >> 53) & 3
         },
     ];
+    // A full-FP32 source promotes the operation; it must never enter the
+    // binary16 FMA opcode, whose FP32 carriers contain exact half operands.
     let promoted = swizzles.contains(&1);
     let raw_dst = word as u8;
     validate_register_range(stage, offset, word, raw_dst, 1, register_count)?;

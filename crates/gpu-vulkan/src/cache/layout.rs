@@ -20,6 +20,67 @@ pub struct LayoutKey {
     pub push_stages: vk::ShaderStageFlags,
 }
 impl LayoutKey {
+    fn select_dynamic_buffers(
+        &mut self,
+        maximum: u32,
+        uniform_maximum: u32,
+    ) -> Result<(), VulkanError> {
+        let explicit = self
+            .bindings
+            .iter()
+            .filter(|b| b.kind == vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
+            .count();
+        let mut available =
+            maximum
+                .checked_sub(explicit as u32)
+                .ok_or(VulkanError::InvalidResource(
+                    "native dynamic storage descriptors exceed device limit",
+                ))?;
+        for binding in &mut self.bindings {
+            if binding.kind == vk::DescriptorType::STORAGE_BUFFER && available != 0 {
+                binding.kind = vk::DescriptorType::STORAGE_BUFFER_DYNAMIC;
+                available -= 1;
+            }
+        }
+        let explicit = self
+            .bindings
+            .iter()
+            .filter(|b| b.kind == vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+            .count();
+        let mut available =
+            uniform_maximum
+                .checked_sub(explicit as u32)
+                .ok_or(VulkanError::InvalidResource(
+                    "native dynamic uniform descriptors exceed device limit",
+                ))?;
+        for binding in &mut self.bindings {
+            if binding.kind == vk::DescriptorType::UNIFORM_BUFFER && available != 0 {
+                binding.kind = vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC;
+                available -= 1;
+            }
+        }
+        Ok(())
+    }
+    fn dynamic_bindings(&self) -> Box<[usize]> {
+        let mut indices: Vec<_> = self
+            .bindings
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                matches!(
+                    b.kind,
+                    vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+                        | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                )
+                .then_some(i)
+            })
+            .collect();
+        // Vulkan consumes offsets in ascending binding order, regardless of
+        // the order in which a caller described the layout.
+        indices.sort_unstable_by_key(|&i| self.bindings[i].binding);
+        indices.into_boxed_slice()
+    }
+
     pub fn reflect(shader: &ShaderArtifact) -> Result<Self, VulkanError> {
         let mut bindings = BTreeMap::<u32, LayoutBinding>::new();
         let mut push_bytes = 0;
@@ -63,6 +124,46 @@ pub struct PipelineLayout {
     pub(crate) handle: vk::PipelineLayout,
     pub(crate) set: vk::DescriptorSetLayout,
     pub key: LayoutKey,
+    pub(crate) dynamic_bindings: Box<[usize]>,
+}
+impl PipelineLayout {
+    /// Separate the stable descriptor base from the command's uint32 offset.
+    /// Explicit ranges preserve shader bounds, including buffers above 4 GiB.
+    // https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdBindDescriptorSets.html
+    pub(crate) fn split_dynamic_offsets(
+        &self,
+        resources: &mut [DescriptorResource],
+        limits: &vk::PhysicalDeviceLimits,
+        mut offsets: Vec<u32>,
+    ) -> Result<Vec<u32>, VulkanError> {
+        offsets.clear();
+        offsets.reserve(self.dynamic_bindings.len());
+        for &index in &self.dynamic_bindings {
+            let Some(DescriptorResource::Buffer {
+                buffer,
+                offset,
+                range,
+            }) = resources.get_mut(index)
+            else {
+                return Err(VulkanError::InvalidResource(
+                    "dynamic storage binding requires a buffer",
+                ));
+            };
+            let alignment = buffer_alignment(self.key.bindings[index].kind, limits);
+            if !offset.is_multiple_of(alignment)
+                || offset
+                    .checked_add(*range)
+                    .is_none_or(|end| end > buffer.size())
+            {
+                return Err(VulkanError::InvalidResource(
+                    "dynamic buffer range/alignment exceeds host contract",
+                ));
+            }
+            offsets.push(*offset as u32);
+            *offset &= !u64::from(u32::MAX);
+        }
+        Ok(offsets)
+    }
 }
 impl Drop for PipelineLayout {
     fn drop(&mut self) {
@@ -96,7 +197,14 @@ impl LayoutCache {
             }),
         }
     }
-    pub fn get(&self, key: LayoutKey) -> Result<Arc<PipelineLayout>, VulkanError> {
+    pub fn get(&self, mut key: LayoutKey) -> Result<Arc<PipelineLayout>, VulkanError> {
+        // Dynamic offsets keep arena positions out of descriptor identities.
+        // Choose the ABI once per layout, within the host's dynamic-binding limit.
+        // https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceLimits.html
+        key.select_dynamic_buffers(
+            self.limits.max_descriptor_set_storage_buffers_dynamic,
+            self.limits.max_descriptor_set_uniform_buffers_dynamic,
+        )?;
         let mut state = self.state.lock().unwrap();
         state.clock = state.clock.wrapping_add(1);
         let clock = state.clock;
@@ -123,8 +231,10 @@ impl LayoutCache {
                 .filter(|b| b.stages.contains(flag))
                 .fold([0u32; 5], |mut c, b| {
                     c[match b.kind {
-                        vk::DescriptorType::UNIFORM_BUFFER => 0,
-                        vk::DescriptorType::STORAGE_BUFFER => 1,
+                        vk::DescriptorType::UNIFORM_BUFFER
+                        | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => 0,
+                        vk::DescriptorType::STORAGE_BUFFER
+                        | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => 1,
                         vk::DescriptorType::SAMPLED_IMAGE => 2,
                         vk::DescriptorType::STORAGE_IMAGE => 3,
                         vk::DescriptorType::SAMPLER => 4,
@@ -147,17 +257,20 @@ impl LayoutCache {
                 ));
             }
         }
-        let counts = key.bindings.iter().fold([0u32; 5], |mut c, b| {
-            c[match b.kind {
-                vk::DescriptorType::UNIFORM_BUFFER => 0,
-                vk::DescriptorType::STORAGE_BUFFER => 1,
-                vk::DescriptorType::SAMPLED_IMAGE => 2,
-                vk::DescriptorType::STORAGE_IMAGE => 3,
-                vk::DescriptorType::SAMPLER => 4,
-                _ => unreachable!(),
-            }] += 1;
-            c
-        });
+        let counts =
+            key.bindings.iter().fold([0u32; 5], |mut c, b| {
+                c[match b.kind {
+                    vk::DescriptorType::UNIFORM_BUFFER
+                    | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => 0,
+                    vk::DescriptorType::STORAGE_BUFFER
+                    | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => 1,
+                    vk::DescriptorType::SAMPLED_IMAGE => 2,
+                    vk::DescriptorType::STORAGE_IMAGE => 3,
+                    vk::DescriptorType::SAMPLER => 4,
+                    _ => unreachable!(),
+                }] += 1;
+                c
+            });
         let limits = [
             self.limits.max_descriptor_set_uniform_buffers,
             self.limits.max_descriptor_set_storage_buffers,
@@ -192,6 +305,7 @@ impl LayoutCache {
             owner: Arc::clone(&self.owner),
             handle: vk::PipelineLayout::null(),
             set,
+            dynamic_bindings: key.dynamic_bindings(),
             key,
         };
         let sets = [set];
@@ -243,13 +357,21 @@ pub(super) fn stage_flags(stage: nixe_gpu::ShaderStage) -> vk::ShaderStageFlags 
         Compute => vk::ShaderStageFlags::COMPUTE,
     }
 }
+pub(super) fn buffer_alignment(kind: vk::DescriptorType, limits: &vk::PhysicalDeviceLimits) -> u64 {
+    if matches!(
+        kind,
+        vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+    ) {
+        limits.min_uniform_buffer_offset_alignment
+    } else {
+        limits.min_storage_buffer_offset_alignment
+    }
+}
 pub(super) fn descriptor_type(kind: nixe_gpu::ShaderResourceKind) -> vk::DescriptorType {
     use nixe_gpu::ShaderResourceKind::*;
     match kind {
-        // The native emitter declares both as std430 word-addressed SSBOs,
-        // including dynamically indexed guest constant data. Reflect the actual
-        // SPIR-V storage class; "constant" is a guest read-only semantic role.
-        ConstantBuffer | StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
+        ConstantBuffer => vk::DescriptorType::UNIFORM_BUFFER,
+        StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
         Sampler | ComparisonSampler => vk::DescriptorType::SAMPLER,
         StorageImage => vk::DescriptorType::STORAGE_IMAGE,
         SampledImage
@@ -257,5 +379,70 @@ pub(super) fn descriptor_type(kind: nixe_gpu::ShaderResourceKind) -> vk::Descrip
         | SampledDepthImage
         | SampledDepthImage2DArray
         | SampledImageCube => vk::DescriptorType::SAMPLED_IMAGE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn uniform_and_storage_dynamic_budgets_are_independent_and_offsets_follow_binding_order() {
+        let mut key = LayoutKey {
+            bindings: vec![
+                LayoutBinding {
+                    binding: 4,
+                    kind: vk::DescriptorType::UNIFORM_BUFFER,
+                    stages: vk::ShaderStageFlags::VERTEX,
+                },
+                LayoutBinding {
+                    binding: 1,
+                    kind: vk::DescriptorType::STORAGE_BUFFER,
+                    stages: vk::ShaderStageFlags::VERTEX,
+                },
+                LayoutBinding {
+                    binding: 2,
+                    kind: vk::DescriptorType::UNIFORM_BUFFER,
+                    stages: vk::ShaderStageFlags::FRAGMENT,
+                },
+            ]
+            .into_boxed_slice(),
+            push_bytes: 0,
+            push_stages: vk::ShaderStageFlags::empty(),
+        };
+        key.select_dynamic_buffers(1, 1).unwrap();
+        assert_eq!(&*key.dynamic_bindings(), &[1, 0]);
+        assert_eq!(key.bindings[2].kind, vk::DescriptorType::UNIFORM_BUFFER);
+        assert!(key.select_dynamic_buffers(1, 0).is_err());
+        let limits = vk::PhysicalDeviceLimits {
+            min_uniform_buffer_offset_alignment: 256,
+            min_storage_buffer_offset_alignment: 16,
+            ..Default::default()
+        };
+        assert_eq!(buffer_alignment(key.bindings[0].kind, &limits), 256);
+        assert_eq!(buffer_alignment(key.bindings[1].kind, &limits), 16);
+    }
+    #[test]
+    fn dynamic_storage_selection_obeys_host_limits_and_binding_order() {
+        let make = || LayoutKey {
+            bindings: [3, 1, 2]
+                .map(|binding| LayoutBinding {
+                    binding,
+                    kind: vk::DescriptorType::STORAGE_BUFFER,
+                    stages: vk::ShaderStageFlags::VERTEX,
+                })
+                .into(),
+            push_bytes: 0,
+            push_stages: vk::ShaderStageFlags::empty(),
+        };
+        let mut no_dynamic = make();
+        no_dynamic.select_dynamic_buffers(0, 0).unwrap();
+        assert!(no_dynamic.dynamic_bindings().is_empty());
+        let mut mixed = make();
+        mixed.select_dynamic_buffers(2, 0).unwrap();
+        assert_eq!(&*mixed.dynamic_bindings(), &[1, 0]);
+        assert_eq!(mixed.bindings[2].kind, vk::DescriptorType::STORAGE_BUFFER);
+        mixed.select_dynamic_buffers(2, 0).unwrap();
+        assert_eq!(&*mixed.dynamic_bindings(), &[1, 0]);
+        assert!(mixed.select_dynamic_buffers(1, 0).is_err());
     }
 }

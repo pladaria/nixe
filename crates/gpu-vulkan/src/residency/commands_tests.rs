@@ -406,7 +406,7 @@ fn binding_candidates_execute_identical_words_and_recycle_descriptors() {
             let work = cache.flush().unwrap().unwrap();
             cache
                 .device
-                .wait_for_work(work, Duration::from_secs(5))
+                .wait_for_work(work, std::time::Duration::from_secs(5))
                 .unwrap();
         }
         assert_eq!(
@@ -422,7 +422,7 @@ fn binding_candidates_execute_identical_words_and_recycle_descriptors() {
     validation.check().unwrap();
 }
 #[test]
-fn undefined_and_discarded_loads_require_an_actual_producer() {
+fn undefined_and_discarded_reads_require_an_actual_producer() {
     let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
         return;
     };
@@ -430,6 +430,7 @@ fn undefined_and_discarded_loads_require_an_actual_producer() {
     let (_, bytes) = backing_allocation(4096, 4096, 0x5b);
     let (description, planes) = color_image();
     let full = transfers::full_rect(planes[0]);
+    let plane = planes[0];
     let image = cache
         .image_for_device_write(bytes.clone(), description, planes)
         .unwrap();
@@ -438,18 +439,7 @@ fn undefined_and_discarded_loads_require_an_actual_producer() {
         0,
         "allocation must not fabricate initialization"
     );
-    assert!(
-        cache
-            .raster_fixture(
-                image,
-                0,
-                full,
-                [1.0; 4],
-                AttachmentLoad::Load,
-                AttachmentStore::Store
-            )
-            .is_err()
-    );
+    assert!(cache.require_image_initialized(image, plane, full).is_err());
     cache
         .raster_fixture(
             image,
@@ -474,18 +464,7 @@ fn undefined_and_discarded_loads_require_an_actual_producer() {
             AttachmentStore::Discard,
         )
         .unwrap();
-    assert!(
-        cache
-            .raster_fixture(
-                image,
-                0,
-                full,
-                [1.0; 4],
-                AttachmentLoad::Load,
-                AttachmentStore::Store
-            )
-            .is_err()
-    );
+    assert!(cache.require_image_initialized(image, plane, full).is_err());
     cache
         .clear_color_image(
             image,
@@ -920,6 +899,43 @@ fn neighboring_cpu_pages_share_one_versioned_native_image_download() {
             .unwrap();
         cache.flush().unwrap();
         let before = cache.device.queue_usage().submitted_tick;
+        // Concurrent CPU faults into one versioned window share the pending
+        // transfer too, before any window has reached the completed cache.
+        let reads: Vec<_> = backing
+            .pages()
+            .map(|page| {
+                let VisibilityState::GpuNewer { device, visible_at } = page.visibility_state()
+                else {
+                    panic!("image producer")
+                };
+                CpuVisibilityRequest {
+                    page: page.identity(),
+                    size: page.size(),
+                    device,
+                    visible_at,
+                }
+            })
+            .collect();
+        let downloaded = cache.statistics.native_readback_bytes;
+        for &request in &reads {
+            assert!(cache.request_cpu_page(request).unwrap().is_none());
+        }
+        cache.flush().unwrap();
+        let point = cache.cpu_readback_point().unwrap().unwrap();
+        cache
+            .device
+            .wait_for_work(
+                cache.device.submission.ticket(point),
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+        for &request in &reads {
+            assert_eq!(
+                &*cache.request_cpu_page(request).unwrap().unwrap(),
+                expected.repeat(16)
+            );
+        }
+        assert_eq!(cache.statistics.native_readback_bytes - downloaded, 512);
         assert_eq!(cpu_read(&mut cache, &backing), expected.repeat(128));
         assert_eq!(
             cache.device.queue_usage().submitted_tick - before,

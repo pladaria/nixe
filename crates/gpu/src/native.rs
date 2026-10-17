@@ -2,7 +2,10 @@
 //! resource-creation transactions, pass commands or aggregate access plans.
 use crate::*;
 use nixe_memory::CanonicalBackingRange;
-use std::sync::Arc;
+use std::{
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 /// Framebuffer source legalized by the console frontend. No guest tiling or
 /// logical allocation IDs cross the native presentation boundary.
@@ -37,7 +40,11 @@ impl GuestImage {
 #[derive(Clone, Debug)]
 pub enum GuestBinding {
     Buffer(CanonicalBackingRange),
-    Image(GuestImage),
+    Image {
+        image: GuestImage,
+        /// Shader view dimensionality remains arrayed for a single layer.
+        arrayed: bool,
+    },
     Sampler(SamplerDescription),
 }
 #[derive(Clone, Debug)]
@@ -45,7 +52,7 @@ pub struct GuestVertexBuffer {
     pub binding: u32,
     pub backing: CanonicalBackingRange,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct GuestVertexLayout {
     pub binding: u32,
     pub stride: u32,
@@ -55,7 +62,7 @@ pub struct GuestVertexLayout {
 #[derive(Clone, Debug)]
 pub struct GuestShaderCode {
     pub identity: ssa::artifact::ContentId,
-    pub functions: Box<[ssa::Function]>,
+    pub functions: Box<[Arc<ssa::Function>]>,
 }
 #[derive(Clone, Debug)]
 pub struct GuestProgram {
@@ -64,7 +71,6 @@ pub struct GuestProgram {
     /// Sorted logical SSA resource identities; Vulkan reflection assigns dense bindings.
     pub bindings: Box<[(ssa::ResourceId, GuestBinding)]>,
     pub shared_memory_bytes: u32,
-    pub local_memory_bytes: u32,
 }
 #[derive(Clone, Debug)]
 pub struct GuestDrawState {
@@ -110,6 +116,34 @@ pub struct GuestDrawParameters {
     pub alpha_to_coverage: bool,
 }
 impl GuestDrawParameters {
+    /// Hash the consumed state, excluding its interned identity.
+    pub fn hash_state<H: Hasher>(&self, state: &mut H) {
+        self.vertices.hash(state);
+        self.color_formats.hash(state);
+        self.depth_stencil_format.hash(state);
+        self.samples.hash(state);
+        self.extent.hash(state);
+        self.render_area.hash(state);
+        self.topology.hash(state);
+        self.restart.hash(state);
+        self.provoking_first.hash(state);
+        self.raster.hash(state);
+        self.line.hash(state);
+        self.front_face.hash(state);
+        self.cull.hash(state);
+        self.depth_bias.hash(state);
+        self.viewport.hash(state);
+        self.position_transform.hash(state);
+        self.scissor.hash(state);
+        self.depth.hash(state);
+        self.stencil.hash(state);
+        self.color_outputs.hash(state);
+        self.alpha_test.hash(state);
+        self.tessellation.hash(state);
+        self.sample_mask.hash(state);
+        self.alpha_to_coverage.hash(state);
+        self.blend_constants.map(f32::to_bits).hash(state);
+    }
     /// Compare consumed semantics when register revisions changed and then
     /// restored a prior value. Identity/provenance is not pipeline state.
     pub fn same_state(&self, other: &Self) -> bool {
@@ -143,6 +177,18 @@ impl GuestDrawParameters {
 #[derive(Clone, Debug)]
 pub enum NativeCommand {
     Sequence(Box<[NativeCommand]>),
+    /// Orders the device stream without waiting for it on the host.
+    WaitForIdle,
+    /// Ordered command-processor write. Inline writes to CPU-owned storage are
+    /// committed at this recording position after prior input snapshots. Release
+    /// writes and device-owned targets require actual producer completion for
+    /// CPU visibility, including when the payload is already known.
+    WriteMemory {
+        target: CanonicalBackingRange,
+        offset: u64,
+        bytes: Arc<[u8]>,
+        after_prior_work: bool,
+    },
     Draw {
         state: Arc<GuestDrawState>,
         arguments: DrawArguments,
@@ -176,6 +222,10 @@ pub enum NativeCommand {
         bytes: [Arc<[u8]>; 2],
         widths: [u32; 2],
     },
+    ImportDecodedPlanes {
+        images: Box<[GuestImage; 2]>,
+        frame: DeviceImageFrame,
+    },
 }
 #[derive(Clone, Debug)]
 pub struct NativeWork {
@@ -191,6 +241,7 @@ impl NativeWork {
 }
 fn command_bytes(command: &NativeCommand) -> usize {
     match command {
+        NativeCommand::WriteMemory { bytes, .. } => bytes.len(),
         NativeCommand::UploadPlanes { bytes, .. } => bytes.iter().map(|b| b.len()).sum(),
         NativeCommand::Sequence(commands) => {
             std::mem::size_of_val(commands.as_ref())

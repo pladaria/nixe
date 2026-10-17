@@ -410,14 +410,14 @@ impl ScreenRenderer {
             &self.linear
         };
         let record = descriptors.get(
-            Arc::clone(&pipeline.layout),
-            Box::new([
+            &pipeline.layout,
+            &[
                 DescriptorResource::Image {
                     view: Arc::clone(&frame.view),
                     layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 },
                 DescriptorResource::Sampler(Arc::clone(sampler)),
-            ]),
+            ],
         )?;
         let mut parameters = GraphicsParameters::new(
             state(
@@ -581,7 +581,7 @@ impl ScreenRenderer {
         push[..4].copy_from_slice(&(extent.width as f32 / ui.pixels_per_point).to_le_bytes());
         push[4..8].copy_from_slice(&(extent.height as f32 / ui.pixels_per_point).to_le_bytes());
         cache.device_mut().end_rendering();
-        let index = cache.device_mut().submission.begin()?;
+        let index = cache.device_mut().begin_recording()?;
         let command = cache.device().submission.slots[index].command;
         let dependency = [vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -620,14 +620,14 @@ impl ScreenRenderer {
                         "UI draw references an absent texture",
                     ))?;
                 let record = descriptors.get(
-                    Arc::clone(&pipeline.layout),
-                    Box::new([
+                    &pipeline.layout,
+                    &[
                         DescriptorResource::Image {
                             view: Arc::clone(&texture.view),
                             layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                         },
                         DescriptorResource::Sampler(Arc::clone(&texture.sampler)),
-                    ]),
+                    ],
                 )?;
                 let mut parameters = GraphicsParameters::new(state(format, 2), extent);
                 let min = (clip.min.to_vec2() * ui.pixels_per_point)

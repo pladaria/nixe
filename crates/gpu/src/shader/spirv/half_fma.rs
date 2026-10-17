@@ -1,10 +1,15 @@
-//! Exact binary16 FMA without Float16/FMA extensions. Binary16 products fit
+//! Binary16 FMA uses native single rounding when enabled. Otherwise products fit
 //! exactly in normal binary32. At a half midpoint, aligned integer significands
 //! with guard/round/sticky bits remove the intermediate F32 double rounding.
 //! https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-fma
 use super::*;
 impl Math {
+    /// Operands are exact binary16 values carried in FP32. The frontend emits
+    /// ordinary FP32 FMA for promoted/mixed inputs, before the half conversion.
     pub(crate) fn half_fma(&mut self, a: u32, b: u32, c: u32, saturate: bool) -> Result<u32> {
+        if self.options.native_half_conversions && self.options.native_half_fma {
+            return self.half_fma_native([a, b, c], saturate);
+        }
         self.require_float(ShaderFloatControl::new(
             ShaderRoundingMode::NearestEven,
             ShaderNanMode::Propagate,

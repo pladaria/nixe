@@ -207,7 +207,23 @@ impl NativeGpuExecution {
         self.images.insert(key, Arc::clone(&result));
         Ok(result)
     }
-    fn view(&mut self, guest: &GuestImage) -> Result<ImageViewId, VulkanError> {
+    pub(super) fn video_view(&mut self, guest: &GuestImage) -> Result<ImageViewId, VulkanError> {
+        let native = self.image(guest)?;
+        self.residency.image_view(
+            native.image,
+            ImageViewDescription {
+                format: native.format,
+                view_type: vk::ImageViewType::TYPE_2D,
+                aspects: vk::ImageAspectFlags::COLOR,
+                base_mip: 0,
+                mip_count: 1,
+                base_layer: 0,
+                layer_count: 1,
+                swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
+            },
+        )
+    }
+    fn view(&mut self, guest: &GuestImage, arrayed: bool) -> Result<ImageViewId, VulkanError> {
         let native = self.image(guest)?;
         if guest.description.samples() != SampleCount::One {
             return Err(VulkanError::InvalidResource(
@@ -228,7 +244,7 @@ impl NativeGpuExecution {
                 format: native.format,
                 view_type: if guest.description.dimension() == ImageDimension::Cube {
                     vk::ImageViewType::CUBE
-                } else if guest.description.array_layers() > 1 {
+                } else if arrayed {
                     vk::ImageViewType::TYPE_2D_ARRAY
                 } else {
                     vk::ImageViewType::TYPE_2D
@@ -237,7 +253,11 @@ impl NativeGpuExecution {
                 base_mip: 0,
                 mip_count: u32::from(guest.description.mip_levels()),
                 base_layer: 0,
-                layer_count: u32::from(guest.description.array_layers()),
+                layer_count: if arrayed || guest.description.dimension() == ImageDimension::Cube {
+                    u32::from(guest.description.array_layers())
+                } else {
+                    1
+                },
                 swizzle,
             },
         )
@@ -262,12 +282,14 @@ impl NativeGpuExecution {
                 GuestBinding::Buffer(backing) => Binding::Buffer {
                     buffer: self.residency.buffer_for_deferred_import(
                         backing.clone(),
-                        vk::BufferUsageFlags::STORAGE_BUFFER,
+                        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER,
                     )?,
                     offset: 0,
                     size: backing.size(),
                 },
-                GuestBinding::Image(image) => Binding::Image(self.view(image)?),
+                GuestBinding::Image { image, arrayed } => {
+                    Binding::Image(self.view(image, *arrayed)?)
+                }
                 GuestBinding::Sampler(s) => {
                     let address = |a| match a {
                         nixe_gpu::AddressMode::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
@@ -481,7 +503,7 @@ impl NativeGpuExecution {
             return Ok(());
         }
         if let Some((first, step)) = sampling {
-            let view = self.view(source)?;
+            let view = self.view(source, false)?;
             let destination = self.image(destination)?;
             let pipeline = self.affine_pipelines[&destination.format]
                 .poll()
@@ -497,7 +519,6 @@ impl NativeGpuExecution {
                 first,
                 step,
                 linear,
-                &mut self.descriptors,
             )?;
             return Ok(());
         }
@@ -572,5 +593,84 @@ fn sampler_border(
                 format: vk::Format::UNDEFINED,
             }),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native::tests::support;
+    use crate::residency::tests::backing_allocation;
+
+    #[test]
+    fn single_layer_texture_keeps_the_shader_array_view_type() {
+        let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+            return;
+        };
+        let validation = device.validation_monitor();
+        let mut execution = NativeGpuExecution::new(
+            device,
+            ShaderNamespace {
+                guest: *b"nixe-native-test",
+                isa: 1,
+            },
+            CacheConfiguration::default(),
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+        let (_, backing) = backing_allocation(4096, 4096, 0);
+        let guest = GuestImage {
+            description: nixe_gpu::ImageDescription::new(
+                ImageDimension::Two,
+                nixe_gpu::ImageExtent::new(1, 1, 1).unwrap(),
+                F::Rgba8Unorm,
+                nixe_gpu::ImageKind::Color,
+                1,
+                1,
+                SampleCount::One,
+            )
+            .unwrap(),
+            swizzle: nixe_gpu::Swizzle::IDENTITY,
+            canonical_texels: true,
+            sample_grid: [1, 1],
+            planes: Arc::from([GuestImagePlane {
+                mip_level: 0,
+                array_layer: 0,
+                aspect: nixe_gpu::native::GuestImageAspect::Color,
+                backing: backing.snapshot_subrange(0, 4).unwrap(),
+                row_pitch: 4,
+                bytes_per_block: 4,
+            }]),
+        };
+        let array = execution.view(&guest, true).unwrap();
+        let scalar = execution.view(&guest, false).unwrap();
+        assert_ne!(array, scalar);
+        let image = execution.image(&guest).unwrap().image;
+        let expected = execution
+            .residency
+            .image_view(
+                image,
+                ImageViewDescription {
+                    format: vk::Format::R8G8B8A8_UNORM,
+                    view_type: vk::ImageViewType::TYPE_2D_ARRAY,
+                    aspects: vk::ImageAspectFlags::COLOR,
+                    base_mip: 0,
+                    mip_count: 1,
+                    base_layer: 0,
+                    layer_count: 1,
+                    swizzle: [
+                        vk::ComponentSwizzle::R,
+                        vk::ComponentSwizzle::G,
+                        vk::ComponentSwizzle::B,
+                        vk::ComponentSwizzle::A,
+                    ],
+                },
+            )
+            .unwrap();
+        assert_eq!(array, expected);
+        assert_eq!(execution.view(&guest, true).unwrap(), array);
+        execution.teardown().unwrap();
+        drop(execution);
+        validation.check().unwrap();
     }
 }

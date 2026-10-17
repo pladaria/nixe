@@ -18,6 +18,7 @@ mod indirect;
 mod integer;
 mod interface;
 mod link;
+mod local_memory;
 mod patch_address;
 mod quad;
 mod source;
@@ -48,7 +49,7 @@ pub(crate) use source::{
 };
 
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 #[cfg(all(test, not(target_os = "macos")))]
 pub(crate) use nixe_gpu_wgpu::test_hardware as hardware;

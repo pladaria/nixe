@@ -21,6 +21,7 @@ fn main() {
         "types.h",
         "decoder.cpp",
         "cuda_transfer.h",
+        "video_transfer.h",
         "dynlink_cuda.h",
     ] {
         println!("cargo:rerun-if-changed=native/nvdec/{file}");

@@ -1203,7 +1203,7 @@ impl<E> MaxwellThreeDMmePreflightError<E> {
 }
 
 pub(super) fn preflight_mme_call<E>(
-    profile: MaxwellGpuProfile,
+    profile: &MaxwellGpuProfile,
     methods: &[MaxwellMethodDispatch],
     parameters: &mut Vec<u32>,
     candidate: &mut MaxwellThreeDFrontendState,
@@ -1244,7 +1244,7 @@ pub(super) fn preflight_mme_call<E>(
 
     {
         let mut host = MmeDispatchHost {
-            profile: &profile,
+            profile,
             source,
             candidate,
             consume,
@@ -1334,6 +1334,7 @@ where
     }
 }
 
+#[inline]
 pub(super) fn preflight(
     profile: &MaxwellGpuProfile,
     mut method: MaxwellMethodDispatch,
@@ -1363,6 +1364,7 @@ fn lower_pending_operation(
     })
 }
 
+#[inline]
 fn preflight_with_shadow(
     profile: &MaxwellGpuProfile,
     method: &mut MaxwellMethodDispatch,
@@ -1396,13 +1398,105 @@ fn preflight_with_shadow(
     Ok(prepared)
 }
 
+// A byte-sized routing table avoids probing every specialized register family
+// on every write, including methods emitted by MME. Value validation remains at
+// the selected consumer. Shadow replay and repeated trigger writes still run.
+// NVIDIA's register aperture: https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum RegisterFamily {
+    Other,
+    InlineToMemory,
+    Mme,
+    ConstantBuffer,
+    VertexAndBinding,
+}
+
+const REGISTER_FAMILIES: [RegisterFamily; 4096] = {
+    let mut families = [RegisterFamily::Other; 4096];
+    let mut index = 0;
+    while index < families.len() {
+        let method = index as u32 * 4;
+        families[index] = match method {
+            0x180..=0x1b4 => RegisterFamily::InlineToMemory,
+            0x114 | 0x118 | 0x11c | 0x120 | 0x3400..=0x37fc => RegisterFamily::Mme,
+            0x238c..=0x23fc => RegisterFamily::ConstantBuffer,
+            0x1120..=0x112c
+            | 0x1160..=0x11dc
+            | 0x1880..=0x18fc
+            | 0x1c00..=0x1dfc
+            | 0x1f00..=0x1ffc
+            | 0x0320..=0x0338
+            | 0x0374
+            | 0x0f84
+            | 0x0f88
+            | 0x02d0
+            | 0x0dcc
+            | 0x0de8
+            | 0x0d74
+            | 0x1118
+            | 0x1434
+            | 0x1438
+            | 0x1610
+            | 0x1614
+            | 0x1618
+            | 0x1644
+            | 0x1648
+            | 0x164c
+            | 0x17c8
+            | 0x17cc
+            | 0x17d0
+            | 0x17d4
+            | 0x17d8
+            | 0x17dc
+            | 0x1948
+            | 0x1970
+            | 0x0310
+            | 0x1608
+            | 0x160c
+            | 0x0f10
+            | 0x1234
+            | 0x155c
+            | 0x1560
+            | 0x1564
+            | 0x1574
+            | 0x1578
+            | 0x157c
+            | 0x2380
+            | 0x2384
+            | 0x2388
+            | 0x2608 => RegisterFamily::VertexAndBinding,
+            0x2000..=0x217c if matches!((method - 0x2000) % 0x40, 0 | 4 | 12 | 16) => {
+                RegisterFamily::VertexAndBinding
+            }
+            0x2400..=0x24fc if (method - 0x2400) % 0x20 == 0x10 => RegisterFamily::VertexAndBinding,
+            _ => RegisterFamily::Other,
+        };
+        index += 1;
+    }
+    families
+};
+
+#[inline]
+fn register_family(method: u32) -> RegisterFamily {
+    if method & 3 != 0 {
+        return RegisterFamily::Other;
+    }
+    REGISTER_FAMILIES
+        .get((method / 4) as usize)
+        .copied()
+        .unwrap_or(RegisterFamily::Other)
+}
+
 fn preflight_register(
     profile: &MaxwellGpuProfile,
     source: crate::MaxwellMethodSource,
     candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
-    if let Some((write, method_name, upload)) =
-        inline_to_memory::preflight(source, candidate.operation_state().inline_to_memory())?
+    let family = register_family(source.method().0);
+    if family == RegisterFamily::InlineToMemory
+        && let Some((write, method_name, upload)) =
+            inline_to_memory::preflight(source, candidate.operation_state().inline_to_memory())?
     {
         candidate.apply(write);
         let metadata =
@@ -1410,20 +1504,27 @@ fn preflight_register(
         let (operation, writes_state) = upload.map_or(state_write(), state_inline_to_memory);
         return Ok(PreparedMethod::new(metadata, operation, writes_state));
     }
-    if let Some((write, method_name)) = preflight_mme_state(source, candidate)? {
+    if family == RegisterFamily::Mme
+        && let Some((write, method_name)) = preflight_mme_state(source, candidate)?
+    {
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         return Ok(PreparedMethod::new(metadata, None, true));
     }
-    if let Some((write, method_name, upload)) = preflight_constant_buffer_load(source, candidate)? {
+    if family == RegisterFamily::ConstantBuffer
+        && let Some((write, method_name, upload)) =
+            preflight_constant_buffer_load(source, candidate)?
+    {
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         let (operation, writes_state) = upload.map_or(state_write(), state_inline_constant_buffer);
         return Ok(PreparedMethod::new(metadata, operation, writes_state));
     }
-    if let Some((write, method_name)) = preflight_vertex_and_binding_state(source, candidate)? {
+    if family == RegisterFamily::VertexAndBinding
+        && let Some((write, method_name)) = preflight_vertex_and_binding_state(source, candidate)?
+    {
         candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
@@ -5062,4 +5163,58 @@ fn preflight_output_state(
         MaxwellThreeDStateWrite::FixedFunction(write),
         fixed.2,
     )))
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn routing_covers_every_specialized_register_and_keeps_other_methods_out() {
+        let mut channel = crate::engines::tests::three_d_channel();
+        crate::engines::tests::program_three_d(&mut channel, 0x0d74, 0);
+        let template = channel
+            .three_d()
+            .vertex_input()
+            .primitive()
+            .vertex_array_start()
+            .source()
+            .unwrap();
+        let candidate = channel.three_d_mut();
+        for method in (0..0x4000).step_by(4) {
+            for argument in [0, 1, u32::MAX] {
+                let source = template.emitted_by_mme(GpuMethodId(method), argument);
+                let recognized = |result: Result<Option<_>, _>| !matches!(result, Ok(None));
+                let inline = !matches!(
+                    inline_to_memory::preflight(
+                        source,
+                        candidate.operation_state().inline_to_memory()
+                    ),
+                    Ok(None)
+                );
+                let mme = recognized(preflight_mme_state(source, candidate));
+                let constant =
+                    !matches!(preflight_constant_buffer_load(source, candidate), Ok(None));
+                let vertex = recognized(preflight_vertex_and_binding_state(source, candidate));
+                let expected = if inline {
+                    RegisterFamily::InlineToMemory
+                } else if mme {
+                    RegisterFamily::Mme
+                } else if constant {
+                    RegisterFamily::ConstantBuffer
+                } else if vertex {
+                    RegisterFamily::VertexAndBinding
+                } else {
+                    RegisterFamily::Other
+                };
+                assert_eq!(
+                    register_family(method),
+                    expected,
+                    "method={method:#x} argument={argument:#x}"
+                );
+            }
+        }
+        assert_eq!(register_family(u32::MAX), RegisterFamily::Other);
+        assert_eq!(register_family(0x4000), RegisterFamily::Other);
+    }
 }

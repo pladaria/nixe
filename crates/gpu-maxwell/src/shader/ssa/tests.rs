@@ -27,6 +27,257 @@ fn bra(index: usize, target: usize, predicate: u8, inverted: bool) -> u64 {
 }
 const EXIT: u64 = 0xe300_0000_0007_000f;
 
+#[test]
+fn static_local_spills_share_words_and_promote_branch_and_predicated_writes_to_phis() {
+    for branch in [false, true] {
+        let mut header = pixel_header();
+        header[1] = 64;
+        let mut code = vec![
+            0x4c98_0788_0007_0002, // R2 = c[2][0], unknown during compilation
+            0x3660_0000_0077_0207 | (2 << 49) | (7 << 39), // P0 = R2 == 7
+            mov(8, 1_f32.to_bits()),
+            mov(9, 2_f32.to_bits()),
+            0xef55_0000_0207_ff08, // STL.64 [RZ+32], R8:R9
+            mov(8, 3_f32.to_bits()),
+        ];
+        if branch {
+            code.push(bra(6, 8, 0, false));
+            code.push(0xef54_0000_0247_ff08); // Replace the second word only.
+        } else {
+            code.push(0xef54_0000_0240_ff08); // @P0 STL.32 [RZ+36], R8
+        }
+        code.extend([0xef44_0000_0247_ff00, EXIT]); // LDL.32 R0, [RZ+36]
+        let (function, _) = fixture(MaxwellShaderStage::Pixel, Some(header), &code, 16);
+        function.verify().unwrap();
+        assert!(
+            function
+                .blocks
+                .iter()
+                .flat_map(|b| &b.phis)
+                .any(|p| function.values[p.result.index()].ty == Type::U32)
+        );
+        assert!(
+            !function
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .any(|i| matches!(
+                    i.op,
+                    Op::Load {
+                        space: MemorySpace::Local,
+                        ..
+                    } | Op::Store {
+                        space: MemorySpace::Local,
+                        ..
+                    }
+                ))
+        );
+        for initial in [0, 7] {
+            let result = output(&function, &BTreeMap::from([((2, 0), initial)]));
+            let expected = if (initial == 7) ^ branch {
+                3_f32
+            } else {
+                2_f32
+            };
+            assert_eq!(
+                result[&(ShaderIoLocation::Color(0), 0)],
+                u64::from(expected.to_bits())
+            );
+        }
+    }
+}
+
+#[test]
+fn local_spills_do_not_initialize_undefined_words_or_accept_unproved_addresses() {
+    let mut header = pixel_header();
+    header[1] = 64;
+    let (function, binary) = fixture(
+        MaxwellShaderStage::Pixel,
+        Some(header),
+        &[0xef44_0000_0207_ff00, EXIT],
+        16,
+    );
+    assert!(
+        function
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|i| matches!(i.op, Op::Undefined(Type::U32)))
+    );
+    for encoding in [
+        0xef55_0000_0407_ff08, // Beyond SPH allocation.
+        0xef55_0000_0207_0108, // Dynamic address.
+        0xef55_0000_0207_ff09, // Misaligned vector register.
+        0xef52_0000_0207_ff08, // Subword access needs exact merging.
+    ] {
+        assert!(
+            super::super::local_memory::LocalMemory::default()
+                .decode(&binary, 8, encoding, 16, &mut 16)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn indexed_local_loads_alias_static_vector_stores_and_freeze_overwritten_base_registers() {
+    let mut header = pixel_header();
+    header[1] = 64;
+    header[3] = 32;
+    header[18] = 3;
+    let (function, _) = fixture(
+        MaxwellShaderStage::Pixel,
+        Some(header),
+        &[
+            0x4c98_0788_0007_0000,
+            mov(8, 1_f32.to_bits()),
+            mov(9, 2_f32.to_bits()),
+            0xef55_0000_0207_ff08,
+            mov(10, 3_f32.to_bits()),
+            mov(11, 4_f32.to_bits()),
+            0xef55_0000_0287_ff0a,
+            0xef45_0000_0007_0000,
+            EXIT,
+        ],
+        16,
+    );
+    assert_eq!(function.local_memory_bytes, 96);
+    function.verify().unwrap();
+    for (address, pair) in [(32, [1_f32, 2_f32]), (40, [3_f32, 4_f32])] {
+        let result = output(&function, &BTreeMap::from([((2, 0), address)]));
+        for (component, value) in pair.into_iter().enumerate() {
+            assert_eq!(
+                result[&(ShaderIoLocation::Color(0), component as u32)],
+                u64::from(value.to_bits())
+            );
+        }
+    }
+}
+
+#[test]
+fn range_reduction_crosses_a_dominated_branch_join_with_unchanged_data() {
+    for initial in [0, 7] {
+        let instructions = [
+            mov(0, initial),
+            0x3660_0000_0077_0007 | (2 << 49) | (7 << 39), // P0 = R0 == 7
+            mov(28, 0.5f32.to_bits()),
+            0x5c90_0000_01c7_0022, // RRO.SINCOS R34, R28
+            bra(4, 6, 0, false),
+            mov(28, 9f32.to_bits()), // original input can change after RRO
+            0x5080_0000_0017_2200,   // MUFU.SIN R0, R34
+            EXIT,
+        ];
+        let (function, _) = fixture(
+            MaxwellShaderStage::Pixel,
+            Some(pixel_header()),
+            &instructions,
+            40,
+        );
+        let values = output(&function, &BTreeMap::new());
+        let value = f32::from_bits(values[&(ShaderIoLocation::Color(0), 0)] as u32);
+        assert!((value - 0.5f32.sin()).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn range_reduced_bits_may_be_preserved_and_discarded_but_never_observed() {
+    let lop = |op: u64, dst: u8, a: u8, b: u8| {
+        0x5c47_0000_0007_0000
+            | (op << 41)
+            | u64::from(dst)
+            | (u64::from(a) << 8)
+            | (u64::from(b) << 20)
+    };
+    let code = [
+        mov(13, 0.5_f32.to_bits()),
+        mov(1, 0xffff0000),
+        mov(2, 0x1234),
+        0x5c90_0080_00d7_000d,
+        0x5080_0000_0027_0d05,
+        lop(0, 13, 13, 1),
+        lop(1, 13, 13, 2),
+        mov(1, 0xffff),
+        lop(0, 0, 13, 1),
+        EXIT,
+    ];
+    let (function, mut binary) =
+        fixture(MaxwellShaderStage::Pixel, Some(pixel_header()), &code, 20);
+    assert_eq!(
+        output(&function, &BTreeMap::new())[&(ShaderIoLocation::Color(0), 0)],
+        0x1234
+    );
+    assert!(
+        !function
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|i| matches!(i.op, Op::Undefined(_)))
+    );
+    // A full-width read would expose the still-unrepresented upper bits.
+    binary.bundles[8 / 3].instructions[8 % 3] = 0x5c98_0780_00d7_0000;
+    assert!(matches!(
+        lower_binary(&binary, 20),
+        Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            detail: "RRO reduced representation has observable bits outside a compatible MUFU",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn packed_half_writes_can_replace_both_halves_of_an_exp2_reduction_register() {
+    let code = [
+        mov(13, 0.5_f32.to_bits()),
+        mov(17, 1_f32.to_bits()),
+        0x5c90_0080_00d7_000d,
+        0x5080_0000_0027_0d05,
+        0x7a04_883c_0f07_110d,
+        0x7a87_0804_00e7_ff0d,
+        0x5c98_0780_00d7_0000,
+        EXIT,
+    ];
+    let (function, _) = fixture(MaxwellShaderStage::Pixel, Some(pixel_header()), &code, 24);
+    function.verify().unwrap();
+    assert!(
+        !function
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|i| matches!(i.op, Op::Undefined(_)))
+    );
+}
+
+#[test]
+fn opposite_predicates_can_reuse_a_reduction_register_for_ordinary_math() {
+    let code = [
+        0x4c98_0788_0007_0002,
+        0x3660_0000_0077_0207 | (2 << 49) | (7 << 39),
+        mov(3, 0.5_f32.to_bits()),
+        mov(14, 4_f32.to_bits()),
+        0x5c90_0080_0038_000e,                 // @!P0 RRO.EX2 R14,R3
+        0x5080_0000_0028_0e00,                 // @!P0 MUFU.EX2 R0,R14
+        mov(14, 4_f32.to_bits()) & !(7 << 16), // @P0 overwrite the ordinary value
+        0x5080_0000_0030_0e00,                 // @P0 MUFU.LG2 R0,R14
+        EXIT,
+    ];
+    let (function, mut binary) =
+        fixture(MaxwellShaderStage::Pixel, Some(pixel_header()), &code, 20);
+    for initial in [0, 7] {
+        let result = output(&function, &BTreeMap::from([((2, 0), initial)]));
+        let actual = f32::from_bits(result[&(ShaderIoLocation::Color(0), 0)] as u32);
+        let expected = if initial == 7 { 2.0 } else { 0.5_f32.exp2() };
+        assert!((actual - expected).abs() < 1e-6);
+    }
+    // An unguarded LG2 would really consume the reduced EX2 representation.
+    binary.bundles[7 / 3].instructions[7 % 3] |= 7 << 16;
+    assert!(matches!(
+        lower_binary(&binary, 20),
+        Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+            detail: "RRO reduced representation has observable bits outside a compatible MUFU",
+            ..
+        })
+    ));
+}
+
 fn pixel_header() -> [u32; 20] {
     let mut h = [0; 20];
     h[0] = 0x0002_5462;
@@ -44,7 +295,7 @@ fn fixture(
     register_count: u8,
 ) -> (Function, MaxwellShaderBinary) {
     let (program, binary) = program_fixture(stage, header, instructions, register_count);
-    (program.function, binary)
+    (std::sync::Arc::unwrap_or_clone(program.function), binary)
 }
 
 fn program_fixture(
@@ -82,6 +333,7 @@ fn program_fixture(
                 workgroup_size: [32, 1, 1],
             },
             None,
+            0,
         )
         .unwrap()
     } else {
@@ -148,6 +400,7 @@ fn output(
     constants: &BTreeMap<(u32, u32), u32>,
 ) -> BTreeMap<(ShaderIoLocation, u32), u64> {
     let mut values = vec![None; function.values.len()];
+    let mut local = vec![None; function.local_memory_bytes as usize / 4];
     let mut result = BTreeMap::new();
     let mut block = function.entry();
     let mut previous = None;
@@ -218,12 +471,38 @@ fn output(
                         _ => panic!("fixture comparison"),
                     }))
                 }
+                Op::Math {
+                    function:
+                        nixe_gpu::ssa::MathFunction::Special(nixe_gpu::ShaderSpecialFunction::Sine),
+                    ..
+                } => Some(u64::from(f32::from_bits(a[0] as u32).sin().to_bits())),
+                Op::Math {
+                    function:
+                        nixe_gpu::ssa::MathFunction::Special(nixe_gpu::ShaderSpecialFunction::Exp2),
+                    ..
+                } => Some(u64::from(f32::from_bits(a[0] as u32).exp2().to_bits())),
+                Op::Math {
+                    function:
+                        nixe_gpu::ssa::MathFunction::Special(nixe_gpu::ShaderSpecialFunction::Log2),
+                    ..
+                } => Some(u64::from(f32::from_bits(a[0] as u32).log2().to_bits())),
                 Op::Output {
                     location,
                     component,
                     ..
                 } => {
                     result.insert((location, component), a[0]);
+                    None
+                }
+                Op::Load {
+                    space: MemorySpace::Local,
+                    ..
+                } => Some(local[a[0] as usize / 4].expect("uninitialized local fixture word")),
+                Op::Store {
+                    space: MemorySpace::Local,
+                    ..
+                } => {
+                    local[a[0] as usize / 4] = Some(a[1]);
                     None
                 }
                 Op::Load {
@@ -721,18 +1000,21 @@ fn spirv_options() -> nixe_gpu::ssa::spirv::Options {
             vertex_position_transform: None,
             input_control_points: 0,
             tessellation_mode: None,
+            native_half_conversions: false,
+            native_half_fma: false,
             float32: nixe_gpu::SpirvFloat32Capabilities {
                 denorm_preserve: true,
                 rounding_mode_rte: true,
                 signed_zero_inf_nan_preserve: true,
                 fused_multiply_add: true,
+                ..Default::default()
             },
             float64: Default::default(),
         },
         integer64: false,
         subgroup_quad: false,
         shared_memory_bytes: 0,
-        local_memory_bytes: 0,
+        uniform_buffer_bytes: 65536,
     }
 }
 #[test]
@@ -812,7 +1094,7 @@ fn captured_graphics_pipeline_compiles_to_linked_ssa_without_oracle_modules() {
     let stages: Vec<_> = pipeline
         .programs
         .iter()
-        .map(|p| (&p.function, spirv_options()))
+        .map(|p| (p.function.as_ref(), spirv_options()))
         .collect();
     let modules = nixe_gpu::ssa::spirv::emit_pipeline(&stages).unwrap();
     assert_eq!(modules.len(), 2);

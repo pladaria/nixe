@@ -14,6 +14,9 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/pixdesc.h>
 }
+#ifdef __linux__
+#include "video_transfer.h"
+#endif
 
 struct Decoder {
     Tegra::Decoders::VP9 headers;
@@ -118,65 +121,80 @@ int nixe_nvdec_receive(Decoder* decoder, uint64_t* origin, uint32_t* width, uint
     catch (...) { decoder->error="unknown native decoder failure"; return -1; }
 }
 void nixe_video_frame_free(AVFrame* frame) noexcept { av_frame_free(&frame); }
-int nixe_video_frame_copy(AVFrame* frame, int fd, int semaphore_fd, uint64_t allocation_size, const uint8_t* uuid,
-                          uint64_t row_pitch, uint64_t chroma_offset, int initialize) noexcept {
+// Capability selection precedes decoder creation; an unavailable CUDA device
+// preserves the existing software decoder. Actual decoding failures stay errors.
+int nixe_video_hardware_supported(const uint8_t* uuid) noexcept {
 #ifdef __linux__
+    if (!uuid) return 0;
+    void* library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!library) return 0;
+    dlclose(library);
     try {
-        if (!frame || frame->format!=AV_PIX_FMT_CUDA || !frame->hw_frames_ctx)
-            throw std::runtime_error("invalid CUDA video frame");
-        if (row_pitch < static_cast<uint64_t>((frame->width+1)/2*2)
-            || chroma_offset < row_pitch*frame->height
-            || allocation_size < chroma_offset+row_pitch*((frame->height+1)/2))
-            throw std::runtime_error("external video buffer does not contain both planes");
-        auto& cuda=CudaTransfer::get();
-        const auto* frames=reinterpret_cast<const AVHWFramesContext*>(frame->hw_frames_ctx->data);
-        const auto* context=reinterpret_cast<const AVCUDADeviceContext*>(frames->device_ctx->hwctx);
-        cuda.check(cuda.cuCtxPushCurrent_v2(context->cuda_ctx));
-        struct Scope {
-            CudaTransfer& cuda; CUexternalMemory memory{}; CUexternalSemaphore semaphore{}; CUdeviceptr pointer{}; CUstream stream{}; bool synchronized{};
-            ~Scope() { if (!synchronized) cuda.cuStreamSynchronize(stream); if (semaphore) cuda.cuDestroyExternalSemaphore(semaphore); if (pointer) cuda.cuMemFree_v2(pointer); if (memory) cuda.cuDestroyExternalMemory(memory); CUcontext popped{}; cuda.cuCtxPopCurrent_v2(&popped); }
-        } scope{cuda};
-        scope.stream=context->stream;
-        CUdevice actual_device{}; CUuuid actual_uuid{};
-        cuda.check(cuda.cuCtxGetDevice(&actual_device)); cuda.check(cuda.cuDeviceGetUuid(&actual_uuid,actual_device));
-        if (std::memcmp(actual_uuid.bytes,uuid,16)!=0) throw std::runtime_error("decoded frame belongs to another GPU");
-        if (!frame->data[0] || !frame->data[1] || frame->linesize[0]<frame->width || frame->linesize[1]<(frame->width+1)/2*2) throw std::runtime_error("invalid NV12 device plane strides");
-        // CUDA owns a successfully imported FD; the caller keeps its original.
-        // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXTRES__INTEROP.html
-        CUDA_EXTERNAL_MEMORY_HANDLE_DESC descriptor{};
-        descriptor.type=CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
-        descriptor.handle.fd=dup(fd); descriptor.size=allocation_size; descriptor.flags=1; // dedicated allocation
-        if (descriptor.handle.fd<0) throw std::runtime_error("cannot duplicate Vulkan memory FD");
-        const auto imported=cuda.cuImportExternalMemory(&scope.memory,&descriptor);
-        if (imported!=CUDA_SUCCESS) close(descriptor.handle.fd);
-        cuda.check(imported);
-        CUDA_EXTERNAL_MEMORY_BUFFER_DESC buffer{}; buffer.size=allocation_size;
-        cuda.check(cuda.cuExternalMemoryGetMappedBuffer(&scope.pointer,scope.memory,&buffer));
-        if (initialize) cuda.check(cuda.cuMemsetD8Async(scope.pointer,0,allocation_size,context->stream));
-        for (int plane=0;plane<2;++plane) {
-            CUDA_MEMCPY2D copy{};
-            copy.srcMemoryType=CU_MEMORYTYPE_DEVICE; copy.srcDevice=reinterpret_cast<CUdeviceptr>(frame->data[plane]); copy.srcPitch=frame->linesize[plane];
-            copy.dstMemoryType=CU_MEMORYTYPE_DEVICE; copy.dstDevice=scope.pointer+(plane ? chroma_offset : 0); copy.dstPitch=row_pitch;
-            copy.WidthInBytes=plane ? (frame->width+1)/2*2 : frame->width;
-            copy.Height=plane ? (frame->height+1)/2 : frame->height;
-            cuda.check(cuda.cuMemcpy2DAsync_v2(&copy,context->stream));
+        if (CudaTransfer::get().find_device(uuid) < 0) return 0;
+        const auto* codec = avcodec_find_decoder(AV_CODEC_ID_VP9);
+        if (!codec) throw std::runtime_error("FFmpeg VP9 decoder unavailable");
+        for (int i=0;; ++i) {
+            const auto* config = avcodec_get_hw_config(codec, i);
+            if (!config) return 0;
+            if (config->device_type == AV_HWDEVICE_TYPE_CUDA
+                && (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) return 1;
         }
-        CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC sem{};
-        sem.type=CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD; sem.handle.fd=dup(semaphore_fd);
-        if (sem.handle.fd<0) throw std::runtime_error("cannot duplicate Vulkan semaphore FD");
-        const auto sem_imported=cuda.cuImportExternalSemaphore(&scope.semaphore,&sem);
-        if (sem_imported!=CUDA_SUCCESS) close(sem.handle.fd);
-        cuda.check(sem_imported);
-        CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS signal{};
-        cuda.check(cuda.cuSignalExternalSemaphoresAsync(&scope.semaphore,&signal,1,context->stream));
-        // Complete actual device writes before Vulkan consumes the shared buffer.
-        cuda.check(cuda.cuStreamSynchronize(context->stream));
-        scope.synchronized=true;
-        return 1;
-    } catch (const std::exception& e) { native_error=e.what(); return -1; }
+    } catch (const std::exception& error) { native_error=error.what(); return -1; }
 #else
-    native_error="CUDA/Vulkan video interop requires Linux"; return -1;
+    (void)uuid; return 0;
 #endif
 }
-
+uintptr_t nixe_video_frame_context(const AVFrame* frame) noexcept {
+#ifdef __linux__
+    try { return reinterpret_cast<uintptr_t>(VideoTransfer::frame_context(frame)->cuda_ctx); }
+    catch (...) { return 0; }
+#else
+    (void)frame; return 0;
+#endif
+}
+void* nixe_video_transfer_create(const AVFrame* frame, int fd, int semaphore_fd, uint64_t allocation_size,
+                                const uint8_t* uuid, uint64_t pitch, uint64_t chroma, int initialize) noexcept {
+#ifdef __linux__
+    try {
+        auto transfer=std::make_unique<VideoTransfer>();
+        transfer->open(frame, fd, semaphore_fd, allocation_size, uuid, pitch, chroma, initialize != 0);
+        return transfer.release();
+    } catch (const std::exception& error) { native_error=error.what(); return nullptr; }
+#else
+    native_error="CUDA/Vulkan video interop requires Linux"; return nullptr;
+#endif
+}
+int nixe_video_transfer_enqueue(void* target, const AVFrame* frame) noexcept {
+#ifdef __linux__
+    try { static_cast<VideoTransfer*>(target)->copy(frame); return 1; }
+    catch (const std::exception& error) { native_error=error.what(); return -1; }
+#else
+    return -1;
+#endif
+}
+int nixe_video_transfer_wait(void* target) noexcept {
+#ifdef __linux__
+    try { static_cast<VideoTransfer*>(target)->wait(); return 1; }
+    catch (const std::exception& error) { native_error=error.what(); return -1; }
+#else
+    return -1;
+#endif
+}
+void nixe_video_transfer_free(void* target) noexcept {
+#ifdef __linux__
+    delete static_cast<VideoTransfer*>(target);
+#endif
+}
+// Temporary synchronous consumer for the old renderer, sharing the same import
+// implementation. The native renderer retains imports and never calls this.
+int nixe_video_frame_copy(AVFrame* frame, int fd, int semaphore_fd, uint64_t allocation_size, const uint8_t* uuid,
+                          uint64_t row_pitch, uint64_t chroma_offset, int initialize) noexcept {
+    void* transfer = nixe_video_transfer_create(frame, fd, semaphore_fd, allocation_size, uuid,
+                                               row_pitch, chroma_offset, initialize);
+    if (!transfer) return -1;
+    const auto copied = nixe_video_transfer_enqueue(transfer, frame);
+    const auto waited = nixe_video_transfer_wait(transfer);
+    nixe_video_transfer_free(transfer);
+    return copied < 0 || waited < 0 ? -1 : 1;
+}
 }

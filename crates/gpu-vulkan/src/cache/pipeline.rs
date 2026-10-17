@@ -104,6 +104,8 @@ impl Libraries {
         key: LibraryKey,
         create: impl FnOnce() -> Result<Library, CompileError>,
     ) -> Result<(Arc<Library>, bool), CompileError> {
+        #[cfg(feature = "performance-counters")]
+        let capture_key = nixe_gpu::compilation_capture::Key::new(&key);
         let (cell, create_here) = {
             let mut map = self.map.lock().unwrap();
             map.clock = map.clock.wrapping_add(1);
@@ -122,16 +124,26 @@ impl Libraries {
                     let Some(victim) = victim else {
                         return Err(CompileError::Budget);
                     };
+                    #[cfg(feature = "performance-counters")]
+                    nixe_gpu::compilation_capture::Key::new(&victim).event("evict", usize::MAX, 0);
                     map.entries.remove(&victim);
                 }
                 let cell = Arc::new(LibraryCell {
                     result: Mutex::new(None),
                     ready: Condvar::new(),
                 });
+                #[cfg(feature = "performance-counters")]
+                if nixe_gpu::compilation_capture::enabled() {
+                    capture_key.detail("identity", usize::MAX, 0, &format!("{key:?}"));
+                }
                 map.entries.insert(key, (Arc::clone(&cell), clock));
                 (cell, true)
             }
         };
+        #[cfg(feature = "performance-counters")]
+        capture_key.event(if create_here { "begin" } else { "hit" }, usize::MAX, 0);
+        #[cfg(feature = "performance-counters")]
+        let started = Instant::now();
         if create_here {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(create))
                 .unwrap_or_else(|_| {
@@ -141,11 +153,21 @@ impl Libraries {
                 })
                 .map(Arc::new)
                 .map_err(Arc::new);
+            #[cfg(feature = "performance-counters")]
+            capture_key.event(
+                if result.is_ok() { "end" } else { "failed" },
+                usize::MAX,
+                started.elapsed().as_nanos() as u64,
+            );
             *cell.result.lock().unwrap() = Some(result);
             cell.ready.notify_all();
         }
         let result = cell.result.lock().unwrap();
         let result = cell.ready.wait_while(result, |r| r.is_none()).unwrap();
+        #[cfg(feature = "performance-counters")]
+        if !create_here {
+            capture_key.event("wait_ns", usize::MAX, started.elapsed().as_nanos() as u64);
+        }
         result
             .as_ref()
             .unwrap()
@@ -292,11 +314,42 @@ impl PipelineCompiler {
             state: state.clone(),
         };
         let compiler = Arc::clone(&self.compiler);
+        #[cfg(feature = "performance-counters")]
+        let captured = key.clone();
         self.cache.request(
             &self.pool,
             key,
             std::mem::size_of::<NativePipeline>(),
-            move |worker| compiler.create(worker, shader, state),
+            move |worker| {
+                #[cfg(feature = "performance-counters")]
+                if nixe_gpu::compilation_capture::enabled() {
+                    nixe_gpu::compilation_capture::Key::new(&captured).detail(
+                        "identity",
+                        worker,
+                        0,
+                        &format!(
+                            "{captured:?} stages={:?} strategy={:?}",
+                            shader
+                                .stages
+                                .iter()
+                                .map(|s| (s.stage, s.identity.hex(), s.module.words.len()))
+                                .collect::<Vec<_>>(),
+                            compiler.strategy
+                        ),
+                    );
+                }
+                let result = compiler.create(worker, shader, state);
+                #[cfg(feature = "performance-counters")]
+                if let Ok(pipeline) = &result {
+                    nixe_gpu::compilation_capture::Key::new(&captured).detail(
+                        "metrics",
+                        worker,
+                        pipeline.metrics.wall_ns,
+                        &format!("{:?}", pipeline.metrics),
+                    );
+                }
+                result
+            },
         )
     }
     pub fn checkpoint(&self) -> Result<(), CompileError> {
@@ -414,6 +467,11 @@ impl Compiler {
             )
         };
         metrics.wall_ns = start.elapsed().as_nanos() as u64;
+        nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::HostPipelineCompilations, 1);
+        nixe_gpu::metrics::record(
+            nixe_gpu::metrics::Counter::HostPipelineCompilationNanoseconds,
+            metrics.wall_ns,
+        );
         let resources = crate::residency::execution::shader_accesses(&shader, &layout.key);
         Ok(NativePipeline {
             owner: Arc::clone(&self.owner),

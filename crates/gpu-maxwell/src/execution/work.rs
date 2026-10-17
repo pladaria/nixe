@@ -8,6 +8,8 @@ pub trait MaxwellWork: Send + 'static {
     fn retained_bytes(&self) -> usize;
     fn canonical_accesses(&self) -> (&[nixe_gpu::BackingView], bool);
     fn frontend(&self) -> FrontendSubmissionId;
+    /// Cold lookahead only; the retiring operation renderer has no native code.
+    fn precompile(&self, _backend: &mut impl nixe_gpu::GpuExecution) {}
 }
 pub trait MaxwellWorkSegment: Send {
     type Commands;
@@ -16,6 +18,21 @@ pub trait MaxwellWorkSegment: Send {
 }
 pub trait MaxwellWorkBatch<W: MaxwellWork + ?Sized>: Default + Send {
     type Segment: MaxwellWorkSegment;
+    /// The native stream can express device ordering and memory producers.
+    /// The operation renderer still executes its canonical effects on the host.
+    const DEVICE_MEMORY: bool = false;
+    fn wait_for_idle(&mut self) {
+        unreachable!("this batch has no device memory commands")
+    }
+    fn write_memory(
+        &mut self,
+        _target: nixe_memory::CanonicalBackingRange,
+        _offset: u64,
+        _bytes: &[u8],
+        _after_prior_work: bool,
+    ) {
+        unreachable!("this batch has no device memory commands")
+    }
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -131,6 +148,9 @@ impl MaxwellWork for nixe_gpu::native::NativeWork {
     fn frontend(&self) -> FrontendSubmissionId {
         self.frontend
     }
+    fn precompile(&self, backend: &mut impl nixe_gpu::GpuExecution) {
+        backend.precompile(&self.command);
+    }
 }
 impl MaxwellWorkSegment for nixe_gpu::native::NativeSubmission {
     type Commands = Self;
@@ -147,6 +167,26 @@ impl MaxwellWorkSegment for nixe_gpu::native::NativeSubmission {
 }
 impl MaxwellWorkBatch<nixe_gpu::native::NativeWork> for NativeWorkBatch {
     type Segment = nixe_gpu::native::NativeSubmission;
+    const DEVICE_MEMORY: bool = true;
+    fn wait_for_idle(&mut self) {
+        self.commands
+            .push(nixe_gpu::native::NativeCommand::WaitForIdle);
+    }
+    fn write_memory(
+        &mut self,
+        target: nixe_memory::CanonicalBackingRange,
+        offset: u64,
+        bytes: &[u8],
+        after_prior_work: bool,
+    ) {
+        self.commands
+            .push(nixe_gpu::native::NativeCommand::WriteMemory {
+                target,
+                offset,
+                bytes: Arc::from(bytes),
+                after_prior_work,
+            });
+    }
     fn len(&self) -> usize {
         self.commands.len()
     }
@@ -201,7 +241,6 @@ mod tests {
             }),
             bindings: Box::new([]),
             shared_memory_bytes: 0,
-            local_memory_bytes: 0,
         });
         let mut batch = NativeWorkBatch::default();
         {

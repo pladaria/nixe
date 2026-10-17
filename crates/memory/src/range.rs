@@ -534,7 +534,7 @@ impl CanonicalCpuWriteDependency {
         } else {
             let mut transitions = execution_gates
                 .iter()
-                .map(crate::ExecutionGate::acquire_exclusive)
+                .map(|gate| gate.acquire_exclusive())
                 .collect::<Vec<_>>();
             if page_list.iter().try_fold(false, |needed, page| {
                 Ok::<_, CanonicalRangeAccessError>(
@@ -752,7 +752,7 @@ impl CanonicalCpuWriteDependency {
             }
             let mut transitions = gates
                 .values()
-                .map(crate::ExecutionGate::acquire_exclusive)
+                .map(|gate| gate.acquire_exclusive())
                 .collect::<Vec<_>>();
             let mut demands = BTreeMap::new();
             let mut retry = Vec::new();
@@ -1305,7 +1305,10 @@ impl CanonicalBackingRange {
         &self.layout.topology().segments
     }
 
-    pub(crate) fn segments_between(
+    /// Iterates the page segments intersecting a validated logical [offset, end)
+    /// window in O(log n + affected segments), without constructing a subrange.
+    /// Returned segments retain their original logical starts and are not clipped.
+    pub fn segments_between(
         &self,
         offset: u64,
         end: u64,
@@ -1532,7 +1535,7 @@ impl CanonicalBackingRange {
 
             let _transitions = self
                 .execution_gates()
-                .map(crate::ExecutionGate::acquire_exclusive)
+                .map(|gate| gate.acquire_exclusive())
                 .collect::<Vec<_>>();
             let mut cpu_visible = true;
             for (logical_start, segment) in self.segments_between(offset, end) {
@@ -1771,7 +1774,7 @@ impl CanonicalBackingRange {
         }
         let mut transitions = gates
             .values()
-            .map(crate::ExecutionGate::acquire_exclusive)
+            .map(|gate| gate.acquire_exclusive())
             .collect::<Vec<_>>();
         for transition in &mut transitions {
             transition.commit();
@@ -1878,7 +1881,7 @@ impl CanonicalBackingRange {
             }
             let mut transitions = gates
                 .values()
-                .map(crate::ExecutionGate::acquire_exclusive)
+                .map(|gate| gate.acquire_exclusive())
                 .collect::<Vec<_>>();
             for transition in &mut transitions {
                 transition.commit();
@@ -1923,7 +1926,7 @@ impl CanonicalBackingRange {
         }
         let mut transitions = gates
             .values()
-            .map(crate::ExecutionGate::acquire_exclusive)
+            .map(|gate| gate.acquire_exclusive())
             .collect::<Vec<_>>();
         for transition in &mut transitions {
             transition.commit();

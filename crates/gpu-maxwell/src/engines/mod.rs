@@ -796,11 +796,12 @@ fn flush_mme_methods<E>(
     if pending.is_empty() {
         return Ok(());
     }
+    let (profile, state) = channel.three_d_with_profile_mut();
     threed::preflight_mme_call(
-        channel.profile(),
+        profile,
         pending,
         parameters,
-        channel.three_d_mut(),
+        state,
         methods.as_deref_mut(),
         &mut |operation, state| emit_pending_operation(operation, state, None, consume),
     )
@@ -1022,7 +1023,6 @@ fn dispatch_class_method(
     channel: &mut MaxwellGpuChannel,
     method: MaxwellMethodDispatch,
 ) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
-    let classes = channel.profile().classes();
     let class = method.class();
     if class == compute::CLASS {
         return compute::preflight(class, method, channel.compute_mut());
@@ -1041,7 +1041,7 @@ fn dispatch_class_method(
         return twod::preflight(method, channel.two_d_mut());
     }
 
-    let class_name = if class == classes.gpfifo() {
+    let class_name = if class == channel.profile().classes().gpfifo() {
         Some("MAXWELL_CHANNEL_GPFIFO_A")
     } else {
         None

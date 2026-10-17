@@ -845,6 +845,8 @@ impl WgpuBackendDriver {
                         .is_some_and(|transform| transform.depth_clip_negative_one_to_one()),
                     input_control_points: 0,
                     tessellation_mode: None,
+                    native_half_conversions: false,
+                    native_half_fma: false,
                     float32: caps.float32,
                     float64: caps.float64,
                 },

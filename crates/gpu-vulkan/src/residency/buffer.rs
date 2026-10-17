@@ -1,5 +1,31 @@
 //! Physical buffer lookup, CPU epochs and GPU alias reconstruction.
 use super::*;
+pub(super) struct CpuImports {
+    pub snapshots: nixe_memory::CanonicalByteSnapshots,
+    pub gpu_invalidated: Vec<(u64, u64)>,
+}
+#[derive(Clone, Copy)]
+pub(super) struct BufferStreamRequest {
+    pub id: BufferId,
+    pub offset: u64,
+    pub size: u64,
+    pub alignment: u64,
+}
+pub(super) type BufferStream = Option<(Arc<AllocatedBuffer>, u64)>;
+/// Owned CPU input versions for one consecutive draw run. CPU bytes are
+/// consumed at capture, not again at each draw. Pending GPU producers and
+/// canonical writeback generations can supersede these versions before use.
+pub(crate) struct DrawInputBatch {
+    work: WorkTicket,
+    buffers: rustc_hash::FxHashMap<(BufferId, u64, u64), CapturedBuffer>,
+}
+struct CapturedBuffer {
+    stream: (Arc<AllocatedBuffer>, u64),
+    pages: Vec<(
+        nixe_memory::CanonicalBackingPage,
+        nixe_memory::ContentGeneration,
+    )>,
+}
 pub(super) struct StreamedBuffer {
     work: WorkTicket,
     window: (u64, u64),
@@ -89,6 +115,7 @@ impl VulkanResidency {
         self.buffers[slot] = Slot {
             generation,
             entry: Some(BufferEntry {
+                known: None,
                 streaming_cpu: None,
                 streamed: None,
                 image_import: None,
@@ -118,101 +145,211 @@ impl VulkanResidency {
     /// mapped submission arena. Every version has a distinct, atom-isolated
     /// region retained until timeline completion; GPU-authored data and large
     /// working sets continue through the native device buffer and exact hazards.
-    pub(super) fn stream_buffer(
+    /// Capture the compatible read windows under one execution exclusion phase.
+    /// Each observer and arena version remains independent of native imports.
+    pub(super) fn stream_buffers(
         &mut self,
-        id: BufferId,
-        offset: u64,
-        size: u64,
-        alignment: u64,
-    ) -> Result<Option<(Arc<AllocatedBuffer>, u64)>, VulkanError> {
-        const MAX_STREAM_BYTES: u64 = 64 * 1024;
-        self.check_buffer_range(id, offset, size)?;
-        if size > MAX_STREAM_BYTES || size > self.device.submission.configuration.arena_bytes {
-            return Ok(None);
-        }
-        let backing = self
-            .buffer(id)?
-            .contents
-            .backing
-            .snapshot_subrange(offset, size)
-            .map_err(memory_error)?;
-        if backing
-            .pages()
-            .any(|page| self.gpu_owned(page.identity(), page.visibility_state()))
-        {
-            return Ok(None);
-        }
+        requests: &[Option<BufferStreamRequest>],
+    ) -> Result<Vec<BufferStream>, VulkanError> {
+        self.stream_buffers_with_inputs(requests, None)
+    }
+    pub(super) fn capture_buffer_inputs(
+        &mut self,
+        requests: &[Option<BufferStreamRequest>],
+    ) -> Result<DrawInputBatch, VulkanError> {
+        let streams = self.stream_buffers(requests)?;
         let work = self.device.work_ticket()?;
-        if let Some(entry) = &self.buffers[id.slot].entry
-            && let Some(stream) = &entry.streamed
-            && stream.work == work
-            && stream.window == (offset, size)
-            && entry
-                .streaming_cpu
-                .as_ref()
-                .is_some_and(CanonicalCpuWriteDependency::remains_current)
-        {
-            let binding = (Arc::clone(&stream.buffer), stream.offset);
-            self.statistics.cpu_stream_hits += 1;
-            self.touch(Resource::Buffer(id));
-            let slot = self.device.submission.recording.expect("stream recording");
-            self.device.submission.retain_stream_upload(slot);
-            return Ok(Some(binding));
-        }
-        // Descriptor records can outlive a submission. Restrict direct streams
-        // to the fixed arenas; retaining overflow allocations in that cache
-        // would escape the queue's transient overflow accounting.
-        let slot = self.device.submission.begin()?;
-        if let Some(arena) = &self.device.submission.slots[slot].upload
-            && crate::queue::align_up(
-                arena.cursor,
-                alignment.max(4).max(arena.buffer.host_alignment()),
-            )
-            .and_then(|start| start.checked_add(size))
-            .is_none_or(|end| end > arena.buffer.size())
-        {
-            return Ok(None);
-        }
-        let dependency = if let Some(dependency) = &self.buffer(id)?.streaming_cpu {
-            dependency.clone()
-        } else {
-            let dependency =
-                CanonicalCpuWriteDependency::capture(&self.buffer(id)?.contents.backing)
+        let mut buffers = rustc_hash::FxHashMap::default();
+        for (request, stream) in requests.iter().zip(streams) {
+            if let (Some(request), Some(stream)) = (request, stream) {
+                let range = self
+                    .buffer(request.id)?
+                    .contents
+                    .backing
+                    .snapshot_subrange(request.offset, request.size)
                     .map_err(memory_error)?;
-            self.buffers[id.slot].entry.as_mut().unwrap().streaming_cpu = Some(dependency.clone());
-            dependency
-        };
-        // This observer is independent of the persistent native buffer's dirty
-        // proof: streaming must not acknowledge data that buffer never imported.
-        let mut snapshots = dependency
-            .snapshot_with_resolver(&backing, CpuWriteSnapshotSelection::All, 1, &mut |_, _| {
+                let pages = range
+                    .pages()
+                    .map(|page| (page.clone(), page.content_generation()))
+                    .collect();
+                buffers.insert(
+                    (request.id, request.offset, request.size),
+                    CapturedBuffer { stream, pages },
+                );
+            }
+        }
+        Ok(DrawInputBatch { work, buffers })
+    }
+    pub(super) fn stream_buffers_with_inputs(
+        &mut self,
+        requests: &[Option<BufferStreamRequest>],
+        inputs: Option<&DrawInputBatch>,
+    ) -> Result<Vec<BufferStream>, VulkanError> {
+        const MAX_STREAM_BYTES: u64 = 64 * 1024;
+        let mut streams = vec![None; requests.len()];
+        let mut pending = Vec::new();
+        let mut admission = None;
+        for (index, request) in requests.iter().enumerate() {
+            let Some(request) = *request else { continue };
+            let BufferStreamRequest {
+                id,
+                offset,
+                size,
+                alignment,
+            } = request;
+            self.check_buffer_range(id, offset, size)?;
+            if size > MAX_STREAM_BYTES || size > self.device.submission.configuration.arena_bytes {
+                continue;
+            }
+            let backing = self
+                .buffer(id)?
+                .contents
+                .backing
+                .snapshot_subrange(offset, size)
+                .map_err(memory_error)?;
+            let mut invalid_cpu_state = false;
+            if backing.pages().any(|page| {
+                let state = page.visibility_state();
+                invalid_cpu_state |= matches!(
+                    state,
+                    VisibilityState::Invalid | VisibilityState::Conflicting
+                );
+                self.gpu_owned(page.identity(), state)
+            }) {
+                continue;
+            }
+            if invalid_cpu_state {
+                return Err(VulkanError::InvalidResource(
+                    "CPU draw input has invalid canonical visibility",
+                ));
+            }
+            let work = self.device.work_ticket()?;
+            if let Some(inputs) = inputs
+                && inputs.work == work
+                && let Some(captured) = inputs.buffers.get(&(id, offset, size))
+                && captured.stream.1.is_multiple_of(alignment)
+                && captured
+                    .pages
+                    .iter()
+                    .all(|(page, generation)| page.content_generation() == *generation)
+            {
+                streams[index] = Some((Arc::clone(&captured.stream.0), captured.stream.1));
+                self.statistics.cpu_stream_hits += 1;
+                self.touch(Resource::Buffer(id));
+                let slot = self
+                    .device
+                    .submission
+                    .recording
+                    .expect("captured input recording");
+                self.device.submission.retain_stream_upload(slot);
+                continue;
+            }
+            if let Some(entry) = &self.buffers[id.slot].entry
+                && let Some(stream) = &entry.streamed
+                && stream.work == work
+                && stream.window == (offset, size)
+                && stream.offset.is_multiple_of(alignment)
+                && entry
+                    .streaming_cpu
+                    .as_ref()
+                    .is_some_and(CanonicalCpuWriteDependency::remains_current)
+            {
+                streams[index] = Some((Arc::clone(&stream.buffer), stream.offset));
+                self.statistics.cpu_stream_hits += 1;
+                self.touch(Resource::Buffer(id));
+                let slot = self.device.submission.recording.expect("stream recording");
+                self.device.submission.retain_stream_upload(slot);
+                continue;
+            }
+            // Stream leases retain only fixed arenas. Admit the complete batch
+            // before snapshots so an exhausted arena does not force read work.
+            let (cursor, atom, capacity) = if let Some(admission) = admission {
+                admission
+            } else {
+                let slot = self.device.begin_recording()?;
+                self.device.submission.slots[slot].upload.as_ref().map_or(
+                    (
+                        0,
+                        self.device.owner.non_coherent_atom_size.max(4),
+                        self.device.submission.configuration.arena_bytes,
+                    ),
+                    |arena| {
+                        (
+                            arena.cursor,
+                            arena.buffer.host_alignment(),
+                            arena.buffer.size(),
+                        )
+                    },
+                )
+            };
+            let Some(end) = crate::queue::align_up(cursor, alignment.max(atom).max(4))
+                .and_then(|start| start.checked_add(size))
+                .filter(|end| *end <= capacity)
+            else {
+                continue;
+            };
+            admission = Some((end, atom, capacity));
+            let dependency = if let Some(dependency) = &self.buffer(id)?.streaming_cpu {
+                dependency.clone()
+            } else {
+                let dependency =
+                    CanonicalCpuWriteDependency::capture(&self.buffer(id)?.contents.backing)
+                        .map_err(memory_error)?;
+                self.buffers[id.slot].entry.as_mut().unwrap().streaming_cpu =
+                    Some(dependency.clone());
+                dependency
+            };
+            pending.push((index, request, backing, dependency));
+        }
+        if pending.is_empty() {
+            return Ok(streams);
+        }
+        let snapshots = CanonicalCpuWriteDependency::snapshot_batch_with_resolver(
+            &pending
+                .iter()
+                .map(|(_, _, backing, dependency)| CpuWriteSnapshotRequest {
+                    dependency,
+                    range: backing,
+                    selection: CpuWriteSnapshotSelection::All,
+                    alignment: 1,
+                })
+                .collect::<Vec<_>>(),
+            &mut |_, _| {
                 Err(nixe_memory::VisibilityCoordinatorError::new(
                     "streamed CPU snapshot crossed concurrent GPU ownership",
                 ))
-            })
-            .map_err(memory_error)?;
-        let (_, bytes) = snapshots.pop().expect("complete CPU stream snapshot");
-        let (slot, slice) = self
-            .device
-            .submission
-            .reserve_upload_aligned(&bytes, alignment.max(4))?;
-        self.device.submission.retain_stream_upload(slot);
-        let buffer = self.device.submission.slots[slot].upload_lease(slice);
-        let work = self.device.work_ticket()?;
-        let contents = self.contents_mut(Resource::Buffer(id));
-        contents.last_use = Some(work);
-        contents.touched = work.tick();
-        self.buffers[id.slot].entry.as_mut().unwrap().streamed = Some(StreamedBuffer {
-            work,
-            window: (offset, size),
-            buffer: Arc::clone(&buffer),
-            offset: slice.offset,
-        });
-        self.statistics.cpu_streamed_bytes += size;
-        // Queue submission makes these already-flushed host writes visible;
-        // no transfer command or in-rendering pipeline barrier is required.
+            },
+        )
+        .map_err(memory_error)?;
+        for ((index, request, _, _), mut snapshots) in pending.into_iter().zip(snapshots) {
+            let (_, bytes) = snapshots.pop().expect("complete CPU stream snapshot");
+            let (slot, slice) = self
+                .device
+                .submission
+                .reserve_upload_aligned(&bytes, request.alignment.max(4))?;
+            self.device.submission.retain_stream_upload(slot);
+            let buffer = self.device.submission.slots[slot].upload_lease(slice);
+            let work = self.device.work_ticket()?;
+            let contents = self.contents_mut(Resource::Buffer(request.id));
+            contents.last_use = Some(work);
+            contents.touched = work.tick();
+            self.buffers[request.id.slot]
+                .entry
+                .as_mut()
+                .unwrap()
+                .streamed = Some(StreamedBuffer {
+                work,
+                window: (request.offset, request.size),
+                buffer: Arc::clone(&buffer),
+                offset: slice.offset,
+            });
+            self.statistics.cpu_streamed_bytes += request.size;
+            streams[index] = Some((buffer, slice.offset));
+        }
+        // Queue submission makes these flushed host writes visible without a
+        // transfer command or a barrier inside rendering.
         // https://docs.vulkan.org/spec/latest/chapters/synchronization.html#synchronization-submission-host-writes
-        Ok(Some((buffer, slice.offset)))
+        Ok(streams)
     }
     /// Warm buffers do one CPU summary check and no page walk or transfer.
     pub fn ensure_buffer(&mut self, id: BufferId) -> Result<(), VulkanError> {
@@ -230,12 +367,14 @@ impl VulkanResidency {
         let backing = self.buffer(id)?.contents.backing.clone();
         let dependency = self.buffer(id)?.contents.cpu.clone();
         let invalid = self.buffer(id)?.contents.invalid.clone();
-        let snapshots = self.cpu_snapshots(&backing, &dependency, &invalid)?;
+        let imports = self.cpu_imports(&backing, &dependency, &invalid)?;
+        let snapshots = imports.snapshots;
         let contents = &mut self.buffers[id.slot]
             .entry
             .as_mut()
             .expect("buffer")
             .contents;
+        contents.invalid.extend(imports.gpu_invalidated);
         contents.invalid.extend(
             snapshots
                 .iter()
@@ -248,13 +387,15 @@ impl VulkanResidency {
                 let range = backing
                     .snapshot_subrange(offset, bytes.len() as u64)
                     .map_err(memory_error)?;
-                let mut visible = self.visibility.pages.lock().unwrap();
                 for backing in range.pages() {
                     if let Some(page) = self.index.pages.get_mut(&backing.identity()) {
                         page.clear_writes();
                     }
-                    visible.remove(&backing.identity());
                 }
+                // An earlier writer binding can already have preserved this
+                // same physical page for the upcoming draw/dispatch. Importing
+                // another CPU-visible alias must not release that baseline.
+                // Canonical visibility transitions replace/release it.
             }
             self.upload_buffer(id, offset, &bytes)?;
         }
@@ -275,12 +416,12 @@ impl VulkanResidency {
     /// its other occurrences were copied. Mixed ownership needs a final rearm
     /// for the excluded GPU pages. A fully CPU-visible range's dirty snapshot
     /// already updates its whole observer and retains adaptive streaming state.
-    pub(super) fn cpu_snapshots(
+    pub(super) fn cpu_imports(
         &self,
         backing: &CanonicalBackingRange,
         dependency: &CanonicalCpuWriteDependency,
         invalid: &[(u64, u64)],
-    ) -> Result<nixe_memory::CanonicalByteSnapshots, VulkanError> {
+    ) -> Result<CpuImports, VulkanError> {
         let mut cpu_segments = Vec::new();
         let mut mapping = Vec::<(u64, u64, u64)>::new();
         let mut logical = 0;
@@ -293,6 +434,24 @@ impl VulkanResidency {
             .filter(|page| self.gpu_owned(page.identity(), page.visibility_state()))
             .map(|page| page.identity())
             .collect();
+        // CPU writes may precede a disjoint GPU write on the same physical
+        // page. Its preserved baseline then contains new CPU bytes even though
+        // no producer overlaps this view. Reconstruct the excluded native
+        // windows before acknowledging that CPU epoch; rearm alone loses them.
+        let cpu_changed = !gpu_pages.is_empty() && !dependency.remains_current();
+        let mut gpu_invalidated = Vec::new();
+        if gpu_pages.len() == backing.pages().count() {
+            // No CPU bytes are consumed. Rearm the observer without expanding
+            // the complete tiled map solely to skip every one of its fragments.
+            dependency.rearm().map_err(memory_error)?;
+            if cpu_changed {
+                gpu_invalidated.push((0, backing.size()));
+            }
+            return Ok(CpuImports {
+                snapshots: Vec::new(),
+                gpu_invalidated,
+            });
+        }
         let all_cpu = gpu_pages.is_empty();
         if all_cpu && (invalid.is_empty() || invalid == [(0, backing.size())]) {
             // A dirty-only request already returns ordered disjoint windows;
@@ -307,7 +466,7 @@ impl VulkanResidency {
                 Err(nixe_memory::VisibilityCoordinatorError::new(
                     "CPU snapshot crossed concurrent GPU ownership; owner must resolve visibility inline",
                 ))
-            }).map_err(memory_error);
+            }).map(|snapshots| CpuImports { snapshots, gpu_invalidated }).map_err(memory_error);
         }
         if all_cpu {
             mapping.push((0, 0, backing.size()));
@@ -324,6 +483,15 @@ impl VulkanResidency {
                         mapping.push((compressed, logical, segment.size()));
                     }
                     compressed += segment.size();
+                }
+                if cpu_changed && gpu_pages.contains(&segment.page()) {
+                    if let Some((start, size)) = gpu_invalidated.last_mut()
+                        && *start + *size == logical
+                    {
+                        *size += segment.size();
+                    } else {
+                        gpu_invalidated.push((logical, segment.size()));
+                    }
                 }
                 logical += segment.size();
             }
@@ -439,10 +607,13 @@ impl VulkanResidency {
                 merged.push((offset, bytes.into_vec()));
             }
         }
-        Ok(merged
-            .into_iter()
-            .map(|(offset, bytes)| (offset, bytes.into_boxed_slice()))
-            .collect())
+        Ok(CpuImports {
+            snapshots: merged
+                .into_iter()
+                .map(|(offset, bytes)| (offset, bytes.into_boxed_slice()))
+                .collect(),
+            gpu_invalidated,
+        })
     }
     fn restore_gpu_bytes(
         &mut self,
@@ -458,20 +629,16 @@ impl VulkanResidency {
             let first = import
                 .copies
                 .partition_point(|&(_, to, size)| to + size <= offset);
-            for &(from, to, size) in &import.copies[first..] {
-                if to >= end {
-                    break;
-                }
-                let begin = to.max(offset);
-                let stop = (to + size).min(end);
-                self.copy_source(
-                    Resource::Image(import.source),
-                    from + begin - to,
-                    id,
-                    begin,
-                    stop - begin,
-                )?;
-            }
+            let copies: Vec<_> = import.copies[first..]
+                .iter()
+                .take_while(|&&(_, to, _)| to < end)
+                .map(|&(from, to, size)| {
+                    let begin = to.max(offset);
+                    let stop = (to + size).min(end);
+                    (from + begin - to, begin, stop - begin)
+                })
+                .collect();
+            self.copy_image_buffer_regions(import.source, id, &copies)?;
             return Ok(());
         }
         let backing = &self.buffer(id)?.contents.backing;
@@ -517,9 +684,7 @@ impl VulkanResidency {
             source: Source,
         }
         let backing = self.buffer(id)?.contents.backing.clone();
-        let range = backing
-            .snapshot_subrange(offset, length)
-            .map_err(memory_error)?;
+        let range = backing.logical_view(offset, length).map_err(memory_error)?;
         let end = offset + length;
         let mut runs = Vec::new();
         for backing_page in range.pages() {
@@ -622,7 +787,31 @@ impl VulkanResidency {
         }
         let mut baseline = None;
         let mut copy: Option<(Resource, u64, u64, u64)> = None;
+        let mut image = None;
+        let mut image_copies = Vec::new();
         for run in runs {
+            if let Source::Device(Resource::Image(source), from) = run.source {
+                self.flush_restore_copy(id, &mut copy)?;
+                self.flush_baseline(id, &mut baseline)?;
+                if image.is_some_and(|old| old != source) || image_copies.len() == 1024 {
+                    self.copy_image_buffer_regions(image.unwrap(), id, &image_copies)?;
+                    image_copies.clear();
+                }
+                image = Some(source);
+                if let Some((previous, to, size)) = image_copies.last_mut()
+                    && *previous + *size == from
+                    && *to + *size == run.destination
+                {
+                    *size += run.length;
+                } else {
+                    image_copies.push((from, run.destination, run.length));
+                }
+                continue;
+            }
+            if !image_copies.is_empty() {
+                self.copy_image_buffer_regions(image.unwrap(), id, &image_copies)?;
+                image_copies.clear();
+            }
             match run.source {
                 Source::Baseline(page, offset) => {
                     self.flush_restore_copy(id, &mut copy)?;
@@ -650,6 +839,9 @@ impl VulkanResidency {
                     }
                 }
             }
+        }
+        if !image_copies.is_empty() {
+            self.copy_image_buffer_regions(image.unwrap(), id, &image_copies)?;
         }
         self.flush_restore_copy(id, &mut copy)?;
         self.flush_baseline(id, &mut baseline)

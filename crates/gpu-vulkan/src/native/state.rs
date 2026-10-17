@@ -251,8 +251,51 @@ pub(super) fn arguments(a: nixe_gpu::DrawArguments) -> Draw {
         },
     }
 }
+pub(super) struct ShaderPreparation {
+    code: Arc<GuestShaderCode>,
+    scaled: Vec<(u32, bool)>,
+    control: Option<(u32, nixe_gpu::TessellationDomain)>,
+    identity: ssa::artifact::ContentId,
+}
+impl ShaderPreparation {
+    /// Transform SSA only inside a genuine compilation-cache miss.
+    pub fn compile(self) -> Result<Arc<GuestShaderCode>, VulkanError> {
+        let mut code = self.code;
+        if !self.scaled.is_empty()
+            && let Some(v) = Arc::make_mut(&mut code)
+                .functions
+                .iter_mut()
+                .find(|f| f.stage == nixe_gpu::ShaderStage::Vertex)
+        {
+            ssa::scale_vertex_inputs(Arc::make_mut(v), &self.scaled)
+                .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
+        }
+        if let Some((points, domain)) = self.control {
+            let vertex = code
+                .functions
+                .iter()
+                .find(|f| f.stage == nixe_gpu::ShaderStage::Vertex)
+                .unwrap();
+            let evaluation = code
+                .functions
+                .iter()
+                .find(|f| f.stage == nixe_gpu::ShaderStage::TessellationEvaluation)
+                .unwrap();
+            let control = ssa::default_control(vertex, evaluation, points, domain)
+                .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
+            let code = Arc::make_mut(&mut code);
+            let mut functions = std::mem::take(&mut code.functions).into_vec();
+            functions.push(Arc::new(control.function));
+            code.functions = functions.into_boxed_slice();
+        }
+        if code.identity != self.identity {
+            Arc::make_mut(&mut code).identity = self.identity;
+        }
+        Ok(code)
+    }
+}
 type SpecializedShader = (
-    Arc<GuestShaderCode>,
+    ShaderPreparation,
     Box<[ssa::spirv::Options]>,
     ssa::artifact::ContentId,
 );
@@ -261,10 +304,11 @@ pub(super) fn shader_code(
     draw: Option<&GuestDrawState>,
     mut options: ssa::spirv::Options,
 ) -> Result<SpecializedShader, VulkanError> {
+    use nixe_gpu::ShaderStage as S;
     options.shared_memory_bytes = program.shared_memory_bytes;
-    options.local_memory_bytes = program.local_memory_bytes;
-    let mut code = Arc::clone(&program.shader);
+    let code = &program.shader;
     let mut scaled = Vec::new();
+    let mut control = None;
     if let Some(draw) = draw {
         for vertex in &draw.parameters.vertices {
             for attr in &vertex.attributes {
@@ -272,15 +316,6 @@ pub(super) fn shader_code(
                     scaled.push((attr.shader_location, signed));
                 }
             }
-        }
-        if !scaled.is_empty()
-            && let Some(v) = Arc::make_mut(&mut code)
-                .functions
-                .iter_mut()
-                .find(|f| f.stage == nixe_gpu::ShaderStage::Vertex)
-        {
-            ssa::scale_vertex_inputs(v, &scaled)
-                .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
         }
         if draw.parameters.alpha_test.is_some() {
             return Err(VulkanError::InvalidResource(
@@ -293,41 +328,23 @@ pub(super) fn shader_code(
                 nixe_gpu::TessellationControl::DefaultLevels { .. }
             )
         {
-            let vertex = code
-                .functions
-                .iter()
-                .find(|f| f.stage == nixe_gpu::ShaderStage::Vertex)
-                .unwrap();
-            let evaluation = code
-                .functions
-                .iter()
-                .find(|f| f.stage == nixe_gpu::ShaderStage::TessellationEvaluation)
-                .unwrap();
-            let control = ssa::default_control(
-                vertex,
-                evaluation,
-                u32::from(t.input_control_points),
-                t.mode.domain,
-            )
-            .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
-            let code = Arc::make_mut(&mut code);
-            let mut functions = std::mem::take(&mut code.functions).into_vec();
-            functions.push(control.function);
-            code.functions = functions.into_boxed_slice();
+            control = Some((u32::from(t.input_control_points), t.mode.domain));
         }
     }
-    let options = code
+    let emission = code
         .functions
         .iter()
-        .map(|f| {
+        .map(|f| f.stage)
+        .chain(control.map(|_| S::TessellationControl))
+        .map(|stage| {
             let mut o = options;
             if let Some(draw) = draw {
                 let final_stage = if draw.parameters.tessellation.is_some() {
-                    nixe_gpu::ShaderStage::TessellationEvaluation
+                    S::TessellationEvaluation
                 } else {
-                    nixe_gpu::ShaderStage::Vertex
+                    S::Vertex
                 };
-                if f.stage == final_stage {
+                if stage == final_stage {
                     o.shader.depth_clip_negative_one_to_one = draw
                         .parameters
                         .viewport
@@ -335,14 +352,17 @@ pub(super) fn shader_code(
                     o.shader.vertex_position_transform = draw.parameters.position_transform;
                 }
                 if let Some(t) = draw.parameters.tessellation {
-                    if f.stage == nixe_gpu::ShaderStage::TessellationControl {
+                    if stage == S::TessellationControl {
                         o.shader.input_control_points = u32::from(t.input_control_points);
-                    } else if f.stage == nixe_gpu::ShaderStage::TessellationEvaluation {
-                        o.shader.input_control_points = code
-                            .functions
-                            .iter()
-                            .find(|f| f.stage == nixe_gpu::ShaderStage::TessellationControl)
-                            .and_then(|f| f.tessellation_control_points)
+                    } else if stage == S::TessellationEvaluation {
+                        o.shader.input_control_points = control
+                            .map(|(points, _)| points)
+                            .or_else(|| {
+                                code.functions
+                                    .iter()
+                                    .find(|f| f.stage == S::TessellationControl)
+                                    .and_then(|f| f.tessellation_control_points)
+                            })
                             .unwrap();
                         o.shader.tessellation_mode = Some(t.mode);
                     }
@@ -352,10 +372,16 @@ pub(super) fn shader_code(
         })
         .collect();
     let identity = vertex::vertex_shader_identity(program.shader.identity, &scaled);
-    if code.identity != identity {
-        Arc::make_mut(&mut code).identity = identity;
-    }
-    Ok((code, options, identity))
+    Ok((
+        ShaderPreparation {
+            code: Arc::clone(code),
+            scaled,
+            control,
+            identity,
+        },
+        emission,
+        identity,
+    ))
 }
 pub(super) fn push(draw: &GuestDrawState) -> Result<Box<[u8]>, VulkanError> {
     if let Some(t) = draw.parameters.tessellation

@@ -121,6 +121,29 @@ impl Math {
         self.b.branch_conditional(repair, body, merge, [])?;
         self.block = self.b.begin_block(Some(body))?;
 
+        let repaired = if let Some(c) = addend {
+            self.repair_call(math::Repair::FtzFma, [left, right, c], |m, [a, b, c]| {
+                m.product_underflow_body(a, b, Some(c), wide)
+            })?
+        } else {
+            self.repair_call(math::Repair::FtzMultiply, [left, right], |m, [a, b]| {
+                m.product_underflow_body(a, b, None, wide)
+            })?
+        };
+        self.b.branch(merge)?;
+        self.block = self.b.begin_block(Some(merge))?;
+        let result = self
+            .b
+            .phi(self.uint, None, [(bits, header), (repaired, body)])?;
+        Ok(self.b.bitcast(self.float, None, result)?)
+    }
+    fn product_underflow_body(
+        &mut self,
+        left: u32,
+        right: u32,
+        addend: Option<u32>,
+        wide: u32,
+    ) -> Result<u32> {
         let a = self.b.f_convert(wide, None, left)?;
         let b = self.b.f_convert(wide, None, right)?;
         let product = self.b.f_mul(wide, None, a, b)?;
@@ -171,12 +194,6 @@ impl Math {
         }
         let minimum = self.constant(0x0080_0000);
         let magnitude = self.b.select(self.uint, None, normal, minimum, zero)?;
-        let repaired = self.b.bitwise_or(self.uint, None, sign, magnitude)?;
-        self.b.branch(merge)?;
-        self.block = self.b.begin_block(Some(merge))?;
-        let result = self
-            .b
-            .phi(self.uint, None, [(bits, header), (repaired, body)])?;
-        Ok(self.b.bitcast(self.float, None, result)?)
+        Ok(self.b.bitwise_or(self.uint, None, sign, magnitude)?)
     }
 }

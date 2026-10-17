@@ -2,7 +2,7 @@ use super::*;
 use crate::residency::tests::{backing_allocation, cpu_read};
 use nixe_gpu::*;
 use std::time::Instant;
-mod support {
+pub(super) mod support {
     use crate as nixe_gpu_vulkan;
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -26,6 +26,605 @@ fn ready(execution: &mut NativeGpuExecution, submission: &NativeSubmission) {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
+
+#[test]
+fn known_completion_versions_do_not_create_gpu_work_and_stale_acknowledgements_cannot_erase_them() {
+    use nixe_memory::VisibilityCoordinator as _;
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let monitor = device.validation_monitor();
+    let mut execution = NativeGpuExecution::new(
+        device,
+        ShaderNamespace {
+            guest: *b"host-effect-test",
+            isa: 1,
+        },
+        CacheConfiguration::default(),
+        4 * 1024 * 1024,
+    )
+    .unwrap();
+    execution.bind_host_wakeup(Arc::new(|| {}));
+    let (_, backing) = backing_allocation(4096, 4096, 0x25);
+    let mut previous: Option<CpuVisibilityRequest> = None;
+    for value in 1..=64u8 {
+        let batch = NativeSubmission {
+            frontend: FrontendSubmissionId::new(u64::from(value)),
+            segment: FrontendSubmissionSegment::FIRST,
+            final_segment: true,
+            commands: vec![NativeCommand::WriteMemory {
+                target: backing.clone(),
+                offset: 64,
+                bytes: Arc::from([value; 16]),
+                after_prior_work: true,
+            }],
+        };
+        ready(&mut execution, &batch);
+        execution
+            .submit(ExecutionBatch {
+                commands: &batch,
+                definitions: &[],
+                retirements: &[],
+            })
+            .unwrap();
+        assert!(
+            !execution.request_completion_wakeup().unwrap(),
+            "a logical producer without GPU work must retire without a future wake"
+        );
+        assert!(execution.poll_completion().unwrap().is_some());
+        let page = backing.pages().next().unwrap();
+        let nixe_memory::VisibilityState::GpuNewer { device, visible_at } = page.visibility_state()
+        else {
+            panic!("ordered logical producer")
+        };
+        let request = CpuVisibilityRequest {
+            page: page.identity(),
+            size: page.size(),
+            device,
+            visible_at,
+        };
+        if let Some(old) = previous {
+            assert!(visible_at > old.visible_at);
+        }
+        let bytes = execution.service_cpu_visibility(request).unwrap().unwrap();
+        if let Some(old) = previous {
+            execution
+                .residency
+                .visibility()
+                .release_cpu_page(old)
+                .unwrap();
+        }
+        assert_eq!(&bytes[64..80], &[value; 16]);
+        assert!(bytes[..64].iter().chain(&bytes[80..]).all(|&b| b == 0x25));
+        previous = Some(request);
+        assert_eq!(execution.residency.device().submitted_tick(), 0);
+        assert!(execution.residency.device().submission.slots.is_empty());
+    }
+    assert_eq!(
+        &cpu_read(&mut execution.residency, &backing)[64..80],
+        &[64; 16]
+    );
+    assert_eq!(execution.residency.statistics().native_readback_bytes, 0);
+    let source = execution
+        .residency
+        .buffer_for_deferred_import(
+            backing.snapshot_subrange(64, 16).unwrap(),
+            vk::BufferUsageFlags::TRANSFER_SRC,
+        )
+        .unwrap();
+    let (_, destination_backing) = backing_allocation(16, 16, 0);
+    let destination = execution
+        .residency
+        .buffer_for_deferred_import(destination_backing, vk::BufferUsageFlags::TRANSFER_DST)
+        .unwrap();
+    execution
+        .residency
+        .copy_buffer(source, 0, destination, 0, 16)
+        .unwrap();
+    assert_eq!(
+        execution.residency.read_buffer(destination, 0, 16).unwrap(),
+        [64; 16]
+    );
+    execution.teardown().unwrap();
+    drop(execution);
+    monitor.check().unwrap();
+}
+
+#[test]
+fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let monitor = device.validation_monitor();
+    let owner = Arc::clone(&device.owner);
+    let mut execution = NativeGpuExecution::new(
+        device,
+        ShaderNamespace {
+            guest: *b"async-page-test!",
+            isa: 1,
+        },
+        CacheConfiguration::default(),
+        4 * 1024 * 1024,
+    )
+    .unwrap();
+    let (_allocation, backing) = backing_allocation(4096, 4096, 0x25);
+    let id = execution
+        .residency
+        .buffer_for(backing.clone(), vk::BufferUsageFlags::TRANSFER_DST)
+        .unwrap();
+    assert_eq!(
+        execution
+            .residency
+            .write_buffer(id, 9, &[0x43; 4])
+            .unwrap()
+            .consumed,
+        4
+    );
+    let mut kind =
+        vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+    let gate = unsafe {
+        owner.device.create_semaphore(
+            &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+            None,
+        )
+    }
+    .unwrap();
+    execution
+        .residency
+        .flush_with_sync(
+            &[vk::SemaphoreSubmitInfo::default()
+                .semaphore(gate)
+                .value(1)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)],
+            &[],
+        )
+        .unwrap();
+    let (wake, wakes) = std::sync::mpsc::channel();
+    execution.bind_host_wakeup(Arc::new(move || {
+        let _ = wake.send(());
+    }));
+    let page = backing.pages().next().unwrap();
+    let nixe_memory::VisibilityState::GpuNewer { device, visible_at } = page.visibility_state()
+    else {
+        panic!("GPU producer")
+    };
+    let request = CpuVisibilityRequest {
+        page: page.identity(),
+        size: page.size(),
+        device,
+        visible_at,
+    };
+    let (release, release_when_recorded) = std::sync::mpsc::channel();
+    let signal_owner = Arc::clone(&owner);
+    let watchdog = std::thread::spawn(move || {
+        let independent = release_when_recorded
+            .recv_timeout(Duration::from_secs(3))
+            .is_ok();
+        unsafe {
+            signal_owner
+                .device
+                .signal_semaphore(&vk::SemaphoreSignalInfo::default().semaphore(gate).value(1))
+        }
+        .unwrap();
+        independent
+    });
+    assert!(execution.service_cpu_visibility(request).unwrap().is_none());
+    assert!(
+        execution.residency.cpu_readback_point().unwrap().unwrap()
+            <= execution.residency.device().submitted_tick(),
+        "a CPU demand must submit its download before unrelated recording"
+    );
+    let batch = NativeSubmission {
+        frontend: FrontendSubmissionId::new(1),
+        segment: FrontendSubmissionSegment::FIRST,
+        final_segment: true,
+        commands: vec![NativeCommand::WaitForIdle],
+    };
+    ready(&mut execution, &batch);
+    execution
+        .submit(ExecutionBatch {
+            commands: &batch,
+            definitions: &[],
+            retirements: &[],
+        })
+        .unwrap();
+    let submitted = execution.residency.device().submitted_tick();
+    assert!(execution.service_cpu_visibility(request).unwrap().is_none());
+    assert_eq!(
+        execution.residency.device().submitted_tick(),
+        submitted,
+        "retrying an already submitted demand must not split independent recording"
+    );
+    execution.request_completion_wakeup().unwrap();
+    release.send(()).unwrap();
+    wakes.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert!(
+        watchdog.join().unwrap(),
+        "unknown GPU data blocked independent recording"
+    );
+    let result = execution.service_cpu_visibility(request).unwrap().unwrap();
+    assert_eq!(&result[9..13], &[0x43; 4]);
+    assert!(
+        result[..9]
+            .iter()
+            .chain(&result[13..])
+            .all(|&byte| byte == 0x25)
+    );
+    assert_eq!(execution.residency.statistics().native_readback_bytes, 4);
+    let bytes = cpu_read(&mut execution.residency, &backing);
+    assert_eq!(&bytes[9..13], &[0x43; 4]);
+    execution.residency.preserve_buffer(id).unwrap();
+    assert_eq!(execution.residency.statistics().native_readback_bytes, 4);
+    execution.teardown().unwrap();
+    unsafe { owner.device.destroy_semaphore(gate, None) };
+    drop(execution);
+    monitor.check().unwrap();
+}
+
+#[test]
+fn completion_observer_wakes_earlier_work_before_a_blocked_later_target() {
+    let Some(mut device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let monitor = device.validation_monitor();
+    let owner = Arc::clone(&device.owner);
+    let first = device.work_ticket().unwrap();
+    device.flush().unwrap();
+    assert!(device.wait_for_work(first, Duration::from_secs(5)).unwrap());
+    let mut kind =
+        vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+    let gate = unsafe {
+        owner.device.create_semaphore(
+            &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+            None,
+        )
+    }
+    .unwrap();
+    let later = device.work_ticket().unwrap();
+    unsafe {
+        device.submission.flush(
+            device.queue,
+            &device.dispatch,
+            &[vk::SemaphoreSubmitInfo::default()
+                .semaphore(gate)
+                .value(1)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)],
+            &[],
+        )
+    }
+    .unwrap();
+    let (notify, notifications) = std::sync::mpsc::channel();
+    let observer = completion::CompletionWakeup::new(
+        &device,
+        Arc::new(move || {
+            let _ = notify.send(());
+        }),
+    );
+    assert!(observer.arm(later.tick()).unwrap());
+    assert!(observer.arm(first.tick()).unwrap());
+    let earlier_notified = notifications.recv_timeout(Duration::from_secs(1)).is_ok();
+    let completed_rearm = observer.arm(first.tick()).unwrap();
+    // Unblock and drain even when the regression assertion will fail. A GPU
+    // dependency held by the test must not strand device destruction.
+    unsafe {
+        owner
+            .device
+            .signal_semaphore(&vk::SemaphoreSignalInfo::default().semaphore(gate).value(1))
+    }
+    .unwrap();
+    assert!(device.wait_for_work(later, Duration::from_secs(5)).unwrap());
+    let later_notified = notifications.recv_timeout(Duration::from_secs(1)).is_ok();
+    drop(observer);
+    unsafe { owner.device.destroy_semaphore(gate, None) };
+    drop(device);
+    monitor.check().unwrap();
+    assert!(
+        earlier_notified,
+        "a later blocked ticket must not hide an earlier completion"
+    );
+    assert!(
+        !completed_rearm,
+        "a consumed completion notification cannot promise another wake"
+    );
+    assert!(
+        later_notified,
+        "the later request must remain armed after the earlier wake"
+    );
+}
+
+#[test]
+fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_completion() {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let monitor = device.validation_monitor();
+    let owner = Arc::clone(&device.owner);
+    let mut execution = NativeGpuExecution::new(
+        device,
+        ShaderNamespace {
+            guest: *b"ordered-effects!",
+            isa: 1,
+        },
+        CacheConfiguration::default(),
+        4 * 1024 * 1024,
+    )
+    .unwrap();
+    let (_allocation, whole) = backing_allocation(4096, 4096, 0x19);
+    let target = whole.snapshot_subrange(64, 16).unwrap();
+    let mut kind =
+        vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+    let semaphore = unsafe {
+        owner.device.create_semaphore(
+            &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+            None,
+        )
+    }
+    .unwrap();
+    let submission = |frontend, value| NativeSubmission {
+        frontend: FrontendSubmissionId::new(frontend),
+        segment: FrontendSubmissionSegment::FIRST,
+        final_segment: true,
+        commands: vec![
+            NativeCommand::WriteMemory {
+                target: whole.clone(),
+                offset: 128,
+                bytes: Arc::from([0xa3; 16]),
+                after_prior_work: false,
+            },
+            NativeCommand::WaitForIdle,
+            NativeCommand::WriteMemory {
+                target: whole.clone(),
+                offset: 64,
+                bytes: Arc::from([value ^ 0xff; 16]),
+                after_prior_work: true,
+            },
+            // A preceding producer in this same recording has not published
+            // canonical ownership yet. The inline update must still remain on
+            // the device rather than taking the CPU upload path.
+            NativeCommand::WriteMemory {
+                target: whole.clone(),
+                offset: 64,
+                bytes: Arc::from([value; 16]),
+                after_prior_work: false,
+            },
+        ],
+    };
+    let (woken, wakeups) = std::sync::mpsc::channel();
+    execution.bind_host_wakeup(Arc::new(move || {
+        let _ = woken.send(());
+    }));
+    let first = submission(1, 0x37);
+    ready(&mut execution, &first);
+    execution
+        .submit(ExecutionBatch {
+            definitions: &[],
+            retirements: &[],
+            commands: &first,
+        })
+        .unwrap();
+    execution
+        .residency
+        .flush_with_sync(
+            &[vk::SemaphoreSubmitInfo::default()
+                .semaphore(semaphore)
+                .value(1)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)],
+            &[],
+        )
+        .unwrap();
+    assert!(execution.request_completion_wakeup().unwrap());
+    assert!(execution.poll_completion().unwrap().is_none());
+
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signalled = Arc::clone(&released);
+    let signalling_owner = Arc::clone(&owner);
+    let (read_started, start_read) = std::sync::mpsc::channel();
+    let signal = std::thread::spawn(move || {
+        let accepted_without_wait = start_read.recv_timeout(Duration::from_secs(3)).is_ok();
+        std::thread::sleep(Duration::from_millis(50));
+        signalled.store(true, std::sync::atomic::Ordering::Release);
+        unsafe {
+            signalling_owner.device.signal_semaphore(
+                &vk::SemaphoreSignalInfo::default()
+                    .semaphore(semaphore)
+                    .value(1),
+            )
+        }
+        .unwrap();
+        accepted_without_wait
+    });
+
+    // The GPU cannot complete the first batch yet. An unrelated subsequent
+    // recording still succeeds; no completion wait is needed for these writes.
+    let second = submission(2, 0x71);
+    ready(&mut execution, &second);
+    execution
+        .submit(ExecutionBatch {
+            definitions: &[],
+            retirements: &[],
+            commands: &second,
+        })
+        .unwrap();
+    assert!(execution.poll_completion().unwrap().is_none());
+    let page = whole.pages().next().unwrap();
+    let nixe_memory::VisibilityState::GpuNewer { device, visible_at } = page.visibility_state()
+    else {
+        panic!("pending native producer")
+    };
+    let request = CpuVisibilityRequest {
+        page: page.identity(),
+        size: page.size(),
+        device,
+        visible_at,
+    };
+    assert!(
+        execution.service_cpu_visibility(request).unwrap().is_none(),
+        "an external CPU demand must leave recording available while the GPU is blocked"
+    );
+    let independent = NativeSubmission {
+        frontend: FrontendSubmissionId::new(90),
+        segment: FrontendSubmissionSegment::FIRST,
+        final_segment: true,
+        commands: vec![NativeCommand::WaitForIdle],
+    };
+    ready(&mut execution, &independent);
+    execution
+        .submit(ExecutionBatch {
+            definitions: &[],
+            retirements: &[],
+            commands: &independent,
+        })
+        .unwrap();
+    assert!(!released.load(std::sync::atomic::Ordering::Acquire));
+    read_started.send(()).unwrap();
+    let bytes = cpu_read(&mut execution.residency, &whole);
+    assert!(
+        released.load(std::sync::atomic::Ordering::Acquire),
+        "known payload was published before its GPU dependency"
+    );
+    assert_eq!(&bytes[..64], &[0x19; 64]);
+    assert_eq!(&bytes[64..80], &[0x71; 16]);
+    assert!(bytes[80..128].iter().all(|&b| b == 0x19));
+    assert_eq!(&bytes[128..144], &[0xa3; 16]);
+    assert!(bytes[144..].iter().all(|&b| b == 0x19));
+    assert_eq!(
+        execution.residency.statistics().native_readback_bytes,
+        0,
+        "known payload requires completion, not a redundant download"
+    );
+    assert!(
+        signal.join().unwrap(),
+        "recording serialized on the blocked producer"
+    );
+    wakeups
+        .recv_timeout(Duration::from_secs(1))
+        .expect("an idle owner must wake without another submission");
+    while execution.wait_for_completion().unwrap().is_some() {}
+    let id = execution
+        .residency
+        .buffer_for_deferred_import(target, vk::BufferUsageFlags::TRANSFER_DST)
+        .unwrap();
+    assert_eq!(
+        execution.residency.read_buffer(id, 0, 16).unwrap(),
+        [0x71; 16],
+        "the real GPU bytes must agree with canonical publication"
+    );
+    // A different native producer invalidates the known payload. Its bytes must
+    // be read from the GPU rather than replaying the preceding host value.
+    let written = execution
+        .residency
+        .write_buffer(id, 0, &[0xa7; 16])
+        .unwrap();
+    assert_eq!(written.consumed, 16);
+    execution.residency.accept_recording().unwrap();
+    assert_eq!(
+        &cpu_read(&mut execution.residency, &whole)[64..80],
+        &[0xa7; 16]
+    );
+    // A host-authored release attaches to the existing real producer prefix.
+    // It must not invent an empty submission; subsequent GPU work is distinct.
+    let prefix = NativeSubmission {
+        frontend: FrontendSubmissionId::new(3),
+        segment: FrontendSubmissionSegment::FIRST,
+        final_segment: true,
+        commands: vec![NativeCommand::WriteMemory {
+            target: whole.clone(),
+            offset: 64,
+            bytes: Arc::from([0xb3; 16]),
+            after_prior_work: true,
+        }],
+    };
+    ready(&mut execution, &prefix);
+    let uploaded_before_release = execution.residency.statistics().cpu_uploaded_bytes;
+    execution
+        .submit(ExecutionBatch {
+            definitions: &[],
+            retirements: &[],
+            commands: &prefix,
+        })
+        .unwrap();
+    let released_tick = execution.completions.back().unwrap().work.unwrap().tick();
+    assert!(released_tick <= execution.residency.device().submitted_tick());
+    assert_eq!(
+        execution.residency.statistics().cpu_uploaded_bytes,
+        uploaded_before_release,
+        "a CPU-only completion effect must not upload its known payload"
+    );
+    let following = NativeSubmission {
+        frontend: FrontendSubmissionId::new(4),
+        segment: FrontendSubmissionSegment::FIRST,
+        final_segment: true,
+        commands: vec![NativeCommand::WriteMemory {
+            target: whole.clone(),
+            offset: 128,
+            bytes: Arc::from([0xc3; 16]),
+            after_prior_work: false,
+        }],
+    };
+    ready(&mut execution, &following);
+    execution
+        .submit(ExecutionBatch {
+            definitions: &[],
+            retirements: &[],
+            commands: &following,
+        })
+        .unwrap();
+    assert!(execution.completions.back().unwrap().work.unwrap().tick() > released_tick);
+    let source = execution
+        .residency
+        .buffer_for_deferred_import(
+            whole.snapshot_subrange(64, 16).unwrap(),
+            vk::BufferUsageFlags::TRANSFER_SRC,
+        )
+        .unwrap();
+    let (_copied, copied) = backing_allocation(16, 16, 0);
+    let destination = execution
+        .residency
+        .buffer_for_deferred_import(copied.clone(), vk::BufferUsageFlags::TRANSFER_DST)
+        .unwrap();
+    let uploaded_before_consumer = execution.residency.statistics().cpu_uploaded_bytes;
+    execution
+        .residency
+        .copy_buffer(source, 0, source, 0, 16)
+        .unwrap();
+    assert_eq!(
+        execution.residency.statistics().cpu_uploaded_bytes,
+        uploaded_before_consumer,
+        "a self-copy neither consumes nor discards the deferred literal"
+    );
+    execution
+        .residency
+        .copy_buffer(source, 0, destination, 0, 16)
+        .unwrap();
+    assert_eq!(
+        execution.residency.statistics().cpu_uploaded_bytes,
+        uploaded_before_consumer + 16,
+        "the first GPU consumer materializes the payload once"
+    );
+    assert_eq!(
+        execution
+            .residency
+            .write_buffer(source, 4, &[0xd5; 4])
+            .unwrap()
+            .consumed,
+        4
+    );
+    execution.residency.accept_recording().unwrap();
+    let bytes = cpu_read(&mut execution.residency, &whole);
+    assert_eq!(&bytes[64..68], &[0xb3; 4]);
+    assert_eq!(&bytes[68..72], &[0xd5; 4]);
+    assert_eq!(&bytes[72..80], &[0xb3; 8]);
+    assert_eq!(&bytes[128..144], &[0xc3; 16]);
+    assert_eq!(
+        &*cpu_read(&mut execution.residency, &copied),
+        &[0xb3; 16],
+        "an earlier GPU consumer keeps its original value before a later partial write"
+    );
+    execution.teardown().unwrap();
+    unsafe { owner.device.destroy_semaphore(semaphore, None) };
+    drop(execution);
+    monitor.check().unwrap();
+}
 #[test]
 fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_state() {
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {
@@ -38,7 +637,10 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             guest: *b"nixe-native-test",
             isa: 1,
         },
-        CacheConfiguration::default(),
+        CacheConfiguration {
+            descriptor_sets: 1,
+            ..CacheConfiguration::default()
+        },
         4 * 1024 * 1024,
     )
     .unwrap();
@@ -87,11 +689,14 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             identity: PreparedStateId::new(1, 1),
             shader: Arc::new(GuestShaderCode {
                 identity: ssa::artifact::ContentId::of(b"native-draw-test", &[]),
-                functions: crate::residency::execution::tests::vertex_fragment(),
+                functions: crate::residency::execution::tests::vertex_fragment()
+                    .into_vec()
+                    .into_iter()
+                    .map(Arc::new)
+                    .collect(),
             }),
             bindings: Box::new([]),
             shared_memory_bytes: 0,
-            local_memory_bytes: 0,
         }),
         vertices: Box::new([GuestVertexBuffer {
             binding: 0,
@@ -170,8 +775,39 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         final_segment: true,
         commands: vec![draw; 16],
     };
+    // Captured future state may compile before earlier FIFO effects execute.
+    // Even duplicate lookahead must leave every canonical resource untouched.
+    for command in &submission.commands {
+        execution.precompile(command);
+    }
+    assert!(execution.precompiling.len() <= 1);
+    let started = Instant::now();
+    while !execution.precompiling.is_empty() {
+        execution.service_host().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(execution.drawings.is_empty());
+    assert!(execution.images.is_empty());
+    assert_eq!(execution.programs.usage(), (0, 0));
+    assert_eq!(execution.statistics.prepared_graphics, 0);
+    assert_eq!(execution.residency.statistics().cpu_uploaded_bytes, 0);
+    assert_eq!(execution.residency.device().submitted_tick(), 0);
+    assert_eq!(execution.descriptors.statistics().allocated, 0);
+    assert!(matches!(
+        execution.graphics.values().next().unwrap(),
+        Graphics::Pipeline { .. }
+    ));
     ready(&mut execution, &submission);
     assert_eq!(execution.statistics.prepared_draws, 1);
+    // Identical recompiled code can have a new allocation after cold-cache
+    // eviction. Content identity, not its allocation, selects graphics state.
+    let mut recaptured = (*state).clone();
+    let program = Arc::make_mut(&mut recaptured.program);
+    program.shader = Arc::new((*program.shader).clone());
+    let prepared_graphics = execution.statistics.prepared_graphics;
+    assert!(execution.graphics(&Arc::new(recaptured), true).unwrap());
+    assert_eq!(execution.statistics.prepared_graphics, prepared_graphics);
     for frontend in 1..=2 {
         let submission = NativeSubmission {
             frontend: FrontendSubmissionId::new(frontend),
@@ -453,17 +1089,37 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         identity: PreparedStateId::new(21, 1),
         shader: Arc::new(GuestShaderCode {
             identity: ssa::artifact::ContentId::of(b"streamed-uniform-test", &[]),
-            functions: uniform_color_shader(),
+            functions: uniform_color_shader()
+                .into_vec()
+                .into_iter()
+                .map(Arc::new)
+                .collect(),
         }),
         bindings: Box::new([(
             ssa::ResourceId::new(42),
             GuestBinding::Buffer(uniform_backing.clone()),
         )]),
         shared_memory_bytes: 0,
-        local_memory_bytes: 0,
     });
-    Arc::make_mut(&mut uniform_draw.parameters).identity = PreparedStateId::new(22, 1);
     let uniform_draw = Arc::new(uniform_draw);
+    // Parameter identity is independent of shader identity. Preparing an
+    // alternative shader with the same parameters must retain both variants.
+    let variant = NativeSubmission {
+        frontend: FrontendSubmissionId::new(19),
+        segment: FrontendSubmissionSegment::FIRST,
+        final_segment: false,
+        commands: vec![NativeCommand::Draw {
+            state: Arc::clone(&uniform_draw),
+            arguments: DrawArguments::NonIndexed {
+                first_vertex: 0,
+                vertex_count: 3,
+                first_instance: 0,
+                instance_count: 1,
+            },
+        }],
+    };
+    ready(&mut execution, &variant);
+    assert!(execution.graphics(&state, true).unwrap());
     let mut inputs = Vec::new();
     for (index, rgba) in [[0., 1., 0., 1.], [1., 0., 0., 1.], [0., 0., 1., 1.]]
         .into_iter()
@@ -480,7 +1136,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         let submission = NativeSubmission {
             frontend: FrontendSubmissionId::new(20 + index as u64),
             segment: FrontendSubmissionSegment::FIRST,
-            final_segment: false,
+            final_segment: true,
             commands: vec![NativeCommand::Draw {
                 state: Arc::new(draw),
                 arguments: DrawArguments::NonIndexed {
@@ -533,6 +1189,87 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             token
         );
     }
+    // Inline uploads between draws preserve each immutable input snapshot in a
+    // single native batch, without forcing a host submission or a GPU write for
+    // ordinary CPU storage. All states were prepared before these writes.
+    let mut commands = Vec::new();
+    for (submission, bytes) in &inputs {
+        commands.push(NativeCommand::WriteMemory {
+            target: uniform_backing.clone(),
+            offset: 0,
+            bytes: Arc::from(bytes.as_slice()),
+            after_prior_work: false,
+        });
+        commands.extend(submission.commands.iter().cloned());
+    }
+    let inline = NativeSubmission {
+        frontend: FrontendSubmissionId::new(30),
+        segment: FrontendSubmissionSegment::FIRST,
+        final_segment: true,
+        commands,
+    };
+    ready(&mut execution, &inline);
+    let submitted = execution.residency.device().submitted_tick();
+    let readbacks = execution.residency.statistics().native_readback_bytes;
+    let scopes = execution.recording_statistics().rendering_scopes;
+    execution
+        .submit(ExecutionBatch {
+            commands: &inline,
+            definitions: &[],
+            retirements: &[],
+        })
+        .unwrap();
+    assert_eq!(execution.residency.device().submitted_tick(), submitted);
+    assert_eq!(
+        execution.residency.statistics().native_readback_bytes,
+        readbacks
+    );
+    assert_eq!(
+        execution.recording_statistics().rendering_scopes - scopes,
+        1
+    );
+    assert!(uniform_backing.pages().all(|page| matches!(
+        page.visibility_state(),
+        nixe_memory::VisibilityState::Clean | nixe_memory::VisibilityState::CpuNewer
+    )));
+    let bytes = cpu_read(&mut execution.residency, &backing);
+    for (index, pixel) in bytes.chunks_exact(4).enumerate() {
+        assert_eq!(
+            pixel,
+            if index % 8 < 4 {
+                &[0, 0, 255, 255]
+            } else {
+                &[255, 0, 0, 255]
+            }
+        );
+    }
+    assert!(execution.wait_for_completion().unwrap().is_some());
+
+    // Reusing immutable preparations must not pin temporary arena descriptors
+    // into the persistent pool. Completed slots recycle them repeatedly.
+    let updates = execution.descriptors.statistics().updates;
+    let repeated = &inputs[2].0;
+    for _ in 0..12 {
+        ready(&mut execution, repeated);
+        execution
+            .submit(ExecutionBatch {
+                commands: repeated,
+                definitions: &[],
+                retirements: &[],
+            })
+            .unwrap();
+        execution
+            .wait_for_completion_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(execution.descriptors.statistics().updates, updates);
+    assert!(
+        execution
+            .recording_statistics()
+            .stream_descriptor_allocations
+            > 0
+    );
     // Streaming has not acknowledged the persistent buffer's dirty observer.
     let native_uniform = execution
         .residency
@@ -556,7 +1293,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         segment: FrontendSubmissionSegment::FIRST,
         final_segment: true,
         commands: vec![NativeCommand::Draw {
-            state: uniform_draw,
+            state: Arc::clone(&uniform_draw),
             arguments: DrawArguments::NonIndexed {
                 first_vertex: 0,
                 vertex_count: 3,
@@ -583,6 +1320,59 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         .wait_for_completion_timeout(Duration::from_secs(5))
         .unwrap()
         .unwrap();
+    // Retained guest preparations must not pin the persistent host descriptor
+    // budget. Force a two-set recording slot and retain many different binding
+    // templates, proving pressure splits recording without dropping any draw.
+    let device = execution.residency.device_mut();
+    let slot = device.begin_recording().unwrap();
+    device.submission.slots[slot].stream_descriptors = Some(DescriptorCache::from_limits(
+        Arc::clone(&device.owner),
+        device.profile().limits,
+        2,
+    ));
+    let mut retained = Vec::new();
+    let before = execution.statistics.draws;
+    for index in 0..32 {
+        let (allocation, backing) = backing_allocation(256, 256, 0);
+        allocation.write(0, &encode([0., 1., 0., 1.])).unwrap();
+        let mut source = (*uniform_draw).clone();
+        source.identity = PreparedStateId::new(1000 + index, 1);
+        let mut program = (*source.program).clone();
+        program.identity = PreparedStateId::new(2000 + index, 1);
+        program.bindings = Box::new([(
+            ssa::ResourceId::new(42),
+            GuestBinding::Buffer(backing.snapshot_subrange(0, 16).unwrap()),
+        )]);
+        source.program = Arc::new(program);
+        let submission = NativeSubmission {
+            frontend: FrontendSubmissionId::new(1000 + index),
+            segment: FrontendSubmissionSegment::FIRST,
+            final_segment: true,
+            commands: vec![NativeCommand::Draw {
+                state: Arc::new(source),
+                arguments: DrawArguments::NonIndexed {
+                    first_vertex: 0,
+                    vertex_count: 3,
+                    first_instance: 0,
+                    instance_count: 1,
+                },
+            }],
+        };
+        ready(&mut execution, &submission);
+        execution
+            .submit(ExecutionBatch {
+                commands: &submission,
+                definitions: &[],
+                retirements: &[],
+            })
+            .unwrap();
+        retained.push((allocation, submission));
+    }
+    assert_eq!(execution.statistics.draws - before, 32);
+    assert_eq!(execution.descriptors.statistics().allocated, 0);
+    let bytes = cpu_read(&mut execution.residency, &backing);
+    assert!(bytes.chunks_exact(4).all(|pixel| pixel == [0, 255, 0, 255]));
+    drop(retained);
     render_area_preserves_undefined_padding(&mut execution, &state);
     drop(pixels);
     execution.teardown().unwrap();
@@ -734,4 +1524,220 @@ fn uniform_color_shader() -> Box<[ssa::Function]> {
         .collect();
     fragment.optimize().unwrap();
     Box::new([vertex, fragment])
+}
+
+#[test]
+fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames() {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let monitor = device.validation_monitor();
+    let mut execution = NativeGpuExecution::new(
+        device,
+        ShaderNamespace {
+            guest: *b"nixe-native-test",
+            isa: 1,
+        },
+        CacheConfiguration::default(),
+        8 * 1024 * 1024,
+    )
+    .unwrap();
+    let plane = |format: ImageFormat, width, height| {
+        let bpp = format.plane_bytes_per_texel(0).unwrap() as u64;
+        let (_, backing) = backing_allocation(4096, 4096, 0xa5);
+        let backing = backing
+            .snapshot_subrange(0, u64::from(width * height) * bpp)
+            .unwrap();
+        GuestImage {
+            sample_grid: [1, 1],
+            canonical_texels: true,
+            swizzle: Swizzle::IDENTITY,
+            description: ImageDescription::new(
+                ImageDimension::Two,
+                ImageExtent::new(width, height, 1).unwrap(),
+                format,
+                ImageKind::Color,
+                1,
+                1,
+                SampleCount::One,
+            )
+            .unwrap(),
+            planes: Arc::from([GuestImagePlane {
+                mip_level: 0,
+                array_layer: 0,
+                aspect: GuestImageAspect::Color,
+                backing,
+                row_pitch: u64::from(width) * bpp,
+                bytes_per_block: bpp as u32,
+            }]),
+        }
+    };
+    let y = plane(ImageFormat::R8Unorm, 5, 3);
+    let uv = plane(ImageFormat::Rg8Unorm, 3, 2);
+    let output = plane(ImageFormat::Bgra8Unorm, 4, 2);
+    let transform = Nv12ColorTransform {
+        coefficients: [
+            [256, 0, 128, -4096],
+            [256, -64, -64, 8192],
+            [256, 256, 0, -16384],
+        ],
+        shift: 0,
+        enabled: true,
+        clamp: [0, 1023],
+        alpha: 37,
+        source_origin: [1, 1],
+    };
+    let mut descriptor_updates = 0;
+    for frame in 0..4 {
+        let ys: Arc<[u8]> = (0..15).map(|i| (i * 11 + frame * 13) as u8).collect();
+        let uvs: Arc<[u8]> = (0..12).map(|i| (i * 7 + frame * 9) as u8).collect();
+        let submission = NativeSubmission {
+            frontend: FrontendSubmissionId::new(frame as u64 + 1),
+            segment: FrontendSubmissionSegment::FIRST,
+            final_segment: true,
+            commands: vec![
+                NativeCommand::UploadPlanes {
+                    images: Box::new([y.clone(), uv.clone()]),
+                    widths: [5, 3],
+                    bytes: [Arc::clone(&ys), Arc::clone(&uvs)],
+                },
+                NativeCommand::ConvertNv12 {
+                    images: Box::new([y.clone(), uv.clone(), output.clone()]),
+                    transform,
+                },
+            ],
+        };
+        ready(&mut execution, &submission);
+        execution
+            .submit(ExecutionBatch {
+                commands: &submission,
+                definitions: &[],
+                retirements: &[],
+            })
+            .unwrap();
+        execution
+            .wait_for_completion_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let pixels = cpu_read(&mut execution.residency, &output.planes[0].backing);
+        for row in 0..2 {
+            for column in 0..4 {
+                let sx = column + 1;
+                let sy = row + 1;
+                let values = [
+                    i32::from(ys[sy * 5 + sx]) * 4,
+                    i32::from(uvs[(sy / 2 * 3 + sx / 2) * 2]) * 4,
+                    i32::from(uvs[(sy / 2 * 3 + sx / 2) * 2 + 1]) * 4,
+                ];
+                let rgb = transform.coefficients.map(|c| {
+                    (((values[0] * c[0] + values[1] * c[1] + values[2] * c[2]) + c[3]) >> 8)
+                        .clamp(0, 1023)
+                        >> 2
+                });
+                assert_eq!(
+                    &pixels[(row * 4 + column) * 4..(row * 4 + column + 1) * 4],
+                    &[rgb[2] as u8, rgb[1] as u8, rgb[0] as u8, 37]
+                );
+            }
+        }
+        if frame == 0 {
+            descriptor_updates = execution.descriptors.statistics().updates;
+        }
+        assert_eq!(
+            execution.descriptors.statistics().updates,
+            descriptor_updates
+        );
+        assert_eq!(execution.video_pipelines.len(), 1);
+    }
+    execution.teardown().unwrap();
+    drop(execution);
+    monitor.check().unwrap();
+}
+
+#[test]
+fn speculative_compilation_failure_is_reported_only_when_ordered_work_consumes_it() {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let monitor = device.validation_monitor();
+    let mut execution = NativeGpuExecution::new(
+        device,
+        ShaderNamespace {
+            guest: *b"compile-failure!",
+            isa: 1,
+        },
+        CacheConfiguration::default(),
+        4 * 1024 * 1024,
+    )
+    .unwrap();
+    let mut b = ssa::FunctionBuilder::new(ShaderStage::Compute);
+    b.terminate(
+        b.entry(),
+        ShaderSourceLocation::new(0),
+        ssa::Terminator::Return,
+    );
+    // A compute shader without a validated workgroup size cannot be emitted.
+    let function = b.finish().unwrap();
+    let future = NativeCommand::Dispatch {
+        program: Arc::new(GuestProgram {
+            identity: PreparedStateId::new(1, 1),
+            shader: Arc::new(GuestShaderCode {
+                identity: ssa::artifact::ContentId::of(b"invalid-future-compute", &[]),
+                functions: Box::new([Arc::new(function)]),
+            }),
+            bindings: Box::new([]),
+            shared_memory_bytes: 0,
+        }),
+        groups: [1, 1, 1],
+    };
+    execution.precompile(&future);
+    let started = Instant::now();
+    while !execution.precompiling.is_empty() {
+        execution.service_host().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (_, backing) = backing_allocation(4096, 4096, 0x19);
+    let earlier = NativeSubmission {
+        frontend: FrontendSubmissionId::new(1),
+        segment: FrontendSubmissionSegment::FIRST,
+        final_segment: true,
+        commands: vec![NativeCommand::WriteMemory {
+            target: backing.clone(),
+            offset: 4,
+            bytes: Arc::from([0x43; 4]),
+            after_prior_work: true,
+        }],
+    };
+    ready(&mut execution, &earlier);
+    execution
+        .submit(ExecutionBatch {
+            commands: &earlier,
+            definitions: &[],
+            retirements: &[],
+        })
+        .unwrap();
+    assert!(execution.poll_completion().unwrap().is_some());
+    assert_eq!(
+        &cpu_read(&mut execution.residency, &backing)[4..8],
+        &[0x43; 4]
+    );
+    let later = NativeSubmission {
+        frontend: FrontendSubmissionId::new(2),
+        segment: FrontendSubmissionSegment::FIRST,
+        final_segment: true,
+        commands: vec![future],
+    };
+    assert!(
+        execution
+            .prepare(ExecutionBatch {
+                commands: &later,
+                definitions: &[],
+                retirements: &[]
+            })
+            .is_err()
+    );
+    execution.teardown().unwrap();
+    drop(execution);
+    monitor.check().unwrap();
 }

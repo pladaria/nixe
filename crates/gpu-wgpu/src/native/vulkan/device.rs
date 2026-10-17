@@ -169,6 +169,7 @@ pub(crate) fn create_device(
                 signed_zero_inf_nan_preserve: floats.shader_signed_zero_inf_nan_preserve_float32
                     != vk::FALSE,
                 fused_multiply_add: fma_enabled.float32 != vk::FALSE,
+                ..Default::default()
             },
             float64: SpirvFloat64Capabilities {
                 enabled: core.shader_float64 != vk::FALSE,

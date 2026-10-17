@@ -147,6 +147,14 @@ impl Kernel {
         }
     }
     fn execute(&mut self, device: &mut VulkanDevice, input: &[u32]) -> Vec<u32> {
+        self.execute_groups(device, input, 1)
+    }
+    fn execute_groups(
+        &mut self,
+        device: &mut VulkanDevice,
+        input: &[u32],
+        groups: u32,
+    ) -> Vec<u32> {
         let bytes: Vec<_> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
         // Previous dispatch completed; host access excludes every in-flight atom.
         unsafe { self.buffer.write_range(0, &bytes) }.unwrap();
@@ -165,7 +173,7 @@ impl Kernel {
                 &[self.set],
                 &[],
             );
-            raw.cmd_dispatch(command, 1, 1, 1);
+            raw.cmd_dispatch(command, groups, 1, 1);
             let barriers = [vk::BufferMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
@@ -209,8 +217,14 @@ fn options(device: &VulkanDevice) -> spirv::Options {
             vertex_position_transform: None,
             input_control_points: 0,
             tessellation_mode: None,
+            native_half_conversions: f.preserving_half_conversions,
+            native_half_fma: f.preserving_half_conversions && f.fma_float16,
             float32: nixe_gpu::SpirvFloat32Capabilities {
                 denorm_preserve: f.float32_denorm_preserve,
+                denorm_flush_to_zero: f.float32_denorm_flush_to_zero,
+                rounding_mode_rtz: f.float32_round_toward_zero,
+                independent_denormals: f.independent_denormals,
+                independent_rounding: f.independent_rounding,
                 rounding_mode_rte: f.float32_round_to_nearest_even,
                 signed_zero_inf_nan_preserve: f.float32_signed_zero_inf_nan_preserve,
                 fused_multiply_add: f.fma_float32,
@@ -224,7 +238,7 @@ fn options(device: &VulkanDevice) -> spirv::Options {
         integer64: device.profile().core.shader_int64 != 0,
         subgroup_quad: false,
         shared_memory_bytes: 0,
-        local_memory_bytes: 0,
+        uniform_buffer_bytes: device.profile().limits.max_uniform_buffer_range,
     }
 }
 fn pc() -> ShaderSourceLocation {
@@ -232,6 +246,25 @@ fn pc() -> ShaderSourceLocation {
 }
 fn constant(b: &mut FunctionBuilder, block: BlockId, bits: u32) -> Operand {
     b.emit(block, pc(), Op::Constant(Constant::u32(bits)), vec![])[0].into()
+}
+fn half_convert(
+    b: &mut FunctionBuilder,
+    block: BlockId,
+    value: nixe_gpu::ssa::ValueId,
+    from: Type,
+    to: Type,
+) -> nixe_gpu::ssa::ValueId {
+    b.emit(
+        block,
+        pc(),
+        Op::Convert {
+            from,
+            to,
+            rounding: nixe_gpu::ShaderRoundingMode::NearestEven,
+            flush_denormals: false,
+        },
+        vec![value.into()],
+    )[0]
 }
 fn scalar_kernel(op: Op, arguments: &[Type], results: &[Type]) -> Function {
     let mut b = FunctionBuilder::new(ShaderStage::Compute);
@@ -263,6 +296,8 @@ fn scalar_kernel(op: Op, arguments: &[Type], results: &[Type]) -> Function {
                 },
                 vec![load.into(), zero],
             )[0]
+        } else if ty == Type::F16 {
+            b.emit(block, pc(), Op::UnpackHalf, vec![load.into()])[0]
         } else {
             b.emit(
                 block,
@@ -289,6 +324,8 @@ fn scalar_kernel(op: Op, arguments: &[Type], results: &[Type]) -> Function {
                 Op::Select(Type::U32),
                 vec![value.into(), one, zero],
             )[0]
+        } else if ty == Type::F16 {
+            b.emit(block, pc(), Op::PackHalf, vec![value.into()])[0]
         } else {
             b.emit(
                 block,
@@ -427,6 +464,205 @@ fn expand_half(bits: u16) -> f32 {
         e => sign * (1.0 + f32::from(fraction) / 1024.0) * 2.0f32.powi(i32::from(e) - 15),
     }
 }
+
+#[test]
+fn ssa_half_pass_preserves_subnormals_quiets_nans_and_resolves_signed_zero() {
+    let Some(mut device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let mut b = FunctionBuilder::new(ShaderStage::Compute);
+    let entry = b.entry();
+    let address = constant(&mut b, entry, 0);
+    let input = b.emit(
+        entry,
+        pc(),
+        Op::Load {
+            space: MemorySpace::Storage,
+            resource: Some(ResourceId::new(42)),
+            address_type: Type::U32,
+            ty: Type::U32,
+        },
+        vec![address],
+    )[0];
+    let half = b.emit(entry, pc(), Op::UnpackHalf, vec![input.into()])[0];
+    let half = half_convert(&mut b, entry, half, Type::F16, Type::F32);
+    let zero = b.emit(
+        entry,
+        pc(),
+        Op::Constant(Constant {
+            ty: Type::F32,
+            bits: 0,
+        }),
+        vec![],
+    )[0];
+    let result = b.emit(
+        entry,
+        pc(),
+        Op::Binary {
+            op: Binary::Add,
+            ty: Type::F32,
+            float_control: nixe_gpu::ShaderFloatControl::new(
+                nixe_gpu::ShaderRoundingMode::NearestEven,
+                nixe_gpu::ShaderNanMode::Propagate,
+                true,
+                true,
+                false,
+            ),
+        },
+        vec![half.into(), zero.into()],
+    )[0];
+    let result = half_convert(&mut b, entry, result, Type::F32, Type::F16);
+    let result = b.emit(entry, pc(), Op::PackHalf, vec![result.into()])[0];
+    let output = constant(&mut b, entry, 4);
+    b.emit(
+        entry,
+        pc(),
+        Op::Store {
+            space: MemorySpace::Storage,
+            resource: Some(ResourceId::new(42)),
+            address_type: Type::U32,
+            ty: Type::U32,
+        },
+        vec![output, result.into()],
+    );
+    b.terminate(entry, pc(), Terminator::Return);
+    let mut function = b.finish().unwrap();
+    function.workgroup_size = Some([1, 1, 1]);
+    function.optimize().unwrap();
+    let module = spirv::emit(&function, options(&device)).unwrap();
+    let mut kernel = Kernel::new(&device, &module, 2);
+    for (input, expected) in [
+        (0x8000, 0),
+        (1, 1),
+        (0x8001, 0x8001),
+        (0x3f00, 0x3f00),
+        (0xbf00, 0xbf00),
+        (0x7c00, 0x7c00),
+        (0x7c01, 0x7e01),
+        (0xfc01, 0xfe01),
+    ] {
+        let actual = kernel.execute(&mut device, &[input, 0])[1];
+        if input & 0x7fff > 0x7c00 {
+            // Arithmetic quiets NaNs; it does not preserve the operand's
+            // payload/sign. NVIDIA arithmetic uses a canonical NaN:
+            // https://docs.nvidia.com/cuda/archive/8.0/cuda-c-programming-guide/#floating-point-standard
+            assert_eq!(actual & 0xffff_7e00, 0x7e00);
+        } else {
+            assert_eq!(actual, expected, "input={input:#x}");
+        }
+    }
+    drop(kernel);
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+fn ssa_indexed_local_memory_is_private_to_each_invocation() {
+    let Some(mut device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let mut b = FunctionBuilder::new(ShaderStage::Compute);
+    let entry = b.entry();
+    let zero = constant(&mut b, entry, 0);
+    let address = b.emit(
+        entry,
+        pc(),
+        Op::Load {
+            space: MemorySpace::Storage,
+            resource: Some(ResourceId::new(42)),
+            address_type: Type::U32,
+            ty: Type::U32,
+        },
+        vec![zero],
+    )[0];
+    let lane = b.emit(
+        entry,
+        pc(),
+        Op::Builtin {
+            builtin: nixe_gpu::ShaderComputeBuiltin::LocalInvocationId,
+            component: 0,
+        },
+        vec![],
+    )[0];
+    let binary = |b: &mut FunctionBuilder, op, left: Operand, right: Operand| {
+        b.emit(
+            b.entry(),
+            pc(),
+            Op::Binary {
+                op,
+                ty: Type::U32,
+                float_control: nixe_gpu::ShaderFloatControl::PRECISE,
+            },
+            vec![left, right],
+        )[0]
+    };
+    let initial = constant(&mut b, entry, 17);
+    let value = binary(&mut b, Binary::Add, lane.into(), initial);
+    b.emit(
+        entry,
+        pc(),
+        Op::Store {
+            space: MemorySpace::Local,
+            resource: None,
+            address_type: Type::U32,
+            ty: Type::U32,
+        },
+        vec![address.into(), value.into()],
+    );
+    b.emit(
+        entry,
+        pc(),
+        Op::Barrier {
+            execution: BarrierScope::Workgroup,
+            memory: BarrierScope::Workgroup,
+            spaces: BarrierMemory::NONE,
+        },
+        vec![],
+    );
+    let value = b.emit(
+        entry,
+        pc(),
+        Op::Load {
+            space: MemorySpace::Local,
+            resource: None,
+            address_type: Type::U32,
+            ty: Type::U32,
+        },
+        vec![address.into()],
+    )[0];
+    let four = constant(&mut b, entry, 4);
+    let output = binary(&mut b, Binary::Multiply, lane.into(), four);
+    let output = binary(&mut b, Binary::Add, output.into(), four);
+    b.emit(
+        entry,
+        pc(),
+        Op::Store {
+            space: MemorySpace::Storage,
+            resource: Some(ResourceId::new(42)),
+            address_type: Type::U32,
+            ty: Type::U32,
+        },
+        vec![output.into(), value.into()],
+    );
+    b.terminate(entry, pc(), Terminator::Return);
+    let mut function = b.finish().unwrap();
+    function.workgroup_size = Some([2, 1, 1]);
+    function.local_memory_bytes = 16;
+    function.optimize().unwrap();
+    let module = spirv::emit(&function, options(&device)).unwrap();
+    let mut kernel = Kernel::new(&device, &module, 3);
+    for address in [0, 4, 8, 12] {
+        assert_eq!(
+            &kernel.execute(&mut device, &[address, 0, 0])[1..],
+            &[17, 18]
+        );
+    }
+    drop(kernel);
+    drop(device);
+    validation.check().unwrap();
+}
 #[test]
 fn ssa_half_fma_avoids_double_rounding_on_real_gpu() {
     let Some(mut device) = support::device_for_test(ApiPreference::Auto) else {
@@ -436,8 +672,8 @@ fn ssa_half_fma_avoids_double_rounding_on_real_gpu() {
     let module = spirv::emit(
         &scalar_kernel(
             Op::HalfFma { saturate: false },
-            &[Type::F32; 3],
-            &[Type::U32],
+            &[Type::F16; 3],
+            &[Type::F16],
         ),
         options(&device),
     )
@@ -465,11 +701,12 @@ fn ssa_half_fma_avoids_double_rounding_on_real_gpu() {
         cases.push((next(), next(), next()));
     }
     for (a, b, c) in cases {
+        let packed = [u32::from(a), u32::from(b), u32::from(c), 0, 0];
         let [a, b, c] = [a, b, c].map(expand_half);
         let expected = u32::from(half_reference::round_half(
             f64::from(a) * f64::from(b) + f64::from(c),
         ));
-        let actual = kernel.execute(&mut device, &[a.to_bits(), b.to_bits(), c.to_bits(), 0, 0])[4];
+        let actual = kernel.execute(&mut device, &packed)[4];
         if expected & 0x7fff > 0x7c00 {
             assert!(actual & 0x7fff > 0x7c00);
         } else {
@@ -1314,3 +1551,5 @@ fn approximate_sfus_preserve_tiny_values_without_native_denorm_support() {
     }
     validation.check().unwrap();
 }
+
+mod half;

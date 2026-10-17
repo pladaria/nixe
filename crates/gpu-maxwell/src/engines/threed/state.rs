@@ -1321,11 +1321,6 @@ impl MaxwellThreeDState {
         &self.vertex_input
     }
 
-    #[must_use]
-    pub(crate) fn shader_bindings_snapshot(&self) -> Arc<MaxwellThreeDShaderBindingState> {
-        Arc::clone(&self.shader_bindings)
-    }
-
     pub fn shader_bindings(&self) -> &MaxwellThreeDShaderBindingState {
         &self.shader_bindings
     }

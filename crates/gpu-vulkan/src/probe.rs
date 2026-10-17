@@ -102,7 +102,7 @@ impl VulkanResidency {
                     owner: Arc::clone(&owner),
                     handle,
                 });
-                let index = self.device.submission.begin()?;
+                let index = self.device.begin_recording()?;
                 self.device.submission.slots[index]
                     .probe_queries
                     .push(Arc::clone(&query));

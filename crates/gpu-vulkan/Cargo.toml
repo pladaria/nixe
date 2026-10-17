@@ -25,4 +25,5 @@ name = "binding-probe"
 required-features = ["binding-probe"]
 
 [dev-dependencies]
+rspirv = "0.13"
 tempfile.workspace = true

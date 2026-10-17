@@ -86,7 +86,6 @@ impl VulkanResidency {
         destination: ImageId,
         plane: usize,
         transform: Nv12ColorTransform,
-        descriptors: &mut DescriptorCache,
     ) -> Result<PreparedNv12, VulkanError> {
         let t = transform;
         if t.shift > 15
@@ -139,7 +138,7 @@ impl VulkanResidency {
                 "NV12 destination requires RGBA8/BGRA8 UNORM",
             ));
         }
-        let program = self.prepare_program(pipeline, &sources.map(Binding::Image), descriptors)?;
+        let program = self.prepare_program(pipeline, &sources.map(Binding::Image))?;
         let graphics = self.prepare_graphics(
             program,
             GraphicsParameters::new(

@@ -11,6 +11,20 @@ impl AccessScope {
     pub const fn new(stages: vk::PipelineStageFlags2, access: vk::AccessFlags2) -> Self {
         Self { stages, access }
     }
+    pub(super) fn buffer_alignment(self, limits: &vk::PhysicalDeviceLimits) -> u64 {
+        let uniform = self.access.contains(vk::AccessFlags2::UNIFORM_READ);
+        let storage = self.access.intersects(
+            vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+        );
+        let mut alignment = 4;
+        if uniform {
+            alignment = alignment.max(limits.min_uniform_buffer_offset_alignment);
+        }
+        if storage || !uniform {
+            alignment = alignment.max(limits.min_storage_buffer_offset_alignment);
+        }
+        alignment
+    }
     pub fn writes(self) -> bool {
         self.access.intersects(
             vk::AccessFlags2::SHADER_WRITE
@@ -249,6 +263,9 @@ impl Barriers {
             );
         }
     }
+    pub fn queue_buffer(&mut self, barrier: vk::BufferMemoryBarrier2<'static>) {
+        self.buffers.push(barrier);
+    }
     pub fn queue_image(&mut self, barrier: vk::ImageMemoryBarrier2<'static>) {
         self.images.push(barrier);
     }
@@ -285,6 +302,25 @@ impl Barriers {
     }
 }
 impl VulkanResidency {
+    /// Guest WFI and ordered completion writes are device dependencies. Queue
+    /// submission order alone would not establish availability/visibility.
+    /// https://docs.vulkan.org/guide/latest/synchronization_examples.html
+    pub(crate) fn order_device(&mut self) -> Result<(), VulkanError> {
+        self.barriers.memory_dependency(Dependency {
+            source: AccessScope::new(
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::MEMORY_WRITE,
+            ),
+            destination: AccessScope::new(
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+            ),
+        });
+        if self.device.submission.recording.is_some() {
+            self.barriers.emit(&mut self.device);
+        }
+        Ok(())
+    }
     pub fn with_recording_policy(
         device: VulkanDevice,
         bytes: u64,
@@ -307,7 +343,27 @@ impl VulkanResidency {
         scope: AccessScope,
     ) -> Result<vk::Buffer, VulkanError> {
         self.check_buffer_range(id, offset, size)?;
-        self.device.submission.begin()?;
+        // Logical completion effects retain an exact literal and producer
+        // ticket. First physical use materializes the literal in queue order;
+        // subsequent partial writers therefore preserve the remaining bytes.
+        // Clear the flag before upload_buffer re-enters buffer_access_range.
+        let pending = self.buffers[id.slot]
+            .entry
+            .as_mut()
+            .expect("buffer")
+            .known
+            .as_mut()
+            .and_then(|known| {
+                if !known.pending_upload {
+                    return None;
+                }
+                known.pending_upload = false;
+                Some(Arc::clone(&known.bytes))
+            });
+        if let Some(bytes) = pending {
+            self.upload_buffer(id, 0, &bytes)?;
+        }
+        self.device.begin_recording()?;
         let work = self.device.work_ticket()?;
         let entry = self.buffers[id.slot]
             .entry
@@ -344,7 +400,7 @@ impl VulkanResidency {
                 "attachment feedback needs an explicit supported feedback-loop layout or an exact snapshot lowering",
             ));
         }
-        self.device.submission.begin()?;
+        self.device.begin_recording()?;
         let work = self.device.work_ticket()?;
         let entry = self.images[id.slot].entry.as_mut().expect("image");
         if range.level_count == 0

@@ -441,7 +441,7 @@ impl VulkanResidency {
                 .dst_subresource(subresource)
                 .extent(p.extent);
             self.barriers.emit(&mut self.device);
-            let slot = self.device.submission.begin()?;
+            let slot = self.device.begin_recording()?;
             unsafe {
                 self.device.owner.device.cmd_copy_image(
                     self.device.submission.slots[slot].command,
@@ -483,15 +483,14 @@ impl VulkanResidency {
             .filter(|page| !self.gpu_owned(page.identity(), page.visibility_state()))
             .map(|page| page.identity())
             .collect();
-        {
-            let mut visible = self.visibility.pages.lock().unwrap();
-            for page in cpu_pages {
-                if let Some(index) = self.index.pages.get_mut(&page) {
-                    index.clear_writes();
-                }
-                visible.remove(&page);
+        for page in cpu_pages {
+            if let Some(index) = self.index.pages.get_mut(&page) {
+                index.clear_writes();
             }
         }
+        // CPU imports do not own the physical page's preserved baseline: an
+        // earlier alias may already have prepared a write in this operation.
+        // Canonical visibility transitions and final eviction retire it.
         dependency.rearm().map_err(memory_error)?;
         Ok(())
     }
@@ -538,7 +537,9 @@ impl VulkanResidency {
                 )
                 .map_err(memory_error)?
         } else {
-            self.cpu_snapshots(&backing, &dependency, &[])?
+            let imports = self.cpu_imports(&backing, &dependency, &[])?;
+            dirty.extend(imports.gpu_invalidated);
+            imports.snapshots
         };
         for (offset, bytes) in &snapshots {
             dirty.push((*offset, bytes.len() as u64));
@@ -557,14 +558,11 @@ impl VulkanResidency {
             // CPU-authored texels already exist in this immutable snapshot.
             // Stage them once; a persistent canonical buffer would duplicate
             // both the snapshot and the GPU transfer, and index tiled fragments.
-            let mut visible = self.visibility.pages.lock().unwrap();
             for page in backing.pages() {
                 if let Some(indexed) = self.index.pages.get_mut(&page.identity()) {
                     indexed.clear_writes();
                 }
-                visible.remove(&page.identity());
             }
-            drop(visible);
             for (offset, bytes) in snapshots {
                 self.upload_cpu_image_rows(id, plane, offset, &bytes)?;
             }
@@ -718,7 +716,7 @@ impl VulkanResidency {
         }
         let (dst, layout) =
             self.image_regions_access(image, &pieces, vk::AccessFlags2::TRANSFER_WRITE)?;
-        let index = self.device.submission.begin()?;
+        let index = self.device.begin_recording()?;
         let command = self.device.submission.slots[index].command;
         let regions = if let Some((scratch, slices)) = &scratch {
             let copies: Vec<_> = pieces
@@ -1210,7 +1208,7 @@ impl VulkanResidency {
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             )?;
         }
-        let index = self.device.submission.begin()?;
+        let index = self.device.begin_recording()?;
         let command = self.device.submission.slots[index].command;
         let regions: Vec<_> = pieces
             .iter()

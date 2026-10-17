@@ -19,7 +19,7 @@ use nixe_gpu::{FrontendSubmissionId, GpuVirtualAddress, MappingGeneration, Verif
 use nixe_memory::{CanonicalAllocation, CanonicalWriteBatch, MemoryPermissions};
 use std::collections::BTreeMap;
 
-pub(super) fn canonical_shader_writes(
+pub(crate) fn canonical_shader_writes(
     address_space: &MaxwellGpuAddressSpace,
     writes: &[(u64, u32)],
 ) -> CanonicalWriteBatch {
@@ -56,8 +56,12 @@ pub(super) fn translate_maxwell_shader_programs(
 ) -> Result<Vec<MaxwellTranslatedShaderProgram>, MaxwellShaderTranslationError> {
     let source = prepare_maxwell_shader_translation_source(state)?.materialize();
     let staged = canonical_shader_writes(address_space, staged_writes);
-    let inputs =
-        prepare_maxwell_shader_translation_inputs_from_source(&source, address_space, &staged)?;
+    let inputs = prepare_maxwell_shader_translation_inputs_from_source(
+        &source,
+        state.shader_bindings(),
+        address_space,
+        &staged,
+    )?;
     translate_prepared_maxwell_shader_programs(&inputs)
 }
 
@@ -69,7 +73,7 @@ pub(super) fn preflight_maxwell_shader_translation(
     translate_maxwell_shader_programs(state, address_space, staged_writes).map(|_| ())
 }
 
-pub(super) fn mapped_memory() -> (CanonicalAllocation, MaxwellGpuAddressSpace, u64) {
+pub(crate) fn mapped_memory() -> (CanonicalAllocation, MaxwellGpuAddressSpace, u64) {
     let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
     let mut address_space =
         MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);

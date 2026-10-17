@@ -54,6 +54,26 @@ impl Emitter {
             self.value(block, pc, Op::Bitcast { from, to }, vec![value])
         }
     }
+    fn half_convert(
+        &mut self,
+        block: BlockId,
+        pc: ShaderSourceLocation,
+        value: Operand,
+        from: Type,
+        to: Type,
+    ) -> Operand {
+        self.value(
+            block,
+            pc,
+            Op::Convert {
+                from,
+                to,
+                rounding: nixe_gpu::ShaderRoundingMode::NearestEven,
+                flush_denormals: false,
+            },
+            vec![value],
+        )
+    }
     fn float(
         &mut self,
         block: BlockId,
@@ -223,6 +243,9 @@ impl Emitter {
         op: &D,
     ) -> Result<(), MaxwellShaderTranslationError> {
         match op {
+            D::GlobalMemory { .. } => {
+                unreachable!("guest global accesses must be legalized before SSA construction")
+            }
             D::Nop => {}
             D::Undefined32 { destination } => {
                 let value = self.value(block, pc, Op::Undefined(Type::U32), vec![]);
@@ -270,6 +293,36 @@ impl Emitter {
                 );
                 self.write(block, pc, *destination, value);
             }
+            D::LoadLocal32 {
+                destination,
+                address,
+            } => {
+                let value = self.value(
+                    block,
+                    pc,
+                    Op::Load {
+                        space: MemorySpace::Local,
+                        resource: None,
+                        address_type: Type::U32,
+                        ty: Type::U32,
+                    },
+                    vec![self.read(*address)],
+                );
+                self.write(block, pc, *destination, value);
+            }
+            D::StoreLocal32 { source, address } => {
+                self.builder.emit(
+                    block,
+                    pc,
+                    Op::Store {
+                        space: MemorySpace::Local,
+                        resource: None,
+                        address_type: Type::U32,
+                        ty: Type::U32,
+                    },
+                    vec![self.read(*address), self.read(*source)],
+                );
+            }
             D::UnpackHalf32 {
                 destination,
                 source,
@@ -281,6 +334,7 @@ impl Emitter {
                     bits = self.binary(block, pc, Binary::ShiftRight, Type::U32, bits, amount);
                 }
                 let value = self.value(block, pc, Op::UnpackHalf, vec![bits]);
+                let value = self.half_convert(block, pc, value, Type::F16, Type::F32);
                 self.write_float(block, pc, *destination, value);
             }
             D::PackHalf32 {
@@ -288,6 +342,7 @@ impl Emitter {
                 source,
             } => {
                 let source = self.float(block, pc, *source);
+                let source = self.half_convert(block, pc, source, Type::F32, Type::F16);
                 let value = self.value(block, pc, Op::PackHalf, vec![source]);
                 self.write(block, pc, *destination, value);
             }
@@ -301,6 +356,9 @@ impl Emitter {
                 let a = self.float(block, pc, *left);
                 let b = self.float(block, pc, *right);
                 let c = self.float(block, pc, *addend);
+                let a = self.half_convert(block, pc, a, Type::F32, Type::F16);
+                let b = self.half_convert(block, pc, b, Type::F32, Type::F16);
+                let c = self.half_convert(block, pc, c, Type::F32, Type::F16);
                 let value = self.value(
                     block,
                     pc,
@@ -309,6 +367,7 @@ impl Emitter {
                     },
                     vec![a, b, c],
                 );
+                let value = self.value(block, pc, Op::PackHalf, vec![value]);
                 self.write(block, pc, *destination, value);
             }
             D::Multiply32 {

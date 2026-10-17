@@ -6,6 +6,33 @@ use crate::MaxwellShaderStage;
 use nixe_gpu::{ShaderOperation, ShaderPredicate, ShaderSourceLocation, lower_shader_ir_to_wgsl};
 
 #[test]
+fn fusion_region_requires_dominance_and_rejects_late_backedge_entries() {
+    use std::collections::{BTreeMap, BTreeSet};
+    let flow = |edges: &[(u32, &[u32])]| ShaderControlFlow {
+        reachable: BTreeSet::from([8, 16, 24, 32, 40]),
+        stack_targets: BTreeMap::new(),
+        successors: edges
+            .iter()
+            .map(|&(pc, next)| (pc, next.iter().copied().collect()))
+            .collect(),
+    };
+    assert!(
+        flow(&[(8, &[16]), (16, &[24, 32]), (24, &[32]), (32, &[40])]).single_entry_region(16, 32)
+    );
+    assert!(!flow(&[(8, &[16, 24]), (16, &[24]), (24, &[32])]).single_entry_region(16, 32));
+    assert!(
+        !flow(&[
+            (8, &[16]),
+            (16, &[24]),
+            (24, &[32]),
+            (32, &[40]),
+            (40, &[24])
+        ])
+        .single_entry_region(16, 32)
+    );
+}
+
+#[test]
 fn captured_ssy_normalizes_and_validates_its_reconvergence_target() {
     let captured = 0xe290_0000_1000_0000;
     assert!(is_set_sync_point(captured));

@@ -1,14 +1,21 @@
 //! Native frontend preparation. Maxwell dirty revisions and mapping/CPU proofs
 //! select immutable semantic state; no renderer IDs or old register IR are built.
 use super::*;
+mod compute;
+mod identity;
 mod image;
+mod interface;
 use crate::execution::{MaxwellFrontend, MaxwellSubmissionExecutionError as Error};
 use crate::{
     MaxwellGpuAddressSpace, MaxwellShaderCompiler, MaxwellShaderSnapshot, MaxwellSsaBindingSource,
 };
+use identity::{DrawKey, ParameterKey, ProgramKey};
+use interface::ShaderInterface;
 use nixe_gpu::native::*;
 use nixe_gpu::ssa::{ResourceId, compile::CompilePool};
 use std::time::Duration;
+
+type ComputeSourceKey = (u64, u8, Option<[u32; 3]>);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeFrontendStatistics {
@@ -23,12 +30,10 @@ pub struct NativeFrontendStatistics {
 struct Code {
     state: super::super::threed::state::MaxwellThreeDShaderStateIdentity,
     source: crate::shader::MaxwellShaderTranslationSourceKey,
-    snapshot: MaxwellShaderSnapshot,
+    snapshot: Arc<MaxwellShaderSnapshot>,
     translated: Arc<crate::MaxwellShaderCode>,
     code: Arc<GuestShaderCode>,
-    bindings: Arc<[(ResourceId, MaxwellThreeDResourceRole)]>,
-    sizes: Box<[(MaxwellThreeDResourceRole, MaxwellShaderBufferSize)]>,
-    roles: Vec<MaxwellThreeDResourceRole>,
+    interface: Arc<ShaderInterface>,
 }
 struct Prepared {
     state: super::super::threed::state::MaxwellThreeDDrawStateIdentity,
@@ -45,7 +50,18 @@ pub struct MaxwellNativeFrontend {
     resources: super::super::threed::MaxwellThreeDResolvedResourceCache,
     draw_roles: Vec<MaxwellThreeDResourceRole>,
     code: Option<Code>,
+    source_codes: nixe_gpu::WorkingSet<
+        crate::shader::MaxwellShaderTranslationSourceKey,
+        (
+            Arc<MaxwellShaderSnapshot>,
+            std::sync::Weak<crate::MaxwellShaderCode>,
+        ),
+    >,
     prepared: Option<Prepared>,
+    interfaces: nixe_gpu::WorkingSet<nixe_gpu::ssa::artifact::ContentId, Arc<ShaderInterface>>,
+    parameter_states: nixe_gpu::WorkingSet<ParameterKey, Arc<GuestDrawParameters>>,
+    programs: nixe_gpu::WorkingSet<ProgramKey, Arc<GuestProgram>>,
+    draws: nixe_gpu::WorkingSet<DrawKey, Arc<GuestDrawState>>,
     next: u64,
     methods: Vec<crate::MaxwellMethodDispatch>,
     parameters: Vec<u32>,
@@ -56,13 +72,17 @@ pub struct MaxwellNativeFrontend {
         nixe_gpu::ImageView,
         GuestImage,
     )>,
-    compute_request: Option<(u64, u8, Option<[u32; 3]>)>,
-    prepared_compute: Option<(Arc<GuestProgram>, Arc<[nixe_gpu::BackingView]>)>,
-    compute: Option<(
-        MaxwellShaderSnapshot,
+    compute_request: Option<ComputeSourceKey>,
+    compute_sources: nixe_gpu::WorkingSet<ComputeSourceKey, Arc<MaxwellShaderSnapshot>>,
+    compute_variants: nixe_gpu::WorkingSet<
+        (
+            nixe_gpu::ssa::artifact::ContentId,
+            nixe_gpu::ssa::UniformSelection,
+        ),
         Arc<crate::MaxwellShaderCode>,
-        Arc<GuestShaderCode>,
-    )>,
+    >,
+    prepared_compute: Option<(Arc<GuestProgram>, Arc<[nixe_gpu::BackingView]>)>,
+    compute: Option<(Arc<MaxwellShaderSnapshot>, Arc<crate::MaxwellShaderCode>)>,
 }
 fn compilation(error: impl Display) -> Error {
     Error::Native(error.to_string().into())
@@ -85,7 +105,12 @@ impl MaxwellNativeFrontend {
             resources: Default::default(),
             draw_roles: Vec::new(),
             code: None,
+            source_codes: nixe_gpu::WorkingSet::new(2048, 32 * 1024 * 1024),
             prepared: None,
+            interfaces: nixe_gpu::WorkingSet::new(2048, 8 * 1024 * 1024),
+            parameter_states: nixe_gpu::WorkingSet::new(8192, 16 * 1024 * 1024),
+            programs: nixe_gpu::WorkingSet::new(8192, 32 * 1024 * 1024),
+            draws: nixe_gpu::WorkingSet::new(8192, 64 * 1024 * 1024),
             next: 1,
             methods: Vec::new(),
             parameters: Vec::new(),
@@ -94,8 +119,37 @@ impl MaxwellNativeFrontend {
             image_view_bytes: 0,
             compute: None,
             compute_request: None,
+            compute_sources: nixe_gpu::WorkingSet::new(256, 8 * 1024 * 1024),
+            compute_variants: nixe_gpu::WorkingSet::new(256, 32 * 1024 * 1024),
             prepared_compute: None,
         }
+    }
+    fn conversion_image(
+        &mut self,
+        source: nixe_gpu::ConversionImage,
+    ) -> Result<GuestImage, MaxwellLoweringError> {
+        if let Some((_, _, image)) = self.image_views.iter().rev().find(|(_, view, image)| {
+            image.description == source.description
+                && view.bindings() == source.view.bindings()
+                && view.swizzle() == source.view.swizzle()
+        }) {
+            return Ok(image.clone());
+        }
+        let image = image::conversion(&source)
+            .map_err(|error| MaxwellLoweringError::ImageBacking(error.to_string()))?;
+        if self.image_views.len() >= 4096 {
+            self.image_views.clear();
+            self.image_view_bytes = 0;
+        }
+        self.image_view_bytes += plane_metadata_bytes(&image);
+        self.image_views.push((
+            super::super::threed::MaxwellThreeDGuestImageFormat::Canonical(
+                source.description.format(),
+            ),
+            source.view,
+            image.clone(),
+        ));
+        Ok(image)
     }
     fn compile(
         &self,
@@ -147,130 +201,69 @@ impl MaxwellNativeFrontend {
             code.state = state.shader_state_identity();
             return Ok(());
         }
-        let snapshot = MaxwellShaderSnapshot::capture_source(&source, space, writes)
-            .map_err(Error::ShaderTranslation)?;
-        self.statistics.shader_captures += 1;
-        let translated = self.compile(snapshot.clone())?;
-        let code = if let Some(old) = &self.code
-            && old.code.identity == snapshot.identity()
-        {
-            Arc::clone(&old.code)
-        } else {
-            Arc::new(GuestShaderCode {
-                identity: snapshot.identity(),
-                functions: translated
-                    .programs
-                    .iter()
-                    .map(|p| p.function.clone())
-                    .collect(),
+        let cached = self
+            .source_codes
+            .get(&source)
+            .filter(|(snapshot, _)| {
+                snapshot.source_is_current(space)
+                    && snapshot.staged_writes_are_irrelevant(writes)
+                    && snapshot.indirect_bindings_current(state.shader_bindings())
             })
+            .cloned();
+        let (snapshot, translated) = if let Some((snapshot, code)) = cached {
+            let code = match code.upgrade() {
+                Some(code) => code,
+                None => {
+                    let code = self.compile(snapshot.as_ref().clone())?;
+                    self.source_codes.insert(
+                        source.clone(),
+                        (Arc::clone(&snapshot), Arc::downgrade(&code)),
+                        snapshot.retained_bytes() + std::mem::size_of_val(&source),
+                    );
+                    code
+                }
+            };
+            (snapshot, code)
+        } else {
+            let snapshot = Arc::new(
+                MaxwellShaderSnapshot::capture_source(
+                    &source,
+                    state.shader_bindings(),
+                    space,
+                    writes,
+                )
+                .map_err(Error::ShaderTranslation)?,
+            );
+            self.statistics.shader_captures += 1;
+            let translated = self.compile(snapshot.as_ref().clone())?;
+            let weight = snapshot.retained_bytes() + std::mem::size_of_val(&source);
+            self.source_codes.insert(
+                source.clone(),
+                (Arc::clone(&snapshot), Arc::downgrade(&translated)),
+                weight,
+            );
+            (snapshot, translated)
         };
-        let mut bindings = BTreeMap::new();
-        let mut sizes = BTreeMap::new();
-        for program in &translated.programs {
-            let constant_extents = program.constant_buffer_extents();
-            let extents: BTreeMap<_, _> = program
-                .global_buffer_extents([1; 3], [1; 3])
-                .into_vec()
-                .into_iter()
-                .collect();
-            for binding in &program.bindings {
-                let group = binding
-                    .binding_group
-                    .ok_or_else(|| compilation("graphics binding has no guest group"))?;
-                let texture = |offset| -> Result<_, Error> {
-                    Ok(super::super::threed::MaxwellThreeDTextureReference::new(
-                        group,
-                        binding
-                            .texture_constant_buffer_slot
-                            .ok_or_else(|| compilation("texture has no handle CB slot"))?,
-                        offset,
-                    ))
-                };
-                let role = match binding.source {
-                    MaxwellSsaBindingSource::ConstantBuffer { slot } => {
-                        let role = MaxwellThreeDResourceRole::ConstantBuffer { group, slot };
-                        let size = constant_extents[&binding.resource].map_or(
-                            MaxwellShaderBufferSize::Declared,
-                            MaxwellShaderBufferSize::Proven,
-                        );
-                        sizes
-                            .entry(role)
-                            .and_modify(|old: &mut MaxwellShaderBufferSize| *old = old.union(size))
-                            .or_insert(size);
-                        role
-                    }
-                    MaxwellSsaBindingSource::GlobalBuffer {
-                        constant_buffer: slot,
-                        byte_offset,
-                        runtime_extent,
-                    } => {
-                        let role = MaxwellThreeDResourceRole::StorageBuffer {
-                            group,
-                            slot,
-                            byte_offset,
-                        };
-                        let size = if runtime_extent {
-                            MaxwellShaderBufferSize::Declared
-                        } else {
-                            MaxwellShaderBufferSize::Proven(
-                                *extents.get(&binding.resource).ok_or_else(|| {
-                                    compilation("storage access has no proved extent")
-                                })?,
-                            )
-                        };
-                        sizes
-                            .entry(role)
-                            .and_modify(|old: &mut MaxwellShaderBufferSize| *old = old.union(size))
-                            .or_insert(size);
-                        role
-                    }
-                    MaxwellSsaBindingSource::Image {
-                        handle_byte_offset,
-                        kind,
-                    } => {
-                        let dimension = match kind {
-                            ShaderResourceKind::SampledImage
-                            | ShaderResourceKind::SampledDepthImage => {
-                                MaxwellThreeDTextureDimension::Two
-                            }
-                            ShaderResourceKind::SampledImage2DArray
-                            | ShaderResourceKind::SampledDepthImage2DArray => {
-                                MaxwellThreeDTextureDimension::TwoArray
-                            }
-                            ShaderResourceKind::SampledImageCube => {
-                                MaxwellThreeDTextureDimension::Cube
-                            }
-                            _ => {
-                                return Err(compilation(format!(
-                                    "unsupported native Maxwell TIC class {kind:?}"
-                                )));
-                            }
-                        };
-                        MaxwellThreeDResourceRole::SampledImage {
-                            texture: texture(handle_byte_offset)?,
-                            dimension,
-                        }
-                    }
-                    MaxwellSsaBindingSource::Sampler {
-                        handle_byte_offset, ..
-                    } => MaxwellThreeDResourceRole::Sampler(texture(handle_byte_offset)?),
-                };
-                bindings.insert(binding.resource, role);
+        let code = Arc::clone(&translated.native);
+        let interface = match self.interfaces.get(&code.identity) {
+            Some(interface) => Arc::clone(interface),
+            None => {
+                let interface = Arc::new(ShaderInterface::new(&translated)?);
+                self.interfaces.insert(
+                    code.identity,
+                    Arc::clone(&interface),
+                    interface.retained_bytes(),
+                );
+                interface
             }
-        }
-        let mut roles: Vec<_> = bindings.values().copied().collect();
-        roles.sort_unstable();
-        roles.dedup();
+        };
         self.code = Some(Code {
             state: state.shader_state_identity(),
             source,
             snapshot,
             translated,
             code,
-            bindings: bindings.into_iter().collect(),
-            sizes: sizes.into_iter().collect(),
-            roles,
+            interface,
         });
         Ok(())
     }
@@ -351,7 +344,7 @@ impl MaxwellNativeFrontend {
             self.prepared.as_ref().unwrap().roles.as_ref()
         } else {
             self.draw_roles.clear();
-            self.draw_roles.extend_from_slice(&code.roles);
+            self.draw_roles.extend_from_slice(&code.interface.roles);
             trigger.append_resource_roles(state, &mut self.draw_roles);
             self.draw_roles.sort_unstable();
             self.draw_roles.dedup();
@@ -359,7 +352,15 @@ impl MaxwellNativeFrontend {
         };
         let resources = self
             .resources
-            .resolve_with_buffer_sizes(state, space, roles, &code.sizes, Some(writes), false, 4096)
+            .resolve_with_buffer_sizes(
+                state,
+                space,
+                roles,
+                &code.interface.sizes,
+                Some(writes),
+                false,
+                4096,
+            )
             .map_err(Error::ThreeDResource)?;
         let prepared_roles = roles;
         let arguments = lowering(native_arguments(state, trigger))?;
@@ -386,7 +387,7 @@ impl MaxwellNativeFrontend {
         };
         let shader = Arc::clone(&code.code);
         let translated = Arc::clone(&code.translated);
-        let binding_roles = Arc::clone(&code.bindings);
+        let binding_roles = Arc::clone(&code.interface.bindings);
         let mut selection = lowering(select_draw_attachments(state, &resources))?;
         let colors: Box<_> = selection
             .colors
@@ -590,15 +591,19 @@ impl MaxwellNativeFrontend {
                 sample_mask: u64::MAX,
                 alpha_to_coverage: false,
             };
-            if let Some(old) = &self.prepared
-                && Arc::ptr_eq(&old.code, &shader)
-                && old.draw.parameters.same_state(&parameters)
-            {
+            let candidate = Arc::new(parameters);
+            let key = ParameterKey(Arc::clone(&candidate));
+            if let Some(parameters) = self.parameter_states.get(&key) {
                 self.statistics.reused_parameters += 1;
-                Arc::clone(&old.draw.parameters)
+                Arc::clone(parameters)
             } else {
                 self.statistics.prepared_parameters += 1;
-                Arc::new(parameters)
+                self.parameter_states.insert(
+                    key,
+                    Arc::clone(&candidate),
+                    identity::parameter_bytes(&candidate),
+                );
+                candidate
             }
         };
         let program = self.native_program(&shader, &binding_roles, &resources)?;
@@ -662,8 +667,19 @@ impl MaxwellNativeFrontend {
             depth_stencil,
             parameters,
         });
+        let key = DrawKey(Arc::clone(&draw));
+        let draw = if let Some(cached) = self.draws.get(&key) {
+            self.statistics.warm_draws += 1;
+            Arc::clone(cached)
+        } else {
+            self.statistics.prepared_draws += 1;
+            self.draws
+                .insert(key, Arc::clone(&draw), identity::draw_bytes(&draw));
+            draw
+        };
+        // Canonical proofs come from this resolution, independently of the
+        // immutable physical bindings retained by the draw template.
         let accesses = accesses(&resources);
-        self.statistics.prepared_draws += 1;
         self.prepared = Some(Prepared {
             state: state.draw_state_identity(),
             resources,
@@ -733,9 +749,17 @@ impl MaxwellNativeFrontend {
                     MaxwellThreeDResolvedResource::Buffer(b) => {
                         GuestBinding::Buffer(b.view().backing().range().clone())
                     }
-                    MaxwellThreeDResolvedResource::Image(_) => {
-                        GuestBinding::Image(self.image(resources, index)?)
-                    }
+                    MaxwellThreeDResolvedResource::Image(_) => GuestBinding::Image {
+                        image: self.image(resources, index)?,
+                        arrayed: matches!(
+                            role,
+                            MaxwellThreeDResourceRole::SampledImage {
+                                dimension:
+                                    super::super::threed::MaxwellThreeDTextureDimension::TwoArray,
+                                ..
+                            }
+                        ),
+                    },
                 }
             };
             if changed.is_none() {
@@ -752,13 +776,24 @@ impl MaxwellNativeFrontend {
             changed.as_mut().unwrap().push((id, binding));
         }
         if let Some(bindings) = changed {
-            Ok(Arc::new(GuestProgram {
+            let candidate = Arc::new(GuestProgram {
                 identity: self.identity(),
                 shader: Arc::clone(shader),
                 bindings: bindings.into_boxed_slice(),
                 shared_memory_bytes: 0,
-                local_memory_bytes: 0,
-            }))
+            });
+            let key = ProgramKey(Arc::clone(&candidate));
+            if let Some(program) = self.programs.get(&key) {
+                self.statistics.reused_programs += 1;
+                Ok(Arc::clone(program))
+            } else {
+                self.programs.insert(
+                    key,
+                    Arc::clone(&candidate),
+                    identity::program_bytes(&candidate),
+                );
+                Ok(candidate)
+            }
         } else {
             self.statistics.reused_programs += 1;
             Ok(previous.unwrap())
@@ -773,7 +808,16 @@ fn same_binding(a: &GuestBinding, b: &GuestBinding) -> bool {
         (GuestBinding::Buffer(a), GuestBinding::Buffer(b)) => {
             a.byte_mapping_key() == b.byte_mapping_key()
         }
-        (GuestBinding::Image(a), GuestBinding::Image(b)) => a.same_view(b),
+        (
+            GuestBinding::Image {
+                image: a,
+                arrayed: aa,
+            },
+            GuestBinding::Image {
+                image: b,
+                arrayed: ab,
+            },
+        ) => aa == ab && a.same_view(b),
         (GuestBinding::Sampler(a), GuestBinding::Sampler(b)) => a == b,
         _ => false,
     }
@@ -985,25 +1029,46 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             request.workgroup_size,
         );
         let reuse = self.compute_request == Some(request_key)
-            && self.compute.as_ref().is_some_and(|(s, _, _)| {
-                s.source_is_current(space) && s.staged_writes_are_irrelevant(writes)
+            && self.compute.as_ref().is_some_and(|(s, _)| {
+                s.source_is_current(space)
+                    && s.staged_writes_are_irrelevant(writes)
+                    && s.compute_indirect_bindings_current(|slot| launch.constant_buffer(slot))
             });
         if !reuse {
-            let snapshot = MaxwellShaderSnapshot::capture_compute(space, writes, request)
-                .map_err(Error::ShaderTranslation)?;
-            let translated = self.compile(snapshot.clone())?;
-            let code = Arc::new(GuestShaderCode {
-                identity: snapshot.identity(),
-                functions: translated
-                    .programs
-                    .iter()
-                    .map(|p| p.function.clone())
-                    .collect(),
-            });
-            self.compute = Some((snapshot, translated, code));
+            let cached = self
+                .compute_sources
+                .get(&request_key)
+                .filter(|snapshot| {
+                    snapshot.source_is_current(space)
+                        && snapshot.staged_writes_are_irrelevant(writes)
+                        && snapshot
+                            .compute_indirect_bindings_current(|slot| launch.constant_buffer(slot))
+                })
+                .cloned();
+            let snapshot = if let Some(snapshot) = cached {
+                snapshot
+            } else {
+                let snapshot = Arc::new(
+                    MaxwellShaderSnapshot::capture_compute(space, writes, request, |slot| {
+                        launch.constant_buffer(slot)
+                    })
+                    .map_err(Error::ShaderTranslation)?,
+                );
+                self.compute_sources.insert(
+                    request_key,
+                    Arc::clone(&snapshot),
+                    snapshot.retained_bytes(),
+                );
+                self.statistics.shader_captures += 1;
+                snapshot
+            };
+            let translated = self.compile(snapshot.as_ref().clone())?;
+            self.compute = Some((snapshot, translated));
             self.compute_request = Some(request_key);
         }
-        let (_, translated, code) = self.compute.as_ref().unwrap();
+        let (_, translated) = self.compute.as_ref().unwrap();
+        let translated = self.specialize_compute(Arc::clone(translated), launch, space, writes)?;
+        let code = &translated.native;
         let resources = launch
             .native_resources(&translated.programs[0], space, writes)
             .map_err(Error::ComputeLaunch)?;
@@ -1045,7 +1110,6 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             shader: code,
             bindings: bindings.into_boxed_slice(),
             shared_memory_bytes: 0,
-            local_memory_bytes: 0,
         });
         let canonical_accesses: Arc<[_]> = canonical.into();
         self.prepared_compute = Some((Arc::clone(&program), Arc::clone(&canonical_accesses)));
@@ -1119,12 +1183,18 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
                 source.description.samples() != nixe_gpu::SampleCount::One,
             ),
             BlitKind::Downsample2x { filter } => {
-                let extent = destination.description.extent();
+                let destination_extent = destination.description.extent();
+                let resolve = source.description.samples() != nixe_gpu::SampleCount::One;
+                let source_extent = if resolve {
+                    destination_extent
+                } else {
+                    source.description.extent()
+                };
                 (
-                    rect(0, 0, extent.width, extent.height),
-                    rect(0, 0, extent.width, extent.height),
+                    rect(0, 0, source_extent.width, source_extent.height),
+                    rect(0, 0, destination_extent.width, destination_extent.height),
                     filter == nixe_gpu::BlitFilter::Linear,
-                    true,
+                    resolve,
                 )
             }
             BlitKind::Scale {
@@ -1205,16 +1275,14 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             .iter()
             .flat_map(|i| i.view.bindings().iter().map(|b| b.backing().clone()))
             .collect();
+        let mut native = Vec::with_capacity(3);
+        for image in images {
+            native.push(self.conversion_image(image)?);
+        }
         Ok(NativeWork {
-            frontend: FrontendSubmissionId::new(u64::MAX - self.next),
+            frontend: FrontendSubmissionId::new(u64::MAX - self.identity().slot()),
             command: NativeCommand::ConvertNv12 {
-                images: Box::new(images.map(|i| GuestImage {
-                    sample_grid: [1, 1],
-                    planes: Arc::from([]),
-                    description: i.description,
-                    canonical_texels: i.view.has_canonical_texels(),
-                    swizzle: i.view.swizzle(),
-                })),
+                images: native.into_boxed_slice().try_into().unwrap(),
                 transform,
             },
             canonical_accesses,
@@ -1230,16 +1298,14 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             .iter()
             .flat_map(|i| i.view.bindings().iter().map(|b| b.backing().clone()))
             .collect();
+        let mut native = Vec::with_capacity(2);
+        for image in images {
+            native.push(self.conversion_image(image)?);
+        }
         Ok(NativeWork {
-            frontend: FrontendSubmissionId::new(u64::MAX - self.next),
+            frontend: FrontendSubmissionId::new(u64::MAX - self.identity().slot()),
             command: NativeCommand::UploadPlanes {
-                images: Box::new(images.map(|i| GuestImage {
-                    sample_grid: [1, 1],
-                    planes: Arc::from([]),
-                    description: i.description,
-                    canonical_texels: i.view.has_canonical_texels(),
-                    swizzle: i.view.swizzle(),
-                })),
+                images: native.into_boxed_slice().try_into().unwrap(),
                 bytes,
                 widths,
             },
@@ -1248,17 +1314,217 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
     }
     fn lower_device_plane_uploads(
         &mut self,
-        _images: [nixe_gpu::ConversionImage; 2],
-        _frame: nixe_gpu::DeviceImageFrame,
+        images: [nixe_gpu::ConversionImage; 2],
+        frame: nixe_gpu::DeviceImageFrame,
     ) -> Result<NativeWork, MaxwellLoweringError> {
-        Err(MaxwellLoweringError::UnsupportedBlit(
-            "external video producer integration is task 13",
-        ))
+        let canonical_accesses = images
+            .iter()
+            .flat_map(|i| i.view.bindings().iter().map(|b| b.backing().clone()))
+            .collect();
+        let mut native = Vec::with_capacity(2);
+        for image in images {
+            native.push(self.conversion_image(image)?);
+        }
+        Ok(NativeWork {
+            frontend: FrontendSubmissionId::new(u64::MAX - self.identity().slot()),
+            command: NativeCommand::ImportDecodedPlanes {
+                images: native.into_boxed_slice().try_into().unwrap(),
+                frame,
+            },
+            canonical_accesses,
+        })
     }
 }
 
 impl Drop for MaxwellNativeFrontend {
     fn drop(&mut self) {
         log::info!("native Maxwell preparation: {:?}", self.statistics);
+    }
+}
+
+#[cfg(test)]
+mod producer_tests {
+    use super::*;
+    use crate::engines::twod::blit::{BlitKind, BlitSurface, BlitSurfaceLayout};
+    use crate::{
+        MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
+        MaxwellMapRequest, SWITCH_1_GM20B_PROFILE,
+    };
+    use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+
+    #[test]
+    fn alternating_native_shader_sources_share_code_and_observe_staged_changes() {
+        use crate::shader::test_support::{canonical_shader_writes, mapped_memory};
+        let (allocation, space, address) = mapped_memory();
+        let mut vertex = [0u32; 20];
+        vertex[0] = 0x0002_0461;
+        let mut pixel = [0u32; 20];
+        pixel[0] = 0x0002_5462;
+        pixel[4] = 0x000f_f000;
+        pixel[6] = 0x77;
+        pixel[13] = 0x0007_f000;
+        pixel[18] = 1;
+        let encode = |header: [u32; 20], instruction: u64| {
+            header
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .chain(
+                    [0, instruction, 0xe300_0000_0007_000f, 0]
+                        .into_iter()
+                        .flat_map(u64::to_le_bytes),
+                )
+                .collect::<Vec<_>>()
+        };
+        let mov = |bits: u32| 0x0100_0000_0007_f000 | u64::from(bits) << 20;
+        allocation
+            .write(0, &encode(vertex, 0xe300_0000_0007_000f))
+            .unwrap();
+        allocation
+            .write(0x100, &encode(pixel, mov(1f32.to_bits())))
+            .unwrap();
+        allocation
+            .write(0x200, &encode(pixel, mov(2f32.to_bits())))
+            .unwrap();
+        let mut channel = crate::engines::tests::three_d_channel();
+        for (method, value) in [
+            (0x2140, 0x50),
+            (0x1608, (address >> 32) as u32),
+            (0x160c, address as u32),
+            (0x2000, 0x11),
+            (0x2004, 0),
+            (0x200c, 4),
+            (0x2040, 0x51),
+            (0x2044, 0x100),
+            (0x204c, 4),
+        ] {
+            crate::engines::tests::program_three_d(&mut channel, method, value);
+        }
+        let mut frontend = MaxwellNativeFrontend::new(Arc::new(CompilePool::new(1, 8).unwrap()));
+        let writes = CanonicalWriteBatch::new();
+        frontend
+            .ensure_code(channel.three_d(), &space, &writes)
+            .unwrap();
+        let first = Arc::clone(&frontend.code.as_ref().unwrap().code);
+        let interface = Arc::clone(&frontend.code.as_ref().unwrap().interface);
+        assert!(Arc::ptr_eq(
+            &first.functions[0],
+            &frontend.code.as_ref().unwrap().translated.programs[0].function
+        ));
+        crate::engines::tests::program_three_d(&mut channel, 0x2044, 0x200);
+        frontend
+            .ensure_code(channel.three_d(), &space, &writes)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &frontend.code.as_ref().unwrap().code));
+        crate::engines::tests::program_three_d(&mut channel, 0x2044, 0x100);
+        frontend
+            .ensure_code(channel.three_d(), &space, &writes)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &frontend.code.as_ref().unwrap().code));
+        assert!(Arc::ptr_eq(
+            &interface,
+            &frontend.code.as_ref().unwrap().interface
+        ));
+        assert_eq!(frontend.statistics.shader_captures, 2);
+        let word = mov(3f32.to_bits());
+        let staged = canonical_shader_writes(
+            &space,
+            &[
+                (address + 0x158, word as u32),
+                (address + 0x15c, (word >> 32) as u32),
+            ],
+        );
+        frontend
+            .ensure_code(channel.three_d(), &space, &staged)
+            .unwrap();
+        assert_ne!(
+            first.identity,
+            frontend.code.as_ref().unwrap().code.identity
+        );
+        assert_eq!(frontend.statistics.shader_captures, 3);
+    }
+
+    #[test]
+    fn single_sample_downsample_is_a_filtered_blit_with_distinct_rectangles() {
+        let mut space =
+            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+        space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let mut addresses = Vec::new();
+        for i in 1..=2 {
+            let storage = CanonicalAllocation::zeroed(0x10000, 4096).unwrap();
+            let address = space
+                .map(MaxwellMapRequest {
+                    allocation: MaxwellAllocationId::new(i),
+                    backing: storage
+                        .backing_range(MemoryPermissions::READ_WRITE)
+                        .unwrap(),
+                    backing_offset: 0,
+                    size: 0x10000,
+                    allocation_alignment: 4096,
+                    page_size: 0,
+                    kind: 0xfe,
+                    cacheable: true,
+                    fixed_offset: None,
+                    permissions: MemoryPermissions::READ_WRITE,
+                })
+                .unwrap()
+                .offset()
+                .get();
+            addresses.push(address);
+        }
+        let mut frontend = MaxwellNativeFrontend::new(Arc::new(CompilePool::new(1, 8).unwrap()));
+        let mut channel = crate::engines::tests::three_d_channel();
+        crate::engines::tests::program_three_d(&mut channel, 0x19d0, 0x3c);
+        let source = channel
+            .three_d()
+            .render_targets()
+            .clear()
+            .last_surface()
+            .source()
+            .unwrap();
+        let request = crate::MaxwellTwoDBlitOperation {
+            source,
+            images: [
+                BlitSurface {
+                    address: addresses[0],
+                    width: 32,
+                    height: 16,
+                    format: 0xcf,
+                    layout: BlitSurfaceLayout::BlockLinear(0),
+                },
+                BlitSurface {
+                    address: addresses[1],
+                    width: 16,
+                    height: 8,
+                    format: 0xcf,
+                    layout: BlitSurfaceLayout::BlockLinear(0),
+                },
+            ],
+            destination_compression: false,
+            kind: BlitKind::Downsample2x {
+                filter: nixe_gpu::BlitFilter::Linear,
+            },
+        };
+        let work = frontend
+            .lower_blit(&request, &space, FrontendSubmissionId::new(1), &[])
+            .unwrap();
+        let NativeCommand::Blit {
+            source_rectangle,
+            destination_rectangle,
+            linear,
+            resolve,
+            ..
+        } = work.command
+        else {
+            panic!("expected native blit")
+        };
+        assert_eq!([source_rectangle.width, source_rectangle.height], [32, 16]);
+        assert_eq!(
+            [destination_rectangle.width, destination_rectangle.height],
+            [16, 8]
+        );
+        assert!(linear);
+        assert!(!resolve);
     }
 }

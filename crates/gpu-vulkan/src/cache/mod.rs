@@ -24,6 +24,7 @@ pub use descriptors::{
 
 #[derive(Clone, Debug)]
 pub struct CacheConfiguration {
+    /// Driver pipeline workers; short source/SSA/SPIR-V translation is isolated.
     pub workers: usize,
     pub pending_jobs: usize,
     pub shader_entries: usize,

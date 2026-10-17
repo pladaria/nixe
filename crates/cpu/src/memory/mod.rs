@@ -12,6 +12,6 @@ mod synthetic;
 pub use contracts::*;
 pub use execution::{
     CpuMemoryBackendError, ExecutionMemory, ExecutionMemoryLease, MappingEpoch, NativeAtomicResult,
-    NativeMemoryAccess,
+    NativeMemoryAccess, NativeMemorySession,
 };
 pub use synthetic::SyntheticMemory;

@@ -172,6 +172,8 @@ pub fn lower_default_tessellation_control_to_spirv(
         vertex_position_transform: None,
         input_control_points: u32::from(options.input_control_points),
         tessellation_mode: None,
+        native_half_conversions: false,
+        native_half_fma: false,
         float32: Default::default(),
         float64: Default::default(),
     });

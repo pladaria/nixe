@@ -160,11 +160,11 @@ impl VulkanResidency {
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         )?;
         let record = conversion.descriptors.get(
-            Arc::clone(&pipeline.layout),
-            Box::new([DescriptorResource::Image {
+            &pipeline.layout,
+            &[DescriptorResource::Image {
                 view: self.image_view_lease(source)?,
                 layout,
-            }]),
+            }],
         )?;
         let extent = vk::Extent2D {
             width: piece.blocks,

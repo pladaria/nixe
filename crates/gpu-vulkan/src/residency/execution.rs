@@ -85,19 +85,37 @@ pub(super) enum Use {
         scope: AccessScope,
     },
 }
-/// Build once when the pipeline or bindings change. Resources and the immutable
-/// descriptor set stay leased until the prepared state and its GPU uses retire.
+/// Prepared guest state retains resources, not native descriptor sets. Sets
+/// belong to recording slots and recycle after their actual GPU use retires.
 pub struct PreparedProgram {
     pub(super) pipeline: Arc<NativePipeline>,
+    // Explicit host bindings are owned by the host texture cache.
     record: Option<Arc<BindingRecord>>,
+    resources: Box<[DescriptorResource]>,
     pub(super) uses: Box<[Use]>,
     // Descriptor-order correspondence to the merged canonical access windows.
     binding_uses: Box<[Option<usize>]>,
+    dynamic_offsets: Box<[u32]>,
+}
+impl PreparedProgram {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + std::mem::size_of_val(self.uses.as_ref())
+            + std::mem::size_of_val(self.binding_uses.as_ref())
+            + std::mem::size_of_val(self.dynamic_offsets.as_ref())
+            + std::mem::size_of_val(self.resources.as_ref())
+    }
 }
 #[derive(Clone, Copy, Debug)]
 pub enum Dispatch {
     Direct([u32; 3]),
     Indirect { buffer: BufferId, offset: u64 },
+}
+struct GraphicsStreams {
+    dynamic_offsets: Option<Vec<u32>>,
+    record: Option<Arc<BindingRecord>>,
+    program_mask: Vec<bool>,
+    vertices: Vec<buffer::BufferStream>,
 }
 impl VulkanResidency {
     /// Host-only sampled resources are synchronized by their concrete owner;
@@ -108,10 +126,13 @@ impl VulkanResidency {
         record: Arc<BindingRecord>,
         parameters: GraphicsParameters,
     ) -> Result<PreparedGraphics, VulkanError> {
+        let dynamic_offsets = vec![0; pipeline.layout.dynamic_bindings.len()].into_boxed_slice();
         self.prepare_graphics(
             PreparedProgram {
                 pipeline,
+                dynamic_offsets,
                 record: Some(record),
+                resources: Box::new([]),
                 uses: Box::new([]),
                 binding_uses: Box::new([]),
             },
@@ -131,7 +152,6 @@ impl VulkanResidency {
         &self,
         pipeline: Arc<NativePipeline>,
         bindings: &[Binding],
-        descriptors: &mut DescriptorCache,
     ) -> Result<PreparedProgram, VulkanError> {
         if !Arc::ptr_eq(&pipeline.owner, &self.device.owner)
             || bindings.len() != pipeline.layout.key.bindings.len()
@@ -152,6 +172,11 @@ impl VulkanResidency {
             if !access.read.is_empty() {
                 flags |= if reflected.kind == vk::DescriptorType::SAMPLED_IMAGE {
                     vk::AccessFlags2::SHADER_SAMPLED_READ
+                } else if matches!(
+                    reflected.kind,
+                    vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                ) {
+                    vk::AccessFlags2::UNIFORM_READ
                 } else {
                     vk::AccessFlags2::SHADER_STORAGE_READ
                 };
@@ -325,74 +350,108 @@ impl VulkanResidency {
             )),
             _ => None,
         }).collect();
-        let record = if resources.is_empty() {
-            None
-        } else {
-            Some(descriptors.get(Arc::clone(&pipeline.layout), resources.into_boxed_slice())?)
-        };
+        let dynamic_offsets = pipeline
+            .layout
+            .split_dynamic_offsets(&mut resources, &self.device.profile().limits, Vec::new())?
+            .into_boxed_slice();
         Ok(PreparedProgram {
             pipeline,
-            record,
+            record: None,
+            resources: resources.into_boxed_slice(),
             uses: merged.into_boxed_slice(),
             binding_uses,
+            dynamic_offsets,
         })
     }
-    fn stream_program(
+    fn stream_graphics(
         &mut self,
         program: &PreparedProgram,
-        descriptors: &mut DescriptorCache,
-    ) -> Result<(Option<Arc<BindingRecord>>, Vec<bool>), VulkanError> {
-        let Some(record) = &program.record else {
-            return Ok((None, Vec::new()));
-        };
-        let mut streams = Vec::with_capacity(program.uses.len());
-        for usage in &program.uses {
-            streams.push(match *usage {
+        vertices: &[VertexBuffer],
+        inputs: Option<&buffer::DrawInputBatch>,
+    ) -> Result<GraphicsStreams, VulkanError> {
+        let limits = self.device.profile().limits;
+        let mut requests = program
+            .uses
+            .iter()
+            .map(|usage| match *usage {
                 Use::Buffer {
                     id,
                     offset,
                     size,
                     scope,
-                } if !scope.writes() => self.stream_buffer(
+                } if !scope.writes() => Some(buffer::BufferStreamRequest {
                     id,
                     offset,
                     size,
-                    self.device
-                        .profile()
-                        .limits
-                        .min_storage_buffer_offset_alignment,
-                )?,
+                    alignment: scope.buffer_alignment(&limits),
+                }),
                 _ => None,
+            })
+            .collect::<Vec<_>>();
+        requests.extend(vertices.iter().map(|vertex| {
+            Some(buffer::BufferStreamRequest {
+                id: vertex.buffer,
+                offset: vertex.offset,
+                size: vertex.size,
+                alignment: 4,
+            })
+        }));
+        let mut streams = self.stream_buffers_with_inputs(&requests, inputs)?;
+        let vertices = streams.split_off(program.uses.len());
+        let program_mask = streams.iter().map(Option::is_some).collect();
+        if streams.iter().all(Option::is_none) {
+            return Ok(GraphicsStreams {
+                dynamic_offsets: None,
+                record: None,
+                program_mask,
+                vertices,
             });
         }
-        let mask = streams.iter().map(Option::is_some).collect();
-        if streams.iter().all(Option::is_none) {
-            return Ok((None, mask));
-        }
-        let mut resources = record.resources.clone();
-        for ((resource, usage), original) in resources
-            .iter_mut()
-            .zip(&program.binding_uses)
-            .zip(&record.resources)
+        let mut resources = std::mem::take(&mut self.descriptor_resources);
+        resources.clear();
+        resources.extend_from_slice(&program.resources);
+        for (&index, &dynamic) in program
+            .pipeline
+            .layout
+            .dynamic_bindings
+            .iter()
+            .zip(&program.dynamic_offsets)
         {
+            if let DescriptorResource::Buffer { offset, .. } = &mut resources[index] {
+                *offset += u64::from(dynamic);
+            }
+        }
+        for (resource, usage) in resources.iter_mut().zip(&program.binding_uses) {
             if let Some(index) = usage
                 && let Some((buffer, base)) = &streams[*index]
-                && let DescriptorResource::Buffer { offset, range, .. } = original
+                && let DescriptorResource::Buffer { offset, range, .. } = resource
             {
                 let Use::Buffer { offset: start, .. } = program.uses[*index] else {
                     unreachable!()
                 };
                 *resource = DescriptorResource::Buffer {
                     buffer: Arc::clone(buffer),
-                    offset: base + offset - start,
+                    offset: base + *offset - start,
                     range: *range,
                 };
             }
         }
-        Ok((
-            Some(descriptors.get(Arc::clone(&program.pipeline.layout), resources)?),
-            mask,
-        ))
+        let limits = self.device.profile().limits;
+        let offsets = std::mem::take(&mut self.descriptor_offsets);
+        let dynamic_offsets =
+            program
+                .pipeline
+                .layout
+                .split_dynamic_offsets(&mut resources, &limits, offsets)?;
+        let result = self.slot_descriptors(&program.pipeline.layout, &resources);
+        resources.clear();
+        self.descriptor_resources = resources;
+        Ok(GraphicsStreams {
+            dynamic_offsets: Some(dynamic_offsets),
+            record: Some(result?),
+            program_mask,
+            vertices,
+        })
     }
     pub(super) fn program_access(&mut self, program: &PreparedProgram) -> Result<(), VulkanError> {
         self.program_access_except(program, &[])
@@ -459,13 +518,50 @@ impl VulkanResidency {
         program: &PreparedProgram,
         push: &[u8],
     ) -> Result<vk::CommandBuffer, VulkanError> {
-        self.program_bind_record(program, push, program.record.as_ref())
+        let record = self.program_record(program)?;
+        self.program_bind_record(program, push, record.as_ref(), &program.dynamic_offsets)
+    }
+    fn program_record(
+        &mut self,
+        program: &PreparedProgram,
+    ) -> Result<Option<Arc<BindingRecord>>, VulkanError> {
+        if let Some(record) = &program.record {
+            return Ok(Some(Arc::clone(record)));
+        }
+        if program.resources.is_empty() {
+            return Ok(None);
+        }
+        self.slot_descriptors(&program.pipeline.layout, &program.resources)
+            .map(Some)
+    }
+    fn slot_descriptors(
+        &mut self,
+        layout: &Arc<crate::cache::PipelineLayout>,
+        resources: &[DescriptorResource],
+    ) -> Result<Arc<BindingRecord>, VulkanError> {
+        let limits = self.device.profile().limits;
+        let index = self.device.begin_recording()?;
+        let descriptors = self.device.submission.slots[index]
+            .stream_descriptors
+            .get_or_insert_with(|| {
+                DescriptorCache::from_limits(Arc::clone(&self.device.owner), limits, 4096)
+            });
+        let before = descriptors.statistics();
+        let result = descriptors.get(layout, resources);
+        let after = descriptors.statistics();
+        self.device.submission.statistics.stream_descriptor_hits += after.hits - before.hits;
+        self.device
+            .submission
+            .statistics
+            .stream_descriptor_allocations += after.allocated - before.allocated;
+        result
     }
     fn program_bind_record(
         &mut self,
         program: &PreparedProgram,
         push: &[u8],
         record: Option<&Arc<BindingRecord>>,
+        dynamic_offsets: &[u32],
     ) -> Result<vk::CommandBuffer, VulkanError> {
         if push.len() < program.pipeline.layout.key.push_bytes as usize
             || !push.len().is_multiple_of(4)
@@ -478,9 +574,9 @@ impl VulkanResidency {
         self.device.bind_native_pipeline(&program.pipeline)?;
         if let Some(record) = record {
             self.device
-                .bind_native_descriptors(&program.pipeline, record)?;
+                .bind_native_descriptors(&program.pipeline, record, dynamic_offsets)?;
         }
-        let index = self.device.submission.begin()?;
+        let index = self.device.begin_recording()?;
         let command = self.device.submission.slots[index].command;
         let slot = &mut self.device.submission.slots[index];
         let layout = program.pipeline.layout.handle;
@@ -504,6 +600,21 @@ impl VulkanResidency {
         Ok(command)
     }
     pub fn dispatch(
+        &mut self,
+        program: &PreparedProgram,
+        dispatch: Dispatch,
+        push: &[u8],
+    ) -> Result<WorkTicket, VulkanError> {
+        loop {
+            match self.dispatch_inner(program, dispatch, push) {
+                Err(VulkanError::DescriptorPressure) => {
+                    self.flush()?;
+                }
+                result => return result,
+            }
+        }
+    }
+    fn dispatch_inner(
         &mut self,
         program: &PreparedProgram,
         dispatch: Dispatch,

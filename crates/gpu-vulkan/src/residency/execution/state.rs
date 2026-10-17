@@ -192,7 +192,7 @@ impl VulkanResidency {
         &mut self,
         graphics: &PreparedGraphics,
     ) -> Result<(), VulkanError> {
-        let index = self.device.submission.begin()?;
+        let index = self.device.begin_recording()?;
         let slot = &mut self.device.submission.slots[index];
         if slot
             .graphics_parameters

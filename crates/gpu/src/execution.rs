@@ -86,9 +86,21 @@ pub trait GpuExecution: Send + 'static {
     fn host_work_pending(&self) -> bool {
         false
     }
+    /// Submit a required progress point and arrange a wakeup on completion.
+    /// Returns true only when a completion notification is armed. Without a
+    /// future event (including an already-ready logical completion), return
+    /// false so the owner can use its bounded wait/retirement contract. The
+    /// queue owner retains all submission, retirement and publication authority.
+    fn request_completion_wakeup(&mut self) -> Result<bool, BackendRuntimeError> {
+        Ok(false)
+    }
     fn external_image_device(&self) -> Option<[u8; 16]> {
         None
     }
+    /// Compile already captured, immutable native state ahead of FIFO execution.
+    /// This must not import resources, read canonical memory, record commands or
+    /// publish guest effects. Failed speculative jobs are consumed by prepare.
+    fn precompile(&mut self, _command: &crate::native::NativeCommand) {}
     /// Poll cold preparation without waiting on compiler workers. No input
     /// acceptance or guest completion occurs until this returns true.
     fn prepare(
@@ -123,6 +135,15 @@ pub trait GpuExecution: Send + 'static {
         &mut self,
         request: CpuVisibilityRequest,
     ) -> Result<Box<[u8]>, BackendRuntimeError>;
+    /// Services an external CPU demand. None retains the demand with the owner;
+    /// the backend must arrange a host wakeup when its producer can progress.
+    /// Executors without deferred visibility keep their synchronous contract.
+    fn service_cpu_visibility(
+        &mut self,
+        request: CpuVisibilityRequest,
+    ) -> Result<Option<Box<[u8]>>, BackendRuntimeError> {
+        self.make_cpu_visible(request).map(Some)
+    }
     fn acquire_presentable_image(
         &mut self,
         request: Self::ImageRequest,

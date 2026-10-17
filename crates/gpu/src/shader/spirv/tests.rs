@@ -17,11 +17,14 @@ fn options() -> SpirvShaderOptions {
         input_control_points: 3,
         tessellation_mode: None,
         float64: SpirvFloat64Capabilities::default(),
+        native_half_conversions: false,
+        native_half_fma: false,
         float32: SpirvFloat32Capabilities {
             denorm_preserve: true,
             rounding_mode_rte: true,
             signed_zero_inf_nan_preserve: true,
             fused_multiply_add: true,
+            ..Default::default()
         },
     }
 }

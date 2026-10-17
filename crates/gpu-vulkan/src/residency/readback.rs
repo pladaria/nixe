@@ -5,7 +5,7 @@ use super::*;
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-struct WindowKey {
+pub(super) struct WindowKey {
     image: ImageId,
     version: u64,
     mip: u32,
@@ -38,26 +38,22 @@ impl WindowPlane {
         }
     }
 }
-struct Scatter {
-    source: usize,
-    destination: usize,
-    length: usize,
-}
+use super::cpu_readback::Scatter;
 #[derive(Default)]
 pub(super) struct ImageReadbacks {
     windows: FxHashMap<WindowKey, Box<[u8]>>,
     order: VecDeque<WindowKey>,
     bytes: usize,
+    pub(super) pending: FxHashMap<WindowKey, Vec<(CpuVisibilityRequest, Vec<Scatter>)>>,
 }
 impl VulkanResidency {
-    pub(super) fn cached_image_authorities(
+    pub(super) fn record_cached_image_authorities(
         &mut self,
+        request: CpuVisibilityRequest,
         id: ImageId,
         writes: &[Authority],
-        target: &mut [u8],
     ) -> Result<bool, VulkanError> {
         let entry = self.image(id)?;
-        let multisample = entry.description.samples != vk::SampleCountFlags::TYPE_1;
         let limit = self.device.submission.configuration.arena_bytes;
         // Exact regions remain necessary for partial images and rows wider than
         // staging. Prefetch never consumes undefined texels.
@@ -101,137 +97,53 @@ impl VulkanResidency {
         if bytes > limit.saturating_mul(2) || needed.len() > 32 {
             return Ok(false);
         }
-        let mut missing: Vec<_> = needed
-            .iter()
-            .filter(|(key, _)| !self.image_readbacks.windows.contains_key(key))
-            .map(|(&key, (piece, _))| (key, *piece))
-            .collect();
-        missing.sort_unstable_by_key(|(_, piece)| piece.logical);
-        let mut next = 0;
-        while next < missing.len() {
-            let first = next;
-            let mut bytes = 0;
-            let mut alignment = 4;
-            let mut offsets = Vec::new();
-            while let Some((_, piece)) = missing.get(next) {
-                let align = u64::from(piece.plane.bytes_per_block).max(4);
-                let offset = crate::queue::align_up(bytes, align).ok_or(
-                    VulkanError::InvalidResource("image readback alignment overflow"),
-                )?;
-                if offset + piece.length > limit {
-                    break;
-                }
-                offsets.push(offset);
-                alignment = alignment.max(align);
-                bytes = offset + piece.length;
-                next += 1;
-            }
-            let batch = &missing[first..next];
-            let pieces: Vec<_> = batch.iter().map(|(_, p)| *p).collect();
-            let mut converted = Vec::new();
-            let ordinary = if multisample {
-                for piece in &pieces {
-                    converted.push(self.sample_readback_window(id, *piece)?);
-                }
-                None
-            } else {
-                Some(self.image_regions_access(id, &pieces, vk::AccessFlags2::TRANSFER_READ)?)
-            };
-            let (index, slice, ticket) = self
-                .device
-                .submission
-                .reserve_readback_aligned(bytes, alignment)?;
-            let command = self.device.submission.slots[index].command;
-            let buffer = self.device.submission.slots[index]
-                .readback_buffer(slice)
-                .handle;
-            if let Some((image, layout)) = ordinary {
-                let regions: Vec<_> = pieces
-                    .iter()
-                    .zip(&offsets)
-                    .map(|(piece, offset)| piece.region(slice.offset + offset))
-                    .collect();
-                self.barriers.emit(&mut self.device);
-                unsafe {
-                    self.device
-                        .owner
-                        .device
-                        .cmd_copy_image_to_buffer(command, image, layout, buffer, &regions);
+        let mut missing = Vec::new();
+        for (key, (piece, copies)) in needed {
+            if let Some(bytes) = self.image_readbacks.windows.get(&key) {
+                let target = &mut self.cpu_readbacks.get_mut(&request).unwrap().bytes;
+                for copy in copies {
+                    target[copy.destination..copy.destination + copy.length]
+                        .copy_from_slice(&bytes[copy.source..copy.source + copy.length]);
                 }
             } else {
-                for ((attachment, piece), offset) in
-                    converted.into_iter().zip(&pieces).zip(&offsets)
-                {
-                    let image = self.attachment_access(
-                        attachment,
-                        AccessScope::new(
-                            vk::PipelineStageFlags2::COPY,
-                            vk::AccessFlags2::TRANSFER_READ,
-                        ),
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    )?;
-                    self.barriers.emit(&mut self.device);
-                    let region = vk::BufferImageCopy::default()
-                        .buffer_offset(slice.offset + offset)
-                        .image_subresource(
-                            vk::ImageSubresourceLayers::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .layer_count(1),
-                        )
-                        .image_extent(vk::Extent3D {
-                            width: piece.blocks,
-                            height: piece.rows,
-                            depth: 1,
-                        });
-                    unsafe {
-                        self.device.owner.device.cmd_copy_image_to_buffer(
-                            command,
-                            image,
-                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                            buffer,
-                            &[region],
-                        );
+                self.cpu_readbacks
+                    .get_mut(&request)
+                    .unwrap()
+                    .waiting_windows += 1;
+                match self.image_readbacks.pending.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().push((request, copies));
                     }
-                    self.release_attachment(attachment)?;
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(vec![(request, copies)]);
+                        missing.push((Some(key), piece, Vec::new()));
+                    }
                 }
             }
-            super::recording::host_read_barrier(&self.device, command, buffer, slice.offset, bytes);
-            self.flush()?;
-            let data = self.device.readback(ticket)?;
-            self.statistics.native_readback_bytes += bytes;
-            for ((key, piece), offset) in batch.iter().zip(offsets) {
-                let bytes: Box<[u8]> =
-                    data[offset as usize..(offset + piece.length) as usize].into();
-                let cache = &mut self.image_readbacks;
-                while cache.bytes + bytes.len() > limit.saturating_mul(2) as usize
-                    || cache.windows.len() >= 32
-                {
-                    let index = cache
-                        .order
-                        .iter()
-                        .position(|key| !needed.contains_key(key))
-                        .expect("bounded working set leaves an evictable window");
-                    let old = cache.order.remove(index).unwrap();
-                    cache.bytes -= cache.windows.remove(&old).unwrap().len();
-                }
-                cache.bytes += bytes.len();
-                cache.order.push_back(*key);
-                cache.windows.insert(*key, bytes);
-            }
         }
-        // Authority intervals are disjoint canonical destinations. Grouping
-        // their copies by window resolves geometry and the cache lookup once,
-        // rather than repeating both for every small tiled run during scatter.
-        for (key, (_, copies)) in needed {
-            let bytes = &self.image_readbacks.windows[&key];
-            for copy in copies {
-                target[copy.destination..copy.destination + copy.length]
-                    .copy_from_slice(&bytes[copy.source..copy.source + copy.length]);
-            }
-        }
+        missing.sort_unstable_by_key(|(_, piece, _)| piece.logical);
+        self.record_image_reads(request, id, missing)?;
         Ok(true)
     }
 }
+impl ImageReadbacks {
+    pub(super) fn install(&mut self, key: WindowKey, bytes: Box<[u8]>, limit: usize) {
+        if let Some(old) = self.windows.remove(&key) {
+            self.bytes -= old.len();
+            self.order.retain(|old| *old != key);
+        }
+        while self.bytes + bytes.len() > limit || self.windows.len() >= 32 {
+            let Some(old) = self.order.pop_front() else {
+                return;
+            };
+            self.bytes -= self.windows.remove(&old).unwrap().len();
+        }
+        self.bytes += bytes.len();
+        self.order.push_back(key);
+        self.windows.insert(key, bytes);
+    }
+}
+
 fn image_chunks(
     id: ImageId,
     version: u64,

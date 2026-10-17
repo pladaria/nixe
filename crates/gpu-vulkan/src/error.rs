@@ -6,6 +6,7 @@ pub enum VulkanError {
     Loader(Box<str>),
     Compilation(Box<str>),
     TextureDecode(Box<str>),
+    ExternalVideo(Box<str>),
     Vulkan {
         operation: &'static str,
         result: vk::Result,
@@ -50,6 +51,7 @@ impl Display for VulkanError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TextureDecode(e) => write!(f,"Vulkan texture decode: {e}"),
+            Self::ExternalVideo(e) => write!(f,"Vulkan external video: {e}"),
             Self::Compilation(e) => write!(f,"Vulkan shader/pipeline compilation: {e}"),
             Self::Loader(e) => write!(f, "cannot load the Vulkan loader: {e}"),
             Self::Vulkan { operation, result } => write!(f, "{operation} failed: {result:?}"),

@@ -108,7 +108,9 @@ impl ExecutionGate {
 
     /// Closes admission and waits until every bounded CPU slice reaches its
     /// safepoint. Pending transitions cannot be overtaken by new readers.
+    #[cfg_attr(feature = "execution-trace", track_caller)]
     pub fn acquire_exclusive(&self) -> ExecutionTransitionGuard<'_> {
+        let _trace = crate::trace::span("gate_exclusive", 0, 0, 0);
         crate::metrics::record(crate::metrics::Counter::GateExclusiveAcquisitions, 1);
         let _measurement =
             crate::metrics::Timer::new(crate::metrics::Counter::GateExclusiveAdmissionNanoseconds);

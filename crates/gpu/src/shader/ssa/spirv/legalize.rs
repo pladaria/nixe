@@ -50,6 +50,21 @@ fn regions(edges: &[Vec<BlockId>], dom: &Dominance) -> Vec<Region> {
         })
         .collect()
 }
+fn exit_join(region: &Region, post: &Dominance) -> Option<BlockId> {
+    let mut exits = region.exits.iter();
+    let mut common = Some(BlockId(exits.next()?.0 + 1));
+    for exit in exits {
+        while let Some(join) = common {
+            if post.dominates(join, BlockId(exit.0 + 1)) {
+                break;
+            }
+            common = post.immediate[join.index()];
+        }
+    }
+    common
+        .filter(|join| join.0 != 0)
+        .map(|join| BlockId(join.0 - 1))
+}
 // Kosaraju with explicit stacks. Natural backedges are removed before SCC
 // analysis so a reducible outer loop cannot hide an irreducible inner cycle.
 fn cyclic_regions(edges: &[Vec<BlockId>], dom: &Dominance) -> Vec<Vec<BlockId>> {
@@ -215,21 +230,10 @@ fn legalize_once(function: &Function) -> Result<Option<Function>, Error> {
     let mut claimed = BTreeSet::new();
     let mut needs_funnel = BTreeSet::new();
     for (index, region) in loops.iter().enumerate() {
-        let Some(first) = region.exits.first() else {
+        if region.exits.is_empty() {
             continue;
-        };
-        let mut common = Some(BlockId(first.0 + 1));
-        for exit in region.exits.iter().skip(1) {
-            while let Some(join) = common {
-                if post.dominates(join, BlockId(exit.0 + 1)) {
-                    break;
-                }
-                common = post.immediate[join.index()];
-            }
         }
-        let merge = common
-            .filter(|join| join.0 != 0)
-            .map(|join| BlockId(join.0 - 1));
+        let merge = exit_join(region, &post);
         if !merge.is_some_and(|join| dom.dominates(region.header, join) && claimed.insert(join)) {
             needs_funnel.insert(index);
         }
@@ -273,13 +277,17 @@ fn split_selections(nodes: &mut Vec<Node>, function: &Function) -> Result<bool, 
                 .iter()
                 .filter(|l| l.members.contains(&header))
                 .min_by_key(|l| l.members.len());
+            // A natural loop contains its backedge paths only. Exit-only
+            // blocks before the structural merge are also inside its SPIR-V
+            // construct and can be shared suffixes requiring node splitting.
+            let boundary = containing.and_then(|region| exit_join(region, &post));
             let mut visited = BTreeSet::new();
             let mut duplicates = BTreeSet::new();
             let mut pending = edges[header.index()].clone();
             while let Some(node) = pending.pop() {
                 if Some(node) == merge
                     || dom.dominates(node, header)
-                    || containing.is_some_and(|l| !l.members.contains(&node))
+                    || Some(node) == boundary
                     || !visited.insert(node)
                 {
                     continue;

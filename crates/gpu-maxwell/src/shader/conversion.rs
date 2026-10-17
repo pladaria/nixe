@@ -183,15 +183,18 @@ pub(super) fn decode_float_to_float(
     // https://gitlab.freedesktop.org/mesa/mesa/-/blob/2c9073912232b93eb9b60486edbd72d53e5f3d26/src/nouveau/compiler/nak/sm50.rs#L1756-L1800
     let destination = (encoding & 0xff) as u8;
     validate_register_range(stage, offset, encoding, destination, 1, register_count)?;
-    if (encoding >> 8) & 0x3 != 2 || (encoding >> 10) & 0x3 != 2 {
+    let source_width = (encoding >> 10) & 3;
+    let destination_width = (encoding >> 8) & 3;
+    if source_width != destination_width || !matches!(source_width, 1 | 2) {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
             encoding,
-            detail: "F2F width other than F32-to-F32",
+            detail: "F2F requires matching F16 or F32 widths",
         });
     }
-    if encoding & (1 << 41) != 0 {
+    let half = source_width == 1;
+    if !half && encoding & (1 << 41) != 0 {
         return Err(malformed(
             stage,
             offset,
@@ -199,12 +202,12 @@ pub(super) fn decode_float_to_float(
             "F2F F32 source selects half swizzle",
         ));
     }
-    if encoding & (1 << 42) == 0 {
+    if half && encoding & (1 << 44) != 0 {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
             encoding,
-            detail: "F2F without integral rounding",
+            detail: "F2F F16 flush-to-zero",
         });
     }
     if encoding & (1 << 47) != 0 {
@@ -223,19 +226,32 @@ pub(super) fn decode_float_to_float(
             detail: "F2F saturation",
         });
     }
-    let rounding = match (encoding >> 39) & 0x3 {
-        0 => {
+    let mode = (encoding >> 39) & 3;
+    let rounding = if encoding & (1 << 42) == 0 {
+        if !matches!(mode, 0 | 3) {
             return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
                 stage,
                 instruction_offset: offset,
                 encoding,
-                detail: "F2F nearest-even integral rounding",
+                detail: "F2F reserved nonintegral rounding mode",
             });
         }
-        1 => ShaderRoundingMode::TowardNegative,
-        2 => ShaderRoundingMode::TowardPositive,
-        3 => ShaderRoundingMode::TowardZero,
-        _ => unreachable!(),
+        None
+    } else {
+        Some(match mode {
+            0 => {
+                return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+                    stage,
+                    instruction_offset: offset,
+                    encoding,
+                    detail: "F2F nearest-even integral rounding",
+                });
+            }
+            1 => ShaderRoundingMode::TowardNegative,
+            2 => ShaderRoundingMode::TowardPositive,
+            3 => ShaderRoundingMode::TowardZero,
+            _ => unreachable!(),
+        })
     };
 
     let opcode = (encoding >> 48) as u16;
@@ -248,8 +264,8 @@ pub(super) fn decode_float_to_float(
                 offset,
                 encoding,
                 source,
-                encoding & (1 << 49) != 0,
-                encoding & (1 << 45) != 0,
+                false,
+                false,
                 register_count,
                 next_temporary,
                 &mut operations,
@@ -272,17 +288,7 @@ pub(super) fn decode_float_to_float(
             byte_offset,
             scalar_type: ShaderScalarType::Float32,
         });
-        let source = apply_float_source_modifiers(
-            stage,
-            offset,
-            encoding,
-            temporary,
-            encoding & (1 << 49) != 0,
-            encoding & (1 << 45) != 0,
-            next_temporary,
-            &mut operations,
-        )?;
-        (source, Some(binding))
+        (temporary, Some(binding))
     } else {
         return Err(MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
@@ -291,12 +297,93 @@ pub(super) fn decode_float_to_float(
             detail: "F2F immediate operand",
         });
     };
-    operations.push(ShaderOperation::RoundFloat32ToIntegral {
-        destination: ShaderRegister::new(u32::from(destination)),
+    // F16 values widen exactly to F32. Every integral rounding result is
+    // representable in F16 too, so narrowing introduces no second rounding.
+    // Half-register selection and zeroed destination upper bits:
+    // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/translate/impl/floating_point_conversion_floating_point.cpp
+    let source = if half {
+        let temporary = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "F2F half source temporary overflow",
+            next_temporary,
+        )?;
+        operations.push(ShaderOperation::UnpackHalf32 {
+            destination: temporary,
+            source,
+            high: encoding & (1 << 41) != 0,
+        });
+        temporary
+    } else {
+        source
+    };
+    let source = apply_float_source_modifiers(
+        stage,
+        offset,
+        encoding,
         source,
-        rounding,
-        flush_denormals_to_zero: encoding & (1 << 44) != 0,
-    });
+        encoding & (1 << 49) != 0,
+        encoding & (1 << 45) != 0,
+        next_temporary,
+        &mut operations,
+    )?;
+    let destination = ShaderRegister::new(u32::from(destination));
+    let rounded = if half {
+        allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "F2F half result temporary overflow",
+            next_temporary,
+        )?
+    } else {
+        destination
+    };
+    if let Some(rounding) = rounding {
+        operations.push(ShaderOperation::RoundFloat32ToIntegral {
+            destination: rounded,
+            source,
+            rounding,
+            flush_denormals_to_zero: encoding & (1 << 44) != 0,
+        });
+    } else {
+        // NONE/PASS adds +0: unlike a bitwise move it quiets NaNs and
+        // resolves -0 + +0. Widened F16 inputs/results cannot be F32
+        // subnormals, so native F32 FTZ is exact for this half operation.
+        let zero = allocate_shader_temporary(
+            stage,
+            offset,
+            encoding,
+            "F2F zero temporary overflow",
+            next_temporary,
+        )?;
+        operations.push(ShaderOperation::MoveImmediate32 {
+            destination: zero,
+            bits: 0,
+            scalar_type: ShaderScalarType::Float32,
+        });
+        let flush = half || encoding & (1 << 44) != 0;
+        operations.push(ShaderOperation::Add32 {
+            destination: rounded,
+            left: source,
+            right: zero,
+            scalar_type: ShaderScalarType::Float32,
+            float_control: nixe_gpu::ShaderFloatControl::new(
+                ShaderRoundingMode::NearestEven,
+                nixe_gpu::ShaderNanMode::Propagate,
+                flush,
+                flush,
+                false,
+            ),
+        });
+    }
+    if half {
+        operations.push(ShaderOperation::PackHalf32 {
+            destination,
+            source: rounded,
+        });
+    }
     Ok(DecodedFloatToFloat {
         operations,
         constant_buffer_binding,

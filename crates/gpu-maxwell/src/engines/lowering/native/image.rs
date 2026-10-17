@@ -95,6 +95,55 @@ pub(super) fn presentation_planes(
         bytes_per_block: bytes,
     }]))
 }
+
+pub(super) fn conversion(image: &nixe_gpu::ConversionImage) -> Result<GuestImage, Error> {
+    let description = image.description;
+    let [binding] = image.view.bindings() else {
+        return Err(compilation(
+            "video conversion requires one canonical image plane",
+        ));
+    };
+    if description.samples() != nixe_gpu::SampleCount::One
+        || description.dimension() != nixe_gpu::ImageDimension::Two
+        || description.mip_levels() != 1
+        || description.array_layers() != 1
+        || !matches!(
+            description.format(),
+            ImageFormat::R8Unorm
+                | ImageFormat::Rg8Unorm
+                | ImageFormat::Rgba8Unorm
+                | ImageFormat::Bgra8Unorm
+        )
+    {
+        return Err(compilation(
+            "unsupported video conversion image representation",
+        ));
+    }
+    let extent = description.extent();
+    let bytes = u32::from(description.format().plane_bytes_per_block(0).unwrap());
+    Ok(GuestImage {
+        description,
+        swizzle: image.view.swizzle(),
+        sample_grid: [1, 1],
+        canonical_texels: image.view.has_canonical_texels(),
+        planes: Arc::from([GuestImagePlane {
+            mip_level: 0,
+            array_layer: 0,
+            aspect: GuestImageAspect::Color,
+            backing: mapped(
+                binding.backing().range().clone(),
+                binding.layout(),
+                0,
+                [extent.width, extent.height],
+                bytes,
+                bytes,
+                0,
+            )?,
+            row_pitch: u64::from(extent.width) * u64::from(bytes),
+            bytes_per_block: bytes,
+        }]),
+    })
+}
 pub(super) fn sample_grid(samples: nixe_gpu::SampleCount) -> Result<[u32; 2], Error> {
     match samples {
         nixe_gpu::SampleCount::One => Ok([1, 1]),

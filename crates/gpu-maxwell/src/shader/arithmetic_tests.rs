@@ -317,6 +317,18 @@ fn hfma2_promoted_operands_keep_fusion_merge_and_destination_aliases() {
     let decoded =
         half::decode_half_fused_multiply_add(MaxwellShaderStage::Pixel, 8, captured, 4, &mut 4)
             .unwrap();
+    assert!(
+        decoded
+            .operations
+            .iter()
+            .any(|op| matches!(op, decoded::Operation::FusedMultiplyAdd32 { .. }))
+    );
+    assert!(
+        !decoded
+            .operations
+            .iter()
+            .any(|op| matches!(op, decoded::Operation::FusedMultiplyAddHalf32 { .. }))
+    );
     assert_eq!(
         evaluate(decoded.operations, &[1.0_f32.to_bits(), 0x3c00], vec![]),
         0x3f80_3d00
@@ -377,6 +389,18 @@ fn hfma2_half_operands_round_directly_at_midpoints_and_overflow() {
         let decoded =
             half::decode_half_fused_multiply_add(MaxwellShaderStage::Pixel, 8, word, 4, &mut 4)
                 .unwrap();
+        assert!(
+            decoded
+                .operations
+                .iter()
+                .any(|op| matches!(op, decoded::Operation::FusedMultiplyAddHalf32 { .. }))
+        );
+        assert!(
+            !decoded
+                .operations
+                .iter()
+                .any(|op| matches!(op, decoded::Operation::FusedMultiplyAdd32 { .. }))
+        );
         assert_eq!(evaluate(decoded.operations, &[a, b, c], vec![]), expected);
     }
 }

@@ -281,11 +281,14 @@ fn native_options(control: bool) -> nixe_gpu::SpirvShaderOptions {
         }),
         // Synthetic enabled profile for emission tests, not a claim about the
         // device used by the production wgpu path.
+        native_half_conversions: false,
+        native_half_fma: false,
         float32: SpirvFloat32Capabilities {
             denorm_preserve: true,
             rounding_mode_rte: true,
             signed_zero_inf_nan_preserve: true,
             fused_multiply_add: true,
+            ..Default::default()
         },
     }
 }
@@ -595,7 +598,7 @@ fn complete_guest_patch_programs_compile_directly_through_ssa() {
                 integer64: false,
                 subgroup_quad: false,
                 shared_memory_bytes: 0,
-                local_memory_bytes: 0,
+                uniform_buffer_bytes: 65536,
             },
         )
         .unwrap();

@@ -1,9 +1,13 @@
-//! Exact binary16 conversion without optional Float16 features or host-dependent
-//! GLSL pack/unpack denormal rules. Mirror the bit conversion in half.wgsl.
+//! Binary16 conversions use native Float16 only with explicit preservation and
+//! rounding guarantees. Other hosts use exact integer conversion. NaN payloads
+//! and quieting are reconstructed by bits on both host capability paths.
 use super::*;
 
 impl Math {
     pub(crate) fn unpack_half(&mut self, packed: u32, high: bool) -> Result<u32> {
+        if self.options.native_half_conversions {
+            return self.unpack_half_native(packed, high);
+        }
         let sixteen = self.constant(16);
         let bits = if high {
             self.b
@@ -56,6 +60,9 @@ impl Math {
     }
 
     pub(crate) fn pack_half(&mut self, bits: u32) -> Result<u32> {
+        if self.options.native_half_conversions {
+            return self.pack_half_native(bits);
+        }
         let zero = self.constant(0);
         let one = self.constant(1);
         let thirteen = self.constant(13);
@@ -148,5 +155,136 @@ impl Math {
         let payload = self.b.bitwise_or(self.uint, None, payload, quiet_nan)?;
         let value = self.b.select(self.uint, None, nan, payload, value)?;
         Ok(self.b.bitwise_or(self.uint, None, value, sign)?)
+    }
+}
+
+impl Math {
+    // OpFConvert obeys the destination width's RTE and preservation modes.
+    // https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#spirvenv-precision
+    pub(crate) fn native_half_type(&mut self) -> Result<u32> {
+        if let Some(half) = self.native_half {
+            return Ok(half);
+        }
+        self.b.extension("SPV_KHR_float_controls");
+        self.b.capability(spv::Capability::RoundingModeRTE);
+        self.b.capability(spv::Capability::SignedZeroInfNanPreserve);
+        self.b.capability(spv::Capability::Float16);
+        self.b.capability(spv::Capability::DenormPreserve);
+        for mode in [
+            spv::ExecutionMode::DenormPreserve,
+            spv::ExecutionMode::RoundingModeRTE,
+            spv::ExecutionMode::SignedZeroInfNanPreserve,
+        ] {
+            self.b.execution_mode(self.entry, mode, [16]);
+        }
+        let half = self.b.type_float(16, None);
+        self.native_half = Some(half);
+        Ok(half)
+    }
+    pub(crate) fn half_value(&mut self, bits: u32) -> Result<u32> {
+        let half = self.native_half_type()?;
+        let pair = self.b.type_vector(half, 2);
+        let pair = self.b.bitcast(pair, None, bits)?;
+        Ok(self.b.composite_extract(half, None, pair, [0])?)
+    }
+    pub(crate) fn half_bits(&mut self, value: u32) -> Result<u32> {
+        let half = self.native_half_type()?;
+        let zero = self.b.constant_bit32(half, 0);
+        let pair = self.b.type_vector(half, 2);
+        let pair = self.b.composite_construct(pair, None, [value, zero])?;
+        Ok(self.b.bitcast(self.uint, None, pair)?)
+    }
+    fn unpack_half_native(&mut self, packed: u32, high: bool) -> Result<u32> {
+        let bits = if high {
+            let shift = self.constant(16);
+            self.b.shift_right_logical(self.uint, None, packed, shift)?
+        } else {
+            packed
+        };
+        let value = self.half_value(bits)?;
+        self.widen_half_native(value, bits)
+    }
+    pub(crate) fn widen_half_native(&mut self, value: u32, bits: u32) -> Result<u32> {
+        self.require_repaired_float(ShaderFloatControl::PRECISE)?;
+        let value = self.b.f_convert(self.float, None, value)?;
+        let native = self.b.bitcast(self.uint, None, value)?;
+        let magnitude = self.masked(bits, 0x7fff)?;
+        let infinity = self.constant(0x7c00);
+        let nan = self
+            .b
+            .u_greater_than(self.boolean, None, magnitude, infinity)?;
+        let sign = self.masked(bits, 0x8000)?;
+        let shift = self.constant(16);
+        let sign = self.b.shift_left_logical(self.uint, None, sign, shift)?;
+        let payload = self.masked(bits, 0x3ff)?;
+        let shift = self.constant(13);
+        let payload = self.b.shift_left_logical(self.uint, None, payload, shift)?;
+        let quiet = self.constant(0x7fc00000);
+        let payload = self.b.bitwise_or(self.uint, None, payload, quiet)?;
+        let payload = self.b.bitwise_or(self.uint, None, payload, sign)?;
+        Ok(self.b.select(self.uint, None, nan, payload, native)?)
+    }
+    fn pack_half_native(&mut self, bits: u32) -> Result<u32> {
+        let value = self.narrow_half_native(bits)?;
+        self.half_bits(value)
+    }
+    pub(crate) fn narrow_half_native(&mut self, bits: u32) -> Result<u32> {
+        let half = self.native_half_type()?;
+        let value = self.b.bitcast(self.float, None, bits)?;
+        let native = self.b.f_convert(half, None, value)?;
+        let magnitude = self.masked(bits, 0x7fffffff)?;
+        let infinity = self.constant(0x7f800000);
+        let nan = self
+            .b
+            .u_greater_than(self.boolean, None, magnitude, infinity)?;
+        let shift = self.constant(13);
+        let payload = self.b.shift_right_logical(self.uint, None, bits, shift)?;
+        let payload = self.masked(payload, 0x3ff)?;
+        let quiet = self.constant(0x7e00);
+        let payload = self.b.bitwise_or(self.uint, None, payload, quiet)?;
+        let shift = self.constant(16);
+        let sign = self.b.shift_right_logical(self.uint, None, bits, shift)?;
+        let sign = self.masked(sign, 0x8000)?;
+        let payload = self.b.bitwise_or(self.uint, None, payload, sign)?;
+        let payload = self.half_value(payload)?;
+        Ok(self.b.select(half, None, nan, payload, native)?)
+    }
+}
+
+impl Math {
+    /// The caller proves all three FP32 carriers represent binary16 values.
+    /// Promoted/mixed-precision arithmetic must keep its FP32 FMA lowering.
+    pub(crate) fn half_fma_native(&mut self, args: [u32; 3], saturate: bool) -> Result<u32> {
+        let half = self.native_half_type()?;
+        self.enable_fma();
+        let mut inputs = [0; 3];
+        for (result, bits) in inputs.iter_mut().zip(args) {
+            let value = self.b.bitcast(self.float, None, bits)?;
+            *result = self.b.f_convert(half, None, value)?;
+        }
+        let value = self
+            .b
+            .fma_khr(half, None, inputs[0], inputs[1], inputs[2])?;
+        self.b.decorate(value, spv::Decoration::NoContraction, []);
+        let zero_half = self.b.constant_bit32(half, 0);
+        let pair = self.b.type_vector(half, 2);
+        let pair = self.b.composite_construct(pair, None, [value, zero_half])?;
+        let bits = self.b.bitcast(self.uint, None, pair)?;
+        if !saturate {
+            return Ok(bits);
+        }
+        let magnitude = self.masked(bits, 0x7fff)?;
+        let infinity = self.constant(0x7c00);
+        let nan = self
+            .b
+            .u_greater_than(self.boolean, None, magnitude, infinity)?;
+        let sign = self.masked(bits, 0x8000)?;
+        let zero = self.constant(0);
+        let negative = self.b.i_not_equal(self.boolean, None, sign, zero)?;
+        let clear = self.b.logical_or(self.boolean, None, negative, nan)?;
+        let one = self.constant(0x3c00);
+        let above = self.b.u_greater_than(self.boolean, None, magnitude, one)?;
+        let value = self.b.select(self.uint, None, above, one, bits)?;
+        Ok(self.b.select(self.uint, None, clear, zero, value)?)
     }
 }

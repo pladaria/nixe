@@ -209,10 +209,10 @@ fn rro_register_constant_and_immediate_sources_decode() {
 }
 
 #[test]
-fn rro_fusion_rejects_mismatched_modes_predicates_and_modifiers() {
+fn rro_fusion_requires_compatible_modes_modifiers_and_predicate_implication() {
     let encoding = 0x5c90_0080_0017_0101_u64;
     let mut temporary = 4;
-    let range_reduction = decode_range_reduction(
+    let mut range_reduction = decode_range_reduction(
         MaxwellShaderStage::Pixel,
         8,
         encoding,
@@ -228,7 +228,7 @@ fn rro_fusion_rejects_mismatched_modes_predicates_and_modifiers() {
         ShaderPredicate::Always
     ));
     let exp2 = cosine | (2 << 20);
-    assert!(!is_compatible_mufu(
+    assert!(is_compatible_mufu(
         &range_reduction,
         exp2,
         ShaderPredicate::Register {
@@ -240,6 +240,23 @@ fn rro_fusion_rejects_mismatched_modes_predicates_and_modifiers() {
         &range_reduction,
         exp2 | (1 << 46),
         ShaderPredicate::Always
+    ));
+    range_reduction.predicate = ShaderPredicate::Register {
+        register: 0,
+        inverted: false,
+    };
+    assert!(!is_compatible_mufu(
+        &range_reduction,
+        exp2,
+        ShaderPredicate::Always
+    ));
+    assert!(!is_compatible_mufu(
+        &range_reduction,
+        exp2,
+        ShaderPredicate::Register {
+            register: 0,
+            inverted: true
+        }
     ));
 }
 

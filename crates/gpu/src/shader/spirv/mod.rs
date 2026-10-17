@@ -22,7 +22,7 @@ pub use pipeline::{
     SpirvPipelineBinding, SpirvTessellationOptions, SpirvTessellationShaders,
     lower_raster_shaders_to_spirv, lower_tessellation_shaders_to_spirv,
 };
-mod math;
+pub(crate) mod math;
 pub(crate) use math::Math;
 mod comparison;
 mod float;
@@ -50,6 +50,12 @@ mod tests;
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct SpirvFloat32Capabilities {
     pub denorm_preserve: bool,
+    pub denorm_flush_to_zero: bool,
+    pub rounding_mode_rtz: bool,
+    /// Full width independence is needed when selecting a different mode from
+    /// the preserving FP16 or RTE FP64 repair environment.
+    pub independent_denormals: bool,
+    pub independent_rounding: bool,
     pub rounding_mode_rte: bool,
     pub signed_zero_inf_nan_preserve: bool,
     /// VK_KHR_shader_fma with shaderFmaFloat32 enabled. GLSL.std.450 Fma alone
@@ -76,6 +82,11 @@ pub struct SpirvShaderOptions {
     pub input_control_points: u32,
     /// Required only for evaluation shaders. Part of the native shader cache key.
     pub tessellation_mode: Option<TessellationMode>,
+    /// Enabled Float16 with independently legal DenormPreserve16,
+    /// RoundingModeRTE16 and SignedZeroInfNanPreserve16 execution modes.
+    pub native_half_conversions: bool,
+    /// Enabled shaderFmaFloat16, in addition to the conversion guarantees.
+    pub native_half_fma: bool,
     pub float32: SpirvFloat32Capabilities,
     pub float64: SpirvFloat64Capabilities,
 }

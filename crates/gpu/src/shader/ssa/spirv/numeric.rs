@@ -15,27 +15,9 @@ impl Emitter<'_> {
     }
     pub(super) fn numeric(&mut self, op: &Op, args: &[u32]) -> Result<u32, Error> {
         match *op {
-            Op::UnpackHalf => {
-                let bits = self
-                    .math
-                    .unpack_half(args[0], false)
-                    .map_err(|e| self.error(e.to_string()))?;
-                self.float(bits)
-            }
-            Op::PackHalf => {
-                let bits = self.bits(args[0])?;
-                self.math
-                    .pack_half(bits)
-                    .map_err(|e| self.error(e.to_string()))
-            }
-            Op::HalfFma { saturate } => {
-                let a = self.bits(args[0])?;
-                let b = self.bits(args[1])?;
-                let c = self.bits(args[2])?;
-                self.math
-                    .half_fma(a, b, c, saturate)
-                    .map_err(|e| self.error(e.to_string()))
-            }
+            Op::UnpackHalf => self.half_unpack(args[0]),
+            Op::PackHalf => self.half_pack(args[0]),
+            Op::HalfFma { saturate } => self.half_fma([args[0], args[1], args[2]], saturate),
             Op::RoundIntegral {
                 rounding,
                 flush_denormals,
@@ -80,6 +62,12 @@ impl Emitter<'_> {
                     return Ok(args[0]);
                 }
                 match (from, to) {
+                    (Type::F16, Type::F32) if !flush_denormals => self.half_widen(args[0]),
+                    (Type::F32, Type::F16)
+                        if rounding == ShaderRoundingMode::NearestEven && !flush_denormals =>
+                    {
+                        self.half_narrow(args[0])
+                    }
                     (Type::U32 | Type::I32, Type::F32) => {
                         let bits = if from == Type::U32 {
                             args[0]
@@ -197,7 +185,7 @@ impl Emitter<'_> {
                 self.math
                     .b
                     .decorate(value, spv::Decoration::NoContraction, []);
-                let value = if !self.options.shader.float32.denorm_preserve
+                let value = if !self.math.preserves_float32()
                     && !(float_control.denormals_are_zero && float_control.flush_denormals_to_zero)
                     && matches!(
                         function,
@@ -209,7 +197,7 @@ impl Emitter<'_> {
                 } else {
                     value
                 };
-                let value = if !self.options.shader.float32.denorm_preserve
+                let value = if !self.math.preserves_float32()
                     && !(float_control.denormals_are_zero && float_control.flush_denormals_to_zero)
                 {
                     use spv::GlslStd450Op as G;

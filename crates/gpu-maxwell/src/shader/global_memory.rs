@@ -13,6 +13,11 @@ use crate::shader::decoded::{Instruction as ShaderInstruction, Operation as Shad
 use nixe_gpu::{ShaderFloatControl, ShaderPredicate, ShaderScalarType};
 use std::collections::BTreeMap;
 
+mod facts;
+mod flow;
+use facts::Facts;
+pub(super) use flow::lower;
+
 #[cfg(test)]
 mod tests;
 
@@ -24,7 +29,7 @@ pub(super) const fn is_store(encoding: u64) -> bool {
     (encoding >> 48) & 0xfff8 == 0xeed8
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Bound {
     Unknown,
     Constant(u32),
@@ -49,7 +54,7 @@ struct Pointer {
     frozen: ShaderRegister,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Value {
     Offset(Offset),
     BaseWord(u8, u32),
@@ -116,8 +121,10 @@ impl GlobalBufferBindings {
 
 pub(super) struct GlobalMemory {
     stage: MaxwellShaderStage,
-    values: BTreeMap<ShaderRegister, Value>,
+    values: Facts,
     pub bindings: GlobalBufferBindings,
+    nodes: BTreeMap<Bound, usize>,
+    frozen: BTreeMap<(u32, usize), ShaderRegister>,
 }
 
 impl Default for GlobalMemory {
@@ -126,11 +133,85 @@ impl Default for GlobalMemory {
     }
 }
 
+pub(super) fn decode_access(
+    stage: MaxwellShaderStage,
+    offset: u32,
+    encoding: u64,
+    register_count: u8,
+) -> Result<ShaderOperation, MaxwellShaderTranslationError> {
+    let load = is_load(encoding);
+    let error = |detail| MaxwellShaderTranslationError::UnsupportedSemanticDetail {
+        stage,
+        instruction_offset: offset,
+        encoding,
+        detail,
+    };
+    if !load && stage != MaxwellShaderStage::Compute {
+        return Err(error("graphics global stores are not implemented"));
+    }
+    let width = (encoding >> 48) & 7;
+    let words: u8 = match width {
+        4 => 1,
+        5 => 2,
+        6 => 4,
+        7 if load => 4,
+        _ => return Err(error("global access element width is not implemented")),
+    };
+    if encoding & (1 << 45) == 0 {
+        return Err(error("global access requires a 64-bit address"));
+    }
+    // LDG cache policies alter caching, not the value or resource identity.
+    // Host storage loads execute under the dispatch's visibility barriers.
+    if encoding & (1 << 44) != 0 || (!load && encoding & (3 << 46) != 0) {
+        return Err(error(
+            "global access cache modifier or reserved field is not supported",
+        ));
+    }
+    let displacement = ((encoding >> 20) & 0xff_ffff) as u32;
+    if displacement & 0x80_0003 != 0 {
+        return Err(error(
+            "global access requires a nonnegative word-aligned displacement",
+        ));
+    }
+    let address = (encoding >> 8) as u8;
+    validate_register_range(stage, offset, encoding, address, 2, register_count)?;
+    if !address.is_multiple_of(2) {
+        return Err(error(
+            "64-bit global address requires an even register pair",
+        ));
+    }
+    let raw = encoding as u8;
+    let data = if raw == 255 {
+        Box::default()
+    } else {
+        validate_register_range(stage, offset, encoding, raw, words, register_count)?;
+        if !raw.is_multiple_of(words) {
+            return Err(error(
+                "global access data registers are not naturally aligned",
+            ));
+        }
+        (0..words)
+            .map(|word| ShaderRegister::new(u32::from(raw) + u32::from(word)))
+            .collect()
+    };
+    Ok(ShaderOperation::GlobalMemory {
+        encoding,
+        address: [
+            ShaderRegister::new(u32::from(address)),
+            ShaderRegister::new(u32::from(address) + 1),
+        ],
+        data,
+        load,
+    })
+}
+
 impl GlobalMemory {
     pub(super) fn new(stage: MaxwellShaderStage) -> Self {
         Self {
             stage,
-            values: BTreeMap::new(),
+            values: Facts::default(),
+            nodes: BTreeMap::from([(Bound::Unknown, 0)]),
+            frozen: BTreeMap::new(),
             bindings: GlobalBufferBindings {
                 buffers: Vec::new(),
                 bounds: vec![Bound::Unknown],
@@ -140,20 +221,16 @@ impl GlobalMemory {
 }
 
 impl GlobalMemory {
-    /// Pointer facts belong to one basic block. A target or branch boundary
-    /// discards them, so a back edge cannot reuse a prior iteration's offset.
-    /// Local definitions can establish a new pointer in every loop iteration.
-    pub(super) fn begin_block(&mut self) {
-        self.values.clear();
-    }
-
     pub(super) fn forget(&mut self, register: ShaderRegister) {
-        self.values.remove(&register);
+        self.values.forget(register);
     }
 
     fn offset(&mut self, bound: Bound, alignment: u32, constant: Option<u32>) -> Value {
-        let node = self.bindings.bounds.len();
-        self.bindings.bounds.push(bound);
+        let node = *self.nodes.entry(bound.clone()).or_insert_with(|| {
+            let node = self.bindings.bounds.len();
+            self.bindings.bounds.push(bound);
+            node
+        });
         Value::Offset(Offset {
             node,
             alignment,
@@ -171,21 +248,28 @@ impl GlobalMemory {
         next_temporary: &mut u32,
     ) -> Result<(), MaxwellShaderTranslationError> {
         let mut index = start;
+        let mut ordinal = 0;
         while index < instructions.len() {
             let instruction = &instructions[index];
             let op = instruction.operation();
+            let predicate = instruction.predicate();
+            if predicate == ShaderPredicate::Never {
+                index += 1;
+                ordinal += 1;
+                continue;
+            }
             let get = |r: &ShaderRegister| {
-                self.values.get(r).copied().or(Some(Value::Offset(Offset {
-                    node: 0,
-                    alignment: 0,
-                    constant: None,
-                })))
+                self.values
+                    .get(*r, predicate)
+                    .or(Some(Value::Offset(Offset {
+                        node: 0,
+                        alignment: 0,
+                        constant: None,
+                    })))
             };
             let mut carry_value = None;
             let mut freeze = None;
-            let value = if instruction.predicate() != ShaderPredicate::Always {
-                None
-            } else {
+            let value = {
                 match op {
                     ShaderOperation::MoveImmediate32 { bits, .. } => Some(self.offset(
                         Bound::Constant(*bits),
@@ -271,13 +355,20 @@ impl GlobalMemory {
                                 _ => None,
                             };
                             if let Some((constant_buffer, byte_offset, offset, source)) = base {
-                                let frozen = allocate_shader_temporary(
-                                    self.stage,
-                                    instruction.source().byte_offset(),
-                                    encoding,
-                                    "global pointer offset temporary overflow",
-                                    next_temporary,
-                                )?;
+                                let key = (instruction.source().byte_offset(), ordinal);
+                                let frozen = if let Some(&frozen) = self.frozen.get(&key) {
+                                    frozen
+                                } else {
+                                    let frozen = allocate_shader_temporary(
+                                        self.stage,
+                                        key.0,
+                                        encoding,
+                                        "global pointer offset temporary overflow",
+                                        next_temporary,
+                                    )?;
+                                    self.frozen.insert(key, frozen);
+                                    frozen
+                                };
                                 let pointer = Pointer {
                                     constant_buffer,
                                     byte_offset,
@@ -291,7 +382,7 @@ impl GlobalMemory {
                                 None
                             }
                         } else if let Some(Value::Carry(pointer)) =
-                            carry_in.and_then(|r| self.values.get(&r).copied())
+                            carry_in.and_then(|r| self.values.get(r, predicate))
                         {
                             let high = match pair {
                                 (
@@ -325,25 +416,16 @@ impl GlobalMemory {
                     _ => None,
                 }
             };
-            // Any write, including a conditional write, invalidates provenance
-            // unless this transfer function has proved its replacement value.
+            let mut first = true;
             op.visit_destination_registers(|r| {
-                self.values.remove(&r);
+                let fact = if first { value } else { None };
+                self.values.write(r, predicate, fact);
+                first = false;
             });
-            if let Some(value) = value {
-                let mut first = true;
-                op.visit_destination_registers(|r| {
-                    if first {
-                        self.values.insert(r, value);
-                        first = false;
-                    }
-                });
+            if let ShaderOperation::AddCarry32 { carry_out, .. } = op {
+                self.values.write(*carry_out, predicate, carry_value);
             }
-            if let ShaderOperation::AddCarry32 { carry_out, .. } = op
-                && let Some(value) = carry_value
-            {
-                self.values.insert(*carry_out, value);
-            }
+            self.values.invalidate_predicate_writes(op);
             if let Some((destination, source)) = freeze {
                 instructions.insert(
                     index,
@@ -360,6 +442,7 @@ impl GlobalMemory {
                 index += 1;
             }
             index += 1;
+            ordinal += 1;
         }
         Ok(())
     }
@@ -393,56 +476,26 @@ impl GlobalMemory {
         load: bool,
     ) -> Result<Vec<ShaderOperation>, MaxwellShaderTranslationError> {
         let stage = self.stage;
+        decode_access(stage, offset, encoding, register_count)?;
         let error = |detail| MaxwellShaderTranslationError::UnsupportedSemanticDetail {
             stage,
             instruction_offset: offset,
             encoding,
             detail,
         };
-        if !load && stage != MaxwellShaderStage::Compute {
-            return Err(error("graphics global stores are not implemented"));
-        }
-        if decode_predicate(encoding) != ShaderPredicate::Always {
-            return Err(error("predicated global access is not implemented"));
-        }
-        let width = (encoding >> 48) & 7;
-        let words: u8 = match width {
+        let words = match (encoding >> 48) & 7 {
             4 => 1,
             5 => 2,
-            6 => 4,
-            7 if load => 4,
-            _ => return Err(error("global access element width is not implemented")),
+            _ => 4,
         };
-        if encoding & (1 << 45) == 0 {
-            return Err(error("global access requires a 64-bit address"));
-        }
-        // LDG cache policies alter caching, not the value or resource identity.
-        // Host storage loads execute under the dispatch's visibility barriers.
-        if encoding & (1 << 44) != 0 || (!load && encoding & (3 << 46) != 0) {
-            return Err(error(
-                "global access cache modifier or reserved field is not supported",
-            ));
-        }
         let displacement = ((encoding >> 20) & 0xff_ffff) as u32;
-        if displacement & 0x80_0003 != 0 {
-            return Err(error(
-                "global access requires a nonnegative word-aligned displacement",
-            ));
-        }
         let address = (encoding >> 8) as u8;
-        validate_register_range(stage, offset, encoding, address, 2, register_count)?;
-        if !address.is_multiple_of(2) {
-            return Err(error(
-                "64-bit global address requires an even register pair",
-            ));
-        }
+        let predicate = decode_predicate(encoding);
         let halves = (
             self.values
-                .get(&ShaderRegister::new(u32::from(address)))
-                .copied(),
+                .get(ShaderRegister::new(u32::from(address)), predicate),
             self.values
-                .get(&ShaderRegister::new(u32::from(address) + 1))
-                .copied(),
+                .get(ShaderRegister::new(u32::from(address) + 1), predicate),
         );
         let mut prefix = Vec::new();
         let pointer = match halves {

@@ -77,7 +77,7 @@ impl VulkanResidency {
                 vk::AccessFlags2::TRANSFER_WRITE,
             ),
         )?;
-        let index = self.device.submission.begin()?;
+        let index = self.device.begin_recording()?;
         self.barriers.emit(&mut self.device);
         unsafe {
             self.device.owner.device.cmd_fill_buffer(
@@ -306,7 +306,7 @@ impl VulkanResidency {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         )?;
         self.barriers.emit(&mut self.device);
-        let index = self.device.submission.begin()?;
+        let index = self.device.begin_recording()?;
         unsafe {
             self.device.owner.device.cmd_clear_color_image(
                 self.device.submission.slots[index].command,
@@ -358,7 +358,7 @@ impl VulkanResidency {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         )?;
         self.barriers.emit(&mut self.device);
-        let index = self.device.submission.begin()?;
+        let index = self.device.begin_recording()?;
         unsafe {
             self.device.owner.device.cmd_clear_depth_stencil_image(
                 self.device.submission.slots[index].command,
@@ -411,9 +411,6 @@ impl VulkanResidency {
             ));
         }
         self.ensure_image_initialized(source, src, source_rect)?;
-        if rect != full_rect(dst) {
-            self.ensure_image(destination)?;
-        }
         self.prepare_image_rect(destination, dst, rect)?;
         let (source, source_layout) = self.image_access_subresources(
             source,
@@ -452,7 +449,7 @@ impl VulkanResidency {
                 depth: 1,
             });
         self.barriers.emit(&mut self.device);
-        let slot = self.device.submission.begin()?;
+        let slot = self.device.begin_recording()?;
         unsafe {
             self.device.owner.device.cmd_resolve_image(
                 self.device.submission.slots[slot].command,
@@ -476,7 +473,6 @@ impl VulkanResidency {
         destination_offset: vk::Offset2D,
     ) -> Result<WorkTicket, VulkanError> {
         self.ensure_image(source)?;
-        self.ensure_image(destination)?;
         let src = self.checked_image_rect(source, source_plane, source_rect)?;
         let rect = vk::Rect2D {
             offset: destination_offset,
@@ -512,7 +508,7 @@ impl VulkanResidency {
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             )?;
             self.barriers.emit(&mut self.device);
-            let index = self.device.submission.begin()?;
+            let index = self.device.begin_recording()?;
             let command = self.device.submission.slots[index].command;
             let extent = vk::Extent3D {
                 width: rect.extent.width,
@@ -607,7 +603,7 @@ impl VulkanResidency {
                 depth: 1,
             });
         self.barriers.emit(&mut self.device);
-        let index = self.device.submission.begin()?;
+        let index = self.device.begin_recording()?;
         unsafe {
             self.device.owner.device.cmd_copy_image(
                 self.device.submission.slots[index].command,
@@ -630,6 +626,18 @@ pub(super) fn full_rect(p: ImagePlane) -> vk::Rect2D {
             height: p.extent.height,
         },
     }
+}
+pub(super) fn contains_rect(outer: vk::Rect2D, inner: vk::Rect2D) -> bool {
+    let end = |r: vk::Rect2D| {
+        [
+            i64::from(r.offset.x) + i64::from(r.extent.width),
+            i64::from(r.offset.y) + i64::from(r.extent.height),
+        ]
+    };
+    outer.offset.x <= inner.offset.x
+        && outer.offset.y <= inner.offset.y
+        && end(outer)[0] >= end(inner)[0]
+        && end(outer)[1] >= end(inner)[1]
 }
 pub(super) fn intersects(a: vk::Rect2D, b: vk::Rect2D) -> bool {
     a.offset.x < b.offset.x + b.extent.width as i32

@@ -282,6 +282,7 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
     let first = cache
         .resolve_shader_translation_source(
             &first_source,
+            channel.three_d().shader_bindings(),
             &address_space,
             &nixe_memory::CanonicalWriteBatch::new(),
         )
@@ -289,6 +290,7 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
     let repeated = cache
         .resolve_shader_translation_source(
             &first_source,
+            channel.three_d().shader_bindings(),
             &address_space,
             &nixe_memory::CanonicalWriteBatch::new(),
         )
@@ -328,6 +330,7 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
     let changed_registers = cache
         .resolve_shader_translation_source(
             &changed_register_source,
+            channel.three_d().shader_bindings(),
             &address_space,
             &nixe_memory::CanonicalWriteBatch::new(),
         )
@@ -346,6 +349,7 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
     let restored = cache
         .resolve_shader_translation_source(
             &restored_source,
+            channel.three_d().shader_bindings(),
             &address_space,
             &nixe_memory::CanonicalWriteBatch::new(),
         )
@@ -366,6 +370,7 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
     let after_cpu_write = cache
         .resolve_shader_translation_source(
             &after_cpu_write_source,
+            channel.three_d().shader_bindings(),
             &address_space,
             &nixe_memory::CanonicalWriteBatch::new(),
         )
@@ -384,7 +389,12 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
     let after_staged_write_source =
         prepare_maxwell_shader_translation_source(channel.three_d()).unwrap();
     let after_staged_write = cache
-        .resolve_shader_translation_source(&after_staged_write_source, &address_space, &staged)
+        .resolve_shader_translation_source(
+            &after_staged_write_source,
+            channel.three_d().shader_bindings(),
+            &address_space,
+            &staged,
+        )
         .unwrap();
     let after_staged_write_id = cache
         .stage_shader_translations(&after_staged_write)
@@ -400,6 +410,7 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
     let forward = cache
         .resolve_shader_translation_source(
             &forward_source,
+            channel.three_d().shader_bindings(),
             &address_space,
             &canonical_shader_writes(&address_space, &ordered_forward),
         )
@@ -408,6 +419,7 @@ fn shader_cache_reuses_exact_inputs_and_retains_alternating_programs() {
     let reverse = cache
         .resolve_shader_translation_source(
             &reverse_source,
+            channel.three_d().shader_bindings(),
             &address_space,
             &canonical_shader_writes(&address_space, &ordered_reverse),
         )

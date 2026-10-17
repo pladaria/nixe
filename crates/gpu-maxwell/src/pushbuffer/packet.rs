@@ -167,13 +167,21 @@ impl MaxwellDecodedMethod {
     }
 }
 
+// Single writes and immediate packets need no heap allocation. Preserve the
+// exact per-word source for larger packets, including mapping/entry boundaries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PacketMethods {
+    One(MaxwellDecodedMethod),
+    Many(Box<[MaxwellDecodedMethod]>),
+}
+
 /// A complete, syntactically validated compressed method sequence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellDecodedMethodPacket {
     mode: MaxwellMethodPacketMode,
     header: MaxwellGpfifoSourceLocation,
     subchannel: Option<MaxwellPushbufferSubchannel>,
-    methods: Box<[MaxwellDecodedMethod]>,
+    methods: PacketMethods,
 }
 
 impl MaxwellDecodedMethodPacket {
@@ -196,7 +204,10 @@ impl MaxwellDecodedMethodPacket {
 
     #[must_use]
     pub fn methods(&self) -> &[MaxwellDecodedMethod] {
-        &self.methods
+        match &self.methods {
+            PacketMethods::One(method) => std::slice::from_ref(method),
+            PacketMethods::Many(methods) => methods,
+        }
     }
 }
 
@@ -455,7 +466,7 @@ where
             mode,
             header: header.location,
             subchannel: None,
-            methods: Box::new([]),
+            methods: PacketMethods::Many(Box::new([])),
         }));
     }
     if header.value & METHOD_RESERVED_BIT != 0 {
@@ -469,18 +480,26 @@ where
     validate_method_range(header.location, mode, first_method_dword, count)?;
     let subchannel =
         MaxwellPushbufferSubchannel(((header.value >> SUBCHANNEL_SHIFT) & SUBCHANNEL_MASK) as u8);
-    let mut methods = Vec::new();
-    methods
-        .try_reserve_exact(usize::from(count))
-        .map_err(|_| MaxwellPushbufferDecodeError::ResourceExhausted)?;
-
-    if mode == MaxwellMethodPacketMode::Immediate {
-        methods.push(MaxwellDecodedMethod {
+    let methods = if count == 1 {
+        let argument = if mode == MaxwellMethodPacketMode::Immediate {
+            MaxwellPushbufferWord::new(u32::from(encoded_count), header.location)
+        } else {
+            next_word(words)?.ok_or(MaxwellPushbufferDecodeError::TruncatedPacket {
+                source: header.location,
+                expected_arguments: count,
+                available_arguments: 0,
+            })?
+        };
+        PacketMethods::One(MaxwellDecodedMethod {
             method: method_id(first_method_dword),
-            argument: (header.value >> COUNT_SHIFT) & COUNT_MASK,
-            argument_source: header.location,
-        });
+            argument: argument.value,
+            argument_source: argument.location,
+        })
     } else {
+        let mut methods = Vec::new();
+        methods
+            .try_reserve_exact(usize::from(count))
+            .map_err(|_| MaxwellPushbufferDecodeError::ResourceExhausted)?;
         for argument_index in 0..count {
             let Some(argument) = next_word(words)? else {
                 return Err(MaxwellPushbufferDecodeError::TruncatedPacket {
@@ -495,13 +514,14 @@ where
                 argument_source: argument.location,
             });
         }
-    }
+        PacketMethods::Many(methods.into_boxed_slice())
+    };
 
     Ok(MaxwellDecodedPacket::Methods(MaxwellDecodedMethodPacket {
         mode,
         header: header.location,
         subchannel: Some(subchannel),
-        methods: methods.into_boxed_slice(),
+        methods,
     }))
 }
 

@@ -10,6 +10,21 @@ use std::sync::Arc;
 
 unsafe extern "C" {
     fn nixe_nvdec_create(uuid: *const u8) -> *mut c_void;
+    fn nixe_video_hardware_supported(uuid: *const u8) -> c_int;
+    fn nixe_video_frame_context(frame: *const c_void) -> usize;
+    fn nixe_video_transfer_create(
+        frame: *const c_void,
+        fd: i32,
+        semaphore_fd: i32,
+        size: u64,
+        uuid: *const u8,
+        pitch: u64,
+        chroma: u64,
+        initialize: c_int,
+    ) -> *mut c_void;
+    fn nixe_video_transfer_enqueue(target: *mut c_void, frame: *const c_void) -> c_int;
+    fn nixe_video_transfer_wait(target: *mut c_void) -> c_int;
+    fn nixe_video_transfer_free(target: *mut c_void);
     fn nixe_video_error() -> *const c_char;
     fn nixe_video_frame_free(frame: *mut c_void);
     fn nixe_video_frame_copy(
@@ -56,6 +71,42 @@ impl Drop for CudaFrame {
     }
 }
 impl nixe_gpu::DeviceImageSource for CudaFrame {
+    fn transfer_context(&self) -> usize {
+        unsafe { nixe_video_frame_context(self.0) }
+    }
+    fn import_nv12(
+        &self,
+        target: nixe_gpu::ExternalImageBuffer,
+    ) -> Result<Box<dyn nixe_gpu::DeviceImageTransfer>, Box<str>> {
+        let transfer = unsafe {
+            nixe_video_transfer_create(
+                self.0,
+                target.fd,
+                target.semaphore_fd,
+                target.allocation_size,
+                target.device_uuid.as_ptr(),
+                target.row_pitch,
+                target.chroma_offset,
+                c_int::from(target.initialize),
+            )
+        };
+        if transfer.is_null() {
+            return Err(video_error());
+        }
+        Ok(Box::new(CudaImageTransfer(transfer)))
+    }
+    fn enqueue_nv12(&self, target: &mut dyn nixe_gpu::DeviceImageTransfer) -> Result<(), Box<str>> {
+        let target = (target as &mut dyn std::any::Any)
+            .downcast_mut::<CudaImageTransfer>()
+            .ok_or_else(|| {
+                Box::<str>::from("decoded frame and transfer use different producer APIs")
+            })?;
+        if unsafe { nixe_video_transfer_enqueue(target.0, self.0) } < 0 {
+            Err(video_error())
+        } else {
+            Ok(())
+        }
+    }
     fn copy_nv12(&self, target: nixe_gpu::ExternalImageBuffer) -> Result<(), Box<str>> {
         let result = unsafe {
             nixe_video_frame_copy(
@@ -77,6 +128,33 @@ impl nixe_gpu::DeviceImageSource for CudaFrame {
         } else {
             Ok(())
         }
+    }
+}
+
+fn video_error() -> Box<str> {
+    unsafe { CStr::from_ptr(nixe_video_error()) }
+        .to_string_lossy()
+        .into_owned()
+        .into_boxed_str()
+}
+
+#[derive(Debug)]
+struct CudaImageTransfer(*mut c_void);
+// Imports retain their device context. The concrete Vulkan owner serializes
+// copies; destruction occurs only after its actual consumer completion.
+unsafe impl Send for CudaImageTransfer {}
+impl nixe_gpu::DeviceImageTransfer for CudaImageTransfer {
+    fn wait(&mut self) -> Result<(), Box<str>> {
+        if unsafe { nixe_video_transfer_wait(self.0) } < 0 {
+            Err(video_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+impl Drop for CudaImageTransfer {
+    fn drop(&mut self) {
+        unsafe { nixe_video_transfer_free(self.0) };
     }
 }
 
@@ -170,6 +248,19 @@ impl Drop for NvDec {
 }
 impl NvDec {
     pub(super) fn new(device: Option<[u8; 16]>) -> Result<Self, String> {
+        let device = match device {
+            Some(uuid) => match unsafe { nixe_video_hardware_supported(uuid.as_ptr()) } {
+                1 => Some(uuid),
+                0 => None,
+                _ => {
+                    return Err(format!(
+                        "cannot query hardware video decoding: {}",
+                        video_error()
+                    ));
+                }
+            },
+            None => None,
+        };
         let decoder = unsafe {
             nixe_nvdec_create(
                 device

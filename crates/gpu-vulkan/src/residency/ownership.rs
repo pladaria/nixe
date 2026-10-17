@@ -53,7 +53,7 @@ impl VulkanResidency {
         layout: vk::ImageLayout,
     ) -> Result<WorkTicket, VulkanError> {
         self.check_image_subresources(id, range)?;
-        self.device.submission.begin()?;
+        self.device.begin_recording()?;
         let source_family = self.device.queues().graphics_compute_family;
         if destination_family == source_family || destination_family == vk::QUEUE_FAMILY_IGNORED {
             return Err(VulkanError::InvalidResource(
@@ -107,7 +107,7 @@ impl VulkanResidency {
         scope: AccessScope,
     ) -> Result<WorkTicket, VulkanError> {
         self.check_image_subresources(id, range)?;
-        self.device.submission.begin()?;
+        self.device.begin_recording()?;
         let destination_family = self.device.queues().graphics_compute_family;
         let entry = self.images[id.slot].entry.as_mut().expect("image");
         for cell in &mut entry.access {

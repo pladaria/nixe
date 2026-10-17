@@ -19,7 +19,7 @@ pub(super) fn link(
         // namespace so host feature/CFG diagnostics can identify A or B.
         let base = super::super::binary::MAXWELL_SHADER_READ_LIMIT as u32;
         let shift = |s: ShaderSourceLocation| ShaderSourceLocation::new(s.byte_offset() + base);
-        for block in &mut programs[z].function.blocks {
+        for block in &mut std::sync::Arc::make_mut(&mut programs[z].function).blocks {
             for phi in &mut block.phis {
                 phi.source = shift(phi.source);
             }
@@ -41,7 +41,10 @@ pub(super) fn link(
             block.source = shift(block.source);
             block.terminator_source = shift(block.terminator_source);
         }
-        programs[z].function = super::vertex::merge(&first.function, &programs[z].function)?;
+        programs[z].function = std::sync::Arc::new(super::vertex::merge(
+            &first.function,
+            &programs[z].function,
+        )?);
         programs[z].sources = first
             .sources
             .iter()
@@ -57,7 +60,7 @@ pub(super) fn link(
             .chain(programs[z].bindings.iter())
             .copied()
             .collect();
-        programs[z].append_buffers(&first);
+        programs[z].append_buffers(&first, base);
         programs[z].retain_live_bindings();
     }
     let fragment = programs
@@ -90,7 +93,7 @@ pub(super) fn link(
             .collect();
         // Disabled generic attributes are Maxwell (0,0,0,1), per component.
         // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
-        for block in &mut programs[fragment].function.blocks {
+        for block in &mut std::sync::Arc::make_mut(&mut programs[fragment].function).blocks {
             for inst in &mut block.instructions {
                 let (location, component, ty) = match inst.op {
                     Op::Input {
@@ -118,8 +121,7 @@ pub(super) fn link(
                 }
             }
         }
-        programs[fragment]
-            .function
+        std::sync::Arc::make_mut(&mut programs[fragment].function)
             .inputs
             .retain(|e| !missing.contains(&(e.location(), e.component())));
         let interpolation: BTreeMap<_, _> = programs[fragment]
@@ -128,7 +130,7 @@ pub(super) fn link(
             .iter()
             .map(|e| ((e.location(), e.component()), e.interpolation()))
             .collect();
-        let function = &mut programs[producer].function;
+        let function = std::sync::Arc::make_mut(&mut programs[producer].function);
         for output in &mut function.outputs {
             if let Some(&i) = interpolation.get(&(output.location(), output.component())) {
                 *output = ShaderInterfaceElement::new(
@@ -191,7 +193,7 @@ pub(super) fn link(
         function.recompact();
     }
     for program in programs.iter_mut() {
-        program.function.optimize()?;
+        std::sync::Arc::make_mut(&mut program.function).optimize()?;
         program.retain_live_bindings();
     }
     let ordered: Vec<_> = [

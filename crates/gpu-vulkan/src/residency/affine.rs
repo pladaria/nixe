@@ -51,7 +51,6 @@ impl VulkanResidency {
         first: [i64; 2],
         step: [i64; 2],
         linear: bool,
-        descriptors: &mut DescriptorCache,
     ) -> Result<WorkTicket, VulkanError> {
         let source_image = self.image(source.image)?;
         let view = source_image
@@ -92,7 +91,7 @@ impl VulkanResidency {
         }
         let p = self.checked_image_rect(destination, plane, destination_rect)?;
         let format = self.image(destination)?.description.format;
-        let program = self.prepare_program(pipeline, &[Binding::Image(source)], descriptors)?;
+        let program = self.prepare_program(pipeline, &[Binding::Image(source)])?;
         let mut parameters = GraphicsParameters::new(
             GraphicsState::color(format),
             vk::Extent2D {

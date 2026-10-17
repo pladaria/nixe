@@ -328,7 +328,49 @@ pub(super) fn read_shader_binary(
         address,
         MaxwellShaderMetadata::Graphics(header),
         Some(header_read),
+        0,
     )
+}
+
+/// Indirect destinations can extend beyond the first lexical EXIT. Re-read
+/// only the newly proven bounded extent and reject a changed captured prefix.
+pub(super) fn extend_shader_code(
+    memory: &MaxwellShaderMemoryView<'_>,
+    binary: &mut MaxwellShaderBinary,
+    target: u32,
+) -> Result<(), MaxwellShaderTranslationError> {
+    let stage = binary.stage();
+    let changed = || MaxwellShaderTranslationError::SourceChangedDuringRead {
+        stage,
+        address: binary.address,
+    };
+    let header = if let MaxwellShaderMetadata::Graphics(expected) = binary.metadata {
+        let read = memory.read_executable(
+            stage,
+            MaxwellShaderExecutableRange::new(stage, binary.address)?,
+            binary.address,
+            MAXWELL_SHADER_PROGRAM_HEADER_SIZE,
+        )?;
+        if decode_program_header(&read.bytes)? != expected {
+            return Err(changed());
+        }
+        Some(read)
+    } else {
+        None
+    };
+    let extended = read_shader_code(
+        memory,
+        stage,
+        binary.address,
+        binary.metadata,
+        header,
+        target,
+    )?;
+    if !extended.bundles.starts_with(&binary.bundles) {
+        return Err(changed());
+    }
+    *binary = extended;
+    Ok(())
 }
 
 pub(super) fn read_shader_code(
@@ -337,6 +379,7 @@ pub(super) fn read_shader_code(
     address: u64,
     metadata: MaxwellShaderMetadata,
     header_read: Option<MaxwellShaderRead>,
+    minimum_target: u32,
 ) -> Result<MaxwellShaderBinary, MaxwellShaderTranslationError> {
     let executable = MaxwellShaderExecutableRange::new(stage, address)?;
     let mut source_pages = BTreeSet::new();
@@ -354,7 +397,7 @@ pub(super) fn read_shader_code(
         0
     };
     let mut bundles = Vec::new();
-    let mut furthest_target = 0_u32;
+    let mut furthest_target = minimum_target;
     let code_address =
         address
             .checked_add(header_size as u64)
@@ -506,6 +549,12 @@ fn retain_shader_read_evidence(
 impl MaxwellShaderProgramHeader {
     pub(super) fn words(&self) -> &[u32; 20] {
         &self.words
+    }
+    /// LOW/HIGH encode a 48-bit size; the call/return stack follows it.
+    /// https://github.com/eden-emulator/mirror/blob/master/src/video_core/shader_environment.cpp
+    pub(super) fn local_memory_bytes(&self) -> u64 {
+        (u64::from(self.words[1] & 0xff_ffff) | (u64::from(self.words[2] & 0xff_ffff) << 24))
+            + u64::from(self.words[3] & 0xff_ffff)
     }
 }
 

@@ -308,7 +308,8 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
                 .attach_presentation(client)
                 .map_err(|e| e.to_string())?;
         }
-        let maxwell = nixe_gpu_maxwell::MaxwellNativeFrontend::new(renderer.compilation_pool());
+        let maxwell =
+            nixe_gpu_maxwell::MaxwellNativeFrontend::new(renderer.shader_translation_pool());
         (
             VideoSystem::with_gpu_frontend(presenter, renderer, maxwell),
             None,

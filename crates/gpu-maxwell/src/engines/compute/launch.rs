@@ -65,6 +65,14 @@ pub enum MaxwellComputeLaunchError {
         address: u64,
         error: MaxwellGpuAccessError,
     },
+    GlobalBufferAddress {
+        source: Box<MaxwellMethodSource>,
+        constant_buffer: u8,
+        byte_offset: u32,
+        address: u64,
+        size: u64,
+        error: MaxwellGpuAccessError,
+    },
     StagedRead {
         source: Box<MaxwellMethodSource>,
         address: u64,
@@ -108,6 +116,17 @@ impl Display for MaxwellComputeLaunchError {
                 f,
                 "compute memory access failed: address={address:#012x} source=[{source}]: {error}"
             ),
+            Self::GlobalBufferAddress {
+                source,
+                constant_buffer,
+                byte_offset,
+                address,
+                size,
+                error,
+            } => write!(
+                f,
+                "compute global buffer access failed: c[{constant_buffer}][{byte_offset:#x}] address={address:#012x} size={size:#x} source=[{source}]: {error}"
+            ),
             Self::StagedRead {
                 source,
                 address,
@@ -150,6 +169,69 @@ pub struct MaxwellResolvedComputeLaunch {
 }
 
 impl MaxwellResolvedComputeLaunch {
+    pub(crate) fn native_uniform_word(
+        &self,
+        program: &crate::MaxwellSsaProgram,
+        resource: nixe_gpu::ssa::ResourceId,
+        offset: u32,
+        space: &MaxwellGpuAddressSpace,
+        writes: &CanonicalWriteBatch,
+    ) -> Result<Option<u32>, MaxwellComputeLaunchError> {
+        let Some(slot) = program.bindings.iter().find_map(|b| {
+            if b.resource == resource
+                && let crate::MaxwellSsaBindingSource::ConstantBuffer { slot } = b.source
+            {
+                Some(slot)
+            } else {
+                None
+            }
+        }) else {
+            return Ok(None);
+        };
+        let (base, size) =
+            self.qmd
+                .constant_buffer(slot)
+                .map_err(|reason| MaxwellComputeLaunchError::Buffer {
+                    source: Box::new(self.source),
+                    binding: slot,
+                    reason,
+                })?;
+        if u64::from(offset) + 4 > size || offset & 3 != 0 {
+            return Ok(None);
+        }
+        let address = base + u64::from(offset);
+        let range = space
+            .address(address)
+            .map_err(MaxwellGpuAccessError::Address)
+            .and_then(|a| space.resolve_range(a, 4, MemoryPermissions::READ))
+            .map_err(|error| MaxwellComputeLaunchError::Address {
+                source: Box::new(self.source),
+                address,
+                error,
+            })?;
+        let mut bytes = [0; 4];
+        let mut copied = 0;
+        for segment in range.segments() {
+            let end = copied + segment.size() as usize;
+            writes
+                .read_overlay(
+                    segment.mapping().backing(),
+                    segment.backing_offset(),
+                    &mut bytes[copied..end],
+                )
+                .map_err(|error| MaxwellComputeLaunchError::StagedRead {
+                    source: Box::new(self.source),
+                    address,
+                    error,
+                })?;
+            copied = end;
+        }
+        Ok(Some(u32::from_le_bytes(bytes)))
+    }
+
+    pub(crate) fn constant_buffer(&self, slot: u8) -> Result<(u64, u64), &'static str> {
+        self.qmd.constant_buffer(slot)
+    }
     pub(crate) fn validate_execution(&self) -> Result<(), MaxwellComputeLaunchError> {
         self.qmd
             .validate_execution()
@@ -496,7 +578,21 @@ impl MaxwellResolvedComputeLaunch {
                             return Err(fail(slot, "global binding has no memory operation"));
                         }
                     };
-                    resolve(address, size, permissions)?
+                    resolve(address, size, permissions).map_err(|error| match error {
+                        MaxwellComputeLaunchError::Address {
+                            source,
+                            address,
+                            error,
+                        } => MaxwellComputeLaunchError::GlobalBufferAddress {
+                            source,
+                            constant_buffer: slot,
+                            byte_offset,
+                            address,
+                            size,
+                            error,
+                        },
+                        error => error,
+                    })?
                 }
                 _ => {
                     return Err(fail(

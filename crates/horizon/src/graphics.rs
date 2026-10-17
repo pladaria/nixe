@@ -351,6 +351,12 @@ impl VideoSystem {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for released in released.drain(..) {
+            nixe_memory::trace::event(
+                "buffer_release",
+                ((released.binder_id as u32 as u64) << 32) | released.slot as u32 as u64,
+                0,
+                0,
+            );
             if let Some(queue) = state.queues.get_mut(&released.binder_id) {
                 let _ = queue.release(released.slot);
             }
@@ -581,8 +587,22 @@ impl VideoSystem {
     pub(crate) fn queue_graphic_buffer(
         &self,
         binder_id: i32,
-        request: QueuedBufferRequest,
+        mut request: QueuedBufferRequest,
     ) -> Result<(), FramebufferError> {
+        let requested_interval = request.input.swap_interval;
+        request.input.swap_interval = nixe_memory::trace::presentation_interval(requested_interval);
+        nixe_memory::trace::event(
+            "requested_interval",
+            ((binder_id as u32 as u64) << 32) | request.slot as u32 as u64,
+            u64::from(requested_interval),
+            u64::from(request.input.swap_interval),
+        );
+        nixe_memory::trace::event(
+            "queue_buffer",
+            ((binder_id as u32 as u64) << 32) | request.slot as u32 as u64,
+            u64::from(request.input.swap_interval),
+            0,
+        );
         let reserved_slot = request.slot;
         let result = (|| {
             let primary = request.buffer.primary_plane();
@@ -737,6 +757,12 @@ impl VideoSystem {
                 state.pending_frames.push_back(pending);
                 continue;
             }
+            nixe_memory::trace::event(
+                "vi_eligible",
+                ((pending.binder_id as u32 as u64) << 32) | pending.slot as u32 as u64,
+                display_sequence,
+                0,
+            );
             if pending.presentation.is_none()
                 && !pending.acquire_fences.iter().all(|fence| {
                     state
@@ -776,6 +802,12 @@ impl VideoSystem {
                 None => None,
             };
             let pending = state.pending_frames.pop_front().unwrap();
+            nixe_memory::trace::event(
+                "vi_latch",
+                ((pending.binder_id as u32 as u64) << 32) | pending.slot as u32 as u64,
+                state.next_frame_sequence,
+                display_sequence,
+            );
             state
                 .queues
                 .get_mut(&binder_id)

@@ -52,6 +52,15 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    #[cfg(feature = "execution-trace")]
+    if let Err(error) = nixe_memory::trace::start() {
+        log::error!("cannot start execution trace: {error}");
+        return ExitCode::FAILURE;
+    }
+    #[cfg(feature = "execution-trace")]
+    if nixe_memory::trace::presentation_interval(2) == 1 {
+        log::warn!("diagnostic presentation override enabled: swap interval 2 -> 1");
+    }
     #[cfg(feature = "performance-counters")]
     let capture = match performance::Capture::start() {
         Ok(capture) => capture,
@@ -71,6 +80,11 @@ fn main() -> ExitCode {
         && let Err(error) = capture.finish()
     {
         log::error!("cannot finish performance capture: {error}");
+        return ExitCode::FAILURE;
+    }
+    #[cfg(feature = "execution-trace")]
+    if let Err(error) = nixe_memory::trace::finish() {
+        log::error!("cannot finish execution trace: {error}");
         return ExitCode::FAILURE;
     }
     match result {

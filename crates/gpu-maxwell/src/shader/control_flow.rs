@@ -21,7 +21,45 @@ pub(super) const fn is_loop_branch(encoding: u64) -> bool {
 /// https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/frontend/maxwell/control_flow.cpp (Stack::Pop)
 pub(super) struct ShaderControlFlow {
     pub(super) reachable: std::collections::BTreeSet<u32>,
+    pub(super) successors: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
     pub(super) stack_targets: std::collections::BTreeMap<u32, ShaderSourceLocation>,
+}
+
+impl ShaderControlFlow {
+    /// RRO's captured input may cross control flow only when its definition
+    /// dominates the consumer and no outside edge can enter the region after
+    /// the definition (including a backedge from later instructions).
+    pub(super) fn single_entry_region(&self, definition: u32, consumer: u32) -> bool {
+        if definition >= consumer {
+            return false;
+        }
+        for (&source, targets) in &self.successors {
+            if (source < definition || source >= consumer)
+                && targets
+                    .iter()
+                    .any(|&target| definition < target && target <= consumer)
+            {
+                return false;
+            }
+        }
+        let Some(&entry) = self.reachable.first() else {
+            return false;
+        };
+        let mut pending = vec![entry];
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(pc) = pending.pop() {
+            if pc == definition || !visited.insert(pc) {
+                continue;
+            }
+            if pc == consumer {
+                return false;
+            }
+            if let Some(next) = self.successors.get(&pc) {
+                pending.extend(next);
+            }
+        }
+        true
+    }
 }
 
 pub(super) fn discover_shader_control_flow(
@@ -47,6 +85,7 @@ pub(super) fn discover_shader_control_flow(
     let mut visited = BTreeSet::new();
     let mut targets = BTreeMap::new();
     let mut reachable = BTreeSet::new();
+    let mut successors = BTreeMap::<u32, BTreeSet<u32>>::new();
     while let Some((index, mut stack)) = pending.pop_front() {
         if index >= code.len() || !visited.insert((index, stack.clone())) {
             continue;
@@ -84,9 +123,16 @@ pub(super) fn discover_shader_control_flow(
                         "BRX target is outside executable code",
                     )
                 })?;
+                successors
+                    .entry(offset)
+                    .or_default()
+                    .insert(code[destination].0);
                 pending.push_back((destination, stack.clone()));
             }
             if predicate != ShaderPredicate::Always {
+                if let Some(&(next, _)) = code.get(index + 1) {
+                    successors.entry(offset).or_default().insert(next);
+                }
                 pending.push_back((index + 1, stack));
             }
             continue;
@@ -163,6 +209,10 @@ pub(super) fn discover_shader_control_flow(
                     "control-stack target is outside executable code",
                 )
             })?;
+            successors
+                .entry(offset)
+                .or_default()
+                .insert(code[destination].0);
             pending.push_back((destination, taken_stack));
         }
         // KIL terminates the invocation just like EXIT. Keeping a lexical
@@ -174,12 +224,16 @@ pub(super) fn discover_shader_control_flow(
             // instruction predicate. A taken branch uses its popped stack,
             // while its fallthrough retains the original one.
             if !terminates || predicate != ShaderPredicate::Always {
+                if let Some(&(next, _)) = code.get(index + 1) {
+                    successors.entry(offset).or_default().insert(next);
+                }
                 pending.push_back((index + 1, stack));
             }
         }
     }
     Ok(ShaderControlFlow {
         reachable,
+        successors,
         stack_targets: targets,
     })
 }

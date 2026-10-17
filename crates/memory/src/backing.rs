@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::direct::DirectArenaWeak;
@@ -212,11 +212,27 @@ struct CanonicalPageInner {
     generation: AtomicU64,
     cpu_dirty_epoch: AtomicU64,
     executable_invalidations: OnceLock<Arc<MemoryInvalidationLog>>,
-    // Read-only resident resources query clean authority on every submission.
-    // Publish this common state without taking one mutex per physical page;
-    // all transitions still serialize through `state`.
-    visibility_clean: AtomicBool,
+    // CPU-visible authority carries no owner payload. Publish its exact class
+    // atomically instead of locking every dirty CPU page for classification.
+    // Device owner/point reads and all transitions still serialize through state.
+    cpu_visibility: AtomicU8,
     state: Mutex<CanonicalPageState>,
+}
+
+#[repr(u8)]
+enum CpuVisibilityHint {
+    Unavailable,
+    Clean,
+    CpuNewer,
+}
+impl CpuVisibilityHint {
+    fn for_state(visibility: &PageVisibility) -> Self {
+        match visibility {
+            PageVisibility::Clean => Self::Clean,
+            PageVisibility::CpuNewer => Self::CpuNewer,
+            _ => Self::Unavailable,
+        }
+    }
 }
 
 struct CanonicalWriteSnapshot {
@@ -432,7 +448,9 @@ pub(crate) fn prepare_device_pages(
         for &index in &changed {
             let (page, declaration) = &pages[index];
             let state = &mut states[index];
-            page.inner.visibility_clean.store(false, Ordering::Release);
+            page.inner
+                .cpu_visibility
+                .store(CpuVisibilityHint::Unavailable as u8, Ordering::Release);
             if declaration.kind().writes() {
                 let mut bytes = Vec::new();
                 bytes
@@ -753,7 +771,7 @@ impl CanonicalBackingPage {
                 executable_invalidations: OnceLock::new(),
                 // No device representation exists yet. CPU RAM is writable
                 // until an actual consumer arms tracking or takes ownership.
-                visibility_clean: AtomicBool::new(false),
+                cpu_visibility: AtomicU8::new(CpuVisibilityHint::CpuNewer as u8),
                 state: Mutex::new(CanonicalPageState {
                     visibility: PageVisibility::CpuNewer,
                     visibility_epoch: 0,
@@ -792,7 +810,7 @@ impl CanonicalBackingPage {
                 executable_invalidations: OnceLock::new(),
                 // No device representation exists yet. CPU RAM is writable
                 // until an actual consumer arms tracking or takes ownership.
-                visibility_clean: AtomicBool::new(false),
+                cpu_visibility: AtomicU8::new(CpuVisibilityHint::CpuNewer as u8),
                 state: Mutex::new(CanonicalPageState {
                     visibility: PageVisibility::CpuNewer,
                     visibility_epoch: 0,
@@ -958,10 +976,10 @@ impl CanonicalBackingPage {
     /// Returns the conservative authority state shared by every page alias.
     #[must_use]
     pub fn visibility_state(&self) -> VisibilityState {
-        if self.inner.visibility_clean.load(Ordering::Acquire) {
-            VisibilityState::Clean
-        } else {
-            Self::visibility_snapshot(&self.lock_state().visibility)
+        match self.inner.cpu_visibility.load(Ordering::Acquire) {
+            value if value == CpuVisibilityHint::Clean as u8 => VisibilityState::Clean,
+            value if value == CpuVisibilityHint::CpuNewer as u8 => VisibilityState::CpuNewer,
+            _ => Self::visibility_snapshot(&self.lock_state().visibility),
         }
     }
 
@@ -1039,31 +1057,63 @@ impl CanonicalBackingPage {
         expected: u128,
         replacement: u128,
     ) -> Result<(u128, bool), CanonicalPageError> {
+        loop {
+            if let Some(result) =
+                self.try_atomic_compare_exchange(offset, size, expected, replacement)?
+            {
+                return Ok(result);
+            }
+            self.prepare_cpu_access()?;
+        }
+    }
+
+    /// Resolves CPU visibility, dirty publication and the hardware CAS under
+    /// one page lock. None defers device reconciliation outside native admission.
+    /// Checked writers use this lock too; independent native stores remain
+    /// ordered by the actual hardware CAS rather than a software transaction.
+    #[inline]
+    pub fn try_atomic_compare_exchange(
+        &self,
+        offset: usize,
+        size: usize,
+        expected: u128,
+        replacement: u128,
+    ) -> Result<Option<(u128, bool)>, CanonicalPageError> {
         self.checked_end(offset, size)?;
         self.ensure_backing()?;
-        loop {
-            let mut state = self.lock_state();
-            if !Self::cpu_visible_locked(&state)? {
-                drop(state);
-                self.prepare_cpu_access()?;
-                continue;
-            }
-            // Keep dirty publication and the hardware CAS indivisible with
-            // tracking rearm/snapshots. Native atomics use their execution lease
-            // instead; this lock is only on the checked/cold backing path.
-            self.prepare_cpu_write_locked(&mut state)?;
-            return self
-                .inner
-                .backing
-                .get()
-                .expect("atomic access materialized canonical backing")
-                .atomic_compare_exchange(offset, size, expected, replacement)
-                .map_err(|error| {
-                    CanonicalPageError::Visibility(VisibilityError::HostMemory(
-                        error.to_string().into_boxed_str(),
-                    ))
-                });
+        let mut state = self.lock_state();
+        if !Self::cpu_visible_locked(&state)? {
+            return Ok(None);
         }
+        let backing = self
+            .inner
+            .backing
+            .get()
+            .expect("atomic access materialized canonical backing");
+        let fail = |error: crate::host_mapped::HostMappedError| {
+            CanonicalPageError::Visibility(VisibilityError::HostMemory(
+                error.to_string().into_boxed_str(),
+            ))
+        };
+        if state.cpu_dirty_observer_armed || !matches!(state.visibility, PageVisibility::CpuNewer) {
+            // An unsuccessful store changes no bytes or dirty observation.
+            // Already dirty, unobserved RAM needs only the hardware CAS below.
+            let observed = backing.atomic_load(offset, size).map_err(fail)?;
+            // atomic_load validates scalar width before this normalization.
+            let expected_at_width = if size == 16 {
+                expected
+            } else {
+                expected & ((1_u128 << (size * 8)) - 1)
+            };
+            if observed != expected_at_width {
+                return Ok(Some((observed, false)));
+            }
+            self.prepare_cpu_write_locked(&mut state)?;
+        }
+        backing
+            .atomic_compare_exchange(offset, size, expected, replacement)
+            .map(Some)
+            .map_err(fail)
     }
 
     /// Copies an already protected CPU-visible page under shared execution
@@ -1492,7 +1542,9 @@ impl CanonicalBackingPage {
         {
             state.visibility.detach_owner();
         }
-        self.inner.visibility_clean.store(false, Ordering::Release);
+        self.inner
+            .cpu_visibility
+            .store(CpuVisibilityHint::Unavailable as u8, Ordering::Release);
         let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
             state.visibility.detach_owner();
             state.visibility = PageVisibility::Invalid;
@@ -1500,8 +1552,8 @@ impl CanonicalBackingPage {
         };
         state.visibility = visibility;
         state.visibility_epoch = next_epoch;
-        self.inner.visibility_clean.store(
-            matches!(state.visibility, PageVisibility::Clean),
+        self.inner.cpu_visibility.store(
+            CpuVisibilityHint::for_state(&state.visibility) as u8,
             Ordering::Release,
         );
         Ok(())
@@ -1536,7 +1588,9 @@ impl CanonicalBackingPage {
         let Some(next) = self.cpu_dirty_epoch().checked_add(1) else {
             self.revoke_direct_access(state)
                 .map_err(CanonicalPageError::Visibility)?;
-            self.inner.visibility_clean.store(false, Ordering::Release);
+            self.inner
+                .cpu_visibility
+                .store(CpuVisibilityHint::Unavailable as u8, Ordering::Release);
             state.visibility.detach_owner();
             Self::notify_visibility_summaries(state);
             state.visibility = PageVisibility::Invalid;
@@ -1561,15 +1615,21 @@ impl CanonicalBackingPage {
             self.publish_direct_aliases_as(state, DirectProtection::None)
         };
         protection.map_err(|error| {
-            self.inner.visibility_clean.store(false, Ordering::Release);
+            self.inner
+                .cpu_visibility
+                .store(CpuVisibilityHint::Unavailable as u8, Ordering::Release);
             state.visibility.detach_owner();
             Self::notify_visibility_summaries(state);
             state.visibility = PageVisibility::Invalid;
             VisibilityError::HostMemory(error.to_string().into_boxed_str())
         })?;
-        self.inner.visibility_clean.store(false, Ordering::Release);
+        self.inner
+            .cpu_visibility
+            .store(CpuVisibilityHint::Unavailable as u8, Ordering::Release);
         let Some(next_epoch) = state.visibility_epoch.checked_add(1) else {
-            self.inner.visibility_clean.store(false, Ordering::Release);
+            self.inner
+                .cpu_visibility
+                .store(CpuVisibilityHint::Unavailable as u8, Ordering::Release);
             state.visibility.detach_owner();
             Self::notify_visibility_summaries(state);
             state.visibility = PageVisibility::Invalid;
@@ -1943,7 +2003,7 @@ impl CanonicalWriteBatch {
             }
             let _transitions = stores
                 .values()
-                .map(ExecutionGate::acquire_exclusive)
+                .map(|gate| gate.acquire_exclusive())
                 .collect::<Vec<_>>();
             if !self.unstaged_cpu_visible_quiescent(range, offset, end)? {
                 continue;
@@ -2163,7 +2223,7 @@ impl CanonicalWriteBatch {
             }
             let _transitions = stores
                 .values()
-                .map(ExecutionGate::acquire_exclusive)
+                .map(|gate| gate.acquire_exclusive())
                 .collect::<Vec<_>>();
             if !self.unstaged_cpu_visible_quiescent(range, offset, end)? {
                 continue;
@@ -2250,7 +2310,7 @@ impl CanonicalWriteBatch {
         }
         let _transitions = stores
             .values()
-            .map(ExecutionGate::acquire_exclusive)
+            .map(|gate| gate.acquire_exclusive())
             .collect::<Vec<_>>();
 
         // Reserve each stream once, in stable order, only after the engine has
@@ -2333,8 +2393,8 @@ impl CanonicalWriteBatch {
                 .expect("prepared canonical batch write retains its bytes");
             backing
                 .inner
-                .visibility_clean
-                .store(false, Ordering::Release);
+                .cpu_visibility
+                .store(CpuVisibilityHint::Unavailable as u8, Ordering::Release);
             state.visibility.detach_owner();
             CanonicalBackingPage::notify_visibility_summaries(state);
             state.visibility = PageVisibility::CpuNewer;
@@ -2353,6 +2413,10 @@ impl CanonicalWriteBatch {
                 .generation
                 .store(write.next_generation.get(), Ordering::Release);
             state.visibility_epoch = write.next_visibility_epoch;
+            backing
+                .inner
+                .cpu_visibility
+                .store(CpuVisibilityHint::CpuNewer as u8, Ordering::Release);
         }
         drop(states);
         for reservation in reservations {
@@ -3206,6 +3270,59 @@ mod tests {
         let mut observed = [0; 1];
         retained.read(7, &mut observed).unwrap();
         assert_eq!(observed, [0x5a]);
+    }
+
+    #[test]
+    fn failed_native_cas_preserves_protected_observations_and_gpu_ownership() {
+        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let page = &allocation.pages()[0];
+        let observed = crate::CanonicalCpuWriteDependency::capture(&range).unwrap();
+        let epoch = page.cpu_dirty_epoch();
+        assert_eq!(
+            page.try_atomic_compare_exchange(0, 4, 1, 9).unwrap(),
+            Some((0, false))
+        );
+        assert_eq!(page.cpu_dirty_epoch(), epoch);
+        assert!(observed.remains_current());
+        assert_eq!(
+            page.try_atomic_compare_exchange(0, 4, 1_u128 << 64, 7)
+                .unwrap(),
+            Some((0, true)),
+            "subword CAS compares the scalar-width bits"
+        );
+        assert!(!observed.remains_current());
+        let dirty = page.cpu_dirty_epoch();
+        assert_eq!(
+            page.try_atomic_compare_exchange(0, 4, 0, 9).unwrap(),
+            Some((7, false))
+        );
+        assert_eq!(page.cpu_dirty_epoch(), dirty);
+        let coordinator = Arc::new(RecordingCoordinator::with_writeback(vec![0x5a; 0x1000]));
+        let declaration = DeviceAccessDeclaration::write(
+            NonCpuDeviceId::new(3),
+            DeviceVisibilityPoint::new(10),
+            DeviceVisibilityPoint::new(11),
+        )
+        .unwrap();
+        CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&range, declaration)],
+            coordinator.clone(),
+        )
+        .unwrap();
+        CanonicalBackingRange::publish_device_writes([(&range, declaration)], coordinator.clone())
+            .unwrap();
+        assert_eq!(page.try_atomic_compare_exchange(0, 4, 7, 9).unwrap(), None);
+        assert!(
+            coordinator.downloads.lock().unwrap().is_empty(),
+            "native admission never invokes a visibility callback"
+        );
+        assert!(matches!(
+            page.visibility_state(),
+            VisibilityState::GpuNewer { .. }
+        ));
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub(super) struct PendingRangeReduction {
     pub(super) encoding: u64,
     pub(super) predicate: ShaderPredicate,
     pub(super) fusion_valid: bool,
+    pub(super) data_valid: bool,
     pub(super) destination: u8,
     input: ShaderRegister,
     mode: MaxwellRangeReduction,
@@ -124,6 +125,7 @@ pub(super) fn decode_range_reduction(
         encoding,
         predicate,
         fusion_valid: true,
+        data_valid: true,
         destination,
         input,
         mode: if encoding & (1 << 39) == 0 {
@@ -164,7 +166,8 @@ pub(super) fn is_compatible_mufu(
 ) -> bool {
     if !range_reduction.fusion_valid
         || !is_mufu(encoding)
-        || predicate != range_reduction.predicate
+        || (range_reduction.predicate != ShaderPredicate::Always
+            && predicate != range_reduction.predicate)
         || ((encoding >> 8) & 0xff) as u8 != range_reduction.destination
         || encoding & ((1 << 46) | (1 << 48)) != 0
     {

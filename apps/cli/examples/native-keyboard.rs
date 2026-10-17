@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         128 * 1024 * 1024,
     )?;
     renderer.attach_presentation(client)?;
-    let frontend = nixe_gpu_maxwell::MaxwellNativeFrontend::new(renderer.compilation_pool());
+    let frontend = nixe_gpu_maxwell::MaxwellNativeFrontend::new(renderer.shader_translation_pool());
     let video =
         nixe_horizon::VideoSystem::with_gpu_frontend(Some(window.mailbox()), renderer, frontend);
     let control = window.control();

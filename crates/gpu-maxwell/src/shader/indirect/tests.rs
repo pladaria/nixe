@@ -87,6 +87,24 @@ fn bounded_table_tracks_only_its_bytes_and_binding_identity() {
             (16, ShaderSourceLocation::new(72))
         ]
     );
+    // Capturing the table already proves the dynamic load's complete extent.
+    // SSA must retain it instead of importing the whole declared CB, which may
+    // extend past the mapped allocation even though every real read is bounded.
+    let decoded =
+        super::super::translate::decode_shader_binary(&binary, 8, &Default::default(), false)
+            .unwrap();
+    let program = super::super::ssa::MaxwellSsaProgram::new(&binary, decoded).unwrap();
+    let binding = program
+        .bindings
+        .iter()
+        .find(|b| {
+            b.source == super::super::ssa::MaxwellSsaBindingSource::ConstantBuffer { slot: 0 }
+        })
+        .unwrap();
+    assert_eq!(
+        program.constant_buffer_extents()[&binding.resource],
+        Some(12)
+    );
     assert!(table.current(&space));
     assert!(table.binding_current(channel.three_d().shader_bindings()));
     allocation.write(0x80, &[1]).unwrap();

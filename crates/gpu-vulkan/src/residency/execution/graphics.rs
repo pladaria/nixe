@@ -79,6 +79,7 @@ pub struct RenderingTargets {
     pub depth: Option<RenderAttachment>,
     pub stencil: Option<RenderAttachment>,
 }
+#[derive(Clone)]
 struct Attachment {
     description: RenderAttachment,
     plane: ImagePlane,
@@ -86,6 +87,7 @@ struct Attachment {
     format: vk::Format,
     samples: vk::SampleCountFlags,
 }
+#[derive(Clone)]
 pub struct PreparedTargets {
     area: vk::Rect2D,
     colors: Box<[Option<Attachment>]>,
@@ -115,6 +117,8 @@ impl PreparedTargets {
                 .iter()
                 .zip(&other.colors)
                 .all(|(a, b)| same(a, b))
+            && self.native_depth.map(|a| a.store_op) == other.native_depth.map(|a| a.store_op)
+            && self.native_stencil.map(|a| a.store_op) == other.native_stencil.map(|a| a.store_op)
             && same(&self.depth, &other.depth)
             && same(&self.stencil, &other.stencil)
     }
@@ -125,6 +129,23 @@ impl PreparedTargets {
             .chain(self.depth.iter())
             .chain(self.stencil.iter())
     }
+}
+fn read_only_attachment(a: &Attachment, state: &GraphicsState) -> bool {
+    let preserve = a.description.load == vk::AttachmentLoadOp::LOAD
+        && a.description.store == vk::AttachmentStoreOp::STORE;
+    preserve
+        && if a.plane.aspect == vk::ImageAspectFlags::DEPTH {
+            !state.depth_write
+        } else if a.plane.aspect == vk::ImageAspectFlags::STENCIL {
+            !state.stencil_test
+                || [state.front, state.back].iter().all(|s| {
+                    [s.fail, s.pass, s.depth_fail]
+                        .iter()
+                        .all(|op| *op == vk::StencilOp::KEEP)
+                })
+        } else {
+            false
+        }
 }
 pub struct PreparedDraw {
     batchable: bool,
@@ -146,6 +167,59 @@ impl PreparedDraw {
     }
 }
 impl VulkanResidency {
+    /// Consume a draw run's CPU inputs at one shared capture boundary. The
+    /// returned versions remain immutable; later CPU writes belong to a later
+    /// read boundary. Intervening GPU producers still invalidate captured data.
+    /// Fixed-arena admission bounds both the copies and their retained leases.
+    pub(crate) fn capture_draw_inputs<'a>(
+        &mut self,
+        draws: impl Iterator<Item = &'a PreparedDraw>,
+    ) -> Result<buffer::DrawInputBatch, VulkanError> {
+        let limits = self.device.profile().limits;
+        let mut seen = rustc_hash::FxHashMap::<(BufferId, u64, u64), usize>::default();
+        let mut requests: Vec<Option<buffer::BufferStreamRequest>> = Vec::new();
+        let mut add = |request: buffer::BufferStreamRequest| {
+            use std::collections::hash_map::Entry;
+            match seen.entry((request.id, request.offset, request.size)) {
+                Entry::Occupied(index) => {
+                    let old = requests[*index.get()].as_mut().unwrap();
+                    old.alignment = old.alignment.max(request.alignment);
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(requests.len());
+                    requests.push(Some(request));
+                }
+            }
+        };
+        for draw in draws.filter(|draw| draw.can_group()) {
+            for usage in &draw.graphics.program.uses {
+                if let Use::Buffer {
+                    id,
+                    offset,
+                    size,
+                    scope,
+                } = *usage
+                    && !scope.writes()
+                {
+                    add(buffer::BufferStreamRequest {
+                        id,
+                        offset,
+                        size,
+                        alignment: scope.buffer_alignment(&limits),
+                    });
+                }
+            }
+            for vertex in &draw.vertices {
+                add(buffer::BufferStreamRequest {
+                    id: vertex.buffer,
+                    offset: vertex.offset,
+                    size: vertex.size,
+                    alignment: 4,
+                });
+            }
+        }
+        self.capture_buffer_inputs(&requests)
+    }
     pub(crate) fn targets_current(&self, targets: &PreparedTargets) -> bool {
         targets
             .attachments()
@@ -372,15 +446,42 @@ impl VulkanResidency {
                 "rendering attachments differ from the compiled formats/sample count/device",
             ));
         }
+        // Read-only depth/stencil can also be sampled. STORE is allowed to
+        // write even when the pipeline disables depth/stencil updates; use NONE
+        // to preserve the original producer and avoid a render-pass data race.
+        // https://docs.vulkan.org/spec/latest/chapters/renderpass.html#renderpass-common-data-races
+        let mut targets = targets;
+        if targets
+            .attachments()
+            .any(|a| read_only_attachment(a, state))
+        {
+            let targets = Arc::make_mut(&mut targets);
+            for (attachment, native) in [
+                (&targets.depth, &mut targets.native_depth),
+                (&targets.stencil, &mut targets.native_stencil),
+            ] {
+                if attachment
+                    .as_ref()
+                    .is_some_and(|a| read_only_attachment(a, state))
+                {
+                    native.as_mut().unwrap().store_op = vk::AttachmentStoreOp::NONE;
+                }
+            }
+        }
         for resource in &graphics.program.uses {
-            if let Use::Image { id, plane, .. } = resource && targets.attachments().any(|a| {
-                matches!(a.description.source,AttachmentSource::Canonical {image,..} if image==*id)
-                    && a.plane.mip_level == plane.mip_level
-                    && a.plane.array_layer == plane.array_layer
-            }) {
-                return Err(VulkanError::InvalidResource(
-                    "attachment/shader feedback requires an exact snapshot or enabled feedback-loop lowering",
-                ));
+            if let Use::Image { id, plane, scope } = resource {
+                for a in targets.attachments().filter(|a| {
+                    matches!(a.description.source,AttachmentSource::Canonical {image,..} if image==*id)
+                        && a.plane.mip_level == plane.mip_level && a.plane.array_layer == plane.array_layer
+                }) {
+                    // Load/store operations can touch adjacent depth/stencil
+                    // aspects too. Both must be read-only before sharing reads.
+                    if scope.writes() || !read_only_attachment(a, state) {
+                        return Err(VulkanError::InvalidResource(
+                            "attachment/shader feedback requires an exact snapshot or enabled feedback-loop lowering",
+                        ));
+                    }
+                }
             }
         }
         if vertices.len() != state.vertex_bindings.len()
@@ -506,34 +607,45 @@ impl VulkanResidency {
         draws: &[Draw],
         push: &[u8],
     ) -> Result<WorkTicket, VulkanError> {
-        self.record_draws(prepared, draws, push, None)
+        self.record_draws(prepared, draws, push, false, None)
     }
     pub(crate) fn draws_streamed(
         &mut self,
         prepared: &PreparedDraw,
         draws: &[Draw],
         push: &[u8],
-        descriptors: &mut DescriptorCache,
+        inputs: Option<&buffer::DrawInputBatch>,
     ) -> Result<WorkTicket, VulkanError> {
-        self.record_draws(prepared, draws, push, Some(descriptors))
+        self.record_draws(prepared, draws, push, true, inputs)
     }
     fn record_draws(
         &mut self,
         prepared: &PreparedDraw,
         draws: &[Draw],
         push: &[u8],
-        descriptors: Option<&mut DescriptorCache>,
+        streaming: bool,
+        inputs: Option<&buffer::DrawInputBatch>,
     ) -> Result<WorkTicket, VulkanError> {
-        let result = self.record_draws_inner(prepared, draws, push, descriptors);
-        self.device.submission.release_stream_uploads();
-        result
+        loop {
+            let result = self.record_draws_inner(prepared, draws, push, streaming, inputs);
+            self.device.submission.release_stream_uploads();
+            if matches!(result, Err(VulkanError::DescriptorPressure)) {
+                // Descriptor allocation precedes draw emission. Submit the
+                // full slot and retry this draw in a fresh bounded slot; no
+                // guest draw or side effect has been emitted by the failed try.
+                self.flush()?;
+                continue;
+            }
+            return result;
+        }
     }
     fn record_draws_inner(
         &mut self,
         prepared: &PreparedDraw,
         draws: &[Draw],
         push: &[u8],
-        descriptors: Option<&mut DescriptorCache>,
+        streaming: bool,
+        inputs: Option<&buffer::DrawInputBatch>,
     ) -> Result<WorkTicket, VulkanError> {
         if draws.is_empty() {
             return Err(VulkanError::InvalidResource("empty draw group"));
@@ -596,20 +708,23 @@ impl VulkanResidency {
                 _ => {}
             }
         }
-        let streaming = descriptors.is_some() && prepared.can_group() && !empty;
-        let (record, mask) = if streaming {
-            self.stream_program(&graphics.program, descriptors.unwrap())?
+        let streaming = streaming && prepared.can_group() && !empty;
+        let streams = if streaming {
+            self.stream_graphics(&graphics.program, &prepared.vertices, inputs)?
         } else {
-            (None, Vec::new())
+            GraphicsStreams {
+                dynamic_offsets: None,
+                record: None,
+                program_mask: Vec::new(),
+                vertices: vec![None; prepared.vertices.len()],
+            }
         };
+        let record = streams.record;
         let mut vertex_bindings = Vec::with_capacity(prepared.vertices.len());
         let indirect = if !empty {
-            self.program_access_except(&graphics.program, &mask)?;
-            for vertex in &prepared.vertices {
-                if streaming
-                    && let Some((buffer, offset)) =
-                        self.stream_buffer(vertex.buffer, vertex.offset, vertex.size, 4)?
-                {
+            self.program_access_except(&graphics.program, &streams.program_mask)?;
+            for (vertex, stream) in prepared.vertices.iter().zip(streams.vertices) {
+                if let Some((buffer, offset)) = stream {
                     vertex_bindings.push((buffer.handle, offset));
                     continue;
                 }
@@ -678,15 +793,68 @@ impl VulkanResidency {
         } else {
             None
         };
+        let mut color_loads = None::<Vec<vk::RenderingAttachmentInfo<'static>>>;
         for a in prepared.targets.attachments() {
             match a.description.source {
                 AttachmentSource::Canonical { image, .. } => {
                     if a.description.load == vk::AttachmentLoadOp::LOAD {
-                        self.ensure_image_initialized(image, a.plane, prepared.targets.area)?;
+                        let replacement = if a.plane.aspect == vk::ImageAspectFlags::COLOR
+                            && !empty
+                            && !self.image(image)?.discarded.is_empty()
+                        {
+                            self.ensure_image(image)?;
+                            prepared
+                                .targets
+                                .colors
+                                .iter()
+                                .position(|color| {
+                                    color.as_ref().is_some_and(|color| std::ptr::eq(color, a))
+                                })
+                                .filter(|&index| {
+                                    let state = &graphics.parameters.state;
+                                    let blend = &state.colors[index].1;
+                                    !state.logic_enabled
+                                        && !blend.enabled
+                                        && blend.write_mask
+                                            == (vk::ColorComponentFlags::R
+                                                | vk::ColorComponentFlags::G
+                                                | vk::ColorComponentFlags::B
+                                                | vk::ColorComponentFlags::A)
+                                })
+                        } else {
+                            None
+                        };
+                        // LOAD preserves existing texels; it does not mean the
+                        // guest reads the destination. Replacement draws can
+                        // write an incompletely initialized target. Keep LOAD
+                        // when it preserves defined texels; discard only an
+                        // entirely undefined render area.
+                        // https://docs.vulkan.org/refpages/latest/refpages/source/VkAttachmentLoadOp.html
+                        let discard = replacement.filter(|_| {
+                            self.image(image).unwrap().discarded.iter().any(
+                                |&(plane, undefined)| {
+                                    self.image(image).unwrap().planes[plane] == a.plane
+                                        && transfers::contains_rect(
+                                            undefined,
+                                            prepared.targets.area,
+                                        )
+                                },
+                            )
+                        });
+                        if let Some(index) = discard {
+                            color_loads
+                                .get_or_insert_with(|| prepared.targets.native_colors.to_vec())
+                                [index]
+                                .load_op = vk::AttachmentLoadOp::DONT_CARE;
+                        } else if replacement.is_none() {
+                            self.ensure_image_initialized(image, a.plane, prepared.targets.area)?;
+                        }
                     } else {
                         self.ensure_image(image)?;
                     }
-                    self.prepare_image_rect(image, a.plane, prepared.targets.area)?;
+                    if !read_only_attachment(a, &graphics.parameters.state) {
+                        self.prepare_image_rect(image, a.plane, prepared.targets.area)?;
+                    }
                 }
                 AttachmentSource::ResidentOnly(id) => {
                     if a.description.load == vk::AttachmentLoadOp::LOAD
@@ -703,6 +871,11 @@ impl VulkanResidency {
                 }
             }
         }
+        let record = if empty || record.is_some() {
+            record
+        } else {
+            self.program_record(&graphics.program)?
+        };
         // Framebuffer operations in one rendering instance already execute in
         // rasterization order. Only unchanged native attachments can continue;
         // shader writes/feedback, imports and real hazards terminate the scope.
@@ -727,6 +900,11 @@ impl VulkanResidency {
                             | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
                     )
                 };
+                let access = if read_only_attachment(a, &graphics.parameters.state) {
+                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                } else {
+                    access
+                };
                 let scope = AccessScope::new(stages, access);
                 match a.description.source {
                     AttachmentSource::Canonical { image, .. } => {
@@ -745,17 +923,24 @@ impl VulkanResidency {
             self.barriers.emit(&mut self.device);
         }
         let command = if empty {
-            let slot = self.device.submission.begin()?;
+            let slot = self.device.begin_recording()?;
             self.device.submission.slots[slot].command
         } else {
             let command = self.program_bind_record(
                 &graphics.program,
                 push,
-                record.as_ref().or(graphics.program.record.as_ref()),
+                record.as_ref(),
+                streams
+                    .dynamic_offsets
+                    .as_deref()
+                    .unwrap_or(&graphics.program.dynamic_offsets),
             )?;
             self.graphics_state(graphics)?;
             command
         };
+        if let Some(offsets) = streams.dynamic_offsets {
+            self.descriptor_offsets = offsets;
+        }
         let index = self.device.submission.recording.unwrap();
         let slot = &mut self.device.submission.slots[index];
         if slot
@@ -790,7 +975,7 @@ impl VulkanResidency {
                 let mut info = vk::RenderingInfo::default()
                     .render_area(targets.area)
                     .layer_count(1)
-                    .color_attachments(&targets.native_colors);
+                    .color_attachments(color_loads.as_deref().unwrap_or(&targets.native_colors));
                 if let Some(depth) = &targets.native_depth {
                     info = info.depth_attachment(depth);
                 }
@@ -864,9 +1049,39 @@ impl VulkanResidency {
             self.program_written(&graphics.program)?;
         }
         for a in prepared.targets.attachments() {
+            if read_only_attachment(a, &graphics.parameters.state) {
+                continue;
+            }
             match a.description.source {
                 AttachmentSource::Canonical { image, .. } => {
-                    if continuing {
+                    let incomplete = a.description.load == vk::AttachmentLoadOp::LOAD
+                        && self
+                            .image(image)?
+                            .discarded
+                            .iter()
+                            .any(|&(index, undefined)| {
+                                self.image(image).unwrap().planes[index] == a.plane
+                                    && transfers::intersects(undefined, prepared.targets.area)
+                            });
+                    if incomplete {
+                        // STORE preserves old defined contents and the draw
+                        // can produce only inside its scissors. Do not publish
+                        // undefined padding as newly written guest bytes.
+                        let regions = preserved_draw_rects(
+                            prepared.targets.area,
+                            self.image(image)?
+                                .discarded
+                                .iter()
+                                .filter_map(|&(index, rect)| {
+                                    (self.image(image).unwrap().planes[index] == a.plane)
+                                        .then_some(rect)
+                                }),
+                            &graphics.parameters.scissors,
+                        );
+                        for rect in regions {
+                            self.finish_image_rect(image, a.plane, rect)?;
+                        }
+                    } else if continuing {
                         // The first draw already published this exact coverage
                         // at the current ticket. A continued LOAD/STORE scope
                         // permits no shader writes, attachment feedback, native
@@ -898,4 +1113,30 @@ impl VulkanResidency {
         }
         self.device.work_ticket()
     }
+}
+
+/// The cold path for a target that still has undefined texels. Ordinary draws
+/// retain the single-rectangle publication and continued-rendering fast path.
+fn preserved_draw_rects(
+    area: vk::Rect2D,
+    undefined: impl Iterator<Item = vk::Rect2D>,
+    scissors: &[vk::Rect2D],
+) -> Vec<vk::Rect2D> {
+    let mut produced = vec![area];
+    for undefined in undefined {
+        let mut untouched = vec![undefined];
+        for &scissor in scissors {
+            untouched = untouched
+                .into_iter()
+                .flat_map(|rect| transfers::subtract_rect(rect, scissor))
+                .collect();
+        }
+        for untouched in untouched {
+            produced = produced
+                .into_iter()
+                .flat_map(|rect| transfers::subtract_rect(rect, untouched))
+                .collect();
+        }
+    }
+    produced
 }
