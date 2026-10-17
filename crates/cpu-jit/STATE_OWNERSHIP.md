@@ -77,14 +77,27 @@ Sources: [dispatch](../runtime/src/process/dispatch.rs),
 
 ## Exclusive monitors
 
-Reservations are not serialized with architectural state. Dynarmic owns the
-process-wide monitor and core-local reservation. A changed worker guest ID clears
+Reservations are not serialized with architectural state. On the validated
+x86-64 host, canonical physical pages own versioned 64-byte reservation granules;
+Dynarmic owns only the core-local physical identity, address, size and captured
+version. Generated writes and checked/device publications share those physical
+versions, including aliases and intervening change-and-restore writes. Pages
+activate monitoring once under execution exclusion; warmed exclusives use no
+memory callbacks or page mutexes. Other host emitters retain their backend-specific
+monitor and require separate hardware validation. A changed worker guest ID clears
 local exclusives; re-entry of the same resident guest through an ordinary budget
 boundary preserves the existing policy. Migration explicitly clears the source.
 The vendored x86-64 SVC emission also clears local exclusives. Tests of reservation
 retention therefore stop before SVC. These rules never fabricate exclusive success.
 
-The interpreter keeps its independent state/monitor and differential role.
+Faulting exclusive stores release the generated monitor before checked handling.
+The handler validates the physical identity/version again and publishes observation
+changes only with a committed conditional write. Visibility waits run after the
+native slice releases admission. Transient observation/ownership faults retain
+fastmem; persistent exceptional mappings may recompile only the affected access.
+
+The interpreter keeps its independent local-monitor state and differential role,
+using the same physical write-version contract.
 Its checked instruction executor also completes cold MMIO memory instructions
 and interrupted ordinary store tails after native return; unsupported Dynarmic
 instructions remain errors. The store continuation matches the failed start VA

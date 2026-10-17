@@ -3,12 +3,36 @@
 use super::*;
 use crate::device::DeviceOwner;
 use ash::vk;
+
+pub(super) fn select_present_mode(
+    vsync: bool,
+    modes: &[vk::PresentModeKHR],
+) -> Result<vk::PresentModeKHR, VulkanError> {
+    // IMMEDIATE does not wait for vertical blank; MAILBOX still does.
+    // https://docs.vulkan.org/refpages/latest/refpages/source/VkPresentModeKHR.html
+    let mode = if vsync {
+        vk::PresentModeKHR::FIFO
+    } else {
+        vk::PresentModeKHR::IMMEDIATE
+    };
+    if modes.contains(&mode) {
+        Ok(mode)
+    } else {
+        Err(VulkanError::InvalidResource(if vsync {
+            "surface does not support FIFO presentation for VSync"
+        } else {
+            "VSync is disabled, but the surface does not support IMMEDIATE presentation"
+        }))
+    }
+}
+
 /// Only read-only timeline queries cross the graphics-owner boundary.
 struct Context {
     owner: Arc<DeviceOwner>,
     queues: crate::device::QueueSelection,
     timeline: vk::Semaphore,
     mutable_format: bool,
+    vsync: bool,
     acquire_count: usize,
 }
 impl Context {
@@ -97,6 +121,7 @@ struct Swapchains {
     requested: [u32; 2],
     present_queue: vk::Queue,
     safe_to_drop: bool,
+    vsync: bool,
 }
 impl Swapchains {
     pub fn new(device: &Context) -> Result<Self, VulkanError> {
@@ -117,6 +142,7 @@ impl Swapchains {
             requested: [0, 0],
             present_queue,
             safe_to_drop: true,
+            vsync: device.vsync,
         };
         for _ in 0..device.acquire_count {
             let semaphore = unsafe {
@@ -255,6 +281,17 @@ impl Swapchains {
             vk::Format::B8G8R8A8_SRGB => vk::Format::B8G8R8A8_UNORM,
             format => format,
         };
+        let modes = unsafe {
+            surface
+                .loader
+                .get_physical_device_surface_present_modes(device.owner.physical, surface.handle)
+        }
+        .map_err(|e| VulkanError::vk("surface present modes", e))?;
+        let present_mode = select_present_mode(self.vsync, &modes)?;
+        log::info!(
+            "Vulkan presentation: vsync={} mode={present_mode:?}",
+            self.vsync
+        );
         let view_formats = [format.format, view_format];
         let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
         let graphics = device.queues.graphics_compute_family;
@@ -270,7 +307,7 @@ impl Swapchains {
             .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
             .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::FIFO)
+            .present_mode(present_mode)
             .clipped(true)
             .old_swapchain(
                 self.current
@@ -550,7 +587,11 @@ enum Event {
     Failed(VulkanError),
 }
 impl Presenter {
-    pub fn new(device: &VulkanDevice, client: PresentationClient) -> Result<Self, VulkanError> {
+    pub fn new(
+        device: &VulkanDevice,
+        client: PresentationClient,
+        vsync: bool,
+    ) -> Result<Self, VulkanError> {
         if device.owner.instance.surface.is_none() {
             return Err(VulkanError::InvalidResource(
                 "native presentation requires the startup window surface",
@@ -574,6 +615,7 @@ impl Presenter {
             },
             timeline: device.submission.timeline,
             mutable_format: device.profile().swapchain_mutable_format,
+            vsync,
             // Pools are allocated lazily; use configured capacity at startup.
             acquire_count: device.submission.configuration.command_slots,
         };

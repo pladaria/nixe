@@ -31,11 +31,15 @@ impl std::fmt::Display for JitError {
 }
 impl std::error::Error for JitError {}
 
-// The monitor is internally synchronized by Dynarmic. It outlives every core,
-// including scheduler control handles retained after a worker is dropped.
+// Non-x86 hosts retain Dynarmic's backend-specific monitor. x86 physical
+// reservations live with canonical pages and need no global monitor object.
+#[cfg(not(target_arch = "x86_64"))]
 struct Monitor(*mut c_void);
+#[cfg(not(target_arch = "x86_64"))]
 unsafe impl Send for Monitor {}
+#[cfg(not(target_arch = "x86_64"))]
 unsafe impl Sync for Monitor {}
+#[cfg(not(target_arch = "x86_64"))]
 impl Drop for Monitor {
     fn drop(&mut self) {
         unsafe { ffi::nixe_dynarmic_monitor_destroy(self.0) }
@@ -62,6 +66,7 @@ pub struct JitProcess {
     cpu: ProcessCpuContext,
     memory: Arc<ExecutionMemory>,
     arena: DirectAddressSpaceView,
+    #[cfg(not(target_arch = "x86_64"))]
     monitor: Arc<Monitor>,
     cores: Mutex<Vec<Weak<Native>>>,
     stopped: AtomicBool,
@@ -79,13 +84,20 @@ impl JitProcess {
         let arena = memory
             .direct_address_space_view(cpu.address_space_id())
             .ok_or_else(|| JitError("Dynarmic requires a direct memory arena".into()))?;
+        if !arena.address_space_size.is_power_of_two() {
+            return Err(JitError(
+                "Dynarmic fastmem confinement requires a power-of-two address space".into(),
+            ));
+        }
         let frequency = u32::try_from(timer_frequency)
             .ok()
             .filter(|f| *f != 0)
             .ok_or_else(|| {
                 JitError("architectural timer frequency must fit a nonzero u32".into())
             })?;
+        #[cfg(not(target_arch = "x86_64"))]
         let monitor = unsafe { ffi::nixe_dynarmic_monitor_create(64) };
+        #[cfg(not(target_arch = "x86_64"))]
         if monitor.is_null() {
             return Err(JitError(ffi::error()));
         }
@@ -93,6 +105,7 @@ impl JitProcess {
             cpu,
             memory,
             arena,
+            #[cfg(not(target_arch = "x86_64"))]
             monitor: Arc::new(Monitor(monitor)),
             cores: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
@@ -161,9 +174,19 @@ impl JitThread {
         let pointer = unsafe {
             ffi::nixe_dynarmic_create(
                 callbacks::table(),
-                process.monitor.0,
+                {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        std::ptr::null_mut()
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        process.monitor.0
+                    }
+                },
                 id,
                 arena.base,
+                arena.exclusive_page_table,
                 arena.address_space_size.trailing_zeros() as usize,
                 process.frequency,
                 register(0xd53b_0020),
@@ -379,11 +402,11 @@ impl JitThread {
                     &lease,
                     process.cpu.address_space_id(),
                 ),
-                arena: process.arena,
                 cpu: process.cpu,
                 timer,
                 blocked_fetches: &mut self.blocked_fetches,
                 visibility: None,
+                exclusive_prepare: None,
                 device_access: false,
                 store_resume: None,
                 data_fault: None,
@@ -420,6 +443,7 @@ impl JitThread {
             let data_fault = context.data_fault;
             let fatal = context.fatal;
             let visibility = context.visibility;
+            let exclusive_prepare = context.exclusive_prepare;
             let device_access = context.device_access;
             let store_resume = context.store_resume;
             drop(active);
@@ -427,6 +451,11 @@ impl JitThread {
             progress = progress.saturating_add(exit.ticks);
             if let Some(error) = fatal {
                 return Err(fault(error, state, progress));
+            }
+            if let Some(page) = exclusive_prepare {
+                page.enable_exclusive_access()
+                    .map_err(|error| fault(error.to_string(), state, progress))?;
+                continue;
             }
             if store_resume.is_none()
                 && let Some(page) = visibility

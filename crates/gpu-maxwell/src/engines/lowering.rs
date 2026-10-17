@@ -165,7 +165,7 @@ impl MaxwellThreeDOperationTrigger {
                 }
             }
             Self::DrawVertexArray { .. } | Self::DrawIndexBuffer { .. } => {
-                if self.is_indexed() {
+                if self.is_indexed() && state.inline_index().is_none() {
                     roles.push(MaxwellThreeDResourceRole::IndexBuffer);
                 }
                 roles.extend(

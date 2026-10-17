@@ -43,6 +43,8 @@ pub struct NixeConfig {
     pub cpu: CpuConfig,
     /// GPU shader, pipeline, and backend-derived cache policy.
     pub gpu: GpuCacheConfiguration,
+    /// Host presentation preferences.
+    pub video: VideoConfig,
     /// Host gamepad identification and emulated-controller mappings.
     pub input: InputConfig,
     /// Application audio output layout.
@@ -124,6 +126,7 @@ impl NixeConfig {
             },
             cpu,
             gpu,
+            video: raw.video,
             input: raw.input,
             audio: raw.audio,
             source_path,
@@ -391,6 +394,19 @@ pub struct AudioConfig {
     pub output: nixe_audio::ChannelLayout,
 }
 
+/// Host presentation policy, independent of guest display timing.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct VideoConfig {
+    /// Synchronize host presentation to the monitor's vertical refresh.
+    pub vsync: bool,
+}
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self { vsync: true }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -405,6 +421,8 @@ struct RawConfig {
     cpu: RawCpuConfig,
     #[serde(default)]
     gpu: RawGpuConfig,
+    #[serde(default)]
+    video: VideoConfig,
     #[serde(default)]
     input: InputConfig,
     #[serde(default)]
@@ -922,6 +940,33 @@ mod tests {
             ));
             NixeConfig::load(&file.path).unwrap();
         }
+    }
+
+    #[test]
+    fn host_vsync_defaults_to_enabled_and_accepts_an_explicit_boolean() {
+        let base = r#"
+            version = 2
+            [library]
+            paths = []
+            [system]
+            preferred_languages = []
+            keys = "keys"
+            initial_operation_mode = "handheld"
+        "#;
+        for (section, expected) in [
+            ("", true),
+            ("[video]", true),
+            ("[video]\nvsync = true", true),
+            ("[video]\nvsync = false", false),
+        ] {
+            let file = TemporaryConfig::new(&format!("{base}\n{section}"));
+            assert_eq!(NixeConfig::load(&file.path).unwrap().video.vsync, expected);
+        }
+        let invalid = TemporaryConfig::new(&format!("{base}\n[video]\nvsync = \"false\""));
+        assert!(matches!(
+            NixeConfig::load(&invalid.path),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 
     #[test]

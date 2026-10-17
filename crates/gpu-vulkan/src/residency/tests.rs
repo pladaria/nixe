@@ -838,6 +838,58 @@ fn presentation_lease_pins_version_until_last_reference() {
     validation.check().unwrap();
 }
 #[test]
+fn cpu_baseline_reuses_exact_revisions_and_outlives_canonical_acknowledgement() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (allocation, range) = backing_allocation(4096, 4096, 0x31);
+    let id = buffer(&mut cache, range.clone());
+    let page = range.pages().next().unwrap().identity();
+    cache.prepare_write(Resource::Buffer(id), 12, 4).unwrap();
+    let baseline = Arc::clone(&cache.visibility.pages.lock().unwrap()[&page].baseline);
+    cache.prepare_write(Resource::Buffer(id), 16, 4).unwrap();
+    assert!(
+        Arc::ptr_eq(
+            &baseline,
+            &cache.visibility.pages.lock().unwrap()[&page].baseline
+        ),
+        "unchanged CPU input must not allocate/copy a new baseline"
+    );
+    write(&mut cache, id, 12, &[0x45; 4]);
+    cache.flush().unwrap();
+    assert!(Arc::ptr_eq(
+        &baseline,
+        &cache.visibility.pages.lock().unwrap()[&page].baseline
+    ));
+    let bytes = cpu_read(&mut cache, &range);
+    assert_eq!(&bytes[12..16], &[0x45; 4]);
+    cache.drain_notifications();
+    assert!(
+        cache.visibility.pages.lock().unwrap().contains_key(&page),
+        "resident aliases still need the preserved baseline after CPU acknowledgement"
+    );
+    allocation.write(32, &[0x67; 4]).unwrap();
+    cache.prepare_write(Resource::Buffer(id), 16, 4).unwrap();
+    let changed = Arc::clone(&cache.visibility.pages.lock().unwrap()[&page].baseline);
+    assert!(!Arc::ptr_eq(&baseline, &changed));
+    assert_eq!(&changed[12..16], &[0x45; 4]);
+    assert_eq!(&changed[32..36], &[0x67; 4]);
+    write(&mut cache, id, 16, &[0x89; 4]);
+    cache.flush().unwrap();
+    let bytes = cpu_read(&mut cache, &range);
+    assert_eq!(
+        &bytes[12..20],
+        &[0x45, 0x45, 0x45, 0x45, 0x89, 0x89, 0x89, 0x89]
+    );
+    assert_eq!(&bytes[32..36], &[0x67; 4]);
+    drop(baseline);
+    drop(changed);
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
 fn stale_cpu_acknowledgement_cannot_release_newer_producer() {
     let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
         return;
@@ -1341,7 +1393,11 @@ fn cpu_visibility_routes_to_the_single_owner() {
     assert_eq!(worker.join().unwrap(), [0x43; 4]);
     cache.drain_notifications();
     assert!(!cache.authoritative(Resource::Buffer(id)));
-    assert!(cache.visibility.pages.lock().unwrap().is_empty());
+    assert_eq!(
+        cache.visibility.pages.lock().unwrap().len(),
+        1,
+        "a resident alias retains its baseline independently of completed producer authority"
+    );
     drop(cache);
     validation.check().unwrap();
 }

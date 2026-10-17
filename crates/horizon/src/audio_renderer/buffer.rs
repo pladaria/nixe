@@ -11,7 +11,7 @@ pub(super) struct Attachment {
 impl Attachment {
     pub(super) fn read(&self, offset: u64, bytes: &mut [u8]) -> Result<(), Box<str>> {
         self.backing
-            .read(offset, bytes)
+            .read_word_stream(offset, bytes)
             .map_err(|e| format!("rendering: audio buffer read failed: {e}").into())
     }
 }

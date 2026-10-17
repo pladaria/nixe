@@ -1082,37 +1082,6 @@ impl CpuMemory for SyntheticMemory {
         Ok(())
     }
 
-    fn resolve_exclusive_load(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        value: MemoryValue,
-    ) -> Result<crate::exclusive::ExclusiveReservation, DataAccessFault> {
-        let access = MemoryAccess::new(
-            value.size(),
-            MemoryAlignment::Natural,
-            super::MemoryOrdering::Relaxed,
-            MemoryAccessClass::Exclusive,
-        );
-        let inner = self.lock_inner();
-        let resolved =
-            resolve_access(&inner, address_space, address, access, DataAccessKind::Read)?;
-        if resolved.second.is_some() || resolved.region != MemoryRegionKind::Ram {
-            return Err(DataAccessFault::new(
-                address_space,
-                address,
-                DataAccessKind::Read,
-                DataAccessFaultReason::MixedRegions,
-            ));
-        }
-        Ok(crate::exclusive::ExclusiveReservation {
-            page: resolved.first.physical_page,
-            byte_offset: page_offset(address) as u16,
-            access_size: value.size().bytes() as u8,
-            expected: value,
-        })
-    }
-
     fn load_exclusive(
         &self,
         address_space: AddressSpaceId,
@@ -1131,7 +1100,7 @@ impl CpuMemory for SyntheticMemory {
             ));
         }
         let mapping = resolved.first;
-        let PhysicalPage::Ram { bytes, .. } = inner
+        let PhysicalPage::Ram { bytes, generation } = inner
             .pages
             .get(&mapping.physical_page)
             .expect("mapping references a page")
@@ -1160,7 +1129,7 @@ impl CpuMemory for SyntheticMemory {
                 page: mapping.physical_page,
                 byte_offset: page_offset(address) as u16,
                 access_size: access.size.bytes() as u8,
-                expected: value,
+                version: generation.get(),
             },
         ))
     }
@@ -1219,40 +1188,55 @@ impl CpuMemory for SyntheticMemory {
                 false,
             ));
         }
-        if reservation.expected.size() != access.size {
+        let PhysicalPage::Ram { generation, .. } =
+            inner.pages.get(&resolved.first.physical_page).unwrap()
+        else {
+            unreachable!()
+        };
+        if generation.get() != reservation.version {
+            return Ok((
+                DataWriteResult {
+                    region: MemoryRegionKind::Ram,
+                },
+                false,
+            ));
+        }
+        if let Some(reason) =
+            inner
+                .data_faults
+                .get(&(address_space, address, DataAccessKind::Write))
+        {
             return Err(DataAccessFault::new(
                 address_space,
                 address,
                 DataAccessKind::Write,
-                DataAccessFaultReason::ValueSizeMismatch,
+                DataAccessFaultReason::Injected(reason.clone()),
             ));
         }
-        let atomic_access = MemoryAccess::new(
-            access.size,
-            MemoryAlignment::Natural,
-            access.ordering,
-            MemoryAccessClass::Atomic,
-        );
-        // Keep the same mapping lock from the physical-identity check through
-        // the transaction. A second virtual lookup must not select another page.
-        let result = Self::atomic_transaction_locked(
-            &mut inner,
-            address_space,
-            address,
-            atomic_access,
-            |previous| {
-                if previous == reservation.expected {
-                    (value, true)
-                } else {
-                    (previous, false)
-                }
-            },
-        )?;
+        super::contracts::begin_ordered_write(access.ordering);
+        let PhysicalPage::Ram { bytes, generation } =
+            inner.pages.get_mut(&resolved.first.physical_page).unwrap()
+        else {
+            unreachable!()
+        };
+        let next = generation.next().map_err(|_| {
+            DataAccessFault::new(
+                address_space,
+                address,
+                DataAccessKind::Write,
+                DataAccessFaultReason::ContentGenerationExhausted,
+            )
+        })?;
+        let bytes = bytes.get_or_insert_with(|| Box::new([0; SYNTHETIC_PAGE_SIZE]));
+        let offset = page_offset(address);
+        value.copy_le_bytes(&mut bytes[offset..offset + access.size.bytes()]);
+        *generation = next;
+        super::contracts::complete_ordered_read(access.ordering);
         Ok((
             DataWriteResult {
                 region: MemoryRegionKind::Ram,
             },
-            result.stored,
+            true,
         ))
     }
 
@@ -3279,159 +3263,6 @@ mod tests {
     }
 
     #[test]
-    fn native_exclusive_load_handoff_preserves_identity_and_observed_bits() {
-        fn check(mut memory: impl CpuMemory + MemorySetup) {
-            let other = GuestVirtualAddress::new(0x9000);
-            assert!(memory.add_ram_page(PAGE_1));
-            assert!(memory.add_ram_page(PAGE_2));
-            for (address, page) in [(CODE, PAGE_1), (ALIAS, PAGE_1), (other, PAGE_2)] {
-                assert!(memory.map_page(SPACE, address, page, MemoryPermissions::READ_WRITE));
-            }
-            let _lease = memory.acquire_execution_lease();
-            let address = CODE.checked_add(32).unwrap();
-            let alias = ALIAS.checked_add(32).unwrap();
-            let other = other.checked_add(32).unwrap();
-            for size in [
-                MemoryAccessSize::Byte,
-                MemoryAccessSize::Halfword,
-                MemoryAccessSize::Word,
-                MemoryAccessSize::Doubleword,
-                MemoryAccessSize::Quadword,
-            ] {
-                let access = MemoryAccess::new(
-                    size,
-                    MemoryAlignment::Natural,
-                    MemoryOrdering::AcquireRelease,
-                    MemoryAccessClass::Exclusive,
-                );
-                let ordinary = MemoryAccess::normal(size);
-                let observed =
-                    MemoryValue::from_bits(size, 0x1234_5678_9abc_def0_fedc_ba98_7654_3210);
-                let changed = MemoryValue::from_bits(size, !observed.bits());
-                memory.write(SPACE, address, ordinary, observed).unwrap();
-                let (loaded, expected) = memory.load_exclusive(SPACE, address, access).unwrap();
-                // Simulate another CPU writing after the native load but before
-                // the exit-side handoff. Resolving must not load these new bits.
-                memory.write(SPACE, alias, ordinary, changed).unwrap();
-                let reservation = memory
-                    .resolve_exclusive_load(SPACE, address, loaded.value)
-                    .unwrap();
-                assert_eq!(reservation, expected);
-                assert_eq!(reservation.page, PAGE_1);
-                assert_eq!(reservation.byte_offset, 32);
-                assert_eq!(reservation.access_size, size.bytes() as u8);
-                assert_eq!(reservation.expected, observed);
-                assert_eq!(
-                    memory
-                        .resolve_exclusive_load(SPACE, alias, loaded.value)
-                        .unwrap(),
-                    reservation
-                );
-                assert!(
-                    !memory
-                        .store_exclusive(SPACE, alias, access, observed, reservation)
-                        .unwrap()
-                        .1
-                );
-                assert_eq!(
-                    memory.read(SPACE, address, ordinary).unwrap().value,
-                    changed
-                );
-
-                // Identical bits on a different physical page are not this
-                // reservation; the physical alias, however, can consume it.
-                memory.write(SPACE, other, ordinary, observed).unwrap();
-                assert!(
-                    !memory
-                        .store_exclusive(SPACE, other, access, changed, reservation)
-                        .unwrap()
-                        .1
-                );
-                assert_eq!(memory.read(SPACE, other, ordinary).unwrap().value, observed);
-                memory.write(SPACE, address, ordinary, observed).unwrap();
-                assert!(
-                    memory
-                        .store_exclusive(SPACE, alias, access, changed, reservation)
-                        .unwrap()
-                        .1
-                );
-                assert_eq!(
-                    memory.read(SPACE, address, ordinary).unwrap().value,
-                    changed
-                );
-            }
-        }
-        check(SyntheticMemory::new());
-        check(ExecutionMemory::new());
-    }
-
-    #[test]
-    fn native_exclusive_load_handoff_rejects_invalid_mappings_without_mmio() {
-        let device = GuestVirtualAddress::new(0x9000);
-        let device_page = GuestPhysicalPageId::new(99);
-        let mut synthetic = SyntheticMemory::new();
-        let mut execution = ExecutionMemory::new();
-        let events = Arc::new(Mutex::new(Vec::new()));
-        assert!(synthetic.add_mmio_page(
-            device_page,
-            RecordingMmio {
-                events: Arc::clone(&events)
-            }
-        ));
-        assert!(execution.add_mmio_page(
-            device_page,
-            RecordingMmio {
-                events: Arc::clone(&events)
-            }
-        ));
-        for memory in [
-            &mut synthetic as &mut dyn MemorySetup,
-            &mut execution as &mut dyn MemorySetup,
-        ] {
-            assert!(memory.add_ram_page(PAGE_1));
-            assert!(memory.map_page(SPACE, CODE, PAGE_1, MemoryPermissions::READ));
-            assert!(memory.map_page(SPACE, ALIAS, PAGE_1, MemoryPermissions::NONE));
-            assert!(memory.map_page(SPACE, device, device_page, MemoryPermissions::READ_WRITE));
-        }
-        for memory in [&synthetic as &dyn CpuMemory, &execution as &dyn CpuMemory] {
-            let _lease = memory.acquire_execution_lease();
-            let observed = MemoryValue::U32(0x1234_5678);
-            // Read-only RAM is valid: identity resolution must not require CAS
-            // write permissions or perform a read-modify-write on the backing.
-            assert_eq!(
-                memory
-                    .resolve_exclusive_load(SPACE, CODE, observed)
-                    .unwrap()
-                    .expected,
-                observed
-            );
-            for (address, reason) in [
-                (
-                    GuestVirtualAddress::new(0xd000),
-                    DataAccessFaultReason::Unmapped,
-                ),
-                (ALIAS, DataAccessFaultReason::ReadPermissionDenied),
-                (
-                    CODE.checked_add(1).unwrap(),
-                    DataAccessFaultReason::Misaligned {
-                        required_alignment: 4,
-                    },
-                ),
-                (device, DataAccessFaultReason::MixedRegions),
-            ] {
-                let fault = memory
-                    .resolve_exclusive_load(SPACE, address, observed)
-                    .unwrap_err();
-                assert_eq!(fault.address_space, SPACE);
-                assert_eq!(fault.address, address);
-                assert_eq!(fault.kind, DataAccessKind::Read);
-                assert_eq!(fault.reason, reason);
-            }
-        }
-        assert!(events.lock().unwrap().is_empty());
-    }
-
-    #[test]
     fn production_and_synthetic_mapping_management_and_exclusives_match() {
         let mut synthetic = SyntheticMemory::new();
         let mut execution = ExecutionMemory::new();
@@ -3469,7 +3300,15 @@ mod tests {
         let (execution_value, execution_reservation) =
             execution.load_exclusive(SPACE, base, access).unwrap();
         assert_eq!(synthetic_value, execution_value);
-        assert_eq!(synthetic_reservation, execution_reservation);
+        assert_eq!(synthetic_reservation.page, execution_reservation.page);
+        assert_eq!(
+            synthetic_reservation.byte_offset,
+            execution_reservation.byte_offset
+        );
+        assert_eq!(
+            synthetic_reservation.access_size,
+            execution_reservation.access_size
+        );
         assert_eq!(
             synthetic.store_exclusive(
                 SPACE,

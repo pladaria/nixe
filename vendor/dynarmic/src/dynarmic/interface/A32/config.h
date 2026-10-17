@@ -188,6 +188,10 @@ struct UserConfig {
     /// Recompiled code will use the page_table if this is available, otherwise memory
     /// accesses will hit the memory callbacks.
     bool recompile_on_fastmem_failure = true;
+    /// Optional per-core external-fault classification, read only in the cold
+    /// fault callback. Persistent exceptional accesses may be recompiled while
+    /// transient tracking/ownership faults retain generated direct accesses.
+    const bool* persistent_fastmem_fault = nullptr;
 
     /// Determines if we should use the above fastmem_pointer for exclusive reads and
     /// writes. On x64, dynarmic currently relies on x64 cmpxchg semantics which may not

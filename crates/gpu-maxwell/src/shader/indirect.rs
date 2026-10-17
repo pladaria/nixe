@@ -77,8 +77,9 @@ impl IndirectTable {
         }
         // Tables may share pages with frequently changing constants. Compare
         // only their actual bytes rather than invalidating a shader per frame.
-        let mut bytes = vec![0; self.bytes.len()];
-        self.range.read(0, &mut bytes).is_ok() && bytes == *self.bytes
+        self.cpu_writes
+            .confirm_unchanged(&self.bytes)
+            .unwrap_or(false)
     }
     pub fn staged_current(&self, writes: &CanonicalWriteBatch) -> bool {
         match writes.overlaps(&self.range, 0, self.bytes.len() as u64) {

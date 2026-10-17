@@ -903,6 +903,19 @@ impl DirectMemorySlice<'_> {
                 .map(|_| ())
                 .map_err(DirectMemoryAccessError::DataFault);
         };
+        // Fixed interpreter stubs have no inline monitor protocol. A page
+        // activated for exclusives therefore uses the checked physical writer;
+        // unmonitored RAM keeps its existing native store. The batch's mapping
+        // lease also excludes first activation between this test and the store.
+        let entry = self.frontend.arena.exclusive_page_table
+            + (address.get() as usize / DIRECT_PAGE_SIZE) * std::mem::size_of::<usize>();
+        if unsafe { &*(entry as *const std::sync::atomic::AtomicUsize) }.load(Ordering::Acquire) > 1
+        {
+            return memory
+                .write(self.frontend.address_space, address, access, value)
+                .map(|_| ())
+                .map_err(DirectMemoryAccessError::DataFault);
+        }
         let mut call = StubCall::new(pointer, value.bits(), memory);
         self.invoke(&mut call, memory_stub(size, DataAccessKind::Write))?;
         call.finish()
@@ -3059,7 +3072,7 @@ mod tests {
         .unwrap();
         nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&range, declaration)],
-            Arc::clone(&coordinator),
+            coordinator.as_ref(),
         )
         .unwrap();
         nixe_memory::CanonicalBackingRange::publish_device_writes(

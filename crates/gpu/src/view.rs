@@ -1,6 +1,7 @@
 //! Checked resource interpretations over explicit canonical backing ranges.
 
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 use crate::{BackingView, BufferDescription, BufferId, ImageDescription, ImageId};
 
@@ -206,7 +207,8 @@ impl ImageSubresourceBinding {
 pub struct ImageView {
     image: ImageId,
     swizzle: Swizzle,
-    bindings: Box<[ImageSubresourceBinding]>,
+    // Reidentifying a checked view never rebuilds its immutable subresource map.
+    bindings: Arc<[ImageSubresourceBinding]>,
     storage: ImageStorage,
 }
 
@@ -250,7 +252,7 @@ impl ImageView {
                 backing,
             })
             .collect::<Vec<_>>()
-            .into_boxed_slice();
+            .into();
         Ok(Self {
             image,
             swizzle,
@@ -479,6 +481,44 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn reidentified_image_views_share_topology_and_keep_storage_policy_independent() {
+        let view = ImageView::new(
+            ImageId::new(1),
+            description(),
+            Swizzle::IDENTITY,
+            vec![(
+                ImageSubresourceRange {
+                    plane: 0,
+                    mip_level: 0,
+                    base_layer: 0,
+                    layer_count: 1,
+                },
+                ImageMemoryLayout::PitchLinear {
+                    row_pitch: 64,
+                    layer_stride: 512,
+                },
+                backing(1, 512),
+            )],
+        )
+        .unwrap();
+        let changed = view
+            .clone()
+            .with_image(ImageId::new(2))
+            .with_resident_only_storage();
+        assert!(std::ptr::eq(view.bindings(), changed.bindings()));
+        assert_eq!(view.image(), ImageId::new(1));
+        assert_eq!(changed.image(), ImageId::new(2));
+        assert!(view.can_initialize_from_canonical_texels());
+        assert!(!changed.can_initialize_from_canonical_texels());
+        let range = changed.bindings()[0].backing().range().clone();
+        drop(view);
+        drop(changed);
+        let mut bytes = [9; 4];
+        range.read(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 4]);
     }
 
     #[test]

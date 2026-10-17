@@ -72,12 +72,18 @@ pub struct GuestProgram {
     pub bindings: Box<[(ssa::ResourceId, GuestBinding)]>,
     pub shared_memory_bytes: u32,
 }
+/// Index bytes come either from guest memory or from ordered inline methods.
+#[derive(Clone, Debug)]
+pub enum GuestIndexBuffer {
+    Canonical(CanonicalBackingRange, IndexType),
+    Inline(Arc<[u8]>),
+}
 #[derive(Clone, Debug)]
 pub struct GuestDrawState {
     pub identity: PreparedStateId,
     pub program: Arc<GuestProgram>,
     pub vertices: Box<[GuestVertexBuffer]>,
-    pub index: Option<(CanonicalBackingRange, IndexType)>,
+    pub index: Option<GuestIndexBuffer>,
     pub colors: Box<[GuestImage]>,
     pub depth_stencil: Option<GuestImage>,
     pub parameters: Arc<GuestDrawParameters>,

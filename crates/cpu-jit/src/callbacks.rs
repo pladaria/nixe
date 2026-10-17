@@ -2,18 +2,18 @@ use crate::ffi;
 use nixe_cpu::execution::ArchitecturalTimer;
 use nixe_cpu::memory::*;
 use nixe_cpu::profile::ProcessCpuContext;
-use nixe_memory::{CanonicalBackingPage, DirectAddressSpaceView, GuestVirtualAddress};
+use nixe_memory::{CanonicalBackingPage, GuestVirtualAddress};
 use std::collections::HashSet;
 use std::ffi::c_void;
 
 pub struct Context<'a> {
     pub memory: &'a ExecutionMemory,
     pub native_memory: NativeMemorySession<'a>,
-    pub arena: DirectAddressSpaceView,
     pub cpu: ProcessCpuContext,
     pub timer: &'a dyn ArchitecturalTimer,
     pub blocked_fetches: &'a mut HashSet<u64>,
     pub visibility: Option<CanonicalBackingPage>,
+    pub exclusive_prepare: Option<CanonicalBackingPage>,
     pub device_access: bool,
     pub store_resume: Option<GuestVirtualAddress>,
     pub data_fault: Option<DataAccessFault>,
@@ -111,6 +111,70 @@ unsafe extern "C" fn memory(
             ..MemoryAccess::normal(size)
         }
     };
+    if matches!(op, 3 | 5) {
+        let kind = if op == 3 {
+            DataAccessKind::Read
+        } else {
+            DataAccessKind::Write
+        };
+        let access = MemoryAccess::new(
+            size,
+            MemoryAlignment::Natural,
+            MemoryOrdering::SequentiallyConsistent,
+            MemoryAccessClass::Exclusive,
+        );
+        match context
+            .memory
+            .native_exclusive_page(space, address, access, kind)
+        {
+            Ok(page) => {
+                if op == 3 {
+                    if matches!(
+                        page.visibility_state(),
+                        nixe_memory::VisibilityState::GpuNewer { .. }
+                    ) {
+                        context.visibility = Some(page);
+                    } else {
+                        context.exclusive_prepare = Some(page);
+                    }
+                    return false;
+                }
+                let (input, identity, version) = unsafe {
+                    (
+                        u128::from(*value) | (u128::from(*value.add(1)) << 64),
+                        *expected,
+                        *expected.add(1),
+                    )
+                };
+                match page.try_exclusive_store(
+                    address.get() as usize % nixe_memory::DIRECT_PAGE_SIZE,
+                    bytes as usize,
+                    Some(identity),
+                    version,
+                    input,
+                ) {
+                    Ok(Some(stored)) => {
+                        unsafe {
+                            *value = u64::from(stored);
+                        }
+                        return true;
+                    }
+                    Ok(None) => {
+                        context.visibility = Some(page);
+                        return false;
+                    }
+                    Err(error) => {
+                        context.fatal = Some(error.to_string().into());
+                        return false;
+                    }
+                }
+            }
+            Err(fault) => {
+                context.data_fault = Some(fault);
+                return false;
+            }
+        }
+    }
     let input = unsafe { u128::from(*value) | (u128::from(*value.add(1)) << 64) };
     let result = if op == 2 {
         let expected = unsafe { u128::from(*expected) | (u128::from(*expected.add(1)) << 64) };
@@ -128,53 +192,27 @@ unsafe extern "C" fn memory(
             Err(fault) => Err(fault),
         }
     } else {
-        let resolution = match context.native_memory.resolve_access(address, access, kind) {
-            Ok(NativeMemoryAccess::Ram) => DirectFaultResolution::Retry,
-            Ok(NativeMemoryAccess::CheckedRam) => DirectFaultResolution::Cold,
-            Ok(NativeMemoryAccess::Fatal(message)) => {
-                context.fatal = Some(message);
-                return false;
-            }
-            Ok(NativeMemoryAccess::Visibility(page)) => {
-                // MemoryAbort exits at the current guest PC before committing the
-                // failed access. Resolve only after Run and its lease have ended.
-                // vendor/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
-                context.visibility = Some(page);
-                if op == 1 {
-                    context.store_resume = Some(address);
-                }
-                return false;
-            }
-            Ok(NativeMemoryAccess::Device) => {
-                // Never perform an externally observable device access in an
-                // instruction that may subsequently need a visibility restart.
-                context.device_access = true;
-                if op == 1 {
-                    context.store_resume = Some(address);
-                }
-                return false;
-            }
-            Err(fault) => {
-                context.data_fault = Some(fault);
-                return false;
-            }
-        };
-        match resolution {
-            DirectFaultResolution::Retry => {
-                // The execution lease keeps mappings stable; the resolver checks
-                // the complete access and reconciles tracking/device ownership.
-                let pointer = (context.arena.base + address.get() as usize) as *mut u8;
+        match context.native_memory.resolve_access(address, access, kind) {
+            Ok(NativeMemoryAccess::Ram(mut page)) => {
                 let mut data = input.to_le_bytes();
-                unsafe {
-                    if op == 0 {
-                        std::ptr::copy_nonoverlapping(pointer, data.as_mut_ptr(), bytes as usize);
-                    } else {
-                        std::ptr::copy_nonoverlapping(data.as_ptr(), pointer, bytes as usize);
-                    }
-                }
-                Ok(u128::from_le_bytes(data))
+                let offset = address.get() as usize % nixe_memory::DIRECT_PAGE_SIZE;
+                let copied = if op == 0 {
+                    page.read(offset, &mut data[..bytes as usize])
+                } else {
+                    page.write_prepared(offset, &data[..bytes as usize])
+                };
+                copied.map(|_| u128::from_le_bytes(data)).map_err(|error| {
+                    nixe_cpu::memory::DataAccessFault::new(
+                        space,
+                        address,
+                        kind,
+                        nixe_cpu::memory::DataAccessFaultReason::HostBacking(
+                            error.to_string().into(),
+                        ),
+                    )
+                })
             }
-            DirectFaultResolution::Cold => {
+            Ok(NativeMemoryAccess::CheckedRam) => {
                 let access = MemoryAccess {
                     alignment: MemoryAlignment::Unaligned,
                     ..MemoryAccess::normal(size)
@@ -191,9 +229,28 @@ unsafe extern "C" fn memory(
                         .map(|_| 0)
                 }
             }
-            DirectFaultResolution::Fault(fault) => Err(fault),
-            DirectFaultResolution::Fatal(message) => {
+            Ok(NativeMemoryAccess::Fatal(message)) => {
                 context.fatal = Some(message);
+                return false;
+            }
+            Ok(NativeMemoryAccess::Visibility(page)) => {
+                // Exit before the access commits. Device reconciliation runs
+                // only after Run and its mapping lease have ended.
+                context.visibility = Some(page);
+                if op == 1 {
+                    context.store_resume = Some(address);
+                }
+                return false;
+            }
+            Ok(NativeMemoryAccess::Device) => {
+                context.device_access = true;
+                if op == 1 {
+                    context.store_resume = Some(address);
+                }
+                return false;
+            }
+            Err(fault) => {
+                context.data_fault = Some(fault);
                 return false;
             }
         }

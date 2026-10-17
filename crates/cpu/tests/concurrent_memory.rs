@@ -2,6 +2,7 @@ use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use nixe_cpu::memory::InstructionMemory;
 use nixe_cpu::memory::{
     AtomicRmwKind, CacheMaintenanceKind, CpuMemory, ExecutionMemory, MemoryAccess,
     MemoryAccessClass, MemoryAccessSize, MemoryAlignment, MemoryMappingPurpose, MemoryOrdering,
@@ -98,7 +99,7 @@ fn execution_lease_only_authorizes_its_own_memory() {
 }
 
 #[test]
-fn external_device_transition_requests_a_safepoint_and_waits_for_the_active_slice() {
+fn external_data_device_transition_keeps_native_admission_and_mapping_epoch() {
     let memory = shared_memory();
     let retained = memory
         .translate_canonical_range(
@@ -108,6 +109,7 @@ fn external_device_transition_requests_a_safepoint_and_waits_for_the_active_slic
             MemoryPermissions::READ,
         )
         .unwrap();
+    let initial = memory.mapping_epoch();
     let lease = memory.acquire_execution_lease();
     let (notified_tx, notified_rx) = mpsc::channel();
     memory.set_transition_notifier(Some(Arc::new(move || {
@@ -122,20 +124,25 @@ fn external_device_transition_requests_a_safepoint_and_waits_for_the_active_slic
         )
         .unwrap();
         let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(NoopVisibility);
-        let result = nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
+        nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
+            [(&retained, declaration)],
+            coordinator.as_ref(),
+        )
+        .unwrap();
+        let result = nixe_memory::CanonicalBackingRange::publish_device_writes(
             [(&retained, declaration)],
             coordinator,
         );
         finished_tx.send(result).unwrap();
     });
 
-    notified_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert!(finished_rx.recv_timeout(Duration::from_millis(20)).is_err());
-    drop(lease);
     finished_rx
         .recv_timeout(Duration::from_secs(1))
         .unwrap()
         .unwrap();
+    assert_eq!(notified_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    assert_eq!(memory.mapping_epoch(), initial);
+    drop(lease);
     worker.join().unwrap();
 }
 
@@ -181,8 +188,17 @@ fn pending_mapping_mutation_cannot_be_overtaken_by_a_new_execution_lease() {
 }
 
 #[test]
-fn bulk_write_snapshot_waits_for_active_native_execution_without_advancing_mapping_epoch() {
+fn executable_host_write_waits_for_native_execution_without_advancing_mapping_epoch() {
     let memory = shared_memory();
+    memory
+        .set_permissions(
+            SPACE,
+            PRIMARY,
+            SYNTHETIC_PAGE_SIZE as u64,
+            MemoryPermissions::READ_EXECUTE,
+        )
+        .unwrap();
+    memory.fetch32(SPACE, PRIMARY).unwrap();
     let initial = memory.mapping_epoch();
     let active = memory.acquire_execution_lease();
     let (notified_tx, notified_rx) = mpsc::channel();
@@ -192,7 +208,7 @@ fn bulk_write_snapshot_waits_for_active_native_execution_without_advancing_mappi
     let (finished_tx, finished_rx) = mpsc::channel();
     let writer_memory = Arc::clone(&memory);
     let writer = thread::spawn(move || {
-        let result = writer_memory.write_bytes(SPACE, PRIMARY, &[0x5a]);
+        let result = writer_memory.overwrite_mapped_ram(SPACE, PRIMARY, &[0x5a; 16]);
         finished_tx.send(result).unwrap();
     });
 
@@ -212,7 +228,54 @@ fn bulk_write_snapshot_waits_for_active_native_execution_without_advancing_mappi
 }
 
 #[test]
-fn bulk_read_snapshot_waits_for_active_native_execution() {
+fn aliased_data_host_writes_finish_during_native_execution_without_changing_mappings() {
+    let memory = shared_memory();
+    let range = memory
+        .translate_canonical_range(
+            SPACE,
+            PRIMARY,
+            (2 * SYNTHETIC_PAGE_SIZE) as u64,
+            MemoryPermissions::READ,
+        )
+        .unwrap();
+    let observation = nixe_memory::CanonicalCpuWriteDependency::capture(&range).unwrap();
+    let epoch = memory.mapping_epoch();
+    let active = memory.acquire_execution_lease();
+    let (notified_tx, notified_rx) = mpsc::channel();
+    memory.set_transition_notifier(Some(Arc::new(move || {
+        let _ = notified_tx.send(());
+    })));
+    let writer_memory = memory.clone();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        // One logical write spans the end and beginning of the same physical
+        // page. Every alias is revoked once, before either fragment changes.
+        let at = GuestVirtualAddress::new(ALIAS.get() - 8);
+        writer_memory.write_bytes(SPACE, at, &[0x5a; 16]).unwrap();
+        writer_memory
+            .write_bytes(SPACE, PRIMARY, &0x1234_5678u32.to_le_bytes())
+            .unwrap();
+        finished_tx.send(()).unwrap();
+    });
+    let completed = finished_rx.recv_timeout(Duration::from_secs(2));
+    drop(active);
+    writer.join().unwrap();
+    completed.expect("data producers must not request a global CPU stop");
+    assert_eq!(notified_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    assert_eq!(memory.mapping_epoch(), epoch);
+    assert!(!observation.remains_current());
+    let bytes = observation.snapshot_all(&range).unwrap();
+    assert_eq!(&bytes[..4], &0x1234_5678u32.to_le_bytes());
+    assert_eq!(&bytes[4..8], &[0x5a; 4]);
+    assert_eq!(
+        &bytes[SYNTHETIC_PAGE_SIZE - 8..SYNTHETIC_PAGE_SIZE],
+        &[0x5a; 8]
+    );
+    assert_eq!(&bytes[..SYNTHETIC_PAGE_SIZE], &bytes[SYNTHETIC_PAGE_SIZE..]);
+}
+
+#[test]
+fn bulk_read_without_native_writers_keeps_execution_admission_open() {
     let memory = shared_memory();
     memory
         .write(
@@ -235,10 +298,9 @@ fn bulk_read_snapshot_waits_for_active_native_execution() {
         finished_tx.send((result, observed)).unwrap();
     });
 
-    notified_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert!(finished_rx.recv_timeout(Duration::from_millis(20)).is_err());
-    drop(active);
     let (result, observed) = finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(notified_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    drop(active);
     result.unwrap();
     assert_eq!(observed, [0x5a]);
     reader.join().unwrap();
@@ -335,7 +397,7 @@ fn contending_exclusive_stores_allow_only_one_cas_winner() {
 }
 
 #[test]
-fn exclusive_store_accepts_a_restored_expected_value_after_aba() {
+fn exclusive_store_rejects_a_restored_value_after_aba() {
     let memory = shared_memory();
     let access = MemoryAccess::new(
         MemoryAccessSize::Word,
@@ -358,10 +420,10 @@ fn exclusive_store_accepts_a_restored_expected_value_after_aba() {
         .store_exclusive(SPACE, ALIAS, access, MemoryValue::U32(11), reservation)
         .unwrap();
 
-    assert!(stored);
+    assert!(!stored);
     assert_eq!(
         memory.read(SPACE, PRIMARY, access).unwrap().value,
-        MemoryValue::U32(11)
+        MemoryValue::U32(7)
     );
 }
 

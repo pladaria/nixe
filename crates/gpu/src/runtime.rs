@@ -212,7 +212,7 @@ impl<D: BackendDriver> BackendRuntime<D> {
             prepared
                 .iter()
                 .map(|access| (&access.range, access.declaration)),
-            Arc::clone(&self.visibility),
+            self.visibility.as_ref(),
         ) {
             invalidate_prepared(&prepared);
             return Err(BackendRuntimeError::Visibility(error.to_string().into()));

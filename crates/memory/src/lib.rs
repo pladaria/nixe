@@ -19,6 +19,7 @@ mod execution_gate;
 mod host_mapped;
 mod invalidation;
 mod range;
+mod reservation;
 mod visibility;
 
 pub use access::{
@@ -27,7 +28,8 @@ pub use access::{
 };
 pub use backing::{
     CanonicalAllocation, CanonicalAllocationError, CanonicalBackingPage, CanonicalBackingStore,
-    CanonicalCpuAccess, CanonicalPageError, CanonicalWriteBatch, CanonicalWriteBatchError,
+    CanonicalCpuAccess, CanonicalHostWrite, CanonicalHostWriteOutcome, CanonicalPageError,
+    CanonicalWriteBatch, CanonicalWriteBatchError, CpuContentRevision, try_write_host_regions,
 };
 pub use direct::{
     CpuMemoryBackend, DIRECT_PAGE_SIZE, DirectAddressSpaceView, DirectArena, DirectBackendPolicy,

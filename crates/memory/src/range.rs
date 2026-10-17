@@ -19,6 +19,10 @@ use crate::{
 mod mapping;
 use mapping::ByteMapping;
 pub use mapping::{CanonicalByteLayout, CanonicalByteTile};
+use smallvec::SmallVec;
+
+type CanonicalPageReader<'a> =
+    dyn FnMut(&CanonicalBackingPage, usize, &mut [u8]) -> Result<(), CanonicalPageError> + 'a;
 
 /// One contiguous segment of a translated canonical backing range.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -450,10 +454,10 @@ impl CanonicalCpuWriteDependency {
     }
 
     /// Captures several ranges as one page-granular dependency domain.
-    /// Already protected pages register observers under shared execution
-    /// admission and page locks. Establishing new protections excludes CPU
-    /// execution. Call without an execution lease or cache lock. Empty input
-    /// is an error.
+    /// Page locks and alias protection stabilize the physical regions under
+    /// shared mapping admission. Hosts without the native write barrier drain
+    /// CPU execution when establishing protection. Call without an execution
+    /// lease or cache lock. Empty input is an error.
     pub fn capture_ranges<'a>(
         ranges: impl IntoIterator<Item = &'a CanonicalBackingRange>,
     ) -> Result<Self, CanonicalRangeAccessError> {
@@ -519,38 +523,12 @@ impl CanonicalCpuWriteDependency {
             (summary, shared)
         };
         let observation = {
-            let leases = execution_gates
+            let _leases: SmallVec<[_; 2]> = execution_gates
                 .iter()
                 .map(crate::ExecutionGate::acquire_shared)
-                .collect::<Vec<_>>();
-            let protected =
-                crate::backing::observe_cpu_pages(&page_list, &mut select_summary, false)
-                    .map_err(CanonicalRangeAccessError::Backing)?;
-            drop(leases);
-            protected
-        };
-        let observation = if let Some(observation) = observation {
-            observation
-        } else {
-            let mut transitions = execution_gates
-                .iter()
-                .map(|gate| gate.acquire_exclusive())
-                .collect::<Vec<_>>();
-            if page_list.iter().try_fold(false, |needed, page| {
-                Ok::<_, CanonicalRangeAccessError>(
-                    needed
-                        || page
-                            .needs_cpu_dirty_tracking()
-                            .map_err(CanonicalRangeAccessError::Backing)?,
-                )
-            })? {
-                for transition in &mut transitions {
-                    transition.commit();
-                }
-            }
-            crate::backing::observe_cpu_pages(&page_list, &mut select_summary, true)
+                .collect();
+            crate::backing::observe_cpu_pages(&page_list, &mut select_summary)
                 .map_err(CanonicalRangeAccessError::Backing)?
-                .expect("exclusive capture establishes CPU-write protection")
         };
         let pages = page_list
             .into_iter()
@@ -599,6 +577,70 @@ impl CanonicalCpuWriteDependency {
         current
     }
 
+    /// Confirms the previously consumed bytes of a single captured range after
+    /// a CPU-write invalidation. Only an exact match refreshes the observation;
+    /// a mismatch stays dirty, so a later check cannot validate stale content.
+    /// This avoids repeated reads/protection when unrelated bytes share a page.
+    pub fn confirm_unchanged(&self, expected: &[u8]) -> Result<bool, CanonicalRangeAccessError> {
+        let [range] = self.inner.domains.as_ref() else {
+            return Err(CanonicalRangeAccessError::DependencyMismatch);
+        };
+        if range.size() != expected.len() as u64 {
+            return Err(CanonicalRangeAccessError::DependencyMismatch);
+        }
+        if self.remains_current() {
+            return Ok(true);
+        }
+        let pages: SmallVec<[&CanonicalBackingPage; 8]> =
+            self.inner.pages.iter().map(|p| &p.page).collect();
+        let mut gates: SmallVec<[&crate::ExecutionGate; 2]> =
+            pages.iter().map(|p| p.store().execution_gate()).collect();
+        gates.sort_unstable_by_key(|g| g.identity());
+        gates.dedup_by_key(|g| g.identity());
+        loop {
+            let checked = {
+                let _shared: SmallVec<[_; 2]> = gates.iter().map(|g| g.acquire_shared()).collect();
+                crate::backing::ProtectedPageSet::with(&pages, |protected| {
+                    if self.remains_current() {
+                        return Ok(Some(true));
+                    }
+                    for page in &pages {
+                        if !protected
+                            .cpu_visible(page)
+                            .map_err(CanonicalRangeAccessError::Backing)?
+                        {
+                            return Ok(None);
+                        }
+                    }
+                    let mut bytes = [0; 256];
+                    for (index, expected) in expected.chunks(bytes.len()).enumerate() {
+                        let output = &mut bytes[..expected.len()];
+                        range.read_with((index * 256) as u64, output, &mut |p, at, out| {
+                            protected.read(p, at, out)
+                        })?;
+                        crate::metrics::record(
+                            crate::metrics::Counter::SnapshotCopiedBytes,
+                            output.len() as u64,
+                        );
+                        if output != expected {
+                            return Ok(Some(false));
+                        }
+                    }
+                    self.rearm_stable(protected)?;
+                    Ok(Some(true))
+                })?
+            };
+            if let Some(matches) = checked {
+                return Ok(matches);
+            }
+            // GPU demand runs without a mapping lease or any physical lock.
+            for page in &pages {
+                page.prepare_cpu_access()
+                    .map_err(CanonicalRangeAccessError::Backing)?;
+            }
+        }
+    }
+
     /// Establishes a protected baseline after the consumer incorporates or
     /// completely overwrites these bytes. Call outside native execution and
     /// without a memory lease: protection changes rendezvous with the engine.
@@ -615,13 +657,16 @@ impl CanonicalCpuWriteDependency {
         Ok(())
     }
 
-    fn rearm_quiescent(&self) -> Result<(), CanonicalRangeAccessError> {
+    fn rearm_stable(
+        &self,
+        protected: &mut crate::backing::ProtectedPageSet<'_>,
+    ) -> Result<(), CanonicalRangeAccessError> {
         let mut adaptive = self
             .inner
             .adaptive
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.arm_pages(0..self.inner.pages.len())?;
+        self.arm_pages(0..self.inner.pages.len(), protected)?;
         adaptive.streaks.fill(0);
         adaptive.streaming.clear();
         self.inner.streaming_pages.store(0, Ordering::Release);
@@ -694,6 +739,14 @@ impl CanonicalCpuWriteDependency {
         alignment: u64,
         resolve: &mut crate::CpuVisibilityResolver<'_>,
     ) -> Result<CanonicalByteSnapshots, CanonicalRangeAccessError> {
+        self.validate_snapshot_range(range, alignment)?;
+        if matches!(
+            selection,
+            CpuWriteSnapshotSelection::DirtyPages | CpuWriteSnapshotSelection::WholeIfDirty
+        ) && self.remains_current()
+        {
+            return Ok(Vec::new());
+        }
         Self::snapshot_batch_with_resolver(
             &[CpuWriteSnapshotRequest {
                 dependency: self,
@@ -736,46 +789,41 @@ impl CanonicalCpuWriteDependency {
             })
             .collect::<Vec<_>>();
         while !pending.is_empty() {
-            let mut gates = BTreeMap::new();
+            let mut pages: SmallVec<[&CanonicalBackingPage; 16]> = SmallVec::new();
             for &index in &pending {
-                let request = &requests[index];
-                if request.selection == CpuWriteSnapshotSelection::Rearm {
-                    for page in &request.dependency.inner.pages {
-                        let gate = page.page.store().execution_gate();
-                        gates.entry(gate.identity()).or_insert_with(|| gate.clone());
-                    }
-                } else {
-                    for gate in request.range.execution_gates() {
-                        gates.entry(gate.identity()).or_insert_with(|| gate.clone());
-                    }
-                }
+                pages.extend(
+                    requests[index]
+                        .dependency
+                        .inner
+                        .pages
+                        .iter()
+                        .map(|page| &page.page),
+                );
             }
-            let mut transitions = gates
-                .values()
-                .map(|gate| gate.acquire_exclusive())
-                .collect::<Vec<_>>();
-            let mut demands = BTreeMap::new();
-            let mut retry = Vec::new();
-            for &index in &pending {
-                let request = &requests[index];
-                match request.dependency.snapshot_quiescent(
-                    request.range,
-                    request.selection,
-                    request.alignment,
-                )? {
-                    Ok(bytes) => snapshots[index] = bytes,
-                    Err(pages) => {
-                        for page in pages {
-                            demands.entry(page.identity()).or_insert(page);
-                        }
-                        retry.push(index);
-                    }
-                }
-            }
-            for transition in &mut transitions {
-                transition.commit();
-            }
-            drop(transitions);
+            pages.sort_unstable_by_key(|page| page.identity());
+            pages.dedup_by_key(|page| page.identity());
+            let mut gates: SmallVec<[&crate::ExecutionGate; 2]> = pages
+                .iter()
+                .map(|page| page.store().execution_gate())
+                .collect();
+            gates.sort_unstable_by_key(|gate| gate.identity());
+            gates.dedup_by_key(|gate| gate.identity());
+            // Only transitions require draining native writers. A protected
+            // read set excludes checked writes and write-fault repair locally;
+            // no global safepoint or content copy is needed for current inputs.
+            // Cover the whole dependency, including its adaptive state, so two
+            // concurrent snapshots cannot invert adaptive/page lock ordering.
+            let (demands, retry) = {
+                let _leases: SmallVec<[_; 2]> =
+                    gates.iter().map(|gate| gate.acquire_shared()).collect();
+                crate::metrics::record(
+                    crate::metrics::Counter::RegionSnapshotPages,
+                    pages.len() as u64,
+                );
+                crate::backing::ProtectedPageSet::with(&pages, |protected| {
+                    Self::snapshot_pending(requests, &pending, &mut snapshots, protected)
+                })?
+            };
             for page in demands.values() {
                 page.ensure_cpu_visible_with(resolve, true)
                     .map_err(|error| {
@@ -787,6 +835,37 @@ impl CanonicalCpuWriteDependency {
             pending = retry;
         }
         Ok(snapshots)
+    }
+
+    fn snapshot_pending(
+        requests: &[CpuWriteSnapshotRequest<'_>],
+        pending: &[usize],
+        snapshots: &mut [CanonicalByteSnapshots],
+        protected: &mut crate::backing::ProtectedPageSet<'_>,
+    ) -> Result<
+        (BTreeMap<CanonicalPageId, CanonicalBackingPage>, Vec<usize>),
+        CanonicalRangeAccessError,
+    > {
+        let mut demands = BTreeMap::new();
+        let mut retry = Vec::new();
+        for &index in pending {
+            let request = &requests[index];
+            match request.dependency.snapshot_stable(
+                request.range,
+                request.selection,
+                request.alignment,
+                protected,
+            )? {
+                Ok(bytes) => snapshots[index] = bytes,
+                Err(pages) => {
+                    for page in pages {
+                        demands.entry(page.identity()).or_insert(page);
+                    }
+                    retry.push(index);
+                }
+            }
+        }
+        Ok((demands, retry))
     }
 
     fn validate_snapshot_range(
@@ -802,32 +881,29 @@ impl CanonicalCpuWriteDependency {
             .domains
             .iter()
             .any(|domain| domain.shares_layout(range));
-        if !known_domain {
-            let dependency_pages = self
-                .inner
-                .pages
-                .iter()
-                .map(|page| page.page.identity())
-                .collect::<BTreeSet<_>>();
-            if !range
-                .pages()
-                .all(|page| dependency_pages.contains(&page.identity()))
-            {
-                return Err(CanonicalRangeAccessError::DependencyMismatch);
-            }
+        if !known_domain
+            && !range.pages().all(|page| {
+                self.inner
+                    .pages
+                    .binary_search_by_key(&page.identity(), |page| page.page.identity())
+                    .is_ok()
+            })
+        {
+            return Err(CanonicalRangeAccessError::DependencyMismatch);
         }
         Ok(())
     }
 
-    fn snapshot_quiescent(
+    fn snapshot_stable(
         &self,
         range: &CanonicalBackingRange,
         selection: CpuWriteSnapshotSelection,
         alignment: u64,
+        protected: &mut crate::backing::ProtectedPageSet<'_>,
     ) -> Result<Result<CanonicalByteSnapshots, Vec<CanonicalBackingPage>>, CanonicalRangeAccessError>
     {
         if selection == CpuWriteSnapshotSelection::Rearm {
-            self.rearm_quiescent()?;
+            self.rearm_stable(protected)?;
             return Ok(Ok(Vec::new()));
         }
         if selection != CpuWriteSnapshotSelection::All && self.remains_current() {
@@ -856,12 +932,12 @@ impl CanonicalCpuWriteDependency {
                         && page.page.cpu_dirty_epoch()
                             == page.observed_epoch.load(Ordering::Acquire)
                         && matches!(
-                            page.page.visibility_state(),
+                            protected.visibility(&page.page),
                             VisibilityState::GpuNewer { .. }
                         )
                 })
                 .collect::<Vec<_>>();
-            self.arm_pages(device_owned.iter().copied())?;
+            self.arm_pages(device_owned.iter().copied(), protected)?;
             for index in device_owned {
                 // Device ownership already revokes CPU writes. Restore a
                 // protected observation without downloading unchanged GPU
@@ -907,9 +983,8 @@ impl CanonicalCpuWriteDependency {
         let visible = needed.iter().try_fold(true, |visible, index| {
             Ok::<_, CanonicalRangeAccessError>(
                 visible
-                    && self.inner.pages[*index]
-                        .page
-                        .cpu_visible_quiescent()
+                    && protected
+                        .cpu_visible(&self.inner.pages[*index].page)
                         .map_err(CanonicalRangeAccessError::Backing)?,
             )
         })?;
@@ -934,8 +1009,8 @@ impl CanonicalCpuWriteDependency {
                 page.page.size() as u64,
             );
             let mut bytes = vec![0; page.page.size()].into_boxed_slice();
-            page.page
-                .read_quiescent(0, &mut bytes)
+            protected
+                .read(&page.page, 0, &mut bytes)
                 .map_err(CanonicalRangeAccessError::Backing)?;
             page.observed_epoch
                 .store(page.page.cpu_dirty_epoch(), Ordering::Release);
@@ -947,7 +1022,7 @@ impl CanonicalCpuWriteDependency {
                 dirty.remove(&index);
                 streaming.quiet = streaming.quiet.saturating_add(1);
                 if streaming.quiet >= STREAMING_QUIET_THRESHOLD {
-                    self.arm_pages([index].into_iter())?;
+                    self.arm_pages([index].into_iter(), protected)?;
                     adaptive.streaming.remove(&index);
                     adaptive.streaks[index] = 0;
                 }
@@ -1012,9 +1087,8 @@ impl CanonicalCpuWriteDependency {
         let visible = needed.iter().try_fold(true, |visible, index| {
             Ok::<_, CanonicalRangeAccessError>(
                 visible
-                    && self.inner.pages[*index]
-                        .page
-                        .cpu_visible_quiescent()
+                    && protected
+                        .cpu_visible(&self.inner.pages[*index].page)
                         .map_err(CanonicalRangeAccessError::Backing)?,
             )
         })?;
@@ -1036,10 +1110,17 @@ impl CanonicalCpuWriteDependency {
                 crate::metrics::Counter::SnapshotCopiedBytes,
                 bytes.len() as u64,
             );
-            window.read_quiescent(0, &mut bytes)?;
+            window.read_with(0, &mut bytes, &mut |page, offset, bytes| {
+                protected.read(page, offset, bytes)
+            })?;
             snapshots.push((offset, bytes.into_boxed_slice()));
         }
         for index in &dirty {
+            // Protected host-written pages do not need the adaptive native
+            // streaming policy. Keep their existing protection and baseline.
+            if protected.is_observed(&self.inner.pages[*index].page) {
+                continue;
+            }
             if adaptive.streaming.contains_key(index) {
                 continue;
             }
@@ -1048,8 +1129,8 @@ impl CanonicalCpuWriteDependency {
             let page = &self.inner.pages[*index];
             if streak >= STREAMING_DIRTY_THRESHOLD {
                 let mut bytes = vec![0; page.page.size()].into_boxed_slice();
-                page.page
-                    .read_quiescent(0, &mut bytes)
+                protected
+                    .read(&page.page, 0, &mut bytes)
                     .map_err(CanonicalRangeAccessError::Backing)?;
                 page.observed_epoch
                     .store(page.page.cpu_dirty_epoch(), Ordering::Release);
@@ -1059,16 +1140,20 @@ impl CanonicalCpuWriteDependency {
             }
         }
         if selection == CpuWriteSnapshotSelection::All {
-            self.arm_pages((0..self.inner.pages.len()).filter(|index| {
-                range.contains_page(self.inner.pages[*index].page.identity())
-                    && !adaptive.streaming.contains_key(index)
-            }))?;
+            self.arm_pages(
+                (0..self.inner.pages.len()).filter(|index| {
+                    range.contains_page(self.inner.pages[*index].page.identity())
+                        && !adaptive.streaming.contains_key(index)
+                }),
+                protected,
+            )?;
         } else {
             self.arm_pages(
                 dirty
                     .iter()
                     .copied()
                     .filter(|index| !adaptive.streaming.contains_key(index)),
+                protected,
             )?;
         }
         self.inner
@@ -1081,18 +1166,12 @@ impl CanonicalCpuWriteDependency {
     fn arm_pages(
         &self,
         indices: impl Iterator<Item = usize> + Clone,
+        protected: &mut crate::backing::ProtectedPageSet<'_>,
     ) -> Result<(), CanonicalRangeAccessError> {
-        if indices.clone().next().is_none() {
-            return Ok(());
-        }
-        let epochs = crate::backing::arm_cpu_pages_quiescent(
-            indices.clone().map(|index| &self.inner.pages[index].page),
-        )
-        .map_err(CanonicalRangeAccessError::Backing)?;
-        for (index, epoch) in indices.zip(epochs) {
-            self.inner.pages[index]
-                .observed_epoch
-                .store(epoch, Ordering::Release);
+        for index in indices {
+            let page = &self.inner.pages[index];
+            page.observed_epoch
+                .store(protected.arm(&page.page), Ordering::Release);
         }
         Ok(())
     }
@@ -1475,6 +1554,73 @@ impl CanonicalBackingRange {
         })
     }
 
+    /// Normal CPU, DSP and command word loads with hardware atomicity against native
+    /// writers. Physical locks serialize checked producers and GPU writeback;
+    /// this does not create a whole-range snapshot or arm native protection.
+    /// Resource observations use the stable read/snapshot operations instead.
+    pub fn read_word_stream(
+        &self,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<(), CanonicalRangeAccessError> {
+        let end = offset
+            .checked_add(output.len() as u64)
+            .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
+        if end > self.size {
+            return Err(CanonicalRangeAccessError::OutOfBounds {
+                offset,
+                size: output.len() as u64,
+                range_size: self.size,
+            });
+        }
+        if output.is_empty() {
+            return Ok(());
+        }
+        let mut pages: SmallVec<[&CanonicalBackingPage; 8]> = self
+            .segments_between(offset, end)
+            .map(|(_, s)| s.backing())
+            .collect();
+        pages.sort_unstable_by_key(|p| p.identity());
+        pages.dedup_by_key(|p| p.identity());
+        loop {
+            let demand = {
+                let _admission: SmallVec<[_; 2]> = self
+                    .execution_gates()
+                    .map(crate::ExecutionGate::acquire_shared)
+                    .collect();
+                let mut accesses = SmallVec::<[crate::CanonicalCpuAccess<'_>; 8]>::new();
+                let mut demand = None;
+                for page in &pages {
+                    if let Some(access) = page
+                        .try_cpu_access()
+                        .map_err(CanonicalRangeAccessError::Backing)?
+                    {
+                        accesses.push(access);
+                    } else {
+                        demand = Some((*page).clone());
+                        break;
+                    }
+                }
+                if demand.is_none() {
+                    self.read_with(offset, output, &mut |page, at, bytes| {
+                        let index = pages
+                            .binary_search_by_key(&page.identity(), |p| p.identity())
+                            .expect("the consumed physical page is retained");
+                        accesses[index].read(at, bytes)
+                    })?;
+                    return Ok(());
+                }
+                demand
+            };
+            // The actual device producer may wait or call back into memory.
+            // Release every page lock and mapping admission before asking it.
+            demand
+                .expect("an incomplete CPU read has one visibility demand")
+                .prepare_cpu_access()
+                .map_err(CanonicalRangeAccessError::Backing)?;
+        }
+    }
+
     /// Reads with explicit visibility routing, allowing a device owner to
     /// resolve its own writes inline. The resolver runs outside memory locks.
     pub fn read_with_resolver(
@@ -1498,9 +1644,9 @@ impl CanonicalBackingRange {
         if output.is_empty() {
             return Ok(());
         }
-        // Scalar command/descriptor fetches commonly occupy one protected
-        // page. They need neither a native stop nor protection changes.
-        {
+        // Naturally atomic command/descriptor scalars and already protected
+        // input bytes need neither a native stop nor permission changes.
+        if self.layout.mapping.is_none() || self.layout.topology.get().is_some() {
             let mut segments = self.segments_between(offset, end);
             if let Some((logical, segment)) = segments.next()
                 && segments.next().is_none()
@@ -1510,61 +1656,67 @@ impl CanonicalBackingRange {
                 let _lease = segment.backing.store().execution_gate().acquire_shared();
                 if segment
                     .backing
-                    .read_protected(page_offset, output)
+                    .read_immediate(page_offset, output)
                     .map_err(CanonicalRangeAccessError::Backing)?
                 {
                     return Ok(());
                 }
             }
         }
+        // Retain only the consumed pages, in physical lock order. Most command
+        // fetches fit on the stack; a large retained view must not enumerate
+        // unrelated pages for a small read.
+        let mut pages: SmallVec<[&CanonicalBackingPage; 8]> =
+            if offset == 0 && end == self.size && self.layout.mapping.is_some() {
+                self.pages().collect()
+            } else {
+                self.segments_between(offset, end)
+                    .map(|(_, segment)| &segment.backing)
+                    .collect()
+            };
+        pages.sort_unstable_by_key(|page| page.identity());
+        pages.dedup_by_key(|page| page.identity());
         loop {
-            let mut visited = BTreeSet::new();
-            for (logical_start, segment) in self.segments_between(offset, end) {
-                let logical_end = logical_start
-                    .checked_add(segment.size)
-                    .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
-                if offset.max(logical_start) < end.min(logical_end)
-                    && visited.insert(segment.page())
-                {
-                    segment
-                        .backing
-                        .prepare_cpu_access_with(resolve)
-                        .map_err(CanonicalRangeAccessError::Backing)?;
-                }
-            }
-
-            let _transitions = self
-                .execution_gates()
-                .map(|gate| gate.acquire_exclusive())
-                .collect::<Vec<_>>();
-            let mut cpu_visible = true;
-            for (logical_start, segment) in self.segments_between(offset, end) {
-                let logical_end = logical_start
-                    .checked_add(segment.size)
-                    .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
-                if offset.max(logical_start) < end.min(logical_end)
-                    && !segment
-                        .backing
-                        .cpu_visible_quiescent()
+            {
+                let _leases: SmallVec<[_; 2]> = self
+                    .execution_gates()
+                    .map(crate::ExecutionGate::acquire_shared)
+                    .collect();
+                crate::metrics::record(
+                    crate::metrics::Counter::RegionRawReadPages,
+                    pages.len() as u64,
+                );
+                if crate::backing::ProtectedPageSet::with(&pages, |protected| {
+                    if !pages
+                        .iter()
+                        .try_fold(true, |visible, page| {
+                            protected.cpu_visible(page).map(|v| visible && v)
+                        })
                         .map_err(CanonicalRangeAccessError::Backing)?
-                {
-                    cpu_visible = false;
-                    break;
+                    {
+                        return Ok(false);
+                    }
+                    self.read_with(offset, output, &mut |page, offset, bytes| {
+                        protected.read(page, offset, bytes)
+                    })?;
+                    Ok(true)
+                })? {
+                    return Ok(());
                 }
             }
-            if !cpu_visible {
-                continue;
+            // Visibility callbacks must never retain admission or page locks.
+            for page in &pages {
+                page.prepare_cpu_access_with(resolve)
+                    .map_err(CanonicalRangeAccessError::Backing)?;
             }
-
-            self.read_quiescent(offset, output)?;
-            return Ok(());
         }
     }
 
-    fn read_quiescent(
+    fn read_with(
         &self,
         offset: u64,
         output: &mut [u8],
+        read: &mut CanonicalPageReader<'_>,
     ) -> Result<(), CanonicalRangeAccessError> {
         let output_size =
             u64::try_from(output.len()).map_err(|_| CanonicalRangeAccessError::RangeOverflow)?;
@@ -1581,7 +1733,7 @@ impl CanonicalBackingRange {
         if offset == 0
             && output_size == self.size
             && let Some(mapping) = &self.layout.mapping
-            && mapping.read_tiled_quiescent(output)?
+            && mapping.read_tiled_with(output, read)?
         {
             return Ok(());
         }
@@ -1605,10 +1757,12 @@ impl CanonicalBackingRange {
                 let copied_end = copied
                     .checked_add(copy_size)
                     .ok_or(CanonicalRangeAccessError::RangeOverflow)?;
-                segment
-                    .backing
-                    .read_quiescent(page_offset, &mut output[copied..copied_end])
-                    .map_err(CanonicalRangeAccessError::Backing)?;
+                read(
+                    &segment.backing,
+                    page_offset,
+                    &mut output[copied..copied_end],
+                )
+                .map_err(CanonicalRangeAccessError::Backing)?;
                 copied = copied_end;
             }
         }
@@ -1697,12 +1851,11 @@ impl CanonicalBackingRange {
     /// CPU-page caching is bounded; host submission and CPU demand happen later.
     pub fn prepare_resident_device_accesses<'a>(
         accesses: impl IntoIterator<Item = (&'a Self, DeviceAccessDeclaration)>,
-        coordinator: Arc<dyn VisibilityCoordinator>,
+        coordinator: &dyn VisibilityCoordinator,
     ) -> Result<(), VisibilityError> {
         let mut boundary = None;
         let mut write_boundary = None;
-        let mut pages =
-            BTreeMap::<CanonicalPageId, (CanonicalBackingPage, DeviceAccessDeclaration)>::new();
+        let mut pages = SmallVec::<[(CanonicalBackingPage, DeviceAccessDeclaration); 8]>::new();
         for (range, declaration) in accesses {
             let current = (declaration.device(), declaration.device_visible_at());
             if boundary.is_some_and(|prior| prior != current) {
@@ -1715,71 +1868,48 @@ impl CanonicalBackingRange {
                 }
                 write_boundary = Some(point);
             }
-            if range.resident_access_ready(declaration) {
-                continue;
-            }
-            for page in range.pages() {
-                match pages.entry(page.identity()) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert((page.clone(), declaration));
-                    }
-                    std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        let previous = entry.get().1;
-                        if previous.cpu_visible_at().is_some()
-                            && declaration.cpu_visible_at().is_some()
-                            && previous.cpu_visible_at() != declaration.cpu_visible_at()
-                        {
-                            return Err(VisibilityError::IncompatibleDeclarations);
-                        }
-                        let kind = match (
-                            previous.kind().reads() || declaration.kind().reads(),
-                            previous.kind().writes() || declaration.kind().writes(),
-                        ) {
-                            (true, true) => crate::DeviceAccessKind::ReadWrite,
-                            (false, true) => crate::DeviceAccessKind::Write,
-                            _ => crate::DeviceAccessKind::Read,
-                        };
-                        entry.get_mut().1 = DeviceAccessDeclaration::new(
-                            declaration.device(),
-                            kind,
-                            declaration.device_visible_at(),
-                            previous.cpu_visible_at().or(declaration.cpu_visible_at()),
-                        )
-                        .map_err(|_| VisibilityError::IncompatibleDeclarations)?;
-                    }
-                }
+            if !range.resident_access_ready(declaration) {
+                pages.extend(range.pages().map(|page| (page.clone(), declaration)));
             }
         }
         if pages.is_empty() {
             return Ok(());
         }
-        let mut gates = BTreeMap::new();
-        for (page, _) in pages.values() {
-            let gate = page.store().execution_gate();
-            gates.entry(gate.identity()).or_insert_with(|| gate.clone());
-        }
-        let pages = pages.into_values().collect::<Vec<_>>();
-        if pages
-            .iter()
-            .all(|(_, declaration)| !declaration.kind().writes())
-        {
-            let shared = gates
-                .values()
-                .map(crate::ExecutionGate::acquire_shared)
-                .collect::<Vec<_>>();
-            if crate::backing::prepare_protected_device_reads(&pages)? {
-                return Ok(());
+        pages.sort_unstable_by_key(|(page, _)| page.identity());
+        let mut distinct = 0;
+        for index in 0..pages.len() {
+            if distinct != 0 && pages[distinct - 1].0.identity() == pages[index].0.identity() {
+                let previous = pages[distinct - 1].1;
+                let declaration = pages[index].1;
+                let kind = match (
+                    previous.kind().reads() || declaration.kind().reads(),
+                    previous.kind().writes() || declaration.kind().writes(),
+                ) {
+                    (true, true) => crate::DeviceAccessKind::ReadWrite,
+                    (false, true) => crate::DeviceAccessKind::Write,
+                    _ => crate::DeviceAccessKind::Read,
+                };
+                pages[distinct - 1].1 = DeviceAccessDeclaration::new(
+                    declaration.device(),
+                    kind,
+                    declaration.device_visible_at(),
+                    previous.cpu_visible_at().or(declaration.cpu_visible_at()),
+                )
+                .map_err(|_| VisibilityError::IncompatibleDeclarations)?;
+            } else {
+                pages.swap(distinct, index);
+                distinct += 1;
             }
-            drop(shared);
         }
-        let mut transitions = gates
-            .values()
-            .map(|gate| gate.acquire_exclusive())
-            .collect::<Vec<_>>();
-        for transition in &mut transitions {
-            transition.commit();
-        }
-        crate::backing::prepare_device_pages(&pages, coordinator.as_ref())
+        pages.truncate(distinct);
+        let mut gates: SmallVec<[&crate::ExecutionGate; 2]> = pages
+            .iter()
+            .map(|(p, _)| p.store().execution_gate())
+            .collect();
+        gates.sort_unstable_by_key(|g| g.identity());
+        gates.dedup_by_key(|g| g.identity());
+        let _shared: SmallVec<[_; 2]> = gates.iter().map(|g| g.acquire_shared()).collect();
+        crate::backing::prepare_device_inputs(&pages, coordinator)
     }
 
     fn advance_device_owner(&self, declaration: DeviceAccessDeclaration) -> bool {
@@ -1879,18 +2009,28 @@ impl CanonicalBackingRange {
                 let gate = page.store().execution_gate();
                 gates.entry(gate.identity()).or_insert_with(|| gate.clone());
             }
-            let mut transitions = gates
+            let shared: SmallVec<[_; 2]> = gates
                 .values()
-                .map(|gate| gate.acquire_exclusive())
-                .collect::<Vec<_>>();
-            for transition in &mut transitions {
-                transition.commit();
+                .map(crate::ExecutionGate::acquire_shared)
+                .collect();
+            if !crate::backing::publish_device_pages(
+                &transitions_required,
+                coordinator.as_ref(),
+                false,
+            )? {
+                drop(shared);
+                // Executable content invalidation must drain running JIT code.
+                // Contents/ownership do not change guest mapping identity.
+                let _exclusive: SmallVec<[_; 2]> = gates
+                    .values()
+                    .map(crate::ExecutionGate::acquire_exclusive)
+                    .collect();
+                crate::backing::publish_device_pages(
+                    &transitions_required,
+                    coordinator.as_ref(),
+                    true,
+                )?;
             }
-            // CPU execution may resume while the backend encodes its inputs.
-            // Refresh untouched bytes and transfer authority under one lease
-            // at host acceptance, so a CPU store is ordered before or after
-            // the device write rather than creating an artificial conflict.
-            crate::backing::publish_device_pages(&transitions_required, coordinator.as_ref())?;
         }
         for (range, owner) in owners {
             *range
@@ -1924,13 +2064,10 @@ impl CanonicalBackingRange {
             let gate = page.store().execution_gate();
             gates.entry(gate.identity()).or_insert_with(|| gate.clone());
         }
-        let mut transitions = gates
+        let _shared: SmallVec<[_; 2]> = gates
             .values()
-            .map(|gate| gate.acquire_exclusive())
-            .collect::<Vec<_>>();
-        for transition in &mut transitions {
-            transition.commit();
-        }
+            .map(crate::ExecutionGate::acquire_shared)
+            .collect();
         crate::backing::invalidate_device_pages(&pages.into_values().collect::<Vec<_>>())
     }
 }
@@ -2152,6 +2289,16 @@ mod tests {
                     variants[left] == variants[right],
                     "{left} vs {right}"
                 );
+                assert_eq!(
+                    a.same_byte_mapping(b),
+                    variants[left]
+                        .iter()
+                        .map(|s| (s.page(), s.offset(), s.size()))
+                        .eq(variants[right]
+                            .iter()
+                            .map(|s| (s.page(), s.offset(), s.size()))),
+                    "physical identity {left} vs {right}"
+                );
             }
         }
     }
@@ -2162,6 +2309,131 @@ mod tests {
     };
 
     struct UnexpectedCpuVisibility;
+
+    #[test]
+    fn protected_multi_page_reads_and_snapshots_keep_native_admission_open() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        allocation.write(0, &vec![0x42; 0x2000]).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let observation = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        // Reversed and repeated aliases must not take a physical lock twice.
+        let alias = CanonicalBackingRange::new(vec![
+            range.segments()[1].clone(),
+            range.segments()[0].clone(),
+            range.segments()[1].clone(),
+        ])
+        .unwrap();
+        let alias_observation = CanonicalCpuWriteDependency::capture(&alias).unwrap();
+        let gate = range
+            .pages()
+            .next()
+            .unwrap()
+            .store()
+            .execution_gate()
+            .clone();
+        let active = gate.acquire_shared();
+        let epoch = gate.epoch();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..8 {
+                let mut bytes = vec![0; 0x3000];
+                alias.read(0, &mut bytes).unwrap();
+                assert!(bytes.iter().all(|&b| b == 0x42));
+                assert_eq!(observation.snapshot_all(&range).unwrap().len(), 0x2000);
+                assert!(
+                    observation
+                        .snapshot_dirty_pages(&range, 4)
+                        .unwrap()
+                        .is_empty()
+                );
+                alias_observation.rearm().unwrap();
+            }
+            send.send(()).unwrap();
+        });
+        let early = receive.recv_timeout(std::time::Duration::from_secs(2));
+        drop(active);
+        worker.join().unwrap();
+        early.expect("protected reads and snapshots must finish during native execution");
+        assert_eq!(gate.epoch(), epoch);
+    }
+
+    #[test]
+    fn exact_confirmation_refreshes_only_equal_bytes_and_keeps_other_observers_stale() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let full = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let range = full.snapshot_subrange(0xffc, 24).unwrap();
+        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        let older = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        allocation.write(0x80, &[1]).unwrap();
+        assert!(!dependency.remains_current());
+        let gate = allocation.pages()[0].store().execution_gate();
+        let epoch = gate.epoch();
+        let active = gate.acquire_shared();
+        assert!(dependency.confirm_unchanged(&[0; 24]).unwrap());
+        assert!(dependency.remains_current());
+        assert!(!older.remains_current());
+        assert_eq!(gate.epoch(), epoch);
+        drop(active);
+        allocation.write(0x1004, &[0x41]).unwrap();
+        for _ in 0..2 {
+            assert!(!dependency.confirm_unchanged(&[0; 24]).unwrap());
+            assert!(
+                !dependency.remains_current(),
+                "a mismatch cannot acknowledge new bytes"
+            );
+        }
+        allocation.write(0x1004, &[0]).unwrap();
+        assert!(dependency.confirm_unchanged(&[0; 24]).unwrap());
+        assert!(dependency.remains_current());
+        assert!(!older.remains_current());
+        assert_eq!(
+            dependency.confirm_unchanged(&[0; 23]),
+            Err(CanonicalRangeAccessError::DependencyMismatch)
+        );
+    }
+
+    #[test]
+    fn protected_host_write_snapshot_keeps_independent_observers_and_epochs() {
+        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
+        let range = allocation
+            .backing_range(MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let observation = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        let older = CanonicalCpuWriteDependency::capture(&range).unwrap();
+        let mut write = CanonicalWriteBatch::new();
+        write.stage(&range, 0xffe, &[1, 2, 3, 4]).unwrap();
+        write.commit_ordered().unwrap();
+        assert!(!older.remains_current());
+        let gate = range
+            .pages()
+            .next()
+            .unwrap()
+            .store()
+            .execution_gate()
+            .clone();
+        let epoch = gate.epoch();
+        let active = gate.acquire_shared();
+        let input = range.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let snapshots = observation.snapshot_dirty_pages(&input, 4).unwrap();
+            assert_eq!(&snapshots[0].1[0xffe..0x1002], &[1, 2, 3, 4]);
+            assert!(observation.remains_current());
+            send.send(()).unwrap();
+        });
+        let early = receive.recv_timeout(std::time::Duration::from_secs(2));
+        drop(active);
+        worker.join().unwrap();
+        early.expect(
+            "a host write retained protection; refreshing it must not drain native execution",
+        );
+        assert!(!older.remains_current());
+        assert_eq!(gate.epoch(), epoch);
+    }
 
     #[test]
     fn protected_scalar_read_uses_shared_admission_without_refreshing_dirty_observations() {
@@ -2190,7 +2462,10 @@ mod tests {
                 send.send((result, bytes)).unwrap();
             });
             let early = receive.recv_timeout(std::time::Duration::from_millis(100));
-            assert_eq!(early.is_ok(), protected);
+            assert!(
+                early.is_ok(),
+                "page locks suffice when no writable native aliases exist"
+            );
             drop(lease);
             let (result, bytes) = early.unwrap_or_else(|_| {
                 receive
@@ -2240,7 +2515,10 @@ mod tests {
                         .unwrap();
                 });
                 let early = receive.recv_timeout(std::time::Duration::from_millis(100));
-                assert_eq!(early.is_ok(), protected);
+                assert!(
+                    early.is_ok(),
+                    "observer arm without native aliases requires no CPU stop"
+                );
                 drop(lease);
                 let observation = early
                     .unwrap_or_else(|_| {
@@ -2250,7 +2528,7 @@ mod tests {
                     })
                     .unwrap();
                 worker.join().unwrap();
-                assert_eq!(gate.epoch() == initial_epoch, protected);
+                assert_eq!(gate.epoch(), initial_epoch);
                 assert!(observation.remains_current());
                 allocation.write(0, &[0x42]).unwrap();
                 assert!(!observation.remains_current());
@@ -2265,7 +2543,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_device_reads_keep_native_execution_running_but_writers_rendezvous() {
+    fn device_preparation_keeps_native_execution_running_before_ownership_handoff() {
         for protected in [false, true] {
             for kind in [
                 crate::DeviceAccessKind::Read,
@@ -2304,12 +2582,12 @@ mod tests {
                     .unwrap();
                     let result = CanonicalBackingRange::prepare_resident_device_accesses(
                         [(&input, declaration)],
-                        Arc::new(UnexpectedCpuVisibility),
+                        &UnexpectedCpuVisibility,
                     );
                     send.send(result).unwrap();
                 });
                 let early = receive.recv_timeout(std::time::Duration::from_millis(200));
-                assert_eq!(early.is_ok(), protected && !kind.writes());
+                assert!(early.is_ok());
                 drop(lease);
                 early
                     .unwrap_or_else(|_| {
@@ -2319,7 +2597,7 @@ mod tests {
                     })
                     .unwrap();
                 worker.join().unwrap();
-                assert_eq!(gate.epoch() == initial_epoch, protected && !kind.writes());
+                assert_eq!(gate.epoch(), initial_epoch);
                 assert_eq!(
                     range.pages().next().unwrap().visibility_state(),
                     VisibilityState::Clean
@@ -2428,7 +2706,7 @@ mod tests {
         .unwrap();
         CanonicalBackingRange::prepare_resident_device_accesses(
             [(&a, write), (&b, write)],
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         let gate = full.pages().next().unwrap().store().execution_gate();
@@ -2440,7 +2718,7 @@ mod tests {
             coordinator,
         )
         .unwrap();
-        assert_eq!(gate.epoch(), epoch + 1);
+        assert_eq!(gate.epoch(), epoch);
         assert!(!gate.transition_pending());
         assert_eq!(
             full.visibility_summary().load(Ordering::Acquire),
@@ -2491,7 +2769,7 @@ mod tests {
         .unwrap();
         CanonicalBackingRange::prepare_resident_device_accesses(
             [(&range, write)],
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         // Inject an invalid retained alias through the real registration
@@ -2540,7 +2818,7 @@ mod tests {
         };
         CanonicalBackingRange::prepare_resident_device_accesses(
             [(&a, write(1)), (&b, write(1))],
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         CanonicalBackingRange::publish_device_writes(
@@ -2638,7 +2916,7 @@ mod tests {
         };
         CanonicalBackingRange::prepare_resident_device_accesses(
             [(&a, write(1)), (&b, write(1))],
-            readback.clone(),
+            readback.as_ref(),
         )
         .unwrap();
         CanonicalBackingRange::publish_device_writes(
@@ -2689,7 +2967,7 @@ mod tests {
         };
         CanonicalBackingRange::prepare_resident_device_accesses(
             [(&a, write(1)), (&b, write(1))],
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         CanonicalBackingRange::publish_device_writes(
@@ -2752,7 +3030,7 @@ mod tests {
         let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
         CanonicalBackingRange::prepare_resident_device_accesses(
             ranges.iter().map(|range| (range, write)),
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         let epoch = gate.epoch();
@@ -2761,12 +3039,12 @@ mod tests {
             coordinator,
         )
         .unwrap();
-        assert_eq!(gate.epoch(), epoch + 1);
+        assert_eq!(gate.epoch(), epoch);
         CanonicalBackingRange::invalidate_visibility_ranges(
             ranges.iter().chain(ranges.iter().rev()),
         )
         .unwrap();
-        assert_eq!(gate.epoch(), epoch + 2);
+        assert_eq!(gate.epoch(), epoch);
         assert!(
             pages
                 .iter()
@@ -2887,7 +3165,7 @@ mod tests {
         assert!(
             CanonicalBackingRange::prepare_resident_device_accesses(
                 [(&range, write), (&alias, write)],
-                Arc::new(FailedCache(std::sync::atomic::AtomicUsize::new(0)))
+                &FailedCache(std::sync::atomic::AtomicUsize::new(0)),
             )
             .is_err()
         );
@@ -2922,7 +3200,7 @@ mod tests {
         let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
         crate::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&range, write)],
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         crate::CanonicalBackingRange::publish_device_writes([(&range, write)], coordinator)
@@ -2970,10 +3248,10 @@ mod tests {
         let epoch = gate.epoch();
         CanonicalBackingRange::prepare_resident_device_accesses(
             [(&a, read), (&b, read), (&alias, read)],
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
-        assert_eq!(gate.epoch(), epoch + 1);
+        assert_eq!(gate.epoch(), epoch);
         assert!(
             full.pages()
                 .all(|page| page.visibility_state() == VisibilityState::Clean)
@@ -2981,10 +3259,10 @@ mod tests {
         let active = gate.acquire_shared();
         CanonicalBackingRange::prepare_resident_device_accesses(
             [(&a, read), (&b, read), (&alias, read)],
-            coordinator,
+            coordinator.as_ref(),
         )
         .unwrap();
-        assert_eq!(gate.epoch(), epoch + 1);
+        assert_eq!(gate.epoch(), epoch);
         drop(active);
     }
 
@@ -3014,7 +3292,7 @@ mod tests {
         assert_eq!(
             CanonicalBackingRange::prepare_resident_device_accesses(
                 [(&a, first), (&b, later)],
-                Arc::new(UnexpectedCpuVisibility),
+                Arc::new(UnexpectedCpuVisibility).as_ref()
             ),
             Err(VisibilityError::IncompatibleDeclarations)
         );
@@ -3053,7 +3331,7 @@ mod tests {
                 panic!("CPU-only snapshot does not need readback")
             })
             .unwrap();
-        assert_eq!(gate.epoch(), epoch + 1);
+        assert_eq!(gate.epoch(), epoch);
         assert_eq!(samples[0][0].1[0x180], 0x42);
         assert_eq!(samples[1][0].1[0x80], 0x42);
         assert!(a.remains_current() && b.remains_current());
@@ -3065,7 +3343,7 @@ mod tests {
         )
         .unwrap();
         assert!(clean.iter().all(Vec::is_empty));
-        assert_eq!(gate.epoch(), epoch + 1);
+        assert_eq!(gate.epoch(), epoch);
         drop(active);
     }
 
@@ -3088,7 +3366,7 @@ mod tests {
         let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(UnexpectedCpuVisibility);
         crate::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&b, write)],
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         crate::CanonicalBackingRange::publish_device_writes([(&b, write)], coordinator).unwrap();
@@ -3170,7 +3448,7 @@ mod tests {
             );
             CanonicalBackingRange::prepare_resident_device_accesses(
                 [(&range, read)],
-                Arc::new(UnexpectedCpuVisibility),
+                Arc::new(UnexpectedCpuVisibility).as_ref(),
             )
             .unwrap();
             done.send(()).unwrap();
@@ -3537,6 +3815,7 @@ mod tests {
             .unwrap();
         let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
         for cycle in 1..=8 {
+            allocation.pages()[0].prepare_cpu_write().unwrap();
             allocation.write(0, &[cycle]).unwrap();
             let snapshots = dependency.snapshot_dirty_pages(&range, 4).unwrap();
             assert_eq!(snapshots.len(), 1);
@@ -3741,7 +4020,7 @@ mod tests {
         .unwrap();
         crate::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&range, declaration)],
-            Arc::clone(&coordinator),
+            coordinator.as_ref(),
         )
         .unwrap();
         crate::CanonicalBackingRange::publish_device_writes([(&range, declaration)], coordinator)
@@ -3774,7 +4053,7 @@ mod tests {
         .unwrap();
         crate::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&range, write)],
-            Arc::clone(&coordinator),
+            coordinator.as_ref(),
         )
         .unwrap();
         let gate = range.segments()[0].backing().store().execution_gate();
@@ -3784,7 +4063,7 @@ mod tests {
                 &range,
                 DeviceAccessDeclaration::read(device, DeviceVisibilityPoint::new(2)),
             )),
-            Arc::clone(&coordinator),
+            coordinator.as_ref(),
         )
         .unwrap();
         assert_eq!(gate.epoch(), epoch);
@@ -3799,7 +4078,7 @@ mod tests {
                 &range,
                 DeviceAccessDeclaration::read(device, DeviceVisibilityPoint::new(2)),
             )),
-            Arc::clone(&coordinator),
+            coordinator.as_ref(),
         )
         .unwrap();
         assert_eq!(gate.epoch(), epoch);
@@ -3809,7 +4088,7 @@ mod tests {
                     &range,
                     DeviceAccessDeclaration::read(device, DeviceVisibilityPoint::new(1))
                 )),
-                coordinator
+                coordinator.as_ref()
             ),
             Err(VisibilityError::ConflictingAccess)
         );
@@ -3835,7 +4114,7 @@ mod tests {
         .unwrap();
         crate::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&range, first)],
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         crate::CanonicalBackingRange::publish_device_writes([(&range, first)], coordinator.clone())
@@ -3851,7 +4130,7 @@ mod tests {
         .unwrap();
         CanonicalBackingRange::prepare_resident_device_accesses(
             std::iter::once((&range, next)),
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         crate::CanonicalBackingRange::publish_device_writes([(&range, next)], coordinator).unwrap();
@@ -3888,7 +4167,7 @@ mod tests {
             DeviceAccessDeclaration::read(NonCpuDeviceId::new(1), DeviceVisibilityPoint::new(1));
         CanonicalBackingRange::prepare_resident_device_accesses(
             std::iter::once((&range, read)),
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         let mut aliases = Vec::new();
@@ -3898,7 +4177,7 @@ mod tests {
             assert!(Arc::ptr_eq(&first.inner.summary, &dependency.inner.summary));
             CanonicalBackingRange::prepare_resident_device_accesses(
                 std::iter::once((&alias, read)),
-                coordinator.clone(),
+                coordinator.as_ref(),
             )
             .unwrap();
             assert!(Arc::ptr_eq(
@@ -3956,7 +4235,7 @@ mod tests {
         .unwrap();
         crate::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&full, first)],
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         crate::CanonicalBackingRange::publish_device_writes([(&full, first)], coordinator.clone())
@@ -3969,7 +4248,7 @@ mod tests {
         .unwrap();
         CanonicalBackingRange::prepare_resident_device_accesses(
             std::iter::once((&first_page, partial)),
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         crate::CanonicalBackingRange::publish_device_writes(
@@ -3999,7 +4278,7 @@ mod tests {
         .unwrap();
         CanonicalBackingRange::prepare_resident_device_accesses(
             std::iter::once((&full, next)),
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         crate::CanonicalBackingRange::publish_device_writes([(&full, next)], coordinator).unwrap();
@@ -4018,6 +4297,7 @@ mod tests {
             .unwrap();
         let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
         for value in 1..=8 {
+            allocation.pages()[0].prepare_cpu_write().unwrap();
             allocation.write(0, &[value]).unwrap();
             assert!(
                 !dependency
@@ -4036,7 +4316,7 @@ mod tests {
         .unwrap();
         crate::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&range, write)],
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         crate::CanonicalBackingRange::publish_device_writes([(&range, write)], coordinator)
@@ -4077,7 +4357,7 @@ mod tests {
         .unwrap();
         crate::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&range, first)],
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         crate::CanonicalBackingRange::publish_device_writes([(&range, first)], coordinator.clone())
@@ -4121,8 +4401,8 @@ mod tests {
             range.pages().next().unwrap().visibility_state(),
             VisibilityState::Clean
         );
-        // Materialization restores CPU authority. The next actual handoff
-        // must close execution again, rather than using the resident update.
+        // Materialization restores CPU authority. The next handoff revokes
+        // aliases locally without changing the guest mapping epoch.
         let gate = range.segments()[0].backing().store().execution_gate();
         let epoch = gate.epoch();
         let next = DeviceAccessDeclaration::write(
@@ -4133,11 +4413,11 @@ mod tests {
         .unwrap();
         CanonicalBackingRange::prepare_resident_device_accesses(
             std::iter::once((&range, next)),
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         crate::CanonicalBackingRange::publish_device_writes([(&range, next)], coordinator).unwrap();
-        assert!(gate.epoch() > epoch);
+        assert_eq!(gate.epoch(), epoch);
     }
 
     #[test]
@@ -4156,7 +4436,7 @@ mod tests {
         .unwrap();
         crate::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&range, declaration)],
-            Arc::clone(&coordinator),
+            coordinator.as_ref(),
         )
         .unwrap();
         crate::CanonicalBackingRange::publish_device_writes([(&range, declaration)], coordinator)

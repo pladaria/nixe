@@ -42,7 +42,7 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
         .ret_rip = iter->second.resume_rip,
     };
 
-    if (iter->second.recompile) {
+    if (iter->second.recompile || (conf.persistent_fastmem_fault && *conf.persistent_fastmem_fault)) {
         const auto marker = iter->second.marker;
         do_not_fastmem.insert(marker);
         InvalidateBasicBlocks({std::get<0>(marker)});
@@ -56,6 +56,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const bool ordered = IsOrdered(args[2].GetImmediateAccType());
     const auto fastmem_marker = ShouldFastmem(ctx, inst);
+    const bool non_writing_ordered_read = ordered && bitsize != 128 && UseNonWritingOrderedReads(conf);
 
     if (!conf.page_table && !fastmem_marker) {
         // Neither fastmem nor page table: Use callbacks
@@ -98,7 +99,8 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
         bool require_abort_handling;
         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
 
-        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
+        if (non_writing_ordered_read) code.mfence();
+        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered && !non_writing_ordered_read);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
@@ -120,7 +122,8 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
         // Use page table
         ASSERT(conf.page_table);
         const auto src_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr);
-        EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
+        if (non_writing_ordered_read) code.mfence();
+        EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered && !non_writing_ordered_read);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);

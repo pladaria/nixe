@@ -323,7 +323,7 @@ impl MaxwellValidatedGpfifoSubmission {
 
     /// The streaming decoder checks the complete retained submission once
     /// before its first read. Each entry still revalidates its own live mappings
-    /// in read_resolved; repeating the all-entry scan here would be quadratic.
+    /// in read_resolved_words; repeating the all-entry scan here would be quadratic.
     pub(crate) fn read_entry(
         &self,
         address_space: &MaxwellGpuAddressSpace,
@@ -335,7 +335,7 @@ impl MaxwellValidatedGpfifoSubmission {
             .get(entry_index as usize)
             .ok_or(MaxwellGpfifoSourceError::UnknownEntry { entry_index })?;
         address_space
-            .read_resolved(&pushbuffer.source, output)
+            .read_resolved_words(&pushbuffer.source, output)
             .map_err(|error| MaxwellGpfifoSourceError::Access {
                 location: first_source_location(self, pushbuffer)
                     .expect("resolved non-empty range has a first mapping"),

@@ -1955,7 +1955,7 @@ fn edge_flag_state_is_typed_source_preserving_and_atomic() {
     let decoded = incrementing_packet(0x15e4 / 4, &[0, 0]);
     assert!(matches!(
         dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
+        Err(MaxwellEngineDispatchError::InvalidMethodEncoding { source, method_name: "INLINE_INDEX", .. })
             if source.method() == GpuMethodId(0x15e8)
     ));
     assert_eq!(channel.frontend(), frontend_before);

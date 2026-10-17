@@ -140,7 +140,7 @@ fn publish(
     .unwrap();
     nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
         [(&range, write)],
-        coordinator.clone(),
+        coordinator.as_ref(),
     )
     .unwrap();
     nixe_memory::CanonicalBackingRange::publish_device_writes(
@@ -183,6 +183,119 @@ fn bounded(task: impl FnOnce() + Send + 'static) {
         .recv_timeout(Duration::from_secs(5))
         .expect("CPU visibility must not wait while retaining execution admission");
     worker.join().unwrap();
+}
+
+#[test]
+fn local_observation_drains_native_stores_and_keeps_repeated_aliases_consistent() {
+    bounded(|| {
+        // STR X0,[X1]; ADD X0,X0,#1; B loop. The snapshots race actual generated
+        // stores, not Rust writers which already take the canonical page lock.
+        // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/STR--immediate---Store-Register--immediate--
+        let memory = fixture(&[0xf900_0020, 0x9100_0400, 0x17ff_fffe], None);
+        let range = memory
+            .translate_canonical_range(SPACE, DATA, 8, MemoryPermissions::READ)
+            .unwrap();
+        let aliases =
+            nixe_memory::CanonicalBackingRange::concatenate(vec![range.clone(), range.clone()])
+                .unwrap();
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let memory = memory.clone();
+            let started = started.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let cpu = ProcessCpuContext::for_platform(TargetPlatform::Switch1, SPACE);
+                let mut jit =
+                    JitThread::new(Arc::new(JitProcess::new(cpu, memory, 19_200_000).unwrap()))
+                        .unwrap();
+                let mut native = nixe_cpu_direct_memory::NativeWorker::default();
+                let events = VcpuEventState::default();
+                let mut saved = A64State::default();
+                saved.set_pc(CODE.get());
+                saved.write_x(x(0), 1);
+                saved.write_x(x(1), DATA.get());
+                let mut state: ThreadState = saved.into();
+                // Warm compilation before the reader begins changing protection.
+                for _ in 0..2 {
+                    jit.run_slice(
+                        &mut native,
+                        JitRunRequest {
+                            state: &mut state,
+                            instruction_budget: 1000,
+                            timer: &Timer,
+                            events: &events,
+                            capture_context: true,
+                        },
+                    )
+                    .unwrap();
+                }
+                started.wait();
+                while !stop.load(Ordering::Acquire) {
+                    jit.run_slice(
+                        &mut native,
+                        JitRunRequest {
+                            state: &mut state,
+                            instruction_budget: 2000,
+                            timer: &Timer,
+                            events: &events,
+                            capture_context: true,
+                        },
+                    )
+                    .unwrap();
+                }
+                jit.run_slice(
+                    &mut native,
+                    JitRunRequest {
+                        state: &mut state,
+                        instruction_budget: 1000,
+                        timer: &Timer,
+                        events: &events,
+                        capture_context: true,
+                    },
+                )
+                .unwrap();
+                state.read_x(x(0))
+            })
+        };
+        started.wait();
+        let observation = nixe_memory::CanonicalCpuWriteDependency::capture(&aliases).unwrap();
+        let mut previous = 0;
+        for sample in 0..128_u8 {
+            // A host-known, unaligned payload shares the native writer's page,
+            // but not its bytes. Publication must preserve that writer and
+            // every snapshot of the repeated aliases without a global stop.
+            let payload = [sample; 37];
+            memory
+                .write_bytes(SPACE, GuestVirtualAddress::new(DATA.get() + 13), &payload)
+                .unwrap();
+            let mut actual = [0; 37];
+            memory
+                .read_bytes(
+                    SPACE,
+                    GuestVirtualAddress::new(DATA.get() + 13),
+                    &mut actual,
+                )
+                .unwrap();
+            assert_eq!(actual, payload);
+            let bytes = observation.snapshot_all(&aliases).unwrap();
+            assert_eq!(&bytes[..8], &bytes[8..]);
+            let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            assert!(value >= previous);
+            previous = value;
+            std::thread::yield_now();
+        }
+        stop.store(true, Ordering::Release);
+        let final_value = writer.join().unwrap();
+        assert!(
+            final_value > previous,
+            "the native writer must make forward progress after fault repair"
+        );
+        assert!(!observation.remains_current());
+        observation.snapshot_all(&aliases).unwrap();
+        observation.rearm().unwrap();
+        assert!(observation.remains_current());
+    });
 }
 
 #[test]
@@ -375,6 +488,7 @@ fn exclusives_retry_visibility_without_committing_a_failed_transaction() {
                 0xc85f_7c23,
                 0x9100_0463,
                 0xc804_7c23,
+                0x35ff_ffa4, // CBNZ W4, LDXR: permitted protection failures retry.
                 0xf940_0025,
                 0xd400_0001,
             ],
@@ -400,9 +514,9 @@ fn repeated_ordered_loads_from_readonly_ram_complete_in_one_native_invocation() 
     bounded(|| {
         // LDAR W2,[X1]; ADD X3,X3,X2; SUBS X0,X0,#1; B.NE loop; SVC.
         // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/LDAR--Load-Acquire-Register-
-        // Dynarmic emits an x86 locked operation for LDAR. On read-only RAM it
-        // must use its read callback on every iteration, including the same
-        // native PC and address, without treating completed loads as retries.
+        // The physical-memory profile emits a full ordering fence followed by
+        // a genuine read. Read-only RAM must not fault just because an acquire
+        // load was lowered to a host read-modify-write operation.
         let memory = fixture(
             &[
                 0x88df_fc22,
@@ -520,7 +634,7 @@ fn store_tail_preserves_completed_ram_prefix_and_vector_element_grouping() {
             .unwrap();
             nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
                 [(&range, write)],
-                coordinator.clone(),
+                coordinator.as_ref(),
             )
             .unwrap();
             nixe_memory::CanonicalBackingRange::publish_device_writes(

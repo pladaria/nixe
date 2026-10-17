@@ -886,33 +886,8 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
         access: MemoryAccess,
     ) -> Result<(DataReadResult, crate::exclusive::ExclusiveReservation), DataAccessFault>;
 
-    /// Resolve the physical identity of an exclusive load already completed by
-    /// native code, retaining exactly `value`, without reading memory again.
-    /// The caller must keep mappings stable from the native load until this
-    /// method returns (the same execution lease), and must have performed the
-    /// load's required ordering. Resolve before releasing that lease, not when
-    /// a later store consumes the reservation: the virtual address may remap.
-    /// This is an exit-side operation, not a generated RAM-access helper.
-    fn resolve_exclusive_load(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        value: MemoryValue,
-    ) -> Result<crate::exclusive::ExclusiveReservation, DataAccessFault> {
-        let _ = value;
-        Err(DataAccessFault::new(
-            address_space,
-            address,
-            DataAccessKind::Read,
-            DataAccessFaultReason::HostBacking(
-                "native exclusive-load identity resolution is not implemented".into(),
-            ),
-        ))
-    }
-
-    /// Conditionally stores through a local physical reservation when the
-    /// current value still equals the value observed by the exclusive load.
-    /// A change-and-restore ABA sequence is intentionally accepted.
+    /// Store only while the captured physical write version is still valid.
+    /// Intervening writes invalidate the reservation, including ABA.
     fn store_exclusive(
         &self,
         address_space: AddressSpaceId,

@@ -199,6 +199,15 @@ template<>
     }
 }
 
+// Our physical-memory profile permits genuine read-only guest aliases.
+// Retain the original locked read's full ordering without writing guest RAM.
+// Intel SDM, Vol. 3, memory ordering and MFENCE:
+// https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+inline bool UseNonWritingOrderedReads(const A64::UserConfig& conf) {
+    return conf.physical_exclusive_page_table != 0;
+}
+inline bool UseNonWritingOrderedReads(const A32::UserConfig&) { return false; }
+
 template<std::size_t bitsize>
 const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {
     if (ordered) {

@@ -316,6 +316,36 @@ impl HostMappedBacking {
         Ok(value)
     }
 
+    pub(crate) fn atomic_store(
+        &self,
+        offset: usize,
+        size: usize,
+        value: u128,
+    ) -> Result<(), HostMappedError> {
+        let pointer = self.atomic_pointer(offset, size)?;
+        unsafe {
+            match size {
+                1 => AtomicU8::from_ptr(pointer).store(value as u8, Ordering::Release),
+                2 => AtomicU16::from_ptr(pointer.cast()).store(value as u16, Ordering::Release),
+                4 => AtomicU32::from_ptr(pointer.cast()).store(value as u32, Ordering::Release),
+                8 => AtomicU64::from_ptr(pointer.cast()).store(value as u64, Ordering::Release),
+                16 => {
+                    let mut expected = atomic_load_128(pointer.cast());
+                    loop {
+                        let (observed, stored) =
+                            atomic_compare_exchange_128(pointer.cast(), expected, value);
+                        if stored {
+                            break;
+                        }
+                        expected = observed;
+                    }
+                }
+                _ => unreachable!("atomic_pointer validates the width"),
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn atomic_compare_exchange(
         &self,
         offset: usize,

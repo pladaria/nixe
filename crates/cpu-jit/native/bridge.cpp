@@ -52,10 +52,11 @@ struct Core final : Dynarmic::A64::UserCallbacks {
   std::uint64_t tpidr = 0, tpidrro = 0;
   NixeExit exit{};
   std::uint64_t ticks_left = 0, ticks_executed = 0;
+  bool persistent_fastmem_fault = false;
   std::unique_ptr<Dynarmic::A64::Jit> jit;
 
   Core(NixeCallbacks cb, Dynarmic::ExclusiveMonitor *monitor, size_t id,
-       std::uintptr_t arena, size_t address_bits, std::uint32_t frequency,
+       std::uintptr_t arena, std::uintptr_t exclusive_table, size_t address_bits, std::uint32_t frequency,
        std::uint32_t ctr, std::uint32_t dczid)
       : callbacks(cb) {
     Dynarmic::A64::UserConfig conf{};
@@ -73,11 +74,16 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.hook_hint_instructions = true;
     conf.hook_data_cache_operations = true;
     conf.fastmem_pointer = arena;
+#if defined(__x86_64__)
+    conf.physical_exclusive_page_table = exclusive_table;
+#endif
     conf.fastmem_address_space_bits = address_bits;
     conf.silently_mirror_fastmem = false;
     // Tracking/ownership faults are transient. Keep the direct access after
     // repair.
     conf.recompile_on_fastmem_failure = false;
+    conf.recompile_on_exclusive_fastmem_failure = false;
+    conf.persistent_fastmem_fault = &persistent_fastmem_fault;
     jit = std::make_unique<Dynarmic::A64::Jit>(conf);
   }
   void stop(std::uint32_t kind, std::uint32_t detail, std::uint64_t pc,
@@ -140,6 +146,12 @@ struct Core final : Dynarmic::A64::UserCallbacks {
                                    Vector e) override {
     return access(addr, 16, 2, v, &e) && v[0] != 0;
   }
+  void PreparePhysicalExclusive(std::uint64_t address, size_t bytes, bool write,
+                                std::uint64_t *data) override {
+    Vector value{data[0], data[1]}, expected{data[2], data[3]};
+    access(address, bytes, write ? 5 : 3, value, &expected);
+    data[0] = value[0];
+  }
   void InterpreterFallback(std::uint64_t pc, size_t) override {
     stop(1, 0, pc);
   }
@@ -182,8 +194,9 @@ struct Core final : Dynarmic::A64::UserCallbacks {
 };
 } // namespace
 extern "C" {
-bool nixe_dynarmic_resolve_fault(std::uint64_t pc, std::uint64_t *call,
+bool nixe_dynarmic_resolve_fault(Core *core, std::uint64_t pc, bool persistent, std::uint64_t *call,
                                  std::uint64_t *ret) noexcept {
+  core->persistent_fastmem_fault = persistent;
   const auto result =
       Dynarmic::Backend::ExceptionHandler::HandleExternalFault(pc);
   if (!result)
@@ -210,12 +223,12 @@ void nixe_dynarmic_monitor_destroy(void *p) noexcept {
   delete static_cast<Dynarmic::ExclusiveMonitor *>(p);
 }
 void *nixe_dynarmic_create(NixeCallbacks cb, void *monitor, size_t id,
-                           std::uintptr_t arena, size_t bits,
+                           std::uintptr_t arena, std::uintptr_t exclusive_table, size_t bits,
                            std::uint32_t frequency, std::uint32_t ctr,
                            std::uint32_t dczid) noexcept {
   try {
     return new Core(cb, static_cast<Dynarmic::ExclusiveMonitor *>(monitor), id,
-                    arena, bits, frequency, ctr, dczid);
+                    arena, exclusive_table, bits, frequency, ctr, dczid);
   } catch (const std::exception &e) {
     last_error = e.what();
     return nullptr;

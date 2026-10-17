@@ -1,6 +1,6 @@
 use super::super::tests::{backing_allocation, cache, cpu_read};
 use super::*;
-use crate::{ApiPreference, cache::*};
+use crate::{ApiPreference, QueueConfiguration, cache::*, queue::QueueState};
 use nixe_gpu::{
     ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation as Io, ShaderScalarType,
     ShaderStage, ssa::*,
@@ -433,7 +433,13 @@ fn graphics_state() -> GraphicsState {
     ]);
     s
 }
-fn streams(cache: &mut VulkanResidency) -> (Box<[VertexBuffer]>, IndexBuffer) {
+fn streams(
+    cache: &mut VulkanResidency,
+) -> (
+    Box<[VertexBuffer]>,
+    IndexBuffer,
+    nixe_memory::CanonicalAllocation,
+) {
     let values = [
         [-1f32, -1., 0.25, 1., 0., 0.],
         [3., -1., 0.25, 0., 1., 0.],
@@ -478,6 +484,7 @@ fn streams(cache: &mut VulkanResidency) -> (Box<[VertexBuffer]>, IndexBuffer) {
             size: 8,
             kind: vk::IndexType::UINT16,
         },
+        allocation,
     )
 }
 #[test]
@@ -521,7 +528,7 @@ fn gathered_draw_inputs_reuse_versions_and_observe_intervening_gpu_writes() {
             stencil: None,
         })
         .unwrap();
-    let (vertices, _) = streams(&mut cache);
+    let (vertices, _, _allocation) = streams(&mut cache);
     let vertex = vertices[0];
     let draw = cache
         .prepare_draw(graphics, targets, vertices, None)
@@ -619,11 +626,23 @@ fn gathered_draw_inputs_reuse_versions_and_observe_intervening_gpu_writes() {
     validation.check().unwrap();
 }
 
-fn raster(api: ApiPreference) {
+fn raster(api: ApiPreference, inline: bool, large: bool) {
     let Some(mut cache) = cache(api, 32 * 1024 * 1024) else {
         return;
     };
     let validation = cache.device.validation_monitor();
+    if inline {
+        cache.device.submission = QueueState::new(
+            Arc::clone(&cache.device.owner),
+            cache.device.queues().graphics_compute_family,
+            QueueConfiguration {
+                command_slots: 2,
+                arena_bytes: 512,
+                overflow_bytes: 0,
+            },
+        )
+        .unwrap();
+    }
     let compilers = Compilers::new(&cache);
     let shader = compilers.shader(&cache, vertex_fragment());
     let (color, backing) = image(
@@ -632,7 +651,13 @@ fn raster(api: ApiPreference) {
         vk::ImageAspectFlags::COLOR,
         4,
     );
-    let (vertices, index) = streams(&mut cache);
+    let (vertices, index, vertex_allocation) = streams(&mut cache);
+    if inline {
+        // Dirty unconsumed padding forces a full vertex-page import after the
+        // inline indices have entered staging. Its repeated flushes must never
+        // recycle the index producer before the draw's real consumer retires.
+        vertex_allocation.write(0, &[0x33]).unwrap();
+    }
     let mut state = graphics_state();
     state.provoking = vk::ProvokingVertexModeEXT::LAST_VERTEX;
     if !cache.device.profile().provoking_vertex_last {
@@ -676,9 +701,39 @@ fn raster(api: ApiPreference) {
             stencil: None,
         })
         .unwrap();
-    let prepared = cache
-        .prepare_draw(graphics, targets, vertices, Some(index))
-        .unwrap();
+    let prepared = if inline {
+        let mut bytes: Vec<u8> = [999_u32, 1, 2, 3]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        if large {
+            bytes.resize(1024, 0);
+        }
+        cache
+            .prepare_inline_index_draw(graphics, targets, vertices, bytes.into())
+            .unwrap()
+    } else {
+        cache
+            .prepare_draw(graphics, targets, vertices, Some(index))
+            .unwrap()
+    };
+    if inline {
+        assert!(
+            cache
+                .draw(
+                    &prepared,
+                    Draw::Indexed {
+                        indices: if large { 256 } else { 4 },
+                        first_index: 1,
+                        vertex_offset: -1,
+                        first_instance: 7,
+                        instances: 1
+                    },
+                    &[]
+                )
+                .is_err()
+        );
+    }
     drop(compilers);
     cache
         .draw(
@@ -693,7 +748,13 @@ fn raster(api: ApiPreference) {
             &[],
         )
         .unwrap();
+    drop(prepared);
     cache.flush().unwrap();
+    if inline {
+        assert!(cache.device.queue_usage().command_pools <= 2);
+        assert!(cache.device.queue_usage().overflow_capacity == 0);
+        assert!(cache.device.queue_usage().submitted_tick >= 3);
+    }
     let result = cpu_read(&mut cache, &backing);
     for y in 0..8 {
         for x in 0..8 {
@@ -710,17 +771,24 @@ fn raster(api: ApiPreference) {
         }
         assert_eq!(&result[64 + y * 48..80 + y * 48], &[0x7b; 16]);
     }
-    drop(prepared);
     drop(cache);
     validation.check().unwrap();
 }
 #[test]
 fn native_indexed_flat_last_vertex_scissor_core() {
-    raster(ApiPreference::Auto)
+    raster(ApiPreference::Auto, false, false)
 }
 #[test]
 fn native_indexed_flat_last_vertex_scissor_khr() {
-    raster(ApiPreference::Compatibility12)
+    raster(ApiPreference::Compatibility12, false, false)
+}
+#[test]
+fn native_inline_index_upload_has_exact_pixels_and_bounds() {
+    raster(ApiPreference::Auto, true, false)
+}
+#[test]
+fn native_large_inline_index_stream_outlives_preparation_without_ring_pressure() {
+    raster(ApiPreference::Auto, true, true)
 }
 fn compute(api: ApiPreference) {
     let Some(mut cache) = cache(api, 32 * 1024 * 1024) else {
@@ -1135,7 +1203,7 @@ fn blend_masks_depth_stencil_and_dynamic_pipeline_reuse() {
             },
         )
         .unwrap();
-    let (vertices, index) = streams(&mut cache);
+    let (vertices, index, _vertex_allocation) = streams(&mut cache);
     let shader = compilers.shader(&cache, vertex_fragment());
     let mut state = graphics_state();
     state.depth_format = vk::Format::D32_SFLOAT_S8_UINT;
@@ -1796,7 +1864,7 @@ fn compute_produced_indexed_indirect_draw_scaled32_and_first_instance() {
             stencil: None,
         })
         .unwrap();
-    let (vertices, index) = streams(&mut cache);
+    let (vertices, index, _vertex_allocation) = streams(&mut cache);
     let (allocation, colors) = backing_allocation(4096, 4096, 0);
     allocation
         .write(
@@ -2185,7 +2253,7 @@ fn native_tessellation_default_control_levels_are_dynamic_and_zero_culls_patch()
             stencil: None,
         })
         .unwrap();
-    let (vertices, _) = streams(&mut cache);
+    let (vertices, _, _allocation) = streams(&mut cache);
     // Compare coverage against an ordinary triangle. Neutral CCW tessellation
     // must preserve its facing for either viewport orientation and front face.
     // A no-culling test alone cannot detect an inverted tessellation domain.

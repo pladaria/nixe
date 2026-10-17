@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 use nixe_gpu::{GpuVirtualAddress, GpuVirtualAddressError};
 use nixe_memory::{
@@ -364,7 +365,9 @@ pub struct MaxwellResolvedRange {
     offset: GpuVirtualAddress,
     size: u64,
     permissions: MemoryPermissions,
-    segments: Box<[MaxwellResolvedMapping]>,
+    // Resource snapshots share immutable mapping leases. Only inline append
+    // creates a new topology when an earlier version is still retained.
+    segments: Arc<[MaxwellResolvedMapping]>,
 }
 
 impl MaxwellResolvedRange {
@@ -372,15 +375,19 @@ impl MaxwellResolvedRange {
     /// The planner borrows the address space immutably for its whole delivery,
     /// so adjacent words need no new VA lookup or mapping allocation.
     pub(crate) fn append_inline_word(&mut self, address: u64) -> Option<()> {
+        self.append_inline_bytes(address, 4)
+    }
+
+    pub(crate) fn append_inline_bytes(&mut self, address: u64, size: u64) -> Option<()> {
         if self.offset.get().checked_add(self.size)? != address || self.segments.len() != 1 {
             return None;
         }
-        let segment = &mut self.segments[0];
-        if address.checked_add(4)? > segment.mapping.end().ok()? {
+        if address.checked_add(size)? > self.segments[0].mapping.end().ok()? {
             return None;
         }
-        segment.size += 4;
-        self.size += 4;
+        let segment = &mut Arc::make_mut(&mut self.segments)[0];
+        segment.size += size;
+        self.size += size;
         Some(())
     }
 
@@ -1181,7 +1188,7 @@ impl MaxwellGpuAddressSpace {
             offset,
             size,
             permissions,
-            segments: segments.into_boxed_slice(),
+            segments: segments.into(),
         })
     }
 
@@ -1194,6 +1201,31 @@ impl MaxwellGpuAddressSpace {
         &self,
         resolved: &MaxwellResolvedRange,
         output: &mut [u8],
+    ) -> Result<(), MaxwellGpuAccessError> {
+        self.read_resolved_with(resolved, output, CanonicalBackingRange::read)
+    }
+
+    /// Command consumption performs normal word loads after validating the
+    /// complete retained mapping. Producer visibility still resolves before
+    /// the bytes are read; this creates no whole-entry atomicity for a racing
+    /// guest producer and does not arm a resource content observation.
+    pub(crate) fn read_resolved_words(
+        &self,
+        resolved: &MaxwellResolvedRange,
+        output: &mut [u8],
+    ) -> Result<(), MaxwellGpuAccessError> {
+        self.read_resolved_with(resolved, output, CanonicalBackingRange::read_word_stream)
+    }
+
+    fn read_resolved_with(
+        &self,
+        resolved: &MaxwellResolvedRange,
+        output: &mut [u8],
+        mut read: impl FnMut(
+            &CanonicalBackingRange,
+            u64,
+            &mut [u8],
+        ) -> Result<(), CanonicalRangeAccessError>,
     ) -> Result<(), MaxwellGpuAccessError> {
         let output_size =
             u64::try_from(output.len()).map_err(|_| MaxwellGpuAccessError::ArithmeticOverflow)?;
@@ -1216,7 +1248,7 @@ impl MaxwellGpuAddressSpace {
                 actual: output_size,
             });
         }
-        for segment in &resolved.segments {
+        for segment in resolved.segments.iter() {
             if !self.retained_mapping_is_current(&segment.mapping) {
                 return Err(MaxwellGpuAccessError::StaleMapping {
                     mapping: segment.mapping.id,
@@ -1226,17 +1258,18 @@ impl MaxwellGpuAddressSpace {
         }
 
         let mut copied = 0_usize;
-        for segment in &resolved.segments {
+        for segment in resolved.segments.iter() {
             let segment_size = usize::try_from(segment.size)
                 .map_err(|_| MaxwellGpuAccessError::ArithmeticOverflow)?;
             let copied_end = copied
                 .checked_add(segment_size)
                 .ok_or(MaxwellGpuAccessError::ArithmeticOverflow)?;
-            segment
-                .mapping
-                .backing
-                .read(segment.backing_offset, &mut output[copied..copied_end])
-                .map_err(MaxwellGpuAccessError::Backing)?;
+            read(
+                &segment.mapping.backing,
+                segment.backing_offset,
+                &mut output[copied..copied_end],
+            )
+            .map_err(MaxwellGpuAccessError::Backing)?;
             copied = copied_end;
         }
         Ok(())
@@ -1789,6 +1822,36 @@ mod tests {
             permissions: MemoryPermissions::READ_WRITE,
             fixed_offset: None,
         }
+    }
+
+    #[test]
+    fn retained_mapping_clones_allocate_nothing_and_append_keeps_prior_extent() {
+        use crate::engines::tests::register_benchmark::ALLOCATIONS;
+        let mut space = address_space();
+        space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let (_, backing) = backing(4096);
+        let mapping = space.map(map_request(backing, 1, 4096)).unwrap();
+        let mut source = space
+            .resolve_range(mapping.offset(), 4, MemoryPermissions::READ)
+            .unwrap();
+        let retained = source.clone();
+        ALLOCATIONS.with(|n| n.set(Some(0)));
+        for _ in 0..1000 {
+            std::hint::black_box(source.clone());
+        }
+        assert_eq!(ALLOCATIONS.with(|n| n.replace(None).unwrap()), 0);
+        source
+            .append_inline_bytes(mapping.offset().get() + 4, 12)
+            .unwrap();
+        assert_eq!(source.size(), 16);
+        assert_eq!(source.segments()[0].size(), 16);
+        assert_eq!(retained.size(), 4);
+        assert_eq!(retained.segments()[0].size(), 4);
+        space.unmap(mapping.offset()).unwrap();
+        assert!(!space.retained_mapping_is_current(retained.segments()[0].mapping()));
+        assert_eq!(retained.segments()[0].mapping().backing().size(), 4096);
     }
 
     #[test]

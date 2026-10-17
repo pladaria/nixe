@@ -15,6 +15,7 @@ const MAX_THREADS: usize = 64;
 const EVENTS_PER_THREAD: usize = 1_048_576;
 static CAPTURE: OnceLock<Capture> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+static FRAMES_ONLY: AtomicBool = AtomicBool::new(false);
 static FORCE_INTERVAL_ONE: AtomicBool = AtomicBool::new(false);
 thread_local! {
     static BUFFER: RefCell<Option<Arc<Mutex<Buffer>>>> = const { RefCell::new(None) };
@@ -41,8 +42,14 @@ struct Event {
 
 /// `NIXE_EXECUTION_TRACE` selects the output. Optional comma-separated
 /// `NIXE_EXECUTION_TRACE_WINDOWS` contains start:end seconds. Detailed spans
-/// require `NIXE_EXECUTION_TRACE_DETAIL=1`; frame events are always recorded.
+/// require `NIXE_EXECUTION_TRACE_DETAIL=1`. `NIXE_EXECUTION_TRACE_FRAMES_ONLY=1`
+/// retains only presentation events, excluding per-command recording from
+/// low-overhead CPU/cadence comparisons.
 pub fn start() -> io::Result<()> {
+    FRAMES_ONLY.store(
+        std::env::var_os("NIXE_EXECUTION_TRACE_FRAMES_ONLY").is_some_and(|v| v == "1"),
+        Ordering::Relaxed,
+    );
     FORCE_INTERVAL_ONE.store(
         std::env::var_os("NIXE_TEST_SWAP_INTERVAL").is_some_and(|v| v == "1"),
         Ordering::Relaxed,
@@ -100,6 +107,9 @@ fn now(detailed: bool) -> Option<u64> {
     if !ACTIVE.load(Ordering::Relaxed) {
         return None;
     }
+    if detailed && FRAMES_ONLY.load(Ordering::Relaxed) {
+        return None;
+    }
     let capture = CAPTURE.get()?;
     if detailed && !capture.detailed {
         return None;
@@ -126,7 +136,11 @@ fn record(event: Event) {
                     std::thread::current().name().unwrap_or("unnamed"),
                     std::thread::current().id()
                 ),
-                events: Vec::with_capacity(EVENTS_PER_THREAD),
+                events: Vec::with_capacity(if FRAMES_ONLY.load(Ordering::Relaxed) {
+                    65_536
+                } else {
+                    EVENTS_PER_THREAD
+                }),
                 dropped: 0,
             }));
             buffers.push(Arc::clone(&buffer));
@@ -143,6 +157,19 @@ fn record(event: Event) {
 
 #[inline]
 pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
+    if FRAMES_ONLY.load(Ordering::Relaxed)
+        && !matches!(
+            name,
+            "host_present"
+                | "queue_buffer"
+                | "requested_interval"
+                | "vi_latch"
+                | "buffer_release"
+                | "vi_eligible"
+        )
+    {
+        return;
+    }
     if let Some(time) = now(false) {
         record(Event {
             begin: time,

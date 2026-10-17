@@ -41,6 +41,9 @@ pub struct DeviceVisibilityRequest {
     pub device: NonCpuDeviceId,
     /// Point before which the transition must be true.
     pub visible_at: DeviceVisibilityPoint,
+    /// Identity of the CPU bytes stabilized by the caller's page protection
+    /// or execution exclusion. Enables exact O(1) retained-baseline reuse.
+    pub cpu_revision: crate::CpuContentRevision,
 }
 
 /// Whole-page transition required before a CPU access.

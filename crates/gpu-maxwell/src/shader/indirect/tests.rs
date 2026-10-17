@@ -108,7 +108,15 @@ fn bounded_table_tracks_only_its_bytes_and_binding_identity() {
     assert!(table.current(&space));
     assert!(table.binding_current(channel.three_d().shader_bindings()));
     allocation.write(0x80, &[1]).unwrap();
+    assert!(!table.cpu_writes.remains_current());
     assert!(table.current(&space));
+    assert!(
+        table.cpu_writes.remains_current(),
+        "equal table bytes refresh the observation"
+    );
+    for _ in 0..8 {
+        assert!(table.current(&space));
+    }
     let mut overlay = CanonicalWriteBatch::new();
     overlay
         .stage(&table.range, 0, &16_u32.to_le_bytes())
@@ -117,6 +125,20 @@ fn bounded_table_tracks_only_its_bytes_and_binding_identity() {
     assert!(!table.binding_current(self::channel(address + 0x100).three_d().shader_bindings()));
     allocation.write(0, &16_u32.to_le_bytes()).unwrap();
     assert!(!table.current(&space));
+    assert!(
+        !table.cpu_writes.remains_current(),
+        "mismatched bytes must stay invalid"
+    );
+    assert!(
+        !table.current(&space),
+        "a second check cannot accept the old shader"
+    );
+    allocation.write(0, &0_u32.to_le_bytes()).unwrap();
+    assert!(
+        table.current(&space),
+        "restoring the exact bytes can reuse the old shader"
+    );
+    assert!(table.cpu_writes.remains_current());
 }
 #[test]
 fn control_edge_cannot_bypass_the_table_index_clamp() {

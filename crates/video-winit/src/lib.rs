@@ -134,6 +134,7 @@ impl WindowFrontend {
                 worker_completion: Arc::clone(&worker_completion),
                 frame_wakeup_pending,
                 context: None,
+                vsync: true,
                 presenter: None,
                 failure: None,
                 initial_window_state: None,
@@ -175,6 +176,13 @@ impl WindowFrontend {
     #[must_use]
     pub fn with_gpu_context(mut self, context: WgpuPresentationContext) -> Self {
         self.application.context = Some(context);
+        self
+    }
+
+    /// Selects host vertical synchronization before creating the presenter.
+    #[must_use]
+    pub fn with_vsync(mut self, vsync: bool) -> Self {
+        self.application.vsync = vsync;
         self
     }
 
@@ -246,7 +254,11 @@ struct LegacyPresenter {
 }
 
 impl LegacyPresenter {
-    fn new(window: Arc<Window>, context: WgpuPresentationContext) -> Result<Self, WindowError> {
+    fn new(
+        window: Arc<Window>,
+        context: WgpuPresentationContext,
+        vsync: bool,
+    ) -> Result<Self, WindowError> {
         let instance = context.instance().clone();
         let surface = instance
             .create_surface(Arc::clone(&window))
@@ -282,7 +294,20 @@ impl LegacyPresenter {
         {
             surface_configuration.format = format;
         }
-        surface_configuration.present_mode = PresentMode::Fifo;
+        surface_configuration.present_mode = if vsync {
+            PresentMode::Fifo
+        } else {
+            PresentMode::Immediate
+        };
+        if !surface
+            .get_capabilities(adapter)
+            .present_modes
+            .contains(&surface_configuration.present_mode)
+        {
+            return Err(WindowError::device(
+                "surface does not support the requested VSync presentation mode",
+            ));
+        }
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Nixe frame bind group layout"),
@@ -900,6 +925,7 @@ struct PresenterApplication {
     worker_completion: Arc<WorkerCompletionState>,
     frame_wakeup_pending: Arc<AtomicBool>,
     context: Option<WgpuPresentationContext>,
+    vsync: bool,
     presenter: Option<Presenter>,
     failure: Option<WindowError>,
     initial_window_state: Option<WindowState>,
@@ -981,7 +1007,7 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             let context = self.context.take().ok_or_else(|| {
                 WindowError::device("accelerated presentation context was not configured")
             })?;
-            let mut presenter = Presenter::new(window, context)?;
+            let mut presenter = Presenter::new(window, context, self.vsync)?;
             presenter.screenshots = self.screenshots.take();
             self.presenter = Some(presenter);
             self.capture_window_state();

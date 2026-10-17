@@ -39,7 +39,10 @@ static RunCodeCallbacks GenRunCodeCallbacks(A64::UserCallbacks* cb, CodePtr (*Lo
 
 static std::function<void(BlockOfCode&)> GenRCP(const A64::UserConfig& conf) {
     return [conf](BlockOfCode& code) {
-        if (conf.page_table) {
+        if (conf.physical_exclusive_page_table) {
+            ASSERT(!conf.page_table);
+            code.mov(code.r14, conf.physical_exclusive_page_table);
+        } else if (conf.page_table) {
             code.mov(code.r14, mcl::bit_cast<u64>(conf.page_table));
         }
         if (conf.fastmem_pointer) {

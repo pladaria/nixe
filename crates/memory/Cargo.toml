@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 rustc-hash.workspace = true
+smallvec = "1.15"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

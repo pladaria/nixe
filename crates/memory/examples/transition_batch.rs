@@ -99,13 +99,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for range in &ranges {
                 CanonicalBackingRange::prepare_resident_device_accesses(
                     [(range, read)],
-                    coordinator.clone(),
+                    coordinator.as_ref(),
                 )?;
             }
         } else {
             CanonicalBackingRange::prepare_resident_device_accesses(
                 ranges.iter().map(|range| (range, read)),
-                coordinator.clone(),
+                coordinator.as_ref(),
             )?;
         }
         Ok(())

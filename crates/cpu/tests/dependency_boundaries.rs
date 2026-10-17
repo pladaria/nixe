@@ -5,7 +5,8 @@ use std::path::Path;
 // the CPU crate's ownership boundary, not merely a manifest edit.
 // rustc-hash provides local page-table containers; it owns no execution engine
 // or platform behavior and introduces no dependency on a concrete CPU backend.
-const APPROVED_DEPENDENCIES: &[&str] = &["nixe-memory", "rustc-hash"];
+// smallvec keeps bounded physical patch sets inline; it owns no memory authority.
+const APPROVED_DEPENDENCIES: &[&str] = &["nixe-memory", "rustc-hash", "smallvec"];
 
 #[test]
 fn manifest_contains_only_architecturally_approved_dependencies() {

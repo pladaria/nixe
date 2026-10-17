@@ -8,6 +8,19 @@ use nixe_gpu::{
     ssa::compile::CompilePool,
 };
 use std::time::{Duration, Instant};
+
+#[test]
+fn vsync_selects_the_requested_surface_mode_without_a_synchronized_fallback() {
+    use vk::PresentModeKHR as Mode;
+    let modes = [Mode::MAILBOX, Mode::FIFO, Mode::IMMEDIATE];
+    assert_eq!(wsi::select_present_mode(true, &modes).unwrap(), Mode::FIFO);
+    assert_eq!(
+        wsi::select_present_mode(false, &modes).unwrap(),
+        Mode::IMMEDIATE
+    );
+    assert!(wsi::select_present_mode(false, &[Mode::FIFO, Mode::MAILBOX]).is_err());
+}
+
 mod support {
     use crate as nixe_gpu_vulkan;
     include!(concat!(

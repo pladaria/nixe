@@ -483,3 +483,31 @@ fn invalid_value(
         defined_mask: declaration.defined_mask,
     }
 }
+
+pub(in crate::engines) fn data_words(
+    class: nixe_gpu::GpuClassId,
+    candidate: &mut MaxwellComputeState,
+    subchannel: crate::MaxwellPushbufferSubchannel,
+    words: &[crate::MaxwellDecodedMethod],
+) -> Result<(MaxwellComputeInlineToMemoryUpload, usize), MaxwellEngineDispatchError> {
+    let source = MaxwellMethodSource::decoded(words[0], subchannel);
+    let pending = candidate.inline_to_memory().pending();
+    let applied = preflight(
+        MaxwellMethodDispatch::emitted_by_mme(source, class),
+        candidate,
+    )?;
+    let pending = pending.expect("validated inline data has an armed transfer");
+    let count = words
+        .len()
+        .min(((pending.byte_length() - pending.next_offset()) / 4) as usize);
+    let last = MaxwellMethodSource::decoded(words[count - 1], subchannel);
+    candidate.apply(MaxwellComputeStateWrite::InlineToMemoryData {
+        value: last.argument(),
+        next_offset: pending.next_offset() + count as u32 * 4,
+        source: last,
+    });
+    let Some(PendingEngineOperation::ComputeInlineToMemory(upload)) = applied.operation else {
+        unreachable!()
+    };
+    Ok((upload, count))
+}

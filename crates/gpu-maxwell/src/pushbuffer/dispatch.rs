@@ -50,6 +50,17 @@ pub struct MaxwellMethodSource {
 }
 
 impl MaxwellMethodSource {
+    pub(crate) const fn decoded(
+        method: MaxwellDecodedMethod,
+        subchannel: MaxwellPushbufferSubchannel,
+    ) -> Self {
+        Self {
+            location: method.argument_source(),
+            subchannel,
+            method: method.method(),
+            argument: method.argument(),
+        }
+    }
     pub(crate) const fn emitted_by_mme(self, method: GpuMethodId, argument: u32) -> Self {
         Self {
             method,
@@ -328,6 +339,35 @@ impl std::error::Error for MaxwellMethodDispatchError {}
 pub(crate) enum MaxwellMethodStreamError<E> {
     Dispatch(MaxwellMethodDispatchError),
     Consumer(E),
+}
+
+/// Resolve an already decoded class-only packet once for bulk consumers.
+/// Binding-changing and host methods retain the ordered scalar dispatcher.
+pub(crate) fn class_packet_methods(
+    channel: &MaxwellGpuChannel,
+    submission: FrontendSubmissionId,
+    packet: &MaxwellDecodedPacket,
+) -> Result<Option<(GpuClassId, MaxwellPushbufferSubchannel)>, MaxwellMethodDispatchError> {
+    let MaxwellDecodedPacket::Methods(packet) = packet else {
+        return Ok(None);
+    };
+    let Some(subchannel) = packet.subchannel() else {
+        return Ok(None);
+    };
+    let methods = packet.methods();
+    if methods.len() < 2 || methods.iter().any(|m| m.method().0 < HOST_METHOD_LIMIT) {
+        return Ok(None);
+    }
+    validate_source_identity(channel.id(), submission, packet.header())?;
+    for method in methods {
+        validate_source_identity(channel.id(), submission, method.argument_source())?;
+    }
+    let Some(class) = channel.frontend().subchannel_binding(subchannel) else {
+        return Err(MaxwellMethodDispatchError::UnboundSubchannel {
+            source: MaxwellMethodSource::decoded(methods[0], subchannel),
+        });
+    };
+    Ok(Some((class, subchannel)))
 }
 
 /// Applies class binding and streams methods without retaining a second packet.

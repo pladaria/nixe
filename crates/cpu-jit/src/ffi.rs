@@ -18,15 +18,24 @@ pub struct Exit {
     pub ticks: u64,
 }
 unsafe extern "C" {
-    pub fn nixe_dynarmic_resolve_fault(pc: u64, call: *mut u64, ret: *mut u64) -> bool;
+    pub fn nixe_dynarmic_resolve_fault(
+        core: *mut c_void,
+        pc: u64,
+        persistent: bool,
+        call: *mut u64,
+        ret: *mut u64,
+    ) -> bool;
     fn nixe_dynarmic_error() -> *const c_char;
+    #[cfg(not(target_arch = "x86_64"))]
     pub fn nixe_dynarmic_monitor_create(count: usize) -> *mut c_void;
+    #[cfg(not(target_arch = "x86_64"))]
     pub fn nixe_dynarmic_monitor_destroy(monitor: *mut c_void);
     pub fn nixe_dynarmic_create(
         cb: Callbacks,
         monitor: *mut c_void,
         id: usize,
         arena: usize,
+        exclusive_table: usize,
         bits: usize,
         frequency: u32,
         ctr: u32,

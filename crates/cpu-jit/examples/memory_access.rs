@@ -55,6 +55,10 @@ fn counters() -> BTreeMap<&'static str, u64> {
                     | "JitGuestTicks"
                     | "JitFaultDispatches"
                     | "JitMemoryCallbacks"
+                    | "JitReadCallbacks"
+                    | "JitWriteCallbacks"
+                    | "JitAtomicCallbacks"
+                    | "TrackingLocks"
                     | "GateSharedAcquisitions"
                     | "GateExclusiveAcquisitions"
                     | "DirectProtectionCalls"
@@ -157,7 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             DeviceVisibilityPoint::new(point),
                         ),
                     )],
-                    device.clone(),
+                    device.as_ref(),
                 )?;
             } else if matches!(workload.as_str(), "gpu-read" | "gpu-write") {
                 let declaration = DeviceAccessDeclaration::write(
@@ -167,7 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
                 CanonicalBackingRange::prepare_resident_device_accesses(
                     [(&range, declaration)],
-                    device.clone(),
+                    device.as_ref(),
                 )?;
                 CanonicalBackingRange::publish_device_writes(
                     [(&range, declaration)],

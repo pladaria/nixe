@@ -114,10 +114,12 @@ impl NativeGpuExecution {
     pub fn attach_presentation(
         &mut self,
         client: crate::presentation::PresentationClient,
+        vsync: bool,
     ) -> Result<(), VulkanError> {
         self.host = Some(crate::presentation::Host::new(
             self.residency.device(),
             client,
+            vsync,
         )?);
         Ok(())
     }
@@ -379,12 +381,15 @@ impl NativeGpuExecution {
         let index = source
             .index
             .as_ref()
-            .map(|(backing, kind)| {
+            .map(|index| {
+                let GuestIndexBuffer::Canonical(backing, kind) = index else {
+                    return Ok(None);
+                };
                 let buffer = self.residency.buffer_for_deferred_import(
                     backing.clone(),
                     vk::BufferUsageFlags::INDEX_BUFFER,
                 )?;
-                Ok::<_, VulkanError>(IndexBuffer {
+                Ok::<_, VulkanError>(Some(IndexBuffer {
                     buffer,
                     offset: 0,
                     size: backing.size(),
@@ -393,12 +398,21 @@ impl NativeGpuExecution {
                         nixe_gpu::IndexType::Uint16 => vk::IndexType::UINT16,
                         nixe_gpu::IndexType::Uint32 => vk::IndexType::UINT32,
                     },
-                })
+                }))
             })
-            .transpose()?;
-        let draw =
+            .transpose()?
+            .flatten();
+        let draw = if let Some(GuestIndexBuffer::Inline(bytes)) = &source.index {
+            self.residency.prepare_inline_index_draw(
+                graphics,
+                targets,
+                vertices.into_boxed_slice(),
+                Arc::clone(bytes),
+            )?
+        } else {
             self.residency
-                .prepare_draw(graphics, targets, vertices.into_boxed_slice(), index)?;
+                .prepare_draw(graphics, targets, vertices.into_boxed_slice(), index)?
+        };
         self.statistics.prepared_draws += 1;
         self.statistics.reused_graphics += u64::from(already_prepared);
         self.drawings.insert(

@@ -191,6 +191,11 @@ pub struct ExecutionSharedGuard {
 }
 
 impl ExecutionSharedGuard {
+    /// Whether this mapping admission belongs to the supplied backing gate.
+    #[must_use]
+    pub fn authorizes(&self, gate: &ExecutionGate) -> bool {
+        self.gate.identity() == gate.identity()
+    }
     #[must_use]
     pub const fn epoch(&self) -> u64 {
         self.epoch

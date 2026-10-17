@@ -774,7 +774,7 @@ impl VulkanResidency {
                 )
                 .map_err(memory_error)?,
             )],
-            self.visibility.clone(),
+            self.visibility.as_ref(),
         )
         .map_err(memory_error)
     }

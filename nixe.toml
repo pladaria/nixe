@@ -69,6 +69,11 @@ backend = "jit"
 # Opt-in host-parallel vCPU execution. False keeps deterministic serialization.
 parallel_vcpus = true
 
+[video]
+# Synchronize host presentation to the monitor. Defaults to true when omitted.
+# Disabling this allows tearing; guest-requested frame intervals are preserved.
+vsync = false
+
 [gpu]
 # Maximum working set retained by each shader cache. Entries are evicted by
 # least-recent use; this is a software budget rather than a hardware limit.

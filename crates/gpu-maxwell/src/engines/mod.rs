@@ -4,6 +4,7 @@
 //! order and returns the first typed fatal boundary. It contains no Horizon
 //! ABI, guest mappings, scheduler state, or host-backend objects.
 
+mod bulk;
 mod compute;
 mod dma_copy;
 mod inline_to_memory;
@@ -198,7 +199,7 @@ pub enum MaxwellEngineCapability {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 impl Display for MaxwellEngineCapability {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
@@ -282,6 +283,8 @@ pub(crate) struct MaxwellEngineEvent<'a> {
     pub(crate) three_d: &'a MaxwellThreeDState,
     /// Present for direct class methods; MME-expanded 3D effects have no compute state.
     pub(crate) compute: Option<&'a MaxwellComputeState>,
+    /// Original decoded payload, borrowed only until the ordered consumer returns.
+    pub(crate) inline_words: Option<&'a [crate::MaxwellDecodedMethod]>,
 }
 
 /// One validated host synchronization at its exact pushbuffer source.
@@ -666,6 +669,7 @@ fn emit_pending_operation<E>(
         operation,
         three_d,
         compute,
+        inline_words: None,
     })
 }
 
@@ -685,6 +689,12 @@ pub(crate) fn stream_maxwell_engine_packet<E>(
     consume: &mut impl for<'a> FnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
 ) -> Result<(), MaxwellEngineStreamError<E>> {
     let mut methods = methods;
+    if methods.is_none()
+        && mme_methods.is_empty()
+        && bulk::stream_packet(channel, submission, packet, consume)?
+    {
+        return Ok(());
+    }
     stream_maxwell_packet_methods(channel, submission, packet, &mut |channel, method| {
         if !mme_methods.is_empty() {
             let first_method = mme_methods[0].source().method().0;
@@ -753,6 +763,14 @@ pub(crate) fn stream_maxwell_engine_packet<E>(
             return Ok(());
         }
         if method.kind() == MaxwellMethodDispatchKind::ClassMethod {
+            if method.class() == threed::CLASS && methods.is_none() {
+                let mut method = method;
+                if threed::write_plain_method(&mut method, channel.three_d_mut())
+                    .map_err(MaxwellEngineStreamError::dispatch)?
+                {
+                    return Ok(());
+                }
+            }
             let applied = dispatch_class_method(channel, method)
                 .map_err(MaxwellEngineStreamError::dispatch)?;
             if let Some(operation) = applied.operation {
@@ -763,6 +781,7 @@ pub(crate) fn stream_maxwell_engine_packet<E>(
                     consume,
                 )
                 .map_err(MaxwellEngineStreamError::Consumer)?;
+                channel.three_d_mut().complete_inline_draw();
             }
             if let Some(methods) = methods.as_deref_mut() {
                 methods.push(applied.dispatch);
@@ -927,7 +946,7 @@ pub fn dispatch_maxwell_engine_packet(
     let mut ordered_operations = Vec::new();
     let mut mme_methods = Vec::new();
     let mut mme_parameters = Vec::new();
-    stream_maxwell_engine_packet(
+    let streamed = stream_maxwell_engine_packet(
         channel,
         submission,
         packet,
@@ -994,7 +1013,20 @@ pub fn dispatch_maxwell_engine_packet(
     .map_err(|error| match error {
         MaxwellEngineStreamError::Dispatch(error) => *error,
         MaxwellEngineStreamError::Consumer(never) => match never {},
-    })?;
+    });
+    // This inspection API explicitly consumes a complete typed snapshot.
+    // Production streaming materializes only the groups needed by an operation.
+    let (profile, state) = channel.three_d_with_profile_mut();
+    let materialized = threed::materialize_state(profile, state);
+    streamed?;
+    materialized?;
+    let mut inspector = state.clone();
+    for observed in &mut methods {
+        if observed.metadata.method_name() == "STATE_REGISTER" {
+            observed.metadata =
+                threed::inspect_state_metadata(profile, observed.method.source(), &mut inspector);
+        }
+    }
     Ok(MaxwellEnginePacketDispatch {
         methods: methods.into_boxed_slice(),
         ordered_operations: ordered_operations.into_boxed_slice(),

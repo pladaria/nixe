@@ -1,6 +1,8 @@
 //! Ordered streaming lowering and canonical execution for a frontend delivery.
 
 mod accesses;
+#[cfg(test)]
+mod benchmark;
 use accesses::BufferedAccesses;
 mod lowerer;
 mod work;
@@ -25,9 +27,10 @@ use crate::engines::{
 };
 use crate::{
     MaxwellComputeSynchronizationPlan, MaxwellGpuAccessError, MaxwellGpuAddressSpace,
-    MaxwellHostSynchronizationKind, MaxwellLoweredWork, MaxwellLoweringCache, MaxwellLoweringError,
-    MaxwellMemoryCopyError, MaxwellMemoryCopyOperation, MaxwellMethodSource, MaxwellResolvedRange,
-    MaxwellShaderTranslationError, MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
+    MaxwellHostSynchronizationKind, MaxwellInlineToMemoryUpload, MaxwellLoweredWork,
+    MaxwellLoweringCache, MaxwellLoweringError, MaxwellMemoryCopyError, MaxwellMemoryCopyOperation,
+    MaxwellMethodSource, MaxwellResolvedRange, MaxwellShaderTranslationError,
+    MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
     MaxwellThreeDSynchronizationPlan, lower_maxwell_compute_synchronization,
     lower_maxwell_three_d_synchronization,
 };
@@ -386,6 +389,7 @@ impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
             operation,
             three_d,
             compute,
+            inline_words,
         } = operation;
         if !matches!(
             operation,
@@ -524,14 +528,55 @@ impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
                 // This also satisfies enabled SYSMEMBAR without an extra host wait
                 // or per-upload flush command. Neither mode releases a semaphore.
                 // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/compute/clb1c0.h#L129-L165
-                self.push_inline_write(
-                    upload.address().get(),
-                    upload.offset(),
-                    upload.value(),
-                    upload.source(),
-                )?;
+                if let Some(words) = inline_words {
+                    self.push_inline_words(
+                        upload.address().get(),
+                        upload.offset(),
+                        words,
+                        upload.source(),
+                    )?;
+                } else {
+                    self.push_inline_write(
+                        upload.address().get(),
+                        upload.offset(),
+                        upload.value(),
+                        upload.source(),
+                    )?;
+                }
             }
             PendingEngineOperation::InlineToMemory(upload) => {
+                if let Some(words) = inline_words {
+                    if <L::Work as MaxwellWork>::Batch::DEVICE_MEMORY {
+                        self.push_inline_words(
+                            upload.address().get(),
+                            upload.offset(),
+                            words,
+                            upload.source(),
+                        )?;
+                    } else {
+                        // The retained renderer has an image import operation;
+                        // its texel permutation remains a distinct semantic case.
+                        for (index, word) in words.iter().enumerate() {
+                            self.push_event(MaxwellEngineEvent {
+                                operation: PendingEngineOperation::InlineToMemory(
+                                    MaxwellInlineToMemoryUpload::new(
+                                        upload.address(),
+                                        upload.offset() + index as u32 * 4,
+                                        word.argument(),
+                                        MaxwellMethodSource::decoded(
+                                            *word,
+                                            upload.source().subchannel(),
+                                        ),
+                                    ),
+                                ),
+                                three_d,
+                                compute,
+                                inline_words: None,
+                            })?;
+                        }
+                    }
+                    return Ok(());
+                }
                 let target = resolve_inline_target(
                     self.address_space,
                     upload.address().get(),
@@ -675,12 +720,21 @@ impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
                 }
             }
             PendingEngineOperation::ThreeDInlineConstantBuffer(upload) => {
-                self.push_inline_write(
-                    upload.address().get(),
-                    upload.offset(),
-                    upload.value(),
-                    upload.source(),
-                )?;
+                if let Some(words) = inline_words {
+                    self.push_inline_words(
+                        upload.address().get(),
+                        upload.offset(),
+                        words,
+                        upload.source(),
+                    )?;
+                } else {
+                    self.push_inline_write(
+                        upload.address().get(),
+                        upload.offset(),
+                        upload.value(),
+                        upload.source(),
+                    )?;
+                }
             }
             PendingEngineOperation::ThreeD(trigger) => {
                 let work = self.cache.lower_three_d(
@@ -779,6 +833,69 @@ impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
             )
             .map_err(MaxwellSubmissionExecutionError::Lowering)?;
         self.steps.push(MaxwellSubmissionExecutionStep::Gpu(work));
+        self.prior_work_pending = true;
+        Ok(())
+    }
+
+    fn push_inline_words(
+        &mut self,
+        base: u64,
+        offset: u32,
+        words: &[crate::MaxwellDecodedMethod],
+        source: MaxwellMethodSource,
+    ) -> Result<(), MaxwellSubmissionExecutionError> {
+        let address = base.checked_add(u64::from(offset)).ok_or(
+            MaxwellSubmissionExecutionError::InlineAddress {
+                source,
+                error: MaxwellGpuAccessError::ArithmeticOverflow,
+            },
+        )?;
+        let size = words.len() as u64 * 4;
+        if let Some(MaxwellSubmissionExecutionStep::InlineWrite { target, value, .. }) =
+            self.steps.last_mut()
+            && target.append_inline_bytes(address, size).is_some()
+        {
+            value.reserve(words.len() * 4);
+            for word in words {
+                value.extend_from_slice(&word.argument().to_le_bytes());
+            }
+        } else {
+            self.flush_inline_writes()?;
+            let address = self
+                .address_space
+                .address(address)
+                .map_err(MaxwellGpuAccessError::Address)
+                .map_err(|error| MaxwellSubmissionExecutionError::InlineAddress {
+                    source,
+                    error,
+                })?;
+            let target = self
+                .address_space
+                .resolve_range(address, size, MemoryPermissions::WRITE)
+                .map_err(|error| {
+                    let at = match &error {
+                        MaxwellGpuAccessError::UnmappedAddress { address }
+                        | MaxwellGpuAccessError::PermissionDenied { address, .. } => address.get(),
+                        _ => address.get(),
+                    };
+                    let word = ((at.saturating_sub(address.get())) / 4) as usize;
+                    let source = words.get(word).map_or(source, |word| {
+                        MaxwellMethodSource::decoded(*word, source.subchannel())
+                    });
+                    MaxwellSubmissionExecutionError::InlineAddress { source, error }
+                })?;
+            let mut value = Vec::with_capacity(words.len() * 4);
+            for word in words {
+                value.extend_from_slice(&word.argument().to_le_bytes());
+            }
+            self.steps
+                .push(MaxwellSubmissionExecutionStep::InlineWrite {
+                    source,
+                    target,
+                    value,
+                });
+        }
+        self.inline_write_pending = true;
         self.prior_work_pending = true;
         Ok(())
     }
@@ -960,7 +1077,7 @@ impl MaxwellBackendSegment {
 pub struct MaxwellBackendExecution<W: MaxwellWork = MaxwellLoweredWork> {
     frontend: FrontendSubmissionId,
     predecessors: Box<[FrontendSubmissionId]>,
-    steps: Vec<MaxwellSubmissionExecutionStep<W>>,
+    steps: std::collections::VecDeque<MaxwellSubmissionExecutionStep<W>>,
     next_step: usize,
     compilation_cursor: usize,
     pre_writes: CanonicalWriteBatch,
@@ -1002,7 +1119,7 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
         Self {
             frontend,
             predecessors: Box::default(),
-            steps: Vec::new(),
+            steps: std::collections::VecDeque::new(),
             next_step: 0,
             compilation_cursor: 0,
             pre_writes: CanonicalWriteBatch::new(),
@@ -1042,7 +1159,11 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
     /// effects. The existing byte permits bound this lookahead; no guest memory
     /// is decoded speculatively and no wait/release/copy is advanced.
     pub fn precompile(&mut self, backend: &mut impl nixe_gpu::GpuExecution) {
-        for step in &self.steps[self.compilation_cursor.max(self.next_step)..] {
+        for step in self
+            .steps
+            .iter()
+            .skip(self.compilation_cursor.max(self.next_step))
+        {
             if let MaxwellSubmissionExecutionStep::Gpu(work) = step {
                 work.precompile(backend);
             }
@@ -1129,7 +1250,7 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
         {
             return false;
         }
-        for step in &self.steps[self.next_step..] {
+        for step in self.steps.iter().skip(self.next_step) {
             match step {
                 MaxwellSubmissionExecutionStep::InlineWrite { target, .. } => {
                     if !target.segments().iter().all(|segment| {
@@ -3349,7 +3470,7 @@ mod tests {
                 let owner: Arc<dyn nixe_memory::VisibilityCoordinator> = Arc::new(NoReadback);
                 nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
                     [(&target, declaration)],
-                    Arc::clone(&owner),
+                    owner.as_ref(),
                 )
                 .unwrap();
                 nixe_memory::CanonicalBackingRange::publish_device_writes(
@@ -4011,7 +4132,7 @@ mod tests {
             let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(InboxCoordinator);
             CanonicalBackingRange::prepare_resident_device_accesses(
                 [(&backing, declaration)],
-                coordinator.clone(),
+                coordinator.as_ref(),
             )
             .unwrap();
             CanonicalBackingRange::publish_device_writes([(&backing, declaration)], coordinator)

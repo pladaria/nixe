@@ -14,15 +14,16 @@ use std::{
 
 use nixe_memory::{
     AddressSpaceId, CanonicalBackingPage, CanonicalBackingRange, CanonicalBackingSegment,
-    CanonicalBackingStore, CanonicalPageError, CanonicalRangeTranslationError,
-    CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator, ContentGeneration,
-    CpuMemoryBackend, DirectAddressSpaceView, DirectArena, DirectBackendPolicy, DirectMapRequest,
-    DirectProtectRequest, DirectProtection, ExecutionGate, ExecutionSharedGuard,
+    CanonicalBackingStore, CanonicalHostWrite, CanonicalHostWriteOutcome, CanonicalPageError,
+    CanonicalRangeTranslationError, CanonicalRangeTranslationErrorReason, CanonicalRangeTranslator,
+    ContentGeneration, CpuMemoryBackend, DirectAddressSpaceView, DirectArena, DirectBackendPolicy,
+    DirectMapRequest, DirectProtectRequest, DirectProtection, ExecutionGate, ExecutionSharedGuard,
     GuestPhysicalPageId, GuestVirtualAddress, HostMappedBacking, MappingGeneration,
     MemoryInvalidation, MemoryInvalidationCursor, MemoryInvalidationError, MemoryInvalidationKind,
     MemoryInvalidationLog, MemoryInvalidationOrigin, MemoryInvalidationSource,
 };
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use crate::{
     error::{InstructionFetchFault, InstructionFetchFaultReason},
@@ -851,8 +852,8 @@ pub struct ExecutionMemory {
 }
 
 /// A native callback must leave its execution lease before a device can wait.
-pub enum NativeMemoryAccess {
-    Ram,
+pub enum NativeMemoryAccess<'a> {
+    Ram(nixe_memory::CanonicalCpuAccess<'a>),
     CheckedRam,
     Device,
     Visibility(CanonicalBackingPage),
@@ -891,15 +892,16 @@ impl ExecutionMemoryLease<'_> {
     }
 }
 
-/// Page proofs retained only while mappings, GPU ownership and tracking rearm
-/// are excluded by the same live native execution lease. No cached bytes or
-/// atomic values are retained. Each vCPU invocation owns its small direct map.
+/// A bounded cache of physical translations and guest permissions. Mapping
+/// admission retains these identities; content/observation may change while a
+/// native slice runs. Callbacks therefore access bytes under the page lock,
+/// never through a cached writable fastmem pointer. Generated loads/stores
+/// continue to use fastmem and its registered fault sites directly.
 pub struct NativeMemorySession<'a> {
     memory: &'a ExecutionMemory,
     _lease: &'a ExecutionMemoryLease<'a>,
     space: AddressSpaceId,
-    direct: [Option<(u64, bool)>; 16],
-    atomic: [Option<(u64, CanonicalBackingPage)>; 16],
+    pages: [Option<(u64, MemoryPermissions, CanonicalBackingPage)>; 16],
 }
 
 impl<'a> NativeMemorySession<'a> {
@@ -916,8 +918,7 @@ impl<'a> NativeMemorySession<'a> {
             memory,
             _lease: lease,
             space,
-            direct: [None; 16],
-            atomic: std::array::from_fn(|_| None),
+            pages: std::array::from_fn(|_| None),
         }
     }
 
@@ -927,26 +928,62 @@ impl<'a> NativeMemorySession<'a> {
         address: GuestVirtualAddress,
         access: MemoryAccess,
         kind: DataAccessKind,
-    ) -> Result<NativeMemoryAccess, DataAccessFault> {
+    ) -> Result<NativeMemoryAccess<'_>, DataAccessFault> {
         let page = virtual_page(address);
         let index = page as usize & 15;
-        let writable = kind == DataAccessKind::Write;
-        // Other access classes and cross-page faults retain the complete
-        // resolver. A proof for one page never authorizes its neighbour.
+        let required = match kind {
+            DataAccessKind::Read => MemoryPermissions::READ,
+            DataAccessKind::Write => MemoryPermissions::WRITE,
+        };
         let cacheable = access.class == MemoryAccessClass::Normal
             && address.is_aligned_to(u64::from(access.alignment.bytes(access.size)))
             && page_offset(address) + access.size.bytes() <= SYNTHETIC_PAGE_SIZE;
-        if cacheable && self.direct[index].is_some_and(|(p, w)| p == page && (!writable || w)) {
-            return Ok(NativeMemoryAccess::Ram);
+        if !cacheable {
+            return self
+                .memory
+                .resolve_native_access(self.space, address, access, kind);
         }
-        let resolved = self
-            .memory
-            .resolve_native_access(self.space, address, access, kind)?;
-        if cacheable && matches!(resolved, NativeMemoryAccess::Ram) {
-            let already_writable = self.direct[index].is_some_and(|(p, w)| p == page && w);
-            self.direct[index] = Some((page, writable || already_writable));
+        if !self.pages[index]
+            .as_ref()
+            .is_some_and(|(p, permissions, _)| *p == page && permissions.contains(required))
+        {
+            let inner = self.memory.lock_inner();
+            if let Some(error) = &inner.direct_failure {
+                return Ok(NativeMemoryAccess::Fatal(error.clone()));
+            }
+            let resolved = resolve_access(&inner, self.space, address, access, kind)?;
+            if resolved.region == MemoryRegionKind::Device {
+                return Ok(NativeMemoryAccess::Device);
+            }
+            let Some(ExecutionPhysicalPage::Ram(backing)) =
+                inner.page(resolved.first.physical_slot)
+            else {
+                unreachable!("resolved RAM retains backing");
+            };
+            self.pages[index] = Some((page, resolved.first.permissions, backing.clone()));
         }
-        Ok(resolved)
+        let backing = &self.pages[index].as_ref().unwrap().2;
+        let fail = |error: CanonicalPageError| {
+            DataAccessFault::new(
+                self.space,
+                address,
+                kind,
+                DataAccessFaultReason::HostBacking(error.to_string().into()),
+            )
+        };
+        let Some(mut guard) = backing.try_cpu_access().map_err(fail)? else {
+            if kind == DataAccessKind::Write {
+                nixe_memory::metrics::cpu_store_visibility_demand(
+                    backing.size(),
+                    access.size.bytes(),
+                );
+            }
+            return Ok(NativeMemoryAccess::Visibility(backing.clone()));
+        };
+        if kind == DataAccessKind::Write {
+            guard.prepare_write().map_err(fail)?;
+        }
+        Ok(NativeMemoryAccess::Ram(guard))
     }
 
     #[inline]
@@ -970,7 +1007,13 @@ impl<'a> NativeMemorySession<'a> {
         let cacheable = access.class == MemoryAccessClass::Atomic
             && access.alignment == MemoryAlignment::Natural
             && address.is_aligned_to(access.size.bytes() as u64);
-        if !cacheable || !self.atomic[index].as_ref().is_some_and(|(p, _)| *p == page) {
+        if !cacheable
+            || !self.pages[index]
+                .as_ref()
+                .is_some_and(|(p, permissions, _)| {
+                    *p == page && permissions.contains(MemoryPermissions::READ_WRITE)
+                })
+        {
             let backing = self
                 .memory
                 .resolve_atomic_backing(self.space, address, access)?;
@@ -984,12 +1027,12 @@ impl<'a> NativeMemorySession<'a> {
                     replacement,
                 );
             }
-            self.atomic[index] = Some((page, backing));
+            self.pages[index] = Some((page, MemoryPermissions::READ_WRITE, backing));
         }
         // Retain real hardware atomics and canonical dirty publication. The
         // cache removes mapping lookup, never the exclusive monitor or CAS.
         ExecutionMemory::try_native_compare_exchange_on_backing(
-            &self.atomic[index].as_ref().unwrap().1,
+            &self.pages[index].as_ref().unwrap().2,
             self.space,
             address,
             access,
@@ -1061,7 +1104,7 @@ impl ExecutionMemory {
         address: GuestVirtualAddress,
         access: MemoryAccess,
         kind: DataAccessKind,
-    ) -> Result<NativeMemoryAccess, DataAccessFault> {
+    ) -> Result<NativeMemoryAccess<'_>, DataAccessFault> {
         let inner = self.lock_inner();
         if let Some(error) = &inner.direct_failure {
             return Ok(NativeMemoryAccess::Fatal(error.clone()));
@@ -1087,12 +1130,30 @@ impl ExecutionMemory {
                 return Ok(NativeMemoryAccess::Visibility(page.clone()));
             }
         }
-        match self.repair_resolved_direct_access(inner, space, address, kind, resolved) {
-            DirectFaultResolution::Retry => Ok(NativeMemoryAccess::Ram),
-            DirectFaultResolution::Cold => Ok(NativeMemoryAccess::CheckedRam),
-            DirectFaultResolution::Fault(fault) => Err(fault),
-            DirectFaultResolution::Fatal(message) => Ok(NativeMemoryAccess::Fatal(message)),
-        }
+        Ok(NativeMemoryAccess::CheckedRam)
+    }
+
+    /// Cold exclusive preparation validates the exact guest access while the
+    /// native slice retains mapping identity. No reservation or store occurs.
+    pub fn native_exclusive_page(
+        &self,
+        space: AddressSpaceId,
+        address: GuestVirtualAddress,
+        access: MemoryAccess,
+        kind: DataAccessKind,
+    ) -> Result<CanonicalBackingPage, DataAccessFault> {
+        let inner = self.lock_inner();
+        let resolved = resolve_access(&inner, space, address, access, kind)?;
+        let Some(ExecutionPhysicalPage::Ram(page)) = inner.page(resolved.first.physical_slot)
+        else {
+            return Err(DataAccessFault::new(
+                space,
+                address,
+                kind,
+                DataAccessFaultReason::MixedRegions,
+            ));
+        };
+        Ok(page.clone())
     }
 
     /// Executes a CAS on backing already validated by the native session.
@@ -1530,6 +1591,7 @@ impl ExecutionMemory {
                 "guest address-space size is not a nonzero page multiple",
             ));
         }
+        let arena_gate = self.execution_gate.clone();
         let inner = self.inner_mut();
         if inner.backends.contains_key(&address_space) {
             return Err(CpuMemoryBackendError::new(
@@ -1564,7 +1626,7 @@ impl ExecutionMemory {
                 "write-only data mappings cannot be represented by LinuxDirect",
             ));
         }
-        let arena = match DirectArena::new(size) {
+        let arena = match DirectArena::with_execution_gate(size, arena_gate) {
             Ok(arena) => arena,
             Err(error)
                 if matches!(policy, DirectBackendPolicy::Preferred) && error.is_unsupported() =>
@@ -2004,9 +2066,9 @@ impl ExecutionMemory {
     }
 
     // Kernel producers and checked process writes use the same byte publication.
-    // Hold exclusion and the mapping lock through validation and the copy; there
-    // is no optimistic whole-page snapshot or temporary write observer to leave
-    // behind on IPC, input and other CPU-only buffers.
+    // Data payloads use normal host word stores under stable mapping admission.
+    // Executable writes retain the JIT invalidation rendezvous.
+    // Neither path stages whole-page copies for short kernel records.
     fn write_mapped_ram(
         &self,
         address_space: AddressSpaceId,
@@ -2033,6 +2095,77 @@ impl ExecutionMemory {
                 DataAccessFaultReason::AddressOverflow,
             )
         })?;
+        loop {
+            let admission = self.execution_gate.acquire_shared();
+            let inner = self.lock_inner();
+            let fail =
+                |at, reason| DataAccessFault::new(address_space, at, DataAccessKind::Write, reason);
+            let mut writes = SmallVec::<[CanonicalHostWrite<'_>; 8]>::new();
+            let mut cursor = address.get();
+            while cursor < end {
+                let at = GuestVirtualAddress::new(cursor);
+                let mapping = inner
+                    .mapping_at(address_space, at)
+                    .ok_or_else(|| fail(at, DataAccessFaultReason::Unmapped))?;
+                if require_write_permission
+                    && !mapping.permissions.contains(MemoryPermissions::WRITE)
+                {
+                    return Err(fail(at, DataAccessFaultReason::WritePermissionDenied));
+                }
+                let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(mapping.physical_slot)
+                else {
+                    return Err(fail(
+                        at,
+                        DataAccessFaultReason::Device(
+                            "bulk guest-memory writes require RAM".into(),
+                        ),
+                    ));
+                };
+                if cursor == address.get()
+                    && matches!(bytes.len(), 1 | 2 | 4 | 8 | 16)
+                    && address.is_aligned_to(bytes.len() as u64)
+                    && let Some(mut access) = backing.try_cpu_access().map_err(|e| {
+                        fail(at, DataAccessFaultReason::HostBacking(e.to_string().into()))
+                    })?
+                    && access
+                        .write_host_scalar(page_offset(at), bytes)
+                        .map_err(|e| {
+                            fail(at, DataAccessFaultReason::HostBacking(e.to_string().into()))
+                        })?
+                {
+                    return Ok(());
+                }
+                let count = (SYNTHETIC_PAGE_SIZE - page_offset(at)).min((end - cursor) as usize);
+                let copied = (cursor - address.get()) as usize;
+                writes.push(CanonicalHostWrite {
+                    page: backing.clone(),
+                    offset: page_offset(at),
+                    bytes: &bytes[copied..copied + count],
+                });
+                cursor += count as u64;
+            }
+            drop(inner);
+            let outcome =
+                nixe_memory::try_write_host_regions(&writes, &admission).map_err(|error| {
+                    fail(
+                        address,
+                        DataAccessFaultReason::HostBacking(error.to_string().into()),
+                    )
+                })?;
+            drop(admission);
+            match outcome {
+                CanonicalHostWriteOutcome::Complete => return Ok(()),
+                CanonicalHostWriteOutcome::CpuVisibility(page) => {
+                    page.prepare_cpu_access().map_err(|error| {
+                        fail(
+                            address,
+                            DataAccessFaultReason::HostBacking(error.to_string().into()),
+                        )
+                    })?
+                }
+                CanonicalHostWriteOutcome::Executable => break,
+            }
+        }
         'retry: loop {
             let transition = self.execution_gate.acquire_exclusive();
             let inner = self.lock_inner();
@@ -2427,29 +2560,6 @@ impl ExecutionMemory {
         {
             return Ok(None);
         }
-        if reservation.expected.size() != access.size {
-            return Err(DataAccessFault::new(
-                address_space,
-                address,
-                DataAccessKind::Write,
-                DataAccessFaultReason::ValueSizeMismatch,
-            ));
-        }
-        // Preserve the existing contract: a matching reservation requires the
-        // CAS read permission and natural alignment, not just write permission.
-        let atomic_access = MemoryAccess::new(
-            access.size,
-            MemoryAlignment::Natural,
-            access.ordering,
-            MemoryAccessClass::Atomic,
-        );
-        resolve_access(
-            &inner,
-            address_space,
-            address,
-            atomic_access,
-            DataAccessKind::Read,
-        )?;
         let Some(ExecutionPhysicalPage::Ram(backing)) = inner.page(resolved.first.physical_slot)
         else {
             unreachable!("resolved exclusive RAM page exists")
@@ -2653,17 +2763,30 @@ fn checked_ram_access(
     };
     let first = backing(resolved.first);
     let second = resolved.second.map(backing);
+    let pending = |page: &CanonicalBackingPage| {
+        if kind == DataAccessKind::Write {
+            let overwritten = if page.identity() == first.identity() {
+                resolved.first_bytes
+            } else {
+                bytes.len() - resolved.first_bytes
+            };
+            // This is a preservation demand, not a CPU load. Do not discard
+            // device-produced bytes outside this store's exact overwrite.
+            nixe_memory::metrics::cpu_store_visibility_demand(page.size(), overwritten);
+        }
+        Some(page.clone())
+    };
     let (low, high) = match second {
         Some(second) if second.identity() < first.identity() => (second, Some(first)),
         Some(second) if second.identity() > first.identity() => (first, Some(second)),
         _ => (first, None),
     };
     let Some(mut low_access) = low.try_cpu_access().map_err(fail)? else {
-        return Ok(Some(low.clone()));
+        return Ok(pending(low));
     };
     let mut high_access = if let Some(high) = high {
         let Some(guard) = high.try_cpu_access().map_err(fail)? else {
-            return Ok(Some(high.clone()));
+            return Ok(pending(high));
         };
         Some(guard)
     } else {
@@ -3261,39 +3384,6 @@ impl CpuMemory for ExecutionMemory {
         Some(result)
     }
 
-    fn resolve_exclusive_load(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        value: MemoryValue,
-    ) -> Result<ExclusiveReservation, DataAccessFault> {
-        let access = MemoryAccess::new(
-            value.size(),
-            MemoryAlignment::Natural,
-            super::MemoryOrdering::Relaxed,
-            MemoryAccessClass::Exclusive,
-        );
-        let inner = self.lock_inner();
-        let resolved =
-            resolve_access(&inner, address_space, address, access, DataAccessKind::Read)?;
-        if resolved.second.is_some() || resolved.region != MemoryRegionKind::Ram {
-            return Err(DataAccessFault::new(
-                address_space,
-                address,
-                DataAccessKind::Read,
-                DataAccessFaultReason::MixedRegions,
-            ));
-        }
-        // No backing read, allocation, visibility repair or device callback.
-        // Concurrent data changes must not replace the value native code saw.
-        Ok(ExclusiveReservation {
-            page: resolved.first.physical_page,
-            byte_offset: page_offset(address) as u16,
-            access_size: value.size().bytes() as u8,
-            expected: value,
-        })
-    }
-
     fn load_exclusive(
         &self,
         address_space: AddressSpaceId,
@@ -3329,8 +3419,8 @@ impl CpuMemory for ExecutionMemory {
         // virtual address; it must not run under this mapping guard.
         let backing = backing.clone();
         drop(inner);
-        let bits = backing
-            .atomic_load(page_offset(address), byte_count)
+        let (bits, version) = backing
+            .exclusive_load(page_offset(address), byte_count)
             .map_err(|reason| {
                 DataAccessFault::new(
                     address_space,
@@ -3350,7 +3440,7 @@ impl CpuMemory for ExecutionMemory {
                 page: mapping.physical_page,
                 byte_offset: page_offset(address) as u16,
                 access_size: access.size.bytes() as u8,
-                expected: value,
+                version,
             },
         ))
     }
@@ -3381,24 +3471,28 @@ impl CpuMemory for ExecutionMemory {
                 false,
             ));
         };
-        let result = Self::atomic_transaction_on_backing(
-            &backing,
-            address_space,
-            address,
-            access,
-            |previous| {
-                if previous == reservation.expected {
-                    (value, true)
-                } else {
-                    (previous, false)
-                }
-            },
-        )?;
+        super::contracts::begin_ordered_write(access.ordering);
+        let stored = backing
+            .exclusive_store(
+                page_offset(address),
+                access.size.bytes(),
+                reservation.version,
+                value.bits(),
+            )
+            .map_err(|error| {
+                DataAccessFault::new(
+                    address_space,
+                    address,
+                    DataAccessKind::Write,
+                    DataAccessFaultReason::HostBacking(error.to_string().into()),
+                )
+            })?;
+        super::contracts::complete_ordered_read(access.ordering);
         Ok((
             DataWriteResult {
                 region: MemoryRegionKind::Ram,
             },
-            result.stored,
+            stored,
         ))
     }
 }
@@ -3424,7 +3518,7 @@ impl ProcessMemory for ExecutionMemory {
         let range = self
             .translate_canonical_range(address_space, address, size, MemoryPermissions::READ)
             .map_err(|error| bulk_translation_fault(error, DataAccessKind::Read))?;
-        range.read(0, output).map_err(|error| {
+        range.read_word_stream(0, output).map_err(|error| {
             DataAccessFault::new(
                 address_space,
                 address,
@@ -4021,13 +4115,13 @@ mod tests {
                     session
                         .resolve_access(address, access, DataAccessKind::Write)
                         .unwrap(),
-                    NativeMemoryAccess::Ram
+                    NativeMemoryAccess::Ram(_)
                 ));
                 assert!(matches!(
                     session
                         .resolve_access(alias, access, DataAccessKind::Read)
                         .unwrap(),
-                    NativeMemoryAccess::Ram
+                    NativeMemoryAccess::Ram(_)
                 ));
                 assert!(
                     session
@@ -4123,7 +4217,7 @@ mod tests {
                     session
                         .resolve_access(address, access, DataAccessKind::Write)
                         .unwrap(),
-                    NativeMemoryAccess::Ram
+                    NativeMemoryAccess::Ram(_)
                 ));
             }
         }
@@ -4141,7 +4235,7 @@ mod tests {
         .unwrap();
         CanonicalBackingRange::prepare_resident_device_accesses(
             [(&range, declaration)],
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         CanonicalBackingRange::publish_device_writes([(&range, declaration)], coordinator).unwrap();
@@ -4684,7 +4778,7 @@ mod tests {
             .unwrap();
             CanonicalBackingRange::prepare_resident_device_accesses(
                 [(&old, write)],
-                coordinator.clone(),
+                coordinator.as_ref(),
             )
             .unwrap();
             CanonicalBackingRange::publish_device_writes([(&old, write)], coordinator).unwrap();
@@ -4885,7 +4979,7 @@ mod tests {
         .unwrap();
         nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&retained, declaration)],
-            Arc::clone(&coordinator),
+            coordinator.as_ref(),
         )
         .unwrap();
         nixe_memory::CanonicalBackingRange::publish_device_writes(
@@ -4936,7 +5030,7 @@ mod tests {
         .unwrap();
         nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&retained, second_write)],
-            Arc::clone(&coordinator),
+            coordinator.as_ref(),
         )
         .unwrap();
         nixe_memory::CanonicalBackingRange::publish_device_writes(
@@ -4994,7 +5088,7 @@ mod tests {
         .unwrap();
         nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&retained, declaration)],
-            Arc::clone(&coordinator),
+            coordinator.as_ref(),
         )
         .unwrap();
         nixe_memory::CanonicalBackingRange::publish_device_writes(
@@ -5053,7 +5147,7 @@ mod tests {
         .unwrap();
         nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&retained, declaration)],
-            Arc::clone(&coordinator),
+            coordinator.as_ref(),
         )
         .unwrap();
         nixe_memory::CanonicalBackingRange::publish_device_writes(
@@ -5116,7 +5210,7 @@ mod tests {
         .unwrap();
         nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&retained, declaration)],
-            Arc::clone(&coordinator),
+            coordinator.as_ref(),
         )
         .unwrap();
         nixe_memory::CanonicalBackingRange::publish_device_writes(
@@ -5125,21 +5219,6 @@ mod tests {
         )
         .unwrap();
 
-        {
-            let _lease = memory.acquire_execution_lease();
-            assert_eq!(
-                memory
-                    .resolve_exclusive_load(space, address, reservation.expected)
-                    .unwrap(),
-                reservation
-            );
-            // Exit-side identity resolution must not pull newer device bytes
-            // into RAM or replace the value observed by the earlier load.
-            assert!(matches!(
-                retained.segments()[0].visibility_state(),
-                VisibilityState::GpuNewer { .. }
-            ));
-        }
         let (_, stored) = memory
             .store_exclusive(space, address, access, MemoryValue::U8(0xff), reservation)
             .unwrap();
@@ -5197,21 +5276,16 @@ mod tests {
                 .unwrap();
             assert!(memory.map_page(space, target, second, MemoryPermissions::READ_WRITE));
             let replacement = MemoryValue::from_bits(size, u128::MAX);
-            let result = ExecutionMemory::atomic_transaction_on_backing(
-                &selected,
-                space,
-                target,
-                access,
-                |previous| {
-                    if previous == reservation.expected {
-                        (replacement, true)
-                    } else {
-                        (previous, false)
-                    }
-                },
-            )
-            .unwrap();
-            assert!(result.stored);
+            assert!(
+                selected
+                    .exclusive_store(
+                        page_offset(target),
+                        size.bytes(),
+                        reservation.version,
+                        replacement.bits()
+                    )
+                    .unwrap()
+            );
             assert_eq!(
                 memory
                     .read(space, alias, MemoryAccess::normal(size))
@@ -5224,7 +5298,7 @@ mod tests {
                     .read(space, target, MemoryAccess::normal(size))
                     .unwrap()
                     .value,
-                reservation.expected
+                MemoryValue::from_bits(size, 0)
             );
             // A store resolved *after* the remap instead fails its old physical
             // reservation, even though the replacement page has matching bits.
@@ -5312,7 +5386,7 @@ mod tests {
         .unwrap();
         nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&retained, declaration)],
-            coordinator.clone(),
+            coordinator.as_ref(),
         )
         .unwrap();
         nixe_memory::CanonicalBackingRange::publish_device_writes(
@@ -5352,7 +5426,7 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_expected_value_model_accepts_change_and_restore_aba() {
+    fn exclusive_reservation_rejects_change_and_restore_aba() {
         let memory = ExecutionMemory::new();
         let space = AddressSpaceId::new(12);
         let address = GuestVirtualAddress::new(0xa000);
@@ -5385,10 +5459,10 @@ mod tests {
         let (_, stored) = memory
             .store_exclusive(space, address, exclusive, replacement, reservation)
             .unwrap();
-        assert!(stored);
+        assert!(!stored);
         assert_eq!(
             memory.read(space, address, ordinary).unwrap().value,
-            replacement
+            original
         );
     }
 
@@ -5826,7 +5900,7 @@ mod tests {
         .unwrap();
         nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
             [(&retained, declaration)],
-            Arc::clone(&coordinator),
+            coordinator.as_ref(),
         )
         .unwrap();
         nixe_memory::CanonicalBackingRange::publish_device_writes(

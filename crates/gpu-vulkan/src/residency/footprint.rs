@@ -202,7 +202,7 @@ impl VulkanResidency {
                 .map_err(memory_error)?;
         let result = CanonicalBackingRange::prepare_resident_device_accesses(
             [(&plan.ownership, declaration)],
-            self.visibility.clone(),
+            self.visibility.as_ref(),
         )
         .map_err(memory_error);
         self.retain_write_plan(id, plane, rect, plan);

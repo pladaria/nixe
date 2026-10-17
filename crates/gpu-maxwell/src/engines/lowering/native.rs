@@ -9,7 +9,7 @@ use crate::execution::{MaxwellFrontend, MaxwellSubmissionExecutionError as Error
 use crate::{
     MaxwellGpuAddressSpace, MaxwellShaderCompiler, MaxwellShaderSnapshot, MaxwellSsaBindingSource,
 };
-use identity::{DrawKey, ParameterKey, ProgramKey};
+use identity::{DrawKey, ImageKey, ParameterKey, ProgramKey};
 use interface::ShaderInterface;
 use nixe_gpu::native::*;
 use nixe_gpu::ssa::{ResourceId, compile::CompilePool};
@@ -66,12 +66,7 @@ pub struct MaxwellNativeFrontend {
     methods: Vec<crate::MaxwellMethodDispatch>,
     parameters: Vec<u32>,
     pub statistics: NativeFrontendStatistics,
-    image_view_bytes: usize,
-    image_views: Vec<(
-        super::super::threed::MaxwellThreeDGuestImageFormat,
-        nixe_gpu::ImageView,
-        GuestImage,
-    )>,
+    image_views: nixe_gpu::WorkingSet<ImageKey, GuestImage>,
     compute_request: Option<ComputeSourceKey>,
     compute_sources: nixe_gpu::WorkingSet<ComputeSourceKey, Arc<MaxwellShaderSnapshot>>,
     compute_variants: nixe_gpu::WorkingSet<
@@ -115,8 +110,7 @@ impl MaxwellNativeFrontend {
             methods: Vec::new(),
             parameters: Vec::new(),
             statistics: Default::default(),
-            image_views: Vec::new(),
-            image_view_bytes: 0,
+            image_views: nixe_gpu::WorkingSet::new(4096, IMAGE_VIEW_BYTES),
             compute: None,
             compute_request: None,
             compute_sources: nixe_gpu::WorkingSet::new(256, 8 * 1024 * 1024),
@@ -128,27 +122,21 @@ impl MaxwellNativeFrontend {
         &mut self,
         source: nixe_gpu::ConversionImage,
     ) -> Result<GuestImage, MaxwellLoweringError> {
-        if let Some((_, _, image)) = self.image_views.iter().rev().find(|(_, view, image)| {
-            image.description == source.description
-                && view.bindings() == source.view.bindings()
-                && view.swizzle() == source.view.swizzle()
-        }) {
+        let key = ImageKey {
+            encoding: super::super::threed::MaxwellThreeDGuestImageFormat::Canonical(
+                source.description.format(),
+            ),
+            description: source.description,
+            canonical_texels: source.view.has_canonical_texels(),
+            view: source.view.clone(),
+        };
+        if let Some(image) = self.image_views.get(&key) {
             return Ok(image.clone());
         }
         let image = image::conversion(&source)
             .map_err(|error| MaxwellLoweringError::ImageBacking(error.to_string()))?;
-        if self.image_views.len() >= 4096 {
-            self.image_views.clear();
-            self.image_view_bytes = 0;
-        }
-        self.image_view_bytes += plane_metadata_bytes(&image);
-        self.image_views.push((
-            super::super::threed::MaxwellThreeDGuestImageFormat::Canonical(
-                source.description.format(),
-            ),
-            source.view,
-            image.clone(),
-        ));
+        self.remember_image(key, &image)
+            .map_err(|error| MaxwellLoweringError::ImageBacking(error.to_string()))?;
         Ok(image)
     }
     fn compile(
@@ -276,18 +264,13 @@ impl MaxwellNativeFrontend {
         let canonical_texels = resolved
             .guest_layout()
             .has_direct_canonical_representation();
-        if let Some((_, _, image)) =
-            self.image_views
-                .iter()
-                .rev()
-                .find(|(encoding, view, image)| {
-                    *encoding == resolved.guest_format()
-                        && image.description == resolved.description()
-                        && image.canonical_texels == canonical_texels
-                        && view.swizzle() == resolved.view().swizzle()
-                        && view.bindings() == resolved.view().bindings()
-                })
-        {
+        let key = ImageKey {
+            encoding: resolved.guest_format(),
+            description: resolved.description(),
+            canonical_texels,
+            view: resolved.view().clone(),
+        };
+        if let Some(image) = self.image_views.get(&key) {
             return Ok(image.clone());
         }
         let image = GuestImage {
@@ -297,27 +280,20 @@ impl MaxwellNativeFrontend {
             canonical_texels,
             planes: image::planes(resolved)?,
         };
-        let size = plane_metadata_bytes(&image);
-        const IMAGE_VIEW_BYTES: usize = 512 * 1024 * 1024;
-        while !self.image_views.is_empty()
-            && (self.image_views.len() >= 4096
-                || self.image_view_bytes.saturating_add(size) > IMAGE_VIEW_BYTES)
-        {
-            let (_, _, old) = self.image_views.remove(0);
-            self.image_view_bytes -= plane_metadata_bytes(&old);
-        }
+        self.remember_image(key, &image)?;
+        Ok(image)
+    }
+    fn remember_image(&mut self, key: ImageKey, image: &GuestImage) -> Result<(), Error> {
+        let size = plane_metadata_bytes(image)
+            + std::mem::size_of::<ImageKey>()
+            + std::mem::size_of_val(key.view.bindings());
         if size > IMAGE_VIEW_BYTES {
             return Err(compilation(
                 "native image address metadata exceeds the 512 MiB frontend cache budget",
             ));
         }
-        self.image_view_bytes += size;
-        self.image_views.push((
-            resolved.guest_format(),
-            resolved.view().clone(),
-            image.clone(),
-        ));
-        Ok(image)
+        self.image_views.insert(key, image.clone(), size);
+        Ok(())
     }
     fn draw(
         &mut self,
@@ -339,6 +315,11 @@ impl MaxwellNativeFrontend {
             p.state.matches_parameters(state)
                 && Arc::ptr_eq(&p.code, &code.code)
                 && p.indexed == trigger.is_indexed()
+                && p.draw
+                    .index
+                    .as_ref()
+                    .is_some_and(|i| matches!(i, GuestIndexBuffer::Inline(_)))
+                    == state.inline_index().is_some()
         });
         let roles = if reuse_roles {
             self.prepared.as_ref().unwrap().roles.as_ref()
@@ -369,6 +350,16 @@ impl MaxwellNativeFrontend {
             && Arc::ptr_eq(&p.resources, &resources)
             && Arc::ptr_eq(&p.code, &code.code)
             && p.indexed == trigger.is_indexed()
+            && p.draw
+                .index
+                .as_ref()
+                .is_some_and(|i| matches!(i, GuestIndexBuffer::Inline(_)))
+                == state.inline_index().is_some()
+            && match (&p.draw.index, state.inline_index()) {
+                (Some(GuestIndexBuffer::Inline(a)), Some(b)) => Arc::ptr_eq(a, b),
+                (_, None) => true,
+                _ => false,
+            }
         {
             self.statistics.warm_draws += 1;
             return Ok(NativeWork {
@@ -625,12 +616,14 @@ impl MaxwellNativeFrontend {
                 })
             })
             .collect::<Result<_, Error>>()?;
-        let index = if trigger.is_indexed() {
+        let index = if let Some(bytes) = state.inline_index() {
+            Some(GuestIndexBuffer::Inline(Arc::clone(bytes)))
+        } else if trigger.is_indexed() {
             let i = lowering(resource_index(
                 &resources,
                 MaxwellThreeDResourceRole::IndexBuffer,
             ))?;
-            Some((
+            Some(GuestIndexBuffer::Canonical(
                 lowering(resolved_buffer(&resources, i))?
                     .view()
                     .backing()
@@ -699,6 +692,8 @@ impl MaxwellNativeFrontend {
         })
     }
 }
+
+const IMAGE_VIEW_BYTES: usize = 512 * 1024 * 1024;
 
 fn plane_metadata_bytes(image: &GuestImage) -> usize {
     image
@@ -828,11 +823,15 @@ fn native_arguments(
 ) -> Result<DrawArguments, MaxwellLoweringError> {
     if let MaxwellThreeDOperationTrigger::DrawIndexBuffer { index_count, .. } = trigger {
         let input = state.vertex_input();
-        let first_index = *input
-            .index()
-            .first()
-            .value()
-            .ok_or(MaxwellLoweringError::IncompleteDraw("SET_INDEX_BUFFER_F"))?;
+        let first_index = if state.inline_index().is_some() {
+            0
+        } else {
+            *input
+                .index()
+                .first()
+                .value()
+                .ok_or(MaxwellLoweringError::IncompleteDraw("SET_INDEX_BUFFER_F"))?
+        };
         let assembly = input.assembly();
         let base = assembly
             .global_base_vertex_index()

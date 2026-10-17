@@ -147,6 +147,20 @@ fn read_only_attachment(a: &Attachment, state: &GraphicsState) -> bool {
             false
         }
 }
+enum InlineIndex {
+    Stream(Arc<[u8]>),
+    // A payload larger than one ring arena needs one contiguous binding. Give
+    // it dedicated mapped storage rather than repeatedly exhausting the ring.
+    Buffer(Arc<AllocatedBuffer>),
+}
+impl InlineIndex {
+    fn size(&self) -> u64 {
+        match self {
+            Self::Stream(bytes) => bytes.len() as u64,
+            Self::Buffer(buffer) => buffer.size(),
+        }
+    }
+}
 pub struct PreparedDraw {
     batchable: bool,
     graphics: PreparedGraphics,
@@ -154,6 +168,7 @@ pub struct PreparedDraw {
     vertices: Box<[VertexBuffer]>,
     _vertex_leases: Box<[Arc<AllocatedBuffer>]>,
     index: Option<(IndexBuffer, Arc<AllocatedBuffer>)>,
+    inline_index: Option<InlineIndex>,
 }
 impl PreparedDraw {
     pub(crate) fn can_group(&self) -> bool {
@@ -412,6 +427,39 @@ impl VulkanResidency {
         })
     }
 
+    pub(crate) fn prepare_inline_index_draw(
+        &mut self,
+        graphics: PreparedGraphics,
+        targets: Arc<PreparedTargets>,
+        vertices: Box<[VertexBuffer]>,
+        bytes: Arc<[u8]>,
+    ) -> Result<PreparedDraw, VulkanError> {
+        if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+            return Err(VulkanError::InvalidResource(
+                "inline UINT32 indices require a nonempty aligned payload",
+            ));
+        }
+        let mut draw = self.prepare_draw(graphics, targets, vertices, None)?;
+        draw.inline_index = Some(
+            if bytes.len() as u64 <= self.device.submission.configuration.arena_bytes {
+                InlineIndex::Stream(bytes)
+            } else {
+                let buffer = crate::memory::allocate_buffer(
+                    &self.device.owner,
+                    bytes.len() as u64,
+                    vk::BufferUsageFlags::INDEX_BUFFER,
+                    crate::MemoryLocation::CpuToGpu,
+                    crate::AllocationMode::Managed,
+                    "nixe large inline index stream",
+                )?;
+                unsafe { buffer.write_range(0, &bytes) }?;
+                self.statistics.cpu_streamed_bytes += bytes.len() as u64;
+                InlineIndex::Buffer(Arc::new(buffer))
+            },
+        );
+        Ok(draw)
+    }
+
     pub fn prepare_draw(
         &self,
         graphics: PreparedGraphics,
@@ -589,6 +637,7 @@ impl VulkanResidency {
             vertices,
             _vertex_leases: vertex_leases,
             index,
+            inline_index: None,
         })
     }
     pub fn draw(
@@ -691,15 +740,23 @@ impl VulkanResidency {
                     first_index,
                     ..
                 } if !is_empty(&draw) => {
-                    let (i, _) = prepared.index.as_ref().ok_or(VulkanError::InvalidResource(
-                        "indexed draw has no index stream",
-                    ))?;
-                    let element = match i.kind {
-                        vk::IndexType::UINT16 => 2,
-                        vk::IndexType::UINT8_EXT => 1,
-                        _ => 4,
+                    let (element, size) = match (&prepared.index, &prepared.inline_index) {
+                        (Some((i, _)), None) => (
+                            match i.kind {
+                                vk::IndexType::UINT16 => 2,
+                                vk::IndexType::UINT8_EXT => 1,
+                                _ => 4,
+                            },
+                            i.size,
+                        ),
+                        (None, Some(index)) => (4, index.size()),
+                        _ => {
+                            return Err(VulkanError::InvalidResource(
+                                "indexed draw has no unique index stream",
+                            ));
+                        }
                     };
-                    if (u64::from(first_index) + u64::from(indices)) * element > i.size {
+                    if (u64::from(first_index) + u64::from(indices)) * element > size {
                         return Err(VulkanError::InvalidResource(
                             "indexed draw exceeds bound index window",
                         ));
@@ -708,6 +765,28 @@ impl VulkanResidency {
                 _ => {}
             }
         }
+        // Inline command bytes use the command slot's existing INDEX_BUFFER
+        // upload arena. No canonical-memory import, resource object or readback.
+        // Slot retirement keeps the mapped bytes alive until GPU completion.
+        let inline_binding = if empty {
+            None
+        } else {
+            match &prepared.inline_index {
+                Some(InlineIndex::Stream(bytes)) => {
+                    // Each stream fits a fresh base arena, so bounded pressure can
+                    // flush/wait for a real reusable slot and make forward progress.
+                    let (slot, slice) = self.reserve_upload(bytes, 4)?;
+                    self.device.submission.retain_stream_upload(slot);
+                    let buffer = self.device.submission.slots[slot].upload_lease(slice);
+                    self.statistics.cpu_streamed_bytes += bytes.len() as u64;
+                    Some((buffer, slice.offset, vk::IndexType::UINT32))
+                }
+                Some(InlineIndex::Buffer(buffer)) => {
+                    Some((Arc::clone(buffer), 0, vk::IndexType::UINT32))
+                }
+                None => None,
+            }
+        };
         let streaming = streaming && prepared.can_group() && !empty;
         let streams = if streaming {
             self.stream_graphics(&graphics.program, &prepared.vertices, inputs)?
@@ -761,7 +840,7 @@ impl VulkanResidency {
                 indexed,
             } = draw
             {
-                if indexed && prepared.index.is_none() {
+                if indexed && prepared.index.is_none() && prepared.inline_index.is_none() {
                     return Err(VulkanError::InvalidResource(
                         "indexed indirect draw has no index stream",
                     ));
@@ -943,6 +1022,11 @@ impl VulkanResidency {
         }
         let index = self.device.submission.recording.unwrap();
         let slot = &mut self.device.submission.slots[index];
+        if let Some(InlineIndex::Buffer(buffer)) = &prepared.inline_index {
+            // The frontend/prepared cache may drop this draw before submission.
+            // Its actual command slot retains the dedicated buffer through retirement.
+            slot.retired_buffers.push(Arc::clone(buffer));
+        }
         if slot
             .target_handles
             .insert(Arc::as_ptr(&prepared.targets) as usize)
@@ -961,13 +1045,20 @@ impl VulkanResidency {
                         slot.vertex_bindings.insert(v.binding, value);
                     }
                 }
-                if let Some((i, buffer)) = &prepared.index {
-                    let value = (buffer.handle, i.offset, i.kind);
-                    if slot.index_binding != Some(value) {
-                        self.device.submission.statistics.index_binds += 1;
-                        raw.cmd_bind_index_buffer(command, buffer.handle, i.offset, i.kind);
-                        slot.index_binding = Some(value);
-                    }
+                if let Some(value) = inline_binding
+                    .as_ref()
+                    .map(|(buffer, offset, kind)| (buffer.handle, *offset, *kind))
+                    .or_else(|| {
+                        prepared
+                            .index
+                            .as_ref()
+                            .map(|(i, buffer)| (buffer.handle, i.offset, i.kind))
+                    })
+                    && slot.index_binding != Some(value)
+                {
+                    self.device.submission.statistics.index_binds += 1;
+                    raw.cmd_bind_index_buffer(command, value.0, value.1, value.2);
+                    slot.index_binding = Some(value);
                 }
             }
             if !continuing {

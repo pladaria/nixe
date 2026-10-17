@@ -13,11 +13,13 @@ mod line;
 mod mme;
 mod operations;
 mod output;
+mod registers;
 mod render_enable;
 mod render_targets;
 mod resource;
 mod shader_execution;
 pub(super) mod state;
+pub(super) use registers::{constant_buffer_words, embedded_words};
 pub(super) mod tessellation;
 mod tiled_cache;
 mod vertex;
@@ -1321,6 +1323,11 @@ where
         }
         let source = self.source.emitted_by_mme(method, argument);
         let mut dispatch = MaxwellMethodDispatch::emitted_by_mme(source, CLASS);
+        if write_plain_method(&mut dispatch, self.candidate)
+            .map_err(MaxwellThreeDMmePreflightError::dispatch)?
+        {
+            return Ok(());
+        }
         // MME sends use the same method path, including shadow tracking/replay,
         // as pushbuffer writes. The interpreter and JIT both call CallMethod:
         // https://github.com/eden-emulator/mirror/blob/67bada77f8a43a90da2e94e89b8e7da73c256989/src/video_core/macro.cpp#L664-L666
@@ -1329,6 +1336,7 @@ where
         if let Some(operation) = lower_pending_operation(prepared.operation, self.candidate) {
             (self.consume)(operation, self.candidate.operation_state())
                 .map_err(MaxwellThreeDMmePreflightError::Consumer)?;
+            self.candidate.complete_inline_draw();
         }
         Ok(())
     }
@@ -1343,6 +1351,28 @@ pub(super) fn preflight(
     let prepared = preflight_with_shadow(profile, &mut method, candidate)?;
     let operation = lower_pending_operation(prepared.operation, candidate);
     Ok(AppliedMethod::new(method, prepared.metadata, operation))
+}
+
+#[cfg(test)]
+pub(in crate::engines) fn materialize_state(
+    profile: &MaxwellGpuProfile,
+    candidate: &mut MaxwellThreeDFrontendState,
+) -> Result<(), MaxwellEngineDispatchError> {
+    registers::materialize(profile, candidate, u64::MAX)
+}
+
+#[cfg(test)]
+pub(in crate::engines) fn inspect_state_metadata(
+    profile: &MaxwellGpuProfile,
+    source: crate::MaxwellMethodSource,
+    snapshot: &mut MaxwellThreeDFrontendState,
+) -> MaxwellEngineMethodMetadata {
+    snapshot.pending_notification = None;
+    preflight_register(profile, source, snapshot, false)
+        .map(|decoded| decoded.metadata)
+        .unwrap_or_else(|_| {
+            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), "STATE_REGISTER")
+        })
 }
 
 fn lower_pending_operation(
@@ -1370,6 +1400,18 @@ fn preflight_with_shadow(
     method: &mut MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDFrontendState,
 ) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
+    if write_plain_method(method, candidate)? {
+        return Ok(PreparedMethod::new(
+            MaxwellEngineMethodMetadata::new(
+                CLASS,
+                CLASS_NAME,
+                method.source().method(),
+                "STATE_REGISTER",
+            ),
+            None,
+            true,
+        ));
+    }
     let source = method.source();
     if is_mme_aperture(source.method()) {
         return Err(MaxwellEngineDispatchError::MmeExecution {
@@ -1384,18 +1426,71 @@ fn preflight_with_shadow(
         .map_err(|error| MaxwellEngineDispatchError::MmeShadowRam { source, error })?;
 
     method.set_effective_argument(effective_argument);
-    let register_changed =
-        candidate.raw_register_value(source.method()) != Some(effective_argument);
+    registers::materialize(profile, candidate, registers::dependencies(source.method()))?;
     let effective_source = method.source();
-    let prepared = preflight_register(profile, effective_source, candidate)?;
+    let changed = candidate.raw_register_value(source.method()) != Some(effective_argument);
+    let prepared = preflight_register(profile, effective_source, candidate, changed)?;
     if prepared.writes_state {
-        candidate.refresh_semantic_identities(register_changed);
         candidate.record_raw_register(effective_source);
     }
     candidate
         .mme_mut()
         .track_shadow_register(shadow_control, effective_source);
     Ok(prepared)
+}
+
+/// Plain state admission builds no typed write, metadata or operation adapter.
+/// The same path handles PFIFO and MME sends, including shadow replay.
+#[inline]
+pub(super) fn write_plain_method(
+    method: &mut MaxwellMethodDispatch,
+    candidate: &mut MaxwellThreeDFrontendState,
+) -> Result<bool, MaxwellEngineDispatchError> {
+    if !registers::passive(method.source().method()) {
+        return Ok(false);
+    }
+    let source = method.source();
+    let control = candidate.mme().shadow_ram_control().value().copied();
+    let argument = candidate
+        .mme()
+        .resolve_shadow_argument(source.method(), source.argument())
+        .map_err(|error| MaxwellEngineDispatchError::MmeShadowRam { source, error })?;
+    method.set_effective_argument(argument);
+    if candidate.pending_notification.is_some()
+        && let Some(declaration) = METHODS_BY_DWORD[(source.method().0 / 4) as usize]
+    {
+        return Err(invalid_encoding(
+            method.source(),
+            declaration.metadata.method_name(),
+            "pending notification requires completion of a method other than NO_OPERATION",
+        ));
+    }
+    if candidate.raw_register_value(source.method()) != Some(argument) {
+        registers::validate_encoding(method.source(), candidate)?;
+    }
+    candidate.defer_register(method.source());
+    candidate
+        .mme_mut()
+        .track_shadow_register(control, method.source());
+    Ok(true)
+}
+
+/// Packet index ports normalize packed lanes into the native UINT32 stream.
+/// No state operation, source vector or reserve call is produced per lane.
+pub(super) fn inline_index_words(
+    candidate: &mut MaxwellThreeDFrontendState,
+    subchannel: crate::MaxwellPushbufferSubchannel,
+    words: &[crate::MaxwellDecodedMethod],
+) -> Result<(), MaxwellEngineDispatchError> {
+    candidate.append_index_values(
+        crate::MaxwellMethodSource::decoded(words[0], subchannel),
+        words.iter().map(|word| word.argument()),
+    )?;
+    let last = crate::MaxwellMethodSource::decoded(*words.last().unwrap(), subchannel);
+    candidate.record_raw_register(last);
+    let control = candidate.mme().shadow_ram_control().value().copied();
+    candidate.mme_mut().track_shadow_register(control, last);
+    Ok(())
 }
 
 // A byte-sized routing table avoids probing every specialized register family
@@ -1492,13 +1587,54 @@ fn preflight_register(
     profile: &MaxwellGpuProfile,
     source: crate::MaxwellMethodSource,
     candidate: &mut MaxwellThreeDFrontendState,
+    changed: bool,
 ) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
+    // NVIDIA's packed inline ports append low lanes first. END consumes the
+    // complete stream, as in the independently reviewed public draw managers:
+    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/engines/draw_manager.cpp
+    if matches!(source.method().0, 0x1300 | 0x15e8 | 0x15ec) {
+        candidate.append_inline_indices(source)?;
+        return Ok(PreparedMethod::new(
+            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), "INLINE_INDEX"),
+            None,
+            true,
+        ));
+    }
+    if source.method().0 == 0x1618 && candidate.has_inline_indices() {
+        return Err(invalid_encoding(
+            source,
+            "BEGIN",
+            "a pending inline primitive requires END",
+        ));
+    }
+    if matches!(source.method().0, 0x0d78 | 0x17e0) && candidate.has_inline_indices() {
+        return Err(invalid_encoding(
+            source,
+            "DRAW",
+            "a pending inline primitive must be consumed by END",
+        ));
+    }
+    if source.method().0 == 0x1614 && candidate.has_inline_indices() {
+        checked_bool(source, "END")?;
+        registers::materialize(profile, candidate, u64::MAX)?;
+        let index_count = candidate.publish_inline_indices(source)?;
+        return Ok(PreparedMethod::new(
+            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), "END"),
+            Some(PendingOperation::ThreeD(
+                MaxwellThreeDOperationTrigger::DrawIndexBuffer {
+                    source,
+                    index_count,
+                },
+            )),
+            true,
+        ));
+    }
     let family = register_family(source.method().0);
     if family == RegisterFamily::InlineToMemory
         && let Some((write, method_name, upload)) =
             inline_to_memory::preflight(source, candidate.operation_state().inline_to_memory())?
     {
-        candidate.apply(write);
+        candidate.apply(write, changed);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         let (operation, writes_state) = upload.map_or(state_write(), state_inline_to_memory);
@@ -1507,7 +1643,7 @@ fn preflight_register(
     if family == RegisterFamily::Mme
         && let Some((write, method_name)) = preflight_mme_state(source, candidate)?
     {
-        candidate.apply(write);
+        candidate.apply(write, changed);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         return Ok(PreparedMethod::new(metadata, None, true));
@@ -1516,7 +1652,7 @@ fn preflight_register(
         && let Some((write, method_name, upload)) =
             preflight_constant_buffer_load(source, candidate)?
     {
-        candidate.apply(write);
+        candidate.apply(write, changed);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         let (operation, writes_state) = upload.map_or(state_write(), state_inline_constant_buffer);
@@ -1525,13 +1661,13 @@ fn preflight_register(
     if family == RegisterFamily::VertexAndBinding
         && let Some((write, method_name)) = preflight_vertex_and_binding_state(source, candidate)?
     {
-        candidate.apply(write);
+        candidate.apply(write, changed);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         return Ok(PreparedMethod::new(metadata, None, true));
     }
     if let Some((write, method_name)) = preflight_output_state(source)? {
-        candidate.apply(write);
+        candidate.apply(write, changed);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         let (operation, writes_state) = if let MaxwellThreeDStateWrite::RenderTarget(
@@ -1582,1363 +1718,1481 @@ fn preflight_register(
             "pending notification requires completion of a method other than NO_OPERATION",
         ));
     }
-    let (operation, writes_state) =
-        match declaration.action {
-            MethodAction::NotifyAddress => state_write(),
-            MethodAction::Notify => {
-                if source.argument() != 0 {
-                    return Err(MaxwellEngineDispatchError::UnsupportedMethod {
-                        source,
-                        metadata: declaration.metadata,
-                    });
-                }
-                let high = candidate.raw_register_value(GpuMethodId(0x0104));
-                let low = candidate.raw_register_value(GpuMethodId(0x0108));
-                let (Some(high), Some(low)) = (high, low) else {
-                    return Err(invalid_encoding(
-                        source,
-                        declaration.metadata.method_name(),
-                        "notification address has not been programmed",
-                    ));
-                };
-                candidate.pending_notification =
-                    Some(((u64::from(high) << 32) | u64::from(low), source));
-                state_write()
+    let (operation, writes_state) = match declaration.action {
+        MethodAction::NotifyAddress
+        | MethodAction::Delay
+        | MethodAction::VpcPerfKnob
+        | MethodAction::InstrumentationHeader
+        | MethodAction::InstrumentationData
+        | MethodAction::IteratedBlend
+        | MethodAction::IteratedBlendPassCount
+        | MethodAction::SubtilingPerfKnobA
+        | MethodAction::SubtilingPerfKnobB
+        | MethodAction::TiledCacheEnable
+        | MethodAction::TiledCacheTileSize
+        | MethodAction::TiledCacheUnknownConfig(..)
+        | MethodAction::ShaderWatermarks(..)
+        | MethodAction::L1Configuration
+        | MethodAction::ColorReductionThresholdsEnable
+        | MethodAction::ColorReductionThresholdsUnorm8
+        | MethodAction::ColorReductionThresholdsUnorm10
+        | MethodAction::ColorReductionThresholdsUnorm16
+        | MethodAction::ColorReductionThresholdsFp16
+        | MethodAction::ColorReductionThresholdsSrgb8
+        | MethodAction::ConstantColorRenderingEnable
+        | MethodAction::ConstantColorRenderingComponent(..)
+        | MethodAction::OpportunisticEarlyZHysteresis
+        | MethodAction::ApiMandatedEarlyZ
+        | MethodAction::PostPsInitialCoverage
+        | MethodAction::PostZPixelShaderImask
+        | MethodAction::PixelShaderInterlockControl
+        | MethodAction::AlphaFraction
+        | MethodAction::RasterBoundingBox
+        | MethodAction::VafL2CacheControl
+        | MethodAction::RopL2CacheControl(..)
+        | MethodAction::ReportSemaphoreAddressUpper
+        | MethodAction::ReportSemaphoreAddressLower
+        | MethodAction::ReportSemaphorePayload
+        | MethodAction::PointSize
+        | MethodAction::PointSpriteSelect
+        | MethodAction::PointCenterMode
+        | MethodAction::EdgeFlag
+        | MethodAction::ViewportZClip
+        | MethodAction::RenderEnableOverride
+        | MethodAction::RenderEnableMode
+        | MethodAction::PsOutputSampleMaskUsage
+        | MethodAction::HybridAntiAliasControl
+        | MethodAction::TirMode
+        | MethodAction::TirControl
+        | MethodAction::TirModulation
+        | MethodAction::TirModulationFunction
+        | MethodAction::CoverageToColor
+        | MethodAction::AlphaToCoverageOverride
+        | MethodAction::AlphaToCoverageDither
+        | MethodAction::SampleLocations(..)
+        | MethodAction::RenderEnableControl
+        | MethodAction::VisibleCallLimit
+        | MethodAction::SmTimeoutCounterBit
+        | MethodAction::ShaderExceptionsEnable
+        | MethodAction::ShaderLocalMemoryWindowBaseAddress
+        | MethodAction::ShaderLocalMemoryAddressUpper
+        | MethodAction::ShaderLocalMemoryAddressLower
+        | MethodAction::ShaderLocalMemorySizeUpper
+        | MethodAction::ShaderLocalMemorySizeLower
+        | MethodAction::ShaderLocalMemoryDefaultSizePerWarp
+        | MethodAction::CsaaEnable
+        | MethodAction::AliasedLineWidthEnable
+        | MethodAction::ActiveZCullRegion
+        | MethodAction::ZCullReportSelection
+        | MethodAction::ZCullReportType
+        | MethodAction::ZCullSubregionAllocation
+        | MethodAction::ZCullSubregionAlgorithm
+        | MethodAction::ZCullStorage(..)
+        | MethodAction::ZCullRegionLocation
+        | MethodAction::ZCullRegionAliquots
+        | MethodAction::ZCullRegionSize(..)
+        | MethodAction::ZCullRegionPixelOffset(..)
+        | MethodAction::ZCullRegionFormat
+        | MethodAction::ZCullSubregion
+        | MethodAction::ZCullDirectionFormat
+        | MethodAction::ZCullStatsEnable
+        | MethodAction::StreamOutputEnable
+        | MethodAction::StatisticsCounterEnable
+        | MethodAction::ZPassPixelCountEnable
+        | MethodAction::ZCullCriterion
+        | MethodAction::ZCullEnable
+        | MethodAction::ZCullBounds => {
+            if let Some(write) = decode_declared_state(source, declaration)? {
+                candidate.apply(write, changed);
             }
-            MethodAction::NoOperation => {
-                if let Some((address, source)) = candidate.pending_notification.take() {
-                    (
-                        Some(PendingOperation::Notification { address, source }),
-                        false,
-                    )
-                } else {
-                    no_operation()
-                }
+            state_write()
+        }
+        MethodAction::Notify => {
+            if source.argument() != 0 {
+                return Err(MaxwellEngineDispatchError::UnsupportedMethod {
+                    source,
+                    metadata: declaration.metadata,
+                });
             }
-            MethodAction::Delay => {
-                // Match the functional emulation contract of Eden and Ryujinx:
-                // retain the full register value for MME reads and shadow RAM,
-                // without a host sleep, GPU barrier, or pipeline-state change.
-                // Neither implementation models the hardware delay duration.
-                // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/engines/maxwell_3d.cpp#L301-L405
-                // https://git.axenov.dev/Museum/ryujinx/src/commit/ec3e848d7998038ce22c41acdbf81032bf47991f/Ryujinx.Graphics.Gpu/Engine/Threed/ThreedClassState.cs#L797
-                state_write()
-            }
-            MethodAction::VpcPerfKnob => {
-                // VPC work-distribution policy has four full-byte fields for
-                // culled small lines/triangles and nonculled lines/points/triangles.
-                // Preserve them for MME reads and replay; host work distribution
-                // is chosen by the host driver rather than Maxwell's VPC.
-                // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1215-L1219
-                state_write()
-            }
-            MethodAction::DiscardRenderTarget => {
-                // A discard relinquishes preservation of the selected target's
-                // contents; it is not a clear, unbind, deallocation, or barrier.
-                // Retaining those contents is valid. Our resident-image path
-                // keeps them without adding a host pass, readback, resource
-                // lookup, or pipeline invalidation. Do not mark an uninitialized
-                // compressed image as materialized merely because it was discarded.
-                // The caller supplies any required fragment ordering separately.
-                // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_3d_base.cpp#L514-L530
-                // Discard/invalidation permits retained contents, not a required
-                // replacement value: https://registry.khronos.org/OpenGL/specs/gl/glspec43.core.pdf section 17.4.4.
+            let high = candidate.raw_register_value(GpuMethodId(0x0104));
+            let low = candidate.raw_register_value(GpuMethodId(0x0108));
+            let (Some(high), Some(low)) = (high, low) else {
+                return Err(invalid_encoding(
+                    source,
+                    declaration.metadata.method_name(),
+                    "notification address has not been programmed",
+                ));
+            };
+            candidate.pending_notification =
+                Some(((u64::from(high) << 32) | u64::from(low), source));
+            state_write()
+        }
+        MethodAction::NoOperation => {
+            if let Some((address, source)) = candidate.pending_notification.take() {
+                (
+                    Some(PendingOperation::Notification { address, source }),
+                    false,
+                )
+            } else {
                 no_operation()
             }
-            MethodAction::ClearReportValue => {
-                // Type 2 resets the hierarchical Z-cull statistics. We do not
-                // run that guest cache, so there is no accumulated cache work
-                // to reset. Counter reporting remains explicitly unsupported;
-                // resetting this cache must not clear depth or other counters.
-                // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2722-L2741
-                if source.argument() != 2 {
-                    return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                        source,
-                        method_name: "CLEAR_REPORT_VALUE",
-                        reason: "resetting non-Z-cull performance counters is not implemented",
-                    });
-                }
-                no_operation()
-            }
-            MethodAction::ZCullMaintenance => {
-                // These commands maintain only Maxwell's hierarchical Z-cull
-                // metadata, never the depth/stencil attachment. We retain no
-                // such cache: neutral draws perform their own depth/stencil
-                // tests. All documented selectors therefore require no host
-                // work, memory writes, or pipeline invalidation. In particular,
-                // deko3d clears conservatively (0x19) after changing targets.
-                // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2091-L2108
-                // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/clear_buffers.mme#L26-L37
-                no_operation()
-            }
-            MethodAction::DecompressSurface => {
-                let request = MaxwellThreeDDecompressSurface::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                synchronization_operation(MaxwellThreeDSynchronizationTrigger::DecompressSurface {
-                    request,
+        }
+        MethodAction::DiscardRenderTarget => {
+            // A discard relinquishes preservation of the selected target's
+            // contents; it is not a clear, unbind, deallocation, or barrier.
+            // Retaining those contents is valid. Our resident-image path
+            // keeps them without adding a host pass, readback, resource
+            // lookup, or pipeline invalidation. Do not mark an uninitialized
+            // compressed image as materialized merely because it was discarded.
+            // The caller supplies any required fragment ordering separately.
+            // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_3d_base.cpp#L514-L530
+            // Discard/invalidation permits retained contents, not a required
+            // replacement value: https://registry.khronos.org/OpenGL/specs/gl/glspec43.core.pdf section 17.4.4.
+            no_operation()
+        }
+        MethodAction::ClearReportValue => {
+            // Type 2 resets the hierarchical Z-cull statistics. We do not
+            // run that guest cache, so there is no accumulated cache work
+            // to reset. Counter reporting remains explicitly unsupported;
+            // resetting this cache must not clear depth or other counters.
+            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2722-L2741
+            if source.argument() != 2 {
+                return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
                     source,
-                })
+                    method_name: "CLEAR_REPORT_VALUE",
+                    reason: "resetting non-Z-cull performance counters is not implemented",
+                });
             }
-            MethodAction::InstrumentationHeader => {
-                let value = MaxwellThreeDInstrumentationValue::from_bits(source.argument());
-                let write = MaxwellThreeDStateWrite::Instrumentation(
-                    MaxwellThreeDInstrumentationStateWrite::Header { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::InstrumentationData => {
-                let value = MaxwellThreeDInstrumentationValue::from_bits(source.argument());
-                let write = MaxwellThreeDStateWrite::Instrumentation(
-                    MaxwellThreeDInstrumentationStateWrite::Data { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::IteratedBlend => {
-                let value = MaxwellThreeDIteratedBlend::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::FixedFunction(
-                    MaxwellThreeDFixedFunctionWrite::IteratedBlend { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::IteratedBlendPassCount => {
-                let value = MaxwellThreeDIteratedBlendPassCount::new(source.argument() as u8);
-                let write = MaxwellThreeDStateWrite::FixedFunction(
-                    MaxwellThreeDFixedFunctionWrite::IteratedBlendPassCount { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::WaitForIdle => {
-                synchronization_operation(MaxwellThreeDSynchronizationTrigger::WaitForIdle {
-                    value: source.argument(),
+            no_operation()
+        }
+        MethodAction::ZCullMaintenance => {
+            // These commands maintain only Maxwell's hierarchical Z-cull
+            // metadata, never the depth/stencil attachment. We retain no
+            // such cache: neutral draws perform their own depth/stencil
+            // tests. All documented selectors therefore require no host
+            // work, memory writes, or pipeline invalidation. In particular,
+            // deko3d clears conservatively (0x19) after changing targets.
+            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2091-L2108
+            // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/clear_buffers.mme#L26-L37
+            no_operation()
+        }
+        MethodAction::DecompressSurface => {
+            let request = MaxwellThreeDDecompressSurface::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
                     source,
-                })
-            }
-            MethodAction::PixelShaderBarrier => {
-                synchronization_operation(MaxwellThreeDSynchronizationTrigger::PixelShaderBarrier {
-                    system_memory_barrier: source.argument() & 1 != 0,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            synchronization_operation(MaxwellThreeDSynchronizationTrigger::DecompressSurface {
+                request,
+                source,
+            })
+        }
+        MethodAction::WaitForIdle => {
+            synchronization_operation(MaxwellThreeDSynchronizationTrigger::WaitForIdle {
+                value: source.argument(),
+                source,
+            })
+        }
+        MethodAction::PixelShaderBarrier => {
+            synchronization_operation(MaxwellThreeDSynchronizationTrigger::PixelShaderBarrier {
+                system_memory_barrier: source.argument() & 1 != 0,
+                source,
+            })
+        }
+        MethodAction::TiledCacheBarrier => {
+            synchronization_operation(MaxwellThreeDSynchronizationTrigger::TiledCacheBarrier {
+                source,
+            })
+        }
+        MethodAction::MmeShadowRamControl => {
+            let value = MaxwellThreeDMmeShadowRamControl::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
                     source,
-                })
-            }
-            MethodAction::TiledCacheBarrier => {
-                synchronization_operation(MaxwellThreeDSynchronizationTrigger::TiledCacheBarrier {
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write =
+                MaxwellThreeDStateWrite::Mme(MaxwellThreeDMmeStateWrite::ShadowRamControl {
+                    value,
                     source,
-                })
-            }
-            MethodAction::MmeShadowRamControl => {
-                let value = MaxwellThreeDMmeShadowRamControl::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
+                });
+            candidate.apply(write, changed);
+            state_write()
+        }
+        MethodAction::MutableMethodControl => {
+            let value = MaxwellThreeDMutableMethodControl::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write =
+                MaxwellThreeDStateWrite::Mme(MaxwellThreeDMmeStateWrite::MutableMethodControl {
+                    value,
+                    source,
+                });
+            candidate.apply(write, changed);
+            state_write()
+        }
+        MethodAction::FalconFirmwareCall4 => {
+            let address = MaxwellThreeDFalconRegisterAddress::try_new(source.argument()).ok_or(
+                MaxwellEngineDispatchError::FalconFirmware {
+                    source,
+                    error: MaxwellThreeDFalconError::UnalignedRegisterAddress {
+                        address: source.argument(),
                     },
-                )?;
-                let write =
-                    MaxwellThreeDStateWrite::Mme(MaxwellThreeDMmeStateWrite::ShadowRamControl {
-                        value,
-                        source,
-                    });
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::MutableMethodControl => {
-                let value = MaxwellThreeDMutableMethodControl::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::Mme(
-                    MaxwellThreeDMmeStateWrite::MutableMethodControl { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::FalconFirmwareCall4 => {
-                let address = MaxwellThreeDFalconRegisterAddress::try_new(source.argument())
+                },
+            )?;
+            let firmware_argument = |index| {
+                candidate
+                    .mme()
+                    .shadow_scratch(MaxwellThreeDMmeShadowScratchIndex::new(index))
+                    .and_then(MaxwellThreeDRegister::raw)
                     .ok_or(MaxwellEngineDispatchError::FalconFirmware {
                         source,
-                        error: MaxwellThreeDFalconError::UnalignedRegisterAddress {
-                            address: source.argument(),
-                        },
-                    })?;
-                let firmware_argument = |index| {
-                    candidate
-                        .mme()
-                        .shadow_scratch(MaxwellThreeDMmeShadowScratchIndex::new(index))
-                        .and_then(MaxwellThreeDRegister::raw)
-                        .ok_or(MaxwellEngineDispatchError::FalconFirmware {
-                            source,
-                            error: MaxwellThreeDFalconError::MissingFirmwareArgument { index },
-                        })
-                };
-                let value = firmware_argument(1)?;
-                let mask = firmware_argument(2)?;
-                let write = MaxwellThreeDStateWrite::FalconMaskedRegister(
-                    MaxwellThreeDFalconMaskedRegisterWrite::new(address, value, mask, source),
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::SubtilingPerfKnobA => {
-                let value = MaxwellThreeDSubtilingPerfKnobA::parse(source.argument());
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobA { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::SubtilingPerfKnobB => {
-                let value = MaxwellThreeDSubtilingPerfKnobB::new(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobB { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::TiledCacheEnable => {
-                let value = source.argument() != 0;
-                let write = MaxwellThreeDStateWrite::TiledCache(
-                    MaxwellThreeDTiledCacheStateWrite::Enable { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::TiledCacheTileSize => {
-                let value = MaxwellThreeDTiledCacheTileSize::parse(source.argument());
-                let write = MaxwellThreeDStateWrite::TiledCache(
-                    MaxwellThreeDTiledCacheStateWrite::TileSize { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::TiledCacheUnknownConfig(index) => {
-                let value = MaxwellThreeDTiledCacheUnknownConfig::from_bits(source.argument());
-                let write = MaxwellThreeDStateWrite::TiledCache(
-                    MaxwellThreeDTiledCacheStateWrite::UnknownConfig {
-                        index,
-                        value,
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::TiledCacheFlush => {
-                let mode = MaxwellThreeDTiledCacheFlushMode::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                synchronization_operation(MaxwellThreeDSynchronizationTrigger::TiledCacheFlush {
-                    mode,
-                    source,
-                })
-            }
-            MethodAction::ShaderWatermarks(target) => {
-                let value = MaxwellThreeDShaderWatermarkRange::parse(source.argument());
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::ShaderWatermarks {
-                        target,
-                        value,
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::L1Configuration => {
-                let value = MaxwellThreeDDirectlyAddressableMemory::parse(source.argument())
-                    .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    })?;
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::L1Configuration { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ColorReductionThresholdsEnable => {
-                let value = MaxwellThreeDColorReductionThresholdsEnable::parse(source.argument())
-                    .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
+                        error: MaxwellThreeDFalconError::MissingFirmwareArgument { index },
+                    })
+            };
+            let value = firmware_argument(1)?;
+            let mask = firmware_argument(2)?;
+            let write = MaxwellThreeDStateWrite::FalconMaskedRegister(
+                MaxwellThreeDFalconMaskedRegisterWrite::new(address, value, mask, source),
+            );
+            candidate.apply(write, changed);
+            state_write()
+        }
+        MethodAction::TiledCacheFlush => {
+            let mode = MaxwellThreeDTiledCacheFlushMode::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
                     source,
                     metadata: declaration.metadata,
                     defined_mask: declaration.defined_mask,
-                })?;
-                let write = MaxwellThreeDStateWrite::ColorReduction(
-                    MaxwellThreeDColorReductionStateWrite::Enable { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ColorReductionThresholdsUnorm8 => {
-                let value = MaxwellThreeDColorReductionThresholdsUnorm8::parse(source.argument())
-                    .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
+                },
+            )?;
+            synchronization_operation(MaxwellThreeDSynchronizationTrigger::TiledCacheFlush {
+                mode,
+                source,
+            })
+        }
+        MethodAction::CheckSphVersion => {
+            let requested = MaxwellShaderProgramHeaderVersionRange::new(
+                MaxwellShaderProgramHeaderVersion::new(source.argument() as u16),
+                MaxwellShaderProgramHeaderVersion::new((source.argument() >> 16) as u16),
+            );
+            if !requested.is_well_ordered() {
+                return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
                     source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                })?;
-                let write = MaxwellThreeDStateWrite::ColorReduction(
-                    MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm8 { value, source },
-                );
-                candidate.apply(write);
-                state_write()
+                    method_name: declaration.metadata.method_name(),
+                    reason: "current SPH version precedes oldest supported SPH version",
+                });
             }
-            MethodAction::ColorReductionThresholdsUnorm10 => {
-                let value = MaxwellThreeDColorReductionThresholdsUnorm10::parse(source.argument())
-                    .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    })?;
-                let write = MaxwellThreeDStateWrite::ColorReduction(
-                    MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm10 { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ColorReductionThresholdsUnorm16 => {
-                let value = MaxwellThreeDColorReductionThresholdsUnorm16::parse(source.argument())
-                    .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    })?;
-                let write = MaxwellThreeDStateWrite::ColorReduction(
-                    MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm16 { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ColorReductionThresholdsFp16 => {
-                let value = MaxwellThreeDColorReductionThresholdsFp16::parse(source.argument())
-                    .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    })?;
-                let write = MaxwellThreeDStateWrite::ColorReduction(
-                    MaxwellThreeDColorReductionStateWrite::ThresholdsFp16 { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ColorReductionThresholdsSrgb8 => {
-                let value = MaxwellThreeDColorReductionThresholdsSrgb8::parse(source.argument())
-                    .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    })?;
-                let write = MaxwellThreeDStateWrite::ColorReduction(
-                    MaxwellThreeDColorReductionStateWrite::ThresholdsSrgb8 { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ConstantColorRenderingEnable => {
-                let value = source.argument() != 0;
-                let write = MaxwellThreeDStateWrite::ConstantColorRendering(
-                    MaxwellThreeDConstantColorRenderingStateWrite::Enable { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ConstantColorRenderingComponent(component) => {
-                let value = MaxwellThreeDConstantColorValue::from_bits(source.argument());
-                let write = MaxwellThreeDStateWrite::ConstantColorRendering(
-                    MaxwellThreeDConstantColorRenderingStateWrite::Component {
-                        component,
-                        value,
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::OpportunisticEarlyZHysteresis => {
-                let raw = source.argument();
-                if raw > 19 && raw != 31 {
-                    return Err(invalid_encoding(
-                        source,
-                        "SET_OPPORTUNISTIC_EARLY_Z_HYSTERESIS",
-                        "undefined primitive-area threshold",
-                    ));
-                }
-                candidate.apply(MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::OpportunisticEarlyZHysteresis {
-                        value: raw as u8,
-                        source,
-                    },
-                ));
-                state_write()
-            }
-            MethodAction::ApiMandatedEarlyZ => {
-                let value = MaxwellThreeDApiMandatedEarlyZ::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::ApiMandatedEarlyZ { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::PostPsInitialCoverage => {
-                candidate.apply(MaxwellThreeDStateWrite::Coverage(
-                    MaxwellThreeDCoverageStateWrite::PostPsInitialCoverage {
-                        value: source.argument() != 0,
-                        source,
-                    },
-                ));
-                state_write()
-            }
-            MethodAction::PostZPixelShaderImask => {
-                let value = MaxwellThreeDPostZPixelShaderImask::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::Coverage(
-                    MaxwellThreeDCoverageStateWrite::PostZPixelShaderImask { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::PixelShaderInterlockControl => {
-                let value = MaxwellThreeDPixelShaderInterlockControl::parse(source.argument())
-                    .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    })?;
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::PixelShaderInterlockControl {
-                        value,
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::AlphaFraction => {
-                let write = MaxwellThreeDStateWrite::AlphaFraction {
-                    value: MaxwellThreeDAlphaFraction::new(source.argument() as u8),
-                    source,
-                };
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::RasterBoundingBox => {
-                let write = MaxwellThreeDStateWrite::RasterBoundingBox {
-                    value: MaxwellThreeDRasterBoundingBox::parse(source.argument()),
-                    source,
-                };
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::CheckSphVersion => {
-                let requested = MaxwellShaderProgramHeaderVersionRange::new(
-                    MaxwellShaderProgramHeaderVersion::new(source.argument() as u16),
-                    MaxwellShaderProgramHeaderVersion::new((source.argument() >> 16) as u16),
-                );
-                if !requested.is_well_ordered() {
-                    return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                        source,
-                        method_name: declaration.metadata.method_name(),
-                        reason: "current SPH version precedes oldest supported SPH version",
-                    });
-                }
-                let supported = profile.shader().sph_versions();
-                if !supported.overlaps(requested) {
-                    return Err(
-                        MaxwellEngineDispatchError::IncompatibleShaderProgramHeaderVersion {
-                            source,
-                            requested,
-                            supported,
-                        },
-                    );
-                }
-                no_operation()
-            }
-            MethodAction::CheckAamVersion => {
-                let requested = MaxwellAamVersionRange::new(
-                    MaxwellAamVersion::new(source.argument() as u16),
-                    MaxwellAamVersion::new((source.argument() >> 16) as u16),
-                );
-                if !requested.is_well_ordered() {
-                    return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                        source,
-                        method_name: declaration.metadata.method_name(),
-                        reason: "current AAM version precedes oldest supported AAM version",
-                    });
-                }
-                let supported = profile.aam_versions();
-                if !supported.overlaps(requested) {
-                    return Err(MaxwellEngineDispatchError::IncompatibleAamVersion {
+            let supported = profile.shader().sph_versions();
+            if !supported.overlaps(requested) {
+                return Err(
+                    MaxwellEngineDispatchError::IncompatibleShaderProgramHeaderVersion {
                         source,
                         requested,
                         supported,
-                    });
-                }
-                no_operation()
-            }
-            MethodAction::VafL2CacheControl => {
-                let value = MaxwellThreeDVafL2CacheControl::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write =
-                    MaxwellThreeDStateWrite::L2Cache(MaxwellThreeDL2CacheStateWrite::VafControl {
-                        value,
-                        source,
-                    });
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::RopL2CacheControl(request) => {
-                let value = MaxwellThreeDL2CacheEvictionPolicy::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write =
-                    MaxwellThreeDStateWrite::L2Cache(MaxwellThreeDL2CacheStateWrite::RopPolicy {
-                        request,
-                        value,
-                        source,
-                    });
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ReportSemaphoreAddressUpper => {
-                let write = MaxwellThreeDStateWrite::ReportSemaphore(
-                    MaxwellThreeDReportSemaphoreStateWrite::AddressUpper {
-                        value: source.argument() as u8,
-                        source,
                     },
                 );
-                candidate.apply(write);
-                state_write()
             }
-            MethodAction::ReportSemaphoreAddressLower => {
-                let write = MaxwellThreeDStateWrite::ReportSemaphore(
-                    MaxwellThreeDReportSemaphoreStateWrite::AddressLower {
-                        value: source.argument(),
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ReportSemaphorePayload => {
-                let write = MaxwellThreeDStateWrite::ReportSemaphore(
-                    MaxwellThreeDReportSemaphoreStateWrite::Payload {
-                        value: source.argument(),
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ReportSemaphoreTrigger => {
-                let control = MaxwellThreeDReportSemaphoreControl::parse(source.argument())
-                    .ok_or_else(|| {
-                        invalid_encoding(
-                            source,
-                            "SET_REPORT_SEMAPHORE_D",
-                            "control contains an unallocated enum value",
-                        )
-                    })?;
-                synchronization_operation(MaxwellThreeDSynchronizationTrigger::ReportSemaphore {
-                    control,
+            no_operation()
+        }
+        MethodAction::CheckAamVersion => {
+            let requested = MaxwellAamVersionRange::new(
+                MaxwellAamVersion::new(source.argument() as u16),
+                MaxwellAamVersion::new((source.argument() >> 16) as u16),
+            );
+            if !requested.is_well_ordered() {
+                return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
                     source,
-                })
+                    method_name: declaration.metadata.method_name(),
+                    reason: "current AAM version precedes oldest supported AAM version",
+                });
             }
-            MethodAction::PointSize => {
-                let write = MaxwellThreeDStateWrite::PointSize {
-                    value: MaxwellThreeDPointSize::from_bits(source.argument()),
+            let supported = profile.aam_versions();
+            if !supported.overlaps(requested) {
+                return Err(MaxwellEngineDispatchError::IncompatibleAamVersion {
                     source,
-                };
-                candidate.apply(write);
-                state_write()
+                    requested,
+                    supported,
+                });
             }
-            MethodAction::PointSpriteSelect => {
-                let value = MaxwellThreeDPointSpriteSelect::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
+            no_operation()
+        }
+        MethodAction::ReportSemaphoreTrigger => {
+            let control = MaxwellThreeDReportSemaphoreControl::parse(source.argument())
+                .ok_or_else(|| {
+                    invalid_encoding(
                         source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::PointSpriteSelect { value, source };
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::PointCenterMode => {
-                let value = MaxwellThreeDPointCenterMode::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::PointCenterMode { value, source };
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::EdgeFlag => {
-                let value = MaxwellThreeDEdgeFlag::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::EdgeFlag { value, source };
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::InvalidateShaderCachesNoWfi => {
-                let caches = MaxwellShaderCacheInvalidation::new(
-                    source.argument() & 1 != 0,
-                    source.argument() & (1 << 4) != 0,
-                    source.argument() & (1 << 12) != 0,
-                );
-                synchronization_operation(
-                    MaxwellThreeDSynchronizationTrigger::InvalidateShaderCachesNoWfi {
-                        caches,
-                        source,
-                    },
-                )
-            }
-            MethodAction::InvalidateShaderCaches => {
-                let caches = MaxwellShaderCacheInvalidation::new(
-                    source.argument() & 1 != 0,
-                    source.argument() & (1 << 4) != 0,
-                    source.argument() & (1 << 12) != 0,
-                );
-                let request = MaxwellThreeDShaderCacheInvalidation::new(
-                    caches,
-                    source.argument() & (1 << 1) != 0,
-                    source.argument() & (1 << 2) != 0,
-                );
-                synchronization_operation(
-                    MaxwellThreeDSynchronizationTrigger::InvalidateShaderCaches { request, source },
-                )
-            }
-            MethodAction::InvalidateTextureCacheNoWfi(target) => {
-                let request = MaxwellThreeDTextureCacheInvalidation::new(
-                    target,
-                    if source.argument() & 1 == 0 {
-                        MaxwellThreeDTextureCacheLines::All
-                    } else {
-                        MaxwellThreeDTextureCacheLines::One
-                    },
-                    (source.argument() >> 4) & 0x003f_ffff,
-                );
-                synchronization_operation(
-                    MaxwellThreeDSynchronizationTrigger::InvalidateTextureCacheNoWfi {
-                        request,
-                        source,
-                    },
-                )
-            }
-            MethodAction::InvalidateTextureCache(target) => {
-                let request = MaxwellThreeDTextureCacheInvalidation::new(
-                    target,
-                    if source.argument() & 1 == 0 {
-                        MaxwellThreeDTextureCacheLines::All
-                    } else {
-                        MaxwellThreeDTextureCacheLines::One
-                    },
-                    (source.argument() >> 4) & 0x003f_ffff,
-                );
-                synchronization_operation(
-                    MaxwellThreeDSynchronizationTrigger::InvalidateTextureCache { request, source },
-                )
-            }
-            MethodAction::FlushPendingWrites => {
-                let request = MaxwellThreeDFlushPendingWrites::new(source.argument() != 0);
-                synchronization_operation(MaxwellThreeDSynchronizationTrigger::FlushPendingWrites {
+                        "SET_REPORT_SEMAPHORE_D",
+                        "control contains an unallocated enum value",
+                    )
+                })?;
+            synchronization_operation(MaxwellThreeDSynchronizationTrigger::ReportSemaphore {
+                control,
+                source,
+            })
+        }
+        MethodAction::InvalidateShaderCachesNoWfi => {
+            let caches = MaxwellShaderCacheInvalidation::new(
+                source.argument() & 1 != 0,
+                source.argument() & (1 << 4) != 0,
+                source.argument() & (1 << 12) != 0,
+            );
+            synchronization_operation(
+                MaxwellThreeDSynchronizationTrigger::InvalidateShaderCachesNoWfi { caches, source },
+            )
+        }
+        MethodAction::InvalidateShaderCaches => {
+            let caches = MaxwellShaderCacheInvalidation::new(
+                source.argument() & 1 != 0,
+                source.argument() & (1 << 4) != 0,
+                source.argument() & (1 << 12) != 0,
+            );
+            let request = MaxwellThreeDShaderCacheInvalidation::new(
+                caches,
+                source.argument() & (1 << 1) != 0,
+                source.argument() & (1 << 2) != 0,
+            );
+            synchronization_operation(
+                MaxwellThreeDSynchronizationTrigger::InvalidateShaderCaches { request, source },
+            )
+        }
+        MethodAction::InvalidateTextureCacheNoWfi(target) => {
+            let request = MaxwellThreeDTextureCacheInvalidation::new(
+                target,
+                if source.argument() & 1 == 0 {
+                    MaxwellThreeDTextureCacheLines::All
+                } else {
+                    MaxwellThreeDTextureCacheLines::One
+                },
+                (source.argument() >> 4) & 0x003f_ffff,
+            );
+            synchronization_operation(
+                MaxwellThreeDSynchronizationTrigger::InvalidateTextureCacheNoWfi {
                     request,
                     source,
-                })
-            }
-            MethodAction::IncrementSyncpoint => {
-                let request = MaxwellThreeDSyncpointIncrement::new(
-                    nixe_gpu::GuestSyncpointId::new(source.argument() & 0x0fff),
-                    source.argument() & (1 << 16) != 0,
-                    if source.argument() & (1 << 20) == 0 {
-                        MaxwellThreeDSyncpointCondition::StreamOutWritesDone
-                    } else {
-                        MaxwellThreeDSyncpointCondition::RopWritesDone
-                    },
-                );
-                synchronization_operation(MaxwellThreeDSynchronizationTrigger::IncrementSyncpoint {
-                    request,
+                },
+            )
+        }
+        MethodAction::InvalidateTextureCache(target) => {
+            let request = MaxwellThreeDTextureCacheInvalidation::new(
+                target,
+                if source.argument() & 1 == 0 {
+                    MaxwellThreeDTextureCacheLines::All
+                } else {
+                    MaxwellThreeDTextureCacheLines::One
+                },
+                (source.argument() >> 4) & 0x003f_ffff,
+            );
+            synchronization_operation(
+                MaxwellThreeDSynchronizationTrigger::InvalidateTextureCache { request, source },
+            )
+        }
+        MethodAction::FlushPendingWrites => {
+            let request = MaxwellThreeDFlushPendingWrites::new(source.argument() != 0);
+            synchronization_operation(MaxwellThreeDSynchronizationTrigger::FlushPendingWrites {
+                request,
+                source,
+            })
+        }
+        MethodAction::IncrementSyncpoint => {
+            let request = MaxwellThreeDSyncpointIncrement::new(
+                nixe_gpu::GuestSyncpointId::new(source.argument() & 0x0fff),
+                source.argument() & (1 << 16) != 0,
+                if source.argument() & (1 << 20) == 0 {
+                    MaxwellThreeDSyncpointCondition::StreamOutWritesDone
+                } else {
+                    MaxwellThreeDSyncpointCondition::RopWritesDone
+                },
+            );
+            synchronization_operation(MaxwellThreeDSynchronizationTrigger::IncrementSyncpoint {
+                request,
+                source,
+            })
+        }
+        MethodAction::DrawVertexArray => {
+            if source.argument() == 0 {
+                return Err(invalid_encoding(
                     source,
-                })
-            }
-            MethodAction::ViewportZClip => {
-                let value = MaxwellThreeDViewportZClipRange::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::ViewportZClip { value, source };
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::RenderEnableOverride => {
-                let value = MaxwellThreeDRenderEnableOverride::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                candidate.apply(MaxwellThreeDStateWrite::RenderEnable(
-                    MaxwellThreeDRenderEnableStateWrite::Override { value, source },
+                    "DRAW_VERTEX_ARRAY",
+                    "vertex count is zero",
                 ));
-                state_write()
             }
-            MethodAction::RenderEnableMode => {
-                let value = MaxwellThreeDRenderEnableMode::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::RenderEnable(
-                    MaxwellThreeDRenderEnableStateWrite::Mode { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::PsOutputSampleMaskUsage => {
-                let value = MaxwellThreeDPsOutputSampleMaskUsage::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::Coverage(
-                    MaxwellThreeDCoverageStateWrite::PsOutputSampleMaskUsage { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::HybridAntiAliasControl => {
-                let value = MaxwellThreeDHybridAntiAliasControl::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::Coverage(
-                    MaxwellThreeDCoverageStateWrite::HybridAntiAliasControl { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::TirMode => {
-                let value = MaxwellThreeDTirMode::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write =
-                    MaxwellThreeDStateWrite::Coverage(MaxwellThreeDCoverageStateWrite::TirMode {
-                        value,
-                        source,
-                    });
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::TirControl => {
-                let value = MaxwellThreeDTirControl::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::Coverage(
-                    MaxwellThreeDCoverageStateWrite::TirControl { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::TirModulation => {
-                let value = MaxwellThreeDTirModulationComponentSelect::parse(source.argument())
-                    .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    })?;
-                let write = MaxwellThreeDStateWrite::Coverage(
-                    MaxwellThreeDCoverageStateWrite::TirModulation { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::TirModulationFunction => {
-                let value = MaxwellThreeDTirModulationFunction::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::Coverage(
-                    MaxwellThreeDCoverageStateWrite::TirModulationFunction { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::CoverageToColor => {
-                let value = MaxwellThreeDCoverageToColor::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::Coverage(
-                    MaxwellThreeDCoverageStateWrite::CoverageToColor { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::AlphaToCoverageOverride => {
-                let value = MaxwellThreeDAlphaToCoverageOverride::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::Coverage(
-                    MaxwellThreeDCoverageStateWrite::AlphaToCoverageOverride { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::AlphaToCoverageDither => {
-                let value = MaxwellThreeDAlphaToCoverageDither::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                candidate.apply(MaxwellThreeDStateWrite::Coverage(
-                    MaxwellThreeDCoverageStateWrite::AlphaToCoverageDither { value, source },
-                ));
-                state_write()
-            }
-            MethodAction::SampleLocations(group) => {
-                let value = MaxwellThreeDSampleLocationGroup::parse(source.argument());
-                let write = MaxwellThreeDStateWrite::Coverage(
-                    MaxwellThreeDCoverageStateWrite::SampleLocations {
-                        group,
-                        value,
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::RenderEnableControl => {
-                let value = MaxwellThreeDConditionalLoadConstantBuffer::parse(source.argument())
-                    .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    })?;
-                let write = MaxwellThreeDStateWrite::RenderEnable(
-                    MaxwellThreeDRenderEnableStateWrite::ConditionalLoadConstantBuffer {
-                        value,
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::VisibleCallLimit => {
-                let value = MaxwellThreeDVisibleCallLimit::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::VisibleCallLimit { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::SmTimeoutCounterBit => {
-                let value = MaxwellThreeDSmTimeoutCounterBit::new(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::SmTimeoutCounterBit { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ShaderExceptionsEnable => {
-                let value = MaxwellThreeDShaderExceptionsEnable::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::ShaderExceptionsEnable {
-                        value,
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ShaderLocalMemoryWindowBaseAddress => {
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryWindowBaseAddress {
-                        value: source.argument(),
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ShaderLocalMemoryAddressUpper => {
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryAddressUpper {
-                        value: source.argument() as u8,
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ShaderLocalMemoryAddressLower => {
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryAddressLower {
-                        value: source.argument(),
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ShaderLocalMemorySizeUpper => {
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemorySizeUpper {
-                        value: source.argument() as u8,
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ShaderLocalMemorySizeLower => {
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemorySizeLower {
-                        value: source.argument(),
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ShaderLocalMemoryDefaultSizePerWarp => {
-                let value = MaxwellThreeDShaderLocalMemoryPerWarpSize::new(source.argument())
-                    .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    })?;
-                let write = MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryDefaultSizePerWarp {
-                        value,
-                        source,
-                    },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::CsaaEnable => {
-                let value = MaxwellThreeDCsaaEnable::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::Coverage(
-                    MaxwellThreeDCoverageStateWrite::CsaaEnable { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::AliasedLineWidthEnable => {
-                let value = MaxwellThreeDAliasedLineWidthEnable::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::Line(
-                    MaxwellThreeDLineStateWrite::AliasedLineWidthEnable { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ActiveZCullRegion => {
-                let value = MaxwellThreeDZCullRegionId::new(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write =
-                    MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::ActiveRegion {
-                        value,
-                        source,
-                    });
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ZCullReportSelection => {
-                candidate.apply(MaxwellThreeDStateWrite::ZCull(
-                    MaxwellThreeDZCullStateWrite::ReportSelection {
-                        value: source.argument(),
-                        source,
-                    },
-                ));
-                state_write()
-            }
-            MethodAction::ZCullReportType => {
-                if source.argument() >> 4 > 3 {
-                    return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                        source,
-                        method_name: "SET_ZCULL_SUBREGION_REPORT_TYPE",
-                        reason: "reserved Z-cull report type",
-                    });
-                }
-                candidate.apply(MaxwellThreeDStateWrite::ZCull(
-                    MaxwellThreeDZCullStateWrite::ReportType {
-                        value: source.argument(),
-                        source,
-                    },
-                ));
-                state_write()
-            }
-            MethodAction::ZCullSubregionAllocation => {
-                let value = MaxwellThreeDZCullSubregionAllocation::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodEncoding {
-                        source,
-                        method_name: "SET_ZCULL_SUBREGION_ALLOCATION",
-                        reason: "reserved Z-cull allocation format",
-                    },
-                )?;
-                candidate.apply(MaxwellThreeDStateWrite::ZCull(
-                    MaxwellThreeDZCullStateWrite::SubregionAllocation { value, source },
-                ));
-                state_write()
-            }
-            MethodAction::ZCullSubregionAlgorithm => {
-                let value = match source.argument() {
-                    0 => MaxwellThreeDZCullSubregionAlgorithm::Static,
-                    1 => MaxwellThreeDZCullSubregionAlgorithm::Adaptive,
-                    _ => {
-                        return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                            source,
-                            method_name: "ASSIGN_ZCULL_SUBREGIONS",
-                            reason: "reserved Z-cull assignment algorithm",
-                        });
-                    }
-                };
-                candidate.apply(MaxwellThreeDStateWrite::ZCull(
-                    MaxwellThreeDZCullStateWrite::SubregionAlgorithm { value, source },
-                ));
-                state_write()
-            }
-            MethodAction::ZCullStorage(index) => {
-                candidate.apply(MaxwellThreeDStateWrite::ZCull(
-                    MaxwellThreeDZCullStateWrite::Storage {
-                        index,
-                        value: source.argument(),
-                        source,
-                    },
-                ));
-                state_write()
-            }
-            MethodAction::ZCullRegionLocation => {
-                candidate.apply(MaxwellThreeDStateWrite::ZCull(
-                    MaxwellThreeDZCullStateWrite::RegionLocation {
-                        value: MaxwellThreeDZCullRegionLocation::parse(source.argument()),
-                        source,
-                    },
-                ));
-                state_write()
-            }
-            MethodAction::ZCullRegionAliquots => {
-                candidate.apply(MaxwellThreeDStateWrite::ZCull(
-                    MaxwellThreeDZCullStateWrite::RegionAliquots {
-                        value: source.argument() as u16,
-                        source,
-                    },
-                ));
-                state_write()
-            }
-            MethodAction::ZCullRegionSize(axis) => {
-                candidate.apply(MaxwellThreeDStateWrite::ZCull(
-                    MaxwellThreeDZCullStateWrite::RegionSize {
-                        axis,
-                        value: source.argument() as u16,
-                        source,
-                    },
-                ));
-                state_write()
-            }
-            MethodAction::ZCullRegionPixelOffset(axis) => {
-                candidate.apply(MaxwellThreeDStateWrite::ZCull(
-                    MaxwellThreeDZCullStateWrite::RegionPixelOffset {
-                        axis,
-                        value: source.argument() as u16,
-                        source,
-                    },
-                ));
-                state_write()
-            }
-            MethodAction::ZCullRegionFormat => {
-                let value = MaxwellThreeDZCullRegionFormat::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodEncoding {
-                        source,
-                        method_name: "SET_ZCULL_REGION_FORMAT",
-                        reason: "reserved Z-cull region format",
-                    },
-                )?;
-                candidate.apply(MaxwellThreeDStateWrite::ZCull(
-                    MaxwellThreeDZCullStateWrite::RegionFormat { value, source },
-                ));
-                state_write()
-            }
-            MethodAction::ZCullSubregion => {
-                let value = MaxwellThreeDZCullSubregion::parse(source.argument())
-                    .expect("validated Z-cull subregion mask");
-                candidate.apply(MaxwellThreeDStateWrite::ZCull(
-                    MaxwellThreeDZCullStateWrite::Subregion { value, source },
-                ));
-                state_write()
-            }
-            MethodAction::ZCullDirectionFormat => {
-                let value = MaxwellThreeDZCullDirectionFormat::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodEncoding {
-                        source,
-                        method_name: "SET_ZCULL_DIR_FORMAT",
-                        reason: "reserved Z-cull direction or depth format",
-                    },
-                )?;
-                candidate.apply(MaxwellThreeDStateWrite::ZCull(
-                    MaxwellThreeDZCullStateWrite::DirectionFormat { value, source },
-                ));
-                state_write()
-            }
-            MethodAction::ZCullStatsEnable => {
-                let value = MaxwellThreeDZCullStatsEnable::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write =
-                    MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::StatsEnable {
-                        value,
-                        source,
-                    });
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::StreamOutputEnable => {
-                candidate.apply(MaxwellThreeDStateWrite::ShaderExecution(
-                    MaxwellThreeDShaderExecutionStateWrite::StreamOutputEnable {
-                        value: source.argument() != 0,
-                        source,
-                    },
-                ));
-                state_write()
-            }
-            MethodAction::StatisticsCounterEnable => {
-                candidate.apply(MaxwellThreeDStateWrite::Counter(
-                    MaxwellThreeDCounterStateWrite::StatisticsEnable {
-                        value: source.argument(),
-                        source,
-                    },
-                ));
-                state_write()
-            }
-            MethodAction::ZPassPixelCountEnable => {
-                let value = MaxwellThreeDZPassPixelCountEnable::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::Counter(
-                    MaxwellThreeDCounterStateWrite::ZPassPixelCountEnable { value, source },
-                );
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ZCullCriterion => {
-                let value = MaxwellThreeDZCullCriterion::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write =
-                    MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::Criterion {
-                        value,
-                        source,
-                    });
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ZCullEnable => {
-                let value = MaxwellThreeDZCullEnable::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::Enable {
-                    value,
+            three_d_operation(MaxwellThreeDOperationTrigger::DrawVertexArray {
+                source,
+                vertex_count: source.argument(),
+            })
+        }
+        MethodAction::DrawIndexBuffer => {
+            if source.argument() == 0 {
+                return Err(invalid_encoding(
                     source,
-                });
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::ZCullBounds => {
-                let value = MaxwellThreeDZCullBounds::parse(source.argument()).ok_or(
-                    MaxwellEngineDispatchError::InvalidMethodValue {
-                        source,
-                        metadata: declaration.metadata,
-                        defined_mask: declaration.defined_mask,
-                    },
-                )?;
-                let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::Bounds {
-                    value,
-                    source,
-                });
-                candidate.apply(write);
-                state_write()
-            }
-            MethodAction::DrawVertexArray => {
-                if source.argument() == 0 {
-                    return Err(invalid_encoding(
-                        source,
-                        "DRAW_VERTEX_ARRAY",
-                        "vertex count is zero",
-                    ));
-                }
-                three_d_operation(MaxwellThreeDOperationTrigger::DrawVertexArray {
-                    source,
-                    vertex_count: source.argument(),
-                })
-            }
-            MethodAction::DrawIndexBuffer => {
-                if source.argument() == 0 {
-                    return Err(invalid_encoding(
-                        source,
-                        "DRAW_INDEX_BUFFER",
-                        "index count is zero",
-                    ));
-                }
-                candidate.apply(MaxwellThreeDStateWrite::VertexInput(
-                    MaxwellThreeDVertexInputWrite::IndexCount {
-                        value: source.argument(),
-                        source,
-                    },
+                    "DRAW_INDEX_BUFFER",
+                    "index count is zero",
                 ));
-                state_operation(MaxwellThreeDOperationTrigger::DrawIndexBuffer {
-                    source,
-                    index_count: source.argument(),
-                })
             }
-            MethodAction::Missing(capability) => {
-                return Err(MaxwellEngineDispatchError::MissingCapability {
+            candidate.apply(
+                MaxwellThreeDStateWrite::VertexInput(MaxwellThreeDVertexInputWrite::IndexCount {
+                    value: source.argument(),
                     source,
-                    metadata: declaration.metadata,
-                    capability,
-                });
-            }
-        };
+                }),
+                changed,
+            );
+            state_operation(MaxwellThreeDOperationTrigger::DrawIndexBuffer {
+                source,
+                index_count: source.argument(),
+            })
+        }
+        MethodAction::Missing(capability) => {
+            return Err(MaxwellEngineDispatchError::MissingCapability {
+                source,
+                metadata: declaration.metadata,
+                capability,
+            });
+        }
+    };
     Ok(PreparedMethod::new(
         *declaration.metadata,
         operation,
         writes_state,
     ))
+}
+
+/// Pure field decoding is shared by local encoding admission and derived state.
+/// No state mirror, identity or provenance is propagated by validation alone.
+#[inline]
+fn decode_declared_state(
+    source: crate::MaxwellMethodSource,
+    declaration: &MethodDeclaration,
+) -> Result<Option<MaxwellThreeDStateWrite>, MaxwellEngineDispatchError> {
+    if source.argument() & !declaration.defined_mask != 0 {
+        return Err(MaxwellEngineDispatchError::InvalidMethodValue {
+            source,
+            metadata: declaration.metadata,
+            defined_mask: declaration.defined_mask,
+        });
+    }
+    match declaration.action {
+        MethodAction::NotifyAddress => Ok(None),
+        MethodAction::Delay => {
+            // Match the functional emulation contract of Eden and Ryujinx:
+            // retain the full register value for MME reads and shadow RAM,
+            // without a host sleep, GPU barrier, or pipeline-state change.
+            // Neither implementation models the hardware delay duration.
+            // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/engines/maxwell_3d.cpp#L301-L405
+            // https://git.axenov.dev/Museum/ryujinx/src/commit/ec3e848d7998038ce22c41acdbf81032bf47991f/Ryujinx.Graphics.Gpu/Engine/Threed/ThreedClassState.cs#L797
+            Ok(None)
+        }
+        MethodAction::VpcPerfKnob => {
+            // VPC work-distribution policy has four full-byte fields for
+            // culled small lines/triangles and nonculled lines/points/triangles.
+            // Preserve them for MME reads and replay; host work distribution
+            // is chosen by the host driver rather than Maxwell's VPC.
+            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1215-L1219
+            Ok(None)
+        }
+        MethodAction::InstrumentationHeader => {
+            let value = MaxwellThreeDInstrumentationValue::from_bits(source.argument());
+            let write = MaxwellThreeDStateWrite::Instrumentation(
+                MaxwellThreeDInstrumentationStateWrite::Header { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::InstrumentationData => {
+            let value = MaxwellThreeDInstrumentationValue::from_bits(source.argument());
+            let write = MaxwellThreeDStateWrite::Instrumentation(
+                MaxwellThreeDInstrumentationStateWrite::Data { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::IteratedBlend => {
+            let value = MaxwellThreeDIteratedBlend::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::FixedFunction(
+                MaxwellThreeDFixedFunctionWrite::IteratedBlend { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::IteratedBlendPassCount => {
+            let value = MaxwellThreeDIteratedBlendPassCount::new(source.argument() as u8);
+            let write = MaxwellThreeDStateWrite::FixedFunction(
+                MaxwellThreeDFixedFunctionWrite::IteratedBlendPassCount { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::SubtilingPerfKnobA => {
+            let value = MaxwellThreeDSubtilingPerfKnobA::parse(source.argument());
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobA { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::SubtilingPerfKnobB => {
+            let value = MaxwellThreeDSubtilingPerfKnobB::new(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobB { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::TiledCacheEnable => {
+            let value = source.argument() != 0;
+            let write =
+                MaxwellThreeDStateWrite::TiledCache(MaxwellThreeDTiledCacheStateWrite::Enable {
+                    value,
+                    source,
+                });
+
+            Ok(Some(write))
+        }
+        MethodAction::TiledCacheTileSize => {
+            let value = MaxwellThreeDTiledCacheTileSize::parse(source.argument());
+            let write =
+                MaxwellThreeDStateWrite::TiledCache(MaxwellThreeDTiledCacheStateWrite::TileSize {
+                    value,
+                    source,
+                });
+
+            Ok(Some(write))
+        }
+        MethodAction::TiledCacheUnknownConfig(index) => {
+            let value = MaxwellThreeDTiledCacheUnknownConfig::from_bits(source.argument());
+            let write = MaxwellThreeDStateWrite::TiledCache(
+                MaxwellThreeDTiledCacheStateWrite::UnknownConfig {
+                    index,
+                    value,
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ShaderWatermarks(target) => {
+            let value = MaxwellThreeDShaderWatermarkRange::parse(source.argument());
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::ShaderWatermarks {
+                    target,
+                    value,
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::L1Configuration => {
+            let value = MaxwellThreeDDirectlyAddressableMemory::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::L1Configuration { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ColorReductionThresholdsEnable => {
+            let value = MaxwellThreeDColorReductionThresholdsEnable::parse(source.argument())
+                .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                })?;
+            let write = MaxwellThreeDStateWrite::ColorReduction(
+                MaxwellThreeDColorReductionStateWrite::Enable { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ColorReductionThresholdsUnorm8 => {
+            let value = MaxwellThreeDColorReductionThresholdsUnorm8::parse(source.argument())
+                .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                })?;
+            let write = MaxwellThreeDStateWrite::ColorReduction(
+                MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm8 { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ColorReductionThresholdsUnorm10 => {
+            let value = MaxwellThreeDColorReductionThresholdsUnorm10::parse(source.argument())
+                .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                })?;
+            let write = MaxwellThreeDStateWrite::ColorReduction(
+                MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm10 { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ColorReductionThresholdsUnorm16 => {
+            let value = MaxwellThreeDColorReductionThresholdsUnorm16::parse(source.argument())
+                .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                })?;
+            let write = MaxwellThreeDStateWrite::ColorReduction(
+                MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm16 { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ColorReductionThresholdsFp16 => {
+            let value = MaxwellThreeDColorReductionThresholdsFp16::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ColorReduction(
+                MaxwellThreeDColorReductionStateWrite::ThresholdsFp16 { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ColorReductionThresholdsSrgb8 => {
+            let value = MaxwellThreeDColorReductionThresholdsSrgb8::parse(source.argument())
+                .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                })?;
+            let write = MaxwellThreeDStateWrite::ColorReduction(
+                MaxwellThreeDColorReductionStateWrite::ThresholdsSrgb8 { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ConstantColorRenderingEnable => {
+            let value = source.argument() != 0;
+            let write = MaxwellThreeDStateWrite::ConstantColorRendering(
+                MaxwellThreeDConstantColorRenderingStateWrite::Enable { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ConstantColorRenderingComponent(component) => {
+            let value = MaxwellThreeDConstantColorValue::from_bits(source.argument());
+            let write = MaxwellThreeDStateWrite::ConstantColorRendering(
+                MaxwellThreeDConstantColorRenderingStateWrite::Component {
+                    component,
+                    value,
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::OpportunisticEarlyZHysteresis => {
+            let raw = source.argument();
+            if raw > 19 && raw != 31 {
+                return Err(invalid_encoding(
+                    source,
+                    "SET_OPPORTUNISTIC_EARLY_Z_HYSTERESIS",
+                    "undefined primitive-area threshold",
+                ));
+            }
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::OpportunisticEarlyZHysteresis {
+                    value: raw as u8,
+                    source,
+                },
+            );
+            Ok(Some(write))
+        }
+        MethodAction::ApiMandatedEarlyZ => {
+            let value = MaxwellThreeDApiMandatedEarlyZ::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::ApiMandatedEarlyZ { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::PostPsInitialCoverage => {
+            let write = MaxwellThreeDStateWrite::Coverage(
+                MaxwellThreeDCoverageStateWrite::PostPsInitialCoverage {
+                    value: source.argument() != 0,
+                    source,
+                },
+            );
+            Ok(Some(write))
+        }
+        MethodAction::PostZPixelShaderImask => {
+            let value = MaxwellThreeDPostZPixelShaderImask::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::Coverage(
+                MaxwellThreeDCoverageStateWrite::PostZPixelShaderImask { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::PixelShaderInterlockControl => {
+            let value = MaxwellThreeDPixelShaderInterlockControl::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::PixelShaderInterlockControl {
+                    value,
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::AlphaFraction => {
+            let write = MaxwellThreeDStateWrite::AlphaFraction {
+                value: MaxwellThreeDAlphaFraction::new(source.argument() as u8),
+                source,
+            };
+
+            Ok(Some(write))
+        }
+        MethodAction::RasterBoundingBox => {
+            let write = MaxwellThreeDStateWrite::RasterBoundingBox {
+                value: MaxwellThreeDRasterBoundingBox::parse(source.argument()),
+                source,
+            };
+
+            Ok(Some(write))
+        }
+        MethodAction::VafL2CacheControl => {
+            let value = MaxwellThreeDVafL2CacheControl::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write =
+                MaxwellThreeDStateWrite::L2Cache(MaxwellThreeDL2CacheStateWrite::VafControl {
+                    value,
+                    source,
+                });
+
+            Ok(Some(write))
+        }
+        MethodAction::RopL2CacheControl(request) => {
+            let value = MaxwellThreeDL2CacheEvictionPolicy::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write =
+                MaxwellThreeDStateWrite::L2Cache(MaxwellThreeDL2CacheStateWrite::RopPolicy {
+                    request,
+                    value,
+                    source,
+                });
+
+            Ok(Some(write))
+        }
+        MethodAction::ReportSemaphoreAddressUpper => {
+            let write = MaxwellThreeDStateWrite::ReportSemaphore(
+                MaxwellThreeDReportSemaphoreStateWrite::AddressUpper {
+                    value: source.argument() as u8,
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ReportSemaphoreAddressLower => {
+            let write = MaxwellThreeDStateWrite::ReportSemaphore(
+                MaxwellThreeDReportSemaphoreStateWrite::AddressLower {
+                    value: source.argument(),
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ReportSemaphorePayload => {
+            let write = MaxwellThreeDStateWrite::ReportSemaphore(
+                MaxwellThreeDReportSemaphoreStateWrite::Payload {
+                    value: source.argument(),
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::PointSize => {
+            let write = MaxwellThreeDStateWrite::PointSize {
+                value: MaxwellThreeDPointSize::from_bits(source.argument()),
+                source,
+            };
+
+            Ok(Some(write))
+        }
+        MethodAction::PointSpriteSelect => {
+            let value = MaxwellThreeDPointSpriteSelect::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::PointSpriteSelect { value, source };
+
+            Ok(Some(write))
+        }
+        MethodAction::PointCenterMode => {
+            let value = MaxwellThreeDPointCenterMode::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::PointCenterMode { value, source };
+
+            Ok(Some(write))
+        }
+        MethodAction::EdgeFlag => {
+            let value = MaxwellThreeDEdgeFlag::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::EdgeFlag { value, source };
+
+            Ok(Some(write))
+        }
+        MethodAction::ViewportZClip => {
+            let value = MaxwellThreeDViewportZClipRange::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ViewportZClip { value, source };
+
+            Ok(Some(write))
+        }
+        MethodAction::RenderEnableOverride => {
+            let value = MaxwellThreeDRenderEnableOverride::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::RenderEnable(
+                MaxwellThreeDRenderEnableStateWrite::Override { value, source },
+            );
+            Ok(Some(write))
+        }
+        MethodAction::RenderEnableMode => {
+            let value = MaxwellThreeDRenderEnableMode::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write =
+                MaxwellThreeDStateWrite::RenderEnable(MaxwellThreeDRenderEnableStateWrite::Mode {
+                    value,
+                    source,
+                });
+
+            Ok(Some(write))
+        }
+        MethodAction::PsOutputSampleMaskUsage => {
+            let value = MaxwellThreeDPsOutputSampleMaskUsage::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::Coverage(
+                MaxwellThreeDCoverageStateWrite::PsOutputSampleMaskUsage { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::HybridAntiAliasControl => {
+            let value = MaxwellThreeDHybridAntiAliasControl::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::Coverage(
+                MaxwellThreeDCoverageStateWrite::HybridAntiAliasControl { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::TirMode => {
+            let value = MaxwellThreeDTirMode::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write =
+                MaxwellThreeDStateWrite::Coverage(MaxwellThreeDCoverageStateWrite::TirMode {
+                    value,
+                    source,
+                });
+
+            Ok(Some(write))
+        }
+        MethodAction::TirControl => {
+            let value = MaxwellThreeDTirControl::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write =
+                MaxwellThreeDStateWrite::Coverage(MaxwellThreeDCoverageStateWrite::TirControl {
+                    value,
+                    source,
+                });
+
+            Ok(Some(write))
+        }
+        MethodAction::TirModulation => {
+            let value = MaxwellThreeDTirModulationComponentSelect::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write =
+                MaxwellThreeDStateWrite::Coverage(MaxwellThreeDCoverageStateWrite::TirModulation {
+                    value,
+                    source,
+                });
+
+            Ok(Some(write))
+        }
+        MethodAction::TirModulationFunction => {
+            let value = MaxwellThreeDTirModulationFunction::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::Coverage(
+                MaxwellThreeDCoverageStateWrite::TirModulationFunction { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::CoverageToColor => {
+            let value = MaxwellThreeDCoverageToColor::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::Coverage(
+                MaxwellThreeDCoverageStateWrite::CoverageToColor { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::AlphaToCoverageOverride => {
+            let value = MaxwellThreeDAlphaToCoverageOverride::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::Coverage(
+                MaxwellThreeDCoverageStateWrite::AlphaToCoverageOverride { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::AlphaToCoverageDither => {
+            let value = MaxwellThreeDAlphaToCoverageDither::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::Coverage(
+                MaxwellThreeDCoverageStateWrite::AlphaToCoverageDither { value, source },
+            );
+            Ok(Some(write))
+        }
+        MethodAction::SampleLocations(group) => {
+            let value = MaxwellThreeDSampleLocationGroup::parse(source.argument());
+            let write = MaxwellThreeDStateWrite::Coverage(
+                MaxwellThreeDCoverageStateWrite::SampleLocations {
+                    group,
+                    value,
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::RenderEnableControl => {
+            let value = MaxwellThreeDConditionalLoadConstantBuffer::parse(source.argument())
+                .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                })?;
+            let write = MaxwellThreeDStateWrite::RenderEnable(
+                MaxwellThreeDRenderEnableStateWrite::ConditionalLoadConstantBuffer {
+                    value,
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::VisibleCallLimit => {
+            let value = MaxwellThreeDVisibleCallLimit::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::VisibleCallLimit { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::SmTimeoutCounterBit => {
+            let value = MaxwellThreeDSmTimeoutCounterBit::new(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::SmTimeoutCounterBit { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ShaderExceptionsEnable => {
+            let value = MaxwellThreeDShaderExceptionsEnable::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::ShaderExceptionsEnable { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ShaderLocalMemoryWindowBaseAddress => {
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryWindowBaseAddress {
+                    value: source.argument(),
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ShaderLocalMemoryAddressUpper => {
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryAddressUpper {
+                    value: source.argument() as u8,
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ShaderLocalMemoryAddressLower => {
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryAddressLower {
+                    value: source.argument(),
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ShaderLocalMemorySizeUpper => {
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemorySizeUpper {
+                    value: source.argument() as u8,
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ShaderLocalMemorySizeLower => {
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemorySizeLower {
+                    value: source.argument(),
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ShaderLocalMemoryDefaultSizePerWarp => {
+            let value = MaxwellThreeDShaderLocalMemoryPerWarpSize::new(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryDefaultSizePerWarp {
+                    value,
+                    source,
+                },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::CsaaEnable => {
+            let value = MaxwellThreeDCsaaEnable::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write =
+                MaxwellThreeDStateWrite::Coverage(MaxwellThreeDCoverageStateWrite::CsaaEnable {
+                    value,
+                    source,
+                });
+
+            Ok(Some(write))
+        }
+        MethodAction::AliasedLineWidthEnable => {
+            let value = MaxwellThreeDAliasedLineWidthEnable::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::Line(
+                MaxwellThreeDLineStateWrite::AliasedLineWidthEnable { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ActiveZCullRegion => {
+            let value = MaxwellThreeDZCullRegionId::new(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write =
+                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::ActiveRegion {
+                    value,
+                    source,
+                });
+
+            Ok(Some(write))
+        }
+        MethodAction::ZCullReportSelection => {
+            let write =
+                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::ReportSelection {
+                    value: source.argument(),
+                    source,
+                });
+            Ok(Some(write))
+        }
+        MethodAction::ZCullReportType => {
+            if source.argument() >> 4 > 3 {
+                return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                    source,
+                    method_name: "SET_ZCULL_SUBREGION_REPORT_TYPE",
+                    reason: "reserved Z-cull report type",
+                });
+            }
+            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::ReportType {
+                value: source.argument(),
+                source,
+            });
+            Ok(Some(write))
+        }
+        MethodAction::ZCullSubregionAllocation => {
+            let value = MaxwellThreeDZCullSubregionAllocation::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodEncoding {
+                    source,
+                    method_name: "SET_ZCULL_SUBREGION_ALLOCATION",
+                    reason: "reserved Z-cull allocation format",
+                },
+            )?;
+            let write =
+                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::SubregionAllocation {
+                    value,
+                    source,
+                });
+            Ok(Some(write))
+        }
+        MethodAction::ZCullSubregionAlgorithm => {
+            let value = match source.argument() {
+                0 => MaxwellThreeDZCullSubregionAlgorithm::Static,
+                1 => MaxwellThreeDZCullSubregionAlgorithm::Adaptive,
+                _ => {
+                    return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                        source,
+                        method_name: "ASSIGN_ZCULL_SUBREGIONS",
+                        reason: "reserved Z-cull assignment algorithm",
+                    });
+                }
+            };
+            let write =
+                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::SubregionAlgorithm {
+                    value,
+                    source,
+                });
+            Ok(Some(write))
+        }
+        MethodAction::ZCullStorage(index) => {
+            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::Storage {
+                index,
+                value: source.argument(),
+                source,
+            });
+            Ok(Some(write))
+        }
+        MethodAction::ZCullRegionLocation => {
+            let write =
+                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::RegionLocation {
+                    value: MaxwellThreeDZCullRegionLocation::parse(source.argument()),
+                    source,
+                });
+            Ok(Some(write))
+        }
+        MethodAction::ZCullRegionAliquots => {
+            let write =
+                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::RegionAliquots {
+                    value: source.argument() as u16,
+                    source,
+                });
+            Ok(Some(write))
+        }
+        MethodAction::ZCullRegionSize(axis) => {
+            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::RegionSize {
+                axis,
+                value: source.argument() as u16,
+                source,
+            });
+            Ok(Some(write))
+        }
+        MethodAction::ZCullRegionPixelOffset(axis) => {
+            let write =
+                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::RegionPixelOffset {
+                    axis,
+                    value: source.argument() as u16,
+                    source,
+                });
+            Ok(Some(write))
+        }
+        MethodAction::ZCullRegionFormat => {
+            let value = MaxwellThreeDZCullRegionFormat::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodEncoding {
+                    source,
+                    method_name: "SET_ZCULL_REGION_FORMAT",
+                    reason: "reserved Z-cull region format",
+                },
+            )?;
+            let write =
+                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::RegionFormat {
+                    value,
+                    source,
+                });
+            Ok(Some(write))
+        }
+        MethodAction::ZCullSubregion => {
+            let value = MaxwellThreeDZCullSubregion::parse(source.argument())
+                .expect("validated Z-cull subregion mask");
+            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::Subregion {
+                value,
+                source,
+            });
+            Ok(Some(write))
+        }
+        MethodAction::ZCullDirectionFormat => {
+            let value = MaxwellThreeDZCullDirectionFormat::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodEncoding {
+                    source,
+                    method_name: "SET_ZCULL_DIR_FORMAT",
+                    reason: "reserved Z-cull direction or depth format",
+                },
+            )?;
+            let write =
+                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::DirectionFormat {
+                    value,
+                    source,
+                });
+            Ok(Some(write))
+        }
+        MethodAction::ZCullStatsEnable => {
+            let value = MaxwellThreeDZCullStatsEnable::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::StatsEnable {
+                value,
+                source,
+            });
+
+            Ok(Some(write))
+        }
+        MethodAction::StreamOutputEnable => {
+            let write = MaxwellThreeDStateWrite::ShaderExecution(
+                MaxwellThreeDShaderExecutionStateWrite::StreamOutputEnable {
+                    value: source.argument() != 0,
+                    source,
+                },
+            );
+            Ok(Some(write))
+        }
+        MethodAction::StatisticsCounterEnable => {
+            let write = MaxwellThreeDStateWrite::Counter(
+                MaxwellThreeDCounterStateWrite::StatisticsEnable {
+                    value: source.argument(),
+                    source,
+                },
+            );
+            Ok(Some(write))
+        }
+        MethodAction::ZPassPixelCountEnable => {
+            let value = MaxwellThreeDZPassPixelCountEnable::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::Counter(
+                MaxwellThreeDCounterStateWrite::ZPassPixelCountEnable { value, source },
+            );
+
+            Ok(Some(write))
+        }
+        MethodAction::ZCullCriterion => {
+            let value = MaxwellThreeDZCullCriterion::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::Criterion {
+                value,
+                source,
+            });
+
+            Ok(Some(write))
+        }
+        MethodAction::ZCullEnable => {
+            let value = MaxwellThreeDZCullEnable::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::Enable {
+                value,
+                source,
+            });
+
+            Ok(Some(write))
+        }
+        MethodAction::ZCullBounds => {
+            let value = MaxwellThreeDZCullBounds::parse(source.argument()).ok_or(
+                MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                },
+            )?;
+            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::Bounds {
+                value,
+                source,
+            });
+
+            Ok(Some(write))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn preflight_mme_state(

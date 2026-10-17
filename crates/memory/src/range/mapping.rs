@@ -217,9 +217,10 @@ impl ByteMapping {
     /// Read dense tiled snapshots in physical tile order. Expanding an image
     /// into retained 16-byte segments adds allocation/reference-count work for
     /// every fragment; each tile needs only one source read and bounded scratch.
-    pub(super) fn read_tiled_quiescent(
+    pub(super) fn read_tiled_with(
         &self,
         output: &mut [u8],
+        read: &mut CanonicalPageReader<'_>,
     ) -> Result<bool, CanonicalRangeAccessError> {
         let Self::Rect { source, layout } = self else {
             return Ok(false);
@@ -250,9 +251,10 @@ impl ByteMapping {
             for tile_x in 0..columns {
                 let x = tile_x * tile_width;
                 let length = tile_width.min(width - x);
-                source.read_quiescent(
+                source.read_with(
                     layout.base + (tile_y * columns + tile_x) * tile_size as u64,
                     &mut bytes,
+                    read,
                 )?;
                 for row in 0..height {
                     let mut column = 0;
@@ -659,10 +661,16 @@ impl CanonicalBackingRange {
                 }),
             ) => x == y && a.same_byte_mapping(b),
             (None, None) => {
-                self.segments().len() == other.segments().len()
-                    && self.segments().iter().zip(other.segments()).all(|(a, b)| {
-                        a.page() == b.page() && a.offset() == b.offset() && a.size() == b.size()
-                    })
+                // Separately captured flat ranges commonly retain the same
+                // lossless runs. Reuse that exact proof instead of comparing
+                // every page on each resource-cache hit. Capture differences
+                // still fall through: physical identity ignores permissions
+                // and mapping generations, unlike segment-run equality.
+                self.layout.segment_runs() == other.layout.segment_runs()
+                    || self.segments().len() == other.segments().len()
+                        && self.segments().iter().zip(other.segments()).all(|(a, b)| {
+                            a.page() == b.page() && a.offset() == b.offset() && a.size() == b.size()
+                        })
             }
             _ => false,
         }

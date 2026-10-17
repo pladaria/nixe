@@ -32,6 +32,19 @@ pub enum Counter {
     BackingPeakStoreOffset,
     BackingReservedBytes,
     BackingMappedBytes,
+    CpuStoreVisibilityDemands,
+    CpuStoreDeclaredOverwriteBytes,
+    CpuStoreVisibilityPageBytes,
+    DeviceBaselineCacheHits,
+    DeviceBaselineCopiedBytes,
+    RegionObservedPages,
+    RegionRawReadPages,
+    RegionSnapshotPages,
+    RegionStagingPages,
+    RegionBatchWritePages,
+    RegionHostWritePages,
+    RegionAllocationReadPages,
+
     // Sampled at direct write-fault resolver entry; another worker may
     // already have repaired a captured native fault.
     WriteFaultCleanUnobserved,
@@ -49,8 +62,10 @@ pub enum Counter {
 }
 
 #[cfg(feature = "performance-counters")]
-static COUNTERS: [std::sync::atomic::AtomicU64; 40] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 40];
+static COUNTERS: [std::sync::atomic::AtomicU64; COUNTER_COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; COUNTER_COUNT];
+#[cfg(feature = "performance-counters")]
+const COUNTER_COUNT: usize = Counter::DirectAliasRegistrations as usize + 1;
 
 #[inline]
 pub fn record(counter: Counter, amount: u64) {
@@ -60,10 +75,22 @@ pub fn record(counter: Counter, amount: u64) {
     let _ = (counter, amount);
 }
 
+/// Checked CPU store demands before page reconciliation. These describe the
+/// requested overwrite and page-preservation volume, not completed downloads.
+#[inline]
+pub fn cpu_store_visibility_demand(page_bytes: usize, overwritten_bytes: usize) {
+    record(Counter::CpuStoreVisibilityDemands, 1);
+    record(
+        Counter::CpuStoreDeclaredOverwriteBytes,
+        overwritten_bytes as u64,
+    );
+    record(Counter::CpuStoreVisibilityPageBytes, page_bytes as u64);
+}
+
 #[cfg(feature = "performance-counters")]
 #[must_use]
 pub fn snapshot() -> Vec<(&'static str, u64)> {
-    const NAMES: &[&str] = &[
+    const NAMES: &[&str; COUNTER_COUNT] = &[
         "RangeChecks",
         "CpuDependencyChecks",
         "PageVisibilityChecks",
@@ -93,6 +120,18 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         "BackingPeakStoreOffset",
         "BackingReservedBytes",
         "BackingMappedBytes",
+        "CpuStoreVisibilityDemands",
+        "CpuStoreDeclaredOverwriteBytes",
+        "CpuStoreVisibilityPageBytes",
+        "DeviceBaselineCacheHits",
+        "DeviceBaselineCopiedBytes",
+        "RegionObservedPages",
+        "RegionRawReadPages",
+        "RegionSnapshotPages",
+        "RegionStagingPages",
+        "RegionBatchWritePages",
+        "RegionHostWritePages",
+        "RegionAllocationReadPages",
         "WriteFaultCleanUnobserved",
         "WriteFaultCleanObserved",
         "WriteFaultCpuUnobserved",

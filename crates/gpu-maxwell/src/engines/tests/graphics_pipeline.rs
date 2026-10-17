@@ -850,7 +850,7 @@ fn check_compressed_color_materialization(format: u32, kind: u8, zbc_mask: Optio
     let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(MaterializationWriteback);
     nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
         [(&backing, declaration)],
-        Arc::clone(&coordinator),
+        coordinator.as_ref(),
     )
     .unwrap();
     nixe_memory::CanonicalBackingRange::publish_device_writes(

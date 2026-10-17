@@ -49,6 +49,10 @@ struct A64JitState {
     // Exclusive state
     static constexpr u64 RESERVATION_GRANULE_MASK = 0xFFFF'FFFF'FFFF'FFF0ull;
     u8 exclusive_state = 0;
+    u8 physical_exclusive_size = 0;
+    u64 physical_exclusive_address = 0;
+    u64 physical_exclusive_version = 0;
+    u64 physical_exclusive_identity = 0;
 
     static constexpr size_t RSBSize = 8;  // MUST be a power of 2.
     static constexpr size_t RSBPtrMask = RSBSize - 1;

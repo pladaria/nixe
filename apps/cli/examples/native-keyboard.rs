@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         nixe_gpu_vulkan::cache::CacheConfiguration::default(),
         128 * 1024 * 1024,
     )?;
-    renderer.attach_presentation(client)?;
+    renderer.attach_presentation(client, true)?;
     let frontend = nixe_gpu_maxwell::MaxwellNativeFrontend::new(renderer.shader_translation_pool());
     let video =
         nixe_horizon::VideoSystem::with_gpu_frontend(Some(window.mailbox()), renderer, frontend);

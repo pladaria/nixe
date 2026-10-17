@@ -4,6 +4,10 @@
 //! canonical storage and neutral resource views retain their own identities.
 //! No host layout, swizzle operation, or backend object crosses this boundary.
 
+#[cfg(test)]
+mod benchmark;
+mod descriptor;
+
 use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
@@ -931,65 +935,15 @@ struct ResourceBuilder<'a> {
 
 #[derive(Debug)]
 struct MaxwellThreeDDescriptorRead {
-    range: CanonicalBackingRange,
-    bytes: [u8; 32],
-    size: u8,
-    cpu_writes: CanonicalCpuWriteDependency,
+    snapshot: Arc<descriptor::Snapshot>,
     pointer_source: Option<MaxwellResolvedRange>,
-    overlay_changed: bool,
 }
-
 impl MaxwellThreeDDescriptorRead {
-    fn capture(
-        range: CanonicalBackingRange,
-        bytes: [u8; 32],
-        size: u8,
-        cpu_writes: CanonicalCpuWriteDependency,
-        staged_writes: Option<&CanonicalWriteBatch>,
-        pointer_source: Option<MaxwellResolvedRange>,
-    ) -> Result<Self, MaxwellThreeDResourceError> {
-        let mut overlay_changed = false;
-        if let Some(writes) = staged_writes
-            && writes
-                .overlaps(&range, 0, u64::from(size))
-                .map_err(MaxwellThreeDResourceError::StagedCanonicalAccess)?
-        {
-            let mut original = [0; 32];
-            read_backing_bytes(&range, 0, &mut original[..usize::from(size)], None)?;
-            overlay_changed = original[..usize::from(size)] != bytes[..usize::from(size)];
-        }
-        Ok(Self {
-            range,
-            bytes,
-            size,
-            cpu_writes,
-            pointer_source,
-            overlay_changed,
-        })
-    }
-
     fn remains_current(
         &self,
-        staged_writes: Option<&CanonicalWriteBatch>,
+        writes: Option<&CanonicalWriteBatch>,
     ) -> Result<bool, MaxwellThreeDResourceError> {
-        if !self.cpu_writes.remains_current() {
-            return Ok(false);
-        }
-        let Some(staged_writes) = staged_writes else {
-            return Ok(!self.overlay_changed);
-        };
-        let size = u64::from(self.size);
-        if !staged_writes
-            .overlaps(&self.range, 0, size)
-            .map_err(MaxwellThreeDResourceError::StagedCanonicalAccess)?
-        {
-            return Ok(!self.overlay_changed);
-        }
-        let mut bytes = [0; 32];
-        staged_writes
-            .read_overlay(&self.range, 0, &mut bytes[..usize::from(self.size)])
-            .map_err(MaxwellThreeDResourceError::StagedCanonicalAccess)?;
-        Ok(bytes[..usize::from(self.size)] == self.bytes[..usize::from(self.size)])
+        self.snapshot.remains_current(writes)
     }
 }
 
@@ -1585,7 +1539,7 @@ struct CanonicalResourceSpan<'a> {
     resource: u16,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct RetainedBackingKey {
     address_space: crate::MaxwellAddressSpaceId,
     offset: GpuVirtualAddress,
@@ -1606,6 +1560,7 @@ impl From<&MaxwellResolvedRange> for RetainedBackingKey {
 
 #[derive(Debug)]
 struct RetainedBackingCacheEntry {
+    mapping_generation: Cell<Option<nixe_memory::MappingGeneration>>,
     source: MaxwellResolvedRange,
     retained: RetainedResourceBacking,
 }
@@ -1648,16 +1603,71 @@ struct CachedResolvedView {
 
 /// Owner-local mapping topology and resource-view cache. Descriptor bytes are
 /// still read in submission order; views are keyed by their actual descriptions.
-#[derive(Debug, Default)]
 pub(crate) struct MaxwellThreeDRetainedBackingCache {
-    entries: BTreeMap<RetainedBackingKey, Arc<RetainedBackingCacheEntry>>,
+    entries: nixe_gpu::WorkingSet<RetainedBackingKey, RetainedBackingCacheEntry>,
     views: HashMap<ResolvedViewKey, usize>,
     view_entries: Vec<CachedResolvedView>,
     view_limit: usize,
     view_clock: usize,
+    descriptors: descriptor::Cache,
+}
+
+impl Default for MaxwellThreeDRetainedBackingCache {
+    fn default() -> Self {
+        Self {
+            entries: nixe_gpu::WorkingSet::new(4096, 64 * 1024 * 1024),
+            views: HashMap::default(),
+            view_entries: Vec::new(),
+            view_limit: 0,
+            view_clock: 0,
+            descriptors: descriptor::Cache::default(),
+        }
+    }
+}
+impl std::fmt::Debug for MaxwellThreeDRetainedBackingCache {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedBackingCache")
+            .field("mappings", &self.entries.usage())
+            .field("views", &self.view_entries.len())
+            .field("descriptors", &self.descriptors)
+            .finish()
+    }
 }
 
 impl MaxwellThreeDRetainedBackingCache {
+    fn resolve_cached(
+        &mut self,
+        space: &MaxwellGpuAddressSpace,
+        address: GpuVirtualAddress,
+        size: u64,
+        permissions: MemoryPermissions,
+    ) -> Option<MaxwellResolvedRange> {
+        // Physical content changes do not invalidate translation. A changed VM
+        // generation checks only the retained mapping leases; ordinary hits
+        // need neither a VM traversal nor a page/alias scan.
+        // https://github.com/yangjieshao/Ryujinx/blob/2505a1abcd5f31e4364bfb7f9313546f1840e5e1/src/Ryujinx.Graphics.Gpu/Memory/BufferCache.cs
+        let key = RetainedBackingKey {
+            address_space: space.id(),
+            offset: address,
+            size,
+            permissions: permissions.bits(),
+        };
+        let entry = self.entries.get(&key)?;
+        let generation = space.mapping_generation();
+        if entry.mapping_generation.get() != Some(generation) {
+            if entry
+                .source
+                .segments()
+                .iter()
+                .any(|s| !space.retained_mapping_is_current(s.mapping()))
+            {
+                return None;
+            }
+            entry.mapping_generation.set(Some(generation));
+        }
+        Some(entry.source.clone())
+    }
+
     fn view(
         &mut self,
         key: &ResolvedViewKey,
@@ -1758,12 +1768,18 @@ impl MaxwellThreeDRetainedBackingCache {
             return Ok(entry.retained.clone());
         }
         let retained = retained_backing(source, role)?;
+        let bytes = std::mem::size_of::<RetainedBackingCacheEntry>()
+            + std::mem::size_of_val(source.segments())
+            + retained.backing.range().metadata_bytes()
+            + std::mem::size_of_val(retained.mappings.as_ref());
         self.entries.insert(
             key,
-            Arc::new(RetainedBackingCacheEntry {
+            RetainedBackingCacheEntry {
+                mapping_generation: Cell::new(None),
                 source: source.clone(),
                 retained: retained.clone(),
-            }),
+            },
+            bytes,
         );
         Ok(retained)
     }
@@ -1792,6 +1808,33 @@ struct MaxwellImageDescriptionRequest {
 }
 
 impl<'a> ResourceBuilder<'a> {
+    fn descriptor_read(
+        &mut self,
+        parent: &CanonicalBackingRange,
+        offset: u64,
+        size: u8,
+        pointer_source: Option<MaxwellResolvedRange>,
+    ) -> Result<[u8; 32], MaxwellThreeDResourceError> {
+        let snapshot = if let Some(cache) = self.retained_backings.as_deref_mut() {
+            cache
+                .descriptors
+                .read(parent, offset, size, self.staged_writes)?
+        } else {
+            Arc::new(descriptor::Snapshot::read(
+                parent,
+                offset,
+                size,
+                self.staged_writes,
+            )?)
+        };
+        let bytes = snapshot.bytes;
+        self.descriptor_reads.push(MaxwellThreeDDescriptorRead {
+            snapshot,
+            pointer_source,
+        });
+        Ok(bytes)
+    }
+
     fn reuse_view(&mut self, key: &ResolvedViewKey) -> Result<bool, MaxwellThreeDResourceError> {
         let Some(cache) = self.retained_backings.as_deref_mut() else {
             return Ok(false);
@@ -2002,15 +2045,11 @@ impl<'a> ResourceBuilder<'a> {
             role,
         )?;
         let retained = self.retained_backing(&source, role)?;
-        let range = retained.backing.range().clone();
-        let cpu_writes = CanonicalCpuWriteDependency::capture(&range)
-            .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
-        let mut bytes = [0; 32];
-        read_backing_bytes(
-            &range,
+        let bytes = self.descriptor_read(
+            retained.backing.range(),
             0,
-            &mut bytes[..descriptor_size as usize],
-            self.staged_writes,
+            descriptor_size as u8,
+            Some(source),
         )?;
         let target = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let target_size = match size {
@@ -2032,15 +2071,6 @@ impl<'a> ResourceBuilder<'a> {
                 address: target,
             });
         }
-        self.descriptor_reads
-            .push(MaxwellThreeDDescriptorRead::capture(
-                range,
-                bytes,
-                descriptor_size as u8,
-                cpu_writes,
-                self.staged_writes,
-                Some(source),
-            )?);
         self.buffer(
             role,
             MaxwellThreeDUnresolvedAddress::new((target >> 32) as u8, target as u32),
@@ -2095,27 +2125,8 @@ impl<'a> ResourceBuilder<'a> {
         {
             return Err(MaxwellThreeDResourceError::DescriptorIndexOutOfRange { role, index });
         }
-        let range = buffer
-            .view()
-            .backing()
-            .range()
-            .snapshot_subrange(offset, MAXWELL_DESCRIPTOR_SIZE)
-            .map_err(MaxwellThreeDResourceError::Canonical)?;
-        // Arm before reading: a CPU write between the read and arming must not
-        // become the clean baseline for already-stale descriptor bytes.
-        let cpu_writes = CanonicalCpuWriteDependency::capture(&range)
-            .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
-        let bytes = read_descriptor_bytes(&range, 0, self.staged_writes)?;
-        self.descriptor_reads
-            .push(MaxwellThreeDDescriptorRead::capture(
-                range,
-                bytes,
-                MAXWELL_DESCRIPTOR_SIZE as u8,
-                cpu_writes,
-                self.staged_writes,
-                None,
-            )?);
-        Ok(bytes)
+        let parent = buffer.view().backing().range().clone();
+        self.descriptor_read(&parent, offset, MAXWELL_DESCRIPTOR_SIZE as u8, None)
     }
 
     fn sampled_texture(
@@ -2194,28 +2205,10 @@ impl<'a> ResourceBuilder<'a> {
                 constant_buffer_size: buffer.description().size(),
             });
         }
-        let range = buffer
-            .view()
-            .backing()
-            .range()
-            .snapshot_subrange(u64::from(texture_reference.byte_offset), 4)
-            .map_err(MaxwellThreeDResourceError::Canonical)?;
-        let cpu_writes = CanonicalCpuWriteDependency::capture(&range)
-            .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
-        let mut bytes = [0_u8; 4];
-        read_backing_bytes(&range, 0, &mut bytes, self.staged_writes)?;
-        let mut expected = [0; 32];
-        expected[..4].copy_from_slice(&bytes);
-        self.descriptor_reads
-            .push(MaxwellThreeDDescriptorRead::capture(
-                range,
-                expected,
-                4,
-                cpu_writes,
-                self.staged_writes,
-                None,
-            )?);
-        Ok(u32::from_le_bytes(bytes))
+        let parent = buffer.view().backing().range().clone();
+        let bytes =
+            self.descriptor_read(&parent, u64::from(texture_reference.byte_offset), 4, None)?;
+        Ok(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
     }
 
     fn sampled_image(
@@ -3032,7 +3025,7 @@ impl<'a> ResourceBuilder<'a> {
     }
 
     fn resolve(
-        &self,
+        &mut self,
         address: MaxwellThreeDUnresolvedAddress,
         size: u64,
         permissions: MemoryPermissions,
@@ -3050,6 +3043,12 @@ impl<'a> ResourceBuilder<'a> {
                 address: address.get(),
             }
         })?;
+        if let Some(cache) = self.retained_backings.as_deref_mut()
+            && let Some(source) =
+                cache.resolve_cached(self.address_space, address, size, permissions)
+        {
+            return Ok(source);
+        }
         self.address_space
             .resolve_range(address, size, permissions)
             .map_err(|error| MaxwellThreeDResourceError::Resolution { role, error })
@@ -3492,6 +3491,7 @@ fn image_description(
     .map_err(|_| MaxwellThreeDResourceError::ContradictoryState { role: request.role })
 }
 
+#[cfg(test)]
 fn read_descriptor_bytes(
     range: &CanonicalBackingRange,
     offset: u64,
@@ -5408,6 +5408,113 @@ mod tests {
                 )
             )
         ));
+    }
+
+    #[test]
+    fn retained_translation_cache_is_bounded_and_rejects_unmapped_generations() {
+        use crate::engines::tests::register_benchmark::ALLOCATIONS;
+        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        let mut space =
+            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+        space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let mapping = space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(1),
+                backing: allocation
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap(),
+                backing_offset: 0,
+                size: 4096,
+                allocation_alignment: 4096,
+                page_size: 0,
+                kind: 0,
+                cacheable: true,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        let address = mapping.offset();
+        let permissions = MemoryPermissions::READ;
+        let source = space.resolve_range(address, 32, permissions).unwrap();
+        let mut cache = MaxwellThreeDRetainedBackingCache {
+            entries: nixe_gpu::WorkingSet::new(2, 64 * 1024),
+            ..Default::default()
+        };
+        let retained = cache
+            .retain(&source, MaxwellThreeDResourceRole::TextureHeaders)
+            .unwrap();
+        assert!(
+            cache
+                .resolve_cached(&space, address, 32, permissions)
+                .is_some()
+        );
+        ALLOCATIONS.with(|n| n.set(Some(0)));
+        for _ in 0..1000 {
+            std::hint::black_box(
+                cache
+                    .resolve_cached(&space, address, 32, permissions)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(ALLOCATIONS.with(|n| n.replace(None).unwrap()), 0);
+        allocation.write(0, &[7]).unwrap();
+        assert!(
+            cache
+                .resolve_cached(&space, address, 32, permissions)
+                .is_some()
+        );
+        space.unmap(address).unwrap();
+        assert!(
+            cache
+                .resolve_cached(&space, address, 32, permissions)
+                .is_none()
+        );
+        assert!(space.resolve_range(address, 32, permissions).is_err());
+        let replacement = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(2),
+                backing: replacement
+                    .backing_range(MemoryPermissions::READ_WRITE)
+                    .unwrap(),
+                backing_offset: 0,
+                size: 4096,
+                allocation_alignment: 4096,
+                page_size: 0,
+                kind: 0,
+                cacheable: true,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        assert!(
+            cache
+                .resolve_cached(&space, address, 32, permissions)
+                .is_none()
+        );
+        for offset in [0, 64, 128] {
+            let source = space
+                .resolve_range(
+                    space.address(address.get() + offset).unwrap(),
+                    32,
+                    permissions,
+                )
+                .unwrap();
+            cache
+                .retain(&source, MaxwellThreeDResourceRole::TextureHeaders)
+                .unwrap();
+        }
+        assert_eq!(cache.entries.usage().0, 2);
+        assert!(
+            cache
+                .resolve_cached(&space, address, 32, permissions)
+                .is_none()
+        );
+        let mut old = [0; 1];
+        retained.backing.range().read(0, &mut old).unwrap();
+        assert_eq!(old, [7]);
     }
 
     #[test]

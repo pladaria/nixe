@@ -23,10 +23,14 @@ pub(crate) struct Host {
     pending_surface: Option<wsi::Acquired>,
 }
 impl Host {
-    pub fn new(device: &VulkanDevice, client: PresentationClient) -> Result<Self, VulkanError> {
+    pub fn new(
+        device: &VulkanDevice,
+        client: PresentationClient,
+        vsync: bool,
+    ) -> Result<Self, VulkanError> {
         Ok(Self {
             client: client.clone(),
-            chains: Presenter::new(device, client.clone())?,
+            chains: Presenter::new(device, client.clone(), vsync)?,
             renderer: ScreenRenderer::new(device)?,
             source: None,
             ui: None,

@@ -258,6 +258,11 @@ mod tests {
                 .cache_cpu_page(
                     DeviceVisibilityRequest {
                         page: segment.page(),
+                        cpu_revision: range
+                            .pages()
+                            .find(|p| p.identity() == segment.page())
+                            .unwrap()
+                            .cpu_content_revision(),
                         size: 4096,
                         device: coordinator.device(),
                         visible_at: point,
@@ -314,6 +319,7 @@ mod tests {
         coordinator
             .cache_cpu_page(
                 DeviceVisibilityRequest {
+                    cpu_revision: range.pages().next().unwrap().cpu_content_revision(),
                     page,
                     size: request.size,
                     device: request.device,

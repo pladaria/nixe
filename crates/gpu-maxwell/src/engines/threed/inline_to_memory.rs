@@ -529,3 +529,10 @@ fn invalid(
         reason,
     }
 }
+
+impl MaxwellThreeDInlineToMemoryState {
+    pub(super) fn pending_words(&self) -> usize {
+        self.pending
+            .map_or(0, |p| ((p.byte_length - p.next_offset) / 4) as usize)
+    }
+}

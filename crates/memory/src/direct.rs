@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fmt::{Display, Formatter};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use crate::host_mapped::{HostMappedBacking, host_atomic_128_supported};
@@ -140,6 +140,9 @@ fn validate_host_limits(
 pub struct DirectAddressSpaceView {
     pub base: usize,
     pub address_space_size: usize,
+    /// Sparse JIT table: 0 is exceptional/unmapped, 1 is unmonitored RAM,
+    /// otherwise an aligned retained physical reservation-page pointer.
+    pub exclusive_page_table: usize,
 }
 
 impl DirectAddressSpaceView {
@@ -174,6 +177,7 @@ struct DirectMappedPage {
     // OS aliases are consumers too: release only after replacing their mapping.
     backing: HostMappedBacking,
     protection: DirectProtection,
+    reservations: Option<Arc<crate::reservation::ReservationPage>>,
 }
 
 struct DirectArenaState {
@@ -186,6 +190,9 @@ struct DirectArenaInner {
     reservation_size: usize,
     base: NonNull<u8>,
     address_space_size: usize,
+    exclusive_page_table: NonNull<AtomicUsize>,
+    exclusive_table_size: usize,
+    execution_gate: crate::ExecutionGate,
     state: Mutex<DirectArenaState>,
     poisoned: AtomicBool,
 }
@@ -198,6 +205,12 @@ impl Drop for DirectArenaInner {
         let result =
             unsafe { libc::munmap(self.reservation.as_ptr().cast(), self.reservation_size) };
         debug_assert_eq!(result, 0, "direct arena munmap failed");
+        unsafe {
+            libc::munmap(
+                self.exclusive_page_table.as_ptr().cast(),
+                self.exclusive_table_size,
+            );
+        }
     }
 }
 
@@ -235,6 +248,14 @@ impl std::fmt::Debug for DirectArena {
 impl DirectArena {
     /// Reserves one process-sized arena surrounded by inaccessible guard pages.
     pub fn new(address_space_size: usize) -> Result<Self, DirectMemoryError> {
+        Self::with_execution_gate(address_space_size, crate::ExecutionGate::new())
+    }
+
+    /// Bind the arena to its native execution admission before publication.
+    pub fn with_execution_gate(
+        address_space_size: usize,
+        execution_gate: crate::ExecutionGate,
+    ) -> Result<Self, DirectMemoryError> {
         DirectHostCapabilities::detect()?;
         if address_space_size == 0 || !address_space_size.is_multiple_of(DIRECT_PAGE_SIZE) {
             return Err(DirectMemoryError::invalid(
@@ -257,12 +278,35 @@ impl DirectArena {
                 "direct host address calculation overflows",
             ));
         }
+        let exclusive_table_size =
+            address_space_size / DIRECT_PAGE_SIZE * std::mem::size_of::<usize>();
+        let table = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                exclusive_table_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if table == libc::MAP_FAILED {
+            unsafe {
+                libc::munmap(reservation.as_ptr().cast(), reservation_size);
+            }
+            return Err(DirectMemoryError::last(
+                "exclusive page table reservation failed",
+            ));
+        }
         Ok(Self {
             inner: Arc::new(DirectArenaInner {
                 reservation,
                 reservation_size,
                 base,
                 address_space_size,
+                exclusive_page_table: NonNull::new(table.cast()).expect("mmap returned a table"),
+                exclusive_table_size,
+                execution_gate,
                 state: Mutex::new(DirectArenaState {
                     pages: FxHashMap::default(),
                 }),
@@ -276,7 +320,41 @@ impl DirectArena {
         DirectAddressSpaceView {
             base: self.inner.base.as_ptr().addr(),
             address_space_size: self.inner.address_space_size,
+            exclusive_page_table: self.inner.exclusive_page_table.as_ptr().addr(),
         }
+    }
+
+    /// Caller owns mapping exclusion, or initializes a previously empty entry
+    /// while all native writers are stopped. Pointers live as long as mappings.
+    pub(crate) fn set_exclusive_page(&self, guest_address: u64, pointer: usize) {
+        debug_assert!(guest_address < self.inner.address_space_size as u64);
+        unsafe {
+            &*self
+                .inner
+                .exclusive_page_table
+                .as_ptr()
+                .add(guest_address as usize / DIRECT_PAGE_SIZE)
+        }
+        .store(pointer, Ordering::Release);
+    }
+
+    pub(crate) fn publish_exclusive_page(
+        &self,
+        guest_address: u64,
+        reservations: Arc<crate::reservation::ReservationPage>,
+    ) {
+        let mut state = self.lock_state();
+        let Some(page) = state.pages.get_mut(&page_number(guest_address)) else {
+            return;
+        };
+        debug_assert_eq!(page.backing.base(), reservations.canonical_base);
+        let pointer = Arc::as_ptr(&reservations).addr();
+        page.reservations = Some(reservations);
+        self.set_exclusive_page(guest_address, pointer);
+    }
+
+    pub(crate) fn execution_gate(&self) -> &crate::ExecutionGate {
+        &self.inner.execution_gate
     }
 
     pub(crate) fn identity(&self) -> usize {
@@ -377,11 +455,30 @@ impl DirectArena {
                 .ok_or_else(|| DirectMemoryError::invalid("direct map batch size overflows"))?;
             self.map_run(first, size)?;
             for request in &requests[start..end] {
+                if !state
+                    .pages
+                    .get(&page_number(request.guest_address))
+                    .is_some_and(|page| {
+                        page.backing.fd() == request.backing.fd()
+                            && page.backing.offset() == request.backing.offset()
+                    })
+                {
+                    self.set_exclusive_page(request.guest_address, 1);
+                }
+                let reservations = state
+                    .pages
+                    .get(&page_number(request.guest_address))
+                    .filter(|page| {
+                        page.backing.fd() == request.backing.fd()
+                            && page.backing.offset() == request.backing.offset()
+                    })
+                    .and_then(|page| page.reservations.clone());
                 state.pages.insert(
                     page_number(request.guest_address),
                     DirectMappedPage {
                         backing: request.backing.clone(),
                         protection: request.protection,
+                        reservations,
                     },
                 );
             }
@@ -583,7 +680,7 @@ impl DirectArena {
                         .is_some_and(|mapped| mapped.protection != request.protection)
                 })
             })
-            .collect::<Vec<_>>();
+            .collect::<smallvec::SmallVec<[_; 8]>>();
         if requests.is_empty() {
             return Ok(());
         }
@@ -636,6 +733,7 @@ impl DirectArena {
         for request in requests {
             self.replace_run_with_none(request.guest_address, request.size)?;
             for page in pages(request.guest_address, request.size) {
+                self.set_exclusive_page(page, 0);
                 state.pages.remove(&page_number(page));
             }
         }
@@ -668,6 +766,13 @@ impl DirectArena {
         size: usize,
         protection: DirectProtection,
     ) -> Result<(), DirectMemoryError> {
+        // Linux completes the affected TLB revocation before mprotect returns.
+        // On x86 the synchronous IPI acknowledgement orders remote accesses;
+        // arm64 completes broadcast TLBI with DSB ISH. With all aliases revoked
+        // and their page locks held, snapshots need no second process-wide IPI.
+        // https://docs.kernel.org/core-api/cachetlb.html
+        // https://github.com/torvalds/linux/blob/v6.17/kernel/smp.c#L312-L350
+        // https://github.com/torvalds/linux/blob/v6.17/arch/arm64/include/asm/tlbflush.h#L227-L245
         let destination = self.host_pointer(guest_address)?;
         crate::metrics::record(crate::metrics::Counter::DirectProtectionCalls, 1);
         crate::metrics::record(crate::metrics::Counter::DirectProtectionBytes, size as u64);

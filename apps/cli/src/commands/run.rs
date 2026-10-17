@@ -279,7 +279,11 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
             None
         }
     };
-    frontend = frontend.map(|frontend| frontend.with_window_state(saved_window_state));
+    frontend = frontend.map(|frontend| {
+        frontend
+            .with_window_state(saved_window_state)
+            .with_vsync(config.video.vsync)
+    });
     let (video_system, presentation_context) = if let Some(options) = native_vulkan {
         let (device, native_presentation) = if let Some(frontend) = frontend.as_mut() {
             let (device, client) = frontend
@@ -305,7 +309,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
         if let Some(client) = native_presentation {
             renderer
-                .attach_presentation(client)
+                .attach_presentation(client, config.video.vsync)
                 .map_err(|e| e.to_string())?;
         }
         let maxwell =

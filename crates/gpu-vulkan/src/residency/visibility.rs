@@ -10,6 +10,7 @@ use std::{
 };
 
 pub(super) struct CpuPage {
+    pub cpu_revision: nixe_memory::CpuContentRevision,
     pub bytes: Arc<[u8]>,
     // Retaining the epoch's original allocation gives an ABA-safe identity
     // across async reads without another allocation or global generation clock.
@@ -49,10 +50,23 @@ impl VisibilityCoordinator for VulkanVisibility {
                 "canonical page cache size mismatch",
             ));
         }
+        let mut pages = self.pages.lock().unwrap();
+        if pages
+            .get(&request.page)
+            .is_some_and(|page| page.cpu_revision == request.cpu_revision)
+        {
+            nixe_memory::metrics::record(nixe_memory::metrics::Counter::DeviceBaselineCacheHits, 1);
+            return Ok(());
+        }
+        nixe_memory::metrics::record(
+            nixe_memory::metrics::Counter::DeviceBaselineCopiedBytes,
+            bytes.len() as u64,
+        );
         let bytes: Arc<[u8]> = bytes.into();
-        self.pages.lock().unwrap().insert(
+        pages.insert(
             request.page,
             CpuPage {
+                cpu_revision: request.cpu_revision,
                 baseline: Arc::clone(&bytes),
                 bytes,
                 completed: None,
@@ -70,16 +84,11 @@ impl VisibilityCoordinator for VulkanVisibility {
         &self,
         request: CpuVisibilityRequest,
     ) -> Result<(), VisibilityCoordinatorError> {
-        let mut pages = self.pages.lock().unwrap();
-        if pages.get(&request.page).is_some_and(|page| {
-            page.completed
-                .is_some_and(|point| point <= request.visible_at)
-        }) {
-            pages.remove(&request.page);
-            self.acknowledgements.send(request).map_err(|_| {
-                VisibilityCoordinatorError::new("Vulkan residency owner has stopped")
-            })?;
-        }
-        Ok(())
+        // Canonical acknowledgement retires producer authority, not the CPU
+        // baseline needed by resident aliases or a concurrently encoded write.
+        // The last resident page binding retires this bounded cache entry.
+        self.acknowledgements
+            .send(request)
+            .map_err(|_| VisibilityCoordinatorError::new("Vulkan residency owner has stopped"))
     }
 }

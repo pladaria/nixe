@@ -444,7 +444,7 @@ pub struct MaxwellInlineToMemoryUpload {
 }
 
 impl MaxwellInlineToMemoryUpload {
-    pub(super) const fn new(
+    pub(crate) const fn new(
         address: MaxwellInlineToMemoryAddress,
         offset: u32,
         value: u32,
@@ -808,4 +808,41 @@ fn invalid_encoding(
         method_name,
         reason,
     }
+}
+
+/// Length of the next physically contiguous run, not just the logical row.
+/// A block-linear GOB changes address permutation at each 16-byte X segment.
+pub(super) fn data_words(
+    candidate: &mut MaxwellInlineToMemoryState,
+    subchannel: crate::MaxwellPushbufferSubchannel,
+    words: &[crate::MaxwellDecodedMethod],
+) -> Result<(MaxwellInlineToMemoryUpload, usize), MaxwellEngineDispatchError> {
+    let source = MaxwellMethodSource::decoded(words[0], subchannel);
+    let pending = candidate.pending();
+    let applied = preflight(
+        MaxwellMethodDispatch::emitted_by_mme(source, CLASS),
+        candidate,
+    )?;
+    let pending = pending.expect("validated inline data has an armed transfer");
+    let remaining = pending.byte_length - pending.next_offset;
+    let row = pending.line_length - pending.next_offset % pending.line_length;
+    let contiguous = match pending.layout {
+        DestinationLayout::Pitch { pitch } if pitch == pending.line_length => remaining,
+        DestinationLayout::Pitch { .. } => row,
+        DestinationLayout::BlockLinear { x, .. } => {
+            row.min(16 - (pending.next_offset % pending.line_length + x) % 16)
+        }
+    };
+    let count = words.len().min((remaining.min(contiguous) / 4) as usize);
+    debug_assert!(count != 0);
+    let last = MaxwellMethodSource::decoded(words[count - 1], subchannel);
+    candidate.apply(MaxwellInlineToMemoryStateWrite::Data {
+        value: last.argument(),
+        next_offset: pending.next_offset + count as u32 * 4,
+        source: last,
+    });
+    let Some(PendingEngineOperation::InlineToMemory(upload)) = applied.operation else {
+        unreachable!()
+    };
+    Ok((upload, count))
 }

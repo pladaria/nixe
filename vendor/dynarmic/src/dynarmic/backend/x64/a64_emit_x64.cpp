@@ -76,7 +76,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
 
     const std::vector<HostLoc> gpr_order = [this] {
         std::vector<HostLoc> gprs{any_gpr};
-        if (conf.page_table) {
+        if (conf.page_table || conf.physical_exclusive_page_table) {
             gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R14));
         }
         if (conf.fastmem_pointer) {

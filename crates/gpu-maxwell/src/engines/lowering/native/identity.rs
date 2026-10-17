@@ -2,6 +2,53 @@
 use super::*;
 use std::hash::{Hash, Hasher};
 
+/// Plane metadata depends on interpretation and physical bindings, never on a
+/// resource-list ID or the current bytes. Hashing visits subresources, not the
+/// image cache or the pages retained by each canonical mapping key.
+#[derive(Clone)]
+pub(super) struct ImageKey {
+    pub encoding: super::super::super::threed::MaxwellThreeDGuestImageFormat,
+    pub description: nixe_gpu::ImageDescription,
+    pub canonical_texels: bool,
+    pub view: nixe_gpu::ImageView,
+}
+impl PartialEq for ImageKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.encoding == other.encoding
+            && self.description == other.description
+            && self.canonical_texels == other.canonical_texels
+            && self.view.swizzle() == other.view.swizzle()
+            && (std::ptr::eq(self.view.bindings(), other.view.bindings())
+                || (self.view.bindings().len() == other.view.bindings().len()
+                    && self
+                        .view
+                        .bindings()
+                        .iter()
+                        .zip(other.view.bindings())
+                        .all(|(a, b)| {
+                            a.subresources() == b.subresources()
+                                && a.layout() == b.layout()
+                                && a.backing().range().byte_mapping_key()
+                                    == b.backing().range().byte_mapping_key()
+                        })))
+    }
+}
+impl Eq for ImageKey {}
+impl Hash for ImageKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.encoding.hash(state);
+        self.description.hash(state);
+        self.canonical_texels.hash(state);
+        self.view.swizzle().hash(state);
+        self.view.bindings().len().hash(state);
+        for binding in self.view.bindings() {
+            binding.subresources().hash(state);
+            binding.layout().hash(state);
+            binding.backing().range().byte_mapping_key().hash(state);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ParameterKey(pub Arc<GuestDrawParameters>);
 impl PartialEq for ParameterKey {
@@ -80,8 +127,12 @@ impl PartialEq for DrawKey {
             })
             && match (&a.index, &b.index) {
                 (None, None) => true,
-                (Some((a, at)), Some((b, bt))) => {
-                    at == bt && a.byte_mapping_key() == b.byte_mapping_key()
+                (
+                    Some(GuestIndexBuffer::Canonical(a, at)),
+                    Some(GuestIndexBuffer::Canonical(b, bt)),
+                ) => at == bt && a.byte_mapping_key() == b.byte_mapping_key(),
+                (Some(GuestIndexBuffer::Inline(a)), Some(GuestIndexBuffer::Inline(b))) => {
+                    Arc::ptr_eq(a, b)
                 }
                 _ => false,
             }
@@ -105,10 +156,18 @@ impl Hash for DrawKey {
             vertex.binding.hash(state);
             vertex.backing.byte_mapping_key().hash(state);
         }
-        a.index
-            .as_ref()
-            .map(|(backing, kind)| (backing.byte_mapping_key(), kind))
-            .hash(state);
+        match &a.index {
+            None => 0_u8.hash(state),
+            Some(GuestIndexBuffer::Canonical(backing, kind)) => {
+                1_u8.hash(state);
+                backing.byte_mapping_key().hash(state);
+                kind.hash(state);
+            }
+            Some(GuestIndexBuffer::Inline(bytes)) => {
+                2_u8.hash(state);
+                (Arc::as_ptr(bytes) as *const u8).hash(state);
+            }
+        }
         a.colors.len().hash(state);
         for image in a.colors.iter().chain(&a.depth_stencil) {
             (Arc::as_ptr(&image.planes) as *const GuestImagePlane).hash(state);
@@ -128,7 +187,10 @@ pub(super) fn draw_bytes(draw: &GuestDrawState) -> usize {
             .iter()
             .map(|v| v.backing.metadata_bytes())
             .sum::<usize>()
-        + draw.index.as_ref().map_or(0, |(b, _)| b.metadata_bytes())
+        + draw.index.as_ref().map_or(0, |b| match b {
+            GuestIndexBuffer::Canonical(b, _) => b.metadata_bytes(),
+            GuestIndexBuffer::Inline(bytes) => bytes.len(),
+        })
         + draw
             .colors
             .iter()
@@ -162,7 +224,108 @@ pub(super) fn program_bytes(p: &GuestProgram) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nixe_gpu::{
+        BackingView, GpuAllocationDescription, GpuAllocationId, ImageDescription, ImageDimension,
+        ImageExtent, ImageFormat, ImageId, ImageKind, ImageMemoryLayout, ImageSubresourceRange,
+        ImageView, SampleCount, Swizzle,
+    };
     use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+
+    fn image_key(allocation: &CanonicalAllocation, width: u32) -> ImageKey {
+        let description = ImageDescription::new(
+            ImageDimension::Two,
+            ImageExtent::new(width, 8, 1).unwrap(),
+            ImageFormat::Rgba8Unorm,
+            ImageKind::Color,
+            1,
+            1,
+            SampleCount::One,
+        )
+        .unwrap();
+        let backing = BackingView::new(
+            GpuAllocationId::new(1),
+            GpuAllocationDescription::new(4096, 1).unwrap(),
+            0,
+            allocation
+                .backing_range(MemoryPermissions::READ_WRITE)
+                .unwrap(),
+        )
+        .unwrap();
+        ImageKey {
+            encoding: super::super::super::super::threed::MaxwellThreeDGuestImageFormat::Canonical(
+                description.format(),
+            ),
+            description,
+            canonical_texels: true,
+            view: ImageView::new(
+                ImageId::new(1),
+                description,
+                Swizzle::IDENTITY,
+                vec![(
+                    ImageSubresourceRange {
+                        plane: 0,
+                        mip_level: 0,
+                        base_layer: 0,
+                        layer_count: 1,
+                    },
+                    ImageMemoryLayout::PitchLinear {
+                        row_pitch: 64,
+                        layer_stride: 512,
+                    },
+                    backing,
+                )],
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn image_metadata_survives_content_updates_and_resource_reidentification() {
+        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        let first = image_key(&allocation, 16);
+        let mut states = nixe_gpu::WorkingSet::new(4, 4096);
+        states.insert(first.clone(), 7, 512);
+        allocation.write(0, &[1, 2, 3, 4]).unwrap();
+        let mut updated = image_key(&allocation, 16);
+        updated.view = updated.view.with_image(ImageId::new(19));
+        assert_eq!(states.get(&updated), Some(&7));
+        let unchanged = updated.clone();
+        crate::engines::tests::register_benchmark::ALLOCATIONS.with(|n| n.set(Some(0)));
+        for _ in 0..1000 {
+            assert_eq!(states.get(&unchanged), Some(&7));
+        }
+        let allocations = crate::engines::tests::register_benchmark::ALLOCATIONS
+            .with(|n| n.replace(None).unwrap());
+        assert_eq!(allocations, 0);
+        drop(first);
+        assert_eq!(states.get(&updated), Some(&7));
+        // Identical storage/pitch with a different extent must not reuse planes.
+        assert_eq!(states.get(&image_key(&allocation, 8)), None);
+        let replacement = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        assert_eq!(states.get(&image_key(&replacement, 16)), None);
+        updated.canonical_texels = false;
+        assert_eq!(states.get(&updated), None);
+    }
+
+    #[test]
+    fn image_metadata_eviction_retains_outstanding_physical_storage() {
+        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        let retained = image_key(&allocation, 16);
+        let mut states = nixe_gpu::WorkingSet::new(1, 512);
+        states.insert(retained.clone(), 7, 512);
+        states.insert(image_key(&allocation, 8), 8, 512);
+        assert_eq!(states.usage(), (1, 512));
+        assert_eq!(states.get(&retained), None);
+        allocation.write(0, &[5]).unwrap();
+        drop(allocation);
+        let mut bytes = [0];
+        retained.view.bindings()[0]
+            .backing()
+            .range()
+            .read(0, &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, [5]);
+    }
 
     #[test]
     fn program_identity_ignores_cpu_versions_but_distinguishes_physical_bindings() {

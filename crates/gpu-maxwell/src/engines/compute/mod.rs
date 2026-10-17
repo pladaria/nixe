@@ -2,6 +2,7 @@
 
 mod launch;
 mod methods;
+pub(super) use methods::data_words;
 mod operations;
 mod qmd;
 mod state;

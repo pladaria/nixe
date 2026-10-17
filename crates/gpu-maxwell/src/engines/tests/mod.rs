@@ -8,7 +8,9 @@ use nixe_memory::{CanonicalAllocation, CanonicalBackingRange, MemoryPermissions}
 
 use super::*;
 
+mod bulk;
 mod compute_launch;
+pub(crate) mod register_benchmark;
 use crate::{
     MaxwellAamVersion, MaxwellAamVersionRange, MaxwellAddressSpaceId,
     MaxwellAddressSpaceInitialization, MaxwellAllocationId, MaxwellChannelId, MaxwellChannelOwner,

@@ -42,9 +42,10 @@ impl Presenter {
     pub(super) fn new(
         window: Arc<Window>,
         context: WgpuPresentationContext,
+        vsync: bool,
     ) -> Result<Self, WindowError> {
         Ok(Self::Legacy(Box::new(LegacyPresenter::new(
-            window, context,
+            window, context, vsync,
         )?)))
     }
     pub(super) fn resize(&mut self, width: u32, height: u32) {

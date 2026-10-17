@@ -124,7 +124,7 @@ fn device_owned_second_page(memory: &Arc<ExecutionMemory>, fail: bool) {
     .unwrap();
     nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
         [(&range, declaration)],
-        device.clone(),
+        device.as_ref(),
     )
     .unwrap();
     nixe_memory::CanonicalBackingRange::publish_device_writes([(&range, declaration)], device)
