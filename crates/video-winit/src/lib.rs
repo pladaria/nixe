@@ -48,6 +48,18 @@ enum FrontendEvent {
     Keyboard,
 }
 
+type PauseHandler = Box<dyn Fn(bool) -> Result<(), String> + Send + Sync>;
+
+fn pause_key_pressed(down: &mut bool, state: ElementState, repeat: bool, synthetic: bool) -> bool {
+    if synthetic {
+        return false;
+    }
+    let pressed = state == ElementState::Pressed;
+    let edge = pressed && !*down && !repeat;
+    *down = pressed;
+    edge
+}
+
 /// Thread-safe control channel into the main-thread window event loop.
 #[derive(Clone, Debug)]
 pub struct FrontendControl {
@@ -135,6 +147,8 @@ impl WindowFrontend {
                 frame_wakeup_pending,
                 context: None,
                 vsync: true,
+                pause_handler: None,
+                pause_key_down: false,
                 presenter: None,
                 failure: None,
                 initial_window_state: None,
@@ -186,6 +200,16 @@ impl WindowFrontend {
         self
     }
 
+    /// Routes host pause requests to the emulation owner.
+    #[must_use]
+    pub fn with_pause_handler(
+        mut self,
+        handler: impl Fn(bool) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        self.application.pause_handler = Some(Box::new(handler));
+        self
+    }
+
     /// Restores saved window geometry when the native window is created.
     #[must_use]
     pub fn with_window_state(mut self, state: Option<WindowState>) -> Self {
@@ -229,6 +253,7 @@ struct PresenterState {
     backend_name: &'static str,
     frame_rate: FrameRateTracker,
     displayed_title: String,
+    paused: bool,
     keyboard: Option<keyboard::KeyboardOverlay>,
     keyboard_host: Option<nixe_applets::keyboard::KeyboardHost>,
     keyboard_redraw_at: Instant,
@@ -406,7 +431,7 @@ impl LegacyPresenter {
             surface_reconfigure_pending: false,
         };
         presenter.resize(size.width, size.height);
-        presenter.update_title();
+        presenter.common.update_title();
         Ok(presenter)
     }
 
@@ -698,19 +723,7 @@ impl LegacyPresenter {
 
     fn refresh_title(&mut self, now: Instant) {
         if self.common.frame_rate.refresh(now) {
-            self.update_title();
-        }
-    }
-
-    fn update_title(&mut self) {
-        let title = window_title(
-            self.common.backend_name,
-            self.common.frame_dimensions,
-            self.common.frame_rate.frames_per_second(),
-        );
-        if title != self.common.displayed_title {
-            self.common.window.set_title(&title);
-            self.common.displayed_title = title;
+            self.common.update_title();
         }
     }
 }
@@ -926,6 +939,8 @@ struct PresenterApplication {
     frame_wakeup_pending: Arc<AtomicBool>,
     context: Option<WgpuPresentationContext>,
     vsync: bool,
+    pause_handler: Option<PauseHandler>,
+    pause_key_down: bool,
     presenter: Option<Presenter>,
     failure: Option<WindowError>,
     initial_window_state: Option<WindowState>,
@@ -1061,6 +1076,23 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             return;
         }
         let event_window = self.presenter.as_ref().map(|p| Arc::clone(&p.window));
+        let pause_pressed = match &event {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } if event.physical_key == PhysicalKey::Code(KeyCode::KeyP) => pause_key_pressed(
+                &mut self.pause_key_down,
+                event.state,
+                event.repeat,
+                *is_synthetic,
+            ),
+            WindowEvent::Focused(false) => {
+                self.pause_key_down = false;
+                false
+            }
+            _ => false,
+        };
         if let Some(presenter) = &mut self.presenter
             && let Some(keyboard) = &mut presenter.keyboard
             && keyboard.active()
@@ -1081,6 +1113,24 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
             }
         }
         match event {
+            WindowEvent::KeyboardInput { .. } if pause_pressed => {
+                if let Some(presenter) = &mut self.presenter
+                    && presenter.window.has_focus()
+                    && let Some(handler) = &self.pause_handler
+                {
+                    let paused = !presenter.paused;
+                    match handler(paused) {
+                        Ok(()) => {
+                            presenter.paused = paused;
+                            presenter.update_title();
+                        }
+                        Err(error) => {
+                            self.failure = Some(WindowError::device(error));
+                            self.stop_requested.store(true, Ordering::Release);
+                        }
+                    }
+                }
+            }
             WindowEvent::CloseRequested => {
                 self.touch_tracker.cancel_all(&self.touch_screen_writer);
                 self.stop_requested.store(true, Ordering::Release);
@@ -1331,6 +1381,54 @@ impl std::error::Error for WindowError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pause_hotkey_requires_a_real_press_edge_and_ignores_repeats_and_synthetic_events() {
+        let mut down = false;
+        assert!(!pause_key_pressed(
+            &mut down,
+            ElementState::Pressed,
+            false,
+            true
+        ));
+        assert!(pause_key_pressed(
+            &mut down,
+            ElementState::Pressed,
+            false,
+            false
+        ));
+        assert!(!pause_key_pressed(
+            &mut down,
+            ElementState::Pressed,
+            true,
+            false
+        ));
+        assert!(!pause_key_pressed(
+            &mut down,
+            ElementState::Pressed,
+            false,
+            false
+        ));
+        assert!(!pause_key_pressed(
+            &mut down,
+            ElementState::Released,
+            false,
+            true
+        ));
+        assert!(down);
+        assert!(!pause_key_pressed(
+            &mut down,
+            ElementState::Released,
+            false,
+            false
+        ));
+        assert!(pause_key_pressed(
+            &mut down,
+            ElementState::Pressed,
+            false,
+            false
+        ));
+    }
 
     #[test]
     fn title_reports_backend_output_size_and_optional_frame_rate() {

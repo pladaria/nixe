@@ -160,6 +160,13 @@ pub(crate) struct AudioRendererState {
 }
 
 impl AudioRendererManagerSession {
+    pub(crate) fn set_host_paused(&self, paused: bool) {
+        for slot in self.slots.lock().unwrap().iter() {
+            if let Some(state) = slot.upgrade() {
+                state.set_host_paused(paused);
+            }
+        }
+    }
     pub(crate) fn device(
         &self,
         revision: u32,

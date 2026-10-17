@@ -10,10 +10,26 @@ impl PresenterState {
             frame_dimensions: None,
             frame_rate: FrameRateTracker::new(Instant::now()),
             displayed_title: String::new(),
+            paused: false,
             keyboard: None,
             keyboard_host: None,
             keyboard_redraw_at: Instant::now(),
             screenshots: None,
+        }
+    }
+
+    pub(super) fn update_title(&mut self) {
+        let mut title = window_title(
+            self.backend_name,
+            self.frame_dimensions,
+            self.frame_rate.frames_per_second(),
+        );
+        if self.paused {
+            title.push_str(" | Paused");
+        }
+        if title != self.displayed_title {
+            self.window.set_title(&title);
+            self.displayed_title = title;
         }
     }
 }
@@ -183,15 +199,7 @@ impl NativePresenter {
     fn refresh_title(&mut self, now: Instant) {
         self.poll();
         if self.common.frame_rate.refresh(now) {
-            let title = window_title(
-                "Vulkan native",
-                self.common.frame_dimensions,
-                self.common.frame_rate.frames_per_second(),
-            );
-            if title != self.common.displayed_title {
-                self.common.window.set_title(&title);
-                self.common.displayed_title = title;
-            }
+            self.common.update_title();
         }
     }
     fn redraw(&mut self) -> Result<(), WindowError> {
@@ -202,6 +210,11 @@ impl NativePresenter {
             .map_err(|e| WindowError::new("Vulkan presentation", e))?;
         if self.pending.is_none()
             && !self.redraw_pending
+            && !self
+                .common
+                .screenshots
+                .as_ref()
+                .is_some_and(screenshot::Screenshots::has_request)
             && !self
                 .common
                 .keyboard
@@ -221,14 +234,13 @@ impl NativePresenter {
                 &self.common.window,
             )
         });
-        let screenshot = if self.pending.is_some() {
-            self.common
-                .screenshots
-                .as_mut()
-                .and_then(|shots| shots.native(&self.client))
-        } else {
-            None
-        };
+        // The GPU owner already retains the last immutable scanout. Capturing
+        // it does not require a new guest frame, including during host pause.
+        let screenshot = self
+            .common
+            .screenshots
+            .as_mut()
+            .and_then(|shots| shots.native(&self.client));
         self.client
             .submit(HostFrame {
                 frame: self.pending.take(),

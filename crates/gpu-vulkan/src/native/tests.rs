@@ -1374,10 +1374,254 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     assert!(bytes.chunks_exact(4).all(|pixel| pixel == [0, 255, 0, 255]));
     drop(retained);
     render_area_preserves_undefined_padding(&mut execution, &state);
+    window_depth_reconstructs_reads_and_clamps_exports(&mut execution, &state);
     drop(pixels);
     execution.teardown().unwrap();
     drop(execution);
     monitor.check().unwrap();
+}
+
+fn window_depth_reconstructs_reads_and_clamps_exports(
+    execution: &mut NativeGpuExecution,
+    state: &Arc<GuestDrawState>,
+) {
+    use ssa::{Constant, FunctionBuilder, Op, Terminator, Type};
+    let pc = ShaderSourceLocation::new(0);
+    let (vertices, vertex_backing) = backing_allocation(256, 256, 0);
+    let data = [
+        -1_f32, -1., 0.25, 0., 0., 0., 3., -1., 0.25, 0., 0., 0., -1., 3., 0.25, 0., 0., 0.,
+    ];
+    vertices
+        .write(
+            0,
+            &data
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    for (index, (transform, explicit)) in [
+        (None, false),
+        (Some([2., -1.]), false),
+        (Some([-2., 1.]), false),
+        (Some([4., -1.]), false),
+        (Some([2., -1.]), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (pixels, color_backing) = backing_allocation(256, 256, 0);
+        let (_, depth_backing) = backing_allocation(256, 256, 0);
+        let mut draw = (**state).clone();
+        draw.identity = PreparedStateId::new(4000 + index as u64, 1);
+        draw.vertices[0].backing = vertex_backing.snapshot_subrange(0, 72).unwrap();
+        draw.colors[0].planes = Arc::from([GuestImagePlane {
+            backing: color_backing.clone(),
+            ..draw.colors[0].planes[0].clone()
+        }]);
+        let mut depth = draw.colors[0].clone();
+        depth.description = ImageDescription::new(
+            ImageDimension::Two,
+            ImageExtent::new(8, 8, 1).unwrap(),
+            ImageFormat::Depth32Float,
+            ImageKind::DepthStencil,
+            1,
+            1,
+            SampleCount::One,
+        )
+        .unwrap();
+        depth.planes = Arc::from([GuestImagePlane {
+            aspect: GuestImageAspect::Depth,
+            backing: depth_backing.clone(),
+            ..depth.planes[0].clone()
+        }]);
+        draw.depth_stencil = Some(depth);
+        let parameters = Arc::make_mut(&mut draw.parameters);
+        parameters.identity = PreparedStateId::new(5000 + index as u64, 1);
+        parameters.depth_stencil_format = Some(ImageFormat::Depth32Float);
+        parameters.depth = DepthState {
+            test_enabled: true,
+            write_enabled: true,
+            compare: DepthCompareOperation::Always,
+        };
+        let mut viewport = ViewportTransform::new([4., 4., 1.], [4., 4., 0.], [0., 1.])
+            .unwrap()
+            .with_negative_one_to_one_depth(true);
+        if let Some([scale, offset]) = transform {
+            viewport = viewport.with_fragment_depth_transform(
+                FragmentDepthTransform::new(scale, offset, 0., 1.).unwrap(),
+            );
+        }
+        parameters.viewport = Some(viewport);
+        let mut b = FunctionBuilder::new(ShaderStage::Fragment);
+        let e = b.entry();
+        let z = b.emit(
+            e,
+            pc,
+            Op::Input {
+                location: ShaderIoLocation::Position,
+                component: 2,
+                ty: Type::F32,
+            },
+            vec![],
+        )[0];
+        let quarter = b.emit(
+            e,
+            pc,
+            Op::Constant(Constant {
+                ty: Type::F32,
+                bits: u64::from(0.25_f32.to_bits()),
+            }),
+            vec![],
+        )[0];
+        let half = b.emit(
+            e,
+            pc,
+            Op::Constant(Constant {
+                ty: Type::F32,
+                bits: u64::from(0.5_f32.to_bits()),
+            }),
+            vec![],
+        )[0];
+        let r = b.emit(
+            e,
+            pc,
+            Op::Binary {
+                op: ssa::Binary::Multiply,
+                ty: Type::F32,
+                float_control: ShaderFloatControl::PRECISE,
+            },
+            vec![z.into(), quarter.into()],
+        )[0];
+        let r = b.emit(
+            e,
+            pc,
+            Op::Binary {
+                op: ssa::Binary::Add,
+                ty: Type::F32,
+                float_control: ShaderFloatControl::PRECISE,
+            },
+            vec![r.into(), half.into()],
+        )[0];
+        b.emit(
+            e,
+            pc,
+            Op::Output {
+                location: ShaderIoLocation::Color(0),
+                component: 0,
+                ty: Type::F32,
+            },
+            vec![r.into()],
+        );
+        if explicit {
+            let z = b.emit(
+                e,
+                pc,
+                Op::Constant(Constant {
+                    ty: Type::F32,
+                    bits: u64::from(0.75_f32.to_bits()),
+                }),
+                vec![],
+            )[0];
+            b.emit(
+                e,
+                pc,
+                Op::Output {
+                    location: ShaderIoLocation::FragmentDepth,
+                    component: 0,
+                    ty: Type::F32,
+                },
+                vec![z.into()],
+            );
+        }
+        b.terminate(e, pc, Terminator::Return);
+        let mut fragment = b.finish().unwrap();
+        fragment.inputs.push(
+            ShaderInterfaceElement::new(
+                ShaderIoLocation::Position,
+                2,
+                ShaderScalarType::Float32,
+                None,
+            )
+            .unwrap(),
+        );
+        fragment.outputs.push(
+            ShaderInterfaceElement::new(
+                ShaderIoLocation::Color(0),
+                0,
+                ShaderScalarType::Float32,
+                None,
+            )
+            .unwrap(),
+        );
+        if explicit {
+            fragment.outputs.push(
+                ShaderInterfaceElement::new(
+                    ShaderIoLocation::FragmentDepth,
+                    0,
+                    ShaderScalarType::Float32,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        fragment.verify().unwrap();
+        let program = Arc::make_mut(&mut draw.program);
+        program.identity = PreparedStateId::new(6000 + index as u64, 1);
+        program.shader = Arc::new(GuestShaderCode {
+            identity: ssa::artifact::ContentId::of(b"window-depth-test", &[&[explicit as u8]]),
+            functions: vec![
+                Arc::clone(&state.program.shader.functions[0]),
+                Arc::new(fragment),
+            ]
+            .into_boxed_slice(),
+        });
+        let submission = NativeSubmission {
+            frontend: FrontendSubmissionId::new(4000 + index as u64),
+            segment: FrontendSubmissionSegment::FIRST,
+            final_segment: true,
+            commands: vec![NativeCommand::Draw {
+                state: Arc::new(draw),
+                arguments: DrawArguments::NonIndexed {
+                    first_vertex: 0,
+                    vertex_count: 3,
+                    first_instance: 0,
+                    instance_count: 1,
+                },
+            }],
+        };
+        ready(execution, &submission);
+        execution
+            .submit(ExecutionBatch {
+                commands: &submission,
+                definitions: &[],
+                retirements: &[],
+            })
+            .unwrap();
+        let guest_z: f32 = transform.map_or(0.625, |[scale, offset]| 0.625 * scale + offset);
+        let expected_red = ((guest_z * 0.25 + 0.5) * 255.).round() as u8;
+        let colors = cpu_read(&mut execution.residency, &color_backing);
+        assert!(
+            colors
+                .chunks_exact(4)
+                .all(|p| p[0].abs_diff(expected_red) <= 1),
+            "case {index}: {colors:?}"
+        );
+        let depth = cpu_read(&mut execution.residency, &depth_backing);
+        let expected_depth = if explicit {
+            0.75
+        } else {
+            guest_z.clamp(0., 1.)
+        };
+        for pixel in depth.chunks_exact(4) {
+            assert_eq!(
+                f32::from_le_bytes(pixel.try_into().unwrap()),
+                expected_depth,
+                "case {index}"
+            );
+        }
+        drop(pixels);
+    }
 }
 
 fn render_area_preserves_undefined_padding(

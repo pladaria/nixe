@@ -254,6 +254,11 @@ impl Emitter<'_> {
                     .io
                     .load_interface(&mut self.math, true, location, component as u8, None)
                     .map_err(|e| self.error(e.to_string()))?;
+                let bits = if location == ShaderIoLocation::Position && component == 2 {
+                    self.window_depth(bits)?
+                } else {
+                    bits
+                };
                 Some(if scalar == Type::U32 {
                     bits
                 } else {
@@ -275,6 +280,11 @@ impl Emitter<'_> {
                         .b
                         .bitcast(self.math.uint, None, args[0])
                         .map_err(|e| self.error(e.to_string()))?
+                };
+                let bits = if location == ShaderIoLocation::FragmentDepth {
+                    self.clamp_depth(bits)?
+                } else {
+                    bits
                 };
                 self.io
                     .store_interface(&mut self.math, location, component as u8, None, bits)

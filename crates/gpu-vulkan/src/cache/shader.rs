@@ -427,6 +427,7 @@ impl crate::VulkanDevice {
                     signed_zero_inf_nan_preserve: f.float64_signed_zero_inf_nan_preserve,
                 },
             },
+            fragment_depth_transform: None,
             integer64: p.core.shader_int64 != 0,
             subgroup_quad: p
                 .subgroup

@@ -618,6 +618,11 @@ impl HorizonSvcDispatcher {
         self.video_system.advance(elapsed)
     }
 
+    /// Parks audio command execution while preserving guest session state.
+    pub fn set_host_paused(&self, paused: bool) {
+        self.audio_renderers.set_host_paused(paused);
+    }
+
     pub fn next_video_deadline(&self) -> Duration {
         self.video_system.next_display_deadline()
     }

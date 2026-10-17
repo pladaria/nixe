@@ -16,6 +16,10 @@ pub(super) struct Screenshots {
 }
 
 impl Screenshots {
+    pub(super) fn has_request(&self) -> bool {
+        self.requested.is_some()
+    }
+
     pub(super) fn native(
         &mut self,
         client: &nixe_gpu_vulkan::presentation::PresentationClient,

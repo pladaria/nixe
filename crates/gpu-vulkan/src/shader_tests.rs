@@ -235,6 +235,7 @@ fn options(device: &VulkanDevice) -> spirv::Options {
                 signed_zero_inf_nan_preserve: f.float64_signed_zero_inf_nan_preserve,
             },
         },
+        fragment_depth_transform: None,
         integer64: device.profile().core.shader_int64 != 0,
         subgroup_quad: false,
         shared_memory_bytes: 0,

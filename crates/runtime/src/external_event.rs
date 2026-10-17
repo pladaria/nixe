@@ -42,6 +42,8 @@ impl ExternalEventSequence {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExternalEvent {
     HostStop,
+    /// Suspends/resumes host emulation without changing guest thread activity.
+    HostPause(bool),
     /// Wakes the host coordinator without making a guest thread runnable.
     HostService(ExternalEventSource),
     Wake {

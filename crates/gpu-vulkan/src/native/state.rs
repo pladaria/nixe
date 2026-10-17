@@ -339,6 +339,12 @@ pub(super) fn shader_code(
         .map(|stage| {
             let mut o = options;
             if let Some(draw) = draw {
+                if stage == S::Fragment {
+                    o.fragment_depth_transform = draw
+                        .parameters
+                        .viewport
+                        .and_then(|v| v.fragment_depth_transform());
+                }
                 let final_stage = if draw.parameters.tessellation.is_some() {
                     S::TessellationEvaluation
                 } else {

@@ -12,6 +12,7 @@ use crate::{AudioBackend, AudioDevice, AudioError, AudioFeed, ChannelLayout};
 
 struct HostState {
     active: bool,
+    paused: bool,
     layout: ChannelLayout,
     next_id: u64,
     streams: HashMap<u64, NativeStream>,
@@ -30,6 +31,7 @@ impl HostAudioRuntime {
         Ok(Self {
             state: Arc::new(Mutex::new(HostState {
                 active: true,
+                paused: false,
                 layout,
                 next_id: 0,
                 streams: HashMap::new(),
@@ -183,7 +185,7 @@ impl AudioBackend for HostAudioBackend {
         };
         // Keep the host clock running; stopped guest sessions supply silence.
         // Pausing SDL would retain stale queued PCM across guest Stop/Start.
-        if !unsafe { SDL_ResumeAudioStreamDevice(native.stream.as_ptr()) } {
+        if !state.paused && !unsafe { SDL_ResumeAudioStreamDevice(native.stream.as_ptr()) } {
             return Err(error(sdl3::get_error()));
         }
         state.next_id = id;
@@ -192,6 +194,39 @@ impl AudioBackend for HostAudioBackend {
             id,
             state: self.state.clone(),
         }))
+    }
+}
+
+impl HostAudioBackend {
+    /// Freezes playback without consuming or discarding queued guest PCM.
+    pub fn set_paused(&self, paused: bool) -> Result<(), AudioError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.active {
+            return Err(AudioError("SDL audio subsystem has been shut down".into()));
+        }
+        if state.paused == paused {
+            return Ok(());
+        }
+        // Streams opened by SDL_OpenAudioDeviceStream have independent logical
+        // devices. Pause every live stream, preserving its queued data.
+        // https://wiki.libsdl.org/SDL3/SDL_PauseAudioStreamDevice
+        for stream in state.streams.values() {
+            let success = unsafe {
+                if paused {
+                    SDL_PauseAudioStreamDevice(stream.stream.as_ptr())
+                } else {
+                    SDL_ResumeAudioStreamDevice(stream.stream.as_ptr())
+                }
+            };
+            if !success {
+                return Err(error(sdl3::get_error()));
+            }
+        }
+        state.paused = paused;
+        Ok(())
     }
 }
 
@@ -256,6 +291,7 @@ mod tests {
         verify_callback_pitch_and_channels();
         let backend = runtime.backend();
         assert_eq!(backend.output_layout().unwrap(), ChannelLayout::Stereo);
+        backend.set_paused(true).unwrap();
         let (send, receive) = mpsc::channel();
         let output = AudioOutput::open(
             backend.as_ref(),
@@ -271,6 +307,19 @@ mod tests {
         output.append(0x1234, [123, -123].repeat(480)).unwrap();
         assert!(output.released(1).unwrap().is_empty());
         output.start().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(output.played_frames().unwrap(), 0);
+        assert!(output.released(1).unwrap().is_empty());
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .streams
+                .values()
+                .all(|stream| unsafe { SDL_AudioStreamDevicePaused(stream.stream.as_ptr()) })
+        );
+        backend.set_paused(false).unwrap();
         receive.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(output.released(1).unwrap(), [0x1234]);
         assert_eq!(output.played_frames().unwrap(), 480);

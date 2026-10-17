@@ -4,7 +4,7 @@ use crate::{TessellationDomain, TessellationOutput, TessellationSpacing, Tessell
 use sha2::{Digest, Sha256};
 
 /// Bump whenever semantic lowering, the binding ABI or emitted code changes.
-pub const COMPILER_SCHEMA: u32 = 17;
+pub const COMPILER_SCHEMA: u32 = 18;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ContentId(pub [u8; 32]);
@@ -55,6 +55,12 @@ pub fn specialization(options: &[Options]) -> ContentId {
     bytes.extend_from_slice(&(options.len() as u32).to_le_bytes());
     for option in options {
         let s = option.shader;
+        bytes.push(option.fragment_depth_transform.is_some() as u8);
+        if let Some(t) = option.fragment_depth_transform {
+            for coefficient in t.coefficients() {
+                bytes.extend_from_slice(&coefficient.to_bits().to_le_bytes());
+            }
+        }
         bytes.push(s.depth_clip_negative_one_to_one as u8);
         bytes.push(s.vertex_position_transform.is_some() as u8);
         if let Some(t) = s.vertex_position_transform {

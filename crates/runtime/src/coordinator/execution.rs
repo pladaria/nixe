@@ -35,6 +35,9 @@ impl RuntimeCoordinator {
         &mut self,
         instruction_budget: u64,
     ) -> Result<Option<CoordinatorExecution>, CoordinatorError> {
+        if self.host_paused() {
+            return Ok(None);
+        }
         if let Some(lease) = self.scheduler.active_leases().next() {
             return Err(CoordinatorError::InFlightLease(lease));
         }
@@ -83,6 +86,9 @@ impl RuntimeCoordinator {
         &mut self,
         instruction_budget: Option<u64>,
     ) -> Result<Option<CoordinatorExecution>, CoordinatorError> {
+        if self.host_paused() {
+            return Ok(None);
+        }
         if self.execution_mode != VcpuExecutionMode::Parallel {
             return Err(CoordinatorError::ParallelModeRequired);
         }

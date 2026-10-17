@@ -14,8 +14,28 @@ const BUFFER_COUNT: usize = 3;
 
 #[derive(Debug)]
 pub(super) struct RendererWorker {
-    stop: Arc<(Mutex<bool>, Condvar)>,
+    stop: Arc<(Mutex<WorkerControl>, Condvar)>,
     thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug, Default)]
+struct WorkerControl {
+    stop: bool,
+    paused: bool,
+    parked: bool,
+    finished: bool,
+}
+
+struct WorkerFinished(Arc<(Mutex<WorkerControl>, Condvar)>);
+impl Drop for WorkerFinished {
+    fn drop(&mut self) {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finished = true;
+        self.0.1.notify_all();
+    }
 }
 
 impl RendererWorker {
@@ -23,7 +43,7 @@ impl RendererWorker {
         state: &AudioRendererState,
         backend: &dyn AudioBackend,
     ) -> Result<Self, Box<str>> {
-        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop = Arc::new((Mutex::new(WorkerControl::default()), Condvar::new()));
         let wake = stop.clone();
         let output = AudioOutput::open(
             backend,
@@ -55,12 +75,23 @@ impl RendererWorker {
         let thread = match thread::Builder::new()
             .name("nixe-audren".into())
             .spawn(move || {
+                // Release a pause waiter on normal completion and unwinding.
+                let _finished = WorkerFinished(thread_stop.clone());
                 let result = (|| -> Result<(), Box<str>> {
                     let mut next = Instant::now();
                     loop {
                         let now = Instant::now();
-                        let stopped = thread_stop.0.lock().unwrap();
-                        if *stopped {
+                        let mut stopped = thread_stop.0.lock().unwrap();
+                        if stopped.paused && !stopped.stop {
+                            stopped.parked = true;
+                            thread_stop.1.notify_all();
+                            while stopped.paused && !stopped.stop {
+                                stopped = thread_stop.1.wait(stopped).unwrap();
+                            }
+                            stopped.parked = false;
+                            next = Instant::now();
+                        }
+                        if stopped.stop {
                             break;
                         }
                         if now < next {
@@ -77,7 +108,7 @@ impl RendererWorker {
                         let Some(mut pcm) = free.pop() else {
                             // Full bounded queue: don't run ahead of host playback.
                             let stopped = thread_stop.0.lock().unwrap();
-                            if *stopped {
+                            if stopped.stop {
                                 break;
                             }
                             drop(thread_stop.1.wait_timeout(stopped, BLOCK).unwrap());
@@ -129,12 +160,21 @@ impl RendererWorker {
             thread: Some(thread),
         })
     }
+
+    fn set_paused(&self, paused: bool) {
+        let mut control = self.stop.0.lock().unwrap();
+        control.paused = paused;
+        self.stop.1.notify_all();
+        while paused && !control.parked && !control.finished {
+            control = self.stop.1.wait(control).unwrap();
+        }
+    }
 }
 
 impl Drop for RendererWorker {
     fn drop(&mut self) {
-        *self.stop.0.lock().unwrap() = true;
-        self.stop.1.notify_one();
+        self.stop.0.lock().unwrap().stop = true;
+        self.stop.1.notify_all();
         if let Some(thread) = self.thread.take() {
             thread.join().expect("audio renderer worker panicked");
         }
@@ -142,6 +182,11 @@ impl Drop for RendererWorker {
 }
 
 impl AudioRendererState {
+    pub(super) fn set_host_paused(&self, paused: bool) {
+        if let Some(worker) = self.worker.lock().unwrap().as_ref() {
+            worker.set_paused(paused);
+        }
+    }
     pub(crate) fn start(&self, backend: &dyn AudioBackend) -> Result<(), Box<str>> {
         let mut worker = self.worker.lock().unwrap();
         if worker.is_none() {
@@ -270,6 +315,15 @@ mod tests {
         assert_eq!(session.0.update.lock().unwrap().frames, BUFFER_COUNT as u64);
         feed.render(&mut [1; 480]);
         wait_until(|| session.0.update.lock().unwrap().frames == BUFFER_COUNT as u64 + 1);
+        session.0.set_host_paused(true);
+        let paused_frames = session.0.update.lock().unwrap().frames;
+        feed.render(&mut [1; 480]);
+        thread::sleep(BLOCK * 3);
+        assert_eq!(session.0.update.lock().unwrap().frames, paused_frames);
+        assert!(session.0.update.lock().unwrap().started);
+        session.0.set_host_paused(false);
+        wait_until(|| session.0.update.lock().unwrap().frames > paused_frames);
+        session.0.set_host_paused(true);
         session.0.stop();
         assert_eq!(backend.live.load(Ordering::SeqCst), 0);
         assert!(!session.0.update.lock().unwrap().started);

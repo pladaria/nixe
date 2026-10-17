@@ -217,6 +217,7 @@ pub struct MaxwellShaderCode {
 pub struct MaxwellShaderCompiler {
     pool: std::sync::Arc<nixe_gpu::ssa::compile::CompilePool>,
     cache: nixe_gpu::ssa::compile::CompilationCache<ContentId, MaxwellShaderCode>,
+    bytes: usize,
 }
 impl MaxwellShaderCompiler {
     pub fn new(
@@ -226,6 +227,7 @@ impl MaxwellShaderCompiler {
     ) -> Self {
         Self {
             pool,
+            bytes,
             cache: nixe_gpu::ssa::compile::CompilationCache::new(entries, bytes),
         }
     }
@@ -242,6 +244,11 @@ impl MaxwellShaderCompiler {
             .iter()
             .map(|p| p.binary.bundles.len() * 32)
             .sum();
+        if weight > self.bytes {
+            return Err(nixe_gpu::ssa::compile::CompileError::Failed(
+                "shader capture exceeds the Maxwell compilation byte budget".into(),
+            ));
+        }
         self.cache.request_sized(
             &self.pool,
             snapshot.identity,

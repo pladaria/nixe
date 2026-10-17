@@ -36,6 +36,52 @@ fn registration(coordinator: &RuntimeCoordinator) -> ProcessRegistration {
 }
 
 #[test]
+fn host_pause_preserves_ready_threads_and_resume_and_stop_wake_the_waiter() {
+    for mode in [
+        VcpuExecutionMode::Deterministic,
+        VcpuExecutionMode::Parallel,
+    ] {
+        let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
+            profile(),
+            crate::VirtualClock::default(),
+            mode,
+        )
+        .unwrap();
+        let process = synthetic_process_for_coordinator(1);
+        let id = coordinator
+            .register_process(process, registration(&coordinator))
+            .unwrap();
+        let sender = coordinator.event_sender();
+        sender.submit(ExternalEvent::HostPause(true)).unwrap();
+        coordinator.drain_external_events().unwrap();
+        assert!(coordinator.host_paused());
+        assert_eq!(coordinator.scheduler.active_leases().count(), 0);
+        assert!(coordinator.run_next_adaptive().unwrap().is_none());
+        if mode == VcpuExecutionMode::Parallel {
+            assert!(coordinator.run_parallel_adaptive().unwrap().is_none());
+        }
+        let resume = sender.clone();
+        let worker =
+            std::thread::spawn(move || resume.submit(ExternalEvent::HostPause(false)).unwrap());
+        coordinator.wait_while_host_paused().unwrap();
+        worker.join().unwrap();
+        assert!(!coordinator.host_paused());
+        let execution = if mode == VcpuExecutionMode::Parallel {
+            coordinator.run_parallel(1).unwrap()
+        } else {
+            coordinator.run_next(1).unwrap()
+        };
+        assert!(execution.is_some());
+        sender.submit(ExternalEvent::HostPause(true)).unwrap();
+        coordinator.drain_external_events().unwrap();
+        sender.submit(ExternalEvent::HostStop).unwrap();
+        coordinator.wait_while_host_paused().unwrap();
+        assert!(coordinator.host_stop_requested());
+        coordinator.remove_process(id).unwrap();
+    }
+}
+
+#[test]
 fn registration_removal_and_identity_retirement_are_atomic() {
     let mut coordinator = RuntimeCoordinator::new(profile());
     let process = synthetic_process_for_coordinator(1);
@@ -1614,7 +1660,7 @@ fn host_termination_keeps_already_exited_guest_threads_terminal() {
 }
 
 #[test]
-fn parallel_completion_returns_before_a_busy_core_and_quiescence_restores_its_state() {
+fn parallel_completion_returns_before_a_busy_core_and_host_pause_restores_its_state() {
     for backend in [
         crate::CpuBackendConfig::Interpreter,
         crate::CpuBackendConfig::Jit,
@@ -1657,9 +1703,14 @@ fn parallel_completion_returns_before_a_busy_core_and_quiescence_restores_its_st
             coordinator.thread_cpu_state(busy.thread.get()),
             Err(ThreadOperationError::InvalidState)
         );
-        coordinator.quiesce().unwrap();
+        let events = coordinator.event_sender();
+        events.submit(ExternalEvent::HostPause(true)).unwrap();
+        coordinator.drain_external_events().unwrap();
         assert!(coordinator.scheduler.active_leases().next().is_none());
         assert!(coordinator.thread_cpu_state(busy.thread.get()).is_ok());
+        assert!(coordinator.run_parallel(1).unwrap().is_none());
+        events.submit(ExternalEvent::HostPause(false)).unwrap();
+        coordinator.drain_external_events().unwrap();
         let stopped = coordinator.run_parallel(1).unwrap().unwrap();
         assert_eq!(stopped.lease, busy);
         assert!(matches!(

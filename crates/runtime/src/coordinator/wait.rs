@@ -11,6 +11,31 @@ impl RuntimeCoordinator {
         self.host_stop_requested
     }
 
+    #[must_use]
+    pub fn host_paused(&self) -> bool {
+        self.virtual_clock.is_paused()
+    }
+
+    /// Shared emulation timeline for host services; excludes host pauses.
+    #[must_use]
+    pub fn emulation_elapsed(&self) -> std::time::Duration {
+        self.virtual_clock.host_elapsed()
+    }
+
+    /// Waits on ingress while paused, ignoring frozen guest deadlines. Host
+    /// stop and device notifications remain live; no guest work is dispatched.
+    pub fn wait_while_host_paused(&mut self) -> Result<(), CoordinatorError> {
+        while self.host_paused() && !self.host_stop_requested {
+            if let Some(event) = self
+                .inbox
+                .recv_sequenced_timeout(std::time::Duration::from_secs(1))?
+            {
+                self.apply_external_event(event, &mut CoordinatorDrainReport::default())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Atomically publishes either immediate readiness or a generation-safe wait.
     pub fn register_wait(
         &mut self,
@@ -203,6 +228,12 @@ impl RuntimeCoordinator {
         report.last_sequence = Some(event.sequence);
         match event.event {
             ExternalEvent::HostStop => self.host_stop_requested = true,
+            ExternalEvent::HostPause(paused) => {
+                if paused {
+                    self.quiesce()?;
+                }
+                self.virtual_clock.set_paused(paused);
+            }
             ExternalEvent::HostService(_) => {}
             ExternalEvent::Wake { token, .. } => {
                 if self.apply_wake(token, false)? {

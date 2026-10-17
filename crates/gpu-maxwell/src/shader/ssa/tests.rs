@@ -1011,6 +1011,7 @@ fn spirv_options() -> nixe_gpu::ssa::spirv::Options {
             },
             float64: Default::default(),
         },
+        fragment_depth_transform: None,
         integer64: false,
         subgroup_quad: false,
         shared_memory_bytes: 0,
@@ -1154,6 +1155,14 @@ fn native_shader_cache_uses_content_identity_and_fresh_write_dependencies() {
             .unwrap();
     let identity = snapshot.identity();
     let pool = Arc::new(CompilePool::new(2, 8).unwrap());
+    // A capture that cannot ever fit must fail permanently; returning Budget
+    // would make the synchronous frontend retry it indefinitely.
+    let undersized = MaxwellShaderCompiler::new(Arc::clone(&pool), 16, 1);
+    assert!(matches!(
+        undersized.request(snapshot.clone()),
+        Err(nixe_gpu::ssa::compile::CompileError::Failed(message))
+            if message.contains("compilation byte budget")
+    ));
     let compiler = MaxwellShaderCompiler::new(pool, 16, 1024 * 1024);
     let code = compiler
         .request(snapshot.clone())

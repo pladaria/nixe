@@ -188,6 +188,14 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     let external_events = coordinator.event_sender();
     install_interrupt_handler(frontend_control.clone(), external_events.clone())?;
+    frontend = frontend.map(|frontend| {
+        let events = external_events.clone();
+        frontend.with_pause_handler(move |paused| {
+            events
+                .submit(nixe_runtime::ExternalEvent::HostPause(paused))
+                .map_err(|error| error.to_string())
+        })
+    });
     let process_started = Instant::now();
     let cpu_backend = select_cpu_backend(cpu_configuration)?;
     let trace_interpreter = matches!(cpu_backend, CpuBackendConfig::Interpreter)
@@ -619,7 +627,7 @@ fn execute_worker(
     horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
     mut host_input: HostInputReaders,
-    audio_backend: Arc<dyn nixe_audio::AudioBackend>,
+    audio_backend: Arc<nixe_audio::HostAudioBackend>,
     trace_interpreter: bool,
 ) -> WorkerResult {
     let registration = ProcessRegistration {
@@ -748,7 +756,7 @@ fn execute(
     horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
     host_input: &mut HostInputReaders,
-    audio_backend: Arc<dyn nixe_audio::AudioBackend>,
+    audio_backend: Arc<nixe_audio::HostAudioBackend>,
     trace_interpreter: bool,
 ) -> Result<ExecutionSummary, String> {
     let coordinator = &mut *scheduled.coordinator;
@@ -762,7 +770,7 @@ fn execute(
     .with_shared_fonts(horizon_environment.shared_fonts)
     .with_system_archives(horizon_environment.system_archives)
     .with_diagnostics(horizon_environment.diagnostics)
-    .with_audio_backend(audio_backend)
+    .with_audio_backend(audio_backend.clone())
     .with_vibration_output(host_input.vibration.clone());
     if let Some(host) = &host_input.keyboard {
         dispatcher = dispatcher.with_keyboard_host(host.clone());
@@ -779,7 +787,7 @@ fn execute(
     if let Some(language) = horizon_environment.application_language {
         dispatcher = dispatcher.with_application_language(language);
     }
-    let execution_started = Instant::now();
+    let execution_started = coordinator.emulation_elapsed();
     let execution_rate_enabled = log::log_enabled!(log::Level::Info);
     let mut execution_completions = 0_u64;
     let mut last_rate_completions = 0_u64;
@@ -803,7 +811,28 @@ fn execute(
             }
             return Ok(execution_summary(&dispatcher, rejected.len()));
         }
-        let elapsed = execution_started.elapsed();
+        if coordinator.host_paused() {
+            audio_backend
+                .set_paused(true)
+                .map_err(|error| error.to_string())?;
+            dispatcher.set_host_paused(true);
+            log::info!("emulation paused");
+            coordinator
+                .wait_while_host_paused()
+                .map_err(|error| error.to_string())?;
+            if !coordinator.host_stop_requested() {
+                dispatcher.set_host_paused(false);
+                audio_backend
+                    .set_paused(false)
+                    .map_err(|error| error.to_string())?;
+                last_input_sample = None;
+                log::info!("emulation resumed");
+            }
+            continue;
+        }
+        let elapsed = coordinator
+            .emulation_elapsed()
+            .saturating_sub(execution_started);
         dispatcher
             .advance_video(elapsed)
             .map_err(|error| error.to_string())?;
@@ -871,7 +900,9 @@ fn execute(
         .map_err(|error| error.to_string())?;
         if executions.is_empty() {
             let host_wait = host_service_wait_duration(
-                execution_started.elapsed(),
+                coordinator
+                    .emulation_elapsed()
+                    .saturating_sub(execution_started),
                 dispatcher.next_video_deadline(),
             );
             coordinator
@@ -884,7 +915,9 @@ fn execute(
             if execution_rate_enabled {
                 execution_completions = execution_completions.wrapping_add(1);
                 if execution_completions.is_multiple_of(EXECUTION_RATE_COMPLETIONS) {
-                    let elapsed = execution_started.elapsed();
+                    let elapsed = coordinator
+                        .emulation_elapsed()
+                        .saturating_sub(execution_started);
                     let interval = elapsed.saturating_sub(last_rate_elapsed);
                     if interval >= EXECUTION_RATE_LOG_INTERVAL {
                         let interval_completions =

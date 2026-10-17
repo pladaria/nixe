@@ -595,6 +595,7 @@ fn complete_guest_patch_programs_compile_directly_through_ssa() {
             &program.function,
             nixe_gpu::ssa::spirv::Options {
                 shader: native_options(control),
+                fragment_depth_transform: None,
                 integer64: false,
                 subgroup_quad: false,
                 shared_memory_bytes: 0,

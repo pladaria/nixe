@@ -20,6 +20,18 @@ struct VirtualClockState {
     wall_anchor: i64,
     monotonic_anchor: Instant,
     scheduler_time_ns: AtomicU64,
+    // Running: accumulated paused nanoseconds. Paused: flag + frozen elapsed.
+    // One atomic word keeps reads lock-free and transitions indivisible.
+    pause: AtomicU64,
+}
+
+const PAUSED: u64 = 1 << 63;
+fn pause_transition(state: u64, now: u64, paused: bool) -> u64 {
+    if paused {
+        PAUSED | now.saturating_sub(state)
+    } else {
+        now.saturating_sub(state & !PAUSED)
+    }
 }
 
 /// One cloneable clock source shared by all services of an emulated process.
@@ -46,6 +58,7 @@ impl VirtualClock {
                 wall_anchor,
                 monotonic_anchor: Instant::now(),
                 scheduler_time_ns: AtomicU64::new(0),
+                pause: AtomicU64::new(0),
             }),
         }
     }
@@ -65,9 +78,57 @@ impl VirtualClock {
     #[must_use]
     pub fn elapsed(&self) -> Duration {
         match self.state.mode {
-            VirtualClockMode::Realtime => self.state.monotonic_anchor.elapsed(),
+            VirtualClockMode::Realtime => self.host_elapsed(),
             VirtualClockMode::Fixed { .. } => Duration::ZERO,
         }
+    }
+
+    /// Host service time excluding pauses, also available with a fixed guest clock.
+    #[must_use]
+    pub fn host_elapsed(&self) -> Duration {
+        loop {
+            let state = self.state.pause.load(Ordering::Acquire);
+            if state & PAUSED != 0 {
+                return Duration::from_nanos(state & !PAUSED);
+            }
+            let now = self.host_elapsed_ns();
+            if self.state.pause.load(Ordering::Acquire) == state {
+                return Duration::from_nanos(now.saturating_sub(state));
+            }
+        }
+    }
+
+    fn host_elapsed_ns(&self) -> u64 {
+        self.state
+            .monotonic_anchor
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(PAUSED - 1)) as u64
+    }
+
+    /// Freezes/resumes the shared process clock, excluding host pause duration.
+    pub(crate) fn set_paused(&self, paused: bool) {
+        let mut state = self.state.pause.load(Ordering::Acquire);
+        loop {
+            if (state & PAUSED != 0) == paused {
+                return;
+            }
+            let next = pause_transition(state, self.host_elapsed_ns(), paused);
+            match self.state.pause.compare_exchange_weak(
+                state,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => state = observed,
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.state.pause.load(Ordering::Acquire) & PAUSED != 0
     }
 
     /// Returns the selected wall-clock policy.
@@ -130,6 +191,41 @@ fn duration_seconds(duration: Duration) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_pauses_exclude_only_the_paused_host_duration() {
+        let frozen = pause_transition(0, 100, true);
+        assert_eq!(frozen, PAUSED | 100);
+        let offset = pause_transition(frozen, 1100, false);
+        assert_eq!(offset, 1000);
+        assert_eq!(1500 - offset, 500);
+        let frozen = pause_transition(offset, 1600, true);
+        assert_eq!(frozen, PAUSED | 600);
+        assert_eq!(pause_transition(frozen, 3600, false), 3000);
+    }
+
+    #[test]
+    fn paused_clock_is_shared_and_freezes_both_guest_and_service_timelines() {
+        let clock = VirtualClock::default();
+        clock.set_paused(true);
+        let frozen = clock.elapsed();
+        let scheduler = clock.scheduler_time_ns();
+        let clone = clock.clone();
+        std::thread::sleep(Duration::from_millis(2));
+        clone.set_paused(true); // Repeated requests must not reset the anchor.
+        assert_eq!(clone.elapsed(), frozen);
+        assert_eq!(clone.host_elapsed(), frozen);
+        assert_eq!(clone.scheduler_time_ns(), scheduler);
+        clone.set_paused(false);
+        assert!(!clock.is_paused());
+        assert!(clock.elapsed() >= frozen);
+        let fixed = VirtualClock::new(VirtualClockMode::Fixed { unix_seconds: 7 });
+        fixed.set_paused(true);
+        let host = fixed.host_elapsed();
+        assert_eq!(fixed.elapsed(), Duration::ZERO);
+        assert_eq!(fixed.unix_seconds(), 7);
+        assert_eq!(fixed.host_elapsed(), host);
+    }
 
     #[test]
     fn fixed_mode_freezes_wall_and_monotonic_time() {

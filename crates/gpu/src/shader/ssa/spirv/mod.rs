@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 mod canonicalize;
 mod control;
+mod depth;
 mod float_control;
 mod float_facts;
 mod half;
@@ -23,6 +24,9 @@ mod unary;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Options {
     pub shader: SpirvShaderOptions,
+    /// Reconstruct window Z after rasterization when the viewport was normalized
+    /// to [0,1]. Explicit guest depth replaces it and is only clamped.
+    pub fragment_depth_transform: Option<crate::FragmentDepthTransform>,
     pub integer64: bool,
     pub subgroup_quad: bool,
     pub shared_memory_bytes: u32,
@@ -167,6 +171,11 @@ impl<'a> Emitter<'a> {
     ) -> Self {
         let mut math = Math::new(options.shader);
         float_control::configure(&mut math, function);
+        if options.fragment_depth_transform.is_some() {
+            // Viewport reconstruction has RTE semantics even if all guest
+            // arithmetic happened to permit an RTZ-only execution environment.
+            math.rounding32 = ShaderRoundingMode::NearestEven;
+        }
         // The backend baseline is Vulkan 1.2+KHR/1.3; SPIR-V 1.5 also permits
         // precise entry-point declaration of descriptor/workgroup variables.
         math.b.set_version(1, 5);
@@ -245,6 +254,11 @@ impl<'a> Emitter<'a> {
         }
     }
     fn emit(&mut self) -> Result<Module, Error> {
+        if self.options.fragment_depth_transform.is_some()
+            && self.function.stage != ShaderStage::Fragment
+        {
+            return Err(self.error("window depth reconstruction requires a fragment shader"));
+        }
         if (self.options.shader.vertex_position_transform.is_some()
             || self.options.shader.depth_clip_negative_one_to_one)
             && !matches!(
@@ -254,12 +268,13 @@ impl<'a> Emitter<'a> {
         {
             return Err(self.error("final position conversion requires the final pre-raster stage"));
         }
+        let (inputs, outputs) = self.depth_interfaces();
         self.io
             .emit_interfaces(
                 &mut self.math,
                 self.function.stage,
-                &self.function.inputs,
-                &self.function.outputs,
+                &inputs,
+                &outputs,
                 self.function.tessellation_control_points,
             )
             .map_err(|e| Error::at(self.math.source, e.to_string()))?;
@@ -351,6 +366,9 @@ impl<'a> Emitter<'a> {
                     .b
                     .begin_block(Some(body))
                     .map_err(|e| self.error(e.to_string()))?;
+            }
+            if block_id == self.function.entry() {
+                self.initialize_fragment_depth()?;
             }
             for instruction in &block.instructions {
                 self.math.source = instruction.source;
@@ -483,11 +501,12 @@ impl<'a> Emitter<'a> {
                 self.math
                     .b
                     .execution_mode(self.math.entry, M::OriginUpperLeft, []);
-                if self
-                    .function
-                    .outputs
-                    .iter()
-                    .any(|o| o.location() == ShaderIoLocation::FragmentDepth)
+                if self.options.fragment_depth_transform.is_some()
+                    || self
+                        .function
+                        .outputs
+                        .iter()
+                        .any(|o| o.location() == ShaderIoLocation::FragmentDepth)
                 {
                     self.math
                         .b

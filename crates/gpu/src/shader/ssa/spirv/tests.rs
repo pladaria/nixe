@@ -22,6 +22,7 @@ pub(super) fn options() -> Options {
                 signed_zero_inf_nan_preserve: true,
             },
         },
+        fragment_depth_transform: None,
         integer64: true,
         subgroup_quad: false,
         shared_memory_bytes: 0,
@@ -30,6 +31,59 @@ pub(super) fn options() -> Options {
 }
 fn pc(offset: u32) -> ShaderSourceLocation {
     ShaderSourceLocation::new(offset)
+}
+
+#[test]
+fn window_depth_reconstruction_adds_fragment_interfaces_and_specializes_cache_identity() {
+    let mut b = FunctionBuilder::new(ShaderStage::Fragment);
+    b.terminate(b.entry(), pc(0), Terminator::Return);
+    let function = b.finish().unwrap();
+    let original = function.clone();
+    let plain = options();
+    let mut corrected = plain;
+    corrected.fragment_depth_transform =
+        Some(crate::FragmentDepthTransform::new(2., -1., 0., 1.).unwrap());
+    let module = emit(&function, corrected).unwrap();
+    let parsed = rspirv::dr::load_words(&module.words).unwrap();
+    if let Some(validator) = std::env::var_os("NIXE_SPIRV_VAL") {
+        validate(&validator, "window-depth", module);
+        let mut repair = corrected;
+        repair.shader.float32.denorm_preserve = false;
+        validate(
+            &validator,
+            "window-depth-repair",
+            emit(&function, repair).unwrap(),
+        );
+    }
+    assert!(parsed.execution_modes.iter().any(|i| i.operands.contains(
+        &SpvOperand::ExecutionMode(spv::ExecutionMode::DepthReplacing)
+    )));
+    for builtin in [spv::BuiltIn::FragCoord, spv::BuiltIn::FragDepth] {
+        assert!(
+            parsed
+                .annotations
+                .iter()
+                .any(|i| i.operands.contains(&SpvOperand::BuiltIn(builtin)))
+        );
+    }
+    assert_eq!(
+        function, original,
+        "host specialization must leave semantic SSA immutable"
+    );
+    assert_ne!(
+        super::super::artifact::specialization(&[plain]),
+        super::super::artifact::specialization(&[corrected])
+    );
+    let mut reversed = corrected;
+    reversed.fragment_depth_transform =
+        Some(crate::FragmentDepthTransform::new(-2., 1., 0., 1.).unwrap());
+    assert_ne!(
+        super::super::artifact::specialization(&[corrected]),
+        super::super::artifact::specialization(&[reversed])
+    );
+    let mut wrong_stage = function;
+    wrong_stage.stage = ShaderStage::Vertex;
+    assert!(emit(&wrong_stage, corrected).is_err());
 }
 fn c(b: &mut FunctionBuilder, block: BlockId, bits: u32) -> Operand {
     b.emit(block, pc(8), Op::Constant(Constant::u32(bits)), vec![])[0].into()
