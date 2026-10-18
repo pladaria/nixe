@@ -288,8 +288,7 @@ mod tests {
     fn frame(sequence: u64) -> PresentationFrame {
         let instance = BackendInstanceId::new(1);
         PresentationFrame::new(
-            ResidentImage::new(
-                instance,
+            ResidentImage::from_lease(
                 ImageDescription::new(
                     ImageDimension::Two,
                     ImageExtent {
@@ -304,7 +303,15 @@ mod tests {
                     SampleCount::One,
                 )
                 .unwrap(),
-                Arc::new(()),
+                nixe_gpu::PresentationLease::new(
+                    nixe_gpu::PresentationImageId {
+                        slot: 1,
+                        generation: 1,
+                    },
+                    sequence,
+                    nixe_gpu::BackendSubmissionToken::new(instance, sequence, 1),
+                    std::sync::mpsc::channel().0,
+                ),
             ),
             FrameCrop {
                 left: 0,

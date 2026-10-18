@@ -39,6 +39,8 @@ impl GuestImage {
 }
 #[derive(Clone, Debug)]
 pub enum GuestBinding {
+    /// An explicitly unbound buffer: reads return zero and writes are discarded.
+    NullBuffer,
     Buffer(CanonicalBackingRange),
     Image {
         image: GuestImage,
@@ -59,17 +61,13 @@ pub struct GuestVertexLayout {
     pub step: VertexStepMode,
     pub attributes: Box<[VertexAttribute]>,
 }
-#[derive(Clone, Debug)]
-pub struct GuestShaderCode {
-    pub identity: ssa::artifact::ContentId,
-    pub functions: Box<[Arc<ssa::Function>]>,
-}
+pub type GuestShaderCode = crate::shader_compilation::ShaderInputs;
 #[derive(Clone, Debug)]
 pub struct GuestProgram {
     pub identity: PreparedStateId,
     pub shader: Arc<GuestShaderCode>,
-    /// Sorted logical SSA resource identities; Vulkan reflection assigns dense bindings.
-    pub bindings: Box<[(ssa::ResourceId, GuestBinding)]>,
+    /// Sorted semantic resource identities; artifact metadata assigns dense bindings.
+    pub bindings: Box<[(crate::shader_module::ResourceId, GuestBinding)]>,
     pub shared_memory_bytes: u32,
 }
 /// Index bytes come either from guest memory or from ordered inline methods.
@@ -88,10 +86,18 @@ pub struct GuestDrawState {
     pub depth_stencil: Option<GuestImage>,
     pub parameters: Arc<GuestDrawParameters>,
 }
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct GuestShaderState {
+    pub base_instance: u32,
+    pub point_size_bits: Option<u32>,
+    pub y_negate: bool,
+    pub force_early_z: bool,
+}
 /// Validated draw semantics independent of current physical buffer/descriptor
 /// bindings. Address changes retain this identity and its compiled preparation.
 #[derive(Clone, Debug)]
 pub struct GuestDrawParameters {
+    pub shader_state: GuestShaderState,
     pub identity: PreparedStateId,
     pub vertices: Box<[GuestVertexLayout]>,
     pub color_formats: Box<[ImageFormat]>,
@@ -124,6 +130,7 @@ pub struct GuestDrawParameters {
 impl GuestDrawParameters {
     /// Hash the consumed state, excluding its interned identity.
     pub fn hash_state<H: Hasher>(&self, state: &mut H) {
+        self.shader_state.hash(state);
         self.vertices.hash(state);
         self.color_formats.hash(state);
         self.depth_stencil_format.hash(state);
@@ -153,7 +160,8 @@ impl GuestDrawParameters {
     /// Compare consumed semantics when register revisions changed and then
     /// restored a prior value. Identity/provenance is not pipeline state.
     pub fn same_state(&self, other: &Self) -> bool {
-        self.vertices == other.vertices
+        self.shader_state == other.shader_state
+            && self.vertices == other.vertices
             && self.color_formats == other.color_formats
             && self.depth_stencil_format == other.depth_stencil_format
             && self.samples == other.samples
@@ -237,24 +245,6 @@ pub enum NativeCommand {
 pub struct NativeWork {
     pub frontend: FrontendSubmissionId,
     pub command: NativeCommand,
-    /// Cached coverage is consumed only at command-processor write boundaries.
-    pub canonical_accesses: Arc<[BackingView]>,
-}
-impl NativeWork {
-    pub fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + command_bytes(&self.command)
-    }
-}
-fn command_bytes(command: &NativeCommand) -> usize {
-    match command {
-        NativeCommand::WriteMemory { bytes, .. } => bytes.len(),
-        NativeCommand::UploadPlanes { bytes, .. } => bytes.iter().map(|b| b.len()).sum(),
-        NativeCommand::Sequence(commands) => {
-            std::mem::size_of_val(commands.as_ref())
-                + commands.iter().map(command_bytes).sum::<usize>()
-        }
-        _ => 0,
-    }
 }
 pub struct NativeSubmission {
     pub frontend: FrontendSubmissionId,

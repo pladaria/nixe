@@ -9,9 +9,8 @@ members = [
     "crates/cpu-jit",
     "crates/cpu-direct-memory",
     "crates/gpu",
-    "crates/gpu-headless",
+    "crates/shader-recompiler",
     "crates/gpu-maxwell",
-    "crates/gpu-wgpu",
     "crates/gpu-vulkan",
     "crates/horizon",
     "crates/input",
@@ -46,13 +45,11 @@ chrono-tz = "0.10.4"
 flate2 = "1"
 egui = { version = "0.36.2", default-features = false }
 egui-winit = { version = "0.36.2", default-features = false, features = ["clipboard", "x11", "wayland"] }
-egui-wgpu = { version = "0.36.2", default-features = false }
 ctrlc = "3.4"
 getrandom = "0.4"
 lz4_flex = "0.11"
 log = "0.4"
 mimalloc = { version = "0.1.52", default-features = false }
-pollster = "0.4"
 rustc-hash = "1.1.0"
 png = "0.18.1"
 sanitize-filename = "0.6"
@@ -74,9 +71,8 @@ nixe-cpu-interpreter = { path = "crates/cpu-interpreter" }
 nixe-cpu-jit = { path = "crates/cpu-jit" }
 nixe-cpu-direct-memory = { path = "crates/cpu-direct-memory" }
 nixe-gpu = { path = "crates/gpu" }
-nixe-gpu-headless = { path = "crates/gpu-headless" }
+nixe-shader-recompiler = { path = "crates/shader-recompiler" }
 nixe-gpu-maxwell = { path = "crates/gpu-maxwell" }
-nixe-gpu-wgpu = { path = "crates/gpu-wgpu" }
 nixe-gpu-vulkan = { path = "crates/gpu-vulkan" }
 nixe-horizon = { path = "crates/horizon" }
 nixe-input = { path = "crates/input" }
@@ -89,12 +85,6 @@ nixe-runtime = { path = "crates/runtime" }
 nixe-scheduler = { path = "crates/scheduler" }
 nixe-video = { path = "crates/video" }
 nixe-video-winit = { path = "crates/video-winit" }
-wgpu = { version = "30", default-features = false, features = [
-    "std",
-    "metal",
-    "vulkan",
-    "wgsl",
-] }
 winit = "0.30"
 toml = "0.8"
 zstd = { version = "0.13", default-features = false }

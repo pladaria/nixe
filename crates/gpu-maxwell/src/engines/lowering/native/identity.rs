@@ -87,6 +87,7 @@ impl Hash for ProgramKey {
             id.hash(state);
             std::mem::discriminant(binding).hash(state);
             match binding {
+                GuestBinding::NullBuffer => (),
                 GuestBinding::Buffer(b) => b.byte_mapping_key().hash(state),
                 GuestBinding::Image { image, arrayed } => {
                     (Arc::as_ptr(&image.planes) as *const GuestImagePlane).hash(state);
@@ -214,6 +215,7 @@ pub(super) fn program_bytes(p: &GuestProgram) -> usize {
         + p.bindings
             .iter()
             .map(|(_, b)| match b {
+                GuestBinding::NullBuffer => 0,
                 GuestBinding::Buffer(b) => b.metadata_bytes(),
                 GuestBinding::Image { image, .. } => plane_metadata_bytes(image),
                 GuestBinding::Sampler(_) => 0,
@@ -334,8 +336,8 @@ mod tests {
             .backing_range(MemoryPermissions::READ_WRITE)
             .unwrap();
         let code = Arc::new(GuestShaderCode {
-            identity: nixe_gpu::ssa::artifact::ContentId::of(b"program-intern-test", &[]),
-            functions: Box::new([]),
+            identity: nixe_gpu::shader_identity::ContentId::of(b"program-intern-test", &[]),
+            stages: Box::new([]),
         });
         let key = |backing| {
             ProgramKey(Arc::new(GuestProgram {

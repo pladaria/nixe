@@ -180,7 +180,7 @@ Native blits perform supported format conversion/scaling, and copies snapshot an
 overlapping source on GPU. Unsupported filter/format/depth combinations fail.
 `nv12_pipeline`/`prepare_nv12`/`convert_nv12` implement the existing fixed-point
 matrix, crop, clamp, truncation, RGBA/BGRA and alpha contract through ordinary
-cached raster execution. External-video import is task 13.
+cached raster execution. Presentation imports use typed leases and versioned snapshots.
 
 Buffer storage writes and sampled image aliases share the canonical producer
 index. The next image use imports the latest GPU bytes without CPU readback for
@@ -189,9 +189,8 @@ snapshot/feedback-loop lowering and is rejected when supplied as ordinary bindin
 
 ## Explicit gaps and reference behavior
 
-- Guest queries/counter reports/resets are not implemented by the reference driver
-  (`gpu-wgpu/src/driver.rs`, `GpuCommand::Query`). Native query support is not
-  advertised as emulated guest support. Binding-probe timestamps are diagnostics.
+- Guest queries/counter reports/resets are not advertised as emulated support.
+  Binding-probe timestamps are diagnostics.
 - Maxwell counter enable/configuration is implemented state programming, not a
   counter result (`gpu-maxwell/src/engines/threed/counters.rs`, `zcull.rs`).
 - Supported report-semaphore payload/PTIMER behavior belongs to Horizon/frontend
@@ -202,8 +201,8 @@ snapshot/feedback-loop lowering and is rejected when supplied as ordinary bindin
   transform-feedback feature does not remove that guest error.
 - Native barriers implement ordered resource dependencies and shader barriers;
   they do not invent completion for unsupported guest synchronization methods.
-- Existing unsupported ISA, guest geometry/FP64 and bindless forms retain precise
-  frontend/compiler errors. There is no recovery into wgpu or CPU guest shaders.
+- Unsupported ISA forms and resource combinations retain precise frontend/compiler
+  errors. Shader execution uses the standalone recompiler and native Vulkan.
 
 The fixed-color/compute helper renderer and its separate solid pipeline factory
 have been removed. Tests use fixtures through this recorder. The alternative

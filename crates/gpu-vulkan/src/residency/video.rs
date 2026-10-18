@@ -77,7 +77,7 @@ impl VulkanResidency {
                 depth: 1,
             });
         unsafe {
-            self.device.owner.device.cmd_copy_buffer_to_image(
+            self.device.dispatch.cmd_copy_buffer_to_image(
                 self.device.submission.slots[slot].command,
                 source,
                 target,
@@ -160,6 +160,7 @@ mod tests {
                 arena_bytes: 512,
                 overflow_bytes: 0,
             },
+            &cache.device.dispatch,
         )
         .unwrap();
         // Odd visible dimensions and a padded destination exercise both chroma

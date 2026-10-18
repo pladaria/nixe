@@ -353,6 +353,7 @@ impl MaxwellThreeDDescriptorPoolState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDShaderBindingState {
+    geometry_passthrough_mask: [MaxwellThreeDRegister<u32>; 8],
     program_region: MaxwellThreeDProgramRegionState,
     pipeline: [MaxwellThreeDPipelineBindingState; MAXWELL_PIPELINE_SHADER_COUNT],
     selector: MaxwellThreeDConstantBufferSelectorState,
@@ -370,6 +371,7 @@ pub struct MaxwellThreeDShaderBindingState {
 impl Default for MaxwellThreeDShaderBindingState {
     fn default() -> Self {
         Self {
+            geometry_passthrough_mask: std::array::from_fn(|_| MaxwellThreeDRegister::default()),
             program_region: MaxwellThreeDProgramRegionState::default(),
             pipeline: std::array::from_fn(MaxwellThreeDPipelineBindingState::initialized),
             selector: MaxwellThreeDConstantBufferSelectorState::default(),
@@ -389,6 +391,13 @@ impl Default for MaxwellThreeDShaderBindingState {
 }
 
 impl MaxwellThreeDShaderBindingState {
+    pub fn geometry_passthrough_mask(&self) -> Option<[u32; 8]> {
+        let mut mask = [0; 8];
+        for (value, register) in mask.iter_mut().zip(&self.geometry_passthrough_mask) {
+            *value = *register.value()?;
+        }
+        Some(mask)
+    }
     pub const fn tessellation_mode(&self) -> &MaxwellThreeDRegister<MaxwellThreeDTessellationMode> {
         &self.tessellation_mode
     }
@@ -401,12 +410,6 @@ impl MaxwellThreeDShaderBindingState {
         self.pipeline
             .iter()
             .any(|pipeline| pipeline.enabled.value() == Some(&true))
-    }
-
-    pub(in crate::engines) fn has_enabled_stage(&self, stage: MaxwellShaderStage) -> bool {
-        self.pipeline.iter().any(|pipeline| {
-            pipeline.enabled.value() == Some(&true) && pipeline.stage.value() == Some(&stage)
-        })
     }
 
     #[must_use]
@@ -477,6 +480,10 @@ impl MaxwellThreeDShaderBindingState {
         let raw = write.raw();
         let source = write.source();
         match write {
+            MaxwellThreeDShaderBindingWrite::GeometryPassthroughMask { index, value, .. } => {
+                self.geometry_passthrough_mask[index as usize] =
+                    MaxwellThreeDRegister::programmed(raw, value, source);
+            }
             MaxwellThreeDShaderBindingWrite::ProgramRegionAddressUpper { value, .. } => {
                 self.program_region.address_upper =
                     MaxwellThreeDRegister::programmed(raw, value, source)
@@ -599,6 +606,11 @@ impl MaxwellThreeDShaderBindingState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDShaderBindingWrite {
+    GeometryPassthroughMask {
+        index: u8,
+        value: u32,
+        source: MaxwellMethodSource,
+    },
     TessellationMode {
         value: MaxwellThreeDTessellationMode,
         source: MaxwellMethodSource,
@@ -711,6 +723,7 @@ pub enum MaxwellThreeDShaderBindingWrite {
 impl MaxwellThreeDShaderBindingWrite {
     pub(super) const fn source(self) -> MaxwellMethodSource {
         match self {
+            Self::GeometryPassthroughMask { source, .. } => source,
             Self::TessellationMode { source, .. }
             | Self::ProgramRegionAddressUpper { source, .. }
             | Self::ProgramRegionAddressLower { source, .. }

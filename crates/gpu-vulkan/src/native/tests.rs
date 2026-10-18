@@ -14,8 +14,6 @@ fn ready(execution: &mut NativeGpuExecution, submission: &NativeSubmission) {
     while !execution
         .prepare(ExecutionBatch {
             commands: submission,
-            definitions: &[],
-            retirements: &[],
         })
         .unwrap()
     {
@@ -25,6 +23,157 @@ fn ready(execution: &mut NativeGpuExecution, submission: &NativeSubmission) {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+fn captured_vertex_fragment(
+    configuration: &nixe_gpu::shader_compilation::Configuration,
+) -> Arc<GuestShaderCode> {
+    captured_graphics(configuration, None)
+}
+
+fn captured_graphics(
+    configuration: &nixe_gpu::shader_compilation::Configuration,
+    fragment: Option<([u32; 20], Vec<u64>)>,
+) -> Arc<GuestShaderCode> {
+    use nixe_gpu::shader_compilation::{ShaderInputs, StageSource};
+    use nixe_shader_recompiler::{
+        Compiler, Stage,
+        environment::{EnvironmentMetadata, Observations, SnapshotEnvironment},
+        maxwell::header::ProgramHeader,
+        types::ProgramOffset,
+    };
+    let attribute = |store: bool, offset: u64| {
+        (if store {
+            0xeff0_0000_0000_0000
+        } else {
+            0xefd8_0000_0000_0000
+        }) | (3 << 47)
+            | (255 << 39)
+            | (offset << 20)
+            | (7 << 16)
+            | (255 << 8)
+    };
+    let exit = 0xe300_0000_0007_000f;
+    let (fragment_header, fragment) = fragment.unwrap_or_else(|| {
+        let mut header = [0; 20];
+        header[6] = 0xaa;
+        header[18] = 15;
+        (
+            header,
+            (0..4u64)
+                .map(|component| 0xe000_0000_0007_ff00 | ((32 + component) << 30) | component)
+                .chain([exit])
+                .collect(),
+        )
+    });
+    let mut compiler = Compiler::new().unwrap();
+    let mut stages = Vec::new();
+    for (stage, instructions) in [
+        (
+            Stage::VertexB,
+            vec![
+                attribute(false, 0x80),
+                attribute(true, 0x70),
+                attribute(false, 0x90),
+                attribute(true, 0x80),
+                exit,
+            ],
+        ),
+        (Stage::Fragment, fragment),
+    ] {
+        let header = if stage == Stage::Fragment {
+            fragment_header
+        } else {
+            [0; 20]
+        };
+        let bytes: [u8; 80] = header
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let mut pc = 0x50;
+        let mut environment = SnapshotEnvironment::new(
+            EnvironmentMetadata {
+                stage,
+                sph: ProgramHeader::from_bytes(&bytes),
+                ..Default::default()
+            },
+            Observations {
+                instructions: instructions
+                    .into_iter()
+                    .map(|word| {
+                        if pc % 32 == 0 {
+                            pc += 8;
+                        }
+                        let address = ProgramOffset(pc);
+                        pc += 8;
+                        (address, word)
+                    })
+                    .collect(),
+                viewport_transform_state: Some(1),
+                ..Default::default()
+            },
+        );
+        let id = compiler
+            .translate(
+                &mut environment,
+                &configuration.host,
+                &configuration.settings,
+            )
+            .unwrap();
+        stages.push(StageSource {
+            environment,
+            info: compiler.program(id).unwrap().info.clone(),
+            binding_group: Some(0),
+        });
+    }
+    Arc::new(ShaderInputs::new(stages.into(), configuration))
+}
+
+#[test]
+fn instance_groups_require_matching_geometry_and_contiguous_nonoverflowing_ids() {
+    let direct = |first, count, vertex| Draw::Direct {
+        vertices: 3,
+        instances: count,
+        first_vertex: vertex,
+        first_instance: first,
+    };
+    let mut draw = direct(6, 3, 2);
+    assert!(append_instances(&mut draw, direct(9, 2, 2)));
+    assert!(matches!(
+        draw,
+        Draw::Direct {
+            first_instance: 6,
+            instances: 5,
+            ..
+        }
+    ));
+    assert!(!append_instances(&mut draw, direct(12, 1, 2)));
+    assert!(!append_instances(&mut draw, direct(11, 1, 3)));
+    assert!(!append_instances(
+        &mut direct(0, u32::MAX, 0),
+        direct(u32::MAX, 1, 0)
+    ));
+    let indexed = |first, offset| Draw::Indexed {
+        indices: 6,
+        instances: 1,
+        first_index: 3,
+        vertex_offset: offset,
+        first_instance: first,
+    };
+    let mut draw = indexed(4, -2);
+    assert!(!append_instances(&mut draw, indexed(5, -1)));
+    assert!(!append_instances(&mut draw, direct(5, 1, 3)));
+    assert!(append_instances(&mut draw, indexed(5, -2)));
+    assert!(matches!(
+        draw,
+        Draw::Indexed {
+            first_instance: 4,
+            instances: 2,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -61,11 +210,7 @@ fn known_completion_versions_do_not_create_gpu_work_and_stale_acknowledgements_c
         };
         ready(&mut execution, &batch);
         execution
-            .submit(ExecutionBatch {
-                commands: &batch,
-                definitions: &[],
-                retirements: &[],
-            })
+            .submit(ExecutionBatch { commands: &batch })
             .unwrap();
         assert!(
             !execution.request_completion_wakeup().unwrap(),
@@ -222,11 +367,7 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
     };
     ready(&mut execution, &batch);
     execution
-        .submit(ExecutionBatch {
-            commands: &batch,
-            definitions: &[],
-            retirements: &[],
-        })
+        .submit(ExecutionBatch { commands: &batch })
         .unwrap();
     let submitted = execution.residency.device().submitted_tick();
     assert!(execution.service_cpu_visibility(request).unwrap().is_none());
@@ -396,11 +537,7 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     let first = submission(1, 0x37);
     ready(&mut execution, &first);
     execution
-        .submit(ExecutionBatch {
-            definitions: &[],
-            retirements: &[],
-            commands: &first,
-        })
+        .submit(ExecutionBatch { commands: &first })
         .unwrap();
     execution
         .residency
@@ -439,11 +576,7 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     let second = submission(2, 0x71);
     ready(&mut execution, &second);
     execution
-        .submit(ExecutionBatch {
-            definitions: &[],
-            retirements: &[],
-            commands: &second,
-        })
+        .submit(ExecutionBatch { commands: &second })
         .unwrap();
     assert!(execution.poll_completion().unwrap().is_none());
     let page = whole.pages().next().unwrap();
@@ -470,8 +603,6 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     ready(&mut execution, &independent);
     execution
         .submit(ExecutionBatch {
-            definitions: &[],
-            retirements: &[],
             commands: &independent,
         })
         .unwrap();
@@ -537,11 +668,7 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     ready(&mut execution, &prefix);
     let uploaded_before_release = execution.residency.statistics().cpu_uploaded_bytes;
     execution
-        .submit(ExecutionBatch {
-            definitions: &[],
-            retirements: &[],
-            commands: &prefix,
-        })
+        .submit(ExecutionBatch { commands: &prefix })
         .unwrap();
     let released_tick = execution.completions.back().unwrap().work.unwrap().tick();
     assert!(released_tick <= execution.residency.device().submitted_tick());
@@ -564,8 +691,6 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     ready(&mut execution, &following);
     execution
         .submit(ExecutionBatch {
-            definitions: &[],
-            retirements: &[],
             commands: &following,
         })
         .unwrap();
@@ -631,6 +756,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         return;
     };
     let monitor = device.validation_monitor();
+    let shader = captured_vertex_fragment(&device.profile().shader_compiler);
     let mut execution = NativeGpuExecution::new(
         device,
         ShaderNamespace {
@@ -687,14 +813,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         identity: PreparedStateId::new(1, 1),
         program: Arc::new(GuestProgram {
             identity: PreparedStateId::new(1, 1),
-            shader: Arc::new(GuestShaderCode {
-                identity: ssa::artifact::ContentId::of(b"native-draw-test", &[]),
-                functions: crate::residency::execution::tests::vertex_fragment()
-                    .into_vec()
-                    .into_iter()
-                    .map(Arc::new)
-                    .collect(),
-            }),
+            shader,
             bindings: Box::new([]),
             shared_memory_bytes: 0,
         }),
@@ -706,6 +825,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         colors: Box::new([image]),
         depth_stencil: None,
         parameters: Arc::new(GuestDrawParameters {
+            shader_state: Default::default(),
             identity: PreparedStateId::new(2, 1),
             vertices: Box::new([GuestVertexLayout {
                 binding: 0,
@@ -775,29 +895,6 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         final_segment: true,
         commands: vec![draw; 16],
     };
-    // Captured future state may compile before earlier FIFO effects execute.
-    // Even duplicate lookahead must leave every canonical resource untouched.
-    for command in &submission.commands {
-        execution.precompile(command);
-    }
-    assert!(execution.precompiling.len() <= 1);
-    let started = Instant::now();
-    while !execution.precompiling.is_empty() {
-        execution.service_host().unwrap();
-        assert!(started.elapsed() < Duration::from_secs(10));
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert!(execution.drawings.is_empty());
-    assert!(execution.images.is_empty());
-    assert_eq!(execution.programs.usage(), (0, 0));
-    assert_eq!(execution.statistics.prepared_graphics, 0);
-    assert_eq!(execution.residency.statistics().cpu_uploaded_bytes, 0);
-    assert_eq!(execution.residency.device().submitted_tick(), 0);
-    assert_eq!(execution.descriptors.statistics().allocated, 0);
-    assert!(matches!(
-        execution.graphics.values().next().unwrap(),
-        Graphics::Pipeline { .. }
-    ));
     ready(&mut execution, &submission);
     assert_eq!(execution.statistics.prepared_draws, 1);
     // Identical recompiled code can have a new allocation after cold-cache
@@ -806,7 +903,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let program = Arc::make_mut(&mut recaptured.program);
     program.shader = Arc::new((*program.shader).clone());
     let prepared_graphics = execution.statistics.prepared_graphics;
-    assert!(execution.graphics(&Arc::new(recaptured), true).unwrap());
+    assert!(execution.graphics(&Arc::new(recaptured)).unwrap());
     assert_eq!(execution.statistics.prepared_graphics, prepared_graphics);
     for frontend in 1..=2 {
         let submission = NativeSubmission {
@@ -818,8 +915,6 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         execution
             .submit(ExecutionBatch {
                 commands: &submission,
-                definitions: &[],
-                retirements: &[],
             })
             .unwrap();
         assert_eq!(
@@ -852,11 +947,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     };
     ready(&mut execution, &prefix);
     let first = execution
-        .submit(ExecutionBatch {
-            commands: &prefix,
-            definitions: &[],
-            retirements: &[],
-        })
+        .submit(ExecutionBatch { commands: &prefix })
         .unwrap();
     assert!(execution.poll_completion().unwrap().is_none());
     match backing.pages().next().unwrap().visibility_state() {
@@ -901,8 +992,6 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let second = execution
         .submit(ExecutionBatch {
             commands: &final_segment,
-            definitions: &[],
-            retirements: &[],
         })
         .unwrap();
     assert_ne!(first, second);
@@ -941,11 +1030,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     ready(&mut execution, &pending);
     let submitted = execution.residency.device().queue_usage().submitted_tick;
     let token = execution
-        .submit(ExecutionBatch {
-            commands: &pending,
-            definitions: &[],
-            retirements: &[],
-        })
+        .submit(ExecutionBatch { commands: &pending })
         .unwrap();
     assert_eq!(
         execution.residency.device().queue_usage().submitted_tick,
@@ -966,11 +1051,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         )
         .unwrap();
     let repeated = execution
-        .submit(ExecutionBatch {
-            commands: &pending,
-            definitions: &[],
-            retirements: &[],
-        })
+        .submit(ExecutionBatch { commands: &pending })
         .unwrap();
     assert_eq!(
         execution.residency.device().queue_usage().submitted_tick,
@@ -1039,8 +1120,6 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             execution
                 .submit(ExecutionBatch {
                     commands: &submission,
-                    definitions: &[],
-                    retirements: &[],
                 })
                 .unwrap(),
         );
@@ -1087,16 +1166,9 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     uniform_draw.identity = PreparedStateId::new(20, 1);
     uniform_draw.program = Arc::new(GuestProgram {
         identity: PreparedStateId::new(21, 1),
-        shader: Arc::new(GuestShaderCode {
-            identity: ssa::artifact::ContentId::of(b"streamed-uniform-test", &[]),
-            functions: uniform_color_shader()
-                .into_vec()
-                .into_iter()
-                .map(Arc::new)
-                .collect(),
-        }),
+        shader: uniform_color_shader(&execution.device_profile().shader_compiler),
         bindings: Box::new([(
-            ssa::ResourceId::new(42),
+            uniform_color_resource(),
             GuestBinding::Buffer(uniform_backing.clone()),
         )]),
         shared_memory_bytes: 0,
@@ -1119,7 +1191,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         }],
     };
     ready(&mut execution, &variant);
-    assert!(execution.graphics(&state, true).unwrap());
+    assert!(execution.graphics(&state).unwrap());
     let mut inputs = Vec::new();
     for (index, rgba) in [[0., 1., 0., 1.], [1., 0., 0., 1.], [0., 0., 1., 1.]]
         .into_iter()
@@ -1158,8 +1230,6 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             execution
                 .submit(ExecutionBatch {
                     commands: submission,
-                    definitions: &[],
-                    retirements: &[],
                 })
                 .unwrap(),
         );
@@ -1213,11 +1283,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let readbacks = execution.residency.statistics().native_readback_bytes;
     let scopes = execution.recording_statistics().rendering_scopes;
     execution
-        .submit(ExecutionBatch {
-            commands: &inline,
-            definitions: &[],
-            retirements: &[],
-        })
+        .submit(ExecutionBatch { commands: &inline })
         .unwrap();
     assert_eq!(execution.residency.device().submitted_tick(), submitted);
     assert_eq!(
@@ -1252,11 +1318,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     for _ in 0..12 {
         ready(&mut execution, repeated);
         execution
-            .submit(ExecutionBatch {
-                commands: repeated,
-                definitions: &[],
-                retirements: &[],
-            })
+            .submit(ExecutionBatch { commands: repeated })
             .unwrap();
         execution
             .wait_for_completion_timeout(Duration::from_secs(5))
@@ -1306,8 +1368,6 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     execution
         .submit(ExecutionBatch {
             commands: &submission,
-            definitions: &[],
-            retirements: &[],
         })
         .unwrap();
     let bytes = cpu_read(&mut execution.residency, &backing);
@@ -1329,6 +1389,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         Arc::clone(&device.owner),
         device.profile().limits,
         2,
+        device.profile().null_descriptor,
     ));
     let mut retained = Vec::new();
     let before = execution.statistics.draws;
@@ -1340,7 +1401,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         let mut program = (*source.program).clone();
         program.identity = PreparedStateId::new(2000 + index, 1);
         program.bindings = Box::new([(
-            ssa::ResourceId::new(42),
+            uniform_color_resource(),
             GuestBinding::Buffer(backing.snapshot_subrange(0, 16).unwrap()),
         )]);
         source.program = Arc::new(program);
@@ -1362,8 +1423,6 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         execution
             .submit(ExecutionBatch {
                 commands: &submission,
-                definitions: &[],
-                retirements: &[],
             })
             .unwrap();
         retained.push((allocation, submission));
@@ -1375,18 +1434,100 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     drop(retained);
     render_area_preserves_undefined_padding(&mut execution, &state);
     window_depth_reconstructs_reads_and_clamps_exports(&mut execution, &state);
+    contiguous_instances_preserve_vertex_inputs(&mut execution, &state, &backing);
     drop(pixels);
     execution.teardown().unwrap();
     drop(execution);
     monitor.check().unwrap();
 }
 
+fn contiguous_instances_preserve_vertex_inputs(
+    execution: &mut NativeGpuExecution,
+    state: &Arc<GuestDrawState>,
+    backing: &nixe_memory::CanonicalBackingRange,
+) {
+    let (colors, color_backing) = backing_allocation(256, 256, 0);
+    let values: [f32; 18] = [
+        0., 0., 0., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 1.,
+    ];
+    colors
+        .write(
+            0,
+            &values
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let mut draw = (**state).clone();
+    draw.identity = PreparedStateId::new(3001, 1);
+    let parameters = Arc::make_mut(&mut draw.parameters);
+    parameters.identity = PreparedStateId::new(3002, 1);
+    parameters.shader_state.base_instance = 3;
+    parameters.vertices[0].attributes = Box::new([parameters.vertices[0].attributes[0]]);
+    let mut layouts = parameters.vertices.to_vec();
+    layouts.push(GuestVertexLayout {
+        binding: 1,
+        stride: 12,
+        step: VertexStepMode::Instance,
+        attributes: Box::new([nixe_gpu::VertexAttribute {
+            shader_location: 1,
+            format: VertexFormat::Float32x3,
+            offset: 0,
+        }]),
+    });
+    parameters.vertices = layouts.into();
+    let mut buffers = draw.vertices.to_vec();
+    buffers.push(GuestVertexBuffer {
+        binding: 1,
+        backing: color_backing.snapshot_subrange(0, 72).unwrap(),
+    });
+    draw.vertices = buffers.into();
+    let draw = Arc::new(draw);
+    let command = |first_instance| NativeCommand::Draw {
+        state: Arc::clone(&draw),
+        arguments: DrawArguments::NonIndexed {
+            first_vertex: 0,
+            vertex_count: 3,
+            first_instance,
+            instance_count: 1,
+        },
+    };
+    for grouped in [false, true] {
+        let before = execution.recording_statistics().draw_calls;
+        let groups = if grouped {
+            vec![vec![command(3), command(4), command(5)]]
+        } else {
+            (3..6).map(|id| vec![command(id)]).collect()
+        };
+        for commands in groups {
+            let submission = NativeSubmission {
+                frontend: FrontendSubmissionId::new(3000),
+                segment: FrontendSubmissionSegment::FIRST,
+                final_segment: true,
+                commands,
+            };
+            ready(execution, &submission);
+            execution
+                .submit(ExecutionBatch {
+                    commands: &submission,
+                })
+                .unwrap();
+        }
+        let bytes = cpu_read(&mut execution.residency, backing);
+        assert!(bytes.chunks_exact(4).all(|pixel| pixel == [0, 0, 255, 255]));
+        assert_eq!(
+            execution.recording_statistics().draw_calls - before,
+            if grouped { 1 } else { 3 }
+        );
+        while execution.wait_for_completion().unwrap().is_some() {}
+    }
+}
+
 fn window_depth_reconstructs_reads_and_clamps_exports(
     execution: &mut NativeGpuExecution,
     state: &Arc<GuestDrawState>,
 ) {
-    use ssa::{Constant, FunctionBuilder, Op, Terminator, Type};
-    let pc = ShaderSourceLocation::new(0);
     let (vertices, vertex_backing) = backing_allocation(256, 256, 0);
     let data = [
         -1_f32, -1., 0.25, 0., 0., 0., 3., -1., 0.25, 0., 0., 0., -1., 3., 0.25, 0., 0., 0.,
@@ -1453,129 +1594,24 @@ fn window_depth_reconstructs_reads_and_clamps_exports(
             );
         }
         parameters.viewport = Some(viewport);
-        let mut b = FunctionBuilder::new(ShaderStage::Fragment);
-        let e = b.entry();
-        let z = b.emit(
-            e,
-            pc,
-            Op::Input {
-                location: ShaderIoLocation::Position,
-                component: 2,
-                ty: Type::F32,
-            },
-            vec![],
-        )[0];
-        let quarter = b.emit(
-            e,
-            pc,
-            Op::Constant(Constant {
-                ty: Type::F32,
-                bits: u64::from(0.25_f32.to_bits()),
-            }),
-            vec![],
-        )[0];
-        let half = b.emit(
-            e,
-            pc,
-            Op::Constant(Constant {
-                ty: Type::F32,
-                bits: u64::from(0.5_f32.to_bits()),
-            }),
-            vec![],
-        )[0];
-        let r = b.emit(
-            e,
-            pc,
-            Op::Binary {
-                op: ssa::Binary::Multiply,
-                ty: Type::F32,
-                float_control: ShaderFloatControl::PRECISE,
-            },
-            vec![z.into(), quarter.into()],
-        )[0];
-        let r = b.emit(
-            e,
-            pc,
-            Op::Binary {
-                op: ssa::Binary::Add,
-                ty: Type::F32,
-                float_control: ShaderFloatControl::PRECISE,
-            },
-            vec![r.into(), half.into()],
-        )[0];
-        b.emit(
-            e,
-            pc,
-            Op::Output {
-                location: ShaderIoLocation::Color(0),
-                component: 0,
-                ty: Type::F32,
-            },
-            vec![r.into()],
-        );
+        let mut header = [0; 20];
+        header[18] = 1;
+        header[19] = if explicit { 2 } else { 0 };
+        let mut instructions = vec![
+            0xe000_0000_0007_ff00 | (30 << 30),
+            0x1e00_0000_0007_0000 | (u64::from(0.25_f32.to_bits()) << 20),
+            0x0800_0000_0007_0000 | (u64::from(0.5_f32.to_bits()) << 20),
+        ];
         if explicit {
-            let z = b.emit(
-                e,
-                pc,
-                Op::Constant(Constant {
-                    ty: Type::F32,
-                    bits: u64::from(0.75_f32.to_bits()),
-                }),
-                vec![],
-            )[0];
-            b.emit(
-                e,
-                pc,
-                Op::Output {
-                    location: ShaderIoLocation::FragmentDepth,
-                    component: 0,
-                    ty: Type::F32,
-                },
-                vec![z.into()],
-            );
+            instructions.push(0x0100_0000_0007_f005 | (u64::from(0.75_f32.to_bits()) << 20));
         }
-        b.terminate(e, pc, Terminator::Return);
-        let mut fragment = b.finish().unwrap();
-        fragment.inputs.push(
-            ShaderInterfaceElement::new(
-                ShaderIoLocation::Position,
-                2,
-                ShaderScalarType::Float32,
-                None,
-            )
-            .unwrap(),
-        );
-        fragment.outputs.push(
-            ShaderInterfaceElement::new(
-                ShaderIoLocation::Color(0),
-                0,
-                ShaderScalarType::Float32,
-                None,
-            )
-            .unwrap(),
-        );
-        if explicit {
-            fragment.outputs.push(
-                ShaderInterfaceElement::new(
-                    ShaderIoLocation::FragmentDepth,
-                    0,
-                    ShaderScalarType::Float32,
-                    None,
-                )
-                .unwrap(),
-            );
-        }
-        fragment.verify().unwrap();
+        instructions.push(0xe300_0000_0007_000f);
         let program = Arc::make_mut(&mut draw.program);
         program.identity = PreparedStateId::new(6000 + index as u64, 1);
-        program.shader = Arc::new(GuestShaderCode {
-            identity: ssa::artifact::ContentId::of(b"window-depth-test", &[&[explicit as u8]]),
-            functions: vec![
-                Arc::clone(&state.program.shader.functions[0]),
-                Arc::new(fragment),
-            ]
-            .into_boxed_slice(),
-        });
+        program.shader = captured_graphics(
+            &execution.device_profile().shader_compiler,
+            Some((header, instructions)),
+        );
         let submission = NativeSubmission {
             frontend: FrontendSubmissionId::new(4000 + index as u64),
             segment: FrontendSubmissionSegment::FIRST,
@@ -1594,8 +1630,6 @@ fn window_depth_reconstructs_reads_and_clamps_exports(
         execution
             .submit(ExecutionBatch {
                 commands: &submission,
-                definitions: &[],
-                retirements: &[],
             })
             .unwrap();
         let guest_z: f32 = transform.map_or(0.625, |[scale, offset]| 0.625 * scale + offset);
@@ -1689,8 +1723,6 @@ fn render_area_preserves_undefined_padding(
         execution
             .submit(ExecutionBatch {
                 commands: submission,
-                definitions: &[],
-                retirements: &[],
             })
             .unwrap();
     }
@@ -1715,59 +1747,37 @@ fn render_area_preserves_undefined_padding(
     }
 }
 
-fn uniform_color_shader() -> Box<[ssa::Function]> {
-    use ssa::*;
-    let vertex = crate::residency::execution::tests::vertex_fragment()[0].clone();
-    let mut builder = FunctionBuilder::new(ShaderStage::Fragment);
-    let entry = builder.entry();
-    let pc = ShaderSourceLocation::new(8);
-    for component in 0..4 {
-        let address = builder.emit(
-            entry,
-            pc,
-            Op::Constant(Constant {
-                ty: Type::U32,
-                bits: u64::from(component * 4),
-            }),
-            vec![],
-        )[0];
-        let value = builder.emit(
-            entry,
-            pc,
-            Op::Load {
-                space: MemorySpace::Storage,
-                resource: Some(ResourceId::new(42)),
-                address_type: Type::U32,
-                ty: Type::F32,
-            },
-            vec![address.into()],
-        )[0];
-        builder.emit(
-            entry,
-            pc,
-            Op::Output {
-                location: ShaderIoLocation::Color(0),
-                component,
-                ty: Type::F32,
-            },
-            vec![value.into()],
-        );
-    }
-    builder.terminate(entry, pc, Terminator::Return);
-    let mut fragment = builder.finish().unwrap();
-    fragment.outputs = (0..4)
+fn uniform_color_shader(
+    configuration: &nixe_gpu::shader_compilation::Configuration,
+) -> Arc<GuestShaderCode> {
+    let mut header = [0; 20];
+    header[18] = 15;
+    let instructions = (0..4u64)
         .map(|component| {
-            ShaderInterfaceElement::new(
-                ShaderIoLocation::Color(0),
-                component,
-                ShaderScalarType::Float32,
-                None,
-            )
-            .unwrap()
+            0xef90_0000_0000_0000
+                | (4 << 48)
+                | ((component * 4) << 20)
+                | (7 << 16)
+                | (255 << 8)
+                | component
         })
+        .chain([0xe300_0000_0007_000f])
         .collect();
-    fragment.optimize().unwrap();
-    Box::new([vertex, fragment])
+    captured_graphics(configuration, Some((header, instructions)))
+}
+
+fn uniform_color_resource() -> nixe_gpu::shader_module::ResourceId {
+    use nixe_shader_recompiler::{
+        Stage,
+        artifact::{ConstantBufferDescriptor, ResourceSource},
+    };
+    nixe_gpu::shader_module::guest_resource(
+        Stage::Fragment,
+        &ResourceSource::ConstantBuffer(ConstantBufferDescriptor::default()),
+        0,
+        0,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -1855,8 +1865,6 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
         execution
             .submit(ExecutionBatch {
                 commands: &submission,
-                definitions: &[],
-                retirements: &[],
             })
             .unwrap();
         execution
@@ -1899,89 +1907,160 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
 }
 
 #[test]
-fn speculative_compilation_failure_is_reported_only_when_ordered_work_consumes_it() {
-    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+fn captured_compute_dispatch_reuses_prepared_pipeline_without_old_ir() {
+    use nixe_gpu::shader_compilation::{ShaderInputs, StageSource};
+    use nixe_shader_recompiler::{
+        Stage,
+        artifact::ShaderInfo,
+        environment::{EnvironmentMetadata, Observations, SnapshotEnvironment},
+        types::ProgramOffset,
+    };
+    let Some(device) = support::device_for_test(ApiPreference::Compatibility12) else {
         return;
     };
     let monitor = device.validation_monitor();
+    let inputs = Arc::new(ShaderInputs::new(
+        vec![StageSource {
+            environment: SnapshotEnvironment::new(
+                EnvironmentMetadata {
+                    stage: Stage::Compute,
+                    workgroup_size: [4, 1, 1],
+                    ..Default::default()
+                },
+                Observations {
+                    instructions: [(ProgramOffset(8), 0xe300_0000_0007_000f)].into(),
+                    ..Default::default()
+                },
+            ),
+            info: ShaderInfo::default(),
+            binding_group: None,
+        }]
+        .into(),
+        &device.profile().shader_compiler,
+    ));
+    let program = Arc::new(GuestProgram {
+        identity: PreparedStateId::new(1, 1),
+        shader: inputs,
+        bindings: Box::new([]),
+        shared_memory_bytes: 0,
+    });
     let mut execution = NativeGpuExecution::new(
         device,
         ShaderNamespace {
-            guest: *b"compile-failure!",
+            guest: *b"new-compute-test",
             isa: 1,
         },
         CacheConfiguration::default(),
         4 * 1024 * 1024,
     )
     .unwrap();
-    let mut b = ssa::FunctionBuilder::new(ShaderStage::Compute);
-    b.terminate(
-        b.entry(),
-        ShaderSourceLocation::new(0),
-        ssa::Terminator::Return,
-    );
-    // A compute shader without a validated workgroup size cannot be emitted.
-    let function = b.finish().unwrap();
-    let future = NativeCommand::Dispatch {
-        program: Arc::new(GuestProgram {
-            identity: PreparedStateId::new(1, 1),
-            shader: Arc::new(GuestShaderCode {
-                identity: ssa::artifact::ContentId::of(b"invalid-future-compute", &[]),
-                functions: Box::new([Arc::new(function)]),
-            }),
-            bindings: Box::new([]),
-            shared_memory_bytes: 0,
-        }),
-        groups: [1, 1, 1],
-    };
-    execution.precompile(&future);
-    let started = Instant::now();
-    while !execution.precompiling.is_empty() {
-        execution.service_host().unwrap();
-        assert!(started.elapsed() < Duration::from_secs(10));
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    let (_, backing) = backing_allocation(4096, 4096, 0x19);
-    let earlier = NativeSubmission {
-        frontend: FrontendSubmissionId::new(1),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: true,
-        commands: vec![NativeCommand::WriteMemory {
-            target: backing.clone(),
-            offset: 4,
-            bytes: Arc::from([0x43; 4]),
-            after_prior_work: true,
-        }],
-    };
-    ready(&mut execution, &earlier);
-    execution
-        .submit(ExecutionBatch {
-            commands: &earlier,
-            definitions: &[],
-            retirements: &[],
-        })
-        .unwrap();
-    assert!(execution.poll_completion().unwrap().is_some());
-    assert_eq!(
-        &cpu_read(&mut execution.residency, &backing)[4..8],
-        &[0x43; 4]
-    );
-    let later = NativeSubmission {
-        frontend: FrontendSubmissionId::new(2),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: true,
-        commands: vec![future],
-    };
-    assert!(
+    for value in 1..=2 {
+        let batch = NativeSubmission {
+            frontend: FrontendSubmissionId::new(value),
+            segment: FrontendSubmissionSegment::FIRST,
+            final_segment: true,
+            commands: vec![NativeCommand::Dispatch {
+                program: Arc::clone(&program),
+                groups: [value as u32, 1, 1],
+            }],
+        };
+        ready(&mut execution, &batch);
         execution
-            .prepare(ExecutionBatch {
-                commands: &later,
-                definitions: &[],
-                retirements: &[]
-            })
-            .is_err()
-    );
-    execution.teardown().unwrap();
+            .submit(ExecutionBatch { commands: &batch })
+            .unwrap();
+        execution
+            .wait_for_completion_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(execution.statistics.dispatches, 2);
+    assert_eq!(execution.computing.len(), 1);
     drop(execution);
     monitor.check().unwrap();
+}
+
+#[test]
+fn recorder_prefixes_retain_gpu_versions_without_allocating_completion_records() {
+    for read_before_final in [false, true] {
+        let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+            return;
+        };
+        let monitor = device.validation_monitor();
+        let mut execution = NativeGpuExecution::new(
+            device,
+            ShaderNamespace {
+                guest: *b"prefix-recording",
+                isa: 1,
+            },
+            CacheConfiguration::default(),
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+        let (_, backing) = backing_allocation(4096, 4096, 0x19);
+        let buffer = execution
+            .residency
+            .buffer_for(backing.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
+            .unwrap();
+        assert_eq!(
+            execution
+                .residency
+                .write_buffer(buffer, 0, &[0x37; 16])
+                .unwrap()
+                .consumed,
+            16
+        );
+        for value in 1..=128u8 {
+            let prefix = NativeSubmission {
+                frontend: FrontendSubmissionId::new(1),
+                segment: FrontendSubmissionSegment::FIRST,
+                final_segment: false,
+                commands: vec![NativeCommand::WriteMemory {
+                    target: backing.clone(),
+                    offset: 64,
+                    bytes: Arc::from([value; 16]),
+                    after_prior_work: true,
+                }],
+            };
+            ready(&mut execution, &prefix);
+            execution
+                .record(ExecutionBatch { commands: &prefix })
+                .unwrap();
+            assert!(execution.completions.is_empty());
+            assert!(execution.poll_completion().unwrap().is_none());
+        }
+        assert_eq!(execution.statistics.batches, 128);
+        assert_eq!(execution.residency.device().submitted_tick(), 0);
+        if read_before_final {
+            let bytes = cpu_read(&mut execution.residency, &backing);
+            assert_eq!(&bytes[..16], &[0x37; 16]);
+            assert_eq!(&bytes[64..80], &[128; 16]);
+            assert!(
+                execution.completions.is_empty(),
+                "CPU visibility must not synthesize a delivery completion"
+            );
+            assert!(execution.poll_completion().unwrap().is_none());
+        }
+        let tail = NativeSubmission {
+            frontend: FrontendSubmissionId::new(1),
+            segment: FrontendSubmissionSegment::FIRST,
+            final_segment: true,
+            commands: vec![NativeCommand::WaitForIdle],
+        };
+        ready(&mut execution, &tail);
+        let token = execution
+            .submit(ExecutionBatch { commands: &tail })
+            .unwrap();
+        assert_eq!(execution.completions.len(), 1);
+        let completed = execution
+            .wait_for_completion_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.submission(), token);
+        let bytes = cpu_read(&mut execution.residency, &backing);
+        assert_eq!(&bytes[..16], &[0x37; 16]);
+        assert_eq!(&bytes[64..80], &[128; 16]);
+        execution.teardown().unwrap();
+        drop(execution);
+        monitor.check().unwrap();
+    }
 }

@@ -1,32 +1,23 @@
 # Native shader, descriptor and pipeline caches
 
-This is the Task 09 cache path. It uses semantic SSA/SPIR-V and the independent
-Vulkan device/queue; it imports no wgpu cache configuration, WGSL/Naga identity,
-per-resource variant quota or frame-count retirement rule.
+The renderer uses captured Maxwell inputs and owned SPIR-V artifacts from
+`nixe-shader-recompiler`. Host conversion and presentation shaders use the same
+native module, pipeline and descriptor caches.
 
 ## Identity and prepared references
 
-The concrete frontend selects a `ShaderNamespace` once. Maxwell capture produces
-an immutable, versioned content identity from explicitly encoded stage/header,
-code, bounded indirect targets and guest specialization. GPU virtual addresses,
-CPU epochs and mappings prove freshness separately; identical code relocated to
-another address reuses its translation. Current captures resolve diagnostic PCs
-against current mappings, rather than cached source addresses. Both graphics and
-headerless QMD compute have this boundary.
+The concrete frontend selects a `ShaderNamespace` once. Captured instruction,
+constant-buffer and texture observations determine immutable source identity.
+GPU virtual addresses, CPU epochs and mapping generations prove freshness
+separately. Bit-identical inputs retain compilation identity after relocation or
+an equivalent write.
 
-`MaxwellShaderCompiler` caches semantic programs using the shared bounded
-`CompilationCache`. Its actual decode/SSA/link elapsed time is recorded only on
-misses. Fresh captures remain with prepared state; cached code contains no old
-mapping freshness proofs. CPU/staged writes and indirect table bindings invalidate
-only their relevant dependencies. Event/revision-driven preparation is wired in
-task 11; no cache API hashes guest registers or polls every dependency per draw.
-
-`ShaderCompiler` independently keys artifacts by guest/ISA namespace, compiler
-schema, canonical source identity and exact emission options. Its callback can
-borrow an already-ready `Arc<MaxwellShaderCode>` through the function-view callback:
-no SSA clone or native-to-old-IR bridge is required. Compose completed frontend
-values before requesting host work; callbacks must not wait for newly submitted
-jobs on the same bounded pool. Disk hits bypass that callback and SPIR-V emission.
+`ShaderCompiler::request_guest` consumes owned `ShaderInputs` and the enabled
+`Configuration`. Workers retain reusable compiler scratch; published artifacts
+contain no IR IDs or arena references. Stage keys include linked runtime state,
+incoming binding counters and renderer legalization. Unchanged stages can be
+reused before SPIR-V emission. Disk hits restore complete stage metadata and
+bypass translation/emission. No callback waits for nested work on the same pool.
 
 A returned shader's **native identity** follows its final SPIR-V code. Source
 variants or namespaces which produce identical code and the same ABI therefore
@@ -56,8 +47,7 @@ Pending results expose polling and bounded waits. The GPU owner can service
 visibility/control while waiting, retaining the required draw/dispatch in order.
 No worker owns a Vulkan queue. Each worker has a separate `VkPipelineCache`; its
 mutex excludes explicit checkpoint merge/serialization as well as creation, without
-serializing every worker on a global driver cache lock. The final scheduler
-composition and required-miss servicing are task 11.
+serializing every worker on a global driver cache lock. Required misses remain ordered while the owner services control and visibility.
 
 ## Vulkan pipeline construction
 
@@ -79,9 +69,8 @@ warm GPU regression or opaque driver-cache persistence/budget problems.
 Useful dynamic state is selected from enabled capabilities. Viewport/scissor,
 line width, depth bias, blend constants and stencil masks/references are dynamic;
 EDS1 also removes culling/winding and depth/stencil controls from static keys.
-Topology remains static: unrestricted dynamic topology has not been assumed from
-an extension/version bit. Task 10 records raster state/setters through the same normalized key and
-construction path. Additional dynamic states should be selected with real
+Topology remains static: unrestricted dynamic topology is not assumed from
+an extension/version bit. Raster state/setters use the same normalized keys. Additional dynamic states should be selected with real
 steady-state evidence, rather than enabling an extension list indiscriminately.
 
 When GPL is enabled, stages chain `VkShaderModuleCreateInfo` directly into pipeline
@@ -98,9 +87,9 @@ References: [graphics pipeline libraries](https://docs.vulkan.org/samples/latest
 ## Layouts and descriptors
 
 Layout keys reflect live dense set-zero bindings, stage visibility and push ranges.
-Buffer descriptors match the current emitter's std430 word-addressed SSBO storage
-class, including guest read-only constant buffers; the guest semantic role is not
-a Vulkan uniform-buffer declaration. Image/sampler classes remain separate.
+Constant buffers use uniform descriptors and storage buffers use storage descriptors.
+Reflection retains combined image/sampler arrays and uniform/storage texel buffers.
+Descriptor resource origins remain independent of shared Vulkan layout identity.
 
 Descriptor records key resource/view/sampler identities, offsets/ranges and layout
 signatures. Leases keep the actual Vulkan allocations/views/samplers alive, so raw
@@ -141,7 +130,3 @@ Gated real GPU submissions prove descriptors cannot recycle before completion.
 Vulkan 1.2/KHR and 1.3 paths are exercised on hardware. The hardware gate skips only
 when no real GPU is available; available-device initialization/validation failures
 fail. The focused strategy probe additionally verifies actual raster output bytes.
-
-Task 10 implements [native execution](../residency/execution/README.md); task 11 integrates
-these caches with guest batches and dirty revisions. Full-game cold/warm behavior,
-latency and working-set tuning remain those integration/performance gates.

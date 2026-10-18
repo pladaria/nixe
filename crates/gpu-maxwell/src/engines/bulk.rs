@@ -24,18 +24,19 @@ pub(super) fn stream_packet<E>(
         return Ok(false);
     }
     let data = if cb && first.method().0 == 0x238c {
-        &decoded[1..]
+        decoded.slice(1..)
     } else {
         decoded
     };
     if data.is_empty()
-        || !data.iter().all(|m| {
-            if cb {
-                (0x2390..=0x23fc).contains(&m.method().0)
-            } else {
-                m.method() == first.method()
-            }
-        })
+        || if cb {
+            // Decoded packet methods are monotonic; endpoint bounds prove the
+            // entire CB aperture without reconstructing each word's provenance.
+            data.first().unwrap().method().0 < 0x2390 || data.last().unwrap().method().0 > 0x23fc
+        } else {
+            data.first().unwrap().method() != first.method()
+                || data.last().unwrap().method() != first.method()
+        }
     {
         return Ok(false);
     }
@@ -62,7 +63,7 @@ pub(super) fn stream_packet<E>(
                 threed::preflight(
                     profile,
                     MaxwellMethodDispatch::emitted_by_mme(
-                        MaxwellMethodSource::decoded(*first, subchannel),
+                        MaxwellMethodSource::decoded(first, subchannel),
                         class,
                     ),
                     state,
@@ -72,17 +73,18 @@ pub(super) fn stream_packet<E>(
             let (upload, count) = threed::constant_buffer_words(profile, state, subchannel, data)
                 .map_err(MaxwellEngineStreamError::dispatch)?;
             consume(MaxwellEngineEvent {
+                instances: None,
                 operation: PendingEngineOperation::ThreeDInlineConstantBuffer(upload),
                 three_d: state.operation_state(),
                 compute: None,
-                inline_words: Some(&data[..count]),
+                inline_words: Some(data.slice(..count)),
             })
             .map_err(MaxwellEngineStreamError::Consumer)?;
             if count < data.len() {
                 threed::preflight(
                     profile,
                     MaxwellMethodDispatch::emitted_by_mme(
-                        MaxwellMethodSource::decoded(data[count], subchannel),
+                        MaxwellMethodSource::decoded(data.get(count).unwrap(), subchannel),
                         class,
                     ),
                     state,
@@ -100,7 +102,7 @@ pub(super) fn stream_packet<E>(
     }
     let mut cursor = 0;
     while cursor < data.len() {
-        let tail = &data[cursor..];
+        let tail = data.slice(cursor..);
         let (operation, count) = if class == threed::CLASS {
             let (profile, state) = channel.three_d_with_profile_mut();
             let (upload, count) = threed::embedded_words(profile, state, subchannel, tail)
@@ -118,10 +120,11 @@ pub(super) fn stream_packet<E>(
             (PendingEngineOperation::InlineToMemory(upload), count)
         };
         consume(MaxwellEngineEvent {
+            instances: None,
             operation,
             three_d: channel.three_d(),
             compute: Some(channel.compute()),
-            inline_words: Some(&tail[..count]),
+            inline_words: Some(tail.slice(..count)),
         })
         .map_err(MaxwellEngineStreamError::Consumer)?;
         cursor += count;

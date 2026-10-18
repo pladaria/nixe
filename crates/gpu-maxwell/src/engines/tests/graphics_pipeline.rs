@@ -1,10 +1,5 @@
 use std::sync::Arc;
 
-use nixe_memory::{
-    CpuVisibilityRequest, DeviceAccessDeclaration, DeviceVisibilityPoint, DeviceVisibilityRequest,
-    NonCpuDeviceId, VisibilityCoordinator, VisibilityCoordinatorError,
-};
-
 use super::*;
 
 #[test]
@@ -153,147 +148,6 @@ fn pending_notification_rejects_unimplemented_completions_and_context_switches()
 }
 
 #[test]
-fn draws_stop_consuming_vertex_streams_when_their_attributes_are_disabled() {
-    let vertices = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-    let color = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
-    let mut space = resource_address_space();
-    let vertex_address = map_resource(
-        &mut space,
-        vertices
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap(),
-        1,
-        0,
-    )
-    .offset()
-    .get();
-    let color_address = map_resource(
-        &mut space,
-        color.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
-        2,
-        0xfe,
-    )
-    .offset()
-    .get();
-    let mut channel = three_d_channel();
-    program_basic_draw_state(&mut channel, vertex_address);
-    program_color_target(&mut channel, 0, color_address, 0xd5);
-    program_three_d(&mut channel, 0x121c, 1);
-    let (shaders, mut cache) = translated_graphics_shaders();
-    for enabled in [true, false, true, false] {
-        program_three_d(
-            &mut channel,
-            0x1160,
-            0x3820_0000 | if enabled { 0 } else { 1 << 6 },
-        );
-        // The stale stream remains enabled, with an invalid range. A draw
-        // without array attributes must neither resolve nor bind its storage.
-        program_three_d(
-            &mut channel,
-            0x1c04,
-            if enabled {
-                (vertex_address >> 32) as u32
-            } else {
-                0
-            },
-        );
-        program_three_d(
-            &mut channel,
-            0x1c08,
-            if enabled { vertex_address as u32 } else { 0 },
-        );
-        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
-        let draw = &dispatch.operations()[0];
-        let mut roles = Vec::new();
-        draw.trigger()
-            .append_resource_roles(draw.state(), &mut roles);
-        assert_eq!(
-            roles.contains(&MaxwellThreeDResourceRole::VertexStream(0)),
-            enabled
-        );
-        let resources = cache
-            .resolved_resources_mut()
-            .resolve(draw.state(), &space, &roles, None, false, 16)
-            .unwrap();
-        assert_eq!(
-            resources
-                .resources()
-                .iter()
-                .any(|resource| resource.role() == MaxwellThreeDResourceRole::VertexStream(0)),
-            enabled
-        );
-        for repetition in 0..2 {
-            let work = lower_maxwell_three_d_operation_into_cache(
-                draw.state(),
-                &resources,
-                draw.trigger(),
-                Some(&shaders),
-                FrontendSubmissionId::new(1),
-                vec![],
-                &mut cache,
-            )
-            .unwrap();
-            let prepared = work
-                .submission()
-                .operations()
-                .iter()
-                .find_map(|op| match op.command() {
-                    GpuCommand::Draw(draw) => Some(&draw.prepared),
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(prepared.vertex_buffers.len(), usize::from(enabled));
-            if repetition == 1 {
-                assert!(work.resource_creations().is_empty());
-            }
-        }
-    }
-    // A genuinely consumed attribute still requires a resolved, enabled stream.
-    program_three_d(&mut channel, 0x1160, 0x3820_0000);
-    program_three_d(&mut channel, 0x1c00, 0x10);
-    let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
-    let draw = &dispatch.operations()[0];
-    let mut roles = Vec::new();
-    draw.trigger()
-        .append_resource_roles(draw.state(), &mut roles);
-    let resources =
-        resolve_maxwell_three_d_resources_for_roles(draw.state(), &space, &roles).unwrap();
-    assert!(matches!(
-        lower_maxwell_three_d_operation_into_cache(
-            draw.state(),
-            &resources,
-            draw.trigger(),
-            Some(&shaders),
-            FrontendSubmissionId::new(1),
-            vec![],
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::MissingResolvedResource {
-            role: MaxwellThreeDResourceRole::VertexStream(0)
-        })
-    ));
-}
-
-struct MaterializationWriteback;
-
-impl VisibilityCoordinator for MaterializationWriteback {
-    fn cache_cpu_page(
-        &self,
-        _request: DeviceVisibilityRequest,
-        _canonical_bytes: &[u8],
-    ) -> Result<(), VisibilityCoordinatorError> {
-        Ok(())
-    }
-
-    fn make_cpu_visible(
-        &self,
-        request: CpuVisibilityRequest,
-    ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
-        Ok(vec![0x5a; request.size].into_boxed_slice())
-    }
-}
-
-#[test]
 fn z_compression_selector_is_typed_depth_state_without_an_operation() {
     let mut channel = three_d_channel();
     let color_before = channel.three_d().render_targets().color().clone();
@@ -362,33 +216,6 @@ fn invalid_z_compression_values_are_rejected_atomically() {
         assert_eq!(channel.two_d(), &two_d_before);
         assert_eq!(channel.three_d(), &three_d_before);
     }
-}
-
-#[test]
-fn enabled_z_compression_without_a_depth_target_does_not_block_draw_preflight() {
-    let mut channel = three_d_channel();
-    let compression_dispatch = dispatch_method(&mut channel, 0x19cc / 4, 1).unwrap();
-    program_three_d(&mut channel, 0x121c, 0);
-    let resources =
-        resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellLoweringCache::default();
-
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source: compression_dispatch.methods()[0].method().source(),
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(10),
-            Vec::new(),
-            &lowering_capabilities(BackendFeatures::empty()),
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::ShaderTranslationRequired)
-    ));
 }
 
 #[test]
@@ -638,293 +465,6 @@ fn compression_threshold_reserved_values_and_failed_packet_keeps_valid_prefix() 
 }
 
 #[test]
-fn compressed_color_clears_materialize_resident_images_and_generic_writeback() {
-    for (format, kind) in [(0xd5, 0xfe), (0xd5, 0xdb), (0xca, 0xfe), (0xca, 0xe9)] {
-        check_compressed_color_materialization(format, kind, None);
-    }
-}
-
-#[test]
-fn zero_bandwidth_clear_masks_preserve_clear_materialization_and_compressed_import_errors() {
-    for mask in [0, 0x7ff8, 0x7fff] {
-        check_compressed_color_materialization(0xd5, 0xfe, Some(mask));
-    }
-}
-
-fn check_compressed_color_materialization(format: u32, kind: u8, zbc_mask: Option<u32>) {
-    let allocation = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
-    let mut address_space = resource_address_space();
-    let mapping = map_resource(
-        &mut address_space,
-        allocation
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap(),
-        41,
-        kind,
-    );
-    let address = mapping.offset().get();
-    let mut channel = three_d_channel();
-    if let Some(mask) = zbc_mask {
-        program_three_d(&mut channel, 0x07a4, mask);
-        program_three_d(&mut channel, 0x07a8, mask);
-    }
-    for (method, argument) in [
-        (0x0800, (address >> 32) as u32),
-        (0x0804, address as u32),
-        (0x0808, 64),
-        (0x080c, 32),
-        (0x0810, format),
-        (0x0814, 0),
-        (0x0818, 1),
-        (0x081c, 0),
-        (0x0820, 0),
-        (0x15d0, 0),
-        (0x19e0, 1),
-        (0x121c, 1),
-        (0x12e4, 0),
-        (0x135c, 0),
-        (0x0d6c, 32 << 16),
-        (0x0d70, 16 << 16),
-        (0x0d80, 0x3f80_0000),
-        (0x0d84, 0x3f00_0000),
-        (0x0d88, 0),
-        (0x0d8c, 0x3f80_0000),
-        (0x10f8, 0x10),
-    ] {
-        program_three_d(&mut channel, method, argument);
-    }
-    let resources = resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
-    assert!(
-        resources
-            .resources()
-            .iter()
-            .any(|resource| { resource.role() == MaxwellThreeDResourceRole::ColorTarget(0) })
-    );
-    let mut cache = MaxwellLoweringCache::default();
-
-    let draw_source = channel.three_d().render_targets().color()[0]
-        .compression()
-        .source()
-        .unwrap();
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source: draw_source,
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(10),
-            Vec::new(),
-            &lowering_capabilities(BackendFeatures::empty()),
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::CompressedColorImportRequired { target: 0 })
-    ));
-
-    let clear_dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
-    let triggered = &clear_dispatch.operations()[0];
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            triggered.state(),
-            &resources,
-            triggered.trigger(),
-            None,
-            FrontendSubmissionId::new(11),
-            Vec::new(),
-            &lowering_capabilities(BackendFeatures::empty()),
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::CompressedColorImportRequired { target: 0 })
-    ));
-
-    program_three_d(&mut channel, 0x10f8, 0);
-    let full_dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
-    let full = &full_dispatch.operations()[0];
-    let full_resources = resolve_maxwell_three_d_resources(full.state(), &address_space).unwrap();
-    let plan = lower_maxwell_three_d_operation(
-        full.state(),
-        &full_resources,
-        full.trigger(),
-        None,
-        FrontendSubmissionId::new(12),
-        Vec::new(),
-        &lowering_capabilities(BackendFeatures::CLEAR),
-        &mut cache,
-    )
-    .unwrap();
-    let (description, view) = plan
-        .resource_creations()
-        .iter()
-        .find_map(|creation| match creation {
-            nixe_gpu::ResourceDefinition::Image {
-                description, view, ..
-            } => Some((description, view)),
-            _ => None,
-        })
-        .expect("clear must create a resident color image");
-    assert_eq!(
-        description.format(),
-        if format == 0xca {
-            ImageFormat::Rgba16Float
-        } else {
-            ImageFormat::Rgba8Unorm
-        }
-    );
-    assert!(
-        view.as_ref()
-            .is_some_and(|view| view.has_canonical_texels()),
-        "materialized single-sample color must support canonical texel readback"
-    );
-    assert!(matches!(
-        plan.submission().operations()[0].command(),
-        GpuCommand::Clear(nixe_gpu::ClearOperation::Image {
-            value: nixe_gpu::ClearValue::Color(_),
-            ..
-        })
-    ));
-
-    let partial_after_materialization = lower_maxwell_three_d_operation(
-        triggered.state(),
-        &resources,
-        triggered.trigger(),
-        None,
-        FrontendSubmissionId::new(13),
-        Vec::new(),
-        &lowering_capabilities(BackendFeatures::CLEAR),
-        &mut cache,
-    )
-    .unwrap();
-    assert!(
-        partial_after_materialization
-            .resource_creations()
-            .is_empty()
-    );
-
-    // C64 compressed storage stays device-resident; only the generic storage
-    // representation below can be exported as canonical uncompressed bytes.
-    if kind != 0xfe {
-        return;
-    }
-
-    // Rebinding the same canonical bytes through a different GPU allocation
-    // changes view identity, not the neutral representation of the image.
-    let remapping = map_resource(
-        &mut address_space,
-        allocation
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap(),
-        42,
-        0xfe,
-    );
-    let remapped_address = remapping.offset().get();
-    program_three_d(&mut channel, 0x0800, (remapped_address >> 32) as u32);
-    program_three_d(&mut channel, 0x0804, remapped_address as u32);
-    program_three_d(&mut channel, 0x10f8, 0x10);
-    let remapped_dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
-    let remapped = &remapped_dispatch.operations()[0];
-    let remapped_resources =
-        resolve_maxwell_three_d_resources(remapped.state(), &address_space).unwrap();
-    lower_maxwell_three_d_operation(
-        remapped.state(),
-        &remapped_resources,
-        remapped.trigger(),
-        None,
-        FrontendSubmissionId::new(15),
-        Vec::new(),
-        &lowering_capabilities(BackendFeatures::CLEAR),
-        &mut cache,
-    )
-    .unwrap();
-
-    let backing = allocation
-        .backing_range(MemoryPermissions::READ_WRITE)
-        .unwrap();
-    let declaration = DeviceAccessDeclaration::write(
-        NonCpuDeviceId::new(9),
-        DeviceVisibilityPoint::new(20),
-        DeviceVisibilityPoint::new(21),
-    )
-    .unwrap();
-    let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(MaterializationWriteback);
-    nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
-        [(&backing, declaration)],
-        coordinator.as_ref(),
-    )
-    .unwrap();
-    nixe_memory::CanonicalBackingRange::publish_device_writes(
-        [(&backing, declaration)],
-        Arc::clone(&coordinator),
-    )
-    .unwrap();
-    // Presentation may materialize only the pages it reads. The remaining
-    // pages retain GPU authority and the original content generation.
-    let mut writeback = vec![0; 0x1000];
-    allocation.read(0, &mut writeback).unwrap();
-
-    let resources_after_writeback =
-        resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            triggered.state(),
-            &resources_after_writeback,
-            triggered.trigger(),
-            None,
-            FrontendSubmissionId::new(16),
-            Vec::new(),
-            &lowering_capabilities(BackendFeatures::CLEAR),
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::CompressedColorImportRequired { target: 0 })
-    ));
-
-    allocation.write(0, &[0xa5]).unwrap();
-    let resources_after_cpu_write =
-        resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            triggered.state(),
-            &resources_after_cpu_write,
-            triggered.trigger(),
-            None,
-            FrontendSubmissionId::new(17),
-            Vec::new(),
-            &lowering_capabilities(BackendFeatures::CLEAR),
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::CompressedColorImportRequired { target: 0 })
-    ));
-}
-
-#[test]
-fn color_compression_does_not_block_a_different_clear_target() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x19e4, 1);
-    program_three_d(&mut channel, 0x121c, 1);
-    let resources =
-        resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
-    let triggered = &dispatch.operations()[0];
-
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            triggered.state(),
-            &resources,
-            triggered.trigger(),
-            None,
-            FrontendSubmissionId::new(12),
-            Vec::new(),
-            &lowering_capabilities(BackendFeatures::empty()),
-            &mut MaxwellLoweringCache::default(),
-        ),
-        Err(MaxwellLoweringError::IncompleteClear(
-            "horizontal rectangle"
-        ))
-    ));
-}
-
-#[test]
 fn color_target_selection_retains_all_fields_for_counts_zero_through_eight() {
     let mut channel = three_d_channel();
     let targets = [7, 0, 6, 1, 5, 2, 4, 3];
@@ -1092,97 +632,6 @@ fn malformed_color_target_selection_and_failed_packet_keeps_valid_prefix() {
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
     assert_ne!(channel.three_d(), &three_d_before);
-}
-
-#[test]
-fn draw_rejects_missing_disabled_incomplete_and_duplicate_color_routes() {
-    let mut cache = MaxwellLoweringCache::default();
-    let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let address_space = resource_address_space();
-    let mut channel = three_d_channel();
-
-    for (argument, expected) in [
-        (
-            color_target_selection_raw(1, [3, 0, 0, 0, 0, 0, 0, 0]),
-            MaxwellLoweringError::ColorTargetRouteUnprogrammed { slot: 0, target: 3 },
-        ),
-        (
-            color_target_selection_raw(2, [3, 3, 0, 0, 0, 0, 0, 0]),
-            MaxwellLoweringError::DuplicateColorTargetRoute { target: 3 },
-        ),
-    ] {
-        program_three_d(&mut channel, 0x121c, argument);
-        let resources =
-            resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
-        let source = channel
-            .three_d()
-            .render_targets()
-            .color_target_selection()
-            .source()
-            .unwrap();
-        let result = lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source,
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(10),
-            Vec::new(),
-            &capabilities,
-            &mut cache,
-        );
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!("invalid color-target route unexpectedly lowered"),
-        };
-        assert_eq!(error.to_string(), expected.to_string());
-    }
-
-    program_three_d(&mut channel, 0x0810, 0);
-    program_three_d(&mut channel, 0x121c, 1);
-    let resources = resolve_maxwell_three_d_resources(channel.three_d(), &address_space).unwrap();
-    let source = channel
-        .three_d()
-        .render_targets()
-        .color_target_selection()
-        .source()
-        .unwrap();
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source,
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(11),
-            Vec::new(),
-            &capabilities,
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::ColorTargetRouteDisabled { slot: 0, target: 0 })
-    ));
-
-    program_three_d(&mut channel, 0x0810, 0xd5);
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source,
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(12),
-            Vec::new(),
-            &capabilities,
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::ColorTargetRouteIncomplete { slot: 0, target: 0 })
-    ));
 }
 
 #[test]
@@ -1430,93 +879,6 @@ fn clear_surface_control_reserved_bits_and_failed_packet_keeps_valid_prefix() {
 }
 
 #[test]
-fn clear_rect_scissor_and_viewport_clip_compose_into_one_neutral_region() {
-    let allocation = CanonicalAllocation::zeroed(0x1_0000, 0x1000).unwrap();
-    let mut address_space = resource_address_space();
-    let mapping = map_resource(
-        &mut address_space,
-        allocation
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap(),
-        41,
-        0xfe,
-    );
-    let address = mapping.offset().get();
-    let mut channel = three_d_channel();
-    for (method, argument) in [
-        (0x0800, (address >> 32) as u32),
-        (0x0804, address as u32),
-        (0x0808, 64),
-        (0x080c, 32),
-        (0x0810, 0xd5),
-        (0x0814, 0),
-        (0x0818, 1),
-        (0x081c, 0),
-        (0x0820, 0),
-        (0x15d0, 0),
-        (0x19e0, 0),
-        (0x0d6c, (60 << 16) | 5),
-        (0x0d70, (30 << 16) | 3),
-        (0x0e04, (50 << 16) | 10),
-        (0x0e08, (20 << 16) | 8),
-        (0x0c00, (45 << 16) | 12),
-        (0x0c04, (18 << 16) | 9),
-        (0x0d80, 0x3f80_0000),
-        (0x0d84, 0x3f00_0000),
-        (0x0d88, 0),
-        (0x0d8c, 0x3f80_0000),
-        (0x10f8, 0x1110),
-    ] {
-        program_three_d(&mut channel, method, argument);
-    }
-    let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
-    let triggered = &dispatch.operations()[0];
-    let resources = resolve_maxwell_three_d_resources(triggered.state(), &address_space).unwrap();
-    let plan = lower_maxwell_three_d_operation(
-        triggered.state(),
-        &resources,
-        triggered.trigger(),
-        None,
-        FrontendSubmissionId::new(10),
-        Vec::new(),
-        &lowering_capabilities(BackendFeatures::CLEAR),
-        &mut MaxwellLoweringCache::default(),
-    )
-    .unwrap();
-    let target = plan
-        .submission()
-        .operations()
-        .iter()
-        .find_map(|operation| match operation.command() {
-            GpuCommand::Clear(nixe_gpu::ClearOperation::Image { target, .. }) => Some(target),
-            _ => None,
-        })
-        .expect("clear command");
-    assert_eq!(target.origin.x, 12);
-    assert_eq!(target.origin.y, 9);
-    assert_eq!(target.extent.width, 38);
-    assert_eq!(target.extent.height, 11);
-
-    program_three_d(&mut channel, 0x0c00, (60 << 16) | 55);
-    let empty_dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
-    let empty = &empty_dispatch.operations()[0];
-    let empty_resources = resolve_maxwell_three_d_resources(empty.state(), &address_space).unwrap();
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            empty.state(),
-            &empty_resources,
-            empty.trigger(),
-            None,
-            FrontendSubmissionId::new(11),
-            Vec::new(),
-            &lowering_capabilities(BackendFeatures::CLEAR),
-            &mut MaxwellLoweringCache::default(),
-        ),
-        Err(MaxwellLoweringError::EmptyClearRectangle)
-    ));
-}
-
-#[test]
 fn malformed_scissor_suffix_keeps_valid_prefix_before_failure() {
     let mut channel = three_d_channel();
     let decoded = incrementing_packet(0x0e00 / 4, &[1, (100 << 16) | 5, (10 << 16) | 20]);
@@ -1656,64 +1018,6 @@ fn malformed_window_clip_rectangle_keeps_valid_prefix_before_failure() {
 }
 
 #[test]
-fn window_clip_draw_validation_follows_enable_while_clear_is_independent() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x121c, 0);
-    program_three_d(&mut channel, 0x1950, 0);
-    program_three_d(&mut channel, 0x194c, 0);
-    program_three_d(&mut channel, 0x0d00, (100 << 16) | 10);
-    program_three_d(&mut channel, 0x1950, 1);
-
-    program_three_d(&mut channel, 0x194c, 1);
-    program_three_d(&mut channel, 0x0d04, (200 << 16) | 20);
-
-    let resources =
-        resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let mut cache = MaxwellLoweringCache::default();
-    let source = channel
-        .three_d()
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::WindowClipEnable)
-        .source()
-        .unwrap();
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source,
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(10),
-            Vec::new(),
-            &capabilities,
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::UnsupportedWindowClipSemantics)
-    ));
-
-    let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
-    let triggered = &dispatch.operations()[0];
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            triggered.state(),
-            &resources,
-            triggered.trigger(),
-            None,
-            FrontendSubmissionId::new(11),
-            Vec::new(),
-            &capabilities,
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::IncompleteClear(
-            "horizontal rectangle"
-        ))
-    ));
-}
-
-#[test]
 fn clip_id_test_enable_is_typed_source_preserving_and_atomic() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
@@ -1788,81 +1092,6 @@ fn clip_id_test_enable_is_typed_source_preserving_and_atomic() {
 }
 
 #[test]
-fn clip_id_test_only_blocks_draw_when_enabled_and_never_blocks_clear() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x121c, 0);
-    program_three_d(&mut channel, 0x197c, 0);
-    let resources =
-        resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let mut cache = MaxwellLoweringCache::default();
-    let disabled_source = channel
-        .three_d()
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::ClipIdTestEnable)
-        .source()
-        .unwrap();
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source: disabled_source,
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(10),
-            Vec::new(),
-            &capabilities,
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::ShaderTranslationRequired)
-    ));
-
-    program_three_d(&mut channel, 0x197c, 1);
-    let enabled_source = channel
-        .three_d()
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::ClipIdTestEnable)
-        .source()
-        .unwrap();
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source: enabled_source,
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(11),
-            Vec::new(),
-            &capabilities,
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::UnsupportedClipIdTestSemantics)
-    ));
-
-    let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
-    let triggered = &dispatch.operations()[0];
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            triggered.state(),
-            &resources,
-            triggered.trigger(),
-            None,
-            FrontendSubmissionId::new(12),
-            Vec::new(),
-            &capabilities,
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::IncompleteClear(
-            "horizontal rectangle"
-        ))
-    ));
-}
-
-#[test]
 fn viewport_scale_offset_enable_is_typed_source_preserving_and_atomic() {
     let mut channel = three_d_channel();
 
@@ -1919,99 +1148,6 @@ fn viewport_scale_offset_enable_is_typed_source_preserving_and_atomic() {
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
     assert_ne!(channel.three_d(), &three_d_before);
-}
-
-#[test]
-fn viewport_scale_offset_draw_validation_follows_enable_only() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x121c, 0);
-    program_three_d(&mut channel, 0x192c, 0);
-
-    program_three_d(&mut channel, 0x0a00, 1.0_f32.to_bits());
-    program_three_d(&mut channel, 0x0a0c, 2.0_f32.to_bits());
-
-    let resources =
-        resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let capabilities = lowering_capabilities(BackendFeatures::empty());
-    let mut cache = MaxwellLoweringCache::default();
-    let disabled_source = channel
-        .three_d()
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable)
-        .source()
-        .unwrap();
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source: disabled_source,
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(10),
-            Vec::new(),
-            &capabilities,
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::ShaderTranslationRequired)
-    ));
-
-    program_three_d(&mut channel, 0x192c, 1);
-    program_three_d(&mut channel, 0x193c, 0);
-    for (method, value) in [
-        (0x0a00, 3.0_f32),
-        (0x0a04, -4.0_f32),
-        (0x0a08, 0.5_f32),
-        (0x0a0c, 2.0_f32),
-        (0x0a10, 4.0_f32),
-        (0x0a14, 0.5_f32),
-        (0x0c08, 0.0_f32),
-        (0x0c0c, 1.0_f32),
-    ] {
-        program_three_d(&mut channel, method, value.to_bits());
-    }
-
-    let enabled_source = channel
-        .three_d()
-        .fixed_function()
-        .register(MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable)
-        .source()
-        .unwrap();
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source: enabled_source,
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(11),
-            Vec::new(),
-            &capabilities,
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::ShaderTranslationRequired)
-    ));
-
-    let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
-    let triggered = &dispatch.operations()[0];
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            triggered.state(),
-            &resources,
-            triggered.trigger(),
-            None,
-            FrontendSubmissionId::new(12),
-            Vec::new(),
-            &capabilities,
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::IncompleteClear(
-            "horizontal rectangle"
-        ))
-    ));
 }
 
 #[test]
@@ -3956,79 +3092,6 @@ fn invalid_vertex_stream_substitute_upper_and_failed_packet_keeps_valid_prefix()
 }
 
 #[test]
-fn active_shader_pipeline_requires_complete_program_region_but_clear_does_not() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x121c, 0);
-    program_three_d(&mut channel, 0x2000, 0x11);
-    program_three_d(&mut channel, 0x160c, 0);
-    let resources =
-        resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    let mut cache = MaxwellLoweringCache::default();
-    let source = channel
-        .three_d()
-        .shader_bindings()
-        .program_region()
-        .address_lower()
-        .source()
-        .unwrap();
-
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source,
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(10),
-            Vec::new(),
-            &lowering_capabilities(BackendFeatures::empty()),
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::IncompleteDraw(
-            "SET_PROGRAM_REGION_A/B"
-        ))
-    ));
-
-    let dispatch = dispatch_method(&mut channel, 0x19d0 / 4, 0x3c).unwrap();
-    let triggered = &dispatch.operations()[0];
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            triggered.state(),
-            &resources,
-            triggered.trigger(),
-            None,
-            FrontendSubmissionId::new(11),
-            Vec::new(),
-            &lowering_capabilities(BackendFeatures::empty()),
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::IncompleteClear(
-            "horizontal rectangle"
-        ))
-    ));
-
-    program_three_d(&mut channel, 0x1608, 4);
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source,
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(12),
-            Vec::new(),
-            &lowering_capabilities(BackendFeatures::empty()),
-            &mut cache,
-        ),
-        Err(MaxwellLoweringError::ShaderTranslationRequired)
-    ));
-}
-
-#[test]
 fn pipeline_program_offsets_and_register_counts_are_indexed_and_atomic() {
     let mut channel = three_d_channel();
 
@@ -4258,7 +3321,7 @@ fn viewport_firmware_defaults_are_shared_by_live_state_and_shadow_replay() {
 #[test]
 fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
     use crate::execution::MaxwellFrontend;
-    use nixe_gpu::{native::NativeCommand, ssa::compile::CompilePool};
+    use nixe_gpu::native::NativeCommand;
     let vertices = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
     let color = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
     let shaders = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
@@ -4287,15 +3350,15 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
             &header
                 .into_iter()
                 .flat_map(u32::to_le_bytes)
-                .chain([0, exit, 0, 0].into_iter().flat_map(u64::to_le_bytes))
+                .chain([exit, 0, 0, 0].into_iter().flat_map(u64::to_le_bytes))
                 .collect::<Vec<_>>(),
         )
         .unwrap();
     header = [0; 20];
     header[0] = 0x0002_5462;
     header[4] = 0x000f_f000;
-    header[6] = 2;
-    header[13] = 0x0007_f000;
+    header[6] = 0xaa;
+    header[13] = 0;
     header[18] = 1;
     shaders
         .write(
@@ -4304,7 +3367,7 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
                 .into_iter()
                 .flat_map(u32::to_le_bytes)
                 .chain(
-                    [0, 0xe0c3_ff88_0077_ff00, exit, 0]
+                    [0xe0c3_ff88_0077_ff00, exit, 0, 0]
                         .into_iter()
                         .flat_map(u64::to_le_bytes),
                 )
@@ -4325,7 +3388,7 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
     ] {
         program_three_d(&mut channel, method, value);
     }
-    let mut frontend = crate::MaxwellNativeFrontend::new(Arc::new(CompilePool::new(1, 8).unwrap()));
+    let mut frontend = crate::MaxwellNativeFrontend::new(Default::default());
     let mut previous = None;
     for first in 0..32 {
         program_three_d(&mut channel, 0x0d74, first);
@@ -4336,16 +3399,17 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
                 draw.state(),
                 draw.trigger(),
                 &space,
-                &nixe_memory::CanonicalWriteBatch::new(),
                 FrontendSubmissionId::new(u64::from(first) + 1),
-                &[],
+                (first == 31).then_some((2, 5)),
             )
             .unwrap();
         let NativeCommand::Draw { state, arguments } = work.command else {
             panic!("expected native draw")
         };
         assert!(
-            matches!(arguments,nixe_gpu::DrawArguments::NonIndexed {first_vertex,..} if first_vertex==first)
+            matches!(arguments,nixe_gpu::DrawArguments::NonIndexed {first_vertex, first_instance, instance_count, ..}
+                if first_vertex == first && first_instance == if first == 31 { 2 } else { 0 }
+                && instance_count == if first == 31 { 5 } else { 1 })
         );
         if let Some(old) = &previous {
             assert!(Arc::ptr_eq(old, &state));
@@ -4368,9 +3432,8 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
                 draw.state(),
                 draw.trigger(),
                 &space,
-                &nixe_memory::CanonicalWriteBatch::new(),
                 FrontendSubmissionId::new(200 + u64::from(offset)),
-                &[],
+                None,
             )
             .unwrap();
         let NativeCommand::Draw { state, .. } = work.command else {
@@ -4398,9 +3461,8 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
             draw.state(),
             draw.trigger(),
             &space,
-            &nixe_memory::CanonicalWriteBatch::new(),
             FrontendSubmissionId::new(500),
-            &[],
+            None,
         )
         .unwrap();
     let NativeCommand::Draw { state, .. } = work.command else {
@@ -4412,9 +3474,9 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
         // Stream offsets affect vertex binding, but not shader input types.
         program_three_d(&mut channel, 0x1160, 0x3820_0000 | (((phase + 1) * 8) << 7));
         if phase == 1 {
-            // Even identical code bytes written through a CPU alias invalidate
-            // the captured dependency and require another protected snapshot.
-            shaders.write(0x50, &0_u64.to_le_bytes()).unwrap();
+            // An identical CPU write refreshes the memory proof while keeping
+            // the immutable capture and compiled code reusable.
+            shaders.write(0x50, &exit.to_le_bytes()).unwrap();
         }
         let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
         let draw = &dispatch.operations()[0];
@@ -4423,9 +3485,8 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
                 draw.state(),
                 draw.trigger(),
                 &space,
-                &nixe_memory::CanonicalWriteBatch::new(),
                 FrontendSubmissionId::new(100 + u64::from(phase)),
-                &[],
+                None,
             )
             .unwrap();
         let NativeCommand::Draw { state, .. } = work.command else {
@@ -4434,7 +3495,7 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
         assert!(!Arc::ptr_eq(&original, &state));
         assert!(!Arc::ptr_eq(&original.parameters, &state.parameters));
         assert!(Arc::ptr_eq(&original.program.shader, &state.program.shader));
-        assert_eq!(frontend.statistics.shader_captures, u64::from(phase) + 1);
+        assert_eq!(frontend.statistics.shader_captures, 1);
     }
 
     // Two live uniform bindings exercise both complete reuse and a changed
@@ -4458,7 +3519,7 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
                 .into_iter()
                 .flat_map(u32::to_le_bytes)
                 .chain(
-                    [0, 0x4c98_0784_0047_0000, 0x4c98_0788_0047_0001, exit]
+                    [0x4c98_0784_0047_0000, 0x4c98_0788_0047_0001, 0, exit]
                         .into_iter()
                         .flat_map(u64::to_le_bytes),
                 )
@@ -4482,9 +3543,8 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
                 trigger.state(),
                 trigger.trigger(),
                 &space,
-                &nixe_memory::CanonicalWriteBatch::new(),
                 FrontendSubmissionId::new(600),
-                &[],
+                None,
             )
             .unwrap();
         let NativeCommand::Draw { state, .. } = work.command else {
@@ -4518,4 +3578,34 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
     program_three_d(&mut channel, 0x1c08, vertex as u32 + 32);
     let rebound_vertex = draw(&mut channel, &mut frontend);
     assert!(Arc::ptr_eq(&changed.program, &rebound_vertex.program));
+}
+
+#[test]
+fn direct_mme_program_cache_follows_instruction_uploads_and_start_address_changes() {
+    let mut channel = three_d_channel();
+    let index = 5u8;
+    let set_method = 1 | (2 << 4) | ((0x1518 / 4) << 14);
+    let send_parameter = (4 << 4) | (1 << 7) | (1 << 11);
+    load_mme_program(&mut channel, index, &[set_method, send_parameter, 0x11]);
+    let call = (0x3800 + u32::from(index) * 8) / 4;
+    dispatch_method(&mut channel, call, 2.5_f32.to_bits()).unwrap();
+    assert_eq!(
+        channel.three_d().raster().point_size().raw(),
+        Some(2.5_f32.to_bits())
+    );
+    let constant = |value: u32| 1 | (4 << 4) | (1 << 7) | (value << 14);
+    load_mme_program(&mut channel, index, &[set_method, constant(4), 0x11]);
+    dispatch_method(&mut channel, call, 3.5_f32.to_bits()).unwrap();
+    assert_eq!(channel.three_d().raster().point_size().raw(), Some(4));
+    load_mme_program(&mut channel, index + 1, &[set_method, constant(8), 0x11]);
+    dispatch_method(&mut channel, call, 3.5_f32.to_bits()).unwrap();
+    assert_eq!(channel.three_d().raster().point_size().raw(), Some(4));
+    dispatch_incrementing(
+        &mut channel,
+        0x011c / 4,
+        &[u32::from(index), 0x100 + u32::from(index + 1) * 0x10],
+    )
+    .unwrap();
+    dispatch_method(&mut channel, call, 3.5_f32.to_bits()).unwrap();
+    assert_eq!(channel.three_d().raster().point_size().raw(), Some(8));
 }

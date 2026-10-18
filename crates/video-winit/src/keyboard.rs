@@ -32,7 +32,6 @@ struct Key {
 pub(super) struct KeyboardOverlay {
     ctx: egui::Context,
     input: egui_winit::State,
-    renderer: Option<egui_wgpu::Renderer>,
     editor: Option<Editor>,
 }
 struct Editor {
@@ -353,13 +352,7 @@ fn enabled(editor: &Editor, key: &Key) -> bool {
     }
 }
 impl KeyboardOverlay {
-    pub fn new(window: &Window, device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let mut overlay =
-            Self::new_native(window, device.limits().max_texture_dimension_2d as usize);
-        overlay.renderer = Some(egui_wgpu::Renderer::new(device, format, Default::default()));
-        overlay
-    }
-    pub fn new_native(window: &Window, max_texture: usize) -> Self {
+    pub fn new(window: &Window, max_texture: usize) -> Self {
         let ctx = egui::Context::default();
         let mut fonts = egui::FontDefinitions::empty();
         fonts.font_data.insert(
@@ -387,7 +380,6 @@ impl KeyboardOverlay {
         Self {
             ctx,
             input,
-            renderer: None,
             editor: None,
         }
     }
@@ -705,56 +697,6 @@ impl KeyboardOverlay {
             textures: output.textures_delta,
             pixels_per_point: pixels,
         })
-    }
-    pub fn encode(
-        &mut self,
-        host: &KeyboardHost,
-        window: &Window,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        view: &wgpu::TextureView,
-    ) {
-        let Some(mut frame) = self.prepare(host, window) else {
-            return;
-        };
-        let renderer = self.renderer.as_mut().expect("legacy keyboard renderer");
-        let jobs = frame.primitives;
-        let screen = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [window.inner_size().width, window.inner_size().height],
-            pixels_per_point: frame.pixels_per_point,
-        };
-        for (id, deltas) in &frame.textures.set {
-            for delta in deltas {
-                renderer.update_texture(device, queue, *id, delta);
-            }
-        }
-        let commands = renderer.update_buffers(device, queue, encoder, &jobs, &screen);
-        debug_assert!(
-            commands.is_empty(),
-            "keyboard has no custom render callbacks"
-        );
-        let mut pass = encoder
-            .begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Nixe software keyboard"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            })
-            .forget_lifetime();
-        renderer.render(&mut pass, &jobs, &screen);
-        drop(pass);
-        for id in &frame.textures.free {
-            renderer.free_texture(id);
-        }
-        frame.textures.clear();
     }
 }
 

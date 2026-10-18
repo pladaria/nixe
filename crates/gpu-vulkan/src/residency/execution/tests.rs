@@ -1,244 +1,85 @@
 use super::super::tests::{backing_allocation, cache, cpu_read};
 use super::*;
+use crate::test_shaders::{self, Shader};
 use crate::{ApiPreference, QueueConfiguration, cache::*, queue::QueueState};
-use nixe_gpu::{
-    ShaderInterfaceElement, ShaderInterpolation, ShaderIoLocation as Io, ShaderScalarType,
-    ShaderStage, ssa::*,
+use nixe_gpu::{ShaderStage, shader_module as spirv, shader_module::ResourceId};
+use nixe_shader_recompiler::{
+    Stage,
+    artifact::{Bindings, ConstantBufferDescriptor, StorageBufferDescriptor},
+    ir::{Attribute, Opcode as O, Type, Value as V},
+    types::{ByteOffset, CbufIndex},
 };
 use std::time::Duration;
-fn pc() -> nixe_gpu::ShaderSourceLocation {
-    nixe_gpu::ShaderSourceLocation::new(8)
+fn vertex_fragment() -> [Shader; 2] {
+    test_shaders::vertex_fragment(false, false)
 }
-fn constant(b: &mut FunctionBuilder, e: BlockId, ty: Type, bits: u32) -> Operand {
-    b.emit(
-        e,
-        pc(),
-        Op::Constant(Constant {
-            ty,
-            bits: u64::from(bits),
-        }),
-        vec![],
-    )[0]
-    .into()
-}
-fn io(location: Io, component: u32, flat: bool) -> ShaderInterfaceElement {
-    ShaderInterfaceElement::new(
-        location,
-        component as u8,
-        ShaderScalarType::Float32,
-        flat.then_some(ShaderInterpolation::Constant),
-    )
-    .unwrap()
-}
-pub(crate) fn vertex_fragment() -> Box<[Function]> {
-    vertex_fragment_counter(false)
-}
-fn vertex_fragment_counter(counter: bool) -> Box<[Function]> {
-    let mut b = FunctionBuilder::new(ShaderStage::Vertex);
-    let e = b.entry();
-    let one = constant(&mut b, e, Type::F32, 1f32.to_bits());
-    for component in 0..4 {
-        let value = if component == 3 {
-            one
-        } else {
-            b.emit(
-                e,
-                pc(),
-                Op::Input {
-                    location: Io::Generic(0),
-                    component,
-                    ty: Type::F32,
-                },
-                vec![],
-            )[0]
-            .into()
-        };
-        b.emit(
-            e,
-            pc(),
-            Op::Output {
-                location: Io::Position,
-                component,
-                ty: Type::F32,
-            },
-            vec![value],
-        );
-    }
-    for component in 0..3 {
-        let value = b.emit(
-            e,
-            pc(),
-            Op::Input {
-                location: Io::Generic(1),
-                component,
-                ty: Type::F32,
-            },
-            vec![],
-        )[0];
-        b.emit(
-            e,
-            pc(),
-            Op::Output {
-                location: Io::Generic(0),
-                component,
-                ty: Type::F32,
-            },
-            vec![value.into()],
-        );
-    }
-    if counter {
-        let index = b.emit(
-            e,
-            pc(),
-            Op::Input {
-                location: Io::VertexId,
-                component: 0,
-                ty: Type::U32,
-            },
-            vec![],
-        )[0];
-        let four = constant(&mut b, e, Type::U32, 4);
-        let address = b.emit(
-            e,
-            pc(),
-            Op::Binary {
-                op: Binary::Multiply,
-                ty: Type::U32,
-                float_control: nixe_gpu::ShaderFloatControl::PRECISE,
-            },
-            vec![index.into(), four],
-        )[0];
-        let old = b.emit(
-            e,
-            pc(),
-            Op::Load {
-                space: MemorySpace::Storage,
-                resource: Some(ResourceId::new(42)),
-                address_type: Type::U32,
-                ty: Type::U32,
-            },
-            vec![address.into()],
-        )[0];
-        let one = constant(&mut b, e, Type::U32, 1);
-        let next = b.emit(
-            e,
-            pc(),
-            Op::Binary {
-                op: Binary::Add,
-                ty: Type::U32,
-                float_control: nixe_gpu::ShaderFloatControl::PRECISE,
-            },
-            vec![old.into(), one],
-        )[0];
-        b.emit(
-            e,
-            pc(),
-            Op::Store {
-                space: MemorySpace::Storage,
-                resource: Some(ResourceId::new(42)),
-                address_type: Type::U32,
-                ty: Type::U32,
-            },
-            vec![address.into(), next.into()],
-        );
-    }
-    b.terminate(e, pc(), Terminator::Return);
-    let mut vertex = b.finish().unwrap();
-    vertex.inputs = (0..3)
-        .flat_map(|c| [io(Io::Generic(0), c, false), io(Io::Generic(1), c, false)])
-        .collect();
-    if counter {
-        vertex.inputs.push(
-            ShaderInterfaceElement::new(Io::VertexId, 0, ShaderScalarType::Unsigned32, None)
-                .unwrap(),
-        );
-    }
-    vertex.outputs = (0..4)
-        .map(|c| io(Io::Position, c, false))
-        .chain((0..3).map(|c| io(Io::Generic(0), c, true)))
-        .collect();
-    let mut b = FunctionBuilder::new(ShaderStage::Fragment);
-    let e = b.entry();
-    for component in 0..4 {
-        let value = if component == 3 {
-            constant(&mut b, e, Type::F32, 1f32.to_bits())
-        } else {
-            b.emit(
-                e,
-                pc(),
-                Op::Input {
-                    location: Io::Generic(0),
-                    component,
-                    ty: Type::F32,
-                },
-                vec![],
-            )[0]
-            .into()
-        };
-        b.emit(
-            e,
-            pc(),
-            Op::Output {
-                location: Io::Color(0),
-                component,
-                ty: Type::F32,
-            },
-            vec![value],
-        );
-    }
-    b.terminate(e, pc(), Terminator::Return);
-    let mut fragment = b.finish().unwrap();
-    fragment.inputs = (0..3).map(|c| io(Io::Generic(0), c, true)).collect();
-    fragment.outputs = (0..4).map(|c| io(Io::Color(0), c, false)).collect();
-    for f in [&mut vertex, &mut fragment] {
-        f.optimize().unwrap();
-    }
-    Box::new([vertex, fragment])
-}
-fn increment() -> Function {
-    let mut b = FunctionBuilder::new(ShaderStage::Compute);
-    let e = b.entry();
-    let addr = constant(&mut b, e, Type::U32, 0);
-    let value = b.emit(
-        e,
-        pc(),
-        Op::Load {
-            space: MemorySpace::Storage,
-            resource: Some(ResourceId::new(42)),
-            address_type: Type::U32,
-            ty: Type::U32,
-        },
-        vec![addr],
-    )[0];
-    let one = constant(&mut b, e, Type::U32, 1);
-    let value = b.emit(
-        e,
-        pc(),
-        Op::Binary {
-            op: Binary::Add,
-            ty: Type::U32,
-            float_control: nixe_gpu::ShaderFloatControl::PRECISE,
-        },
-        vec![value.into(), one],
-    )[0];
-    b.emit(
-        e,
-        pc(),
-        Op::Store {
-            space: MemorySpace::Storage,
-            resource: Some(ResourceId::new(42)),
-            address_type: Type::U32,
-            ty: Type::U32,
-        },
-        vec![addr, value.into()],
-    );
-    b.terminate(e, pc(), Terminator::Return);
-    let mut f = b.finish().unwrap();
-    f.workgroup_size = Some([1, 1, 1]);
-    f.optimize().unwrap();
-    f
+fn increment() -> Shader {
+    test_shaders::increment(1, 0)
 }
 
+#[test]
+fn null_storage_buffers_read_zero_and_discard_writes_and_atomics() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    if !cache.device.profile().null_descriptor {
+        return;
+    }
+    let validation = cache.device.validation_monitor();
+    let compilers = Compilers::new(&cache);
+    let (_, backing) = backing_allocation(4096, 4096, 0x19);
+    let destination = cache
+        .buffer_for(backing.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
+        .unwrap();
+    let mut s = Shader::new(Stage::Compute);
+    s.storage();
+    s.program
+        .info
+        .storage_buffers_descriptors
+        .push(StorageBufferDescriptor {
+            cbuf_index: CbufIndex(0),
+            cbuf_offset: ByteOffset(16),
+            count: 1,
+            is_written: true,
+        })
+        .unwrap();
+    s.op(O::WriteStorage32, &[V::U32(0), V::U32(0), V::U32(99)]);
+    let loaded = s.op(O::LoadStorage32, &[V::U32(0), V::U32(0)]);
+    let atomic = s.op(O::StorageAtomicIAdd32, &[V::U32(0), V::U32(0), V::U32(1)]);
+    s.op(O::WriteStorage32, &[V::U32(1), V::U32(0), loaded]);
+    s.op(O::WriteStorage32, &[V::U32(1), V::U32(4), atomic]);
+    let shader = compilers.shader(&cache, [s]);
+    let pipeline = ready(
+        compilers
+            .pipelines
+            .request(PipelineRecipe::Compute(shader))
+            .unwrap(),
+    );
+    let program = cache
+        .prepare_program(
+            pipeline,
+            &[
+                Binding::NullBuffer,
+                Binding::Buffer {
+                    buffer: destination,
+                    offset: 0,
+                    size: 16,
+                },
+            ],
+        )
+        .unwrap();
+    for _ in 0..2 {
+        cache
+            .dispatch(&program, Dispatch::Direct([1; 3]), &[])
+            .unwrap();
+    }
+    cache.flush().unwrap();
+    let bytes = cpu_read(&mut cache, &backing);
+    assert_eq!(&bytes[..8], &[0; 8]);
+    assert_eq!(&bytes[8..], &[0x19; 4088]);
+    drop(cache);
+    validation.check().unwrap();
+}
 #[test]
 fn dispatch_alias_import_keeps_prepared_physical_page_baseline() {
     let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
@@ -260,12 +101,29 @@ fn dispatch_alias_import_keeps_prepared_physical_page_baseline() {
         )
         .unwrap();
     let mut shader = increment();
-    for inst in shader.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
-        if let Op::Load { resource, .. } = &mut inst.op {
-            *resource = Some(ResourceId::new(43));
+    shader
+        .program
+        .info
+        .storage_buffers_descriptors
+        .push(StorageBufferDescriptor {
+            cbuf_index: CbufIndex(0),
+            cbuf_offset: ByteOffset(16),
+            count: 1,
+            is_written: false,
+        })
+        .unwrap();
+    for id in shader
+        .ir
+        .block(shader.block)
+        .unwrap()
+        .instructions()
+        .to_vec()
+    {
+        if shader.ir.inst(id).unwrap().opcode() == O::LoadStorage32 {
+            shader.ir.set_arg(id, 0, V::U32(1)).unwrap();
         }
     }
-    let shader = compilers.shader(&cache, Box::new([shader]));
+    let shader = compilers.shader(&cache, [shader]);
     let pipeline = ready(
         compilers
             .pipelines
@@ -307,7 +165,6 @@ fn dispatch_alias_import_keeps_prepared_physical_page_baseline() {
     validation.check().unwrap();
 }
 struct Compilers {
-    shaders: ShaderCompiler,
     pipelines: PipelineCompiler,
 }
 impl Compilers {
@@ -318,32 +175,15 @@ impl Compilers {
         };
         let pool = Arc::new(CompilePool::new(1, 32).unwrap());
         Self {
-            shaders: ShaderCompiler::new(
-                nixe_gpu::ssa::artifact::ShaderNamespace {
-                    guest: *b"execution-tests1",
-                    isa: 1,
-                },
-                Arc::clone(&pool),
-                &config,
-            ),
             pipelines: PipelineCompiler::new(cache.device(), pool, &config).unwrap(),
         }
     }
-    fn shader(&self, cache: &VulkanResidency, fs: Box<[Function]>) -> Arc<ShaderArtifact> {
-        let source = nixe_gpu::ssa::artifact::ContentId::of(
-            b"execution-tests",
-            &[format!("{fs:?}").as_bytes()],
-        );
-        ready(
-            self.shaders
-                .request(
-                    source,
-                    vec![cache.device.shader_options(); fs.len()].into_boxed_slice(),
-                    move || Ok(fs),
-                    |fs| fs.iter().collect(),
-                )
-                .unwrap(),
-        )
+    fn shader(
+        &self,
+        cache: &VulkanResidency,
+        shaders: impl IntoIterator<Item = Shader>,
+    ) -> Arc<ShaderArtifact> {
+        test_shaders::compile(&cache.device.profile().shader_compiler.profile, shaders)
     }
 }
 fn ready<T>(pending: Pending<T>) -> Arc<T> {
@@ -640,6 +480,7 @@ fn raster(api: ApiPreference, inline: bool, large: bool) {
                 arena_bytes: 512,
                 overflow_bytes: 0,
             },
+            &cache.device.dispatch,
         )
         .unwrap();
     }
@@ -796,7 +637,7 @@ fn compute(api: ApiPreference) {
     };
     let validation = cache.device.validation_monitor();
     let compilers = Compilers::new(&cache);
-    let shader = compilers.shader(&cache, Box::new([increment()]));
+    let shader = compilers.shader(&cache, [increment()]);
     let pipeline = ready(
         compilers
             .pipelines
@@ -1060,7 +901,9 @@ impl Utilities for VulkanResidency {
             Box::new([spirv::Binding {
                 resource: ResourceId::new(0),
                 binding: 0,
-                kind: nixe_gpu::ShaderResourceKind::StorageBuffer,
+                kind: spirv::DescriptorKind::StorageBuffer,
+                count: 1,
+                sampler: None,
                 readable: true,
                 writable: true,
             }]),
@@ -1551,54 +1394,8 @@ fn exercise_sample_mask_and_resolve(canonical: bool) {
     drop(cache);
     validation.check().unwrap();
 }
-fn sampled_fragment(coords: [f32; 2]) -> Function {
-    let mut b = FunctionBuilder::new(ShaderStage::Fragment);
-    let e = b.entry();
-    let args = coords
-        .map(|v| constant(&mut b, e, Type::F32, v.to_bits()))
-        .to_vec();
-    let color = b.emit(
-        e,
-        pc(),
-        Op::TextureSample {
-            image: ResourceId::new(42),
-            sampler: Some(ResourceId::new(43)),
-            kind: nixe_gpu::ShaderResourceKind::SampledImage,
-            mode: SampleMode::LevelZero,
-            offset: None,
-        },
-        args,
-    );
-    for (component, value) in color.into_iter().enumerate() {
-        b.emit(
-            e,
-            pc(),
-            Op::Output {
-                location: Io::Color(0),
-                component: component as u32,
-                ty: Type::F32,
-            },
-            vec![value.into()],
-        );
-    }
-    b.terminate(e, pc(), Terminator::Return);
-    let mut f = b.finish().unwrap();
-    f.resources = vec![
-        nixe_gpu::ssa::Resource {
-            id: ResourceId::new(42),
-            kind: nixe_gpu::ShaderResourceKind::SampledImage,
-        },
-        nixe_gpu::ssa::Resource {
-            id: ResourceId::new(43),
-            kind: nixe_gpu::ShaderResourceKind::Sampler,
-        },
-    ];
-    f.outputs = (0..4).map(|c| io(Io::Color(0), c, false)).collect();
-    f.optimize().unwrap();
-    f
-}
 fn sampled_shader(cache: &VulkanResidency, coords: [f32; 2]) -> Arc<ShaderArtifact> {
-    let f = sampled_fragment(coords);
+    let f = test_shaders::sampled_fragment(coords);
     Arc::new(ShaderArtifact::new(Box::new([
         host_stage(
             ShaderStage::Vertex,
@@ -1606,12 +1403,9 @@ fn sampled_shader(cache: &VulkanResidency, coords: [f32; 2]) -> Arc<ShaderArtifa
             Box::new([]),
             0,
         ),
-        CompiledStage::new(
-            ShaderStage::Fragment,
-            spirv::emit(&f, cache.device.shader_options()).unwrap(),
-            None,
-            0,
-            None,
+        f.compile(
+            &cache.device.profile().shader_compiler.profile,
+            &mut Bindings::default(),
         ),
     ])))
 }
@@ -1720,7 +1514,13 @@ fn native_bc_extent_astc_decode_dirty_blocks_and_custom_sampler_border() {
                 .unwrap(),
         );
         let program = cache
-            .prepare_program(pipeline, &[Binding::Image(view), Binding::Sampler(sampler)])
+            .prepare_program(
+                pipeline,
+                &[Binding::CombinedImageSampler {
+                    image: view,
+                    sampler,
+                }],
+            )
             .unwrap();
         let graphics = cache
             .prepare_graphics(program, GraphicsParameters::new(state, area().extent))
@@ -1817,8 +1617,7 @@ fn compute_produced_indexed_indirect_draw_scaled32_and_first_instance() {
     };
     let validation = cache.device.validation_monitor();
     let compilers = Compilers::new(&cache);
-    let mut functions = vertex_fragment();
-    crate::vertex::legalize_scaled_vertex_inputs(&mut functions[0], &[(1, false)]).unwrap();
+    let functions = test_shaders::vertex_fragment(false, true);
     let shader = compilers.shader(&cache, functions);
     let mut state = graphics_state();
     state.vertex_bindings = Box::new([
@@ -1897,28 +1696,15 @@ fn compute_produced_indexed_indirect_draw_scaled32_and_first_instance() {
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
         )
         .unwrap();
-    let mut b = FunctionBuilder::new(ShaderStage::Compute);
-    let e = b.entry();
+    let mut f = Shader::new(Stage::Compute);
+    f.storage();
     for (i, value) in [3u32, 1, 1, u32::MAX, 1].into_iter().enumerate() {
-        let addr = constant(&mut b, e, Type::U32, 12 + i as u32 * 4);
-        let value = constant(&mut b, e, Type::U32, value);
-        b.emit(
-            e,
-            pc(),
-            Op::Store {
-                space: MemorySpace::Storage,
-                resource: Some(ResourceId::new(42)),
-                address_type: Type::U32,
-                ty: Type::U32,
-            },
-            vec![addr, value],
+        f.op(
+            O::WriteStorage32,
+            &[V::U32(0), V::U32(12 + i as u32 * 4), V::U32(value)],
         );
     }
-    b.terminate(e, pc(), Terminator::Return);
-    let mut f = b.finish().unwrap();
-    f.workgroup_size = Some([1, 1, 1]);
-    f.optimize().unwrap();
-    let shader = compilers.shader(&cache, Box::new([f]));
+    let shader = compilers.shader(&cache, [f]);
     let pipeline = ready(
         compilers
             .pipelines
@@ -2088,152 +1874,54 @@ fn native_tessellation_default_control_levels_are_dynamic_and_zero_culls_patch()
     };
     let validation = cache.device.validation_monitor();
     let compilers = Compilers::new(&cache);
-    let fs = vertex_fragment();
-    let reference_shader = compilers.shader(&cache, fs.clone());
-    let vertex = fs[0].clone();
-    let fragment = fs[1].clone();
-    let mut b = FunctionBuilder::new(ShaderStage::TessellationEvaluation);
-    let e = b.entry();
-    let weights: Vec<_> = (0..3)
-        .map(|component| {
-            b.emit(
-                e,
-                pc(),
-                Op::Input {
-                    location: Io::TessCoord,
-                    component,
-                    ty: Type::F32,
-                },
-                vec![],
-            )[0]
-        })
-        .collect();
-    for component in 0..4 {
-        let mut sum = constant(&mut b, e, Type::F32, 0);
-        for (i, weight) in weights.iter().enumerate() {
-            let index = constant(&mut b, e, Type::U32, i as u32);
-            let raw = b.emit(
-                e,
-                pc(),
-                Op::ControlPointLoad {
-                    location: Io::Position,
-                    component,
-                    output: false,
-                },
-                vec![index],
-            )[0];
-            let value = b.emit(
-                e,
-                pc(),
-                Op::Bitcast {
-                    from: Type::U32,
-                    to: Type::F32,
-                },
-                vec![raw.into()],
-            )[0];
-            let product = b.emit(
-                e,
-                pc(),
-                Op::Binary {
-                    op: Binary::Multiply,
-                    ty: Type::F32,
-                    float_control: nixe_gpu::ShaderFloatControl::new(
-                        nixe_gpu::ShaderRoundingMode::NearestEven,
-                        nixe_gpu::ShaderNanMode::Propagate,
-                        true,
-                        true,
-                        false,
-                    ),
-                },
-                vec![value.into(), (*weight).into()],
-            )[0];
-            sum = b.emit(
-                e,
-                pc(),
-                Op::Binary {
-                    op: Binary::Add,
-                    ty: Type::F32,
-                    float_control: nixe_gpu::ShaderFloatControl::new(
-                        nixe_gpu::ShaderRoundingMode::NearestEven,
-                        nixe_gpu::ShaderNanMode::Propagate,
-                        true,
-                        true,
-                        false,
-                    ),
-                },
-                vec![sum, product.into()],
-            )[0]
-            .into();
+    let reference_shader = compilers.shader(&cache, vertex_fragment());
+    let [vertex, fragment] = vertex_fragment();
+    let mut evaluation = Shader::new(Stage::TessellationEval);
+    evaluation.runtime.tess_primitive = nixe_shader_recompiler::types::TessPrimitive::Triangles;
+    evaluation.runtime.tess_clockwise = false;
+    let weights = [
+        Attribute::TessellationEvaluationPointU,
+        Attribute::TessellationEvaluationPointV,
+    ]
+    .map(|attr| evaluation.input(attr, 0));
+    let uv = evaluation.op(O::FPAdd32, &weights);
+    let negative_uv = evaluation.op(O::FPNeg32, &[uv]);
+    let w = evaluation.op(O::FPAdd32, &[V::f32(1.), negative_uv]);
+    for c in 0..4 {
+        let attr = Attribute::from_index((Attribute::PositionX.index() + c) as u16).unwrap();
+        let mut sum = V::f32(0.);
+        for (i, weight) in [weights[0], weights[1], w].into_iter().enumerate() {
+            let value = evaluation.input(attr, i as u32);
+            let product = evaluation.op(O::FPMul32, &[value, weight]);
+            sum = evaluation.op(O::FPAdd32, &[sum, product]);
         }
-        b.emit(
-            e,
-            pc(),
-            Op::Output {
-                location: Io::Position,
-                component,
-                ty: Type::F32,
-            },
-            vec![sum],
+        evaluation.output(attr, sum);
+    }
+    for c in 0..3 {
+        evaluation.output(
+            Attribute::generic(0, c).unwrap(),
+            V::f32(if c == 0 { 1. } else { 0. }),
         );
     }
-    for component in 0..3 {
-        let value = constant(
-            &mut b,
-            e,
-            Type::F32,
-            if component == 0 { 1f32.to_bits() } else { 0 },
-        );
-        b.emit(
-            e,
-            pc(),
-            Op::Output {
-                location: Io::Generic(0),
-                component,
-                ty: Type::F32,
-            },
-            vec![value],
-        );
-    }
-    b.terminate(e, pc(), Terminator::Return);
-    let mut evaluation = b.finish().unwrap();
-    evaluation.inputs = (0..4)
-        .map(|c| io(Io::Position, c, false))
-        .chain((0..3).map(|c| io(Io::TessCoord, c, false)))
-        .collect();
-    evaluation.outputs = vertex.outputs.clone();
-    evaluation.optimize().unwrap();
-    let control = nixe_gpu::ssa::default_control(
-        &vertex,
-        &evaluation,
-        3,
-        nixe_gpu::TessellationDomain::Triangles,
+    let profile = &cache.device.profile().shader_compiler.profile;
+    let mut bindings = Bindings::default();
+    let vertex = vertex.compile(profile, &mut bindings);
+    let evaluation = evaluation.compile(profile, &mut bindings);
+    let control = CompiledStage::from_guest(
+        spirv::synthetic::default_control(
+            &vertex.guest.as_ref().unwrap().interface,
+            &evaluation.guest.as_ref().unwrap().interface,
+            3,
+            nixe_gpu::TessellationDomain::Triangles,
+            profile.supported_spirv,
+        )
+        .unwrap(),
     )
     .unwrap();
-    let stages = Box::new([vertex, control.function.clone(), evaluation, fragment]);
-    let mut options = vec![cache.device.shader_options(); 4];
-    options[1].shader.input_control_points = 3;
-    options[2].shader.input_control_points = 3;
-    options[2].shader.tessellation_mode = Some(nixe_gpu::TessellationMode {
-        domain: nixe_gpu::TessellationDomain::Triangles,
-        spacing: nixe_gpu::TessellationSpacing::Equal,
-        output: nixe_gpu::TessellationOutput::Triangles(
-            nixe_gpu::TessellationWinding::CounterClockwise,
-        ),
-    });
-    let shader = ready(
-        compilers
-            .shaders
-            .request(
-                nixe_gpu::ssa::artifact::ContentId::of(
-                    b"native-tessellation",
-                    &[b"default-levels"],
-                ),
-                options.into_boxed_slice(),
-                move || Ok(stages),
-                |fs| fs.iter().collect(),
-            )
-            .unwrap(),
-    );
+    let fragment = fragment.compile(profile, &mut bindings);
+    let shader = Arc::new(ShaderArtifact::new(Box::new([
+        vertex, control, evaluation, fragment,
+    ])));
     let (target, pixels) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
@@ -2297,18 +1985,15 @@ fn native_tessellation_default_control_levels_are_dynamic_and_zero_culls_patch()
                         .prepare_draw(graphics, targets.clone(), vertices.clone(), None)
                         .unwrap();
                     for cull in [false, true] {
-                        let parameters = control
-                            .parameters(nixe_gpu::TessellationControl::DefaultLevels {
-                                outer: [
-                                    if cull { 0 } else { 5f32.to_bits() },
-                                    1f32.to_bits(),
-                                    1f32.to_bits(),
-                                    1f32.to_bits(),
-                                ],
-                                inner: [5f32.to_bits(); 2],
-                                defined: 63,
-                            })
-                            .unwrap();
+                        let mut parameters = vec![0u32; 8];
+                        parameters.extend([
+                            if cull { 0 } else { 5f32.to_bits() },
+                            1f32.to_bits(),
+                            1f32.to_bits(),
+                            1f32.to_bits(),
+                            5f32.to_bits(),
+                            5f32.to_bits(),
+                        ]);
                         cache
                             .draw(
                                 &draw,
@@ -2373,20 +2058,22 @@ fn quad_geometry(provoking_first: bool) {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let functions = vertex_fragment_counter(true);
-    let modules = spirv::emit_pipeline(
-        &functions
-            .iter()
-            .map(|f| (f, cache.device.shader_options()))
-            .collect::<Vec<_>>(),
+    let [vertex, fragment] = test_shaders::vertex_fragment(true, false);
+    let profile = &cache.device.profile().shader_compiler.profile;
+    let mut bindings = Bindings::default();
+    let vertex = vertex.compile(profile, &mut bindings);
+    let fragment = fragment.compile(profile, &mut bindings);
+    let geometry = CompiledStage::from_guest(
+        spirv::synthetic::quad_geometry(
+            &vertex.guest.as_ref().unwrap().interface,
+            Some(&fragment.guest.as_ref().unwrap().interface),
+            provoking_first,
+            profile.supported_spirv,
+        )
+        .unwrap(),
     )
     .unwrap();
-    let geometry = spirv::emit_quad_geometry(&functions[0], provoking_first).unwrap();
-    let shader = Arc::new(ShaderArtifact::new(Box::new([
-        CompiledStage::new(ShaderStage::Vertex, modules[0].clone(), None, 0, None),
-        CompiledStage::new(ShaderStage::Geometry, geometry, None, 0, None),
-        CompiledStage::new(ShaderStage::Fragment, modules[1].clone(), None, 0, None),
-    ])));
+    let shader = Arc::new(ShaderArtifact::new(Box::new([vertex, geometry, fragment])));
     let mut state = graphics_state();
     state.topology = vk::PrimitiveTopology::LINE_LIST_WITH_ADJACENCY;
     state.provoking = if provoking_first {
@@ -3532,26 +3219,13 @@ fn shader_storage_alias_becomes_sampled_texture_without_cpu_readback() {
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )
         .unwrap();
-    let mut b = FunctionBuilder::new(ShaderStage::Compute);
-    let e = b.entry();
-    let address = constant(&mut b, e, Type::U32, 0);
-    let value = constant(&mut b, e, Type::U32, 0xff0000ff);
-    b.emit(
-        e,
-        pc(),
-        Op::Store {
-            space: MemorySpace::Storage,
-            resource: Some(ResourceId::new(42)),
-            address_type: Type::U32,
-            ty: Type::U32,
-        },
-        vec![address, value],
+    let mut f = Shader::new(Stage::Compute);
+    f.storage();
+    f.op(
+        O::WriteStorage32,
+        &[V::U32(0), V::U32(0), V::U32(0xff0000ff)],
     );
-    b.terminate(e, pc(), Terminator::Return);
-    let mut f = b.finish().unwrap();
-    f.workgroup_size = Some([1, 1, 1]);
-    f.optimize().unwrap();
-    let shader = compilers.shader(&cache, Box::new([f]));
+    let shader = compilers.shader(&cache, [f]);
     let pipeline = ready(
         compilers
             .pipelines
@@ -3591,7 +3265,13 @@ fn shader_storage_alias_becomes_sampled_texture_without_cpu_readback() {
         .get(&vk::SamplerCreateInfo::default())
         .unwrap();
     let program = cache
-        .prepare_program(pipeline, &[Binding::Image(view), Binding::Sampler(sampler)])
+        .prepare_program(
+            pipeline,
+            &[Binding::CombinedImageSampler {
+                image: view,
+                sampler,
+            }],
+        )
         .unwrap();
     let graphics = cache
         .prepare_graphics(program, GraphicsParameters::new(state, area().extent))
@@ -3864,7 +3544,13 @@ fn exercise_read_only_depth(api: ApiPreference) {
     let mut samplers = SamplerCache::new(cache.device(), 16);
     let sampler = samplers.get(&vk::SamplerCreateInfo::default()).unwrap();
     let program = cache
-        .prepare_program(pipeline, &[Binding::Image(view), Binding::Sampler(sampler)])
+        .prepare_program(
+            pipeline,
+            &[Binding::CombinedImageSampler {
+                image: view,
+                sampler,
+            }],
+        )
         .unwrap();
     let graphics = cache
         .prepare_graphics(program, GraphicsParameters::new(state, area().extent))
@@ -4048,245 +3734,6 @@ fn replacement_draw_into_undefined_color_needs_no_load_and_preserves_unwritten_b
 }
 
 #[test]
-fn fragment_swizzle_add_preserves_subnormals_and_special_values_without_native_preserve() {
-    let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
-        return;
-    };
-    let validation = cache.device.validation_monitor();
-    let mut options = cache.device.shader_options();
-    if !options.subgroup_quad {
-        return;
-    }
-    options.shader.float32.denorm_preserve = false;
-    let (inputs, backing) = backing_allocation(4096, 4096, 0);
-    let buffer = cache
-        .buffer_for(backing, vk::BufferUsageFlags::STORAGE_BUFFER)
-        .unwrap();
-    // Integer color storage makes the shader's exact float bit patterns observable
-    // without a floating-point attachment conversion affecting subnormal values.
-    let (target, pixels) = image(
-        &mut cache,
-        vk::Format::R32G32B32A32_UINT,
-        vk::ImageAspectFlags::COLOR,
-        16,
-    );
-    let compiler = compiler(&cache);
-    for ftz in [false, true] {
-        let control = nixe_gpu::ShaderFloatControl::new(
-            nixe_gpu::ShaderRoundingMode::NearestEven,
-            nixe_gpu::ShaderNanMode::Propagate,
-            ftz,
-            ftz,
-            false,
-        );
-        let mut builder = FunctionBuilder::new(ShaderStage::Fragment);
-        let entry = builder.entry();
-        let mut args = Vec::new();
-        for address in [0, 4] {
-            let address = constant(&mut builder, entry, Type::U32, address);
-            let value = builder.emit(
-                entry,
-                pc(),
-                Op::Load {
-                    space: MemorySpace::Storage,
-                    resource: Some(ResourceId::new(42)),
-                    address_type: Type::U32,
-                    ty: Type::U32,
-                },
-                vec![address],
-            )[0];
-            let value = builder.emit(
-                entry,
-                pc(),
-                Op::Bitcast {
-                    from: Type::U32,
-                    to: Type::F32,
-                },
-                vec![value.into()],
-            )[0];
-            args.push(value.into());
-        }
-        for component in 0..4 {
-            let value = builder.emit(
-                entry,
-                pc(),
-                Op::QuadSwizzleAdd {
-                    swizzle: component * 0x55,
-                    float_control: control,
-                },
-                args.clone(),
-            )[0];
-            let value = builder.emit(
-                entry,
-                pc(),
-                Op::Bitcast {
-                    from: Type::F32,
-                    to: Type::U32,
-                },
-                vec![value.into()],
-            )[0];
-            builder.emit(
-                entry,
-                pc(),
-                Op::Output {
-                    location: Io::Color(0),
-                    component,
-                    ty: Type::U32,
-                },
-                vec![value.into()],
-            );
-        }
-        builder.terminate(entry, pc(), Terminator::Return);
-        let mut fragment = builder.finish().unwrap();
-        fragment.resources = vec![nixe_gpu::ssa::Resource {
-            id: ResourceId::new(42),
-            kind: nixe_gpu::ShaderResourceKind::StorageBuffer,
-        }];
-        fragment.outputs = (0..4)
-            .map(|c| {
-                ShaderInterfaceElement::new(Io::Color(0), c, ShaderScalarType::Unsigned32, None)
-                    .unwrap()
-            })
-            .collect();
-        fragment.optimize().unwrap();
-        let shader = Arc::new(ShaderArtifact::new(Box::new([
-            host_stage(
-                ShaderStage::Vertex,
-                include_bytes!("../../../shaders/spv/solid.vert.spv"),
-                Box::new([]),
-                0,
-            ),
-            CompiledStage::new(
-                ShaderStage::Fragment,
-                spirv::emit(&fragment, options).unwrap(),
-                None,
-                0,
-                None,
-            ),
-        ])));
-        let state = GraphicsState::color(vk::Format::R32G32B32A32_UINT);
-        let pipeline = ready(
-            compiler
-                .request(PipelineRecipe::Graphics {
-                    shader,
-                    state: state.clone(),
-                })
-                .unwrap(),
-        );
-        let program = cache
-            .prepare_program(
-                pipeline,
-                &[Binding::Buffer {
-                    buffer,
-                    offset: 0,
-                    size: 8,
-                }],
-            )
-            .unwrap();
-        let graphics = cache
-            .prepare_graphics(program, GraphicsParameters::new(state, area().extent))
-            .unwrap();
-        let targets = cache
-            .prepare_targets(RenderingTargets {
-                area: area(),
-                colors: Box::new([Some(RenderAttachment::color(
-                    target,
-                    0,
-                    AttachmentLoad::Clear([0.; 4]),
-                    AttachmentStore::Store,
-                ))]),
-                depth: None,
-                stencil: None,
-            })
-            .unwrap();
-        let draw = cache
-            .prepare_draw(graphics, targets, Box::new([]), None)
-            .unwrap();
-        for [a, b] in [
-            [1_u32, 0],
-            [3, 1],
-            [0x7fffff, 1],
-            [0x800000, 0x7fffff],
-            [1, 0x80000001],
-            [0x80000001, 0],
-            [0, 0x80000000],
-            [0x80000000, 0],
-            [0x80000000, 0x80000000],
-            [0x80000001, 0x80000001],
-            [0x3f800000, 0x3f000000],
-            [0x7f7fffff, 0x7f7fffff],
-            [0x7f800000, 1],
-            [0x7f800000, 0x7f800000],
-            [0xff800000, 0x7f800000],
-            [0x7fc12345, 1],
-            [0x7f812345, 0x80000001],
-            [1, 0xffc12345],
-        ] {
-            inputs
-                .write(
-                    0,
-                    &[a, b]
-                        .into_iter()
-                        .flat_map(u32::to_le_bytes)
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap();
-            cache
-                .draw(
-                    &draw,
-                    Draw::Direct {
-                        vertices: 3,
-                        instances: 1,
-                        first_vertex: 0,
-                        first_instance: 0,
-                    },
-                    &[],
-                )
-                .unwrap();
-            cache.flush().unwrap();
-            let actual = cpu_read(&mut cache, &pixels);
-            let flush = |bits: u32| {
-                if ftz && bits & 0x7f800000 == 0 {
-                    bits & 0x80000000
-                } else {
-                    bits
-                }
-            };
-            let av = f64::from(f32::from_bits(flush(a)));
-            let bv = f64::from(f32::from_bits(flush(b)));
-            let expected = [
-                (-av - bv) as f32,
-                (av - bv) as f32,
-                (-av + bv) as f32,
-                (av * 0. - bv) as f32,
-            ]
-            .map(|v| flush(v.to_bits()));
-            for row in 0..8 {
-                for pixel in actual[32 + row * 144..32 + row * 144 + 128].chunks_exact(16) {
-                    for (component, word) in pixel.chunks_exact(4).enumerate() {
-                        let value = u32::from_le_bytes(word.try_into().unwrap());
-                        if f32::from_bits(expected[component]).is_nan() {
-                            assert!(
-                                f32::from_bits(value).is_nan(),
-                                "FTZ={ftz} a={a:08x} b={b:08x} selector={component}"
-                            );
-                        } else {
-                            assert_eq!(
-                                value, expected[component],
-                                "FTZ={ftz} a={a:08x} b={b:08x} selector={component}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-    drop(compiler);
-    drop(cache);
-    validation.check().unwrap();
-}
-
-#[test]
 fn transfer_writes_skip_old_destination_import_and_preserve_exterior_producers() {
     for blit in [false, true] {
         for partial in [false, true] {
@@ -4405,7 +3852,7 @@ fn uniform_word_addressing_dynamic_offsets_and_cpu_gpu_producers_keep_visibility
         .min_uniform_buffer_offset_alignment
         .max(16);
     let (input_allocation, input_backing) =
-        backing_allocation((alignment * 2 + 64) as usize, 4096, 0x19);
+        backing_allocation((alignment * 2 + 80) as usize, 4096, 0x19);
     let (_, output_backing) = backing_allocation(4096, 4096, 0x71);
     let input = cache
         .buffer_for(input_backing.clone(), vk::BufferUsageFlags::UNIFORM_BUFFER)
@@ -4413,45 +3860,21 @@ fn uniform_word_addressing_dynamic_offsets_and_cpu_gpu_producers_keep_visibility
     let output = cache
         .buffer_for(output_backing.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
         .unwrap();
-    let mut b = FunctionBuilder::new(ShaderStage::Compute);
-    let block = b.entry();
-    let address = b.emit(
-        block,
-        pc(),
-        Op::Parameter {
-            index: 0,
-            ty: Type::U32,
-        },
-        vec![],
-    )[0];
-    let value = b.emit(
-        block,
-        pc(),
-        Op::Load {
-            space: MemorySpace::Constant,
-            resource: Some(ResourceId::new(7)),
-            address_type: Type::U32,
-            ty: Type::U32,
-        },
-        vec![address.into()],
-    )[0];
-    let zero = constant(&mut b, block, Type::U32, 0);
-    b.emit(
-        block,
-        pc(),
-        Op::Store {
-            space: MemorySpace::Storage,
-            resource: Some(ResourceId::new(42)),
-            address_type: Type::U32,
-            ty: Type::U32,
-        },
-        vec![zero, value.into()],
-    );
-    b.terminate(block, pc(), Terminator::Return);
-    let mut f = b.finish().unwrap();
-    f.workgroup_size = Some([1, 1, 1]);
-    f.optimize().unwrap();
-    let shader = compilers.shader(&cache, Box::new([f]));
+    let mut f = Shader::new(Stage::Compute);
+    f.storage();
+    f.program.info.used_constant_buffer_types = Type::U32;
+    f.program
+        .info
+        .constant_buffer_descriptors
+        .push(ConstantBufferDescriptor {
+            index: CbufIndex(0),
+            count: 1,
+        })
+        .unwrap();
+    let address = f.op(O::GetCbufU32, &[V::U32(0), V::U32(64)]);
+    let value = f.op(O::GetCbufU32, &[V::U32(0), address]);
+    f.op(O::WriteStorage32, &[V::U32(0), V::U32(0), value]);
+    let shader = compilers.shader(&cache, [f]);
     let pipeline = ready(
         compilers
             .pipelines
@@ -4469,7 +3892,7 @@ fn uniform_word_addressing_dynamic_offsets_and_cpu_gpu_producers_keep_visibility
                 Binding::Buffer {
                     buffer: input,
                     offset: alignment,
-                    size: 64,
+                    size: 80,
                 },
                 Binding::Buffer {
                     buffer: output,
@@ -4488,12 +3911,11 @@ fn uniform_word_addressing_dynamic_offsets_and_cpu_gpu_producers_keep_visibility
                 &expected.to_le_bytes(),
             )
             .unwrap();
+        input_allocation
+            .write((alignment + 64) as usize, &address.to_le_bytes())
+            .unwrap();
         cache
-            .dispatch(
-                &program,
-                Dispatch::Direct([1, 1, 1]),
-                &address.to_le_bytes(),
-            )
+            .dispatch(&program, Dispatch::Direct([1, 1, 1]), &[])
             .unwrap();
         cache.flush().unwrap();
         assert_eq!(
@@ -4503,12 +3925,15 @@ fn uniform_word_addressing_dynamic_offsets_and_cpu_gpu_producers_keep_visibility
     }
     // A native producer must become visible to the uniform access class.
     let expected = 0xabcdef12u32;
+    input_allocation
+        .write((alignment + 64) as usize, &16u32.to_le_bytes())
+        .unwrap();
     let upload = cache
         .write_buffer(input, alignment + 16, &expected.to_le_bytes())
         .unwrap();
     assert_eq!(upload.consumed, 4);
     cache
-        .dispatch(&program, Dispatch::Direct([1, 1, 1]), &16u32.to_le_bytes())
+        .dispatch(&program, Dispatch::Direct([1, 1, 1]), &[])
         .unwrap();
     cache.flush().unwrap();
     assert_eq!(

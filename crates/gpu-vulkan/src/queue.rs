@@ -175,7 +175,11 @@ pub(crate) struct Slot {
     pub bound_descriptor_offset: u64,
 }
 impl Slot {
-    fn new(owner: Arc<DeviceOwner>, family: u32) -> Result<Self, VulkanError> {
+    fn new(
+        owner: Arc<DeviceOwner>,
+        family: u32,
+        #[cfg(feature = "performance-counters")] recording_handle: crate::dispatch::RecordingHandle,
+    ) -> Result<Self, VulkanError> {
         // Reset the whole pool after its real last use; no per-buffer reset flag.
         let pool = unsafe {
             owner.device.create_command_pool(
@@ -189,7 +193,7 @@ impl Slot {
         let mut slot = Self {
             stream_descriptors: None,
             #[cfg(feature = "performance-counters")]
-            timing: timing::Queries::new(Arc::clone(&owner), family)?,
+            timing: timing::Queries::new(Arc::clone(&owner), family, recording_handle)?,
             owner,
             pool,
             command: vk::CommandBuffer::null(),
@@ -297,8 +301,11 @@ pub struct RecordingStatistics {
     pub push_updates: u64,
     pub graphics_updates: u64,
     pub rendering_scopes: u64,
+    pub draw_calls: u64,
 }
 pub(crate) struct QueueState {
+    recording_handle: crate::dispatch::RecordingHandle,
+    native_submitted: Arc<AtomicU64>,
     pub statistics: RecordingStatistics,
     owner: Arc<DeviceOwner>,
     pub timeline: vk::Semaphore,
@@ -328,6 +335,7 @@ impl QueueState {
         owner: Arc<DeviceOwner>,
         family: u32,
         configuration: QueueConfiguration,
+        _dispatch: &crate::dispatch::Dispatch,
     ) -> Result<Self, VulkanError> {
         static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
         let instance = NEXT_INSTANCE
@@ -340,6 +348,8 @@ impl QueueState {
         let timeline = unsafe { owner.device.create_semaphore(&info, None) }
             .map_err(|e| VulkanError::vk("vkCreateSemaphore(owner timeline)", e))?;
         let state = Self {
+            recording_handle: _dispatch.recording_handle(),
+            native_submitted: Arc::new(AtomicU64::new(0)),
             owner,
             timeline,
             instance: BackendInstanceId::new(instance),
@@ -361,7 +371,7 @@ impl QueueState {
         Ok(state)
     }
     pub(crate) fn is_device_lost(&self) -> bool {
-        self.lost
+        self.lost || self.recording_handle.is_device_lost()
     }
     pub(crate) fn ticket(&self, tick: u64) -> WorkTicket {
         WorkTicket {
@@ -370,6 +380,7 @@ impl QueueState {
         }
     }
     fn check_running(&self) -> Result<(), VulkanError> {
+        self.recording_handle.check_failure()?;
         if self.stopped {
             Err(VulkanError::QueueStopped)
         } else {
@@ -503,8 +514,12 @@ impl QueueState {
         {
             Some(index) => index,
             None if self.slots.len() < self.configuration.command_slots => {
-                self.slots
-                    .push(Slot::new(Arc::clone(&self.owner), self.family)?);
+                self.slots.push(Slot::new(
+                    Arc::clone(&self.owner),
+                    self.family,
+                    #[cfg(feature = "performance-counters")]
+                    self.recording_handle.clone(),
+                )?);
                 self.slots.len() - 1
             }
             None => return Err(self.pressure()),
@@ -516,23 +531,9 @@ impl QueueState {
                 "submission timeline exhausted",
             ))?;
         let slot = &mut self.slots[index];
-        // Every command buffer in this pool is no longer pending.
-        // https://docs.vulkan.org/refpages/latest/refpages/source/vkResetCommandPool.html
-        unsafe {
-            self.owner
-                .device
-                .reset_command_pool(slot.pool, vk::CommandPoolResetFlags::empty())
-        }
-        .map_err(|e| self.error("vkResetCommandPool", e))?;
-        let slot = &mut self.slots[index];
-        unsafe {
-            self.owner.device.begin_command_buffer(
-                slot.command,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-        }
-        .map_err(|e| self.error("vkBeginCommandBuffer", e))?;
+        // The slot's previous GPU tick is complete. Reset/begin remain ordered
+        // native jobs; no owner/worker round trip is needed to acquire a slot.
+        self.recording_handle.begin(slot.pool, slot.command)?;
         let slot = &mut self.slots[index];
         #[cfg(feature = "performance-counters")]
         if let Some(timing) = &mut slot.timing {
@@ -601,7 +602,9 @@ impl QueueState {
                     | vk::BufferUsageFlags::VERTEX_BUFFER
                     | vk::BufferUsageFlags::INDEX_BUFFER
                     | vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    | vk::BufferUsageFlags::UNIFORM_BUFFER
+                    | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
+                    | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,
                 "nixe upload arena",
             ),
             (
@@ -667,7 +670,9 @@ impl QueueState {
                     | vk::BufferUsageFlags::VERTEX_BUFFER
                     | vk::BufferUsageFlags::INDEX_BUFFER
                     | vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    | vk::BufferUsageFlags::UNIFORM_BUFFER
+                    | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
+                    | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,
                 MemoryLocation::CpuToGpu,
                 AllocationMode::Dedicated,
                 "nixe upload overflow",
@@ -809,7 +814,9 @@ impl QueueState {
                     | vk::BufferUsageFlags::VERTEX_BUFFER
                     | vk::BufferUsageFlags::INDEX_BUFFER
                     | vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    | vk::BufferUsageFlags::UNIFORM_BUFFER
+                    | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
+                    | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,
                 "nixe upload arena",
             )
         } else {
@@ -918,6 +925,15 @@ impl QueueState {
         let Some(index) = self.recording else {
             return Ok(None);
         };
+        if waits
+            .iter()
+            .chain(extra_signals)
+            .any(|info| !info.p_next.is_null())
+        {
+            return Err(VulkanError::InvalidResource(
+                "queue semaphore extensions require owned native parameters",
+            ));
+        }
         self.end_rendering(dispatch);
         let slot = &self.slots[index];
         let tick = slot.tick;
@@ -928,11 +944,6 @@ impl QueueState {
                 timing.end(slot.command);
             }
         }
-        let slot = &self.slots[index];
-        unsafe { self.owner.device.end_command_buffer(slot.command) }
-            .map_err(|e| self.error("vkEndCommandBuffer", e))?;
-        let commands =
-            [vk::CommandBufferSubmitInfo::default().command_buffer(self.slots[index].command)];
         if extra_signals.len() > 1 {
             return Err(VulkanError::InvalidResource(
                 "owner submission supports one presentation signal",
@@ -945,27 +956,37 @@ impl QueueState {
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
             extra_signals.first().copied().unwrap_or_default(),
         ];
-        let info = vk::SubmitInfo2::default()
-            .wait_semaphore_infos(waits)
-            .command_buffer_infos(&commands)
-            .signal_semaphore_infos(&signals[..1 + extra_signals.len()]);
-        // SAFETY: sole owner serializes queue; slots retain every referenced
-        // allocation. Extra waits are internal WSI/external ownership dependencies.
-        #[cfg(feature = "performance-counters")]
-        let submitted_at = std::time::Instant::now();
-        unsafe { dispatch.submit(queue, &info, vk::Fence::null()) }.inspect_err(|e| {
-            self.stopped = true;
-            if let VulkanError::Vulkan { result, .. } = e {
-                self.lost |= *result == vk::Result::ERROR_DEVICE_LOST;
-            }
-        })?;
-        #[cfg(feature = "performance-counters")]
-        nixe_gpu::metrics::record(
-            nixe_gpu::metrics::Counter::HostQueueSubmitNanoseconds,
-            submitted_at.elapsed().as_nanos() as u64,
-        );
-        nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::HostQueueSubmissions, 1);
-        nixe_gpu::trace::detail_event("queue_submit", tick, 0, 0);
+        // Capture native parameters now. The worker closes and submits this
+        // command buffer in FIFO order while the owner prepares following work.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_scheduler.cpp
+        self.recording_handle
+            .submit(crate::dispatch::QueueSubmission {
+                queue,
+                command: self.slots[index].command,
+                waits: waits
+                    .iter()
+                    .map(|info| {
+                        vk::SemaphoreSubmitInfo::default()
+                            .semaphore(info.semaphore)
+                            .value(info.value)
+                            .stage_mask(info.stage_mask)
+                            .device_index(info.device_index)
+                    })
+                    .collect(),
+                signals: signals[..1 + extra_signals.len()]
+                    .iter()
+                    .map(|info| {
+                        vk::SemaphoreSubmitInfo::default()
+                            .semaphore(info.semaphore)
+                            .value(info.value)
+                            .stage_mask(info.stage_mask)
+                            .device_index(info.device_index)
+                    })
+                    .collect(),
+                tick,
+                submitted: Arc::clone(&self.native_submitted),
+            })?;
+        nixe_gpu::trace::detail_event("queue_schedule", tick, 0, 0);
         self.submitted = tick;
         self.recording = None;
         self.visibility_scope = None;
@@ -991,6 +1012,9 @@ impl QueueState {
         }
         if ticket.tick <= self.completed {
             return Ok(true);
+        }
+        if self.native_submitted.load(Ordering::Acquire) < ticket.tick {
+            self.recording_handle.finish()?;
         }
         let semaphores = [self.timeline];
         let values = [ticket.tick];
@@ -1054,11 +1078,16 @@ impl QueueState {
 }
 impl Drop for QueueState {
     fn drop(&mut self) {
+        let _ = self.recording_handle.finish();
+        self.lost |= self.recording_handle.is_device_lost();
+        // A failed native job never signals its queued tick. Drain only host
+        // submissions actually accepted before the failure, retaining all slots.
+        let submitted = self.native_submitted.load(Ordering::Acquire);
         // Cancel recording without submission; accepted work drains only to the
         // last real tick. No queue/device-wide idle wait is needed, even at shutdown.
-        if !self.lost && self.completed < self.submitted {
+        if !self.lost && self.completed < submitted {
             let semaphores = [self.timeline];
-            let values = [self.submitted];
+            let values = [submitted];
             let info = vk::SemaphoreWaitInfo::default()
                 .semaphores(&semaphores)
                 .values(&values);
@@ -1287,6 +1316,7 @@ impl VulkanDevice {
     /// Cancel unsubmitted recording and drain accepted work, without publishing
     /// canceled guest reservations. Dropping the device uses the same last tick.
     pub fn shutdown(&mut self) -> Result<(), VulkanError> {
+        self.dispatch.finish_recording()?;
         if self.submission.lost {
             self.submission.stopped = true;
             return Err(VulkanError::QueueStopped);

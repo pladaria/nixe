@@ -34,7 +34,7 @@ fn descriptor_lookup_throughput() {
         .unwrap();
     let mut cache = MaxwellThreeDRetainedBackingCache::default();
     cache.set_view_limit(4096);
-    let mut builder = ResourceBuilder::new(&space, None, None, Some(&mut cache));
+    let mut builder = ResourceBuilder::new(&space, None, Some(&mut cache));
     let address = mapping.offset().get();
     builder
         .buffer(

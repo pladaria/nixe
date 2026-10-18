@@ -3,7 +3,7 @@
 use super::{CacheConfiguration, CompileError, persistent};
 use crate::{VulkanDevice, VulkanError, device::DeviceOwner};
 use ash::vk;
-use nixe_gpu::ssa::artifact::ContentId;
+use nixe_gpu::shader_identity::ContentId;
 use std::sync::{Arc, Mutex};
 struct Cache {
     owner: Arc<DeviceOwner>,

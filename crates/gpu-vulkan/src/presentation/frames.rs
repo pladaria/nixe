@@ -51,9 +51,7 @@ impl Frames {
         }
     }
     pub fn get(&self, image: &ResidentImage) -> Result<&Snapshot, VulkanError> {
-        let lease = image.lease().ok_or(VulkanError::InvalidResource(
-            "native presenter requires a typed frame lease",
-        ))?;
+        let lease = image.lease();
         let frame = self
             .snapshots
             .get(lease.image().slot as usize)
@@ -70,11 +68,7 @@ impl Frames {
         Ok(frame)
     }
     pub fn used(&mut self, image: &ResidentImage, work: WorkTicket) -> Result<(), VulkanError> {
-        let slot = image
-            .lease()
-            .ok_or(VulkanError::InvalidResource("missing frame lease"))?
-            .image()
-            .slot as usize;
+        let slot = image.lease().image().slot as usize;
         self.get(image)?;
         // The lease's producer stays immutable; actual last use is tracked separately.
         self.snapshots[slot].last_use = work;
@@ -244,7 +238,7 @@ impl Frames {
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .layer_count(1);
         unsafe {
-            device.owner.device.cmd_copy_image(
+            device.dispatch.cmd_copy_image(
                 command,
                 native.handle,
                 layout,

@@ -1,14 +1,11 @@
 //! Buffer views shared by graphics and compute; content ownership stays canonical.
 use super::*;
-use crate::{MaxwellResolvedRange, MaxwellThreeDMappingReference};
-use nixe_gpu::{BackingView, BufferDescription, GpuAllocationDescription, GpuAllocationId};
+use crate::MaxwellResolvedRange;
+use nixe_gpu::{BackingView, GpuAllocationDescription, GpuAllocationId};
 use nixe_memory::CanonicalBackingRange;
 
 pub(super) struct RetainedBuffer {
-    pub description: BufferDescription,
-    pub allocation_description: GpuAllocationDescription,
     pub backing: BackingView,
-    pub mappings: Arc<[MaxwellThreeDMappingReference]>,
 }
 
 pub(super) fn retain(range: &MaxwellResolvedRange) -> Result<RetainedBuffer, MaxwellLoweringError> {
@@ -22,7 +19,6 @@ pub(super) fn retain(range: &MaxwellResolvedRange) -> Result<RetainedBuffer, Max
     let offset = first.backing_offset();
     let mut end = offset;
     let mut segments = Vec::new();
-    let mut mappings = Vec::new();
     for segment in range.segments() {
         if segment.mapping().allocation() != allocation
             || segment.backing_offset() != end
@@ -38,10 +34,8 @@ pub(super) fn retain(range: &MaxwellResolvedRange) -> Result<RetainedBuffer, Max
         end = end
             .checked_add(segment.size())
             .ok_or_else(|| fail("range overflow"))?;
-        mappings.push(MaxwellThreeDMappingReference::from_segment(segment));
     }
     let canonical = CanonicalBackingRange::new(segments).map_err(|e| fail(&e.to_string()))?;
-    let description = BufferDescription::new(end - offset).map_err(|e| fail(&e.to_string()))?;
     let allocation_description =
         GpuAllocationDescription::new(allocation_size, 1).map_err(|e| fail(&e.to_string()))?;
     let backing = BackingView::new(
@@ -51,101 +45,5 @@ pub(super) fn retain(range: &MaxwellResolvedRange) -> Result<RetainedBuffer, Max
         canonical,
     )
     .map_err(|e| fail(&e.to_string()))?;
-    Ok(RetainedBuffer {
-        description,
-        allocation_description,
-        backing,
-        mappings: mappings.into(),
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn prepare_buffer(
-    description: BufferDescription,
-    allocation_description: GpuAllocationDescription,
-    backing: BackingView,
-    mappings: Arc<[MaxwellThreeDMappingReference]>,
-    writable: bool,
-    cache: &mut MaxwellLoweringCache,
-    creations: &mut Vec<ResourceDefinition>,
-    invalidations: &mut Vec<ResourceDependency>,
-    retained: impl Iterator<Item = ResourceDependency> + Clone,
-) -> Result<ResourceDependency, MaxwellLoweringError> {
-    let key = ViewKey::Buffer {
-        description,
-        buffer_offset: 0,
-        backing: backing.clone(),
-        mappings,
-    };
-    let interval = (
-        backing.allocation(),
-        backing.allocation_offset(),
-        description.size(),
-    );
-    if let Some(record) = cache
-        .buffer_views_by_range
-        .get(&interval)
-        .into_iter()
-        .flatten()
-        .filter_map(|dependency| cache.views.get(dependency))
-        .find(|record| match &record.key {
-            ViewKey::Buffer {
-                description: current,
-                buffer_offset,
-                backing: old,
-                mappings: old_mappings,
-            } => {
-                *current == description
-                    && *buffer_offset == 0
-                    && same_canonical_backing(old, &backing)
-                    && matches!(&key, ViewKey::Buffer { mappings, .. } if mappings == old_mappings)
-            }
-            _ => false,
-        })
-    {
-        return Ok(record.dependency);
-    }
-    let allocation = backing.allocation();
-    match cache.allocations.iter().find(|(id, _)| *id == allocation) {
-        Some((_, current)) if *current != allocation_description => {
-            return Err(MaxwellLoweringError::AllocationDescriptionChanged { allocation });
-        }
-        Some(_) => {}
-        None => {
-            cache.allocations.push((allocation, allocation_description));
-            creations.push(ResourceDefinition::Allocation {
-                id: allocation,
-                description: allocation_description,
-            });
-        }
-    }
-    retire_overlapping_views(&key, writable, retained, cache, invalidations);
-    let id = BufferId::new(take_identity(cache)?);
-    let view = BufferView::new(id, description, 0, backing)
-        .map_err(|e| MaxwellLoweringError::BufferBacking(e.to_string()))?;
-    creations.push(ResourceDefinition::Buffer {
-        id,
-        description,
-        view: Some(view),
-    });
-    let dependency = ResourceDependency::Buffer(id);
-    cache.views.insert(
-        dependency,
-        ViewRecord {
-            key,
-            dependency,
-            materialization: ViewMaterialization::Direct,
-            cpu_writes: None,
-            write_revision: 0,
-            last_used: 0,
-            uninitialized_color_regions: Vec::new(),
-            uninitialized_depth_stencil_regions: Default::default(),
-        },
-    );
-    cache
-        .buffer_views_by_range
-        .entry(interval)
-        .or_default()
-        .push(dependency);
-    Ok(dependency)
+    Ok(RetainedBuffer { backing })
 }

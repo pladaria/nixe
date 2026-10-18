@@ -1035,7 +1035,7 @@ impl VulkanResidency {
         }
         // Vertex/index leases can survive removal from the residency index.
         // Residency last_use also prevents release before this reservation retires.
-        let raw = &self.device.owner.device;
+        let raw = &self.device.dispatch;
         unsafe {
             if !empty {
                 for (v, &value) in prepared.vertices.iter().zip(&vertex_bindings) {
@@ -1080,6 +1080,7 @@ impl VulkanResidency {
                 slot.active_targets = Some(Arc::clone(&prepared.targets));
             }
             if !empty {
+                self.device.submission.statistics.draw_calls += draws.len() as u64;
                 for &draw in draws {
                     match draw {
                         Draw::Direct {

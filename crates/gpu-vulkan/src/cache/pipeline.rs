@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{VulkanDevice, VulkanError, device::DeviceOwner};
 use ash::vk;
-use nixe_gpu::{ShaderStage, ssa::artifact::ContentId};
+use nixe_gpu::{ShaderStage, shader_identity::ContentId};
 use rustc_hash::FxHashMap as HashMap;
 use std::{
     sync::{Arc, Condvar, Mutex},
@@ -57,6 +57,8 @@ pub struct NativePipeline {
     pub metrics: PipelineMetrics,
     pub(crate) graphics: Option<GraphicsState>,
     pub(crate) resources: Box<[crate::residency::execution::ShaderAccess]>,
+    pub(crate) host_uniforms: Box<[nixe_shader_recompiler::artifact::HostUniformLayout]>,
+    pub(crate) binding_origins: Box<[super::layout::BindingOrigin]>,
     _libraries: Box<[Arc<Library>]>,
 }
 impl Drop for NativePipeline {
@@ -374,6 +376,7 @@ impl Compiler {
     ) -> Result<NativePipeline, CompileError> {
         self.check_stages(&shader, state.as_ref())?;
         let layout = self.layouts.get(LayoutKey::reflect(&shader)?)?;
+        let binding_origins = super::layout::binding_origins(&shader, &layout.key)?;
         let start = Instant::now();
         let mut metrics = PipelineMetrics::default();
         let mut linked_libraries = Vec::new();
@@ -481,6 +484,13 @@ impl Compiler {
             dynamic_states: dynamic,
             metrics,
             resources,
+            binding_origins,
+            host_uniforms: shader
+                .stages
+                .iter()
+                .filter_map(|stage| stage.guest.as_ref())
+                .flat_map(|stage| stage.host_uniforms.iter().cloned())
+                .collect(),
             graphics: state,
             _libraries: linked_libraries.into_boxed_slice(),
         })

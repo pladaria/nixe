@@ -169,28 +169,3 @@ pub(in crate::engines) fn draw_state(
         control,
     }))
 }
-
-pub(in crate::engines) fn validate_default_level_inputs(
-    control: nixe_gpu::TessellationControl,
-    ir: &nixe_gpu::ShaderIr,
-) -> Result<(), super::MaxwellLoweringError> {
-    let nixe_gpu::TessellationControl::DefaultLevels { defined, .. } = control else {
-        return Ok(());
-    };
-    if ir.stage() != nixe_gpu::ShaderStage::TessellationEvaluation {
-        return Ok(());
-    }
-    for input in ir.inputs() {
-        let bit = match input.location() {
-            nixe_gpu::ShaderIoLocation::TessLevelOuter => input.component(),
-            nixe_gpu::ShaderIoLocation::TessLevelInner => 4 + input.component(),
-            _ => continue,
-        };
-        if defined & (1 << bit) == 0 {
-            return Err(super::MaxwellLoweringError::IncompleteDraw(
-                "default tessellation level consumed by evaluation shader",
-            ));
-        }
-    }
-    Ok(())
-}

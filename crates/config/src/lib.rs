@@ -7,11 +7,6 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use nixe_gpu::{
-    DEFAULT_BIND_GROUPS_PER_DESCRIPTOR_TABLE, DEFAULT_PERSISTENT_PIPELINE_CACHE_BYTES,
-    DEFAULT_PIPELINE_CACHE_ENTRIES, DEFAULT_PIPELINE_VARIANTS_PER_RESOURCE,
-    DEFAULT_SHADER_CACHE_ENTRIES, GpuCacheConfiguration,
-};
 use nixe_loader_title::{DirectoryScanOptions, NacpLanguage};
 use serde::Deserialize;
 
@@ -25,6 +20,25 @@ pub const CONFIG_FILE_NAME: &str = "nixe.toml";
 
 /// Current configuration schema version.
 pub const CONFIG_VERSION: u32 = 2;
+
+/// Bounds for derived native GPU caches; these are not hardware limits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuConfig {
+    pub shader_entries: usize,
+    pub pipeline_entries: usize,
+    pub descriptor_sets: usize,
+    pub persistent_bytes: u64,
+}
+impl Default for GpuConfig {
+    fn default() -> Self {
+        Self {
+            shader_entries: 2048,
+            pipeline_entries: 8192,
+            descriptor_sets: 4096,
+            persistent_bytes: 128 * 1024 * 1024,
+        }
+    }
+}
 
 /// Configuration shared by the CLI and desktop applications.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,7 +56,7 @@ pub struct NixeConfig {
     /// CPU backend selection and resource policy.
     pub cpu: CpuConfig,
     /// GPU shader, pipeline, and backend-derived cache policy.
-    pub gpu: GpuCacheConfiguration,
+    pub gpu: GpuConfig,
     /// Host presentation preferences.
     pub video: VideoConfig,
     /// Host gamepad identification and emulated-controller mappings.
@@ -445,10 +459,8 @@ struct RawGpuConfig {
     shader_cache_entries: usize,
     #[serde(default = "default_pipeline_cache_entries")]
     pipeline_cache_entries: usize,
-    #[serde(default = "default_pipeline_variants_per_resource")]
-    pipeline_variants_per_resource: usize,
-    #[serde(default = "default_bind_groups_per_descriptor_table")]
-    bind_groups_per_descriptor_table: usize,
+    #[serde(default = "default_descriptor_sets")]
+    descriptor_sets: usize,
     #[serde(default = "default_persistent_pipeline_cache_mib")]
     persistent_pipeline_cache_mib: u64,
 }
@@ -458,8 +470,7 @@ impl Default for RawGpuConfig {
         Self {
             shader_cache_entries: default_shader_cache_entries(),
             pipeline_cache_entries: default_pipeline_cache_entries(),
-            pipeline_variants_per_resource: default_pipeline_variants_per_resource(),
-            bind_groups_per_descriptor_table: default_bind_groups_per_descriptor_table(),
+            descriptor_sets: default_descriptor_sets(),
             persistent_pipeline_cache_mib: default_persistent_pipeline_cache_mib(),
         }
     }
@@ -574,30 +585,20 @@ fn default_sd_card_path() -> PathBuf {
     PathBuf::from("./storage/sdmc")
 }
 
-const fn default_shader_cache_entries() -> usize {
-    DEFAULT_SHADER_CACHE_ENTRIES
+fn default_shader_cache_entries() -> usize {
+    GpuConfig::default().shader_entries
+}
+fn default_pipeline_cache_entries() -> usize {
+    GpuConfig::default().pipeline_entries
+}
+fn default_descriptor_sets() -> usize {
+    GpuConfig::default().descriptor_sets
+}
+fn default_persistent_pipeline_cache_mib() -> u64 {
+    GpuConfig::default().persistent_bytes / (1024 * 1024)
 }
 
-const fn default_pipeline_cache_entries() -> usize {
-    DEFAULT_PIPELINE_CACHE_ENTRIES
-}
-
-const fn default_pipeline_variants_per_resource() -> usize {
-    DEFAULT_PIPELINE_VARIANTS_PER_RESOURCE
-}
-
-const fn default_bind_groups_per_descriptor_table() -> usize {
-    DEFAULT_BIND_GROUPS_PER_DESCRIPTOR_TABLE
-}
-
-const fn default_persistent_pipeline_cache_mib() -> u64 {
-    DEFAULT_PERSISTENT_PIPELINE_CACHE_BYTES / (1024 * 1024)
-}
-
-fn gpu_cache_configuration(
-    path: &Path,
-    raw: RawGpuConfig,
-) -> Result<GpuCacheConfiguration, ConfigError> {
+fn gpu_cache_configuration(path: &Path, raw: RawGpuConfig) -> Result<GpuConfig, ConfigError> {
     let persistent_bytes = raw
         .persistent_pipeline_cache_mib
         .checked_mul(1024 * 1024)
@@ -605,16 +606,24 @@ fn gpu_cache_configuration(
             path: path.to_owned(),
             reason: "persistent_pipeline_cache_mib does not fit in bytes".to_owned(),
         })?;
-    GpuCacheConfiguration::new(
-        raw.shader_cache_entries,
-        raw.pipeline_cache_entries,
-        raw.pipeline_variants_per_resource,
-        raw.bind_groups_per_descriptor_table,
+    for (name, count) in [
+        ("shader_cache_entries", raw.shader_cache_entries as u64),
+        ("pipeline_cache_entries", raw.pipeline_cache_entries as u64),
+        ("descriptor_sets", raw.descriptor_sets as u64),
+        ("persistent_pipeline_cache_mib", persistent_bytes),
+    ] {
+        if count == 0 {
+            return Err(ConfigError::InvalidGpu {
+                path: path.to_owned(),
+                reason: format!("{name} must be nonzero"),
+            });
+        }
+    }
+    Ok(GpuConfig {
+        shader_entries: raw.shader_cache_entries,
+        pipeline_entries: raw.pipeline_cache_entries,
+        descriptor_sets: raw.descriptor_sets,
         persistent_bytes,
-    )
-    .map_err(|error| ConfigError::InvalidGpu {
-        path: path.to_owned(),
-        reason: error.to_string(),
     })
 }
 
@@ -873,7 +882,7 @@ mod tests {
         assert_eq!(config.diagnostics.log_level, DiagnosticLogLevel::Info);
         assert_eq!(config.diagnostics.guest_logs_level, GuestLogsLevel::Inherit);
         assert!(!config.diagnostics.file_system_access_log);
-        assert_eq!(config.gpu, GpuCacheConfiguration::default());
+        assert_eq!(config.gpu, GpuConfig::default());
         assert!(config.input.profiles.is_empty());
     }
 
@@ -1081,26 +1090,20 @@ mod tests {
                 [gpu]
                 shader_cache_entries = 512
                 pipeline_cache_entries = 2048
-                pipeline_variants_per_resource = 24
-                bind_groups_per_descriptor_table = 12
+                descriptor_sets = 12
                 persistent_pipeline_cache_mib = 96
             "#,
         );
         let config = NixeConfig::load(&explicit.path).unwrap();
-        assert_eq!(config.gpu.shader_entries(), 512);
-        assert_eq!(config.gpu.pipeline_entries(), 2_048);
-        assert_eq!(config.gpu.pipeline_variants_per_resource(), 24);
-        assert_eq!(config.gpu.bind_groups_per_descriptor_table(), 12);
-        assert_eq!(
-            config.gpu.persistent_pipeline_cache_bytes(),
-            96 * 1024 * 1024
-        );
+        assert_eq!(config.gpu.shader_entries, 512);
+        assert_eq!(config.gpu.pipeline_entries, 2_048);
+        assert_eq!(config.gpu.descriptor_sets, 12);
+        assert_eq!(config.gpu.persistent_bytes, 96 * 1024 * 1024);
 
         for setting in [
             "shader_cache_entries = 0",
             "pipeline_cache_entries = 0",
-            "pipeline_variants_per_resource = 0",
-            "bind_groups_per_descriptor_table = 0",
+            "descriptor_sets = 0",
             "persistent_pipeline_cache_mib = 0",
         ] {
             let invalid = TemporaryConfig::new(&format!(

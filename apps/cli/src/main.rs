@@ -57,10 +57,6 @@ fn main() -> ExitCode {
         log::error!("cannot start execution trace: {error}");
         return ExitCode::FAILURE;
     }
-    #[cfg(feature = "execution-trace")]
-    if nixe_memory::trace::presentation_interval(2) == 1 {
-        log::warn!("diagnostic presentation override enabled: swap interval 2 -> 1");
-    }
     #[cfg(feature = "performance-counters")]
     let capture = match performance::Capture::start() {
         Ok(capture) => capture,
@@ -106,7 +102,6 @@ fn parse_arguments(
     let mut file_system_access_log = None;
     let mut headless = false;
     let mut validation = false;
-    let mut vulkan_dev = false;
     let mut vulkan_api = None;
     let mut adapter = None;
     let mut positionals = Vec::new();
@@ -145,13 +140,6 @@ fn parse_arguments(
                 return Err("--headless may only be specified once".to_owned());
             }
             headless = true;
-            continue;
-        }
-        if argument == "--vulkan-dev" {
-            if vulkan_dev {
-                return Err("--vulkan-dev may only be specified once".to_owned());
-            }
-            vulkan_dev = true;
             continue;
         }
         if argument == "--validation" {
@@ -239,11 +227,9 @@ fn parse_arguments(
     let vulkan_check = positionals
         .first()
         .is_some_and(|command| command == "vulkan-check");
-    if !vulkan_check && !vulkan_dev && (validation || vulkan_api.is_some() || adapter.is_some()) {
-        return Err("Vulkan diagnostic options are only valid with vulkan-check".to_owned());
-    }
-    if vulkan_dev && !positionals.first().is_some_and(|c| c == "run") {
-        return Err("--vulkan-dev is only valid with run".to_owned());
+    let run = positionals.first().is_some_and(|command| command == "run");
+    if !vulkan_check && !run && (validation || vulkan_api.is_some() || adapter.is_some()) {
+        return Err("Vulkan options are only valid with run or vulkan-check".to_owned());
     }
     match positionals.as_slice() {
         [command] if command == "vulkan-check" => {
@@ -316,18 +302,14 @@ fn parse_arguments(
                     log_level_override: log_level,
                     identifier,
                     headless,
-                    native_vulkan: if vulkan_dev {
-                        Some(nixe_gpu_vulkan::DeviceOptions {
-                            api: vulkan_api.unwrap_or_default(),
-                            validation: if validation {
-                                nixe_gpu_vulkan::ValidationMode::Enabled
-                            } else {
-                                nixe_gpu_vulkan::ValidationMode::Disabled
-                            },
-                            adapter,
-                        })
-                    } else {
-                        None
+                    vulkan: nixe_gpu_vulkan::DeviceOptions {
+                        api: vulkan_api.unwrap_or_default(),
+                        validation: if validation {
+                            nixe_gpu_vulkan::ValidationMode::Enabled
+                        } else {
+                            nixe_gpu_vulkan::ValidationMode::Disabled
+                        },
+                        adapter,
                     },
                     cpu_backend_override: cpu_backend,
                     guest_logs_level_override: guest_logs_level,
@@ -373,13 +355,12 @@ fn print_usage(program: &OsStr) {
            list            List configured titles as title ID and localized name\n  \
            run <id|name>   Run a title\n  \
            vulkan-check    Verify independent Vulkan device, transfers and cleanup\n\n\
-         Vulkan check options:\n  \
+         Vulkan options (run and vulkan-check):\n  \
            --headless              Create no window or surface\n  \
            --validation            Require the Khronos validation layer\n  \
            --vulkan-api <auto|1.2>  Select core 1.3 or exercise the 1.2 KHR path\n  \
            --adapter <substring>   Select an adapter by name\n\n\
          Run options:\n  \
-           --vulkan-dev            Select the native Vulkan development renderer\n  \
            --headless              Run without creating a host window\n  \
            --cpu-backend <backend> Override CPU backend: jit or interpreter\n  \
            --guest-logs-level <level> Override diagnostics.guest_logs_level\n  \
@@ -429,7 +410,7 @@ mod tests {
         );
         assert_eq!(options.options.adapter.as_deref(), Some("NVIDIA"));
         for args in [
-            &["run", "example", "--validation"][..],
+            &["list", "--validation"][..],
             &["vulkan-check", "--vulkan-api", "1.1"][..],
             &["vulkan-check", "--cpu-backend", "jit"][..],
             &["vulkan-check", "extra"][..],
@@ -440,21 +421,23 @@ mod tests {
 
     #[test]
     fn native_vulkan_accepts_windowed_runs() {
-        let invocation = parse_arguments(arguments(&["--vulkan-dev", "run", "es2gears"]))
+        let invocation = parse_arguments(arguments(&["run", "es2gears"]))
             .unwrap()
             .unwrap();
         let Command::Run(run) = invocation.command else {
             panic!("expected run")
         };
         assert!(!run.headless);
-        assert!(run.native_vulkan.is_some());
+        assert_eq!(
+            run.vulkan.validation,
+            nixe_gpu_vulkan::ValidationMode::Disabled
+        );
     }
 
     #[test]
-    fn native_vulkan_selection_is_explicit_and_fixed_at_startup() {
+    fn native_vulkan_options_are_fixed_at_startup() {
         let invocation = parse_arguments(arguments(&[
             "--headless",
-            "--vulkan-dev",
             "--validation",
             "--adapter",
             "NVIDIA",
@@ -466,21 +449,11 @@ mod tests {
         let Command::Run(run) = invocation.command else {
             panic!("expected run")
         };
-        let options = run.native_vulkan.unwrap();
+        let options = run.vulkan;
         assert_eq!(options.adapter.as_deref(), Some("NVIDIA"));
         assert_eq!(options.validation, nixe_gpu_vulkan::ValidationMode::Enabled);
-        for args in [
-            &["--headless", "--vulkan-dev", "list"][..],
-            &[
-                "--headless",
-                "--vulkan-dev",
-                "--vulkan-dev",
-                "run",
-                "textured_cube",
-            ][..],
-        ] {
-            assert!(parse_arguments(arguments(args)).is_err());
-        }
+        assert!(parse_arguments(arguments(&["--validation", "list"])).is_err());
+        assert!(parse_arguments(arguments(&["--vulkan-dev", "run", "es2gears"])).is_err());
     }
     fn arguments(values: &[&str]) -> impl Iterator<Item = OsString> {
         values

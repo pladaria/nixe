@@ -488,9 +488,9 @@ pub(in crate::engines) fn data_words(
     class: nixe_gpu::GpuClassId,
     candidate: &mut MaxwellComputeState,
     subchannel: crate::MaxwellPushbufferSubchannel,
-    words: &[crate::MaxwellDecodedMethod],
+    words: crate::MaxwellMethodSpan<'_>,
 ) -> Result<(MaxwellComputeInlineToMemoryUpload, usize), MaxwellEngineDispatchError> {
-    let source = MaxwellMethodSource::decoded(words[0], subchannel);
+    let source = MaxwellMethodSource::decoded(words.first().unwrap(), subchannel);
     let pending = candidate.inline_to_memory().pending();
     let applied = preflight(
         MaxwellMethodDispatch::emitted_by_mme(source, class),
@@ -500,7 +500,7 @@ pub(in crate::engines) fn data_words(
     let count = words
         .len()
         .min(((pending.byte_length() - pending.next_offset()) / 4) as usize);
-    let last = MaxwellMethodSource::decoded(words[count - 1], subchannel);
+    let last = MaxwellMethodSource::decoded(words.get(count - 1).unwrap(), subchannel);
     candidate.apply(MaxwellComputeStateWrite::InlineToMemoryData {
         value: last.argument(),
         next_offset: pending.next_offset() + count as u32 * 4,

@@ -37,7 +37,6 @@ impl Cache {
         parent: &CanonicalBackingRange,
         offset: u64,
         size: u8,
-        writes: Option<&CanonicalWriteBatch>,
     ) -> Result<Arc<Snapshot>, MaxwellThreeDResourceError> {
         let key = Key {
             parent: parent.byte_mapping_key(),
@@ -45,7 +44,7 @@ impl Cache {
             size,
         };
         let range = if let Some(snapshot) = self.entries.get(&key) {
-            if snapshot.remains_current(writes)? {
+            if snapshot.remains_current()? {
                 return Ok(Arc::clone(snapshot));
             }
             // New bytes need an independent observation, not a new physical
@@ -56,7 +55,7 @@ impl Cache {
                 .snapshot_subrange(offset, u64::from(size))
                 .map_err(MaxwellThreeDResourceError::Canonical)?
         };
-        let snapshot = Arc::new(Snapshot::capture(range, size, writes)?);
+        let snapshot = Arc::new(Snapshot::capture(range, size)?);
         // Both parent identity and the narrow observed range retain metadata.
         // Charge them conservatively even when other consumers share it.
         let bytes = std::mem::size_of::<Snapshot>()
@@ -74,56 +73,38 @@ pub(super) struct Snapshot {
     pub(super) bytes: [u8; 32],
     size: u8,
     cpu_writes: CanonicalCpuWriteDependency,
-    overlay_changed: bool,
 }
 impl Snapshot {
     pub(super) fn read(
         parent: &CanonicalBackingRange,
         offset: u64,
         size: u8,
-        writes: Option<&CanonicalWriteBatch>,
     ) -> Result<Self, MaxwellThreeDResourceError> {
         let range = parent
             .snapshot_subrange(offset, u64::from(size))
             .map_err(MaxwellThreeDResourceError::Canonical)?;
-        Self::capture(range, size, writes)
+        Self::capture(range, size)
     }
 
-    fn capture(
-        range: CanonicalBackingRange,
-        size: u8,
-        writes: Option<&CanonicalWriteBatch>,
-    ) -> Result<Self, MaxwellThreeDResourceError> {
+    fn capture(range: CanonicalBackingRange, size: u8) -> Result<Self, MaxwellThreeDResourceError> {
         debug_assert!((1..=32).contains(&size));
         // Arm before reading. A concurrent write must not establish a clean
         // baseline for bytes already captured from an older version.
         let cpu_writes = CanonicalCpuWriteDependency::capture(&range)
             .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
         let mut bytes = [0; 32];
-        read_backing_bytes(&range, 0, &mut bytes[..usize::from(size)], writes)?;
-        let mut overlay_changed = false;
-        if let Some(writes) = writes
-            && writes
-                .overlaps(&range, 0, u64::from(size))
-                .map_err(MaxwellThreeDResourceError::StagedCanonicalAccess)?
-        {
-            let mut original = [0; 32];
-            read_backing_bytes(&range, 0, &mut original[..usize::from(size)], None)?;
-            overlay_changed = original[..usize::from(size)] != bytes[..usize::from(size)];
-        }
+        range
+            .read(0, &mut bytes[..usize::from(size)])
+            .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
         Ok(Self {
             range,
             bytes,
             size,
             cpu_writes,
-            overlay_changed,
         })
     }
 
-    pub(super) fn remains_current(
-        &self,
-        writes: Option<&CanonicalWriteBatch>,
-    ) -> Result<bool, MaxwellThreeDResourceError> {
+    pub(super) fn remains_current(&self) -> Result<bool, MaxwellThreeDResourceError> {
         // CPU-write epochs alone do not prove that an outstanding GPU producer
         // has left descriptor bytes unchanged. Reject without waiting; an actual
         // read on a miss resolves that producer through normal memory admission.
@@ -134,29 +115,11 @@ impl Snapshot {
         {
             return Ok(false);
         }
-        if !self.cpu_writes.remains_current()
-            && (self.overlay_changed
-                || !self
-                    .cpu_writes
-                    .confirm_unchanged(&self.bytes[..usize::from(self.size)])
-                    .map_err(MaxwellThreeDResourceError::CanonicalAccess)?)
-        {
-            return Ok(false);
-        }
-        let Some(writes) = writes else {
-            return Ok(!self.overlay_changed);
-        };
-        if !writes
-            .overlaps(&self.range, 0, u64::from(self.size))
-            .map_err(MaxwellThreeDResourceError::StagedCanonicalAccess)?
-        {
-            return Ok(!self.overlay_changed);
-        }
-        let mut bytes = [0; 32];
-        writes
-            .read_overlay(&self.range, 0, &mut bytes[..usize::from(self.size)])
-            .map_err(MaxwellThreeDResourceError::StagedCanonicalAccess)?;
-        Ok(bytes[..usize::from(self.size)] == self.bytes[..usize::from(self.size)])
+        Ok(self.cpu_writes.remains_current()
+            || self
+                .cpu_writes
+                .confirm_unchanged(&self.bytes[..usize::from(self.size)])
+                .map_err(MaxwellThreeDResourceError::CanonicalAccess)?)
     }
 }
 

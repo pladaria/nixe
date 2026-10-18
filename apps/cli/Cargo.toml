@@ -19,7 +19,6 @@ nixe-cpu-jit.workspace = true
 nixe-horizon.workspace = true
 nixe-gpu.workspace = true
 nixe-gpu-maxwell.workspace = true
-nixe-gpu-wgpu.workspace = true
 nixe-gpu-vulkan.workspace = true
 nixe-input.workspace = true
 nixe-loader-content.workspace = true
@@ -34,4 +33,4 @@ nixe-video-winit.workspace = true
 
 [features]
 execution-trace = ["nixe-memory/execution-trace"]
-performance-counters = ["nixe-gpu-vulkan/performance-counters", "nixe-gpu/performance-counters", "nixe-gpu-wgpu/performance-counters", "nixe-horizon/performance-counters", "nixe-cpu-jit/performance-counters", "nixe-audio/performance-counters", "nixe-video-winit/performance-counters"]
+performance-counters = ["nixe-gpu-vulkan/performance-counters", "nixe-gpu/performance-counters", "nixe-horizon/performance-counters", "nixe-cpu-jit/performance-counters", "nixe-audio/performance-counters", "nixe-video-winit/performance-counters"]

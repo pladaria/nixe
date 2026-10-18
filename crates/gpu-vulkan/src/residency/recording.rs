@@ -77,7 +77,7 @@ impl VulkanResidency {
                 .size(bytes.len() as u64)];
             self.barriers.emit(&mut self.device);
             unsafe {
-                self.device.owner.device.cmd_copy_buffer(
+                self.device.dispatch.cmd_copy_buffer(
                     self.device.submission.slots[index].command,
                     upload,
                     target,
@@ -135,14 +135,14 @@ impl VulkanResidency {
                 )?;
                 self.barriers.emit(&mut self.device);
                 unsafe {
-                    self.device.owner.device.cmd_copy_buffer(
+                    self.device.dispatch.cmd_copy_buffer(
                         command,
                         src,
                         scratch.handle,
                         &[vk::BufferCopy::default().src_offset(offset).size(size)],
                     );
                     scratch_read_barrier(&self.device, command, scratch.handle, size);
-                    self.device.owner.device.cmd_copy_buffer(
+                    self.device.dispatch.cmd_copy_buffer(
                         command,
                         scratch.handle,
                         dst,
@@ -156,7 +156,7 @@ impl VulkanResidency {
             } else {
                 self.barriers.emit(&mut self.device);
                 unsafe {
-                    self.device.owner.device.cmd_copy_buffer(
+                    self.device.dispatch.cmd_copy_buffer(
                         command,
                         src,
                         dst,
@@ -192,7 +192,7 @@ impl VulkanResidency {
                 let index = self.device.begin_recording()?;
                 self.barriers.emit(&mut self.device);
                 unsafe {
-                    self.device.owner.device.cmd_copy_image_to_buffer(
+                    self.device.dispatch.cmd_copy_image_to_buffer(
                         self.device.submission.slots[index].command,
                         src,
                         layout,
@@ -216,7 +216,7 @@ impl VulkanResidency {
                 let index = self.device.begin_recording()?;
                 self.barriers.emit(&mut self.device);
                 unsafe {
-                    self.device.owner.device.cmd_copy_buffer(
+                    self.device.dispatch.cmd_copy_buffer(
                         self.device.submission.slots[index].command,
                         scratch,
                         dst,
@@ -278,7 +278,7 @@ impl VulkanResidency {
             let slot = self.device.begin_recording()?;
             self.barriers.emit(&mut self.device);
             unsafe {
-                self.device.owner.device.cmd_copy_image_to_buffer(
+                self.device.dispatch.cmd_copy_image_to_buffer(
                     self.device.submission.slots[slot].command,
                     src,
                     layout,
@@ -303,7 +303,7 @@ impl VulkanResidency {
             let slot = self.device.begin_recording()?;
             self.barriers.emit(&mut self.device);
             unsafe {
-                self.device.owner.device.cmd_copy_buffer(
+                self.device.dispatch.cmd_copy_buffer(
                     self.device.submission.slots[slot].command,
                     scratch,
                     dst,
@@ -426,7 +426,7 @@ impl VulkanResidency {
                 )?;
                 self.barriers.emit(&mut self.device);
                 unsafe {
-                    self.device.owner.device.cmd_copy_buffer(
+                    self.device.dispatch.cmd_copy_buffer(
                         command,
                         source,
                         target,
@@ -545,7 +545,7 @@ impl VulkanResidency {
                             depth: 1,
                         });
                     unsafe {
-                        self.device.owner.device.cmd_copy_image_to_buffer(
+                        self.device.dispatch.cmd_copy_image_to_buffer(
                             command,
                             image,
                             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -566,8 +566,7 @@ impl VulkanResidency {
                 self.barriers.emit(&mut self.device);
                 unsafe {
                     self.device
-                        .owner
-                        .device
+                        .dispatch
                         .cmd_copy_image_to_buffer(command, image, layout, buffer, &regions);
                 }
             }
@@ -608,7 +607,7 @@ impl VulkanResidency {
             .handle;
         self.barriers.emit(&mut self.device);
         unsafe {
-            self.device.owner.device.cmd_copy_buffer(
+            self.device.dispatch.cmd_copy_buffer(
                 command,
                 source,
                 target,

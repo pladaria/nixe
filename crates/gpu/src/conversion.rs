@@ -1,5 +1,5 @@
 //! Exact integer conversion of an 8-bit, 4:2:0 semiplanar image.
-use crate::{GpuAllocationDescription, ImageDescription, ImageRegion, ImageView};
+use crate::{GpuAllocationDescription, ImageDescription, ImageView};
 
 /// A canonical image interpretation supplied by a non-raster producer.
 #[derive(Clone, Debug)]
@@ -19,15 +19,4 @@ pub struct Nv12ColorTransform {
     pub clamp: [i32; 2],
     pub alpha: u8,
     pub source_origin: [u32; 2],
-}
-
-/// Full destination overwrite. Luma is R8, interleaved chroma is RG8; the
-/// destination is RGBA8 or BGRA8. All image accesses use ordinary device ownership.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Nv12Conversion {
-    pub luma: ImageRegion,
-    pub chroma: ImageRegion,
-    pub destination: ImageRegion,
-    pub destination_format: crate::ImageFormat,
-    pub transform: Nv12ColorTransform,
 }

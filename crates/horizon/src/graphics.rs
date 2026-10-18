@@ -6,10 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nixe_gpu::{
-    BackingView, BlockLinearLayout, GpuAllocationDescription, GpuAllocationId,
-    GpuCacheConfiguration, GuestSyncpointId, GuestSyncpointValue, GuestTimelinePoint,
-    ImageMemoryLayout, NeutralBackendRuntime, PresentationImageFormat, PresentationImageRequest,
-    ResidentImage,
+    BackingView, BlockLinearLayout, GpuAllocationDescription, GpuAllocationId, GuestSyncpointId,
+    GuestSyncpointValue, GuestTimelinePoint, ImageMemoryLayout, PresentationImageFormat,
+    PresentationImageRequest, ResidentImage,
 };
 use nixe_memory::CanonicalCpuWriteDependency;
 use nixe_runtime::{EventObject, ExternalEventSource, ReadableEventObject, WritableEventObject};
@@ -264,36 +263,7 @@ impl Default for VideoSystem {
 impl VideoSystem {
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_gpu_backend(None, None, GpuCacheConfiguration::default())
-    }
-
-    /// Constructs the process graphics system with a composition-root-selected
-    /// neutral GPU backend. Horizon never observes its concrete host API.
-    #[must_use]
-    pub fn with_gpu_backend(
-        presenter: Option<FrameMailbox>,
-        backend: Box<dyn NeutralBackendRuntime>,
-        cache_configuration: GpuCacheConfiguration,
-    ) -> Self {
-        Self::new_with_gpu_backend(presenter, Some(backend), cache_configuration)
-    }
-
-    /// Composes the Switch Maxwell frontend with a concrete host renderer.
-    #[must_use]
-    pub fn with_gpu_execution<
-        E: nixe_gpu::GpuExecution<
-                Commands = nixe_gpu::OperationSubmission,
-                ImageRequest = nixe_gpu::PresentationImageRequest,
-            >,
-    >(
-        presenter: Option<FrameMailbox>,
-        execution: E,
-        cache_configuration: GpuCacheConfiguration,
-    ) -> Self {
-        Self::with_nvdrv(
-            presenter,
-            NvDrvSession::with_gpu_execution(execution, cache_configuration),
-        )
+        Self::with_nvdrv(None, NvDrvSession::new())
     }
 
     /// Composes concrete native Maxwell work with its renderer before workers start.
@@ -314,17 +284,6 @@ impl VideoSystem {
             presenter,
             NvDrvSession::with_gpu_frontend(execution, frontend),
         )
-    }
-
-    fn new_with_gpu_backend(
-        presenter: Option<FrameMailbox>,
-        backend: Option<Box<dyn NeutralBackendRuntime>>,
-        cache_configuration: GpuCacheConfiguration,
-    ) -> Self {
-        let nvdrv = backend.map_or_else(NvDrvSession::new, |backend| {
-            NvDrvSession::with_gpu_backend(backend, cache_configuration)
-        });
-        Self::with_nvdrv(presenter, nvdrv)
     }
 
     fn with_nvdrv(presenter: Option<FrameMailbox>, nvdrv: NvDrvSession) -> Self {
@@ -587,10 +546,9 @@ impl VideoSystem {
     pub(crate) fn queue_graphic_buffer(
         &self,
         binder_id: i32,
-        mut request: QueuedBufferRequest,
+        request: QueuedBufferRequest,
     ) -> Result<(), FramebufferError> {
         let requested_interval = request.input.swap_interval;
-        request.input.swap_interval = nixe_memory::trace::presentation_interval(requested_interval);
         nixe_memory::trace::event(
             "requested_interval",
             ((binder_id as u32 as u64) << 32) | request.slot as u32 as u64,
@@ -681,6 +639,7 @@ impl VideoSystem {
                 slot: request.slot,
                 acquire_fences: request.input.acquire_fences,
                 swap_interval: request.input.swap_interval,
+                acquired: false,
                 presentation,
             });
             Ok(())
@@ -722,7 +681,7 @@ impl VideoSystem {
             && !state
                 .pending_frames
                 .iter()
-                .any(|frame| frame.swap_interval == 0)
+                .any(|frame| frame.acquired || frame.swap_interval == 0)
         {
             return Ok(0);
         }
@@ -745,8 +704,9 @@ impl VideoSystem {
                     "pending frame lost its producer",
                 ))?;
             if queue.blocked_this_advance
-                || queue.next_acquire_sequence > display_sequence
-                || (ticks.crossed == 0 && pending.swap_interval != 0)
+                || !pending.acquired
+                    && (queue.next_acquire_sequence > display_sequence
+                        || (ticks.crossed == 0 && pending.swap_interval != 0))
             {
                 state
                     .queues
@@ -757,12 +717,6 @@ impl VideoSystem {
                 state.pending_frames.push_back(pending);
                 continue;
             }
-            nixe_memory::trace::event(
-                "vi_eligible",
-                ((pending.binder_id as u32 as u64) << 32) | pending.slot as u32 as u64,
-                display_sequence,
-                0,
-            );
             if pending.presentation.is_none()
                 && !pending.acquire_fences.iter().all(|fence| {
                     state
@@ -780,6 +734,21 @@ impl VideoSystem {
                 state.pending_frames.push_back(pending);
                 continue;
             }
+            if !pending.acquired {
+                let key = ((pending.binder_id as u32 as u64) << 32) | pending.slot as u32 as u64;
+                let interval = pending.swap_interval;
+                nixe_memory::trace::event("vi_acquire", key, display_sequence, u64::from(interval));
+                state
+                    .queues
+                    .get_mut(&binder_id)
+                    .unwrap()
+                    .next_acquire_sequence = display_sequence.saturating_add(u64::from(interval));
+                state.pending_frames.front_mut().unwrap().acquired = true;
+            }
+            // Acquisition follows the guest display clock. Image preparation
+            // completes asynchronously and must not add another refresh period.
+            // Keep this slot leased and later frames of this producer ordered.
+            let pending = state.pending_frames.front().unwrap();
             let image = match &pending.presentation {
                 Some(presentation) => match presentation.image.try_recv() {
                     Ok(result) => Some(result.map_err(FramebufferError::Backend)?),
@@ -808,12 +777,6 @@ impl VideoSystem {
                 state.next_frame_sequence,
                 display_sequence,
             );
-            state
-                .queues
-                .get_mut(&binder_id)
-                .unwrap()
-                .next_acquire_sequence =
-                display_sequence.saturating_add(u64::from(pending.swap_interval));
             if let Some(presentation) = pending.presentation {
                 let sequence = state.next_frame_sequence;
                 state.next_frame_sequence = state.next_frame_sequence.saturating_add(1);
@@ -985,6 +948,7 @@ struct PendingFrame {
     slot: i32,
     acquire_fences: Box<[NvFence]>,
     swap_interval: u32,
+    acquired: bool,
     presentation: Option<PendingPresentation>,
 }
 
@@ -1727,10 +1691,8 @@ pub(crate) fn encode_native_window(binder_id: i32) -> [u8; 0x3c] {
 mod tests {
     use nixe_cpu::memory::{ExecutionMemory, MemoryMappingPurpose, ProcessMemory};
     use nixe_gpu::{
-        BackendCapabilities, BackendExecutionCompletion, BackendFeatures, BackendInstanceId,
-        BackendLimits, BackendResourceCreateInfo, BackendRuntimeError, BackendSubmissionToken,
-        ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageKind, OperationSubmission,
-        QueryKind, ResourceDependency, SampleCount, ShaderStage,
+        BackendExecutionCompletion, BackendInstanceId, BackendRuntimeError, BackendSubmissionToken,
+        ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageKind, SampleCount,
     };
     use nixe_memory::{AddressSpaceId, GuestVirtualAddress, MemoryPermissions};
     use nixe_video::FrameNotifier;
@@ -1852,43 +1814,31 @@ mod tests {
     #[derive(Debug)]
     struct ResidentTestRuntime {
         preparation_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
-        capabilities: BackendCapabilities,
     }
 
     impl ResidentTestRuntime {
         fn new() -> Self {
             Self {
                 preparation_gate: None,
-                capabilities: BackendCapabilities::new(
-                    BackendFeatures::empty(),
-                    [ImageFormat::Rgba8Unorm],
-                    [SampleCount::One],
-                    std::iter::empty::<ShaderStage>(),
-                    std::iter::empty::<QueryKind>(),
-                    BackendLimits {
-                        max_color_attachments: 1,
-                        max_descriptor_bindings: 0,
-                        max_compute_workgroups: [0; 3],
-                    },
-                ),
             }
         }
     }
 
-    impl NeutralBackendRuntime for ResidentTestRuntime {
-        fn capabilities(&self) -> &BackendCapabilities {
-            &self.capabilities
+    impl nixe_gpu::GpuExecution for ResidentTestRuntime {
+        type Commands = nixe_gpu::native::NativeSubmission;
+        type ImageRequest = nixe_gpu::native::NativePresentationImage;
+        fn record(
+            &mut self,
+            _batch: nixe_gpu::ExecutionBatch<'_, Self::Commands>,
+        ) -> Result<(), BackendRuntimeError> {
+            unreachable!("resident presentation fixture records no GPU work")
         }
-
         fn submit(
             &mut self,
-            _creations: &[BackendResourceCreateInfo],
-            _invalidations: &[ResourceDependency],
-            _submission: &OperationSubmission,
+            _batch: nixe_gpu::ExecutionBatch<'_, Self::Commands>,
         ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
             unreachable!("resident presentation fixture submits no GPU work")
         }
-
         fn poll_completion(
             &mut self,
         ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
@@ -1897,6 +1847,13 @@ mod tests {
 
         fn wait_for_completion(
             &mut self,
+        ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
+            Ok(None)
+        }
+
+        fn wait_for_completion_timeout(
+            &mut self,
+            _: Duration,
         ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
             Ok(None)
         }
@@ -1917,7 +1874,7 @@ mod tests {
 
         fn acquire_presentable_image(
             &mut self,
-            request: PresentationImageRequest,
+            request: Self::ImageRequest,
         ) -> Result<ResidentImage, BackendRuntimeError> {
             if let Some((entered, release)) = &self.preparation_gate {
                 entered.send(()).unwrap();
@@ -1927,8 +1884,8 @@ mod tests {
             let description = ImageDescription::new(
                 ImageDimension::Two,
                 ImageExtent {
-                    width: request.width,
-                    height: request.height,
+                    width: request.extent[0],
+                    height: request.extent[1],
                     depth: 1,
                 },
                 match request.format {
@@ -1944,7 +1901,18 @@ mod tests {
                 SampleCount::One,
             )
             .unwrap();
-            Ok(ResidentImage::new(instance, description, Arc::new(())))
+            Ok(ResidentImage::from_lease(
+                description,
+                nixe_gpu::PresentationLease::new(
+                    nixe_gpu::PresentationImageId {
+                        slot: 1,
+                        generation: 1,
+                    },
+                    1,
+                    BackendSubmissionToken::new(instance, 1, 1),
+                    std::sync::mpsc::channel().0,
+                ),
+            ))
         }
 
         fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
@@ -1980,6 +1948,7 @@ mod tests {
                     slot: 0,
                     acquire_fences: Box::default(),
                     swap_interval: 1,
+                    acquired: false,
                     presentation: Some(PendingPresentation {
                         image: receiver,
                         crop: frame_crop(CropRect {
@@ -2663,10 +2632,10 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut backend = ResidentTestRuntime::new();
         backend.preparation_gate = Some((entered_tx, release_rx));
-        let video = VideoSystem::with_gpu_backend(
+        let video = VideoSystem::with_gpu_frontend(
             Some(mailbox.clone()),
-            Box::new(backend),
-            GpuCacheConfiguration::default(),
+            backend,
+            nixe_gpu_maxwell::MaxwellNativeFrontend::new(Default::default()),
         );
         let (video, binder_id, buffer) = configure_rgba_nvmap(video);
         let syncpoint = GuestSyncpointId::new(11);
@@ -2732,14 +2701,12 @@ mod tests {
         );
         release_tx.send(()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut elapsed = Duration::from_millis(34);
         let frame = loop {
-            video.advance(elapsed).unwrap();
+            assert_eq!(video.advance(Duration::from_millis(18)).unwrap(), 0);
             if let Some(frame) = mailbox.take_latest() {
                 break frame;
             }
             assert!(std::time::Instant::now() < deadline);
-            elapsed += Duration::from_millis(17);
             std::thread::yield_now();
         };
         assert_eq!((frame.width(), frame.height()), (4, 4));

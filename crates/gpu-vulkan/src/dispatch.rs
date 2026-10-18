@@ -2,14 +2,27 @@
 use crate::{VulkanError, profile::ApiPath};
 use ash::{Device, Instance, vk};
 
-pub(crate) struct Dispatch {
-    pub state: Option<StateDispatch>,
+mod commands;
+mod record;
+mod worker;
+pub(crate) use commands::Command;
+use worker::Recorder;
+pub(crate) use worker::{QueueSubmission, RecordingHandle};
+
+#[derive(Clone, Copy)]
+struct Functions {
     submit: vk::PFN_vkQueueSubmit2,
     barrier: vk::PFN_vkCmdPipelineBarrier2,
     begin: vk::PFN_vkCmdBeginRendering,
     end: vk::PFN_vkCmdEndRendering,
     #[cfg(feature = "binding-probe")]
     timestamp: vk::PFN_vkCmdWriteTimestamp2,
+    state: Option<StateDispatch>,
+}
+
+pub(crate) struct Dispatch {
+    recorder: Recorder,
+    pub state: Option<StateDispatch>,
     pub release_swapchain_images: Option<vk::PFN_vkReleaseSwapchainImagesEXT>,
 }
 impl Dispatch {
@@ -19,6 +32,7 @@ impl Dispatch {
         path: ApiPath,
         maintenance: crate::SwapchainMaintenance,
         dynamic: bool,
+        queue_mutex: std::sync::Arc<std::sync::Mutex<()>>,
     ) -> Result<Self, VulkanError> {
         let (submit, barrier, begin, end) = match path {
             ApiPath::Core13 => {
@@ -101,14 +115,22 @@ impl Dispatch {
                 }
             }
         });
+        let recorder = Recorder::new(
+            device.clone(),
+            Functions {
+                submit,
+                barrier,
+                begin,
+                end,
+                #[cfg(feature = "binding-probe")]
+                timestamp,
+                state,
+            },
+            queue_mutex,
+        )?;
         Ok(Self {
+            recorder,
             state,
-            submit,
-            barrier,
-            begin,
-            end,
-            #[cfg(feature = "binding-probe")]
-            timestamp,
             release_swapchain_images,
         })
     }
@@ -120,38 +142,157 @@ impl Dispatch {
         pool: vk::QueryPool,
         query: u32,
     ) {
-        unsafe {
-            (self.timestamp)(command, stage, pool, query);
-        }
+        self.recorder.push(Command::Timestamp {
+            command,
+            stage,
+            pool,
+            index: query,
+        });
     }
-    pub unsafe fn submit(
+    pub fn recording_handle(&self) -> RecordingHandle {
+        self.recorder.handle.clone()
+    }
+    pub fn finish_recording(&self) -> Result<(), VulkanError> {
+        self.recorder.finish()
+    }
+    pub unsafe fn dynamic_state(
         &self,
-        queue: vk::Queue,
-        info: &vk::SubmitInfo2<'_>,
-        fence: vk::Fence,
-    ) -> Result<(), VulkanError> {
-        // SAFETY: caller owns queue synchronization and retains submission data.
-        let result = unsafe { (self.submit)(queue, 1, info, fence) };
-        if result == vk::Result::SUCCESS {
-            Ok(())
+        command: vk::CommandBuffer,
+        state: &crate::cache::GraphicsState,
+    ) {
+        self.recorder.push(Command::Dynamic {
+            command,
+            state: commands::DynamicState::from(state),
+        });
+    }
+    pub unsafe fn barrier(&self, command: vk::CommandBuffer, info: &vk::DependencyInfo<'_>) {
+        debug_assert!(info.p_next.is_null());
+        // SAFETY: the caller supplies live arrays; all entries are copied now.
+        let memory = if info.memory_barrier_count == 0 {
+            &[]
         } else {
-            Err(VulkanError::vk("vkQueueSubmit2", result))
-        }
+            unsafe {
+                std::slice::from_raw_parts(
+                    info.p_memory_barriers,
+                    info.memory_barrier_count as usize,
+                )
+            }
+        };
+        let buffers = if info.buffer_memory_barrier_count == 0 {
+            &[]
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(
+                    info.p_buffer_memory_barriers,
+                    info.buffer_memory_barrier_count as usize,
+                )
+            }
+        };
+        let images = if info.image_memory_barrier_count == 0 {
+            &[]
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(
+                    info.p_image_memory_barriers,
+                    info.image_memory_barrier_count as usize,
+                )
+            }
+        };
+        debug_assert!(
+            memory.iter().all(|v| v.p_next.is_null())
+                && buffers.iter().all(|v| v.p_next.is_null())
+                && images.iter().all(|v| v.p_next.is_null())
+        );
+        self.recorder.push(Command::Barrier {
+            command,
+            flags: info.dependency_flags,
+            memory: memory
+                .iter()
+                .map(|v| {
+                    vk::MemoryBarrier2::default()
+                        .src_stage_mask(v.src_stage_mask)
+                        .src_access_mask(v.src_access_mask)
+                        .dst_stage_mask(v.dst_stage_mask)
+                        .dst_access_mask(v.dst_access_mask)
+                })
+                .collect(),
+            buffers: buffers
+                .iter()
+                .map(|v| {
+                    vk::BufferMemoryBarrier2::default()
+                        .src_stage_mask(v.src_stage_mask)
+                        .src_access_mask(v.src_access_mask)
+                        .dst_stage_mask(v.dst_stage_mask)
+                        .dst_access_mask(v.dst_access_mask)
+                        .src_queue_family_index(v.src_queue_family_index)
+                        .dst_queue_family_index(v.dst_queue_family_index)
+                        .buffer(v.buffer)
+                        .offset(v.offset)
+                        .size(v.size)
+                })
+                .collect(),
+            images: images
+                .iter()
+                .map(|v| {
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(v.src_stage_mask)
+                        .src_access_mask(v.src_access_mask)
+                        .dst_stage_mask(v.dst_stage_mask)
+                        .dst_access_mask(v.dst_access_mask)
+                        .src_queue_family_index(v.src_queue_family_index)
+                        .dst_queue_family_index(v.dst_queue_family_index)
+                        .image(v.image)
+                        .old_layout(v.old_layout)
+                        .new_layout(v.new_layout)
+                        .subresource_range(v.subresource_range)
+                })
+                .collect(),
+        });
     }
-    pub unsafe fn barrier(&self, cmd: vk::CommandBuffer, info: &vk::DependencyInfo<'_>) {
-        // SAFETY: caller provides a recording buffer and valid resource scopes.
-        unsafe { (self.barrier)(cmd, info) }
+    pub unsafe fn begin_rendering(&self, command: vk::CommandBuffer, info: &vk::RenderingInfo<'_>) {
+        debug_assert!(info.p_next.is_null());
+        let own = |v: &vk::RenderingAttachmentInfo<'_>| {
+            debug_assert!(v.p_next.is_null());
+            vk::RenderingAttachmentInfo::default()
+                .image_view(v.image_view)
+                .image_layout(v.image_layout)
+                .resolve_mode(v.resolve_mode)
+                .resolve_image_view(v.resolve_image_view)
+                .resolve_image_layout(v.resolve_image_layout)
+                .load_op(v.load_op)
+                .store_op(v.store_op)
+                .clear_value(v.clear_value)
+        };
+        // SAFETY: all caller-owned attachments are copied into this command.
+        let colors = if info.color_attachment_count == 0 {
+            &[]
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(
+                    info.p_color_attachments,
+                    info.color_attachment_count as usize,
+                )
+            }
+        };
+        let depth = unsafe { info.p_depth_attachment.as_ref() }.map(own);
+        let stencil = unsafe { info.p_stencil_attachment.as_ref() }.map(own);
+        self.recorder.push(Command::BeginRendering {
+            command,
+            flags: info.flags,
+            area: info.render_area,
+            layers: info.layer_count,
+            mask: info.view_mask,
+            colors: colors.iter().map(own).collect(),
+            depth,
+            stencil,
+        });
     }
-    pub unsafe fn begin_rendering(&self, cmd: vk::CommandBuffer, info: &vk::RenderingInfo<'_>) {
-        // SAFETY: caller provides a recording buffer outside any rendering scope.
-        unsafe { (self.begin)(cmd, info) }
-    }
-    pub unsafe fn end_rendering(&self, cmd: vk::CommandBuffer) {
-        // SAFETY: caller pairs this with begin_rendering on this command buffer.
-        unsafe { (self.end)(cmd) }
+    pub unsafe fn end_rendering(&self, command: vk::CommandBuffer) {
+        self.recorder.push(Command::EndRendering { command });
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct StateDispatch {
     pub cull: vk::PFN_vkCmdSetCullMode,
     pub front: vk::PFN_vkCmdSetFrontFace,

@@ -2,7 +2,6 @@
 //! stage retained by program/prepared owners. Weak entries do not create a
 //! second SPIR-V store or bypass the existing shader byte budget.
 use super::*;
-use nixe_gpu::ssa::artifact::StageKey;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::{Condvar, Mutex, Weak};
 

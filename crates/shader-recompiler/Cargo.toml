@@ -1,0 +1,8 @@
+[package]
+name = "nixe-shader-recompiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+spirv = "0.4"

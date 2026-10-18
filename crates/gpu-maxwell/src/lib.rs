@@ -14,11 +14,7 @@ mod pushbuffer;
 mod scheduler;
 mod shader;
 mod shader_stage;
-pub use shader::{
-    MAXWELL_SHADER_NAMESPACE, MaxwellShaderCode, MaxwellShaderCompiler, MaxwellShaderSnapshot,
-    MaxwellSsaBinding, MaxwellSsaBindingSource, MaxwellSsaPipeline, MaxwellSsaProgram,
-    MaxwellSsaRequest, MaxwellSsaSource, compile_maxwell_pipeline_ssa, compile_maxwell_shader_ssa,
-};
+pub use shader::recompiler::MAXWELL_SHADER_NAMESPACE;
 
 pub use address_space::{
     MAX_MAPPING_DUMP_ENTRIES, MaxwellAddressSpaceError, MaxwellAddressSpaceId,
@@ -28,10 +24,11 @@ pub use address_space::{
     MaxwellSparseMapping, MaxwellSparseRemapRequest, MaxwellVaRegion, MaxwellVaReservation,
 };
 pub use channel::{
-    MaxwellChannelError, MaxwellChannelFrontendState, MaxwellChannelId, MaxwellChannelOwner,
-    MaxwellChannelPriority, MaxwellChannelSchedulingPolicy, MaxwellChannelTimeout,
-    MaxwellChannelTimeslice, MaxwellGpuChannel, MaxwellMemoryManagerId, MaxwellObjectContext,
-    MaxwellZCullBinding, MaxwellZCullMode,
+    MaxwellChannelConfiguration, MaxwellChannelDriverState, MaxwellChannelError,
+    MaxwellChannelFrontendState, MaxwellChannelId, MaxwellChannelOwner, MaxwellChannelPriority,
+    MaxwellChannelSchedulingPolicy, MaxwellChannelTimeout, MaxwellChannelTimeslice,
+    MaxwellGpuChannel, MaxwellMemoryManagerId, MaxwellObjectContext, MaxwellZCullBinding,
+    MaxwellZCullMode,
 };
 pub use engines::{
     MAXWELL_BIND_GROUP_COUNT, MAXWELL_COLOR_TARGET_COUNT, MAXWELL_COMPUTE_CWD_REF_COUNTER_COUNT,
@@ -60,11 +57,10 @@ pub use engines::{
     MaxwellEngineMethodMetadata, MaxwellInlineToMemoryAddress, MaxwellInlineToMemoryLaunch,
     MaxwellInlineToMemoryPendingTransfer, MaxwellInlineToMemoryRegister,
     MaxwellInlineToMemorySemaphoreStructureSize, MaxwellInlineToMemoryState,
-    MaxwellInlineToMemoryUpload, MaxwellLoweredWork, MaxwellLoweringCache, MaxwellLoweringError,
-    MaxwellMemoryCopyComponentSource, MaxwellMemoryCopyError, MaxwellMemoryCopyLayout,
-    MaxwellMemoryCopyOperation, MaxwellMemoryCopyRemap, MaxwellShaderCacheInvalidation,
-    MaxwellShaderStage, MaxwellSpaVersion, MaxwellTessellationModeError,
-    MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAlphaFraction,
+    MaxwellInlineToMemoryUpload, MaxwellLoweringError, MaxwellMemoryCopyComponentSource,
+    MaxwellMemoryCopyError, MaxwellMemoryCopyLayout, MaxwellMemoryCopyOperation,
+    MaxwellMemoryCopyRemap, MaxwellShaderCacheInvalidation, MaxwellShaderStage, MaxwellSpaVersion,
+    MaxwellTessellationModeError, MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAlphaFraction,
     MaxwellThreeDAlphaToCoverageDither, MaxwellThreeDAlphaToCoverageOverride,
     MaxwellThreeDAntiAliasedLineEnable, MaxwellThreeDApiMandatedEarlyZ,
     MaxwellThreeDAttachmentReadiness, MaxwellThreeDAttributeDefaultVector,
@@ -137,10 +133,9 @@ pub use engines::{
     MaxwellThreeDShaderBindingState, MaxwellThreeDShaderCacheInvalidation,
     MaxwellThreeDShaderExceptionsEnable, MaxwellThreeDShaderExecutionState,
     MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderLocalMemoryState,
-    MaxwellThreeDShaderResourceUse, MaxwellThreeDShaderWatermarkRange,
-    MaxwellThreeDShaderWatermarkTarget, MaxwellThreeDSingleRopControl,
-    MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState, MaxwellThreeDStencilOp,
-    MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
+    MaxwellThreeDShaderWatermarkRange, MaxwellThreeDShaderWatermarkTarget,
+    MaxwellThreeDSingleRopControl, MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState,
+    MaxwellThreeDStencilOp, MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
     MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationPlan,
     MaxwellThreeDSynchronizationTrigger, MaxwellThreeDSyncpointCondition,
     MaxwellThreeDSyncpointIncrement, MaxwellThreeDSystemMemoryVolatile,
@@ -150,8 +145,7 @@ pub use engines::{
     MaxwellThreeDTiledCacheState, MaxwellThreeDTiledCacheTileSize,
     MaxwellThreeDTiledCacheUnknownConfig, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
     MaxwellThreeDTirModulationComponentSelect, MaxwellThreeDTirModulationFunction,
-    MaxwellThreeDTranslatedShader, MaxwellThreeDTranslatedShaders, MaxwellThreeDUnorm8,
-    MaxwellThreeDUnresolvedAddress, MaxwellThreeDVafL2CacheControl,
+    MaxwellThreeDUnorm8, MaxwellThreeDUnresolvedAddress, MaxwellThreeDVafL2CacheControl,
     MaxwellThreeDVertexArrayPrimitiveRestartEnable, MaxwellThreeDVertexAssemblyState,
     MaxwellThreeDVertexAttributeFormat, MaxwellThreeDVertexComponentWidths,
     MaxwellThreeDVertexIdUsesArrayStart, MaxwellThreeDVertexInputState,
@@ -174,19 +168,18 @@ pub use engines::{
     MaxwellTwoDPixelsFromMemorySafeOverlap, MaxwellTwoDPixelsFromMemoryState,
     MaxwellTwoDProcessingClusters, MaxwellTwoDRegister, MaxwellTwoDRegisterOrigin,
     MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableState, MaxwellTwoDState,
-    lower_maxwell_compute_synchronization, lower_maxwell_three_d_operation,
-    lower_maxwell_three_d_synchronization, resolve_maxwell_three_d_resources,
-    resolve_maxwell_three_d_resources_for_roles,
+    lower_maxwell_compute_synchronization, lower_maxwell_three_d_synchronization,
+    resolve_maxwell_three_d_resources, resolve_maxwell_three_d_resources_for_roles,
 };
 pub use execution::{
-    MaxwellBackendExecution, MaxwellBackendExecutionError, MaxwellBackendSegment,
-    MaxwellCanonicalExecutionError, MaxwellSubmissionExecutionError,
-    MaxwellSubmissionExecutionPlan, MaxwellSubmissionExecutionStep,
+    MaxwellBackendExecution, MaxwellBackendExecutionError, MaxwellCanonicalExecutionError,
+    MaxwellSubmissionExecutionError, MaxwellSubmissionExecutionPlan,
+    MaxwellSubmissionExecutionStep,
 };
 
 pub use frontend::{
-    MAXWELL_FRONTEND_DIAGNOSTIC_WORDS, MaxwellFrontendDiagnostic, MaxwellFrontendDispatchError,
-    diagnose_maxwell_frontend, lower_maxwell_pushbuffer, stream_maxwell_frontend,
+    MAXWELL_FRONTEND_DIAGNOSTIC_WORDS, MaxwellCommandSourceScratch, MaxwellFrontendDiagnostic,
+    MaxwellFrontendDispatchError, diagnose_maxwell_frontend, stream_maxwell_frontend,
 };
 pub use gpfifo::{
     MAXWELL_GPFIFO_CAPTURE_SOURCES, MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellDecodedGpfifoSubmission,
@@ -215,17 +208,14 @@ pub use pushbuffer::dispatch::{
 };
 pub use pushbuffer::packet::{
     MaxwellDecodedMethod, MaxwellDecodedMethodPacket, MaxwellDecodedPacket,
-    MaxwellDecodedPushbuffer, MaxwellMethodPacketMode, MaxwellPushbufferControl,
-    MaxwellPushbufferDecodeError, MaxwellPushbufferSubchannel, MaxwellPushbufferWord,
-    decode_maxwell_pushbuffer, decode_maxwell_submission,
+    MaxwellDecodedPushbuffer, MaxwellMethodIterator, MaxwellMethodPacketMode, MaxwellMethodSpan,
+    MaxwellPushbufferControl, MaxwellPushbufferDecodeError, MaxwellPushbufferSubchannel,
+    MaxwellPushbufferWord, decode_maxwell_pushbuffer, decode_maxwell_submission,
 };
 pub use scheduler::{
     MaxwellFrontendDispatch, MaxwellFrontendDispatchBoundary, MaxwellScheduleError,
     MaxwellScheduledSubmission, MaxwellScheduler, MaxwellSchedulerSequence,
     MaxwellSubmissionOrderingStage,
-};
-pub use shader::{
-    MAXWELL_SHADER_PROGRAM_HEADER_SIZE, MAXWELL_SHADER_READ_LIMIT, MaxwellShaderTranslationError,
 };
 
 pub use execution::{MaxwellFrontend, MaxwellWork, MaxwellWorkBatch, MaxwellWorkSegment};
@@ -237,3 +227,5 @@ pub use engines::{
     MaxwellNativeFrontend, MaxwellResolvedComputeLaunch, MaxwellTwoDSolidOperation,
     NativeFrontendStatistics,
 };
+
+pub use shader::recompiler;

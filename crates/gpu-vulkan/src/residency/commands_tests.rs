@@ -4,8 +4,6 @@ use super::*;
 use crate::ApiPreference;
 #[cfg(feature = "binding-probe")]
 use crate::BufferBinding;
-#[cfg(feature = "binding-probe")]
-use std::time::Duration;
 fn color_image() -> (NativeImageDescription, Vec<ImagePlane>) {
     let extent = vk::Extent3D {
         width: 8,

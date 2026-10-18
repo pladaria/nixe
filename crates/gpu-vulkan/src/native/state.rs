@@ -251,181 +251,186 @@ pub(super) fn arguments(a: nixe_gpu::DrawArguments) -> Draw {
         },
     }
 }
-pub(super) struct ShaderPreparation {
-    code: Arc<GuestShaderCode>,
-    scaled: Vec<(u32, bool)>,
-    control: Option<(u32, nixe_gpu::TessellationDomain)>,
-    identity: ssa::artifact::ContentId,
-}
-impl ShaderPreparation {
-    /// Transform SSA only inside a genuine compilation-cache miss.
-    pub fn compile(self) -> Result<Arc<GuestShaderCode>, VulkanError> {
-        let mut code = self.code;
-        if !self.scaled.is_empty()
-            && let Some(v) = Arc::make_mut(&mut code)
-                .functions
-                .iter_mut()
-                .find(|f| f.stage == nixe_gpu::ShaderStage::Vertex)
-        {
-            ssa::scale_vertex_inputs(Arc::make_mut(v), &self.scaled)
-                .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
-        }
-        if let Some((points, domain)) = self.control {
-            let vertex = code
-                .functions
-                .iter()
-                .find(|f| f.stage == nixe_gpu::ShaderStage::Vertex)
-                .unwrap();
-            let evaluation = code
-                .functions
-                .iter()
-                .find(|f| f.stage == nixe_gpu::ShaderStage::TessellationEvaluation)
-                .unwrap();
-            let control = ssa::default_control(vertex, evaluation, points, domain)
-                .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
-            let code = Arc::make_mut(&mut code);
-            let mut functions = std::mem::take(&mut code.functions).into_vec();
-            functions.push(Arc::new(control.function));
-            code.functions = functions.into_boxed_slice();
-        }
-        if code.identity != self.identity {
-            Arc::make_mut(&mut code).identity = self.identity;
-        }
-        Ok(code)
+pub(super) fn guest_runtime(
+    draw: &GuestDrawParameters,
+) -> Result<nixe_shader_recompiler::passes::GraphicsRuntimeState, VulkanError> {
+    use nixe_shader_recompiler::{
+        passes::GraphicsRuntimeState,
+        types::{
+            AttributeType as A, CompareFunction as C, InputTopology as I, TessPrimitive as P,
+            TessSpacing as S,
+        },
+    };
+    let mut runtime = GraphicsRuntimeState {
+        base_instance: Some(draw.shader_state.base_instance),
+        vertex_input_types: [A::Disabled; 32],
+        input_topology: match draw.topology {
+            T::Points => I::Points,
+            T::Lines | T::LineStrip => I::Lines,
+            T::Quads => I::LinesAdjacency,
+            T::Triangles | T::TriangleStrip | T::TriangleFan | T::Patches => I::Triangles,
+        },
+        ndc_minus_one_to_one: draw
+            .viewport
+            .is_some_and(|viewport| viewport.depth_clip_negative_one_to_one()),
+        y_negate: draw.shader_state.y_negate,
+        force_early_z: draw.shader_state.force_early_z,
+        ..Default::default()
+    };
+    if draw.topology == T::Points {
+        runtime.point_size = draw
+            .shader_state
+            .point_size_bits
+            .map(f32::from_bits)
+            .filter(|size| size.is_finite() && *size > 0.)
+            .ok_or(VulkanError::InvalidResource(
+                "point rasterization requires a finite positive programmed size",
+            ))?;
     }
-}
-type SpecializedShader = (
-    ShaderPreparation,
-    Box<[ssa::spirv::Options]>,
-    ssa::artifact::ContentId,
-);
-pub(super) fn shader_code(
-    program: &GuestProgram,
-    draw: Option<&GuestDrawState>,
-    mut options: ssa::spirv::Options,
-) -> Result<SpecializedShader, VulkanError> {
-    use nixe_gpu::ShaderStage as S;
-    options.shared_memory_bytes = program.shared_memory_bytes;
-    let code = &program.shader;
-    let mut scaled = Vec::new();
-    let mut control = None;
-    if let Some(draw) = draw {
-        for vertex in &draw.parameters.vertices {
-            for attr in &vertex.attributes {
-                if let Some(signed) = vertex::VertexFetchFormat::new(attr.format).scaled32 {
-                    scaled.push((attr.shader_location, signed));
+    for vertex in &draw.vertices {
+        for attribute in &vertex.attributes {
+            let ty = if let Some(signed) = vertex::VertexFetchFormat::new(attribute.format).scaled32
+            {
+                if signed {
+                    A::SignedScaled
+                } else {
+                    A::UnsignedScaled
                 }
-            }
+            } else if let Some((signed, _, _)) = attribute.format.integer_layout() {
+                if signed { A::SignedInt } else { A::UnsignedInt }
+            } else {
+                A::Float
+            };
+            *runtime
+                .vertex_input_types
+                .get_mut(attribute.shader_location as usize)
+                .ok_or(VulkanError::InvalidResource(
+                    "vertex attribute location exceeds compiler limits",
+                ))? = ty;
         }
-        if draw.parameters.alpha_test.is_some() {
+    }
+    if let Some(alpha) = draw.alpha_test {
+        use nixe_gpu::AlphaCompareOperation as Op;
+        runtime.alpha_test_reference = f32::from_bits(alpha.reference_bits);
+        runtime.alpha_test_func = match alpha.comparison {
+            Op::Never => C::Never,
+            Op::Less => C::Less,
+            Op::Equal => C::Equal,
+            Op::LessEqual => C::LessThanEqual,
+            Op::Greater => C::Greater,
+            Op::NotEqual => C::NotEqual,
+            Op::GreaterEqual => C::GreaterThanEqual,
+            Op::Always => C::Always,
+        };
+    }
+    if let Some(tessellation) = draw.tessellation {
+        runtime.tess_primitive = match tessellation.mode.domain {
+            nixe_gpu::TessellationDomain::Isolines => P::Isolines,
+            nixe_gpu::TessellationDomain::Triangles => P::Triangles,
+            nixe_gpu::TessellationDomain::Quads => P::Quads,
+        };
+        runtime.tess_spacing = match tessellation.mode.spacing {
+            nixe_gpu::TessellationSpacing::Equal => S::Equal,
+            nixe_gpu::TessellationSpacing::FractionalOdd => S::FractionalOdd,
+            nixe_gpu::TessellationSpacing::FractionalEven => S::FractionalEven,
+        };
+        runtime.tess_clockwise = matches!(
+            tessellation.mode.output,
+            nixe_gpu::TessellationOutput::Triangles(nixe_gpu::TessellationWinding::Clockwise)
+        );
+    }
+    Ok(runtime)
+}
+
+pub(super) fn guest_push(
+    pipeline: &NativePipeline,
+    draw: Option<&GuestDrawParameters>,
+) -> Result<Box<[u8]>, VulkanError> {
+    use nixe_shader_recompiler::artifact::HostUniformLayout as H;
+    let mut bytes = vec![0; pipeline.layout.key.push_bytes as usize];
+    let mut assigned = vec![None; bytes.len() / 4];
+    let mut put = |offset: u32, bits: u32| -> Result<(), VulkanError> {
+        if !offset.is_multiple_of(4) || offset as usize + 4 > bytes.len() {
             return Err(VulkanError::InvalidResource(
-                "native fragment alpha-test legalization is required",
+                "host uniform exceeds reflected push constant range",
             ));
         }
-        if let Some(t) = draw.parameters.tessellation
-            && matches!(
-                t.control,
-                nixe_gpu::TessellationControl::DefaultLevels { .. }
-            )
+        if assigned[offset as usize / 4]
+            .replace(bits)
+            .is_some_and(|old| old != bits)
         {
-            control = Some((u32::from(t.input_control_points), t.mode.domain));
+            return Err(VulkanError::InvalidResource(
+                "overlapping shader host uniforms require incompatible values",
+            ));
         }
-    }
-    let emission = code
-        .functions
-        .iter()
-        .map(|f| f.stage)
-        .chain(control.map(|_| S::TessellationControl))
-        .map(|stage| {
-            let mut o = options;
-            if let Some(draw) = draw {
-                if stage == S::Fragment {
-                    o.fragment_depth_transform = draw
-                        .parameters
-                        .viewport
-                        .and_then(|v| v.fragment_depth_transform());
+        bytes[offset as usize..offset as usize + 4].copy_from_slice(&bits.to_le_bytes());
+        Ok(())
+    };
+    for uniform in &pipeline.host_uniforms {
+        match *uniform {
+            H::RescalingPushConstants {
+                texture_mask_offset,
+                texture_mask_words,
+                image_mask_offset,
+                image_mask_words,
+                down_factor_offset,
+            } => {
+                for i in 0..texture_mask_words {
+                    put(texture_mask_offset + i * 4, 0)?;
                 }
-                let final_stage = if draw.parameters.tessellation.is_some() {
-                    S::TessellationEvaluation
-                } else {
-                    S::Vertex
-                };
-                if stage == final_stage {
-                    o.shader.depth_clip_negative_one_to_one = draw
-                        .parameters
-                        .viewport
-                        .is_some_and(|v| v.depth_clip_negative_one_to_one());
-                    o.shader.vertex_position_transform = draw.parameters.position_transform;
+                for i in 0..image_mask_words {
+                    put(image_mask_offset + i * 4, 0)?;
                 }
-                if let Some(t) = draw.parameters.tessellation {
-                    if stage == S::TessellationControl {
-                        o.shader.input_control_points = u32::from(t.input_control_points);
-                    } else if stage == S::TessellationEvaluation {
-                        o.shader.input_control_points = control
-                            .map(|(points, _)| points)
-                            .or_else(|| {
-                                code.functions
-                                    .iter()
-                                    .find(|f| f.stage == S::TessellationControl)
-                                    .and_then(|f| f.tessellation_control_points)
-                            })
-                            .unwrap();
-                        o.shader.tessellation_mode = Some(t.mode);
-                    }
+                if let Some(offset) = down_factor_offset {
+                    put(offset, 1f32.to_bits())?;
                 }
             }
-            o
-        })
-        .collect();
-    let identity = vertex::vertex_shader_identity(program.shader.identity, &scaled);
-    Ok((
-        ShaderPreparation {
-            code: Arc::clone(code),
-            scaled,
-            control,
-            identity,
-        },
-        emission,
-        identity,
-    ))
-}
-pub(super) fn push(draw: &GuestDrawState) -> Result<Box<[u8]>, VulkanError> {
-    if let Some(t) = draw.parameters.tessellation
-        && let nixe_gpu::TessellationControl::DefaultLevels {
-            outer,
-            inner,
-            defined,
-        } = t.control
-    {
-        let vertex = draw
-            .program
-            .shader
-            .functions
-            .iter()
-            .find(|f| f.stage == nixe_gpu::ShaderStage::Vertex)
-            .unwrap();
-        let evaluation = draw
-            .program
-            .shader
-            .functions
-            .iter()
-            .find(|f| f.stage == nixe_gpu::ShaderStage::TessellationEvaluation)
-            .unwrap();
-        let default = ssa::default_control(
-            vertex,
-            evaluation,
-            u32::from(t.input_control_points),
-            t.mode.domain,
-        )
-        .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
-        let words = default
-            .parameters(nixe_gpu::TessellationControl::DefaultLevels {
-                outer,
-                inner,
-                defined,
-            })
-            .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
-        return Ok(words.iter().flat_map(|w| w.to_le_bytes()).collect());
+            H::TessellationLevelsPushConstants {
+                offset,
+                required_levels,
+            } => {
+                let control = draw.and_then(|draw| draw.tessellation).map(|t| t.control);
+                let Some(nixe_gpu::TessellationControl::DefaultLevels {
+                    outer,
+                    inner,
+                    defined,
+                }) = control
+                else {
+                    return Err(VulkanError::InvalidResource(
+                        "default tessellation control requires programmed levels",
+                    ));
+                };
+                if defined & required_levels != required_levels {
+                    return Err(VulkanError::InvalidResource(
+                        "required default tessellation levels were not programmed",
+                    ));
+                }
+                for (lane, value) in outer.into_iter().chain(inner).enumerate() {
+                    put(offset + lane as u32 * 4, value)?;
+                }
+            }
+            H::RenderAreaPushConstants { offset, size } => {
+                let draw = draw.ok_or(VulkanError::InvalidResource(
+                    "render-area uniform requires graphics parameters",
+                ))?;
+                if size != 16 {
+                    return Err(VulkanError::InvalidResource(
+                        "unexpected render-area uniform size",
+                    ));
+                }
+                for (i, value) in [draw.extent[0] as f32, draw.extent[1] as f32, 0., 0.]
+                    .into_iter()
+                    .enumerate()
+                {
+                    put(offset + i as u32 * 4, value.to_bits())?;
+                }
+            }
+            H::RescalingUniformConstant { .. } => {
+                return Err(VulkanError::InvalidResource(
+                    "Vulkan host uniforms must use push constants",
+                ));
+            }
+        }
     }
-    Ok(Box::new([]))
+    Ok(bytes.into())
 }

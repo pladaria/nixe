@@ -108,7 +108,9 @@ impl VulkanResidency {
                     .push(Arc::clone(&query));
                 let command = self.device.submission.slots[index].command;
                 unsafe {
-                    owner.device.cmd_reset_query_pool(command, handle, 0, 2);
+                    self.device
+                        .dispatch
+                        .cmd_reset_query_pool(command, handle, 0, 2);
                     self.device.dispatch.timestamp(
                         command,
                         vk::PipelineStageFlags2::ALL_COMMANDS,

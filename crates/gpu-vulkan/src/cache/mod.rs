@@ -1,5 +1,5 @@
 //! Native cold caches and prepared references. No wgpu identities or policies.
-pub use nixe_gpu::ssa::compile::{CompilationCache, CompileError, CompilePool, Pending};
+pub use nixe_gpu::compilation::{CompilationCache, CompileError, CompilePool, Pending};
 impl From<crate::VulkanError> for CompileError {
     fn from(e: crate::VulkanError) -> Self {
         Self::Failed(e.to_string().into())
@@ -55,3 +55,5 @@ impl Default for CacheConfiguration {
 
 #[cfg(test)]
 mod tests;
+
+mod fingerprint;

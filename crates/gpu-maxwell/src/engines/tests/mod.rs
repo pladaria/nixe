@@ -1,8 +1,6 @@
 use nixe_gpu::{
-    BackendCapabilities, BackendFeatures, BackendLimits, GpuCommand, GpuVirtualAddress,
-    GuestSyncpointId, GuestSyncpointValue, GuestTimeline, ImageFormat, MappingGeneration,
-    QueryKind, RenderPassOperation, ReservedTimelinePoint, SampleCount, ShaderId, ShaderStage,
-    TimelineInstanceId, TimelineOwnerId,
+    GpuVirtualAddress, GuestSyncpointId, GuestSyncpointValue, GuestTimeline, ImageFormat,
+    MappingGeneration, ReservedTimelinePoint, TimelineInstanceId, TimelineOwnerId,
 };
 use nixe_memory::{CanonicalAllocation, CanonicalBackingRange, MemoryPermissions};
 
@@ -27,7 +25,7 @@ fn channel() -> MaxwellGpuChannel {
     )
 }
 
-pub(super) fn three_d_channel() -> MaxwellGpuChannel {
+pub(crate) fn three_d_channel() -> MaxwellGpuChannel {
     let mut channel = channel();
     bind_three_d(&mut channel);
     // Synthetic tests which omit viewport coefficients explicitly select
@@ -269,7 +267,7 @@ fn bind_three_d(channel: &mut MaxwellGpuChannel) {
         .unwrap();
 }
 
-pub(super) fn program_three_d(channel: &mut MaxwellGpuChannel, method: u32, argument: u32) {
+pub(crate) fn program_three_d(channel: &mut MaxwellGpuChannel, method: u32, argument: u32) {
     dispatch_method(channel, method / 4, argument).unwrap();
 }
 
@@ -309,25 +307,6 @@ fn map_resource(
             fixed_offset: None,
         })
         .unwrap()
-}
-
-fn lowering_capabilities(features: BackendFeatures) -> BackendCapabilities {
-    BackendCapabilities::new(
-        features,
-        [
-            ImageFormat::Rgba8Unorm,
-            ImageFormat::Bgra8Unorm,
-            ImageFormat::Rgba16Float,
-        ],
-        [SampleCount::One],
-        [ShaderStage::Vertex, ShaderStage::Fragment],
-        std::iter::empty::<QueryKind>(),
-        BackendLimits {
-            max_color_attachments: 8,
-            max_descriptor_bindings: 32,
-            max_compute_workgroups: [1, 1, 1],
-        },
-    )
 }
 
 fn color_target_selection_raw(count: u8, targets: [u8; 8]) -> u32 {
@@ -393,32 +372,6 @@ fn program_polygon_fill(channel: &mut MaxwellGpuChannel) {
     ] {
         program_three_d(channel, method, value);
     }
-}
-
-fn translated_graphics_shaders() -> (MaxwellThreeDTranslatedShaders, MaxwellLoweringCache) {
-    let shaders = MaxwellThreeDTranslatedShaders::new(
-        vec![
-            MaxwellThreeDTranslatedShader::new(
-                ShaderStage::Vertex,
-                ShaderId::new(1),
-                1,
-                Some(MaxwellThreeDDirectlyAddressableMemory::Size48KiB),
-                0,
-            ),
-            MaxwellThreeDTranslatedShader::new(
-                ShaderStage::Fragment,
-                ShaderId::new(2),
-                2,
-                Some(MaxwellThreeDDirectlyAddressableMemory::Size48KiB),
-                0,
-            ),
-        ],
-        Vec::new(),
-    )
-    .unwrap();
-    let mut cache = MaxwellLoweringCache::default();
-    cache.seed_test_shader_translations(&shaders);
-    (shaders, cache)
 }
 
 mod color_output;

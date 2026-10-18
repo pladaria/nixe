@@ -10,6 +10,7 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct LayoutBinding {
     pub binding: u32,
+    pub element: u32,
     pub kind: vk::DescriptorType,
     pub stages: vk::ShaderStageFlags,
 }
@@ -25,6 +26,12 @@ impl LayoutKey {
         maximum: u32,
         uniform_maximum: u32,
     ) -> Result<(), VulkanError> {
+        let arrays: std::collections::HashSet<_> = self
+            .bindings
+            .iter()
+            .filter(|b| b.element != 0)
+            .map(|b| b.binding)
+            .collect();
         let explicit = self
             .bindings
             .iter()
@@ -37,7 +44,10 @@ impl LayoutKey {
                     "native dynamic storage descriptors exceed device limit",
                 ))?;
         for binding in &mut self.bindings {
-            if binding.kind == vk::DescriptorType::STORAGE_BUFFER && available != 0 {
+            if binding.kind == vk::DescriptorType::STORAGE_BUFFER
+                && available != 0
+                && !arrays.contains(&binding.binding)
+            {
                 binding.kind = vk::DescriptorType::STORAGE_BUFFER_DYNAMIC;
                 available -= 1;
             }
@@ -54,7 +64,10 @@ impl LayoutKey {
                     "native dynamic uniform descriptors exceed device limit",
                 ))?;
         for binding in &mut self.bindings {
-            if binding.kind == vk::DescriptorType::UNIFORM_BUFFER && available != 0 {
+            if binding.kind == vk::DescriptorType::UNIFORM_BUFFER
+                && available != 0
+                && !arrays.contains(&binding.binding)
+            {
                 binding.kind = vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC;
                 available -= 1;
             }
@@ -77,12 +90,12 @@ impl LayoutKey {
             .collect();
         // Vulkan consumes offsets in ascending binding order, regardless of
         // the order in which a caller described the layout.
-        indices.sort_unstable_by_key(|&i| self.bindings[i].binding);
+        indices.sort_unstable_by_key(|&i| (self.bindings[i].binding, self.bindings[i].element));
         indices.into_boxed_slice()
     }
 
     pub fn reflect(shader: &ShaderArtifact) -> Result<Self, VulkanError> {
-        let mut bindings = BTreeMap::<u32, LayoutBinding>::new();
+        let mut bindings = BTreeMap::<u32, (LayoutBinding, u32)>::new();
         let mut push_bytes = 0;
         let mut push_stages = vk::ShaderStageFlags::empty();
         for stage in &shader.stages {
@@ -92,9 +105,14 @@ impl LayoutKey {
                 push_stages |= flags;
             }
             for binding in &stage.module.bindings {
+                if binding.count == 0 || binding.count > 1024 {
+                    return Err(VulkanError::InvalidResource(
+                        "descriptor array count exceeds host ABI",
+                    ));
+                }
                 let kind = descriptor_type(binding.kind);
-                if let Some(old) = bindings.get_mut(&binding.binding) {
-                    if old.kind != kind {
+                if let Some((old, count)) = bindings.get_mut(&binding.binding) {
+                    if old.kind != kind || *count != binding.count {
                         return Err(VulkanError::InvalidResource(
                             "linked descriptor class mismatch",
                         ));
@@ -103,22 +121,86 @@ impl LayoutKey {
                 } else {
                     bindings.insert(
                         binding.binding,
-                        LayoutBinding {
-                            binding: binding.binding,
-                            kind,
-                            stages: flags,
-                        },
+                        (
+                            LayoutBinding {
+                                binding: binding.binding,
+                                element: 0,
+                                kind,
+                                stages: flags,
+                            },
+                            binding.count,
+                        ),
                     );
                 }
             }
         }
         Ok(Self {
-            bindings: bindings.into_values().collect(),
+            bindings: bindings
+                .into_values()
+                .flat_map(|(binding, count)| {
+                    (0..count).map(move |element| LayoutBinding { element, ..binding })
+                })
+                .collect(),
             push_bytes,
             push_stages,
         })
     }
 }
+/// The pipeline owns semantic origins; a shared layout contains only Vulkan ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BindingOrigin {
+    pub resource: nixe_gpu::shader_module::ResourceId,
+    pub sampler: Option<nixe_gpu::shader_module::ResourceId>,
+}
+pub(crate) fn binding_origins(
+    shader: &ShaderArtifact,
+    layout: &LayoutKey,
+) -> Result<Box<[BindingOrigin]>, VulkanError> {
+    use nixe_gpu::shader_module::ResourceId;
+    layout
+        .bindings
+        .iter()
+        .map(|slot| {
+            let mut origin = None;
+            for stage in &shader.stages {
+                for binding in stage
+                    .module
+                    .bindings
+                    .iter()
+                    .filter(|b| b.binding == slot.binding)
+                {
+                    if slot.element >= binding.count {
+                        return Err(VulkanError::InvalidResource(
+                            "descriptor element exceeds reflected array",
+                        ));
+                    }
+                    let element = |id: ResourceId| {
+                        u32::try_from(id.index())
+                            .ok()
+                            .and_then(|base| base.checked_add(slot.element))
+                            .map(ResourceId::new)
+                            .ok_or(VulkanError::InvalidResource(
+                                "descriptor resource identity overflow",
+                            ))
+                    };
+                    let current = BindingOrigin {
+                        resource: element(binding.resource)?,
+                        sampler: binding.sampler.map(element).transpose()?,
+                    };
+                    if origin.replace(current).is_some_and(|old| old != current) {
+                        return Err(VulkanError::InvalidResource(
+                            "linked descriptor has conflicting resource origins",
+                        ));
+                    }
+                }
+            }
+            origin.ok_or(VulkanError::InvalidResource(
+                "descriptor has no shader resource origin",
+            ))
+        })
+        .collect()
+}
+
 pub struct PipelineLayout {
     pub(crate) owner: Arc<DeviceOwner>,
     pub(crate) handle: vk::PipelineLayout,
@@ -139,6 +221,10 @@ impl PipelineLayout {
         offsets.clear();
         offsets.reserve(self.dynamic_bindings.len());
         for &index in &self.dynamic_bindings {
+            if matches!(resources.get(index), Some(DescriptorResource::NullBuffer)) {
+                offsets.push(0);
+                continue;
+            }
             let Some(DescriptorResource::Buffer {
                 buffer,
                 offset,
@@ -222,26 +308,12 @@ impl LayoutCache {
             vk::ShaderStageFlags::VERTEX,
             vk::ShaderStageFlags::TESSELLATION_CONTROL,
             vk::ShaderStageFlags::TESSELLATION_EVALUATION,
+            vk::ShaderStageFlags::GEOMETRY,
             vk::ShaderStageFlags::FRAGMENT,
             vk::ShaderStageFlags::COMPUTE,
         ] {
-            let counts = key
-                .bindings
-                .iter()
-                .filter(|b| b.stages.contains(flag))
-                .fold([0u32; 5], |mut c, b| {
-                    c[match b.kind {
-                        vk::DescriptorType::UNIFORM_BUFFER
-                        | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => 0,
-                        vk::DescriptorType::STORAGE_BUFFER
-                        | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => 1,
-                        vk::DescriptorType::SAMPLED_IMAGE => 2,
-                        vk::DescriptorType::STORAGE_IMAGE => 3,
-                        vk::DescriptorType::SAMPLER => 4,
-                        _ => unreachable!(),
-                    }] += 1;
-                    c
-                });
+            let counts =
+                descriptor_counts(key.bindings.iter().filter(|b| b.stages.contains(flag)))?;
             let limits = [
                 self.limits.max_per_stage_descriptor_uniform_buffers,
                 self.limits.max_per_stage_descriptor_storage_buffers,
@@ -250,27 +322,19 @@ impl LayoutCache {
                 self.limits.max_per_stage_descriptor_samplers,
             ];
             if counts.iter().zip(limits).any(|(&n, max)| n > max)
-                || counts.iter().sum::<u32>() > self.limits.max_per_stage_resources
+                || key
+                    .bindings
+                    .iter()
+                    .filter(|b| b.stages.contains(flag))
+                    .count()
+                    > self.limits.max_per_stage_resources as usize
             {
                 return Err(VulkanError::InvalidResource(
                     "native descriptors exceed per-stage device limits",
                 ));
             }
         }
-        let counts =
-            key.bindings.iter().fold([0u32; 5], |mut c, b| {
-                c[match b.kind {
-                    vk::DescriptorType::UNIFORM_BUFFER
-                    | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => 0,
-                    vk::DescriptorType::STORAGE_BUFFER
-                    | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => 1,
-                    vk::DescriptorType::SAMPLED_IMAGE => 2,
-                    vk::DescriptorType::STORAGE_IMAGE => 3,
-                    vk::DescriptorType::SAMPLER => 4,
-                    _ => unreachable!(),
-                }] += 1;
-                c
-            });
+        let counts = descriptor_counts(key.bindings.iter())?;
         let limits = [
             self.limits.max_descriptor_set_uniform_buffers,
             self.limits.max_descriptor_set_storage_buffers,
@@ -283,15 +347,26 @@ impl LayoutCache {
                 "native descriptors exceed set device limits",
             ));
         }
-        let bindings: Vec<_> = key
-            .bindings
-            .iter()
-            .map(|b| {
+        let mut declarations = BTreeMap::new();
+        for b in &key.bindings {
+            let declaration = declarations
+                .entry(b.binding)
+                .or_insert((b.kind, b.stages, 0));
+            if *declaration != (b.kind, b.stages, b.element) {
+                return Err(VulkanError::InvalidResource(
+                    "descriptor array elements must be consecutive and have one type and visibility",
+                ));
+            }
+            declaration.2 += 1;
+        }
+        let bindings: Vec<_> = declarations
+            .into_iter()
+            .map(|(binding, (kind, stages, count))| {
                 vk::DescriptorSetLayoutBinding::default()
-                    .binding(b.binding)
-                    .descriptor_type(b.kind)
-                    .descriptor_count(1)
-                    .stage_flags(b.stages)
+                    .binding(binding)
+                    .descriptor_type(kind)
+                    .descriptor_count(count)
+                    .stage_flags(stages)
             })
             .collect();
         let set = unsafe {
@@ -367,39 +442,149 @@ pub(super) fn buffer_alignment(kind: vk::DescriptorType, limits: &vk::PhysicalDe
         limits.min_storage_buffer_offset_alignment
     }
 }
-pub(super) fn descriptor_type(kind: nixe_gpu::ShaderResourceKind) -> vk::DescriptorType {
-    use nixe_gpu::ShaderResourceKind::*;
+fn descriptor_counts<'a>(
+    bindings: impl Iterator<Item = &'a LayoutBinding>,
+) -> Result<[u32; 5], VulkanError> {
+    let mut counts = [0; 5];
+    for binding in bindings {
+        let slot = match binding.kind {
+            vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => 0,
+            vk::DescriptorType::STORAGE_BUFFER | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => 1,
+            vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::UNIFORM_TEXEL_BUFFER => 2,
+            vk::DescriptorType::STORAGE_IMAGE | vk::DescriptorType::STORAGE_TEXEL_BUFFER => 3,
+            vk::DescriptorType::SAMPLER => 4,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER => {
+                counts[4] += 1;
+                2
+            }
+            _ => {
+                return Err(VulkanError::InvalidResource(
+                    "unsupported native descriptor type",
+                ));
+            }
+        };
+        counts[slot] += 1;
+    }
+    Ok(counts)
+}
+
+pub(super) fn descriptor_type(kind: nixe_gpu::shader_module::DescriptorKind) -> vk::DescriptorType {
+    use nixe_gpu::shader_module::DescriptorKind::*;
     match kind {
-        ConstantBuffer => vk::DescriptorType::UNIFORM_BUFFER,
+        UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
         StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
-        Sampler | ComparisonSampler => vk::DescriptorType::SAMPLER,
+        SampledImage => vk::DescriptorType::SAMPLED_IMAGE,
         StorageImage => vk::DescriptorType::STORAGE_IMAGE,
-        SampledImage
-        | SampledImage2DArray
-        | SampledDepthImage
-        | SampledDepthImage2DArray
-        | SampledImageCube => vk::DescriptorType::SAMPLED_IMAGE,
+        Sampler => vk::DescriptorType::SAMPLER,
+        CombinedImageSampler => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        UniformTexelBuffer => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+        StorageTexelBuffer => vk::DescriptorType::STORAGE_TEXEL_BUFFER,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn reflected(bindings: Vec<nixe_gpu::shader_module::Binding>) -> ShaderArtifact {
+        ShaderArtifact::new(Box::new([CompiledStage::new(
+            nixe_gpu::ShaderStage::Fragment,
+            nixe_gpu::shader_module::Module {
+                words: Box::new([]),
+                bindings: bindings.into(),
+                push_constant_bytes: 0,
+            },
+            None,
+            0,
+            None,
+        )]))
+    }
+    #[test]
+    fn array_elements_retain_semantic_origins_and_combined_descriptor_limits() {
+        use nixe_gpu::shader_module::{Binding, DescriptorKind, ResourceId};
+        let shader = reflected(vec![
+            Binding {
+                resource: ResourceId::new(100),
+                sampler: Some(ResourceId::new(200)),
+                binding: 7,
+                count: 3,
+                kind: DescriptorKind::CombinedImageSampler,
+                readable: true,
+                writable: false,
+            },
+            Binding {
+                resource: ResourceId::new(10),
+                sampler: None,
+                binding: 1,
+                count: 2,
+                kind: DescriptorKind::StorageBuffer,
+                readable: true,
+                writable: true,
+            },
+        ]);
+        let mut layout = LayoutKey::reflect(&shader).unwrap();
+        assert_eq!(
+            layout
+                .bindings
+                .iter()
+                .map(|b| (b.binding, b.element))
+                .collect::<Vec<_>>(),
+            [(1, 0), (1, 1), (7, 0), (7, 1), (7, 2)]
+        );
+        assert_eq!(
+            descriptor_counts(layout.bindings.iter()).unwrap(),
+            [0, 2, 3, 0, 3]
+        );
+        layout.select_dynamic_buffers(16, 16).unwrap();
+        assert!(layout.dynamic_bindings().is_empty());
+        let origins = binding_origins(&shader, &layout).unwrap();
+        assert_eq!(origins[1].resource, ResourceId::new(11));
+        assert_eq!(
+            origins[4],
+            BindingOrigin {
+                resource: ResourceId::new(102),
+                sampler: Some(ResourceId::new(202))
+            }
+        );
+        let mut other = shader.stages[0].as_ref().clone();
+        other.module.bindings[0].resource = ResourceId::new(300);
+        let conflict =
+            ShaderArtifact::new(vec![Arc::clone(&shader.stages[0]), Arc::new(other)].into());
+        assert!(binding_origins(&conflict, &layout).is_err());
+    }
+    #[test]
+    fn malformed_array_counts_are_rejected_before_layout_expansion() {
+        use nixe_gpu::shader_module::{Binding, DescriptorKind, ResourceId};
+        for count in [0, 1025, u32::MAX] {
+            let shader = reflected(vec![Binding {
+                resource: ResourceId::new(0),
+                binding: 0,
+                count,
+                sampler: None,
+                kind: DescriptorKind::UniformBuffer,
+                readable: true,
+                writable: false,
+            }]);
+            assert!(LayoutKey::reflect(&shader).is_err());
+        }
+    }
     #[test]
     fn uniform_and_storage_dynamic_budgets_are_independent_and_offsets_follow_binding_order() {
         let mut key = LayoutKey {
             bindings: vec![
                 LayoutBinding {
+                    element: 0,
                     binding: 4,
                     kind: vk::DescriptorType::UNIFORM_BUFFER,
                     stages: vk::ShaderStageFlags::VERTEX,
                 },
                 LayoutBinding {
+                    element: 0,
                     binding: 1,
                     kind: vk::DescriptorType::STORAGE_BUFFER,
                     stages: vk::ShaderStageFlags::VERTEX,
                 },
                 LayoutBinding {
+                    element: 0,
                     binding: 2,
                     kind: vk::DescriptorType::UNIFORM_BUFFER,
                     stages: vk::ShaderStageFlags::FRAGMENT,
@@ -426,6 +611,7 @@ mod tests {
         let make = || LayoutKey {
             bindings: [3, 1, 2]
                 .map(|binding| LayoutBinding {
+                    element: 0,
                     binding,
                     kind: vk::DescriptorType::STORAGE_BUFFER,
                     stages: vk::ShaderStageFlags::VERTEX,

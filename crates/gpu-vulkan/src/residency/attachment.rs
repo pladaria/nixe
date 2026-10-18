@@ -265,7 +265,7 @@ impl VulkanResidency {
         self.barriers.emit(&mut self.device);
         let slot = self.device.begin_recording()?;
         unsafe {
-            self.device.owner.device.cmd_resolve_image(
+            self.device.dispatch.cmd_resolve_image(
                 self.device.submission.slots[slot].command,
                 source,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,

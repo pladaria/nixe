@@ -1,6 +1,5 @@
 //! Backend-neutral transfer of resident images to host presentation.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, mpsc};
 
@@ -43,45 +42,25 @@ pub struct PresentationImageRequest {
 
 /// An immutable presentation lease over a backend-resident image.
 ///
-/// New renderers export typed owner-managed leases. Opaque payloads are a
-/// temporary wgpu integration seam, removed by tasks 13 and 15.
+/// Host objects remain owned by the renderer; frames carry typed release leases.
 #[derive(Clone)]
 pub struct ResidentImage {
     backend: BackendInstanceId,
     description: ImageDescription,
-    storage: ResidentImageStorage,
+    lease: PresentationLease,
 }
-
 impl ResidentImage {
-    #[must_use]
-    pub fn new(
-        backend: BackendInstanceId,
-        description: ImageDescription,
-        payload: Arc<dyn Any + Send + Sync>,
-    ) -> Self {
-        Self {
-            backend,
-            description,
-            storage: ResidentImageStorage::Legacy(payload),
-        }
-    }
-
-    /// Constructs a typed owner-managed frame; host objects never leave the owner.
     #[must_use]
     pub fn from_lease(description: ImageDescription, lease: PresentationLease) -> Self {
         Self {
             backend: lease.producer().instance(),
             description,
-            storage: ResidentImageStorage::Lease(lease),
+            lease,
         }
     }
-
     #[must_use]
-    pub fn lease(&self) -> Option<&PresentationLease> {
-        match &self.storage {
-            ResidentImageStorage::Lease(lease) => Some(lease),
-            ResidentImageStorage::Legacy(_) => None,
-        }
+    pub fn lease(&self) -> &PresentationLease {
+        &self.lease
     }
 
     #[must_use]
@@ -93,14 +72,6 @@ impl ResidentImage {
     pub const fn description(&self) -> ImageDescription {
         self.description
     }
-
-    #[must_use]
-    pub fn payload<T: Any>(&self) -> Option<&T> {
-        match &self.storage {
-            ResidentImageStorage::Legacy(payload) => payload.downcast_ref(),
-            ResidentImageStorage::Lease(_) => None,
-        }
-    }
 }
 
 impl Debug for ResidentImage {
@@ -111,13 +82,6 @@ impl Debug for ResidentImage {
             .field("description", &self.description)
             .finish_non_exhaustive()
     }
-}
-
-// Remove this enum's Legacy variant and payload downcasts during task 13/15.
-#[derive(Clone)]
-enum ResidentImageStorage {
-    Legacy(Arc<dyn Any + Send + Sync>),
-    Lease(PresentationLease),
 }
 
 /// Generation-safe identity in the GPU owner's presentation image cache.
@@ -257,7 +221,6 @@ mod tests {
         .unwrap();
         let frame = ResidentImage::from_lease(description, lease);
         assert_eq!(frame.backend(), producer.instance());
-        assert_eq!(frame.lease().unwrap().content_version(), 15);
-        assert!(frame.payload::<u32>().is_none());
+        assert_eq!(frame.lease().content_version(), 15);
     }
 }

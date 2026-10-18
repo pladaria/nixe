@@ -1,18 +1,8 @@
 use super::*;
 use crate::*;
 use ash::vk;
-use nixe_gpu::{
-    ShaderInterfaceElement, ShaderIoLocation, ShaderScalarType, ShaderSourceLocation, ShaderStage,
-    ssa::artifact::{ContentId, ShaderNamespace},
-    ssa::*,
-};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use nixe_gpu::shader_identity::{ContentId, ShaderNamespace};
+use std::{sync::Arc, time::Duration};
 mod support {
     use crate as nixe_gpu_vulkan;
     include!(concat!(
@@ -35,56 +25,7 @@ fn ready<T>(p: Pending<T>) -> Arc<T> {
         .expect("compiler publication")
         .unwrap()
 }
-fn pc() -> ShaderSourceLocation {
-    ShaderSourceLocation::new(8)
-}
-fn c(b: &mut FunctionBuilder, block: BlockId, bits: u32) -> Operand {
-    b.emit(block, pc(), Op::Constant(Constant::u32(bits)), vec![])[0].into()
-}
-fn kernel(increment: u32) -> Function {
-    let mut b = FunctionBuilder::new(ShaderStage::Compute);
-    let entry = b.entry();
-    let zero = c(&mut b, entry, 0);
-    let input = b.emit(
-        entry,
-        pc(),
-        Op::Load {
-            space: MemorySpace::Storage,
-            resource: Some(ResourceId::new(42)),
-            address_type: Type::U32,
-            ty: Type::U32,
-        },
-        vec![zero],
-    )[0];
-    let increment = c(&mut b, entry, increment);
-    let value = b.emit(
-        entry,
-        pc(),
-        Op::Binary {
-            op: Binary::Add,
-            ty: Type::U32,
-            float_control: nixe_gpu::ShaderFloatControl::PRECISE,
-        },
-        vec![input.into(), increment],
-    )[0];
-    let address = c(&mut b, entry, 4);
-    b.emit(
-        entry,
-        pc(),
-        Op::Store {
-            space: MemorySpace::Storage,
-            resource: Some(ResourceId::new(42)),
-            address_type: Type::U32,
-            ty: Type::U32,
-        },
-        vec![address, value.into()],
-    );
-    b.terminate(entry, pc(), Terminator::Return);
-    let mut f = b.finish().unwrap();
-    f.workgroup_size = Some([1, 1, 1]);
-    f.optimize().unwrap();
-    f
-}
+
 #[test]
 fn persistent_payload_is_checked_and_bounded_before_consumption() {
     let root = tempfile::tempdir().unwrap();
@@ -102,379 +43,7 @@ fn persistent_payload_is_checked_and_bounded_before_consumption() {
     store.write(key, b"rebuilt").unwrap();
     assert_eq!(store.read(key).unwrap(), b"rebuilt");
 }
-#[test]
-fn native_cached_compute_deduplicates_persists_and_retains_in_flight_objects() {
-    let Some(mut device) = support::device_for_test(ApiPreference::Auto) else {
-        return;
-    };
-    let validation = device.validation_monitor();
-    let root = tempfile::tempdir().unwrap();
-    let config = CacheConfiguration {
-        workers: 2,
-        directory: Some(root.path().to_path_buf()),
-        ..Default::default()
-    };
-    let pool = Arc::new(CompilePool::new(config.workers, config.pending_jobs).unwrap());
-    let shaders = ShaderCompiler::new(NS, Arc::clone(&pool), &config);
-    let pipelines = PipelineCompiler::new(&device, Arc::clone(&pool), &config).unwrap();
-    let source = ContentId::of(b"test-source", &[b"increment7"]);
-    let calls = Arc::new(AtomicUsize::new(0));
-    let submit = || {
-        let calls = Arc::clone(&calls);
-        shaders
-            .request(
-                source,
-                Box::new([device.shader_options()]),
-                move || {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(Box::new([kernel(7)]))
-                },
-                |fs| fs.iter().collect(),
-            )
-            .unwrap()
-    };
-    let shader = ready(submit());
-    let duplicate = ready(submit());
-    assert!(Arc::ptr_eq(&shader, &duplicate));
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    drop(duplicate);
-    let pipeline = ready(
-        pipelines
-            .request(PipelineRecipe::Compute(Arc::clone(&shader)))
-            .unwrap(),
-    );
-    let duplicate = ready(
-        pipelines
-            .request(PipelineRecipe::Compute(Arc::clone(&shader)))
-            .unwrap(),
-    );
-    assert!(Arc::ptr_eq(&pipeline, &duplicate));
-    drop(duplicate);
-    pipelines.checkpoint().unwrap();
-    let buffer = Arc::new(
-        device
-            .allocate_buffer(
-                8,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-                MemoryLocation::GpuToCpu,
-                AllocationMode::Managed,
-                "cached SSA compute",
-            )
-            .unwrap(),
-    );
-    unsafe { buffer.write_range(0, &[17u32.to_le_bytes(), 0u32.to_le_bytes()].concat()) }.unwrap();
-    let mut descriptors = DescriptorCache::new(&device, 64);
-    let resources = || {
-        Box::new([DescriptorResource::Buffer {
-            buffer: Arc::clone(&buffer),
-            offset: 0,
-            range: 8,
-        }]) as Box<[DescriptorResource]>
-    };
-    let record = descriptors.get(&pipeline.layout, &resources()).unwrap();
-    assert!(Arc::ptr_eq(
-        &record,
-        &descriptors.get(&pipeline.layout, &resources()).unwrap()
-    ));
-    device.bind_native_pipeline(&pipeline).unwrap();
-    device
-        .bind_native_descriptors(
-            &pipeline,
-            &record,
-            &vec![0; pipeline.layout.dynamic_bindings.len()],
-        )
-        .unwrap();
-    let counts = (Arc::strong_count(&pipeline), Arc::strong_count(&record));
-    for _ in 0..100 {
-        device.bind_native_pipeline(&pipeline).unwrap();
-        device
-            .bind_native_descriptors(
-                &pipeline,
-                &record,
-                &vec![0; pipeline.layout.dynamic_bindings.len()],
-            )
-            .unwrap();
-    }
-    assert_eq!(
-        counts,
-        (Arc::strong_count(&pipeline), Arc::strong_count(&record))
-    );
-    assert_eq!(descriptors.statistics().updates, 1);
-    let slot = device.submission.recording.unwrap();
-    let command = device.submission.slots[slot].command;
-    unsafe {
-        device.owner.device.cmd_dispatch(command, 1, 1, 1);
-        let barriers = [vk::BufferMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-            .dst_access_mask(vk::AccessFlags2::HOST_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(buffer.handle)
-            .size(8)];
-        device.dispatch.barrier(
-            command,
-            &vk::DependencyInfo::default().buffer_memory_barriers(&barriers),
-        );
-    }
-    let mut gate = gate::Gate::new(&device);
-    let waits = [vk::SemaphoreSubmitInfo::default()
-        .semaphore(gate.handle)
-        .value(1)
-        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-    let work = unsafe {
-        device
-            .submission
-            .flush(device.queue, &device.dispatch, &waits, &[])
-    }
-    .unwrap()
-    .unwrap();
-    gate.last_use = work.tick();
-    let weak_pipeline = Arc::downgrade(&pipeline);
-    let weak_record = Arc::downgrade(&record);
-    let weak_buffer = Arc::downgrade(&buffer);
-    drop(pipeline);
-    drop(record);
-    drop(buffer);
-    drop(descriptors);
-    drop(pipelines);
-    drop(shaders);
-    assert!(weak_pipeline.upgrade().is_some());
-    assert!(weak_record.upgrade().is_some());
-    let buffer = weak_buffer.upgrade().expect("batch must keep buffer alive");
-    assert!(!device.wait_for_work(work, Duration::ZERO).unwrap());
-    gate.signal();
-    assert!(device.wait_for_work(work, Duration::from_secs(10)).unwrap());
-    assert!(weak_pipeline.upgrade().is_none());
-    assert!(weak_record.upgrade().is_none());
-    assert_eq!(
-        unsafe { buffer.read_range(4, 4) }.unwrap(),
-        24u32.to_le_bytes()
-    );
-    drop(buffer);
-    assert!(weak_buffer.upgrade().is_none());
-    let shaders = ShaderCompiler::new(NS, Arc::clone(&pool), &config);
-    let warm = ready(
-        shaders
-            .request(
-                source,
-                Box::new([device.shader_options()]),
-                || -> Result<Box<[Function]>, CompileError> {
-                    panic!("persisted SPIR-V must bypass translation")
-                },
-                |fs| fs.iter().collect(),
-            )
-            .unwrap(),
-    );
-    assert!(warm.timings.disk_hit);
-    let path = root.path().join("spirv-v1").join(format!(
-        "{}.cache",
-        nixe_gpu::ssa::artifact::ArtifactKey::new(
-            NS,
-            source,
-            nixe_gpu::ssa::artifact::specialization(&[device.shader_options()])
-        )
-        .0
-        .hex()
-    ));
-    let mut bytes = std::fs::read(&path).unwrap();
-    *bytes.last_mut().unwrap() ^= 1;
-    std::fs::write(path, bytes).unwrap();
-    let rebuilt_compiler = ShaderCompiler::new(NS, Arc::clone(&pool), &config);
-    let rebuilt = ready(
-        rebuilt_compiler
-            .request(
-                source,
-                Box::new([device.shader_options()]),
-                || Ok(Box::new([kernel(7)])),
-                |fs| fs.iter().collect(),
-            )
-            .unwrap(),
-    );
-    assert!(!rebuilt.timings.disk_hit);
-    assert_eq!(rebuilt.identity, warm.identity);
-    drop(rebuilt_compiler);
-    let different_namespace = ShaderNamespace { isa: 2, ..NS };
-    let isolated = ShaderCompiler::new(different_namespace, Arc::clone(&pool), &config);
-    let same_code = ready(
-        isolated
-            .request(
-                source,
-                Box::new([device.shader_options()]),
-                || Ok(Box::new([kernel(7)])),
-                |fs| fs.iter().collect(),
-            )
-            .unwrap(),
-    );
-    assert!(!same_code.timings.disk_hit);
-    assert_eq!(same_code.identity, warm.identity);
-    drop(isolated);
-    let pipelines = PipelineCompiler::new(&device, Arc::clone(&pool), &config).unwrap();
-    let restarted = ready(pipelines.request(PipelineRecipe::Compute(warm)).unwrap());
-    let shared = ready(
-        pipelines
-            .request(PipelineRecipe::Compute(same_code))
-            .unwrap(),
-    );
-    assert!(Arc::ptr_eq(&shared, &restarted));
-    drop(shared);
-    eprintln!(
-        "native cache cold/warm driver feedback: {:?}",
-        restarted.metrics
-    );
-    drop(restarted);
-    drop(pipelines);
-    drop(shaders);
-    drop(pool);
-    drop(gate);
-    drop(device);
-    validation.check().unwrap();
-}
 
-fn graphics_functions(seed: u32) -> Box<[Function]> {
-    let mut b = FunctionBuilder::new(ShaderStage::Vertex);
-    let entry = b.entry();
-    let id = b.emit(
-        entry,
-        pc(),
-        Op::Input {
-            location: ShaderIoLocation::VertexId,
-            component: 0,
-            ty: Type::U32,
-        },
-        vec![],
-    )[0];
-    let mut positions = Vec::new();
-    for index in [1, 2] {
-        let index = c(&mut b, entry, index);
-        let test = b.emit(
-            entry,
-            pc(),
-            Op::IntegerCompare {
-                ty: Type::U32,
-                comparison: nixe_gpu::ShaderIntegerComparison::Equal,
-            },
-            vec![id.into(), index],
-        )[0];
-        let yes = b.emit(
-            entry,
-            pc(),
-            Op::Constant(Constant {
-                ty: Type::F32,
-                bits: 3f32.to_bits() as u64,
-            }),
-            vec![],
-        )[0];
-        let no = b.emit(
-            entry,
-            pc(),
-            Op::Constant(Constant {
-                ty: Type::F32,
-                bits: (-1f32).to_bits() as u64,
-            }),
-            vec![],
-        )[0];
-        positions.push(
-            b.emit(
-                entry,
-                pc(),
-                Op::Select(Type::F32),
-                vec![test.into(), yes.into(), no.into()],
-            )[0],
-        );
-    }
-    for value in [0f32, 1.] {
-        positions.push(
-            b.emit(
-                entry,
-                pc(),
-                Op::Constant(Constant {
-                    ty: Type::F32,
-                    bits: value.to_bits() as u64,
-                }),
-                vec![],
-            )[0],
-        );
-    }
-    for (component, &value) in positions.iter().enumerate() {
-        b.emit(
-            entry,
-            pc(),
-            Op::Output {
-                location: ShaderIoLocation::Position,
-                component: component as u32,
-                ty: Type::F32,
-            },
-            vec![value.into()],
-        );
-    }
-    b.terminate(entry, pc(), Terminator::Return);
-    let mut vertex = b.finish().unwrap();
-    vertex.inputs = vec![
-        ShaderInterfaceElement::new(
-            ShaderIoLocation::VertexId,
-            0,
-            ShaderScalarType::Unsigned32,
-            None,
-        )
-        .unwrap(),
-    ];
-    vertex.outputs = (0..4)
-        .map(|i| {
-            ShaderInterfaceElement::new(
-                ShaderIoLocation::Position,
-                i,
-                ShaderScalarType::Float32,
-                None,
-            )
-            .unwrap()
-        })
-        .collect();
-    vertex.optimize().unwrap();
-    let mut b = FunctionBuilder::new(ShaderStage::Fragment);
-    let entry = b.entry();
-    for (component, bits) in [(seed + 1) as f32 / 16., 0.25, 0.5, 1.]
-        .map(f32::to_bits)
-        .into_iter()
-        .enumerate()
-    {
-        let value = b.emit(
-            entry,
-            pc(),
-            Op::Constant(Constant {
-                ty: Type::F32,
-                bits: bits as u64,
-            }),
-            vec![],
-        )[0];
-        b.emit(
-            entry,
-            pc(),
-            Op::Output {
-                location: ShaderIoLocation::Color(0),
-                component: component as u32,
-                ty: Type::F32,
-            },
-            vec![value.into()],
-        );
-    }
-    b.terminate(entry, pc(), Terminator::Return);
-    let mut fragment = b.finish().unwrap();
-    fragment.outputs = (0..4)
-        .map(|i| {
-            ShaderInterfaceElement::new(
-                ShaderIoLocation::Color(0),
-                i,
-                ShaderScalarType::Float32,
-                None,
-            )
-            .unwrap()
-        })
-        .collect();
-    fragment.optimize().unwrap();
-    Box::new([vertex, fragment])
-}
 #[test]
 fn native_graphics_cache_normalizes_dynamic_state_and_reuses_library_parts() {
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {
@@ -487,13 +56,13 @@ fn native_graphics_cache_normalizes_dynamic_state_and_reuses_library_parts() {
     };
     let pool = Arc::new(CompilePool::new(2, 32).unwrap());
     let shaders = ShaderCompiler::new(NS, Arc::clone(&pool), &config);
+    let configuration = Arc::new(device.profile().shader_compiler.clone());
     let shader = ready(
         shaders
-            .request(
-                ContentId::of(b"gfx", &[&[0]]),
-                Box::new([device.shader_options(); 2]),
-                || Ok(graphics_functions(0)),
-                |fs| fs.iter().collect(),
+            .request_guest(
+                probe::captured_graphics(0, &configuration),
+                configuration,
+                Some(Default::default()),
             )
             .unwrap(),
     );
@@ -562,15 +131,9 @@ fn descriptor_pressure(api: ApiPreference) {
     let pool = Arc::new(CompilePool::new(1, 8).unwrap());
     let shaders = ShaderCompiler::new(NS, Arc::clone(&pool), &config);
     let pipelines = PipelineCompiler::new(&device, Arc::clone(&pool), &config).unwrap();
-    let shader = ready(
-        shaders
-            .request(
-                ContentId::of(b"pressure", &[b"increment"]),
-                Box::new([device.shader_options()]),
-                || Ok(Box::new([kernel(1)])),
-                |fs| fs.iter().collect(),
-            )
-            .unwrap(),
+    let shader = crate::test_shaders::compile(
+        &device.profile().shader_compiler.profile,
+        [crate::test_shaders::increment(7, 4)],
     );
     let pipeline = ready(pipelines.request(PipelineRecipe::Compute(shader)).unwrap());
     let alignment = device
@@ -713,15 +276,9 @@ fn dynamic_offsets_reuse_one_set_and_preserve_bounds_and_gpu_leases() {
     let pool = Arc::new(CompilePool::new(config.workers, config.pending_jobs).unwrap());
     let shaders = ShaderCompiler::new(NS, Arc::clone(&pool), &config);
     let pipelines = PipelineCompiler::new(&device, Arc::clone(&pool), &config).unwrap();
-    let shader = ready(
-        shaders
-            .request(
-                ContentId::of(b"test-source", &[b"dynamic-increment7"]),
-                Box::new([device.shader_options()]),
-                || Ok(Box::new([kernel(7)])),
-                |fs| fs.iter().collect(),
-            )
-            .unwrap(),
+    let shader = crate::test_shaders::compile(
+        &device.profile().shader_compiler.profile,
+        [crate::test_shaders::increment(7, 4)],
     );
     let pipeline = ready(pipelines.request(PipelineRecipe::Compute(shader)).unwrap());
     assert_eq!(&*pipeline.layout.dynamic_bindings, &[0]);
@@ -775,7 +332,7 @@ fn dynamic_offsets_reuse_one_set_and_preserve_bounds_and_gpu_leases() {
         .unwrap();
     let slot = device.submission.recording.unwrap();
     let command = device.submission.slots[slot].command;
-    unsafe { device.owner.device.cmd_dispatch(command, 1, 1, 1) };
+    unsafe { device.dispatch.cmd_dispatch(command, 1, 1, 1) };
     device
         .bind_native_descriptors(&pipeline, &record, &second_offsets)
         .unwrap();
@@ -802,7 +359,7 @@ fn dynamic_offsets_reuse_one_set_and_preserve_bounds_and_gpu_leases() {
         );
     }
     unsafe {
-        device.owner.device.cmd_dispatch(command, 1, 1, 1);
+        device.dispatch.cmd_dispatch(command, 1, 1, 1);
         let barriers = [vk::BufferMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
             .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
@@ -840,59 +397,450 @@ fn dynamic_offsets_reuse_one_set_and_preserve_bounds_and_gpu_leases() {
     validation.check().unwrap();
 }
 
-#[test]
-fn stage_reuse_precedes_emission_across_programs_and_restored_disk_artifacts() {
-    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
-        return;
+fn captured_kernel(
+    size: [u32; 3],
+    config: &nixe_gpu::shader_compilation::Configuration,
+) -> Arc<nixe_gpu::shader_compilation::ShaderInputs> {
+    use nixe_gpu::shader_compilation::{ShaderInputs, StageSource};
+    use nixe_shader_recompiler::{
+        Stage,
+        artifact::ShaderInfo,
+        environment::{EnvironmentMetadata, Observations, SnapshotEnvironment},
+        types::ProgramOffset,
     };
-    let monitor = device.validation_monitor();
+    Arc::new(ShaderInputs::new(
+        vec![StageSource {
+            environment: SnapshotEnvironment::new(
+                EnvironmentMetadata {
+                    stage: Stage::Compute,
+                    workgroup_size: size,
+                    ..Default::default()
+                },
+                Observations {
+                    instructions: [(ProgramOffset(8), 0xe300_0000_0007_000f)].into(),
+                    ..Default::default()
+                },
+            ),
+            info: ShaderInfo::default(),
+            binding_group: None,
+        }]
+        .into(),
+        config,
+    ))
+}
+
+#[test]
+fn guest_artifacts_deduplicate_survive_worker_reuse_and_roundtrip_metadata() {
     let root = tempfile::tempdir().unwrap();
+    let pool = Arc::new(CompilePool::new(1, 4).unwrap());
     let config = CacheConfiguration {
-        directory: Some(root.path().to_path_buf()),
+        directory: Some(root.path().into()),
         ..Default::default()
     };
-    let pool = Arc::new(CompilePool::new(2, 16).unwrap());
-    let shaders = ShaderCompiler::new(NS, Arc::clone(&pool), &config);
-    let opts = device.shader_options();
-    let source = |value| ContentId::of(b"stage-program-test", &[&[value]]);
-    let request = |compiler: &ShaderCompiler, value| {
-        ready(
-            compiler
-                .request(
-                    source(value),
-                    Box::new([opts]),
-                    || Ok(Box::new([kernel(7)])),
-                    |fs| fs.iter().collect(),
-                )
-                .unwrap(),
-        )
-    };
-    let first = request(&shaders, 1);
-    let related = request(&shaders, 2);
-    assert!(!Arc::ptr_eq(&first, &related));
-    assert!(
-        Arc::ptr_eq(&first.stages[0], &related.stages[0]),
-        "different program misses must share the pre-emission stage"
-    );
-    drop(shaders);
-    let restored = ShaderCompiler::new(NS, pool, &config);
-    let disk = ready(
-        restored
-            .request::<Box<[Function; 1]>>(
-                source(1),
-                Box::new([opts]),
-                || panic!("disk hit must not translate"),
-                |fs| fs.iter().collect(),
+    let compiler = ShaderCompiler::new(NS, Arc::clone(&pool), &config);
+    let configuration = Arc::new(nixe_gpu::shader_compilation::Configuration {
+        profile: nixe_shader_recompiler::Profile {
+            supported_spirv: 0x10500,
+            unified_descriptor_binding: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let source = captured_kernel([4, 2, 1], &configuration);
+    let first = compiler
+        .request_guest(Arc::clone(&source), Arc::clone(&configuration), None)
+        .unwrap();
+    let duplicate = compiler
+        .request_guest(Arc::clone(&source), Arc::clone(&configuration), None)
+        .unwrap();
+    let first = ready(first);
+    assert!(Arc::ptr_eq(&first, &ready(duplicate)));
+    assert!(!first.timings.disk_hit);
+    assert!(first.timings.translation_ns > 0);
+    assert!(first.timings.spirv_ns > 0);
+    let words = first.stages[0].module.words.clone();
+    let second = ready(
+        compiler
+            .request_guest(
+                captured_kernel([8, 1, 1], &configuration),
+                Arc::clone(&configuration),
+                None,
             )
             .unwrap(),
     );
-    assert!(disk.timings.disk_hit);
-    let fresh = request(&restored, 3);
-    assert!(
-        Arc::ptr_eq(&disk.stages[0], &fresh.stages[0]),
-        "disk hydration must register its semantic stage key"
+    assert_ne!(first.identity, second.identity);
+    assert_eq!(first.stages[0].module.words, words);
+    assert_eq!(
+        first.stages[0]
+            .guest
+            .as_ref()
+            .unwrap()
+            .execution
+            .workgroup_size,
+        [4, 2, 1]
     );
-    drop(restored);
+    assert_eq!(second.stages[0].workgroup_size, Some([8, 1, 1]));
+    drop(compiler);
+    let reloaded = ShaderCompiler::new(NS, pool, &config);
+    let cached = ready(reloaded.request_guest(source, configuration, None).unwrap());
+    assert!(cached.timings.disk_hit);
+    assert_eq!(cached.timings.translation_ns, 0);
+    assert_eq!(cached.timings.spirv_ns, 0);
+    assert_eq!(first.identity, cached.identity);
+    assert_eq!(first.stages[0].module, cached.stages[0].module);
+    assert_eq!(
+        first.stages[0].guest.as_ref().unwrap().execution,
+        cached.stages[0].guest.as_ref().unwrap().execution
+    );
+}
+
+#[test]
+fn guest_link_variants_reuse_unchanged_stages_before_emission() {
+    use nixe_gpu::shader_compilation::{Configuration, ShaderInputs, StageSource};
+    use nixe_shader_recompiler::{
+        Compiler, Stage,
+        environment::{EnvironmentMetadata, Observations, SnapshotEnvironment},
+        maxwell::header::ProgramHeader,
+        types::ProgramOffset,
+    };
+    let configuration = Arc::new(Configuration::default());
+    let source = |color: f32| {
+        let mut compiler = Compiler::new().unwrap();
+        let stages = [Stage::VertexB, Stage::Fragment].map(|stage| {
+            let mut bytes = [0; 80];
+            let mut instructions = [(ProgramOffset(0x50), 0xe300_0000_0007_000f)].into();
+            if stage == Stage::Fragment {
+                bytes[72] = 1;
+                instructions = [
+                    (
+                        ProgramOffset(0x50),
+                        0x0100_0000_0007_f000 | (u64::from(color.to_bits()) << 20),
+                    ),
+                    (ProgramOffset(0x58), 0xe300_0000_0007_000f),
+                ]
+                .into();
+            }
+            let mut environment = SnapshotEnvironment::new(
+                EnvironmentMetadata {
+                    stage,
+                    sph: ProgramHeader::from_bytes(&bytes),
+                    ..Default::default()
+                },
+                Observations {
+                    instructions,
+                    viewport_transform_state: Some(1),
+                    ..Default::default()
+                },
+            );
+            let id = compiler
+                .translate(
+                    &mut environment,
+                    &configuration.host,
+                    &configuration.settings,
+                )
+                .unwrap();
+            StageSource {
+                environment,
+                info: compiler.program(id).unwrap().info.clone(),
+                binding_group: Some(0),
+            }
+        });
+        Arc::new(ShaderInputs::new(Box::new(stages), &configuration))
+    };
+    let pool = Arc::new(CompilePool::new(2, 4).unwrap());
+    let compiler = ShaderCompiler::new(NS, pool, &CacheConfiguration::default());
+    let first = compiler
+        .request_guest(
+            source(0.25),
+            Arc::clone(&configuration),
+            Some(Default::default()),
+        )
+        .unwrap();
+    let second = compiler
+        .request_guest(
+            source(0.75),
+            configuration.clone(),
+            Some(Default::default()),
+        )
+        .unwrap();
+    let first = ready(first);
+    let second = ready(second);
+    assert!(Arc::ptr_eq(&first.stages[0], &second.stages[0]));
+    assert!(!Arc::ptr_eq(&first.stages[1], &second.stages[1]));
+    assert_ne!(first.stages[1].identity, second.stages[1].identity);
+    let depth = ready(
+        compiler
+            .request_guest_with_depth(
+                source(0.25),
+                Arc::clone(&configuration),
+                Some(Default::default()),
+                Some(nixe_gpu::FragmentDepthTransform::new(2., -1., 0., 1.).unwrap()),
+            )
+            .unwrap(),
+    );
+    assert!(Arc::ptr_eq(&first.stages[0], &depth.stages[0]));
+    assert_ne!(first.stages[1].identity, depth.stages[1].identity);
+    assert!(
+        depth.stages[1]
+            .guest
+            .as_ref()
+            .unwrap()
+            .info
+            .stores_frag_depth
+    );
+    let reversed = ready(
+        compiler
+            .request_guest_with_depth(
+                source(0.25),
+                Arc::clone(&configuration),
+                Some(Default::default()),
+                Some(nixe_gpu::FragmentDepthTransform::new(-2., 1., 0., 1.).unwrap()),
+            )
+            .unwrap(),
+    );
+    assert_ne!(depth.stages[1].identity, reversed.stages[1].identity);
+}
+
+#[test]
+fn guest_compilation_artifact_creates_native_compute_pipeline() {
+    let Some(device) = support::device_for_test(ApiPreference::Compatibility12) else {
+        return;
+    };
+    let monitor = device.validation_monitor();
+    let pool = Arc::new(CompilePool::new(1, 4).unwrap());
+    let config = CacheConfiguration {
+        workers: 1,
+        ..Default::default()
+    };
+    let compiler = ShaderCompiler::new(NS, Arc::clone(&pool), &config);
+    let configuration = Arc::new(device.profile().shader_compiler.clone());
+    let shader = ready(
+        compiler
+            .request_guest(
+                captured_kernel([4, 2, 1], &configuration),
+                configuration,
+                None,
+            )
+            .unwrap(),
+    );
+    let pipelines = PipelineCompiler::new(&device, pool, &config).unwrap();
+    let pipeline = ready(pipelines.request(PipelineRecipe::Compute(shader)).unwrap());
+    assert_eq!(pipeline.bind_point, vk::PipelineBindPoint::COMPUTE);
+    assert!(pipeline.layout.key.bindings.is_empty());
+    drop(pipeline);
+    drop(pipelines);
+    drop(compiler);
     drop(device);
     monitor.check().unwrap();
+}
+
+#[test]
+fn combined_arrays_and_texel_views_keep_descriptor_resources_alive() {
+    let Some(device) = support::device_for_test(ApiPreference::Compatibility12) else {
+        return;
+    };
+    let monitor = device.validation_monitor();
+    let layouts = layout::LayoutCache::new(&device, 8);
+    let key = LayoutKey {
+        bindings: vec![
+            LayoutBinding {
+                binding: 0,
+                element: 0,
+                kind: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                stages: vk::ShaderStageFlags::COMPUTE,
+            },
+            LayoutBinding {
+                binding: 0,
+                element: 1,
+                kind: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                stages: vk::ShaderStageFlags::COMPUTE,
+            },
+            LayoutBinding {
+                binding: 1,
+                element: 0,
+                kind: vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+                stages: vk::ShaderStageFlags::COMPUTE,
+            },
+            LayoutBinding {
+                binding: 2,
+                element: 0,
+                kind: vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+                stages: vk::ShaderStageFlags::COMPUTE,
+            },
+        ]
+        .into(),
+        push_bytes: 0,
+        push_stages: vk::ShaderStageFlags::empty(),
+    };
+    let layout = layouts.get(key).unwrap();
+    let image = Arc::new(
+        device
+            .allocate_image_2d(
+                1,
+                1,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::SAMPLED,
+                AllocationMode::Managed,
+                "combined descriptor test",
+            )
+            .unwrap(),
+    );
+    let handle = unsafe {
+        device.owner.device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(image.handle)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                ),
+            None,
+        )
+    }
+    .unwrap();
+    let view = Arc::new(AllocatedImageView::from_handle(image, handle));
+    let sampler = Sampler::new(&device, &vk::SamplerCreateInfo::default()).unwrap();
+    let buffer = Arc::new(
+        device
+            .allocate_buffer(
+                16,
+                vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
+                    | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,
+                MemoryLocation::CpuToGpu,
+                AllocationMode::Managed,
+                "texel descriptor test",
+            )
+            .unwrap(),
+    );
+    let weak_buffer = Arc::downgrade(&buffer);
+    let weak_sampler = Arc::downgrade(&sampler);
+    let resources = [
+        DescriptorResource::CombinedImageSampler {
+            view: Arc::clone(&view),
+            layout: vk::ImageLayout::GENERAL,
+            sampler: Arc::clone(&sampler),
+        },
+        DescriptorResource::CombinedImageSampler {
+            view: Arc::clone(&view),
+            layout: vk::ImageLayout::GENERAL,
+            sampler: Arc::clone(&sampler),
+        },
+        DescriptorResource::TexelBuffer {
+            buffer: Arc::clone(&buffer),
+            offset: 0,
+            range: 16,
+            format: vk::Format::R32_UINT,
+            element_bytes: 4,
+        },
+        DescriptorResource::TexelBuffer {
+            buffer: Arc::clone(&buffer),
+            offset: 0,
+            range: 16,
+            format: vk::Format::R32_UINT,
+            element_bytes: 4,
+        },
+    ];
+    let mut descriptors = DescriptorCache::new(&device, 8);
+    let record = descriptors.get(&layout, &resources).unwrap();
+    assert!(Arc::ptr_eq(
+        &record,
+        &descriptors.get(&layout, &resources).unwrap()
+    ));
+    descriptors.forget_image(&view);
+    assert!(!Arc::ptr_eq(
+        &record,
+        &descriptors.get(&layout, &resources).unwrap()
+    ));
+    drop(resources);
+    drop(buffer);
+    drop(sampler);
+    drop(view);
+    drop(descriptors);
+    assert!(weak_buffer.upgrade().is_some());
+    assert!(weak_sampler.upgrade().is_some());
+    drop(record);
+    assert!(weak_buffer.upgrade().is_none());
+    assert!(weak_sampler.upgrade().is_none());
+    drop(layout);
+    drop(layouts);
+    drop(device);
+    monitor.check().unwrap();
+}
+
+#[test]
+fn host_topology_stages_use_owned_interfaces_and_validate() {
+    use nixe_shader_recompiler::{artifact::StageInterface, ir::Attribute, types::Interpolation};
+    let mut vertex = StageInterface::default();
+    let mut consumer = StageInterface::default();
+    for component in 0..4 {
+        let position = Attribute::from_index(28 + component as u16).unwrap();
+        vertex.outputs.set(position, true);
+        consumer.inputs.set(position, true);
+        let generic = Attribute::generic(0, component).unwrap();
+        vertex.outputs.set(generic, true);
+        consumer.inputs.set(generic, true);
+    }
+    consumer.interpolation[0] = Interpolation::Flat;
+    let mut artifacts = Vec::new();
+    for first in [false, true] {
+        let quad = nixe_gpu::shader_module::synthetic::quad_geometry(
+            &vertex,
+            Some(&consumer),
+            first,
+            0x10500,
+        )
+        .unwrap();
+        assert_eq!(quad.execution.output_vertices, 6);
+        assert_eq!(quad.interface.interpolation[0], Interpolation::Flat);
+        artifacts.push(quad);
+    }
+    assert_ne!(artifacts[0].words, artifacts[1].words);
+    for domain in [
+        nixe_gpu::TessellationDomain::Isolines,
+        nixe_gpu::TessellationDomain::Triangles,
+        nixe_gpu::TessellationDomain::Quads,
+    ] {
+        let control = nixe_gpu::shader_module::synthetic::default_control(
+            &vertex, &consumer, 3, domain, 0x10500,
+        )
+        .unwrap();
+        assert_eq!(control.execution.output_vertices, 3);
+        let native = CompiledStage::from_guest(control.clone()).unwrap();
+        assert_eq!(native.module.push_constant_bytes, 56);
+        assert_eq!(native.output_control_points, Some(3));
+        artifacts.push(control);
+    }
+    let directory = tempfile::tempdir().unwrap();
+    for (i, artifact) in artifacts.iter().enumerate() {
+        let path = directory.path().join(format!("stage-{i}.spv"));
+        std::fs::write(
+            &path,
+            artifact
+                .words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let result = std::process::Command::new(
+            std::env::var_os("SPIRV_VAL").unwrap_or_else(|| "spirv-val".into()),
+        )
+        .args(["--target-env", "vulkan1.2"])
+        .arg(&path)
+        .output()
+        .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let bytes = nixe_gpu::shader_encoding::encode_artifacts(&artifacts);
+    assert_eq!(
+        nixe_gpu::shader_encoding::decode_artifacts(&bytes).unwrap(),
+        artifacts
+    );
 }

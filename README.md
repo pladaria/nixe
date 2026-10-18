@@ -100,7 +100,7 @@ When no physical GPU is available they print `SKIP:` (visible with `--nocapture`
 and return. The standard Rust harness labels these returns `ok`, so they must
 not be counted as hardware validation. Errors after GPU initialization remain
 test failures. Opt-in native tests and their additional requirements are described
-in [the native interop test guide](crates/gpu-wgpu/tests/native_interop/README.md).
+in [the native Vulkan guide](crates/gpu-vulkan/README.md).
 
 ### Integration tests against real titles
 

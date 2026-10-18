@@ -1,6 +1,6 @@
 //! Optional bounded derived-data storage. Corruption is a miss, never an input
 //! to Vulkan. This wire format contains only explicit scalars/bytes, not IR layout.
-use nixe_gpu::ssa::artifact::ContentId;
+use nixe_gpu::shader_identity::ContentId;
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -106,17 +106,6 @@ pub(super) fn store(directory: Option<&Path>, child: &str, budget: u64) -> Optio
     directory.map(|dir| Store::new(dir.join(child), budget))
 }
 
-pub(super) struct Reader<'a>(pub &'a [u8]);
-impl<'a> Reader<'a> {
-    pub fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let (a, b) = self.0.split_at_checked(n)?;
-        self.0 = b;
-        Some(a)
-    }
-    pub fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-}
 pub(super) fn word(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }

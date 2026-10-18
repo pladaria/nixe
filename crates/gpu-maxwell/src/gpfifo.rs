@@ -11,8 +11,8 @@ use nixe_memory::MemoryPermissions;
 
 use crate::{
     MaxwellAddressSpaceId, MaxwellAllocationId, MaxwellChannelId, MaxwellGpuAccessError,
-    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellGpuMapping, MaxwellGpuProfile,
-    MaxwellMappingId, MaxwellResolvedRange,
+    MaxwellGpuAddressSpace, MaxwellGpuMapping, MaxwellGpuProfile, MaxwellMappingId,
+    MaxwellResolvedRange,
 };
 
 /// Size of one hardware-format GPFIFO descriptor.
@@ -552,6 +552,14 @@ impl Display for MaxwellGpfifoCapture {
 /// Failure while resolving or revalidating a complete command source.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellGpfifoSourceError {
+    Synchronization {
+        entry_index: u32,
+        detail: Box<str>,
+    },
+    CaptureTooLarge {
+        bytes: usize,
+        limit: usize,
+    },
     ChannelAddressSpaceUnbound {
         channel: MaxwellChannelId,
     },
@@ -589,6 +597,17 @@ pub enum MaxwellGpfifoSourceError {
 impl Display for MaxwellGpfifoSourceError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Synchronization {
+                entry_index,
+                detail,
+            } => write!(
+                formatter,
+                "GPFIFO fetch synchronization failed: entry={entry_index} detail=[{detail}]"
+            ),
+            Self::CaptureTooLarge { bytes, limit } => write!(
+                formatter,
+                "GPFIFO command capture exceeds host bound: bytes={bytes} limit={limit}"
+            ),
             Self::ChannelAddressSpaceUnbound { channel } => write!(
                 formatter,
                 "GPFIFO channel has no bound GPU address space: {channel}"
@@ -641,7 +660,7 @@ impl std::error::Error for MaxwellGpfifoSourceError {}
 
 /// Resolves and retains every command byte before returning any usable work.
 pub fn resolve_gpfifo_submission(
-    channel: &MaxwellGpuChannel,
+    channel: &crate::MaxwellChannelConfiguration,
     frontend: FrontendSubmissionId,
     decoded: MaxwellDecodedGpfifoSubmission,
     address_space: &MaxwellGpuAddressSpace,
@@ -1035,6 +1054,7 @@ pub fn decode_gpfifo_submission(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MaxwellGpuChannel;
     use crate::{
         MaxwellAddressSpaceInitialization, MaxwellAllocationId, MaxwellChannelOwner,
         MaxwellMapRequest, SWITCH_1_GM20B_PROFILE,
@@ -1298,9 +1318,16 @@ mod tests {
             .read_pushbuffer(&address_space, 0, &mut bytes)
             .unwrap();
         assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-        let words = crate::pushbuffer::packet::SubmissionWords::new(&validated, &address_space)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let mut scratch = crate::MaxwellCommandSourceScratch::default();
+        let mut synchronize = || Ok(());
+        let words = crate::pushbuffer::packet::SubmissionWords::new(
+            &validated,
+            &address_space,
+            &mut scratch,
+            &mut synchronize,
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
         for (index, word) in words.iter().enumerate() {
             assert_eq!(
                 word.value(),

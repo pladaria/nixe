@@ -8,9 +8,9 @@ use nixe_gpu::{
     GuestTimelinePoint, ReservedTimelinePoint,
 };
 use nixe_gpu_maxwell::{
-    MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellChannelError, MaxwellChannelPriority,
-    MaxwellFrontendDispatchBoundary, MaxwellGpfifoDecodeError, MaxwellGpfifoSubmitRequest,
-    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellInvalidGpfifoSubmission,
+    MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellChannelConfiguration, MaxwellChannelError,
+    MaxwellChannelPriority, MaxwellFrontendDispatchBoundary, MaxwellGpfifoDecodeError,
+    MaxwellGpfifoSubmitRequest, MaxwellGpuAddressSpace, MaxwellInvalidGpfifoSubmission,
     MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler, MaxwellZCullMode,
     decode_gpfifo_submission, resolve_gpfifo_submission,
 };
@@ -78,11 +78,11 @@ impl NvHostGpuErrorEvent {
 
 /// Horizon-owned channel descriptors and their runtime event resources.
 ///
-/// Durable GPU semantics remain in `MaxwellGpuChannel`; this table only maps
+/// Durable GPU semantics remain in `MaxwellChannelConfiguration`; this table only maps
 /// Horizon descriptor lifetimes onto those frontend objects.
 #[derive(Debug)]
 pub(super) struct NvHostGpu {
-    channels: BTreeMap<NvDrvFileDescriptor, Arc<Mutex<MaxwellGpuChannel>>>,
+    channels: BTreeMap<NvDrvFileDescriptor, MaxwellChannelConfiguration>,
     error_events: BTreeMap<NvDrvFileDescriptor, NvHostGpuErrorEvent>,
     next_frontend_submission: u64,
     scheduler: MaxwellScheduler,
@@ -118,9 +118,9 @@ impl NvHostGpu {
             scheduler: MaxwellScheduler::default(),
         }
     }
-    pub(super) fn open(&mut self, fd: NvDrvFileDescriptor, channel: MaxwellGpuChannel) {
+    pub(super) fn open(&mut self, fd: NvDrvFileDescriptor, channel: MaxwellChannelConfiguration) {
         let channel_id = channel.id().get();
-        let previous_channel = self.channels.insert(fd, Arc::new(Mutex::new(channel)));
+        let previous_channel = self.channels.insert(fd, channel);
         let previous_event = self
             .error_events
             .insert(fd, NvHostGpuErrorEvent::new(channel_id));
@@ -128,14 +128,14 @@ impl NvHostGpu {
         debug_assert!(previous_event.is_none());
     }
 
-    pub(super) fn close(&mut self, fd: NvDrvFileDescriptor) -> Option<GuestSyncpointId> {
+    pub(super) fn close(
+        &mut self,
+        fd: NvDrvFileDescriptor,
+    ) -> Option<(nixe_gpu_maxwell::MaxwellChannelId, Option<GuestSyncpointId>)> {
         self.error_events.remove(&fd);
-        self.channels.remove(&fd).and_then(|channel| {
-            let channel = channel
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.channels.remove(&fd).map(|channel| {
             self.scheduler.cancel_channel(channel.id());
-            channel.syncpoint()
+            (channel.id(), channel.syncpoint())
         })
     }
 
@@ -144,12 +144,7 @@ impl NvHostGpu {
         let syncpoints = self
             .channels
             .values()
-            .filter_map(|channel| {
-                channel
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .syncpoint()
-            })
+            .filter_map(|channel| channel.syncpoint())
             .collect();
         self.channels.clear();
         self.scheduler.clear();
@@ -161,24 +156,18 @@ impl NvHostGpu {
         channel_fd: NvDrvFileDescriptor,
         address_space: nixe_gpu_maxwell::MaxwellAddressSpaceId,
     ) -> Option<Result<(), MaxwellChannelError>> {
-        self.channels.get_mut(&channel_fd).map(|channel| {
-            channel
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .bind_address_space(address_space)
-        })
+        self.channels
+            .get_mut(&channel_fd)
+            .map(|channel| channel.bind_address_space(address_space))
     }
 
     pub(super) fn bound_address_space(
         &self,
         channel_fd: NvDrvFileDescriptor,
     ) -> Option<nixe_gpu_maxwell::MaxwellAddressSpaceId> {
-        self.channels.get(&channel_fd).and_then(|channel| {
-            channel
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .address_space()
-        })
+        self.channels
+            .get(&channel_fd)
+            .and_then(|channel| channel.address_space())
     }
 
     pub(super) fn unbind_address_space(
@@ -186,10 +175,7 @@ impl NvHostGpu {
         address_space: nixe_gpu_maxwell::MaxwellAddressSpaceId,
     ) {
         for channel in self.channels.values_mut() {
-            channel
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .unbind_address_space(address_space);
+            channel.unbind_address_space(address_space);
         }
     }
 
@@ -204,9 +190,6 @@ impl NvHostGpu {
             .channels
             .get_mut(&descriptor.fd())
             .ok_or_else(|| unsupported_state(descriptor, request))?;
-        let mut channel = channel
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match request {
             IOCTL_CHANNEL_SET_NVMAP_FD => {
                 require_input_size(input, 4)?;
@@ -389,7 +372,7 @@ impl NvHostGpu {
             return Err(unsupported_state(descriptor, request));
         };
         submit_gpfifo(
-            Arc::clone(channel),
+            *channel,
             NvHostGpuSubmissionState {
                 scheduler: &mut self.scheduler,
                 next_frontend_submission: &mut self.next_frontend_submission,
@@ -422,13 +405,8 @@ impl NvHostGpu {
             .ok_or_else(|| unsupported_state(descriptor, 0))
     }
 
-    pub(super) fn channel(&self, fd: NvDrvFileDescriptor) -> Option<MaxwellGpuChannel> {
-        self.channels.get(&fd).map(|channel| {
-            channel
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        })
+    pub(super) fn channel(&self, fd: NvDrvFileDescriptor) -> Option<MaxwellChannelConfiguration> {
+        self.channels.get(&fd).copied()
     }
 
     #[cfg(test)]
@@ -486,7 +464,7 @@ fn decode_legacy_submit_gpfifo(
 }
 
 fn submit_gpfifo(
-    channel_state: Arc<Mutex<MaxwellGpuChannel>>,
+    channel: MaxwellChannelConfiguration,
     state: NvHostGpuSubmissionState<'_>,
     resources: NvHostGpuSubmitResources<'_>,
     descriptor: NvDrvDeviceDescriptor,
@@ -498,9 +476,6 @@ fn submit_gpfifo(
         scheduler,
         next_frontend_submission,
     } = state;
-    let channel = channel_state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let allocated_entries = channel
         .frontend()
         .gpfifo_entries()
@@ -621,7 +596,7 @@ fn submit_gpfifo(
         descriptor,
         request,
         dispatch,
-        Arc::clone(&channel_state),
+        channel,
         dispatch_address_space.clone(),
         reservation.clone(),
         Arc::clone(resources.control),

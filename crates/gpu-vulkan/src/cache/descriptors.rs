@@ -43,6 +43,14 @@ impl Drop for Sampler {
 }
 #[derive(Clone)]
 pub enum DescriptorResource {
+    NullBuffer,
+    TexelBuffer {
+        buffer: Arc<AllocatedBuffer>,
+        offset: u64,
+        range: u64,
+        format: vk::Format,
+        element_bytes: u32,
+    },
     Buffer {
         buffer: Arc<AllocatedBuffer>,
         offset: u64,
@@ -52,32 +60,64 @@ pub enum DescriptorResource {
         view: Arc<AllocatedImageView>,
         layout: vk::ImageLayout,
     },
+    CombinedImageSampler {
+        view: Arc<AllocatedImageView>,
+        layout: vk::ImageLayout,
+        sampler: Arc<Sampler>,
+    },
     Sampler(Arc<Sampler>),
 }
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum ResourceKey {
+    NullBuffer,
+    TexelBuffer(u64, u64, u64, vk::Format, u32),
     Buffer(u64, u64, u64),
     Image(u64, vk::ImageLayout),
+    CombinedImageSampler(u64, vk::ImageLayout, u64),
     Sampler(u64),
 }
 impl DescriptorResource {
     fn key(&self) -> ResourceKey {
         match self {
+            Self::NullBuffer => ResourceKey::NullBuffer,
+            Self::TexelBuffer {
+                buffer,
+                offset,
+                range,
+                format,
+                element_bytes,
+            } => ResourceKey::TexelBuffer(
+                buffer.handle.as_raw(),
+                *offset,
+                *range,
+                *format,
+                *element_bytes,
+            ),
             Self::Buffer {
                 buffer,
                 offset,
                 range,
             } => ResourceKey::Buffer(buffer.handle.as_raw(), *offset, *range),
             Self::Image { view, layout } => ResourceKey::Image(view.handle.as_raw(), *layout),
+            Self::CombinedImageSampler {
+                view,
+                layout,
+                sampler,
+            } => ResourceKey::CombinedImageSampler(
+                view.handle.as_raw(),
+                *layout,
+                sampler.handle.as_raw(),
+            ),
             Self::Sampler(s) => ResourceKey::Sampler(s.handle.as_raw()),
         }
     }
-    fn owner(&self) -> &Arc<DeviceOwner> {
-        match self {
-            Self::Buffer { buffer, .. } => &buffer.owner,
-            Self::Image { view, .. } => &view.image.owner,
+    fn owner(&self) -> Option<&Arc<DeviceOwner>> {
+        Some(match self {
+            Self::NullBuffer => return None,
+            Self::Buffer { buffer, .. } | Self::TexelBuffer { buffer, .. } => &buffer.owner,
+            Self::Image { view, .. } | Self::CombinedImageSampler { view, .. } => &view.image.owner,
             Self::Sampler(s) => &s.owner,
-        }
+        })
     }
 }
 // Borrowed lookups allocate and retain resources only on a real miss.
@@ -116,6 +156,19 @@ pub struct BindingRecord {
     pub layout: Arc<PipelineLayout>,
     _page: Arc<Page>,
     pub(crate) resources: Box<[DescriptorResource]>,
+    _texel_views: Vec<BufferView>,
+}
+struct BufferView {
+    owner: Arc<DeviceOwner>,
+    handle: vk::BufferView,
+    _buffer: Arc<AllocatedBuffer>,
+}
+impl Drop for BufferView {
+    fn drop(&mut self) {
+        unsafe {
+            self.owner.device.destroy_buffer_view(self.handle, None);
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DescriptorStatistics {
@@ -130,6 +183,7 @@ struct Entry {
 }
 pub struct DescriptorCache {
     owner: Arc<DeviceOwner>,
+    null_descriptor: bool,
     limits: vk::PhysicalDeviceLimits,
     maximum: usize,
     pages: Vec<PageSlot>,
@@ -139,15 +193,22 @@ pub struct DescriptorCache {
 }
 impl DescriptorCache {
     pub fn new(device: &VulkanDevice, maximum: usize) -> Self {
-        Self::from_limits(Arc::clone(&device.owner), device.profile().limits, maximum)
+        Self::from_limits(
+            Arc::clone(&device.owner),
+            device.profile().limits,
+            maximum,
+            device.profile().null_descriptor,
+        )
     }
     pub(crate) fn from_limits(
         owner: Arc<DeviceOwner>,
         limits: vk::PhysicalDeviceLimits,
         maximum: usize,
+        null_descriptor: bool,
     ) -> Self {
         Self {
             owner,
+            null_descriptor,
             limits,
             maximum,
             pages: Vec::new(),
@@ -164,7 +225,7 @@ impl DescriptorCache {
     pub(crate) fn forget_image(&mut self, view: &AllocatedImageView) {
         self.records.retain(|_, entry| {
             !entry.record.resources.iter().any(
-                |r| matches!(r.key(), ResourceKey::Image(handle, _) if handle == view.handle.as_raw()),
+                |r| matches!(r.key(), ResourceKey::Image(handle, _) | ResourceKey::CombinedImageSampler(handle, _, _) if handle == view.handle.as_raw()),
             )
         });
     }
@@ -183,11 +244,12 @@ impl DescriptorCache {
         }
         if resources
             .iter()
-            .any(|r| !Arc::ptr_eq(r.owner(), &self.owner))
+            .any(|r| r.owner().is_some_and(|owner| !Arc::ptr_eq(owner, &self.owner))
+                || matches!(r, DescriptorResource::CombinedImageSampler { sampler, .. } if !Arc::ptr_eq(&sampler.owner, &self.owner)))
         {
             return Err(VulkanError::InvalidResource("foreign descriptor resource"));
         }
-        let key = nixe_gpu::cache_fingerprint(&Key {
+        let key = super::fingerprint::cache_fingerprint(&Key {
             layout: &layout.key,
             resources,
         });
@@ -209,6 +271,59 @@ impl DescriptorCache {
         }
         for (b, r) in layout.key.bindings.iter().zip(resources) {
             match (b.kind, r) {
+                (
+                    vk::DescriptorType::STORAGE_BUFFER
+                    | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+                    | vk::DescriptorType::UNIFORM_BUFFER
+                    | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+                    DescriptorResource::NullBuffer,
+                ) if self.null_descriptor => {}
+                (
+                    kind @ (vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                    | vk::DescriptorType::STORAGE_TEXEL_BUFFER),
+                    DescriptorResource::TexelBuffer {
+                        buffer,
+                        offset,
+                        range,
+                        format,
+                        element_bytes,
+                    },
+                ) => {
+                    let (usage, feature) = if kind == vk::DescriptorType::UNIFORM_TEXEL_BUFFER {
+                        (
+                            vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER,
+                            vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER,
+                        )
+                    } else {
+                        (
+                            vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,
+                            vk::FormatFeatureFlags::STORAGE_TEXEL_BUFFER,
+                        )
+                    };
+                    let properties = unsafe {
+                        self.owner
+                            .instance
+                            .instance
+                            .get_physical_device_format_properties(self.owner.physical, *format)
+                    };
+                    if !buffer.usage.contains(usage)
+                        || !properties.buffer_features.contains(feature)
+                        || *element_bytes == 0
+                        || *range == 0
+                        || !range.is_multiple_of(u64::from(*element_bytes))
+                        || range / u64::from((*element_bytes).max(1))
+                            > u64::from(self.limits.max_texel_buffer_elements)
+                        || !offset
+                            .is_multiple_of(self.limits.min_texel_buffer_offset_alignment.max(1))
+                        || offset
+                            .checked_add(*range)
+                            .is_none_or(|end| end > buffer.size())
+                    {
+                        return Err(VulkanError::InvalidResource(
+                            "texel buffer format, usage, range or alignment exceeds host support",
+                        ));
+                    }
+                }
                 (
                     vk::DescriptorType::STORAGE_BUFFER
                     | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
@@ -264,6 +379,10 @@ impl DescriptorCache {
                 (
                     vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::STORAGE_IMAGE,
                     DescriptorResource::Image { layout, .. },
+                )
+                | (
+                    vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    DescriptorResource::CombinedImageSampler { layout, .. },
                 ) => {
                     if b.kind == vk::DescriptorType::STORAGE_IMAGE
                         && *layout != vk::ImageLayout::GENERAL
@@ -308,6 +427,9 @@ impl DescriptorCache {
         let buffers: Vec<_> = resources
             .iter()
             .map(|r| match r {
+                DescriptorResource::NullBuffer => {
+                    vk::DescriptorBufferInfo::default().range(vk::WHOLE_SIZE)
+                }
                 DescriptorResource::Buffer {
                     buffer,
                     offset,
@@ -328,9 +450,47 @@ impl DescriptorCache {
                 DescriptorResource::Sampler(s) => {
                     vk::DescriptorImageInfo::default().sampler(s.handle)
                 }
+                DescriptorResource::CombinedImageSampler {
+                    view,
+                    layout,
+                    sampler,
+                } => vk::DescriptorImageInfo::default()
+                    .image_view(view.handle)
+                    .image_layout(*layout)
+                    .sampler(sampler.handle),
                 _ => Default::default(),
             })
             .collect();
+        let mut texel_views = Vec::new();
+        let mut texels = vec![vk::BufferView::null(); resources.len()];
+        for (index, resource) in resources.iter().enumerate() {
+            if let DescriptorResource::TexelBuffer {
+                buffer,
+                offset,
+                range,
+                format,
+                ..
+            } = resource
+            {
+                let handle = unsafe {
+                    self.owner.device.create_buffer_view(
+                        &vk::BufferViewCreateInfo::default()
+                            .buffer(buffer.handle)
+                            .format(*format)
+                            .offset(*offset)
+                            .range(*range),
+                        None,
+                    )
+                }
+                .map_err(|e| VulkanError::vk("native texel buffer view", e))?;
+                texel_views.push(BufferView {
+                    owner: Arc::clone(&self.owner),
+                    handle,
+                    _buffer: Arc::clone(buffer),
+                });
+                texels[index] = handle;
+            }
+        }
         let writes: Vec<_> = layout
             .key
             .bindings
@@ -340,9 +500,15 @@ impl DescriptorCache {
                 let write = vk::WriteDescriptorSet::default()
                     .dst_set(set)
                     .dst_binding(b.binding)
+                    .dst_array_element(b.element)
                     .descriptor_type(b.kind);
-                if matches!(resources[i], DescriptorResource::Buffer { .. }) {
+                if matches!(
+                    resources[i],
+                    DescriptorResource::Buffer { .. } | DescriptorResource::NullBuffer
+                ) {
                     write.buffer_info(&buffers[i..i + 1])
+                } else if matches!(resources[i], DescriptorResource::TexelBuffer { .. }) {
+                    write.texel_buffer_view(&texels[i..i + 1])
                 } else {
                     write.image_info(&images[i..i + 1])
                 }
@@ -358,6 +524,7 @@ impl DescriptorCache {
             layout: Arc::clone(layout),
             _page: Arc::clone(&self.pages[page].page),
             resources: resources.into(),
+            _texel_views: texel_views,
         });
         self.records.insert(
             key,
@@ -480,8 +647,7 @@ impl VulkanDevice {
             return Ok(());
         }
         unsafe {
-            self.owner
-                .device
+            self.dispatch
                 .cmd_bind_pipeline(slot.command, pipeline.bind_point, pipeline.handle);
         }
         self.submission.statistics.pipeline_binds += 1;
@@ -539,6 +705,9 @@ impl VulkanDevice {
             ));
         }
         for (&index, &dynamic) in record.layout.dynamic_bindings.iter().zip(dynamic_offsets) {
+            if matches!(record.resources[index], DescriptorResource::NullBuffer) && dynamic == 0 {
+                continue;
+            }
             let DescriptorResource::Buffer {
                 buffer,
                 offset,
@@ -561,7 +730,7 @@ impl VulkanDevice {
             }
         }
         unsafe {
-            self.owner.device.cmd_bind_descriptor_sets(
+            self.dispatch.cmd_bind_descriptor_sets(
                 slot.command,
                 pipeline.bind_point,
                 pipeline.layout.handle,

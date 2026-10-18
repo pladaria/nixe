@@ -264,7 +264,7 @@ impl VulkanResidency {
             });
         self.barriers.emit(&mut self.device);
         unsafe {
-            self.device.owner.device.cmd_copy_buffer_to_image(
+            self.device.dispatch.cmd_copy_buffer_to_image(
                 self.device.submission.slots[slot].command,
                 self.device.submission.slots[slot]
                     .upload_buffer(slice)

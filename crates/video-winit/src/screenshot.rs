@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use nixe_video::{FrameCrop, FrameTransform, PresentationFrame};
-use wgpu::{CommandEncoder, Device};
+use nixe_video::FrameTransform;
 
 pub(super) struct Screenshots {
     title: String,
@@ -93,52 +92,6 @@ impl Screenshots {
         log::info!("screenshot requested; waiting for the next presented frame");
     }
 
-    pub(super) fn encode(
-        &mut self,
-        device: &Device,
-        encoder: &mut CommandEncoder,
-        frame: &PresentationFrame,
-    ) -> Option<Capture> {
-        let path = self.requested.take()?;
-        let texture =
-            nixe_gpu_wgpu::resident_texture(frame.image()).expect("validated resident frame");
-        match Capture::encode(
-            device,
-            encoder,
-            texture,
-            frame.crop(),
-            frame.transform(),
-            path,
-        ) {
-            Ok(capture) => Some(capture),
-            Err(error) => {
-                log::error!("cannot capture presentation image: {error}");
-                None
-            }
-        }
-    }
-
-    pub(super) fn save(
-        &mut self,
-        device: Device,
-        submission: wgpu::SubmissionIndex,
-        capture: Capture,
-    ) {
-        // Bounded to one in-flight capture. Do not hold WgpuQueueAccess while
-        // polling or writing the file: guest execution/presentation can continue.
-        match std::thread::Builder::new()
-            .name("nixe-screenshot".into())
-            .spawn(move || match capture.save(&device, submission) {
-                Ok(()) => log::info!("saved screenshot {}", capture.path.display()),
-                Err(error) => {
-                    log::error!("cannot save screenshot {}: {error}", capture.path.display())
-                }
-            }) {
-            Ok(worker) => self.worker = Some(worker),
-            Err(error) => log::error!("cannot start screenshot writer: {error}"),
-        }
-    }
-
     fn join_worker(&mut self) {
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()
@@ -156,111 +109,6 @@ impl Drop for Screenshots {
         if self.requested.is_some() {
             log::warn!("screenshot cancelled: no new frame was presented before shutdown");
         }
-    }
-}
-
-pub(super) struct Capture {
-    buffer: wgpu::Buffer,
-    dimensions: (u32, u32),
-    row_pitch: u32,
-    path: PathBuf,
-    transform: FrameTransform,
-    bgra: bool,
-}
-
-impl Capture {
-    fn encode(
-        device: &Device,
-        encoder: &mut CommandEncoder,
-        texture: &wgpu::Texture,
-        crop: FrameCrop,
-        transform: FrameTransform,
-        path: PathBuf,
-    ) -> io::Result<Self> {
-        // No rendering, filtering or color-space conversion: copy the actual
-        // resident presentation bytes. A future format must be handled explicitly.
-        let bgra = match texture.format() {
-            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => false,
-            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => true,
-            format => {
-                return Err(io::Error::other(format!(
-                    "unsupported screenshot format {format:?}"
-                )));
-            }
-        };
-        let (width, height) = (crop.width, crop.height);
-        let row_pitch = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Nixe on-demand screenshot readback"),
-            size: u64::from(row_pitch) * u64::from(height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                origin: wgpu::Origin3d {
-                    x: crop.left,
-                    y: crop.top,
-                    z: 0,
-                },
-                ..texture.as_image_copy()
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row_pitch),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        Ok(Self {
-            buffer,
-            dimensions: (width, height),
-            row_pitch,
-            path,
-            transform,
-            bgra,
-        })
-    }
-
-    fn save(&self, device: &Device, submission: wgpu::SubmissionIndex) -> io::Result<()> {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.buffer
-            .map_async(wgpu::MapMode::Read, .., move |result| {
-                let _ = tx.send(result);
-            });
-        // https://docs.rs/wgpu/30.0.0/wgpu/type.PollType.html
-        device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: Some(Duration::from_secs(30)),
-            })
-            .map_err(io::Error::other)?;
-        // Another device-polling thread may be delivering the mapping callback.
-        // Wait for that callback rather than treating its scheduling as failure.
-        rx.recv_timeout(Duration::from_secs(5))
-            .map_err(io::Error::other)?
-            .map_err(io::Error::other)?;
-        let result = {
-            let bytes = self.buffer.get_mapped_range(..).map_err(io::Error::other)?;
-            save_png(
-                &self.path,
-                self.dimensions,
-                self.row_pitch,
-                &bytes,
-                self.transform,
-                self.bgra,
-            )
-        };
-        self.buffer.unmap();
-        result
     }
 }
 
@@ -498,104 +346,6 @@ mod tests {
             }
             let expected: Vec<_> = expected.iter().flat_map(|n| [*n, n + 10, n + 20]).collect();
             assert_eq!(actual, expected, "transform bits={bits}");
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a Vulkan GPU; tests real cropped RGBA/BGRA readback to PNG"]
-    fn gpu_framebuffer_dump_preserves_pixels_crop_and_all_transforms() {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let Some(adapter) = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
-            .into_iter()
-            .find(|adapter| {
-                matches!(
-                    adapter.get_info().device_type,
-                    wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu
-                )
-            })
-        else {
-            eprintln!("SKIP: framebuffer readback requires a physical Vulkan GPU");
-            return;
-        };
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        for (bgra, format) in [
-            (false, wgpu::TextureFormat::Rgba8Unorm),
-            (true, wgpu::TextureFormat::Bgra8Unorm),
-            (false, wgpu::TextureFormat::Rgba8UnormSrgb),
-            (true, wgpu::TextureFormat::Bgra8UnormSrgb),
-        ] {
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("screenshot source with crop padding"),
-                size: wgpu::Extent3d {
-                    width: 4,
-                    height: 5,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            let mut bytes = vec![199; 4 * 5 * 4];
-            for y in 0..3 {
-                for x in 0..2 {
-                    let n = (y * 2 + x + 1) as u8;
-                    let offset = ((y + 1) * 4 + x + 1) * 4;
-                    let pixel = if bgra {
-                        [n + 20, n + 10, n, 0]
-                    } else {
-                        [n, n + 10, n + 20, 0]
-                    };
-                    bytes[offset..offset + 4].copy_from_slice(&pixel);
-                }
-            }
-            queue.write_texture(
-                texture.as_image_copy(),
-                &bytes,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(16),
-                    rows_per_image: Some(5),
-                },
-                texture.size(),
-            );
-            for (bits, expected) in TRANSFORMED.iter().enumerate() {
-                let path = directory.path().join(format!("{format:?}-{bits}.png"));
-                let mut encoder = device.create_command_encoder(&Default::default());
-                let capture = Capture::encode(
-                    &device,
-                    &mut encoder,
-                    &texture,
-                    FrameCrop {
-                        left: 1,
-                        top: 1,
-                        width: 2,
-                        height: 3,
-                    },
-                    transform(bits),
-                    path.clone(),
-                )
-                .unwrap();
-                let submission = queue.submit([encoder.finish()]);
-                capture.save(&device, submission).unwrap();
-                let mut reader =
-                    png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
-                        .read_info()
-                        .unwrap();
-                let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
-                let info = reader.next_frame(&mut decoded).unwrap();
-                let dimensions = if bits & 4 != 0 { (3, 2) } else { (2, 3) };
-                assert_eq!((info.width, info.height), dimensions);
-                let expected: Vec<_> = expected.iter().flat_map(|n| [*n, n + 10, n + 20]).collect();
-                assert_eq!(decoded, expected, "bgra={bgra} transform bits={bits}");
-            }
         }
     }
 }

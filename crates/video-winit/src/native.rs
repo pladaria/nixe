@@ -1,4 +1,4 @@
-//! Shared window/input state; only the retiring renderer selection is temporary.
+//! Native window/input state and owner-controlled presentation.
 use super::*;
 use nixe_gpu_vulkan::presentation::{HostFrame, PresentationClient};
 use std::ops::{Deref, DerefMut};
@@ -33,94 +33,56 @@ impl PresenterState {
         }
     }
 }
-pub(super) enum Presenter {
-    Legacy(Box<LegacyPresenter>),
-    Native(Box<NativePresenter>),
-}
 impl Deref for Presenter {
     type Target = PresenterState;
     fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Legacy(p) => &p.common,
-            Self::Native(p) => &p.common,
-        }
+        &self.common
     }
 }
 impl DerefMut for Presenter {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            Self::Legacy(p) => &mut p.common,
-            Self::Native(p) => &mut p.common,
-        }
+        &mut self.common
     }
 }
 impl Presenter {
-    pub(super) fn new(
-        window: Arc<Window>,
-        context: WgpuPresentationContext,
-        vsync: bool,
-    ) -> Result<Self, WindowError> {
-        Ok(Self::Legacy(Box::new(LegacyPresenter::new(
-            window, context, vsync,
-        )?)))
-    }
     pub(super) fn resize(&mut self, width: u32, height: u32) {
-        match self {
-            Self::Legacy(p) => p.resize(width, height),
-            Self::Native(p) => {
-                p.size = if p.occluded { [0, 0] } else { [width, height] };
-                p.redraw_pending = true;
-            }
-        }
+        self.size = if self.occluded {
+            [0, 0]
+        } else {
+            [width, height]
+        };
+        self.redraw_pending = true;
     }
     pub(super) fn resize_to_frame(&mut self) {
-        match self {
-            Self::Legacy(p) => p.resize_to_frame(),
-            Self::Native(p) => {
-                if let Some((width, height)) = p.common.frame_dimensions {
-                    p.common.window.set_min_inner_size(Some(PhysicalSize::new(
-                        width.min(320),
-                        height.min(180),
-                    )));
-                    if let Some(size) = p
-                        .common
-                        .window
-                        .request_inner_size(PhysicalSize::new(width, height))
-                    {
-                        p.size = [size.width, size.height];
-                        p.redraw_pending = true;
-                        p.common.window.request_redraw();
-                    }
-                }
+        if let Some((width, height)) = self.common.frame_dimensions {
+            self.common
+                .window
+                .set_min_inner_size(Some(PhysicalSize::new(width.min(320), height.min(180))));
+            if let Some(size) = self
+                .common
+                .window
+                .request_inner_size(PhysicalSize::new(width, height))
+            {
+                self.resize(size.width, size.height);
+                self.common.window.request_redraw();
             }
         }
     }
     pub(super) fn touch_position(&self, position: PhysicalPosition<f64>) -> Option<(u32, u32)> {
-        match self {
-            Self::Legacy(p) => p.touch_position(position),
-            Self::Native(p) => map_touch_position(
-                position,
-                letterbox_viewport(
-                    p.common
-                        .frame_dimensions
-                        .unwrap_or((TOUCH_SCREEN_WIDTH, TOUCH_SCREEN_HEIGHT)),
-                    (p.size[0], p.size[1]),
-                ),
+        map_touch_position(
+            position,
+            letterbox_viewport(
+                self.common
+                    .frame_dimensions
+                    .unwrap_or((TOUCH_SCREEN_WIDTH, TOUCH_SCREEN_HEIGHT)),
+                (self.size[0], self.size[1]),
             ),
-        }
+        )
     }
     pub(super) fn bind_frame(&mut self, frame: Arc<PresentationFrame>) -> Result<(), WindowError> {
-        match self {
-            Self::Legacy(p) => {
-                p.bind_frame(frame)?;
-                p.common.frame_rate.record_frame();
-            }
-            Self::Native(p) => {
-                p.common.frame_dimensions = Some((frame.width(), frame.height()));
-                p.pending = Some(frame);
-                p.redraw_pending = true;
-            }
-        }
+        self.common.frame_dimensions = Some((frame.width(), frame.height()));
+        self.pending = Some(frame);
+        self.redraw_pending = true;
         Ok(())
     }
     pub(super) fn open_keyboard(
@@ -128,49 +90,18 @@ impl Presenter {
         request: Arc<nixe_applets::keyboard::KeyboardSession>,
         host: nixe_applets::keyboard::KeyboardHost,
     ) {
-        match self {
-            Self::Legacy(p) => {
-                p.common
-                    .keyboard
-                    .get_or_insert_with(|| {
-                        keyboard::KeyboardOverlay::new(
-                            &p.common.window,
-                            &p.device,
-                            p.surface_configuration.format,
-                        )
-                    })
-                    .open(request);
-                p.common.keyboard_host = Some(host);
-            }
-            Self::Native(p) => {
-                p.common
-                    .keyboard
-                    .get_or_insert_with(|| {
-                        keyboard::KeyboardOverlay::new_native(&p.common.window, 4096)
-                    })
-                    .open(request);
-                p.common.keyboard_host = Some(host);
-                p.redraw_pending = true;
-            }
-        }
-    }
-    pub(super) fn redraw(&mut self) -> Result<(), WindowError> {
-        match self {
-            Self::Legacy(p) => p.redraw(),
-            Self::Native(p) => p.redraw(),
-        }
-    }
-    pub(super) fn refresh_title(&mut self, now: Instant) {
-        match self {
-            Self::Legacy(p) => p.refresh_title(now),
-            Self::Native(p) => p.refresh_title(now),
-        }
+        self.common
+            .keyboard
+            .get_or_insert_with(|| keyboard::KeyboardOverlay::new(&self.common.window, 4096))
+            .open(request);
+        self.common.keyboard_host = Some(host);
+        self.redraw_pending = true;
     }
     pub(super) fn needs_retry(&self) -> bool {
-        matches!(self, Self::Native(p) if p.redraw_pending)
+        self.redraw_pending
     }
 }
-pub(super) struct NativePresenter {
+pub(super) struct Presenter {
     common: PresenterState,
     client: PresentationClient,
     pending: Option<Arc<PresentationFrame>>,
@@ -178,7 +109,7 @@ pub(super) struct NativePresenter {
     redraw_pending: bool,
     occluded: bool,
 }
-impl NativePresenter {
+impl Presenter {
     pub(super) fn set_occluded(&mut self, occluded: bool) {
         self.occluded = occluded;
         let size = self.common.window.inner_size();
@@ -196,13 +127,13 @@ impl NativePresenter {
             metrics::presented_at(_instant);
         }
     }
-    fn refresh_title(&mut self, now: Instant) {
+    pub(super) fn refresh_title(&mut self, now: Instant) {
         self.poll();
         if self.common.frame_rate.refresh(now) {
             self.common.update_title();
         }
     }
-    fn redraw(&mut self) -> Result<(), WindowError> {
+    pub(super) fn redraw(&mut self) -> Result<(), WindowError> {
         self.poll();
         let admitted = self
             .client
@@ -258,17 +189,15 @@ impl NativePresenter {
         Ok(())
     }
 }
-impl Drop for NativePresenter {
+impl Drop for Presenter {
     fn drop(&mut self) {
         self.client.close();
     }
 }
 impl WindowFrontend {
-    /// Temporary desktop bootstrap for the current CLI initialization order.
-    /// Unified startup moves this into ActiveEventLoop::resumed at cutover.
+    /// Create the surface during the event loop resume callback.
     /// The actual surface precedes device selection; graphics queue access
     /// moves to Horizon and never remains on the window thread.
-    #[allow(deprecated)]
     pub fn create_vulkan_device(
         &mut self,
         options: nixe_gpu_vulkan::DeviceOptions,
@@ -283,30 +212,70 @@ impl WindowFrontend {
                 attributes = attributes.with_position(PhysicalPosition::new(x, y));
             }
         }
-        let window = Arc::new(
-            self.event_loop
-                .create_window(attributes)
-                .map_err(WindowError::window)?,
-        );
+        use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+        let mut bootstrap = DeviceBootstrap {
+            attributes: Some(attributes),
+            options: Some(options),
+            result: None,
+        };
+        while bootstrap.result.is_none() {
+            if matches!(
+                self.event_loop
+                    .pump_app_events(Some(Duration::from_millis(50)), &mut bootstrap),
+                PumpStatus::Exit(_)
+            ) {
+                return Err(WindowError::new(
+                    "Vulkan startup",
+                    "event loop exited before device initialization",
+                ));
+            }
+        }
+        let (window, device) = bootstrap.result.take().unwrap()?;
         let size = window.inner_size();
-        let device = nixe_gpu_vulkan::VulkanDevice::new(
-            options,
-            Some(nixe_gpu_vulkan::SurfaceTarget::new(Arc::clone(&window))),
-        )
-        .map_err(|e| WindowError::new("Vulkan device", e))?;
         let client = PresentationClient::default();
         let proxy = self.control.proxy.clone();
         client.set_notifier(Arc::new(move || {
             let _ = proxy.send_event(FrontendEvent::FrameAvailable);
         }));
-        self.application.presenter = Some(Presenter::Native(Box::new(NativePresenter {
+        self.application.presenter = Some(Presenter {
             common: PresenterState::new(window, "Vulkan native"),
             client: client.clone(),
             pending: None,
             size: [size.width, size.height],
             redraw_pending: true,
             occluded: false,
-        })));
+        });
         Ok((device, client))
+    }
+}
+
+struct DeviceBootstrap {
+    attributes: Option<WindowAttributes>,
+    options: Option<nixe_gpu_vulkan::DeviceOptions>,
+    result: Option<Result<(Arc<Window>, nixe_gpu_vulkan::VulkanDevice), WindowError>>,
+}
+impl ApplicationHandler<FrontendEvent> for DeviceBootstrap {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(attributes) = self.attributes.take() else {
+            return;
+        };
+        self.result = Some((|| {
+            let window = Arc::new(
+                event_loop
+                    .create_window(attributes)
+                    .map_err(WindowError::window)?,
+            );
+            let device = nixe_gpu_vulkan::VulkanDevice::new(
+                self.options.take().unwrap(),
+                Some(nixe_gpu_vulkan::SurfaceTarget::new(Arc::clone(&window))),
+            )
+            .map_err(|e| WindowError::new("Vulkan device", e))?;
+            Ok((window, device))
+        })());
+    }
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        if event == WindowEvent::CloseRequested {
+            event_loop.exit();
+        }
     }
 }

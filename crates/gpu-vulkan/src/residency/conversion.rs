@@ -5,8 +5,8 @@ use crate::{
     Binding, Draw, GraphicsParameters, PreparedDraw, RenderAttachment, RenderingTargets, cache::*,
 };
 use nixe_gpu::{
-    Nv12ColorTransform, ShaderResourceKind, ShaderStage,
-    ssa::{ResourceId, spirv},
+    Nv12ColorTransform, ShaderStage,
+    shader_module::{self as spirv, ResourceId},
 };
 use std::sync::OnceLock;
 pub(crate) fn stage(
@@ -64,7 +64,9 @@ pub fn nv12_pipeline(
                     .map(|binding| spirv::Binding {
                         resource: ResourceId::new(binding),
                         binding,
-                        kind: ShaderResourceKind::SampledImage,
+                        kind: spirv::DescriptorKind::SampledImage,
+                        count: 1,
+                        sampler: None,
                         readable: true,
                         writable: false,
                     })

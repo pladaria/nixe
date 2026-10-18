@@ -314,7 +314,7 @@ impl Host {
                         .layer_count(1),
                 );
             unsafe {
-                device.owner.device.cmd_copy_image_to_buffer(
+                device.dispatch.cmd_copy_image_to_buffer(
                     command,
                     capture.view.image.handle,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,

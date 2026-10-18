@@ -3,8 +3,8 @@
 use super::{image::ImagePiece, *};
 use crate::{Draw, GraphicsParameters, RenderAttachment, RenderingTargets, cache::*};
 use nixe_gpu::{
-    ShaderResourceKind, ShaderStage,
-    ssa::{ResourceId, spirv},
+    ShaderStage,
+    shader_module::{self as spirv, ResourceId},
 };
 use std::{sync::OnceLock, time::Duration};
 
@@ -34,7 +34,9 @@ fn artifact(stencil: bool) -> Arc<ShaderArtifact> {
                 Box::new([spirv::Binding {
                     resource: ResourceId::new(0),
                     binding: 0,
-                    kind: ShaderResourceKind::SampledImage,
+                    kind: spirv::DescriptorKind::SampledImage,
+                    count: 1,
+                    sampler: None,
                     readable: true,
                     writable: false,
                 }]),

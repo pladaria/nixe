@@ -1,6 +1,11 @@
 //! Source-preserving Macro Method Expander program storage for `MAXWELL_B`.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
+};
+mod direct;
+use direct::DirectProgram;
 
 use nixe_gpu::GpuMethodId;
 
@@ -231,7 +236,7 @@ pub enum MaxwellThreeDMmeExecutionError {
     },
 }
 
-/// Host services used by the ISA interpreter.
+/// Host services used by direct programs and ISA execution.
 pub(super) trait MaxwellThreeDMmeHost {
     type Error;
 
@@ -292,11 +297,36 @@ struct MmeInstructionPage {
     decoded: Box<[Option<MmeInstruction>]>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug)]
 struct MmeInstructionRam {
     pages: BTreeMap<u32, MmeInstructionPage>,
     count: usize,
+    programs: Box<[OnceLock<Option<DirectProgram>>]>,
 }
+impl Default for MmeInstructionRam {
+    fn default() -> Self {
+        Self {
+            pages: BTreeMap::new(),
+            count: 0,
+            programs: (0..256).map(|_| OnceLock::new()).collect(),
+        }
+    }
+}
+impl Clone for MmeInstructionRam {
+    fn clone(&self) -> Self {
+        Self {
+            pages: self.pages.clone(),
+            count: self.count,
+            ..Self::default()
+        }
+    }
+}
+impl PartialEq for MmeInstructionRam {
+    fn eq(&self, other: &Self) -> bool {
+        self.pages == other.pages && self.count == other.count
+    }
+}
+impl Eq for MmeInstructionRam {}
 
 impl MmeInstructionRam {
     fn page(&self, address: u32) -> Option<&MmeInstructionPage> {
@@ -313,6 +343,9 @@ impl MmeInstructionRam {
         address: u32,
         register: MaxwellThreeDRegister<MaxwellThreeDMmeInstruction>,
     ) {
+        for program in self.programs.iter_mut() {
+            program.take();
+        }
         let page = self
             .pages
             .entry(address / MME_INSTRUCTION_PAGE_WORDS as u32)
@@ -385,6 +418,24 @@ impl MaxwellThreeDMmeProgram {
             return Err(MaxwellThreeDMmeRunError::Execution(
                 MaxwellThreeDMmeExecutionError::ParameterUnavailable { index: 0 },
             ));
+        }
+        if let Some(program) = self.instructions.programs[macro_index as usize].get_or_init(|| {
+            let program = DirectProgram::compile(&self.instructions, start.raw());
+            nixe_gpu::trace::event(
+                "mme_program",
+                u64::from(macro_index),
+                u64::from(start.raw()),
+                u64::from(program.is_some()),
+            );
+            program
+        }) {
+            nixe_gpu::trace::detail_event(
+                "mme_direct_macro",
+                u64::from(macro_index),
+                u64::from(start.raw()),
+                parameters.len() as u64,
+            );
+            return program.execute(parameters, host);
         }
         let mut interpreter = MaxwellThreeDMmeInterpreter {
             program: self,
@@ -870,6 +921,12 @@ impl MaxwellThreeDMmeState {
                 value,
                 source,
             } => {
+                nixe_gpu::trace::event(
+                    "mme_upload",
+                    u64::from(address.raw()),
+                    u64::from(value.raw()),
+                    0,
+                );
                 Arc::make_mut(&mut self.instructions).insert(
                     address.raw(),
                     MaxwellThreeDRegister::programmed(value.raw(), value, source),
@@ -891,6 +948,18 @@ impl MaxwellThreeDMmeState {
                 address,
                 source,
             } => {
+                nixe_gpu::trace::event(
+                    "mme_start",
+                    u64::from(index.raw()),
+                    u64::from(address.raw()),
+                    0,
+                );
+                if let Some(program) = Arc::make_mut(&mut self.instructions)
+                    .programs
+                    .get_mut(index.raw() as usize)
+                {
+                    program.take();
+                }
                 Arc::make_mut(&mut self.start_addresses).insert(
                     index.raw(),
                     MaxwellThreeDRegister::programmed(address.raw(), address, source),

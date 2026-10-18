@@ -27,8 +27,7 @@ impl VulkanDevice {
             .src_offset(source_slice.offset)
             .size(bytes.len() as u64)];
         unsafe {
-            self.owner
-                .device
+            self.dispatch
                 .cmd_copy_buffer(command, upload, middle, &region);
         }
         let barrier = [vk::BufferMemoryBarrier2::default()
@@ -48,8 +47,7 @@ impl VulkanDevice {
             let region = [vk::BufferCopy::default()
                 .dst_offset(destination_slice.offset)
                 .size(bytes.len() as u64)];
-            self.owner
-                .device
+            self.dispatch
                 .cmd_copy_buffer(command, middle, download, &region);
         }
         host_read_barrier(
@@ -132,7 +130,7 @@ impl VulkanDevice {
                 command,
                 &vk::DependencyInfo::default().image_memory_barriers(&barrier),
             );
-            self.owner.device.cmd_copy_buffer_to_image(
+            self.dispatch.cmd_copy_buffer_to_image(
                 command,
                 upload,
                 image_handle,
@@ -160,7 +158,7 @@ impl VulkanDevice {
                 buffer_offset: destination_slice.offset,
                 ..region[0]
             }];
-            self.owner.device.cmd_copy_image_to_buffer(
+            self.dispatch.cmd_copy_image_to_buffer(
                 command,
                 image_handle,
                 source,

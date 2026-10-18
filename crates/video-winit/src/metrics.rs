@@ -47,9 +47,6 @@ pub fn finish_frame_capture() -> io::Result<()> {
     })
 }
 
-pub(crate) fn presented() {
-    presented_at(Instant::now());
-}
 pub(crate) fn presented_at(now: Instant) {
     let frame = FRAMES.fetch_add(1, Relaxed) + 1;
     let interval = LAST.with(|last| {

@@ -201,11 +201,6 @@ impl MaxwellObjectContext {
 /// State needed by the Maxwell packet frontend, independent of a host GPU.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellChannelFrontendState {
-    gpfifo_entries: Option<u32>,
-    gpfifo_vpr_enabled: bool,
-    object_context: Option<MaxwellObjectContext>,
-    error_notifier_enabled: bool,
-    z_cull_binding: Option<MaxwellZCullBinding>,
     legacy_mem_op_a: Option<u32>,
     host_semaphore: [u32; 3],
     reference_count: u32,
@@ -213,31 +208,6 @@ pub struct MaxwellChannelFrontendState {
 }
 
 impl MaxwellChannelFrontendState {
-    #[must_use]
-    pub const fn gpfifo_entries(self) -> Option<u32> {
-        self.gpfifo_entries
-    }
-
-    #[must_use]
-    pub const fn gpfifo_vpr_enabled(self) -> bool {
-        self.gpfifo_vpr_enabled
-    }
-
-    #[must_use]
-    pub const fn object_context(self) -> Option<MaxwellObjectContext> {
-        self.object_context
-    }
-
-    #[must_use]
-    pub const fn error_notifier_enabled(self) -> bool {
-        self.error_notifier_enabled
-    }
-
-    #[must_use]
-    pub const fn z_cull_binding(self) -> Option<MaxwellZCullBinding> {
-        self.z_cull_binding
-    }
-
     /// Returns the last source-preserving legacy `MEM_OP_A` operand.
     #[must_use]
     pub const fn legacy_mem_op_a(self) -> Option<u32> {
@@ -283,21 +253,52 @@ impl MaxwellChannelFrontendState {
     }
 }
 
-/// Persistent semantic state of one Switch 1 GPU channel.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellGpuChannel {
+/// Driver configuration carried by value with an accepted delivery.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MaxwellChannelDriverState {
+    gpfifo_entries: Option<u32>,
+    gpfifo_vpr_enabled: bool,
+    object_context: Option<MaxwellObjectContext>,
+    error_notifier_enabled: bool,
+    z_cull_binding: Option<MaxwellZCullBinding>,
+}
+impl MaxwellChannelDriverState {
+    #[must_use]
+    pub const fn gpfifo_entries(self) -> Option<u32> {
+        self.gpfifo_entries
+    }
+
+    #[must_use]
+    pub const fn gpfifo_vpr_enabled(self) -> bool {
+        self.gpfifo_vpr_enabled
+    }
+
+    #[must_use]
+    pub const fn object_context(self) -> Option<MaxwellObjectContext> {
+        self.object_context
+    }
+
+    #[must_use]
+    pub const fn error_notifier_enabled(self) -> bool {
+        self.error_notifier_enabled
+    }
+
+    #[must_use]
+    pub const fn z_cull_binding(self) -> Option<MaxwellZCullBinding> {
+        self.z_cull_binding
+    }
+}
+
+/// Host driver metadata, independent of command processor registers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellChannelConfiguration {
     id: MaxwellChannelId,
     owner: MaxwellChannelOwner,
     profile: MaxwellGpuProfile,
     memory_manager: Option<MaxwellMemoryManagerId>,
     address_space: Option<MaxwellAddressSpaceId>,
     syncpoint: Option<GuestSyncpointId>,
-    frontend: MaxwellChannelFrontendState,
-    compute: MaxwellComputeState,
-    dma_copy: MaxwellDmaCopyState,
-    inline_to_memory: MaxwellInlineToMemoryState,
-    two_d: MaxwellTwoDState,
-    three_d: MaxwellThreeDFrontendState,
+    frontend: MaxwellChannelDriverState,
     priority: MaxwellChannelPriority,
     timeslice: MaxwellChannelTimeslice,
     timeout: MaxwellChannelTimeout,
@@ -305,6 +306,28 @@ pub struct MaxwellGpuChannel {
     scheduling_policy: MaxwellChannelSchedulingPolicy,
 }
 
+/// Engine registers owned exclusively by the GPU command processor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaxwellGpuChannel {
+    configuration: MaxwellChannelConfiguration,
+    frontend: MaxwellChannelFrontendState,
+    compute: MaxwellComputeState,
+    dma_copy: MaxwellDmaCopyState,
+    inline_to_memory: MaxwellInlineToMemoryState,
+    two_d: MaxwellTwoDState,
+    three_d: MaxwellThreeDFrontendState,
+}
+impl std::ops::Deref for MaxwellGpuChannel {
+    type Target = MaxwellChannelConfiguration;
+    fn deref(&self) -> &Self::Target {
+        &self.configuration
+    }
+}
+impl std::ops::DerefMut for MaxwellGpuChannel {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.configuration
+    }
+}
 impl MaxwellGpuChannel {
     #[must_use]
     pub fn new(
@@ -312,77 +335,32 @@ impl MaxwellGpuChannel {
         owner: MaxwellChannelOwner,
         profile: MaxwellGpuProfile,
     ) -> Self {
+        Self::from_configuration(MaxwellChannelConfiguration::new(id, owner, profile))
+    }
+    pub fn from_configuration(configuration: MaxwellChannelConfiguration) -> Self {
         Self {
-            id,
-            owner,
-            profile,
-            memory_manager: None,
-            address_space: None,
-            syncpoint: None,
-            frontend: MaxwellChannelFrontendState {
-                gpfifo_entries: None,
-                gpfifo_vpr_enabled: false,
-                object_context: None,
-                error_notifier_enabled: false,
-                z_cull_binding: None,
-                legacy_mem_op_a: None,
-                host_semaphore: [0; 3],
-                reference_count: 0,
-                subchannel_bindings: [None; 8],
-            },
+            configuration,
+            frontend: MaxwellChannelFrontendState::default(),
             compute: MaxwellComputeState::new(),
             dma_copy: MaxwellDmaCopyState::new(),
             inline_to_memory: MaxwellInlineToMemoryState::new(),
             two_d: MaxwellTwoDState::new(),
             three_d: MaxwellThreeDFrontendState::new(),
-            priority: MaxwellChannelPriority::Medium,
-            timeslice: MaxwellChannelTimeslice::DriverDefault,
-            timeout: MaxwellChannelTimeout::DriverDefault,
-            user_data: 0,
-            scheduling_policy: MaxwellChannelSchedulingPolicy::DeterministicSingleQueue,
         }
     }
-
-    #[must_use]
-    pub const fn id(&self) -> MaxwellChannelId {
-        self.id
+    pub const fn configuration(&self) -> MaxwellChannelConfiguration {
+        self.configuration
     }
-
-    #[must_use]
-    pub const fn owner(&self) -> MaxwellChannelOwner {
-        self.owner
+    pub fn update_configuration(&mut self, configuration: MaxwellChannelConfiguration) {
+        assert_eq!(
+            self.configuration.id, configuration.id,
+            "channel lifetime must not change"
+        );
+        self.configuration = configuration;
     }
-
-    #[must_use]
-    pub const fn profile_id(&self) -> GpuProfileId {
-        self.profile.id()
-    }
-
-    #[must_use]
-    pub const fn profile(&self) -> MaxwellGpuProfile {
-        self.profile
-    }
-
-    #[must_use]
-    pub const fn memory_manager(&self) -> Option<MaxwellMemoryManagerId> {
-        self.memory_manager
-    }
-
-    #[must_use]
-    pub const fn address_space(&self) -> Option<MaxwellAddressSpaceId> {
-        self.address_space
-    }
-
-    #[must_use]
-    pub const fn syncpoint(&self) -> Option<GuestSyncpointId> {
-        self.syncpoint
-    }
-
-    #[must_use]
     pub const fn frontend(&self) -> MaxwellChannelFrontendState {
         self.frontend
     }
-
     pub(crate) const fn frontend_mut(&mut self) -> &mut MaxwellChannelFrontendState {
         &mut self.frontend
     }
@@ -440,13 +418,83 @@ impl MaxwellGpuChannel {
     pub(crate) const fn three_d_with_profile_mut(
         &mut self,
     ) -> (&MaxwellGpuProfile, &mut MaxwellThreeDFrontendState) {
-        (&self.profile, &mut self.three_d)
+        (&self.configuration.profile, &mut self.three_d)
     }
 
     /// Resets frontend class selection at a verified channel-reset boundary.
     /// Closing a channel normally drops the complete object instead.
     pub fn reset_subchannel_bindings(&mut self) {
         self.frontend.reset_subchannel_bindings();
+    }
+}
+
+impl MaxwellChannelConfiguration {
+    #[must_use]
+    pub fn new(
+        id: MaxwellChannelId,
+        owner: MaxwellChannelOwner,
+        profile: MaxwellGpuProfile,
+    ) -> Self {
+        Self {
+            id,
+            owner,
+            profile,
+            memory_manager: None,
+            address_space: None,
+            syncpoint: None,
+            frontend: MaxwellChannelDriverState {
+                gpfifo_entries: None,
+                gpfifo_vpr_enabled: false,
+                object_context: None,
+                error_notifier_enabled: false,
+                z_cull_binding: None,
+            },
+            priority: MaxwellChannelPriority::Medium,
+            timeslice: MaxwellChannelTimeslice::DriverDefault,
+            timeout: MaxwellChannelTimeout::DriverDefault,
+            user_data: 0,
+            scheduling_policy: MaxwellChannelSchedulingPolicy::DeterministicSingleQueue,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> MaxwellChannelId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn owner(&self) -> MaxwellChannelOwner {
+        self.owner
+    }
+
+    #[must_use]
+    pub const fn profile_id(&self) -> GpuProfileId {
+        self.profile.id()
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> MaxwellGpuProfile {
+        self.profile
+    }
+
+    #[must_use]
+    pub const fn memory_manager(&self) -> Option<MaxwellMemoryManagerId> {
+        self.memory_manager
+    }
+
+    #[must_use]
+    pub const fn address_space(&self) -> Option<MaxwellAddressSpaceId> {
+        self.address_space
+    }
+
+    #[must_use]
+    pub const fn syncpoint(&self) -> Option<GuestSyncpointId> {
+        self.syncpoint
+    }
+
+    #[must_use]
+    pub const fn frontend(&self) -> MaxwellChannelDriverState {
+        self.frontend
     }
 
     #[must_use]
@@ -690,6 +738,27 @@ mod tests {
     }
 
     #[test]
+    fn configuration_snapshots_do_not_share_or_reset_engine_registers() {
+        let mut driver = MaxwellChannelConfiguration::new(
+            MaxwellChannelId::new(1),
+            MaxwellChannelOwner::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        driver.set_user_data(11);
+        let accepted = driver;
+        let mut context = MaxwellGpuChannel::from_configuration(accepted);
+        context.frontend_mut().set_legacy_mem_op_a(0x1234);
+        driver.set_user_data(22);
+        driver.set_priority(MaxwellChannelPriority::High);
+        assert_eq!(context.user_data(), 11);
+        assert_eq!(accepted.user_data(), 11);
+        context.update_configuration(driver);
+        assert_eq!(context.user_data(), 22);
+        assert_eq!(context.priority(), MaxwellChannelPriority::High);
+        assert_eq!(context.frontend().legacy_mem_op_a(), Some(0x1234));
+    }
+
+    #[test]
     fn channel_starts_with_explicit_deterministic_scheduling_state() {
         let channel = channel();
         assert_eq!(channel.priority(), MaxwellChannelPriority::Medium);
@@ -749,8 +818,11 @@ mod tests {
             .unwrap();
         channel.allocate_gpfifo(0x800, true, syncpoint).unwrap();
         assert_eq!(channel.syncpoint(), Some(syncpoint));
-        assert_eq!(channel.frontend().gpfifo_entries(), Some(0x800));
-        assert!(channel.frontend().gpfifo_vpr_enabled());
+        assert_eq!(
+            channel.configuration().frontend().gpfifo_entries(),
+            Some(0x800)
+        );
+        assert!(channel.configuration().frontend().gpfifo_vpr_enabled());
     }
 
     #[test]
@@ -780,7 +852,7 @@ mod tests {
             MaxwellChannelTimeslice::Requested(0x400)
         );
         assert_eq!(channel.timeout(), MaxwellChannelTimeout::Requested(10_000));
-        assert!(channel.frontend().error_notifier_enabled());
+        assert!(channel.configuration().frontend().error_notifier_enabled());
     }
 
     #[test]
@@ -805,7 +877,7 @@ mod tests {
             .unwrap();
         channel.bind_z_cull(null, MaxwellZCullMode::Global).unwrap();
         assert_eq!(
-            channel.frontend().z_cull_binding(),
+            channel.configuration().frontend().z_cull_binding(),
             Some(MaxwellZCullBinding {
                 address: null,
                 mode: MaxwellZCullMode::Global,
@@ -821,7 +893,7 @@ mod tests {
             .bind_z_cull(separate, MaxwellZCullMode::SeparateBuffer)
             .unwrap();
         assert_eq!(
-            channel.frontend().z_cull_binding(),
+            channel.configuration().frontend().z_cull_binding(),
             Some(MaxwellZCullBinding {
                 address: separate,
                 mode: MaxwellZCullMode::SeparateBuffer,

@@ -22,16 +22,15 @@ use super::{
     MaxwellThreeDCounterStateWrite, MaxwellThreeDCoverageState, MaxwellThreeDCoverageStateWrite,
     MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconState,
     MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionState,
-    MaxwellThreeDFixedFunctionValue, MaxwellThreeDFixedFunctionWrite,
-    MaxwellThreeDInlineToMemoryState, MaxwellThreeDInlineToMemoryStateWrite,
-    MaxwellThreeDInstrumentationState, MaxwellThreeDInstrumentationStateWrite,
-    MaxwellThreeDL2CacheState, MaxwellThreeDL2CacheStateWrite, MaxwellThreeDLineState,
-    MaxwellThreeDLineStateWrite, MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState,
-    MaxwellThreeDMmeStateWrite, MaxwellThreeDRenderEnableState,
-    MaxwellThreeDRenderEnableStateWrite, MaxwellThreeDRenderTargetState,
-    MaxwellThreeDRenderTargetWrite, MaxwellThreeDReportSemaphoreState,
-    MaxwellThreeDReportSemaphoreStateWrite, MaxwellThreeDResourceRole,
-    MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite,
+    MaxwellThreeDFixedFunctionWrite, MaxwellThreeDInlineToMemoryState,
+    MaxwellThreeDInlineToMemoryStateWrite, MaxwellThreeDInstrumentationState,
+    MaxwellThreeDInstrumentationStateWrite, MaxwellThreeDL2CacheState,
+    MaxwellThreeDL2CacheStateWrite, MaxwellThreeDLineState, MaxwellThreeDLineStateWrite,
+    MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState, MaxwellThreeDMmeStateWrite,
+    MaxwellThreeDRenderEnableState, MaxwellThreeDRenderEnableStateWrite,
+    MaxwellThreeDRenderTargetState, MaxwellThreeDRenderTargetWrite,
+    MaxwellThreeDReportSemaphoreState, MaxwellThreeDReportSemaphoreStateWrite,
+    MaxwellThreeDResourceRole, MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite,
     MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderExecutionStateWrite,
     MaxwellThreeDTiledCacheState, MaxwellThreeDTiledCacheStateWrite, MaxwellThreeDVertexInputState,
     MaxwellThreeDVertexInputWrite, MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite,
@@ -1033,6 +1032,8 @@ pub(crate) struct MaxwellThreeDResourceStateIdentity {
 pub(crate) struct MaxwellThreeDShaderStateIdentity {
     scope: Arc<()>,
     revision: u64,
+    constant_buffers: u64,
+    textures: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1062,7 +1063,10 @@ pub(in crate::engines) enum GeneratedPrimitive {
 
 impl MaxwellThreeDShaderStateIdentity {
     pub(crate) fn matches(&self, state: &MaxwellThreeDState) -> bool {
-        Arc::ptr_eq(&self.scope, &state.cache_scope) && self.revision == state.shader_revision
+        Arc::ptr_eq(&self.scope, &state.cache_scope)
+            && self.revision == state.shader_revision
+            && self.constant_buffers == state.constant_buffer_revision
+            && self.textures == state.texture_revision
     }
 }
 
@@ -1125,6 +1129,8 @@ struct MaxwellThreeDResourceSemanticWrites {
 /// Complete currently modeled live state of one channel's `MAXWELL_B` engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MaxwellThreeDFrontendState {
+    pub(super) instance_run: Option<super::draw::InstanceRun>,
+    deferred_draw_end: Option<MaxwellThreeDVertexInputWrite>,
     raw_registers: MaxwellThreeDRawRegisterFile,
     // One bit per method, plus a summary bit per 64-method group. Only changed
     // state is decoded at a consumer; the raw register file is authoritative.
@@ -1192,6 +1198,8 @@ impl Default for MaxwellThreeDFrontendState {
         }
         Self {
             raw_registers,
+            instance_run: None,
+            deferred_draw_end: None,
             pending_registers: [0; 64],
             pending_groups: 0,
             pending_original: vec![0; 4096].into_boxed_slice(),
@@ -1467,6 +1475,8 @@ impl MaxwellThreeDState {
         MaxwellThreeDShaderStateIdentity {
             scope: Arc::clone(&self.cache_scope),
             revision: self.shader_revision,
+            constant_buffers: self.constant_buffer_revision,
+            textures: self.texture_revision,
         }
     }
 
@@ -1569,19 +1579,6 @@ impl MaxwellThreeDState {
         self.tiled_cache.as_ref()
     }
 
-    pub(crate) fn ps_output_sample_mask_effective(&self) -> Option<bool> {
-        let usage = self.coverage.ps_output_sample_mask_usage().value()?;
-        let anti_alias_enable = self
-            .fixed_function
-            .register(MaxwellThreeDFixedFunctionRegister::AntiAliasEnable)
-            .value()
-            .and_then(|value| match value {
-                MaxwellThreeDFixedFunctionValue::Boolean(value) => Some(*value),
-                _ => None,
-            });
-        usage.effective(anti_alias_enable)
-    }
-
     /// Patches consume the tessellator's output primitive, not their input topology.
     pub(in crate::engines) fn generated_primitive(&self) -> Option<GeneratedPrimitive> {
         use GeneratedPrimitive as Output;
@@ -1606,7 +1603,23 @@ impl MaxwellThreeDState {
 }
 
 impl MaxwellThreeDFrontendState {
+    pub(super) fn complete_draw_end(&mut self) {
+        if let Some(write) = self.deferred_draw_end.take() {
+            self.operation_state_mut().vertex_input.apply(write);
+        }
+    }
     pub(super) fn apply(&mut self, write: MaxwellThreeDStateWrite, changed: bool) {
+        // END terminates the pending draw, whose capture still consumes its
+        // validated BEGIN. Materialize that termination after the draw consumer
+        // or before the next BEGIN; raw/shadow register writes remain immediate.
+        if self.instance_run.is_some()
+            && let MaxwellThreeDStateWrite::VertexInput(
+                end @ MaxwellThreeDVertexInputWrite::End { .. },
+            ) = write
+        {
+            self.deferred_draw_end = Some(end);
+            return;
+        }
         let mut resource_semantic_writes = if changed {
             write.resource_semantic_writes()
         } else {
@@ -2126,7 +2139,6 @@ impl MaxwellThreeDStateWrite {
             Self::VertexInput(write) => !matches!(
                 write,
                 MaxwellThreeDVertexInputWrite::VertexArrayStart { .. }
-                    | MaxwellThreeDVertexInputWrite::GlobalBaseInstanceIndex { .. }
             ),
             Self::ShaderBinding(MaxwellThreeDShaderBindingWrite::TessellationMode { .. }
                 | MaxwellThreeDShaderBindingWrite::TessellationLod { .. }) => true,
@@ -2227,7 +2239,8 @@ impl MaxwellThreeDStateWrite {
             self,
             Self::VertexInput(MaxwellThreeDVertexInputWrite::Attribute { .. })
                 | Self::FixedFunction(MaxwellThreeDFixedFunctionWrite::Register {
-                    register: MaxwellThreeDFixedFunctionRegister::WindowOrigin,
+                    register: MaxwellThreeDFixedFunctionRegister::WindowOrigin
+                        | MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable,
                     ..
                 })
                 | Self::ShaderBinding(
@@ -2238,6 +2251,7 @@ impl MaxwellThreeDStateWrite {
                         | MaxwellThreeDShaderBindingWrite::PipelineRegisterCount { .. }
                         | MaxwellThreeDShaderBindingWrite::PipelineGroup { .. }
                         | MaxwellThreeDShaderBindingWrite::BindlessTextureSlot { .. }
+                        | MaxwellThreeDShaderBindingWrite::GeometryPassthroughMask { .. }
                 )
         )
     }

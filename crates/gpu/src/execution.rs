@@ -10,8 +10,7 @@ use nixe_memory::CpuVisibilityRequest;
 
 use crate::{
     BackendExecutionCompletion, BackendRuntimeError, BackendSubmissionToken,
-    BackendVisibilityRequester, NeutralBackendRuntime, OperationSubmission,
-    PresentationImageRequest, ResidentImage, ResourceDefinition, ResourceDependency,
+    BackendVisibilityRequester, ResidentImage,
 };
 
 /// Frontend-owned identity of an immutable prepared state revision.
@@ -43,30 +42,10 @@ impl PreparedStateId {
 ///
 /// Acceptance must capture input snapshots and retain canonical ranges needed
 /// by asynchronous execution. A successful return is not guest completion.
-/// Resource retirement is ordered after this batch's uses; no transactional
-/// resource-creation rollback is part of this contract.
+/// Resource ownership remains with the native command inputs and GPU owner.
 #[derive(Clone, Copy)]
-pub struct ExecutionBatch<'a, C = OperationSubmission> {
-    pub definitions: &'a [ResourceDefinition],
-    pub retirements: &'a [ResourceDependency],
+pub struct ExecutionBatch<'a, C> {
     pub commands: &'a C,
-}
-
-impl<'a> ExecutionBatch<'a> {
-    /// Shader/resource effects in command order; the canonical access summary
-    /// is not a replacement for this stream when computing host hazards.
-    pub fn ordered_accesses(self) -> impl Iterator<Item = (usize, &'a crate::ResourceAccess)> {
-        self.commands
-            .operations()
-            .iter()
-            .enumerate()
-            .flat_map(|(index, operation)| {
-                operation
-                    .accesses()
-                    .iter()
-                    .map(move |access| (index, access))
-            })
-    }
 }
 
 /// Interface consumed by Horizon's statically instantiated owner loop.
@@ -94,13 +73,15 @@ pub trait GpuExecution: Send + 'static {
     fn request_completion_wakeup(&mut self) -> Result<bool, BackendRuntimeError> {
         Ok(false)
     }
+    /// Complete preceding native work before fetching a SYNC_WAIT command source.
+    fn synchronize_command_sources(&mut self) -> Result<(), BackendRuntimeError> {
+        Err(BackendRuntimeError::Backend(
+            "command-source synchronization requires an accelerated backend".into(),
+        ))
+    }
     fn external_image_device(&self) -> Option<[u8; 16]> {
         None
     }
-    /// Compile already captured, immutable native state ahead of FIFO execution.
-    /// This must not import resources, read canonical memory, record commands or
-    /// publish guest effects. Failed speculative jobs are consumed by prepare.
-    fn precompile(&mut self, _command: &crate::native::NativeCommand) {}
     /// Poll cold preparation without waiting on compiler workers. No input
     /// acceptance or guest completion occurs until this returns true.
     fn prepare(
@@ -109,6 +90,13 @@ pub trait GpuExecution: Send + 'static {
     ) -> Result<bool, BackendRuntimeError> {
         Ok(true)
     }
+    /// Record an ordered prefix and retain its native resources without creating
+    /// a host completion notification. Visibility demands still address the real
+    /// device producer. The delivery's final submit owns its completion ticket.
+    fn record(
+        &mut self,
+        batch: ExecutionBatch<'_, Self::Commands>,
+    ) -> Result<(), BackendRuntimeError>;
     fn submit(
         &mut self,
         batch: ExecutionBatch<'_, Self::Commands>,
@@ -152,179 +140,58 @@ pub trait GpuExecution: Send + 'static {
     fn teardown(&mut self) -> Result<(), BackendRuntimeError>;
 }
 
-/// Sole temporary seam to the old object-safe runtime. Delete in task 15.
-///
-/// The Vulkan renderer implements GpuExecution directly. It must not reuse this
-/// bridge, the generic Backend<D>, or the legacy creation/rollback machinery.
-pub struct LegacyGpuExecution(Box<dyn NeutralBackendRuntime>);
-
-impl LegacyGpuExecution {
-    #[must_use]
-    pub fn new(runtime: Box<dyn NeutralBackendRuntime>) -> Self {
-        Self(runtime)
-    }
-}
-
-impl GpuExecution for LegacyGpuExecution {
-    type Commands = OperationSubmission;
-    type ImageRequest = PresentationImageRequest;
-    fn external_image_device(&self) -> Option<[u8; 16]> {
-        self.0.external_image_device()
+// An absent renderer has no constructible execution value. Loader/service-only
+// sessions can retain a typed None without linking any renderer implementation.
+impl GpuExecution for std::convert::Infallible {
+    type Commands = crate::native::NativeSubmission;
+    type ImageRequest = crate::native::NativePresentationImage;
+    fn record(
+        &mut self,
+        _batch: ExecutionBatch<'_, Self::Commands>,
+    ) -> Result<(), BackendRuntimeError> {
+        match *self {}
     }
     fn submit(
         &mut self,
-        batch: ExecutionBatch<'_>,
+        _batch: ExecutionBatch<'_, Self::Commands>,
     ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
-        self.0
-            .submit(batch.definitions, batch.retirements, batch.commands)
+        match *self {}
     }
     fn poll_completion(
         &mut self,
     ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
-        self.0.poll_completion()
+        match *self {}
     }
     fn wait_for_completion(
         &mut self,
     ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
-        self.0.wait_for_completion()
+        match *self {}
     }
     fn wait_for_completion_timeout(
         &mut self,
-        timeout: Duration,
+        _timeout: Duration,
     ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
-        // Only the retiring oracle lacks a timed host wait. Do not block its
-        // owner indefinitely; this adapter disappears with the legacy runtime.
-        if let Some(completion) = self.0.poll_completion()? {
-            return Ok(Some(completion));
-        }
-        std::thread::sleep(timeout);
-        self.0.poll_completion()
+        match *self {}
     }
     fn bind_visibility_requester(
         &mut self,
-        requester: Arc<dyn BackendVisibilityRequester>,
+        _requester: Arc<dyn BackendVisibilityRequester>,
     ) -> Result<(), BackendRuntimeError> {
-        self.0.bind_visibility_requester(requester)
+        match *self {}
     }
     fn make_cpu_visible(
         &mut self,
-        request: CpuVisibilityRequest,
+        _request: CpuVisibilityRequest,
     ) -> Result<Box<[u8]>, BackendRuntimeError> {
-        self.0.make_cpu_visible(request)
+        match *self {}
     }
     fn acquire_presentable_image(
         &mut self,
-        request: PresentationImageRequest,
+        _request: Self::ImageRequest,
     ) -> Result<ResidentImage, BackendRuntimeError> {
-        self.0.acquire_presentable_image(request)
+        match *self {}
     }
     fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
-        self.0.teardown()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        BufferId, BufferRange, BufferRegion, CapabilityRequirements, CopyOperation, DrawArguments,
-        DrawOperation, FrontendSubmissionId, GpuCommand, GpuOperation, PipelineId, PreparedDraw,
-        PrimitiveTopology, RenderPassId,
-    };
-
-    #[test]
-    fn ordered_accesses_keep_write_then_read_even_when_canonical_summary_merges_them() {
-        let region = |id| BufferRegion {
-            buffer: BufferId::new(id),
-            range: BufferRange::new(0, 16).unwrap(),
-        };
-        let copy = |source, destination| {
-            GpuOperation::new(
-                GpuCommand::Copy(CopyOperation::BufferToBuffer {
-                    source: region(source),
-                    destination: region(destination),
-                }),
-                [],
-                [],
-                CapabilityRequirements::none(),
-            )
-        };
-        let commands = OperationSubmission::new(
-            FrontendSubmissionId::new(1),
-            vec![],
-            vec![copy(1, 2), copy(2, 3)],
-        )
-        .unwrap();
-        let batch = ExecutionBatch {
-            definitions: &[],
-            retirements: &[],
-            commands: &commands,
-        };
-        let effects: Vec<_> = batch
-            .ordered_accesses()
-            .filter(|(_, access)| {
-                access.target().dependency() == ResourceDependency::Buffer(BufferId::new(2))
-            })
-            .map(|(index, access)| (index, access.scope().mode()))
-            .collect();
-        assert_eq!(
-            effects,
-            [(0, crate::AccessMode::Write), (1, crate::AccessMode::Read)]
-        );
-    }
-
-    #[test]
-    fn queued_prepared_revisions_stay_immutable_and_warm_draws_share_the_record() {
-        let mut state = PreparedDraw::new(
-            PreparedStateId::new(8, 1),
-            PipelineId::new(1),
-            RenderPassId::new(1),
-            PrimitiveTopology::Triangles,
-            vec![],
-            vec![],
-            None,
-        )
-        .unwrap();
-        let first_id = state.identity();
-        state.edit_state().cull_mode = crate::CullMode::Back;
-        assert_ne!(
-            state.identity(),
-            first_id,
-            "mutable preparation must invalidate the earlier revision"
-        );
-        let mut prepared = Arc::new(state);
-        let arguments = |first_vertex| DrawArguments::NonIndexed {
-            first_vertex,
-            vertex_count: 3,
-            first_instance: 0,
-            instance_count: 1,
-        };
-        let original = GpuOperation::new(
-            GpuCommand::Draw(DrawOperation::new(Arc::clone(&prepared), arguments(0)).unwrap()),
-            [],
-            [],
-            CapabilityRequirements::none(),
-        );
-        let warm = original.with_draw_arguments(arguments(3)).unwrap();
-        let GpuCommand::Draw(first) = original.command() else {
-            panic!()
-        };
-        let GpuCommand::Draw(next) = warm.command() else {
-            panic!()
-        };
-        assert!(Arc::ptr_eq(&first.prepared, &next.prepared));
-        assert_eq!(original.retained_bytes(), warm.retained_bytes());
-        assert!(Arc::get_mut(&mut prepared).is_none());
-        let mut changed = PreparedDraw::from_state(
-            PreparedStateId::new(
-                prepared.identity().slot(),
-                prepared.identity().revision() + 1,
-            ),
-            prepared.state().clone(),
-        );
-        changed.edit_state().pipeline = PipelineId::new(2);
-        assert_ne!(changed.identity(), first.prepared.identity());
-        assert_eq!(first.prepared.pipeline, PipelineId::new(1));
-        assert_eq!(next.arguments, arguments(3));
+        match *self {}
     }
 }

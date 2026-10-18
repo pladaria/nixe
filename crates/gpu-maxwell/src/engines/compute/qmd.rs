@@ -66,10 +66,6 @@ impl MaxwellComputeQmd {
         self.words[0x20 / 4]
     }
 
-    pub(super) fn register_count(&self) -> u8 {
-        (self.words[0xb8 / 4] >> 24) as u8
-    }
-
     pub(super) fn sass_version(&self) -> u8 {
         (self.words[0xbc / 4] >> 24) as u8
     }
@@ -92,6 +88,9 @@ impl MaxwellComputeQmd {
         // and pending writes, never a stale copy of a driver constant buffer.
         Ok((address, size))
     }
+    pub(super) fn constant_buffer_enabled(&self, slot: u8) -> bool {
+        slot < 8 && self.words[0x50 / 4] & (1 << slot) != 0
+    }
 
     pub(super) fn workgroups(&self) -> [u32; 3] {
         [
@@ -107,6 +106,16 @@ impl MaxwellComputeQmd {
             self.words[0x4c / 4] & 0xffff,
             self.words[0x4c / 4] >> 16,
         ]
+    }
+
+    pub(super) fn shared_memory_size(&self) -> u32 {
+        self.words[0x44 / 4] & 0x3ffff
+    }
+    pub(super) fn local_memory_size(&self) -> u32 {
+        (self.words[0xb4 / 4] & 0xfffff) + (self.words[0xbc / 4] & 0xfffff)
+    }
+    pub(super) fn linked_samplers(&self) -> bool {
+        self.words[0x2c / 4] & (1 << 30) != 0
     }
 }
 
@@ -209,7 +218,6 @@ mod tests {
         assert_eq!(qmd.program_offset(), 0xf123_4567);
         assert_eq!(qmd.workgroups(), [0x89ab_cdef, 0x3210, 0x7654]);
         assert_eq!(qmd.workgroup_size(), [0xabcd, 0x1234, 0x3456]);
-        assert_eq!(qmd.register_count(), 11);
         assert_eq!(qmd.sass_version(), 7);
     }
 

@@ -4,22 +4,17 @@
 //! Horizon ABI, console packet formats, or concrete host graphics objects.
 
 mod access;
-mod access_plan;
-pub use access_plan::{PlannedAccess, SubmissionAccessPlan};
 mod address;
 mod allocation;
-mod backend;
-mod cache;
 mod working_set;
 pub use working_set::WorkingSet;
-mod capability;
 mod color;
 mod command;
 mod conversion;
 pub use color::{
     BlendComponent, BlendFactor, BlendOperation, ColorBlendState, ColorOutputState, ColorWriteMask,
 };
-pub use conversion::{ConversionImage, Nv12ColorTransform, Nv12Conversion};
+pub use conversion::{ConversionImage, Nv12ColorTransform};
 mod device_image;
 pub use device_image::{
     DeviceImageFrame, DeviceImageSource, DeviceImageTransfer, ExternalImageBuffer,
@@ -28,13 +23,8 @@ mod diagnostics;
 mod execution;
 mod presentation;
 mod resource;
-mod resource_definition;
 mod runtime;
-pub use execution::{ExecutionBatch, GpuExecution, LegacyGpuExecution, PreparedStateId};
-pub use resource_definition::ResourceDefinition;
-/// Temporary name for old driver consumers; removed with the legacy backend in task 15.
-pub use resource_definition::ResourceDefinition as BackendResourceCreateInfo;
-mod shader;
+pub use execution::{ExecutionBatch, GpuExecution, PreparedStateId};
 mod tessellation;
 pub use tessellation::{
     TessellationControl, TessellationDomain, TessellationMode, TessellationOutput,
@@ -53,30 +43,13 @@ pub use allocation::{
     AllocationDescriptionError, BackingView, BackingViewError, CanonicalBackingSpan,
     GpuAllocationDescription, GpuAllocationId,
 };
-pub use backend::{
-    AcceptedBackendSubmission, Backend, BackendDriver, BackendDriverError, BackendError,
-    BackendResourceHandle, BackendResourceKind, BackendResourceValidationError, BackendState,
-    ResolvedBackendResources,
-};
-pub use cache::{
-    DEFAULT_BIND_GROUPS_PER_DESCRIPTOR_TABLE, DEFAULT_PERSISTENT_PIPELINE_CACHE_BYTES,
-    DEFAULT_PIPELINE_CACHE_ENTRIES, DEFAULT_PIPELINE_VARIANTS_PER_RESOURCE,
-    DEFAULT_SHADER_CACHE_ENTRIES, GpuCacheConfiguration, GpuCacheConfigurationError,
-    MIN_SHADER_CACHE_ENTRIES, cache_fingerprint,
-};
-pub use capability::{
-    BackendCapabilities, BackendCapabilityError, BackendFeatures, BackendLimits,
-    CapabilityAgreement, CapabilityRequirement, CapabilityRequirements,
-};
+
 pub use command::{
     AlphaCompareOperation, AlphaTest, AttachmentLoad, AttachmentStore, BarrierOperation,
-    BlitFilter, BlitOperation, BufferRegion, CacheMaintenanceOperation, ClearOperation, ClearValue,
-    CommandDescriptionError, CopyOperation, CullMode, DepthBias, DepthCompareOperation, DepthState,
-    DispatchOperation, DrawArguments, DrawOperation, FragmentDepthTransform, FrontFace, GpuCommand,
-    GpuOperation, ImageOrigin, ImageRegion, IndexType, LineRasterization, OperationSubmission,
-    PreparedDraw, PreparedDrawState, PrimitiveTopology, QueryOperation, RenderAttachment,
-    RenderPassOperation, ResolveOperation, ScissorRect, StencilFaceState, StencilOperation,
-    StencilTestState, TriangleRasterization, VertexAttribute, VertexBufferLayout,
+    BlitFilter, CacheMaintenanceOperation, ClearValue, CommandDescriptionError, CullMode,
+    DepthBias, DepthCompareOperation, DepthState, DrawArguments, FragmentDepthTransform, FrontFace,
+    ImageOrigin, IndexType, LineRasterization, PrimitiveTopology, ScissorRect, StencilFaceState,
+    StencilOperation, StencilTestState, TriangleRasterization, VertexAttribute,
     VertexComponentCount, VertexComponentWidth, VertexFormat, VertexPositionTransform,
     VertexStepMode, ViewportTransform,
 };
@@ -90,38 +63,12 @@ pub use presentation::{
     PresentationRelease, ResidentImage,
 };
 pub use resource::{
-    AddressMode, BufferDescription, BufferId, DescriptorKind, DescriptorTableBinding,
-    DescriptorTableDescription, DescriptorTableId, FilterMode, ImageDescription, ImageDimension,
-    ImageExtent, ImageFormat, ImageId, ImageKind, PipelineDescription, PipelineId, PipelineKind,
-    QueryKind, QueryPoolDescription, QueryPoolId, RenderPassAttachmentDescription,
-    RenderPassDescription, RenderPassId, ResourceDescriptionError, SampleCount, SamplerDescription,
-    SamplerId, ShaderDescription, ShaderId, ShaderStage,
+    AddressMode, BufferDescription, BufferId, DescriptorTableId, FilterMode, ImageDescription,
+    ImageDimension, ImageExtent, ImageFormat, ImageId, ImageKind, PipelineId, QueryKind,
+    QueryPoolId, RenderPassId, ResourceDescriptionError, SampleCount, SamplerDescription,
+    SamplerId, ShaderId, ShaderStage,
 };
-pub use runtime::{
-    BackendExecutionCompletion, BackendRuntime, BackendRuntimeError, BackendVisibilityRequester,
-    NeutralBackendRuntime,
-};
-pub use shader::spirv::{
-    SpirvDefaultControlOptions, SpirvDefaultControlShader, SpirvFloat32Capabilities,
-    SpirvFloat64Capabilities, SpirvPipelineBinding, SpirvShaderError, SpirvShaderModule,
-    SpirvShaderOptions, SpirvTessellationOptions, SpirvTessellationShaders,
-    lower_default_tessellation_control_to_spirv, lower_raster_shaders_to_spirv,
-    lower_shader_ir_to_spirv, lower_tessellation_shaders_to_spirv,
-};
-pub use shader::ssa;
-pub use shader::{
-    ShaderBackendLoweringError, ShaderBackendModule, ShaderBitwiseOperation, ShaderComputeBuiltin,
-    ShaderEvaluationError, ShaderEvaluationInputs, ShaderEvaluationResult, ShaderFloatComparison,
-    ShaderFloatControl, ShaderInstruction, ShaderIntegerComparison, ShaderInterfaceElement,
-    ShaderInterpolation, ShaderIoLocation, ShaderIr, ShaderIrConstructionError, ShaderMathAccuracy,
-    ShaderNanMode, ShaderOperation, ShaderPredicate, ShaderPredicateSetOperation,
-    ShaderQuadOperation, ShaderRegister, ShaderResourceAccess, ShaderResourceKind,
-    ShaderRoundingMode, ShaderScalarType, ShaderSourceLocation, ShaderSpecialFunction,
-    ShaderStageInterfaceError, ShaderTextureSampleOutput, ShaderVerificationError,
-    VerifiedShaderIr, WgslShaderModule, evaluate_shader_ir, lower_shader_ir_to_wgsl,
-    lower_shader_ir_to_wgsl_with_quad_flat_attributes, lower_shader_ir_to_wgsl_with_vertex_pulling,
-    validate_shader_stage_link,
-};
+pub use runtime::{BackendExecutionCompletion, BackendRuntimeError, BackendVisibilityRequester};
 pub use submission::{
     BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId, FrontendSubmissionSegment,
 };
@@ -146,3 +93,9 @@ pub mod native;
 
 #[cfg(feature = "performance-counters")]
 pub mod compilation_capture;
+
+pub mod compilation;
+pub mod shader_compilation;
+pub mod shader_encoding;
+pub mod shader_identity;
+pub mod shader_module;

@@ -355,16 +355,16 @@ pub(crate) fn class_packet_methods(
         return Ok(None);
     };
     let methods = packet.methods();
-    if methods.len() < 2 || methods.iter().any(|m| m.method().0 < HOST_METHOD_LIMIT) {
+    if methods.len() < 2 || methods.first().unwrap().method().0 < HOST_METHOD_LIMIT {
         return Ok(None);
     }
     validate_source_identity(channel.id(), submission, packet.header())?;
-    for method in methods {
-        validate_source_identity(channel.id(), submission, method.argument_source())?;
+    for source in packet.source_runs() {
+        validate_source_identity(channel.id(), submission, source)?;
     }
     let Some(class) = channel.frontend().subchannel_binding(subchannel) else {
         return Err(MaxwellMethodDispatchError::UnboundSubchannel {
-            source: MaxwellMethodSource::decoded(methods[0], subchannel),
+            source: MaxwellMethodSource::decoded(methods.first().unwrap(), subchannel),
         });
     };
     Ok(Some((class, subchannel)))
@@ -463,7 +463,7 @@ fn stream_method_packet<E>(
             &profile,
             submission,
             subchannel,
-            *method,
+            method,
             channel.frontend_mut(),
         )
         .map_err(MaxwellMethodStreamError::Dispatch)?;

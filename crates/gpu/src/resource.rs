@@ -627,155 +627,12 @@ pub enum ShaderStage {
     Compute,
 }
 
-/// Immutable shader description. Shader IR is added at its dedicated boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ShaderDescription {
-    pub stage: ShaderStage,
-}
-
-/// Kind of neutral pipeline resource.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum PipelineKind {
-    Graphics,
-    Compute,
-}
-
-/// Immutable pipeline description. Detailed state is supplied by later operations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PipelineDescription {
-    pub kind: PipelineKind,
-}
-
-/// Type of resource named by a descriptor slot.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum DescriptorKind {
-    Buffer,
-    SampledImage,
-    StorageImage,
-    Sampler,
-}
-
-/// One explicitly numbered neutral descriptor-table binding.
-///
-/// The binding names a logical resource rather than a backend handle so the
-/// validated backend boundary remains instance- and API-independent.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct DescriptorTableBinding {
-    pub binding: u8,
-    pub resource: crate::ResourceDependency,
-}
-
-/// Immutable descriptor-table shape.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DescriptorTableDescription {
-    bindings: Box<[DescriptorKind]>,
-}
-
-impl DescriptorTableDescription {
-    pub fn new(bindings: Vec<DescriptorKind>) -> Result<Self, ResourceDescriptionError> {
-        if bindings.is_empty() {
-            return Err(ResourceDescriptionError::EmptyDescriptorTable);
-        }
-        Ok(Self {
-            bindings: bindings.into_boxed_slice(),
-        })
-    }
-    #[must_use]
-    pub fn bindings(&self) -> &[DescriptorKind] {
-        &self.bindings
-    }
-}
-
-/// Immutable compatibility shape of one ordered render-pass attachment.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct RenderPassAttachmentDescription {
-    pub kind: ImageKind,
-    pub format: ImageFormat,
-    pub samples: SampleCount,
-}
-
-/// Immutable ordered render-pass compatibility description.
-///
-/// Color attachment position is semantically relevant to fragment output
-/// routing, so the description retains every attachment rather than merely
-/// a count. Resource identities remain dynamic begin-operation data.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RenderPassDescription {
-    attachments: Box<[RenderPassAttachmentDescription]>,
-}
-
-impl RenderPassDescription {
-    pub fn new(
-        attachments: Vec<RenderPassAttachmentDescription>,
-    ) -> Result<Self, ResourceDescriptionError> {
-        let mut depth_stencil = false;
-        let mut seen_depth_stencil = false;
-        for attachment in &attachments {
-            if attachments
-                .first()
-                .is_some_and(|first| first.samples != attachment.samples)
-            {
-                return Err(ResourceDescriptionError::InvalidRenderPassAttachments);
-            }
-            match attachment.kind {
-                ImageKind::Color if !seen_depth_stencil => {}
-                ImageKind::Color => {
-                    return Err(ResourceDescriptionError::InvalidRenderPassAttachments);
-                }
-                ImageKind::DepthStencil if !depth_stencil => {
-                    depth_stencil = true;
-                    seen_depth_stencil = true;
-                }
-                ImageKind::DepthStencil => {
-                    return Err(ResourceDescriptionError::InvalidRenderPassAttachments);
-                }
-            }
-            if attachment.format.is_depth_stencil() != (attachment.kind == ImageKind::DepthStencil)
-            {
-                return Err(ResourceDescriptionError::InvalidRenderPassAttachments);
-            }
-        }
-        Ok(Self {
-            attachments: attachments.into_boxed_slice(),
-        })
-    }
-
-    #[must_use]
-    pub fn attachments(&self) -> &[RenderPassAttachmentDescription] {
-        &self.attachments
-    }
-}
-
 /// Type of values stored by a query pool.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum QueryKind {
     Occlusion,
     Timestamp,
     PipelineStatistics,
-}
-
-/// Immutable query-pool shape.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct QueryPoolDescription {
-    kind: QueryKind,
-    count: u32,
-}
-
-impl QueryPoolDescription {
-    pub const fn new(kind: QueryKind, count: u32) -> Result<Self, ResourceDescriptionError> {
-        if count == 0 {
-            return Err(ResourceDescriptionError::EmptyQueryPool);
-        }
-        Ok(Self { kind, count })
-    }
-    #[must_use]
-    pub const fn kind(self) -> QueryKind {
-        self.kind
-    }
-    #[must_use]
-    pub const fn count(self) -> u32 {
-        self.count
-    }
 }
 
 /// Failure to construct an immutable neutral resource description.
@@ -839,26 +696,6 @@ impl std::error::Error for ResourceDescriptionError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn render_pass_attachments_require_matching_sample_counts() {
-        let color = RenderPassAttachmentDescription {
-            kind: ImageKind::Color,
-            format: ImageFormat::Rgba8Unorm,
-            samples: SampleCount::Four,
-        };
-        let mut depth = RenderPassAttachmentDescription {
-            kind: ImageKind::DepthStencil,
-            format: ImageFormat::Depth32Float,
-            samples: SampleCount::One,
-        };
-        assert_eq!(
-            RenderPassDescription::new(vec![color, depth]),
-            Err(ResourceDescriptionError::InvalidRenderPassAttachments)
-        );
-        depth.samples = SampleCount::Four;
-        assert!(RenderPassDescription::new(vec![color, depth]).is_ok());
-    }
 
     #[test]
     fn image_description_checks_dimension_mips_samples_and_kind() {
@@ -927,26 +764,6 @@ mod tests {
         assert_eq!(
             DescriptorTableId::new(3).to_string(),
             "descriptor-table=0x0000000000000003"
-        );
-    }
-
-    #[test]
-    fn sampler_descriptor_and_query_validation_is_explicit() {
-        assert_eq!(
-            SamplerDescription::new(
-                FilterMode::Nearest,
-                FilterMode::Linear,
-                FilterMode::Nearest,
-                [AddressMode::Repeat; 3],
-                2.0,
-                1.0,
-                1.0
-            ),
-            Err(ResourceDescriptionError::InvalidLodRange)
-        );
-        assert_eq!(
-            QueryPoolDescription::new(QueryKind::Timestamp, 0),
-            Err(ResourceDescriptionError::EmptyQueryPool)
         );
     }
 }

@@ -4,14 +4,13 @@ use std::fmt::{Display, Formatter};
 
 use crate::engines::{MaxwellEngineStreamError, stream_maxwell_engine_packet};
 use crate::execution::{MaxwellFrontend, MaxwellSubmissionPlanner};
-use crate::pushbuffer::packet::SubmissionWords;
+pub use crate::pushbuffer::packet::MaxwellCommandSourceScratch;
+use crate::pushbuffer::packet::{DecodedPackets, SubmissionWords};
 use crate::{
-    MaxwellDecodedPushbuffer, MaxwellEngineDispatchError, MaxwellFrontendDispatch,
-    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellPushbufferDecodeError,
-    MaxwellSubmissionExecutionError, MaxwellSubmissionExecutionPlan,
-    MaxwellSubmissionExecutionStep, decode_maxwell_pushbuffer,
+    MaxwellEngineDispatchError, MaxwellFrontendDispatch, MaxwellGpuAddressSpace, MaxwellGpuChannel,
+    MaxwellPushbufferDecodeError, MaxwellSubmissionExecutionError, MaxwellSubmissionExecutionPlan,
+    MaxwellSubmissionExecutionStep,
 };
-use nixe_gpu::{FrontendSubmissionId, ReservedTimelinePoint};
 
 /// Hard bound for a failure-only command dump.
 // Retain up to 256 KiB of commands so ordinary multi-entry submissions
@@ -68,91 +67,94 @@ impl std::error::Error for MaxwellFrontendDispatchError {}
 
 /// Decodes, dispatches, and lowers a retained submission exactly once.
 ///
-/// Delivers bounded lowered prefixes while subsequent packets are prepared.
+/// Consumes completed effects before decoding subsequent operations.
 /// The returned tail has passed completion-signal validation; only then may
 /// its backend consumer seal the frontend delivery and publish its fence.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "command state, source capture and native consumption boundaries"
+)]
 pub fn stream_maxwell_frontend<L: MaxwellFrontend>(
     dispatch: &MaxwellFrontendDispatch,
     channel: &mut MaxwellGpuChannel,
     address_space: &MaxwellGpuAddressSpace,
     cache: &mut L,
-    consume: &mut impl FnMut(Vec<MaxwellSubmissionExecutionStep<L::Work>>) -> Result<(), Box<str>>,
+    sources: &mut MaxwellCommandSourceScratch,
+    synchronize: &mut dyn FnMut() -> Result<(), Box<str>>,
+    consume: &mut impl FnMut(
+        std::vec::Drain<'_, MaxwellSubmissionExecutionStep<L::Work>>,
+    ) -> Result<(), Box<str>>,
 ) -> Result<MaxwellSubmissionExecutionPlan<L::Work>, MaxwellFrontendDispatchError> {
     let submission = dispatch.scheduled().submission();
-    let decoded = decode_maxwell_pushbuffer(SubmissionWords::new(submission, address_space))
-        .map_err(MaxwellFrontendDispatchError::PacketDecode)?;
-    if decoded.packets().is_empty() {
-        return Err(MaxwellFrontendDispatchError::EmptySubmission);
-    }
+    let packet_scratch = sources.take_packet_scratch();
+    let mut packets = DecodedPackets::with_scratch(
+        SubmissionWords::new(submission, address_space, sources, synchronize),
+        packet_scratch,
+    );
     let mut planner = MaxwellSubmissionPlanner::new(
         address_space,
         dispatch.scheduled().frontend(),
-        Vec::new(),
         dispatch.scheduled().completion(),
         cache,
     );
     if submission.decoded().mode().fence_get() {
         planner.set_driver_completion_increments(2);
     }
-    lower_packets_streamed(&decoded, channel, planner, consume)
+    let result = lower_packets_streamed(&mut packets, channel, planner, consume);
+    let packet_scratch = packets.into_scratch();
+    sources.recycle_packet_scratch(packet_scratch);
+    result
 }
 
-/// Applies and lowers an already decoded pushbuffer through the current
-/// streaming frontend path.
-pub fn lower_maxwell_pushbuffer<L: MaxwellFrontend>(
-    decoded: &MaxwellDecodedPushbuffer,
-    channel: &mut MaxwellGpuChannel,
-    address_space: &MaxwellGpuAddressSpace,
-    frontend: FrontendSubmissionId,
-    predecessors: Vec<FrontendSubmissionId>,
-    completion: Option<&ReservedTimelinePoint>,
-    cache: &mut L,
-) -> Result<MaxwellSubmissionExecutionPlan<L::Work>, MaxwellFrontendDispatchError> {
-    if decoded.packets().is_empty() {
-        return Err(MaxwellFrontendDispatchError::EmptySubmission);
-    }
-    let planner =
-        MaxwellSubmissionPlanner::new(address_space, frontend, predecessors, completion, cache);
-    lower_packets(decoded, channel, planner)
-}
-
-fn lower_packets<L: MaxwellFrontend>(
-    decoded: &MaxwellDecodedPushbuffer,
-    channel: &mut MaxwellGpuChannel,
-    planner: MaxwellSubmissionPlanner<'_, L>,
-) -> Result<MaxwellSubmissionExecutionPlan<L::Work>, MaxwellFrontendDispatchError> {
-    let mut prefix = Vec::new();
-    let tail = lower_packets_streamed(decoded, channel, planner, &mut |steps| {
-        prefix.extend(steps);
-        Ok(())
-    })?;
-    Ok(tail.prepend_steps(prefix))
-}
-
-fn lower_packets_streamed<L: MaxwellFrontend>(
-    decoded: &MaxwellDecodedPushbuffer,
+fn lower_packets_streamed<
+    L: MaxwellFrontend,
+    I: Iterator<Item = Result<crate::MaxwellPushbufferWord, crate::MaxwellGpfifoSourceError>>,
+>(
+    packets: &mut DecodedPackets<I>,
     channel: &mut MaxwellGpuChannel,
     mut planner: MaxwellSubmissionPlanner<'_, L>,
-    consume: &mut impl FnMut(Vec<MaxwellSubmissionExecutionStep<L::Work>>) -> Result<(), Box<str>>,
+    consume: &mut impl FnMut(
+        std::vec::Drain<'_, MaxwellSubmissionExecutionStep<L::Work>>,
+    ) -> Result<(), Box<str>>,
 ) -> Result<MaxwellSubmissionExecutionPlan<L::Work>, MaxwellFrontendDispatchError> {
     #[cfg(feature = "performance-counters")]
     let started = std::time::Instant::now();
+    #[cfg(feature = "performance-counters")]
+    let mut consumed = std::time::Duration::ZERO;
     let frontend = planner.frontend();
     let (mut mme_methods, mut mme_parameters) = planner.take_mme_scratch();
-    for packet in decoded.packets() {
+    let mut any_packet = false;
+    while let Some(packet) = packets.next() {
+        let packet = packet.map_err(MaxwellFrontendDispatchError::PacketDecode)?;
+        any_packet = true;
         stream_maxwell_engine_packet(
             channel,
             frontend,
-            packet,
+            &packet,
             None,
             &mut mme_methods,
             &mut mme_parameters,
             &mut |event| {
+                if let Some(steps) = planner.before_event(&event) {
+                    #[cfg(feature = "performance-counters")]
+                    let consume_started = std::time::Instant::now();
+                    consume(steps).map_err(MaxwellFrontendDispatchError::Delivery)?;
+                    #[cfg(feature = "performance-counters")]
+                    {
+                        consumed += consume_started.elapsed();
+                    }
+                }
                 planner
                     .push_event(event)
                     .map_err(|error| MaxwellFrontendDispatchError::Execution(Box::new(error)))?;
                 if let Some(steps) = planner.take_ready_steps() {
+                    #[cfg(feature = "performance-counters")]
+                    let consume_started = std::time::Instant::now();
                     consume(steps).map_err(MaxwellFrontendDispatchError::Delivery)?;
+                    #[cfg(feature = "performance-counters")]
+                    {
+                        consumed += consume_started.elapsed();
+                    }
                 }
                 Ok(())
             },
@@ -163,8 +165,21 @@ fn lower_packets_streamed<L: MaxwellFrontend>(
             }
             MaxwellEngineStreamError::Consumer(error) => error,
         })?;
+        if let Some(steps) = planner.finish_packet() {
+            #[cfg(feature = "performance-counters")]
+            let consume_started = std::time::Instant::now();
+            consume(steps).map_err(MaxwellFrontendDispatchError::Delivery)?;
+            #[cfg(feature = "performance-counters")]
+            {
+                consumed += consume_started.elapsed();
+            }
+        }
+        packets.recycle(packet);
     }
     planner.recycle_mme_scratch(mme_methods, mme_parameters);
+    if !any_packet {
+        return Err(MaxwellFrontendDispatchError::EmptySubmission);
+    }
     let plan = planner
         .finish()
         .map_err(|error| MaxwellFrontendDispatchError::Execution(Box::new(error)))?;
@@ -173,7 +188,7 @@ fn lower_packets_streamed<L: MaxwellFrontend>(
         nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::FrontendSubmissions, 1);
         nixe_gpu::metrics::record(
             nixe_gpu::metrics::Counter::FrontendLoweringNanoseconds,
-            started.elapsed().as_nanos() as u64,
+            started.elapsed().saturating_sub(consumed).as_nanos() as u64,
         );
     }
     Ok(plan)
@@ -244,3 +259,6 @@ pub fn diagnose_maxwell_frontend(
         words: words.into_boxed_slice(),
     })
 }
+
+#[cfg(test)]
+mod tests;

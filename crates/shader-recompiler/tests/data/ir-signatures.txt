@@ -1,0 +1,534 @@
+Phi Opaque
+Identity Opaque Opaque
+Void Void
+ConditionRef U1 U1
+Reference Void Opaque
+PhiMove Void Opaque Opaque
+Prologue Void
+Epilogue Void
+Join Void
+DemoteToHelperInvocation Void
+EmitVertex Void U32
+EndPrimitive Void U32
+Barrier Void
+WorkgroupMemoryBarrier Void
+DeviceMemoryBarrier Void
+GetRegister U32 Reg
+SetRegister Void Reg U32
+GetPred U1 Pred
+SetPred Void Pred U1
+GetGotoVariable U1 U32
+SetGotoVariable Void U32 U1
+GetIndirectBranchVariable U32
+SetIndirectBranchVariable Void U32
+GetCbufU8 U32 U32 U32
+GetCbufS8 U32 U32 U32
+GetCbufU16 U32 U32 U32
+GetCbufS16 U32 U32 U32
+GetCbufU32 U32 U32 U32
+GetCbufF32 F32 U32 U32
+GetCbufU32x2 U32x2 U32 U32
+GetAttribute F32 Attribute U32
+GetAttributeU32 U32 Attribute U32
+SetAttribute Void Attribute F32 U32
+GetAttributeIndexed F32 U32 U32
+SetAttributeIndexed Void U32 F32 U32
+GetPatch F32 Patch
+SetPatch Void Patch F32
+SetFragColor Void U32 U32 F32
+SetSampleMask Void U32
+SetFragDepth Void F32
+GetZFlag U1 Void
+GetSFlag U1 Void
+GetCFlag U1 Void
+GetOFlag U1 Void
+SetZFlag Void U1
+SetSFlag Void U1
+SetCFlag Void U1
+SetOFlag Void U1
+WorkgroupId U32x3
+LocalInvocationId U32x3
+InvocationId U32
+InvocationInfo U32
+SampleId U32
+IsHelperInvocation U1
+SR_WScaleFactorXY U32
+SR_WScaleFactorZ U32
+YDirection F32
+ResolutionDownFactor F32
+RenderArea F32x4
+UndefU1 U1
+UndefU8 U8
+UndefU16 U16
+UndefU32 U32
+UndefU64 U64
+LoadGlobalU8 U32 Opaque
+LoadGlobalS8 U32 Opaque
+LoadGlobalU16 U32 Opaque
+LoadGlobalS16 U32 Opaque
+LoadGlobal32 U32 Opaque
+LoadGlobal64 U32x2 Opaque
+LoadGlobal128 U32x4 Opaque
+WriteGlobalU8 Void Opaque U32
+WriteGlobalS8 Void Opaque U32
+WriteGlobalU16 Void Opaque U32
+WriteGlobalS16 Void Opaque U32
+WriteGlobal32 Void Opaque U32
+WriteGlobal64 Void Opaque U32x2
+WriteGlobal128 Void Opaque U32x4
+LoadStorageU8 U32 U32 U32
+LoadStorageS8 U32 U32 U32
+LoadStorageU16 U32 U32 U32
+LoadStorageS16 U32 U32 U32
+LoadStorage32 U32 U32 U32
+LoadStorage64 U32x2 U32 U32
+LoadStorage128 U32x4 U32 U32
+WriteStorageU8 Void U32 U32 U32
+WriteStorageS8 Void U32 U32 U32
+WriteStorageU16 Void U32 U32 U32
+WriteStorageS16 Void U32 U32 U32
+WriteStorage32 Void U32 U32 U32
+WriteStorage64 Void U32 U32 U32x2
+WriteStorage128 Void U32 U32 U32x4
+LoadLocal U32 U32
+WriteLocal Void U32 U32
+LoadSharedU8 U32 U32
+LoadSharedS8 U32 U32
+LoadSharedU16 U32 U32
+LoadSharedS16 U32 U32
+LoadSharedU32 U32 U32
+LoadSharedU64 U32x2 U32
+LoadSharedU128 U32x4 U32
+WriteSharedU8 Void U32 U32
+WriteSharedU16 Void U32 U32
+WriteSharedU32 Void U32 U32
+WriteSharedU64 Void U32 U32x2
+WriteSharedU128 Void U32 U32x4
+CompositeConstructU32x2 U32x2 U32 U32
+CompositeConstructU32x3 U32x3 U32 U32 U32
+CompositeConstructU32x4 U32x4 U32 U32 U32 U32
+CompositeExtractU32x2 U32 U32x2 U32
+CompositeExtractU32x3 U32 U32x3 U32
+CompositeExtractU32x4 U32 U32x4 U32
+CompositeInsertU32x2 U32x2 U32x2 U32 U32
+CompositeInsertU32x3 U32x3 U32x3 U32 U32
+CompositeInsertU32x4 U32x4 U32x4 U32 U32
+CompositeConstructF16x2 F16x2 F16 F16
+CompositeConstructF16x3 F16x3 F16 F16 F16
+CompositeConstructF16x4 F16x4 F16 F16 F16 F16
+CompositeExtractF16x2 F16 F16x2 U32
+CompositeExtractF16x3 F16 F16x3 U32
+CompositeExtractF16x4 F16 F16x4 U32
+CompositeInsertF16x2 F16x2 F16x2 F16 U32
+CompositeInsertF16x3 F16x3 F16x3 F16 U32
+CompositeInsertF16x4 F16x4 F16x4 F16 U32
+CompositeConstructF32x2 F32x2 F32 F32
+CompositeConstructF32x3 F32x3 F32 F32 F32
+CompositeConstructF32x4 F32x4 F32 F32 F32 F32
+CompositeExtractF32x2 F32 F32x2 U32
+CompositeExtractF32x3 F32 F32x3 U32
+CompositeExtractF32x4 F32 F32x4 U32
+CompositeInsertF32x2 F32x2 F32x2 F32 U32
+CompositeInsertF32x3 F32x3 F32x3 F32 U32
+CompositeInsertF32x4 F32x4 F32x4 F32 U32
+CompositeConstructF64x2 F64x2 F64 F64
+CompositeConstructF64x3 F64x3 F64 F64 F64
+CompositeConstructF64x4 F64x4 F64 F64 F64 F64
+CompositeExtractF64x2 F64 F64x2 U32
+CompositeExtractF64x3 F64 F64x3 U32
+CompositeExtractF64x4 F64 F64x4 U32
+CompositeInsertF64x2 F64x2 F64x2 F64 U32
+CompositeInsertF64x3 F64x3 F64x3 F64 U32
+CompositeInsertF64x4 F64x4 F64x4 F64 U32
+SelectU1 U1 U1 U1 U1
+SelectU8 U8 U1 U8 U8
+SelectU16 U16 U1 U16 U16
+SelectU32 U32 U1 U32 U32
+SelectU64 U64 U1 U64 U64
+SelectF16 F16 U1 F16 F16
+SelectF32 F32 U1 F32 F32
+SelectF64 F64 U1 F64 F64
+BitCastU16F16 U16 F16
+BitCastU32F32 U32 F32
+BitCastU64F64 U64 F64
+BitCastF16U16 F16 U16
+BitCastF32U32 F32 U32
+BitCastF64U64 F64 U64
+PackUint2x32 U64 U32x2
+UnpackUint2x32 U32x2 U64
+PackFloat2x16 U32 F16x2
+UnpackFloat2x16 F16x2 U32
+PackHalf2x16 U32 F32x2
+UnpackHalf2x16 F32x2 U32
+PackDouble2x32 F64 U32x2
+UnpackDouble2x32 U32x2 F64
+GetZeroFromOp U1 Opaque
+GetSignFromOp U1 Opaque
+GetCarryFromOp U1 Opaque
+GetOverflowFromOp U1 Opaque
+GetSparseFromOp U1 Opaque
+GetInBoundsFromOp U1 Opaque
+FPAbs16 F16 F16
+FPAbs32 F32 F32
+FPAbs64 F64 F64
+FPAdd16 F16 F16 F16
+FPAdd32 F32 F32 F32
+FPAdd64 F64 F64 F64
+FPFma16 F16 F16 F16 F16
+FPFma32 F32 F32 F32 F32
+FPFma64 F64 F64 F64 F64
+FPMax32 F32 F32 F32
+FPMax64 F64 F64 F64
+FPMin32 F32 F32 F32
+FPMin64 F64 F64 F64
+FPMul16 F16 F16 F16
+FPMul32 F32 F32 F32
+FPMul64 F64 F64 F64
+FPNeg16 F16 F16
+FPNeg32 F32 F32
+FPNeg64 F64 F64
+FPRecip32 F32 F32
+FPRecip64 F64 F64
+FPRecipSqrt32 F32 F32
+FPRecipSqrt64 F64 F64
+FPSqrt F32 F32
+FPSin F32 F32
+FPExp2 F32 F32
+FPCos F32 F32
+FPLog2 F32 F32
+FPSaturate16 F16 F16
+FPSaturate32 F32 F32
+FPSaturate64 F64 F64
+FPClamp16 F16 F16 F16 F16
+FPClamp32 F32 F32 F32 F32
+FPClamp64 F64 F64 F64 F64
+FPRoundEven16 F16 F16
+FPRoundEven32 F32 F32
+FPRoundEven64 F64 F64
+FPFloor16 F16 F16
+FPFloor32 F32 F32
+FPFloor64 F64 F64
+FPCeil16 F16 F16
+FPCeil32 F32 F32
+FPCeil64 F64 F64
+FPTrunc16 F16 F16
+FPTrunc32 F32 F32
+FPTrunc64 F64 F64
+FPOrdEqual16 U1 F16 F16
+FPOrdEqual32 U1 F32 F32
+FPOrdEqual64 U1 F64 F64
+FPUnordEqual16 U1 F16 F16
+FPUnordEqual32 U1 F32 F32
+FPUnordEqual64 U1 F64 F64
+FPOrdNotEqual16 U1 F16 F16
+FPOrdNotEqual32 U1 F32 F32
+FPOrdNotEqual64 U1 F64 F64
+FPUnordNotEqual16 U1 F16 F16
+FPUnordNotEqual32 U1 F32 F32
+FPUnordNotEqual64 U1 F64 F64
+FPOrdLessThan16 U1 F16 F16
+FPOrdLessThan32 U1 F32 F32
+FPOrdLessThan64 U1 F64 F64
+FPUnordLessThan16 U1 F16 F16
+FPUnordLessThan32 U1 F32 F32
+FPUnordLessThan64 U1 F64 F64
+FPOrdGreaterThan16 U1 F16 F16
+FPOrdGreaterThan32 U1 F32 F32
+FPOrdGreaterThan64 U1 F64 F64
+FPUnordGreaterThan16 U1 F16 F16
+FPUnordGreaterThan32 U1 F32 F32
+FPUnordGreaterThan64 U1 F64 F64
+FPOrdLessThanEqual16 U1 F16 F16
+FPOrdLessThanEqual32 U1 F32 F32
+FPOrdLessThanEqual64 U1 F64 F64
+FPUnordLessThanEqual16 U1 F16 F16
+FPUnordLessThanEqual32 U1 F32 F32
+FPUnordLessThanEqual64 U1 F64 F64
+FPOrdGreaterThanEqual16 U1 F16 F16
+FPOrdGreaterThanEqual32 U1 F32 F32
+FPOrdGreaterThanEqual64 U1 F64 F64
+FPUnordGreaterThanEqual16 U1 F16 F16
+FPUnordGreaterThanEqual32 U1 F32 F32
+FPUnordGreaterThanEqual64 U1 F64 F64
+FPIsNan16 U1 F16
+FPIsNan32 U1 F32
+FPIsNan64 U1 F64
+IAdd32 U32 U32 U32
+IAdd64 U64 U64 U64
+ISub32 U32 U32 U32
+ISub64 U64 U64 U64
+IMul32 U32 U32 U32
+SDiv32 U32 U32 U32
+UDiv32 U32 U32 U32
+INeg32 U32 U32
+INeg64 U64 U64
+IAbs32 U32 U32
+IAbs64 U64 U64
+ShiftLeftLogical32 U32 U32 U32
+ShiftLeftLogical64 U64 U64 U32
+ShiftRightLogical32 U32 U32 U32
+ShiftRightLogical64 U64 U64 U32
+ShiftRightArithmetic32 U32 U32 U32
+ShiftRightArithmetic64 U64 U64 U32
+BitwiseAnd32 U32 U32 U32
+BitwiseOr32 U32 U32 U32
+BitwiseXor32 U32 U32 U32
+BitFieldInsert U32 U32 U32 U32 U32
+BitFieldSExtract U32 U32 U32 U32
+BitFieldUExtract U32 U32 U32 U32
+BitReverse32 U32 U32
+BitCount32 U32 U32
+BitwiseNot32 U32 U32
+FindSMsb32 U32 U32
+FindUMsb32 U32 U32
+SMin32 U32 U32 U32
+UMin32 U32 U32 U32
+SMax32 U32 U32 U32
+UMax32 U32 U32 U32
+SClamp32 U32 U32 U32 U32
+UClamp32 U32 U32 U32 U32
+SLessThan U1 U32 U32
+ULessThan U1 U32 U32
+IEqual U1 U32 U32
+SLessThanEqual U1 U32 U32
+ULessThanEqual U1 U32 U32
+SGreaterThan U1 U32 U32
+UGreaterThan U1 U32 U32
+INotEqual U1 U32 U32
+SGreaterThanEqual U1 U32 U32
+UGreaterThanEqual U1 U32 U32
+SharedAtomicIAdd32 U32 U32 U32
+SharedAtomicSMin32 U32 U32 U32
+SharedAtomicUMin32 U32 U32 U32
+SharedAtomicSMax32 U32 U32 U32
+SharedAtomicUMax32 U32 U32 U32
+SharedAtomicInc32 U32 U32 U32
+SharedAtomicDec32 U32 U32 U32
+SharedAtomicAnd32 U32 U32 U32
+SharedAtomicOr32 U32 U32 U32
+SharedAtomicXor32 U32 U32 U32
+SharedAtomicExchange32 U32 U32 U32
+SharedAtomicExchange64 U64 U32 U64
+SharedAtomicExchange32x2 U32x2 U32 U32x2
+GlobalAtomicIAdd32 U32 U64 U32
+GlobalAtomicSMin32 U32 U64 U32
+GlobalAtomicUMin32 U32 U64 U32
+GlobalAtomicSMax32 U32 U64 U32
+GlobalAtomicUMax32 U32 U64 U32
+GlobalAtomicInc32 U32 U64 U32
+GlobalAtomicDec32 U32 U64 U32
+GlobalAtomicAnd32 U32 U64 U32
+GlobalAtomicOr32 U32 U64 U32
+GlobalAtomicXor32 U32 U64 U32
+GlobalAtomicExchange32 U32 U64 U32
+GlobalAtomicIAdd64 U64 U64 U64
+GlobalAtomicSMin64 U64 U64 U64
+GlobalAtomicUMin64 U64 U64 U64
+GlobalAtomicSMax64 U64 U64 U64
+GlobalAtomicUMax64 U64 U64 U64
+GlobalAtomicAnd64 U64 U64 U64
+GlobalAtomicOr64 U64 U64 U64
+GlobalAtomicXor64 U64 U64 U64
+GlobalAtomicExchange64 U64 U64 U64
+GlobalAtomicIAdd32x2 U32x2 U32x2 U32x2
+GlobalAtomicSMin32x2 U32x2 U32x2 U32x2
+GlobalAtomicUMin32x2 U32x2 U32x2 U32x2
+GlobalAtomicSMax32x2 U32x2 U32x2 U32x2
+GlobalAtomicUMax32x2 U32x2 U32x2 U32x2
+GlobalAtomicAnd32x2 U32x2 U32x2 U32x2
+GlobalAtomicOr32x2 U32x2 U32x2 U32x2
+GlobalAtomicXor32x2 U32x2 U32x2 U32x2
+GlobalAtomicExchange32x2 U32x2 U32x2 U32x2
+GlobalAtomicAddF32 F32 U64 F32
+GlobalAtomicAddF16x2 U32 U64 F16x2
+GlobalAtomicAddF32x2 U32 U64 F32x2
+GlobalAtomicMinF16x2 U32 U64 F16x2
+GlobalAtomicMinF32x2 U32 U64 F32x2
+GlobalAtomicMaxF16x2 U32 U64 F16x2
+GlobalAtomicMaxF32x2 U32 U64 F32x2
+StorageAtomicIAdd32 U32 U32 U32 U32
+StorageAtomicSMin32 U32 U32 U32 U32
+StorageAtomicUMin32 U32 U32 U32 U32
+StorageAtomicSMax32 U32 U32 U32 U32
+StorageAtomicUMax32 U32 U32 U32 U32
+StorageAtomicInc32 U32 U32 U32 U32
+StorageAtomicDec32 U32 U32 U32 U32
+StorageAtomicAnd32 U32 U32 U32 U32
+StorageAtomicOr32 U32 U32 U32 U32
+StorageAtomicXor32 U32 U32 U32 U32
+StorageAtomicExchange32 U32 U32 U32 U32
+StorageAtomicIAdd64 U64 U32 U32 U64
+StorageAtomicSMin64 U64 U32 U32 U64
+StorageAtomicUMin64 U64 U32 U32 U64
+StorageAtomicSMax64 U64 U32 U32 U64
+StorageAtomicUMax64 U64 U32 U32 U64
+StorageAtomicAnd64 U64 U32 U32 U64
+StorageAtomicOr64 U64 U32 U32 U64
+StorageAtomicXor64 U64 U32 U32 U64
+StorageAtomicExchange64 U64 U32 U32 U64
+StorageAtomicIAdd32x2 U32x2 U32 U32 U32x2
+StorageAtomicSMin32x2 U32x2 U32 U32 U32x2
+StorageAtomicUMin32x2 U32x2 U32 U32 U32x2
+StorageAtomicSMax32x2 U32x2 U32 U32 U32x2
+StorageAtomicUMax32x2 U32x2 U32 U32 U32x2
+StorageAtomicAnd32x2 U32x2 U32 U32 U32x2
+StorageAtomicOr32x2 U32x2 U32 U32 U32x2
+StorageAtomicXor32x2 U32x2 U32 U32 U32x2
+StorageAtomicExchange32x2 U32x2 U32 U32 U32x2
+StorageAtomicAddF32 F32 U32 U32 F32
+StorageAtomicAddF16x2 U32 U32 U32 F16x2
+StorageAtomicAddF32x2 U32 U32 U32 F32x2
+StorageAtomicMinF16x2 U32 U32 U32 F16x2
+StorageAtomicMinF32x2 U32 U32 U32 F32x2
+StorageAtomicMaxF16x2 U32 U32 U32 F16x2
+StorageAtomicMaxF32x2 U32 U32 U32 F32x2
+LogicalOr U1 U1 U1
+LogicalAnd U1 U1 U1
+LogicalXor U1 U1 U1
+LogicalNot U1 U1
+ConvertS16F16 U32 F16
+ConvertS16F32 U32 F32
+ConvertS16F64 U32 F64
+ConvertS32F16 U32 F16
+ConvertS32F32 U32 F32
+ConvertS32F64 U32 F64
+ConvertS64F16 U64 F16
+ConvertS64F32 U64 F32
+ConvertS64F64 U64 F64
+ConvertU16F16 U32 F16
+ConvertU16F32 U32 F32
+ConvertU16F64 U32 F64
+ConvertU32F16 U32 F16
+ConvertU32F32 U32 F32
+ConvertU32F64 U32 F64
+ConvertU64F16 U64 F16
+ConvertU64F32 U64 F32
+ConvertU64F64 U64 F64
+ConvertU64U32 U64 U32
+ConvertU32U64 U32 U64
+ConvertF16F32 F16 F32
+ConvertF32F16 F32 F16
+ConvertF32F64 F32 F64
+ConvertF64F32 F64 F32
+ConvertF16S8 F16 U32
+ConvertF16S16 F16 U32
+ConvertF16S32 F16 U32
+ConvertF16S64 F16 U64
+ConvertF16U8 F16 U32
+ConvertF16U16 F16 U32
+ConvertF16U32 F16 U32
+ConvertF16U64 F16 U64
+ConvertF32S8 F32 U32
+ConvertF32S16 F32 U32
+ConvertF32S32 F32 U32
+ConvertF32S64 F32 U64
+ConvertF32U8 F32 U32
+ConvertF32U16 F32 U32
+ConvertF32U32 F32 U32
+ConvertF32U64 F32 U64
+ConvertF64S8 F64 U32
+ConvertF64S16 F64 U32
+ConvertF64S32 F64 U32
+ConvertF64S64 F64 U64
+ConvertF64U8 F64 U32
+ConvertF64U16 F64 U32
+ConvertF64U32 F64 U32
+ConvertF64U64 F64 U64
+ConvertU16U32 U16 U32
+ConvertU32U16 U32 U16
+ConvertU8U32 U8 U32
+ConvertU32U8 U32 U8
+ConvertS32S8 U32 U8
+ConvertS32S16 U32 U16
+BindlessImageSampleImplicitLod F32x4 U32 Opaque Opaque Opaque
+BindlessImageSampleExplicitLod F32x4 U32 Opaque Opaque Opaque
+BindlessImageSampleDrefImplicitLod F32 U32 Opaque F32 Opaque Opaque
+BindlessImageSampleDrefExplicitLod F32 U32 Opaque F32 Opaque Opaque
+BindlessImageGather F32x4 U32 Opaque Opaque Opaque
+BindlessImageGatherDref F32x4 U32 Opaque Opaque Opaque F32
+BindlessImageFetch F32x4 U32 Opaque Opaque U32 Opaque
+BindlessImageQueryDimensions U32x4 U32 U32 U1
+BindlessImageQueryLod F32x4 U32 Opaque
+BindlessImageGradient F32x4 U32 Opaque Opaque Opaque Opaque
+BindlessImageRead U32x4 U32 Opaque
+BindlessImageWrite Void U32 Opaque U32x4
+BoundImageSampleImplicitLod F32x4 U32 Opaque Opaque Opaque
+BoundImageSampleExplicitLod F32x4 U32 Opaque Opaque Opaque
+BoundImageSampleDrefImplicitLod F32 U32 Opaque F32 Opaque Opaque
+BoundImageSampleDrefExplicitLod F32 U32 Opaque F32 Opaque Opaque
+BoundImageGather F32x4 U32 Opaque Opaque Opaque
+BoundImageGatherDref F32x4 U32 Opaque Opaque Opaque F32
+BoundImageFetch F32x4 U32 Opaque Opaque U32 Opaque
+BoundImageQueryDimensions U32x4 U32 U32 U1
+BoundImageQueryLod F32x4 U32 Opaque
+BoundImageGradient F32x4 U32 Opaque Opaque Opaque Opaque
+BoundImageRead U32x4 U32 Opaque
+BoundImageWrite Void U32 Opaque U32x4
+ImageSampleImplicitLod F32x4 Opaque Opaque Opaque Opaque
+ImageSampleExplicitLod F32x4 Opaque Opaque Opaque Opaque
+ImageSampleDrefImplicitLod F32 Opaque Opaque F32 Opaque Opaque
+ImageSampleDrefExplicitLod F32 Opaque Opaque F32 Opaque Opaque
+ImageGather F32x4 Opaque Opaque Opaque Opaque
+ImageGatherDref F32x4 Opaque Opaque Opaque Opaque F32
+ImageFetch F32x4 Opaque Opaque Opaque U32 Opaque
+ImageQueryDimensions U32x4 Opaque U32 U1
+ImageQueryLod F32x4 Opaque Opaque
+ImageGradient F32x4 Opaque Opaque Opaque Opaque Opaque
+ImageRead U32x4 Opaque Opaque
+ImageWrite Void Opaque Opaque U32x4
+IsTextureScaled U1 U32
+IsImageScaled U1 U32
+BindlessImageAtomicIAdd32 U32 U32 Opaque U32
+BindlessImageAtomicSMin32 U32 U32 Opaque U32
+BindlessImageAtomicUMin32 U32 U32 Opaque U32
+BindlessImageAtomicSMax32 U32 U32 Opaque U32
+BindlessImageAtomicUMax32 U32 U32 Opaque U32
+BindlessImageAtomicInc32 U32 U32 Opaque U32
+BindlessImageAtomicDec32 U32 U32 Opaque U32
+BindlessImageAtomicAnd32 U32 U32 Opaque U32
+BindlessImageAtomicOr32 U32 U32 Opaque U32
+BindlessImageAtomicXor32 U32 U32 Opaque U32
+BindlessImageAtomicExchange32 U32 U32 Opaque U32
+BoundImageAtomicIAdd32 U32 U32 Opaque U32
+BoundImageAtomicSMin32 U32 U32 Opaque U32
+BoundImageAtomicUMin32 U32 U32 Opaque U32
+BoundImageAtomicSMax32 U32 U32 Opaque U32
+BoundImageAtomicUMax32 U32 U32 Opaque U32
+BoundImageAtomicInc32 U32 U32 Opaque U32
+BoundImageAtomicDec32 U32 U32 Opaque U32
+BoundImageAtomicAnd32 U32 U32 Opaque U32
+BoundImageAtomicOr32 U32 U32 Opaque U32
+BoundImageAtomicXor32 U32 U32 Opaque U32
+BoundImageAtomicExchange32 U32 U32 Opaque U32
+ImageAtomicIAdd32 U32 Opaque Opaque U32
+ImageAtomicSMin32 U32 Opaque Opaque U32
+ImageAtomicUMin32 U32 Opaque Opaque U32
+ImageAtomicSMax32 U32 Opaque Opaque U32
+ImageAtomicUMax32 U32 Opaque Opaque U32
+ImageAtomicInc32 U32 Opaque Opaque U32
+ImageAtomicDec32 U32 Opaque Opaque U32
+ImageAtomicAnd32 U32 Opaque Opaque U32
+ImageAtomicOr32 U32 Opaque Opaque U32
+ImageAtomicXor32 U32 Opaque Opaque U32
+ImageAtomicExchange32 U32 Opaque Opaque U32
+LaneId U32
+VoteAll U1 U1
+VoteAny U1 U1
+VoteEqual U1 U1
+SubgroupBallot U32 U1
+SubgroupEqMask U32
+SubgroupLtMask U32
+SubgroupLeMask U32
+SubgroupGtMask U32
+SubgroupGeMask U32
+ShuffleIndex U32 U32 U32 U32 U32
+ShuffleUp U32 U32 U32 U32 U32
+ShuffleDown U32 U32 U32 U32 U32
+ShuffleButterfly U32 U32 U32 U32 U32
+QuadBroadcast U32 U32 U32
+QuadSwap U32 U32 U32
+FSwizzleAdd F32 F32 F32 U32
+DPdxFine F32 F32
+DPdyFine F32 F32
+DPdxCoarse F32 F32
+DPdyCoarse F32 F32

@@ -51,6 +51,7 @@ pub(crate) struct DeviceOwner {
     pub instance: Arc<InstanceOwner>,
     pub device: ash::Device,
     pub physical: vk::PhysicalDevice,
+    pub queue_mutex: Arc<Mutex<()>>,
     pub allocator: Mutex<Option<Allocator>>,
     pub debug: Option<ash::ext::debug_utils::Device>,
     pub non_coherent_atom_size: u64,
@@ -180,6 +181,7 @@ impl VulkanDevice {
             instance,
             device,
             physical: selected.physical,
+            queue_mutex: Arc::new(Mutex::new(())),
             allocator: Mutex::new(None),
             debug,
             non_coherent_atom_size: selected.profile.limits.non_coherent_atom_size,
@@ -192,6 +194,7 @@ impl VulkanDevice {
             selected.profile.api_path,
             selected.profile.swapchain_maintenance,
             selected.profile.dynamic_state.base,
+            Arc::clone(&owner.queue_mutex),
         )?;
         debug_assert_eq!(
             dispatch.release_swapchain_images.is_some(),
@@ -231,6 +234,7 @@ impl VulkanDevice {
             Arc::clone(&owner),
             selected.queues.graphics_compute_family,
             configuration,
+            &dispatch,
         )?;
         Ok(Self {
             owner,

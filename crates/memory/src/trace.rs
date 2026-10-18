@@ -5,7 +5,7 @@
 #[cfg(feature = "execution-trace")]
 mod capture;
 #[cfg(feature = "execution-trace")]
-pub use capture::{Span, detail_event, event, finish, presentation_interval, span, start};
+pub use capture::{Span, detail_event, event, finish, span, start};
 
 #[cfg(not(feature = "execution-trace"))]
 pub struct Span;
@@ -13,11 +13,6 @@ pub struct Span;
 impl Drop for Span {
     #[inline(always)]
     fn drop(&mut self) {}
-}
-#[cfg(not(feature = "execution-trace"))]
-#[inline(always)]
-pub fn presentation_interval(requested: u32) -> u32 {
-    requested
 }
 #[cfg(not(feature = "execution-trace"))]
 #[inline(always)]

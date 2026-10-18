@@ -4,8 +4,8 @@ use crate::residency::tests::backing_allocation;
 use ash::vk;
 use nixe_gpu::{
     PresentationImageFormat as F,
+    compilation::CompilePool,
     native::{GuestImageAspect, GuestImagePlane, NativePresentationImage},
-    ssa::compile::CompilePool,
 };
 use std::time::{Duration, Instant};
 
@@ -81,7 +81,7 @@ fn read_in_layout(
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .layer_count(1);
     unsafe {
-        device.owner.device.cmd_copy_image_to_buffer(
+        device.dispatch.cmd_copy_image_to_buffer(
             command,
             view.image.handle,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -287,10 +287,7 @@ fn native_frame_snapshots_preserve_versions_crop_formats_and_every_transform() {
         let changed = frames
             .capture(&mut cache, request, &mut descriptors)
             .unwrap();
-        assert_ne!(
-            image.lease().unwrap().image(),
-            changed.lease().unwrap().image()
-        );
+        assert_ne!(image.lease().image(), changed.lease().image());
         for (bits, order) in ORDER.iter().enumerate() {
             let source = Source {
                 image: image.clone(),
@@ -437,7 +434,7 @@ fn native_ui_texture_updates_blending_clipping_and_free() {
             vk::AccessFlags2::TRANSFER_WRITE,
         );
         unsafe {
-            cache.device().owner.device.cmd_clear_color_image(
+            cache.device().dispatch.cmd_clear_color_image(
                 command,
                 target.image.handle,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -734,10 +731,7 @@ fn scanout_retargets_a_new_producer_and_ignores_undefined_padding() {
     assert_eq!(before.cpu_uploaded_bytes, after.cpu_uploaded_bytes);
     assert_eq!(before.gpu_copied_bytes, after.gpu_copied_bytes);
     assert_eq!(after.native_readback_bytes, 0);
-    assert_ne!(
-        initial.lease().unwrap().producer(),
-        snapshot.lease().unwrap().producer()
-    );
+    assert_ne!(initial.lease().producer(), snapshot.lease().producer());
     assert_eq!(frames.get(&snapshot).unwrap().extent, [4, 4]);
     // Verify the raw size-compatible BGRA -> RGBA copy: blue BGRA bits become
     // red RGBA texels, without a color conversion or CPU reconstruction.

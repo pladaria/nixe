@@ -24,6 +24,7 @@ pub enum SwapchainMaintenance {
 
 #[derive(Debug)]
 pub struct DeviceProfile {
+    pub shader_compiler: nixe_gpu::shader_compilation::Configuration,
     pub name: String,
     pub device_type: vk::PhysicalDeviceType,
     pub api_version: u32,
@@ -37,6 +38,7 @@ pub struct DeviceProfile {
     pub pipeline_creation_cache_control: bool,
     pub limits: vk::PhysicalDeviceLimits,
     pub core: vk::PhysicalDeviceFeatures,
+    pub null_descriptor: bool,
     pub float_controls: FloatControls,
     pub subgroup: SubgroupSupport,
     pub dynamic_state: DynamicStateSupport,
@@ -216,6 +218,7 @@ macro_rules! optional_features {
         pub(crate) struct FeatureSet {
             chains: FeatureChains,
             pub core: vk::PhysicalDeviceFeatures,
+            pub v11: vk::PhysicalDeviceVulkan11Features<'static>,
             pub v12: vk::PhysicalDeviceVulkan12Features<'static>,
             pub sync: vk::PhysicalDeviceSynchronization2Features<'static>,
             pub rendering: vk::PhysicalDeviceDynamicRenderingFeatures<'static>,
@@ -228,7 +231,7 @@ macro_rules! optional_features {
             pub unsafe fn query(instance: &Instance, physical: vk::PhysicalDevice, ext: &ExtensionSet,
                 version: u32, maintenance: SwapchainMaintenance) -> Self {
                 let mut result = Self::default();
-                let mut query = vk::PhysicalDeviceFeatures2::default().push_next(&mut result.v12);
+                let mut query = vk::PhysicalDeviceFeatures2::default().push_next(&mut result.v11).push_next(&mut result.v12);
                 if version >= vk::API_VERSION_1_3 || ext.contains(ash::khr::synchronization2::NAME) { query = query.push_next(&mut result.sync); }
                 if version >= vk::API_VERSION_1_3 || ext.contains(ash::khr::dynamic_rendering::NAME) { query = query.push_next(&mut result.rendering); }
                 if version >= vk::API_VERSION_1_3 || ext.contains(ash::ext::subgroup_size_control::NAME) {
@@ -253,6 +256,7 @@ macro_rules! optional_features {
                 unsafe { instance.get_physical_device_features2(physical, &mut query); }
                 result.core = query.features;
                 result.v12.p_next = std::ptr::null_mut();
+                result.v11.p_next = std::ptr::null_mut();
                 result.sync.p_next = std::ptr::null_mut();
                 result.rendering.p_next = std::ptr::null_mut();
                 result.subgroup.p_next = std::ptr::null_mut();
@@ -262,7 +266,7 @@ macro_rules! optional_features {
             }
             pub fn enable_info(&mut self) -> vk::DeviceCreateInfo<'_> {
                 let mut info = vk::DeviceCreateInfo::default().enabled_features(&self.core)
-                    .push_next(&mut self.v12).push_next(&mut self.sync).push_next(&mut self.rendering);
+                    .push_next(&mut self.v11).push_next(&mut self.v12).push_next(&mut self.sync).push_next(&mut self.rendering);
                 if self.chains.subgroup { info = info.push_next(&mut self.subgroup); }
                 if self.chains.cache_control {info=info.push_next(&mut self.cache_control);}
                 $(if self.chains.$field { info = info.push_next(&mut self.$field); })+
@@ -283,6 +287,9 @@ macro_rules! fixed {
     };
 }
 optional_features! {
+    robustness2: vk::PhysicalDeviceRobustness2FeaturesEXT<'static> => fixed!(ash::ext::robustness2::NAME),
+    demote: vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures<'static> => fixed!(ash::ext::shader_demote_to_helper_invocation::NAME),
+    workgroup_layout: vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR<'static> => fixed!(ash::khr::workgroup_memory_explicit_layout::NAME),
     state1: vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT<'static> => fixed!(ash::ext::extended_dynamic_state::NAME),
     state2: vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT<'static> => fixed!(ash::ext::extended_dynamic_state2::NAME),
     state3: vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT<'static> => fixed!(ash::ext::extended_dynamic_state3::NAME),
@@ -366,6 +373,8 @@ impl FeatureSet {
         self.descriptors.descriptor_buffer_capture_replay = vk::FALSE;
         self.descriptors.descriptor_buffer_push_descriptors = vk::FALSE;
         self.core.robust_buffer_access = vk::FALSE;
+        self.robustness2.robust_buffer_access2 = vk::FALSE;
+        self.robustness2.robust_image_access2 = vk::FALSE;
         self.core.sparse_binding = vk::FALSE;
         self.core.sparse_residency_buffer = vk::FALSE;
         self.core.sparse_residency_image2_d = vk::FALSE;
@@ -411,12 +420,14 @@ impl FeatureSet {
         maintenance: SwapchainMaintenance,
     ) -> DeviceProfile {
         let mut floats = vk::PhysicalDeviceFloatControlsProperties::default();
+        let mut driver = vk::PhysicalDeviceDriverProperties::default();
         let mut id = vk::PhysicalDeviceIDProperties::default();
         let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
         let mut subgroup_control = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
         let mut gpl = vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
         let mut descriptors = vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
         let mut props = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut driver)
             .push_next(&mut floats)
             .push_next(&mut id)
             .push_next(&mut subgroup);
@@ -438,6 +449,14 @@ impl FeatureSet {
         }
         let properties = props.properties;
         DeviceProfile {
+            shader_compiler: self.shader_configuration(
+                version,
+                &properties,
+                &floats,
+                &subgroup,
+                &subgroup_control,
+                driver.driver_id,
+            ),
             // SAFETY: physical device properties include a NUL-terminated name.
             name: unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
                 .to_string_lossy()
@@ -462,6 +481,7 @@ impl FeatureSet {
                 != 0,
             limits: properties.limits,
             core: self.core,
+            null_descriptor: self.robustness2.null_descriptor != 0,
             float_controls: FloatControls {
                 // Mixed-width repair may need different denormal modes. Select
                 // native half conversion only with independent host guarantees.
@@ -640,3 +660,5 @@ mod tests {
         );
     }
 }
+
+mod shader;

@@ -2,7 +2,7 @@
 
 use std::fmt::{Display, Formatter};
 
-use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions};
+use nixe_memory::MemoryPermissions;
 
 use super::{
     MaxwellComputeAddress, MaxwellComputeState,
@@ -60,6 +60,13 @@ pub enum MaxwellComputeLaunchError {
         binding: u8,
         reason: &'static str,
     },
+    StorageDescriptor {
+        source: Box<MaxwellMethodSource>,
+        binding: u8,
+        offset: u32,
+        address: u64,
+        size: u64,
+    },
     Address {
         source: Box<MaxwellMethodSource>,
         address: u64,
@@ -73,10 +80,10 @@ pub enum MaxwellComputeLaunchError {
         size: u64,
         error: MaxwellGpuAccessError,
     },
-    StagedRead {
+    CanonicalRead {
         source: Box<MaxwellMethodSource>,
         address: u64,
-        error: CanonicalWriteBatchError,
+        error: nixe_memory::CanonicalRangeAccessError,
     },
     QmdVersion {
         source: Box<MaxwellMethodSource>,
@@ -116,6 +123,16 @@ impl Display for MaxwellComputeLaunchError {
                 f,
                 "compute memory access failed: address={address:#012x} source=[{source}]: {error}"
             ),
+            Self::StorageDescriptor {
+                source,
+                binding,
+                offset,
+                address,
+                size,
+            } => write!(
+                f,
+                "invalid compute storage descriptor: c[{binding}][{offset:#x}] address={address:#012x} size={size:#x}; source=[{source}]"
+            ),
             Self::GlobalBufferAddress {
                 source,
                 constant_buffer,
@@ -127,13 +144,13 @@ impl Display for MaxwellComputeLaunchError {
                 f,
                 "compute global buffer access failed: c[{constant_buffer}][{byte_offset:#x}] address={address:#012x} size={size:#x} source=[{source}]: {error}"
             ),
-            Self::StagedRead {
+            Self::CanonicalRead {
                 source,
                 address,
                 error,
             } => write!(
                 f,
-                "compute staged read failed: address={address:#012x} source=[{source}]: {error}"
+                "compute canonical read failed: address={address:#012x} source=[{source}]: {error}"
             ),
             Self::QmdVersion {
                 source,
@@ -166,72 +183,11 @@ pub struct MaxwellResolvedComputeLaunch {
     source: MaxwellMethodSource,
     program_address: u64,
     qmd: MaxwellComputeQmd,
+    texture_pool: Option<crate::recompiler::TexturePool>,
+    texture_cbuf: u32,
 }
 
 impl MaxwellResolvedComputeLaunch {
-    pub(crate) fn native_uniform_word(
-        &self,
-        program: &crate::MaxwellSsaProgram,
-        resource: nixe_gpu::ssa::ResourceId,
-        offset: u32,
-        space: &MaxwellGpuAddressSpace,
-        writes: &CanonicalWriteBatch,
-    ) -> Result<Option<u32>, MaxwellComputeLaunchError> {
-        let Some(slot) = program.bindings.iter().find_map(|b| {
-            if b.resource == resource
-                && let crate::MaxwellSsaBindingSource::ConstantBuffer { slot } = b.source
-            {
-                Some(slot)
-            } else {
-                None
-            }
-        }) else {
-            return Ok(None);
-        };
-        let (base, size) =
-            self.qmd
-                .constant_buffer(slot)
-                .map_err(|reason| MaxwellComputeLaunchError::Buffer {
-                    source: Box::new(self.source),
-                    binding: slot,
-                    reason,
-                })?;
-        if u64::from(offset) + 4 > size || offset & 3 != 0 {
-            return Ok(None);
-        }
-        let address = base + u64::from(offset);
-        let range = space
-            .address(address)
-            .map_err(MaxwellGpuAccessError::Address)
-            .and_then(|a| space.resolve_range(a, 4, MemoryPermissions::READ))
-            .map_err(|error| MaxwellComputeLaunchError::Address {
-                source: Box::new(self.source),
-                address,
-                error,
-            })?;
-        let mut bytes = [0; 4];
-        let mut copied = 0;
-        for segment in range.segments() {
-            let end = copied + segment.size() as usize;
-            writes
-                .read_overlay(
-                    segment.mapping().backing(),
-                    segment.backing_offset(),
-                    &mut bytes[copied..end],
-                )
-                .map_err(|error| MaxwellComputeLaunchError::StagedRead {
-                    source: Box::new(self.source),
-                    address,
-                    error,
-                })?;
-            copied = end;
-        }
-        Ok(Some(u32::from_le_bytes(bytes)))
-    }
-
-    pub(crate) fn constant_buffer(&self, slot: u8) -> Result<(u64, u64), &'static str> {
-        self.qmd.constant_buffer(slot)
-    }
     pub(crate) fn validate_execution(&self) -> Result<(), MaxwellComputeLaunchError> {
         self.qmd
             .validate_execution()
@@ -240,149 +196,9 @@ impl MaxwellResolvedComputeLaunch {
                 reason,
             })
     }
-    pub(crate) fn kernel_key(&self) -> (u64, u8, [u32; 3]) {
-        (
-            self.program_address,
-            self.qmd.register_count(),
-            self.qmd.workgroup_size(),
-        )
-    }
 
     pub(crate) fn workgroups(&self) -> [u32; 3] {
         self.qmd.workgroups()
-    }
-    pub(crate) fn resolve_resources(
-        &self,
-        program: &crate::shader::MaxwellComputeProgram,
-        address_space: &MaxwellGpuAddressSpace,
-        writes: &CanonicalWriteBatch,
-    ) -> Result<Vec<(u8, crate::MaxwellResolvedRange)>, MaxwellComputeLaunchError> {
-        let buffer_error = |binding, reason| MaxwellComputeLaunchError::Buffer {
-            source: Box::new(self.source),
-            binding,
-            reason,
-        };
-        let resolve = |address: u64, size, permissions| {
-            let error = |error| MaxwellComputeLaunchError::Address {
-                source: Box::new(self.source),
-                address,
-                error,
-            };
-            let address = address_space
-                .address(address)
-                .map_err(MaxwellGpuAccessError::Address)
-                .map_err(error)?;
-            address_space
-                .resolve_range(address, size, permissions)
-                .map_err(error)
-        };
-        let mut resources = Vec::new();
-        for resource in program.module.ir().ir().resources() {
-            if resource.kind() != nixe_gpu::ShaderResourceKind::ConstantBuffer {
-                continue;
-            }
-            let binding = resource.binding();
-            let required_size = program.constant_buffer_extents[&binding];
-            let (address, size) = self
-                .qmd
-                .constant_buffer(binding)
-                .map_err(|reason| buffer_error(binding, reason))?;
-            if required_size > size {
-                return Err(buffer_error(
-                    binding,
-                    "shader access exceeds its constant buffer",
-                ));
-            }
-            resources.push((binding, resolve(address, size, MemoryPermissions::READ)?));
-        }
-        let extents = program
-            .global_buffers
-            .byte_extents(self.qmd.workgroups(), self.qmd.workgroup_size());
-        for (buffer, size) in program.global_buffers.buffers.iter().zip(extents) {
-            let (address, cb_size) = self
-                .qmd
-                .constant_buffer(buffer.constant_buffer)
-                .map_err(|reason| buffer_error(buffer.oracle_binding(), reason))?;
-            let descriptor_bytes = if buffer.runtime_extent { 16 } else { 8 };
-            if u64::from(buffer.byte_offset) + descriptor_bytes > cb_size {
-                return Err(buffer_error(
-                    buffer.oracle_binding(),
-                    "global pointer exceeds its constant buffer",
-                ));
-            }
-            let range = resolve(
-                address + u64::from(buffer.byte_offset),
-                descriptor_bytes,
-                MemoryPermissions::READ,
-            )?;
-            let mut bytes = [0; 16];
-            let mut copied = 0;
-            for segment in range.segments() {
-                let end = copied + segment.size() as usize;
-                writes
-                    .read_overlay(
-                        segment.mapping().backing(),
-                        segment.backing_offset(),
-                        &mut bytes[copied..end],
-                    )
-                    .map_err(|error| MaxwellComputeLaunchError::StagedRead {
-                        source: Box::new(self.source),
-                        address,
-                        error,
-                    })?;
-                copied = end;
-            }
-            let address = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-            let size = if buffer.runtime_extent {
-                // NVN descriptor size is runtime state, not a compile-time
-                // bound on loop indices. Read it for every dispatch.
-                // https://github.com/eden-emulator/mirror/blob/master/src/video_core/buffer_cache/buffer_cache.h (StorageBufferBinding)
-                let declared = u64::from(u32::from_le_bytes(bytes[8..12].try_into().unwrap()));
-                if declared == 0 {
-                    return Err(buffer_error(
-                        buffer.oracle_binding(),
-                        "NVN storage descriptor has zero size",
-                    ));
-                }
-                declared
-            } else {
-                size
-            };
-            if address & 3 != 0 {
-                return Err(buffer_error(
-                    buffer.oracle_binding(),
-                    "global buffer base is not word aligned",
-                ));
-            }
-            resources.push((
-                buffer.oracle_binding(),
-                resolve(
-                    address,
-                    size,
-                    match (buffer.read, buffer.write) {
-                        (true, true) => MemoryPermissions::READ_WRITE,
-                        (true, false) => MemoryPermissions::READ,
-                        (false, true) => MemoryPermissions::WRITE,
-                        (false, false) => unreachable!("global binding must be accessed"),
-                    },
-                )?,
-            ));
-        }
-        Ok(resources)
-    }
-
-    pub(crate) fn translate_kernel(
-        &self,
-        address_space: &MaxwellGpuAddressSpace,
-        writes: &CanonicalWriteBatch,
-    ) -> Result<crate::shader::MaxwellComputeProgram, crate::MaxwellShaderTranslationError> {
-        crate::shader::translate_compute_program(
-            address_space,
-            writes,
-            self.program_address,
-            self.qmd.register_count(),
-            self.qmd.workgroup_size(),
-        )
     }
 }
 
@@ -390,7 +206,6 @@ pub(crate) fn resolve_compute_launch(
     launch: &MaxwellComputeLaunch,
     state: &MaxwellComputeState,
     address_space: &MaxwellGpuAddressSpace,
-    writes: &CanonicalWriteBatch,
 ) -> Result<MaxwellResolvedComputeLaunch, MaxwellComputeLaunchError> {
     let source = launch.source();
     if state.shader_exceptions_enable().value() == Some(&true) {
@@ -415,21 +230,16 @@ pub(crate) fn resolve_compute_launch(
     let mut bytes = [0; QMD_SIZE];
     let mut copied = 0;
     // Resolve each trigger afresh, including INVALIDATE=0: we keep no QMD cache.
-    // Overlay by canonical backing, not GPU VA, so aliased inline/DMA writes in
-    // this submission are visible without committing or publishing completion.
+    // Earlier inline/DMA effects have already been consumed by the owner.
+    // Canonical physical aliases therefore observe the same committed bytes.
     for segment in range.segments() {
         let end = copied + segment.size() as usize;
         let output = &mut bytes[copied..end];
-        // read_overlay also reads the unstaged bytes. A separate backing read
-        // would duplicate work and could materialize contents fully overwritten
-        // by the pending upload.
-        writes
-            .read_overlay(
-                segment.mapping().backing(),
-                segment.backing_offset(),
-                output,
-            )
-            .map_err(|error| MaxwellComputeLaunchError::StagedRead {
+        segment
+            .mapping()
+            .backing()
+            .read(segment.backing_offset(), output)
+            .map_err(|error| MaxwellComputeLaunchError::CanonicalRead {
                 source: Box::new(source),
                 address,
                 error,
@@ -463,28 +273,70 @@ pub(crate) fn resolve_compute_launch(
     Ok(MaxwellResolvedComputeLaunch {
         source,
         program_address,
+        texture_pool: state
+            .texture_headers()
+            .address()
+            .zip(state.texture_headers().maximum_index().value().copied())
+            .map(|(address, maximum_index)| crate::recompiler::TexturePool {
+                address: address.get(),
+                maximum_index,
+                via_header_index: qmd.linked_samplers(),
+            }),
+        texture_cbuf: state
+            .bindless_texture_constant_buffer_slot()
+            .value()
+            .map_or(0, |slot| u32::from(slot.get())),
         qmd,
     })
 }
 impl MaxwellResolvedComputeLaunch {
-    pub(crate) fn native_request(&self) -> crate::MaxwellSsaRequest {
-        crate::MaxwellSsaRequest {
-            stage: crate::MaxwellShaderStage::Compute,
+    pub fn capture_request(&self) -> crate::recompiler::CaptureRequest {
+        use nixe_shader_recompiler::{
+            environment::EnvironmentMetadata,
+            types::{CbufIndex, ProgramOffset, Stage},
+        };
+        let mut bindings = crate::recompiler::CaptureBindings {
+            texture_pool: self.texture_pool,
+            ..Default::default()
+        };
+        for (index, binding) in bindings.constant_buffers.iter_mut().enumerate() {
+            if self.qmd.constant_buffer_enabled(index as u8) {
+                match self.qmd.constant_buffer(index as u8) {
+                    Ok((address, size)) => {
+                        *binding = Some(crate::recompiler::BufferBinding { address, size })
+                    }
+                    Err(reason) => bindings.invalid_constant_buffers[index] = Some(reason),
+                }
+            }
+        }
+        crate::recompiler::CaptureRequest {
             address: self.program_address,
-            register_count: self.qmd.register_count(),
-            workgroup_size: Some(self.qmd.workgroup_size()),
+            metadata: EnvironmentMetadata {
+                stage: Stage::Compute,
+                start_address: ProgramOffset((self.program_address & 31) as u32),
+                texture_bound_buffer: CbufIndex(self.texture_cbuf),
+                is_proprietary_driver: self.texture_cbuf == 2,
+                local_memory_size: self.qmd.local_memory_size(),
+                shared_memory_size: self.qmd.shared_memory_size(),
+                workgroup_size: self.qmd.workgroup_size(),
+                ..Default::default()
+            },
+            bindings,
         }
     }
+
     pub(crate) fn native_resources(
         &self,
-        program: &crate::MaxwellSsaProgram,
+        info: &nixe_shader_recompiler::artifact::ShaderInfo,
         space: &MaxwellGpuAddressSpace,
-        writes: &CanonicalWriteBatch,
     ) -> Result<
-        Vec<(nixe_gpu::ssa::ResourceId, crate::MaxwellResolvedRange)>,
+        Vec<(
+            nixe_gpu::shader_module::ResourceId,
+            Option<crate::MaxwellResolvedRange>,
+        )>,
         MaxwellComputeLaunchError,
     > {
-        use crate::MaxwellSsaBindingSource as S;
+        use nixe_shader_recompiler::{Stage, artifact::ResourceSource};
         let fail = |binding, reason| MaxwellComputeLaunchError::Buffer {
             source: Box::new(self.source),
             binding,
@@ -496,113 +348,303 @@ impl MaxwellResolvedComputeLaunch {
                 address,
                 error,
             };
-            let address = space
+            space
                 .address(address)
                 .map_err(MaxwellGpuAccessError::Address)
-                .map_err(error)?;
-            space
-                .resolve_range(address, size, permissions)
                 .map_err(error)
+                .and_then(|address| {
+                    space
+                        .resolve_range(address, size, permissions)
+                        .map_err(error)
+                })
         };
-        let extents =
-            program.global_buffer_extents(self.qmd.workgroup_size(), self.qmd.workgroups());
+        let resource = |source: &ResourceSource, index: u32| {
+            nixe_gpu::shader_module::guest_resource(Stage::Compute, source, index, 0)
+                .map_err(|_| fail(0, "compute resource identity exceeds host limits"))
+        };
         let mut result = Vec::new();
-        for binding in &program.bindings {
-            let range = match binding.source {
-                S::ConstantBuffer { slot } => {
-                    let (address, size) =
-                        self.qmd.constant_buffer(slot).map_err(|e| fail(slot, e))?;
-                    resolve(address, size, MemoryPermissions::READ)?
-                }
-                S::GlobalBuffer {
-                    constant_buffer: slot,
-                    byte_offset,
-                    runtime_extent,
-                } => {
-                    let (cb, size) = self.qmd.constant_buffer(slot).map_err(|e| fail(slot, e))?;
-                    let width = if runtime_extent { 16 } else { 8 };
-                    if u64::from(byte_offset) + width > size {
-                        return Err(fail(slot, "global descriptor exceeds its constant buffer"));
-                    }
-                    let pointer =
-                        resolve(cb + u64::from(byte_offset), width, MemoryPermissions::READ)?;
-                    let mut bytes = [0; 16];
-                    let mut copied = 0;
-                    for segment in pointer.segments() {
-                        let end = copied + segment.size() as usize;
-                        writes
-                            .read_overlay(
-                                segment.mapping().backing(),
-                                segment.backing_offset(),
-                                &mut bytes[copied..end],
-                            )
-                            .map_err(|error| MaxwellComputeLaunchError::StagedRead {
-                                source: Box::new(self.source),
-                                address: cb,
-                                error,
-                            })?;
-                        copied = end;
-                    }
-                    let address = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-                    let size = if runtime_extent {
-                        u64::from(u32::from_le_bytes(bytes[8..12].try_into().unwrap()))
-                    } else {
-                        extents
-                            .iter()
-                            .find(|(id, _)| *id == binding.resource)
-                            .map(|(_, s)| *s)
-                            .ok_or_else(|| fail(slot, "global binding has no proved extent"))?
-                    };
-                    if size == 0 || address & 3 != 0 {
-                        return Err(fail(slot, "global buffer size/alignment is invalid"));
-                    }
-                    let mut read = false;
-                    let mut write = false;
-                    for instruction in program.function.blocks.iter().flat_map(|b| &b.instructions)
-                    {
-                        match instruction.op {
-                            nixe_gpu::ssa::Op::Load {
-                                resource: Some(id), ..
-                            } if id == binding.resource => read = true,
-                            nixe_gpu::ssa::Op::Store {
-                                resource: Some(id), ..
-                            } if id == binding.resource => write = true,
-                            _ => {}
-                        }
-                    }
-                    let permissions = match (read, write) {
-                        (true, true) => MemoryPermissions::READ_WRITE,
-                        (true, false) => MemoryPermissions::READ,
-                        (false, true) => MemoryPermissions::WRITE,
-                        (false, false) => {
-                            return Err(fail(slot, "global binding has no memory operation"));
-                        }
-                    };
-                    resolve(address, size, permissions).map_err(|error| match error {
-                        MaxwellComputeLaunchError::Address {
-                            source,
-                            address,
-                            error,
-                        } => MaxwellComputeLaunchError::GlobalBufferAddress {
-                            source,
-                            constant_buffer: slot,
-                            byte_offset,
-                            address,
-                            size,
-                            error,
-                        },
-                        error => error,
-                    })?
-                }
-                _ => {
-                    return Err(fail(
-                        0,
-                        "compute texture/sampler descriptor resolution is not implemented",
-                    ));
-                }
-            };
-            result.push((binding.resource, range));
+        for (index, descriptor) in info.constant_buffer_descriptors.iter().enumerate() {
+            let slot = u8::try_from(descriptor.index.0)
+                .map_err(|_| fail(0, "constant-buffer index exceeds QMD limits"))?;
+            let (address, size) = self
+                .qmd
+                .constant_buffer(slot)
+                .map_err(|reason| fail(slot, reason))?;
+            result.push((
+                resource(
+                    &ResourceSource::ConstantBuffer(descriptor.clone()),
+                    index as u32,
+                )?,
+                Some(resolve(address, size, MemoryPermissions::READ)?),
+            ));
         }
+        for (index, descriptor) in info.storage_buffers_descriptors.iter().enumerate() {
+            let slot = u8::try_from(descriptor.cbuf_index.0)
+                .map_err(|_| fail(0, "storage descriptor cbuf index exceeds QMD limits"))?;
+            let offset = u64::from(descriptor.cbuf_offset.0);
+            let (cb, size) = self
+                .qmd
+                .constant_buffer(slot)
+                .map_err(|reason| fail(slot, reason))?;
+            if offset + 12 > size {
+                return Err(fail(slot, "storage descriptor exceeds its constant buffer"));
+            }
+            let pointer_address = cb
+                .checked_add(offset)
+                .ok_or_else(|| fail(slot, "storage descriptor address overflows"))?;
+            let pointer = resolve(pointer_address, 12, MemoryPermissions::READ)?;
+            let mut bytes = [0; 12];
+            let mut copied = 0;
+            for segment in pointer.segments() {
+                let end = copied + segment.size() as usize;
+                segment
+                    .mapping()
+                    .backing()
+                    .read(segment.backing_offset(), &mut bytes[copied..end])
+                    .map_err(|error| MaxwellComputeLaunchError::CanonicalRead {
+                        source: Box::new(self.source),
+                        address: pointer_address,
+                        error,
+                    })?;
+                copied = end;
+            }
+            let address = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let size = u64::from(u32::from_le_bytes(bytes[8..12].try_into().unwrap()));
+            if address == 0 {
+                result.push((
+                    resource(
+                        &ResourceSource::StorageBuffer(descriptor.clone()),
+                        index as u32,
+                    )?,
+                    None,
+                ));
+                continue;
+            }
+            if size == 0 || address & 3 != 0 {
+                return Err(MaxwellComputeLaunchError::StorageDescriptor {
+                    source: Box::new(self.source),
+                    binding: slot,
+                    offset: descriptor.cbuf_offset.0,
+                    address,
+                    size,
+                });
+            }
+            let permissions = if descriptor.is_written {
+                MemoryPermissions::READ_WRITE
+            } else {
+                MemoryPermissions::READ
+            };
+            let range = resolve(address, size, permissions).map_err(|error| match error {
+                MaxwellComputeLaunchError::Address {
+                    source,
+                    address,
+                    error,
+                } => MaxwellComputeLaunchError::GlobalBufferAddress {
+                    source,
+                    constant_buffer: slot,
+                    byte_offset: descriptor.cbuf_offset.0,
+                    address,
+                    size,
+                    error,
+                },
+                error => error,
+            })?;
+            result.push((
+                resource(
+                    &ResourceSource::StorageBuffer(descriptor.clone()),
+                    index as u32,
+                )?,
+                Some(range),
+            ));
+        }
+        if !info.texture_descriptors.is_empty()
+            || !info.image_descriptors.is_empty()
+            || !info.texture_buffer_descriptors.is_empty()
+            || !info.image_buffer_descriptors.is_empty()
+        {
+            return Err(fail(
+                0,
+                "compute image and texel-buffer resource resolution is not implemented",
+            ));
+        }
+        result.sort_unstable_by_key(|(resource, _)| *resource);
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use crate::execution::MaxwellFrontend;
+    use nixe_gpu::{FrontendSubmissionId, native::NativeCommand};
+    use std::sync::Arc;
+
+    fn source() -> MaxwellMethodSource {
+        let mut channel = crate::engines::tests::three_d_channel();
+        crate::engines::tests::program_three_d(&mut channel, 0x19d0, 0x3c);
+        channel
+            .three_d()
+            .render_targets()
+            .clear()
+            .last_surface()
+            .source()
+            .unwrap()
+    }
+    fn qmd(words: [u32; 64]) -> MaxwellComputeQmd {
+        MaxwellComputeQmd::decode(
+            &words
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn native_compute_uses_owned_captures_and_specializes_execution_facts() {
+        let (allocation, space, base) = crate::shader::test_support::mapped_memory();
+        allocation
+            .write(8, &0xe300_0000_0007_000fu64.to_le_bytes())
+            .unwrap();
+        let mut words = [0; 64];
+        words[0x48 / 4] = (4 << 16) | 0x17;
+        words[0x4c / 4] = 0x0001_0001;
+        words[0x30 / 4] = 1;
+        words[0x34 / 4] = 0x0001_0001;
+        let launch = |words| MaxwellResolvedComputeLaunch {
+            source: source(),
+            program_address: base,
+            qmd: qmd(words),
+            texture_pool: None,
+            texture_cbuf: 0,
+        };
+        let config = nixe_gpu::shader_compilation::Configuration {
+            profile: nixe_shader_recompiler::Profile {
+                supported_spirv: 0x10500,
+                unified_descriptor_binding: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut frontend = crate::MaxwellNativeFrontend::new(config.clone());
+
+        let first = frontend
+            .lower_launch(&launch(words), &space, FrontendSubmissionId::new(1))
+            .unwrap();
+        let NativeCommand::Dispatch { program: first, .. } = first.command else {
+            panic!("dispatch expected")
+        };
+        let inputs = &first.shader;
+        let artifacts = inputs
+            .compile(
+                &mut nixe_shader_recompiler::Compiler::new().unwrap(),
+                &config,
+                None,
+            )
+            .unwrap();
+        assert_eq!(artifacts[0].execution.workgroup_size, [4, 1, 1]);
+        words[0x30 / 4] = 5;
+        let second = frontend
+            .lower_launch(&launch(words), &space, FrontendSubmissionId::new(2))
+            .unwrap();
+        let NativeCommand::Dispatch {
+            program: second,
+            groups,
+        } = second.command
+        else {
+            panic!("dispatch expected")
+        };
+        assert_eq!(groups, [5, 1, 1]);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(frontend.statistics.shader_captures, 1);
+        words[0x44 / 4] = 64;
+        let third = frontend
+            .lower_launch(&launch(words), &space, FrontendSubmissionId::new(3))
+            .unwrap();
+        let NativeCommand::Dispatch { program: third, .. } = third.command else {
+            panic!("dispatch expected")
+        };
+        assert_ne!(first.shader.identity, third.shader.identity);
+        assert_eq!(frontend.statistics.shader_captures, 2);
+    }
+
+    #[test]
+    fn native_storage_resources_use_descriptor_metadata_and_committed_runtime_extent() {
+        use nixe_shader_recompiler::{
+            artifact::{ConstantBufferDescriptor, ShaderInfo, StorageBufferDescriptor},
+            types::{ByteOffset, CbufIndex},
+        };
+        let (_allocation, space, base) = crate::shader::test_support::mapped_memory();
+        let mut words = [0; 64];
+        words[0x48 / 4] = 0x17;
+        words[0x50 / 4] = 1;
+        words[0x74 / 4] = base as u32 + 0x100;
+        words[0x78 / 4] = (base >> 32) as u32 | (64 << 15);
+        let launch = MaxwellResolvedComputeLaunch {
+            source: source(),
+            program_address: base,
+            qmd: qmd(words),
+            texture_pool: None,
+            texture_cbuf: 0,
+        };
+        let info = &mut ShaderInfo::default();
+        info.constant_buffer_descriptors
+            .push(ConstantBufferDescriptor {
+                index: CbufIndex(0),
+                count: 1,
+            })
+            .unwrap();
+        info.storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: CbufIndex(0),
+                cbuf_offset: ByteOffset(16),
+                count: 1,
+                is_written: true,
+            })
+            .unwrap();
+        crate::shader::test_support::write_shader_words(
+            &space,
+            &[
+                (base + 0x110, base as u32 + 0x300),
+                (base + 0x114, (base >> 32) as u32),
+                (base + 0x118, 128),
+            ],
+        );
+        let resources = launch.native_resources(info, &space).unwrap();
+        assert_eq!(resources.len(), 2);
+        assert_eq!(
+            resources[0]
+                .1
+                .as_ref()
+                .unwrap()
+                .segments()
+                .iter()
+                .map(|s| s.size())
+                .sum::<u64>(),
+            64
+        );
+        assert_eq!(
+            resources[1]
+                .1
+                .as_ref()
+                .unwrap()
+                .segments()
+                .iter()
+                .map(|s| s.size())
+                .sum::<u64>(),
+            128
+        );
+        info.storage_buffers_descriptors
+            .push(StorageBufferDescriptor {
+                cbuf_index: CbufIndex(0),
+                cbuf_offset: ByteOffset(32),
+                count: 1,
+                is_written: true,
+            })
+            .unwrap();
+        let resources = launch.native_resources(info, &space).unwrap();
+        assert_eq!(resources.len(), 3);
+        assert!(resources[2].1.is_none());
     }
 }

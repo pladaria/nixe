@@ -267,18 +267,39 @@ impl NativeGpuExecution {
         program: &GuestProgram,
         pipeline: &NativePipeline,
     ) -> Result<Vec<Binding>, VulkanError> {
-        // The frontend already supplies strictly sorted SSA identities. Avoid
-        // allocating and rebuilding an ordered map for each changed binding set.
-        if program.bindings.len() != pipeline.layout.key.bindings.len()
-            || program.bindings.windows(2).any(|b| b[0].0 >= b[1].0)
-        {
+        if program.bindings.windows(2).any(|b| b[0].0 >= b[1].0) {
             return Err(VulkanError::InvalidResource(
-                "native guest resources differ from linked reflection",
+                "guest resource identities must be unique and sorted",
             ));
         }
-        let mut result = Vec::with_capacity(program.bindings.len());
-        for (_, binding) in &program.bindings {
+        let lookup = |id| {
+            program
+                .bindings
+                .binary_search_by_key(&id, |(id, _)| *id)
+                .map(|index| &program.bindings[index].1)
+                .map_err(|_| VulkanError::InvalidResource("reflected shader resource is missing"))
+        };
+        let mut result = Vec::with_capacity(pipeline.binding_origins.len());
+        for origin in &pipeline.binding_origins {
+            let binding = lookup(origin.resource)?;
+            if let Some(sampler) = origin.sampler {
+                let GuestBinding::Image { image, arrayed } = binding else {
+                    return Err(VulkanError::InvalidResource(
+                        "combined descriptor requires an image",
+                    ));
+                };
+                let GuestBinding::Sampler(sampler) = lookup(sampler)? else {
+                    return Err(VulkanError::InvalidResource(
+                        "combined descriptor requires a sampler",
+                    ));
+                };
+                let image = self.view(image, *arrayed)?;
+                let sampler = self.guest_sampler(sampler)?;
+                result.push(Binding::CombinedImageSampler { image, sampler });
+                continue;
+            }
             result.push(match binding {
+                GuestBinding::NullBuffer => Binding::NullBuffer,
                 GuestBinding::Buffer(backing) => Binding::Buffer {
                     buffer: self.residency.buffer_for_deferred_import(
                         backing.clone(),
@@ -290,59 +311,59 @@ impl NativeGpuExecution {
                 GuestBinding::Image { image, arrayed } => {
                     Binding::Image(self.view(image, *arrayed)?)
                 }
-                GuestBinding::Sampler(s) => {
-                    let address = |a| match a {
-                        nixe_gpu::AddressMode::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
-                        nixe_gpu::AddressMode::Repeat => vk::SamplerAddressMode::REPEAT,
-                        nixe_gpu::AddressMode::MirroredRepeat => {
-                            vk::SamplerAddressMode::MIRRORED_REPEAT
-                        }
-                        nixe_gpu::AddressMode::ClampToBorder => {
-                            vk::SamplerAddressMode::CLAMP_TO_BORDER
-                        }
-                    };
-                    let filter = |f| {
-                        if f == nixe_gpu::FilterMode::Linear {
-                            vk::Filter::LINEAR
-                        } else {
-                            vk::Filter::NEAREST
-                        }
-                    };
-                    let info = vk::SamplerCreateInfo::default()
-                        .min_filter(filter(s.min_filter))
-                        .mag_filter(filter(s.mag_filter))
-                        .mipmap_mode(if s.mip_filter == nixe_gpu::FilterMode::Linear {
-                            vk::SamplerMipmapMode::LINEAR
-                        } else {
-                            vk::SamplerMipmapMode::NEAREST
-                        })
-                        .address_mode_u(address(s.address_modes[0]))
-                        .address_mode_v(address(s.address_modes[1]))
-                        .address_mode_w(address(s.address_modes[2]))
-                        .mip_lod_bias(s.lod_bias)
-                        .min_lod(s.lod_min)
-                        .max_lod(s.lod_max)
-                        .anisotropy_enable(s.max_anisotropy > 1.)
-                        .max_anisotropy(s.max_anisotropy)
-                        .compare_enable(s.compare.is_some())
-                        .compare_op(
-                            s.compare
-                                .map(state::compare)
-                                .unwrap_or(vk::CompareOp::ALWAYS),
-                        );
-                    let (border, custom_border) = sampler_border(s);
-                    let info = info.border_color(border);
-                    Binding::Sampler(self.samplers.get_extended(
-                        &info,
-                        SamplerExtensions {
-                            custom_border,
-                            ..Default::default()
-                        },
-                    )?)
-                }
+                GuestBinding::Sampler(s) => Binding::Sampler(self.guest_sampler(s)?),
             });
         }
         Ok(result)
+    }
+    fn guest_sampler(
+        &mut self,
+        s: &nixe_gpu::SamplerDescription,
+    ) -> Result<Arc<Sampler>, VulkanError> {
+        let address = |a| match a {
+            nixe_gpu::AddressMode::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            nixe_gpu::AddressMode::Repeat => vk::SamplerAddressMode::REPEAT,
+            nixe_gpu::AddressMode::MirroredRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
+            nixe_gpu::AddressMode::ClampToBorder => vk::SamplerAddressMode::CLAMP_TO_BORDER,
+        };
+        let filter = |f| {
+            if f == nixe_gpu::FilterMode::Linear {
+                vk::Filter::LINEAR
+            } else {
+                vk::Filter::NEAREST
+            }
+        };
+        let info = vk::SamplerCreateInfo::default()
+            .min_filter(filter(s.min_filter))
+            .mag_filter(filter(s.mag_filter))
+            .mipmap_mode(if s.mip_filter == nixe_gpu::FilterMode::Linear {
+                vk::SamplerMipmapMode::LINEAR
+            } else {
+                vk::SamplerMipmapMode::NEAREST
+            })
+            .address_mode_u(address(s.address_modes[0]))
+            .address_mode_v(address(s.address_modes[1]))
+            .address_mode_w(address(s.address_modes[2]))
+            .mip_lod_bias(s.lod_bias)
+            .min_lod(s.lod_min)
+            .max_lod(s.lod_max)
+            .anisotropy_enable(s.max_anisotropy > 1.)
+            .max_anisotropy(s.max_anisotropy)
+            .compare_enable(s.compare.is_some())
+            .compare_op(
+                s.compare
+                    .map(state::compare)
+                    .unwrap_or(vk::CompareOp::ALWAYS),
+            );
+        let (border, custom_border) = sampler_border(s);
+        let info = info.border_color(border);
+        self.samplers.get_extended(
+            &info,
+            SamplerExtensions {
+                custom_border,
+                ..Default::default()
+            },
+        )
     }
     pub(super) fn targets(
         &mut self,

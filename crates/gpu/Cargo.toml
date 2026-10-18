@@ -5,18 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+half = "2.7"
+spirv = "0.4"
 bcdec_rs = "0.2.0"
 ctt-astcenc = "0.4.0"
 rustc-hash.workspace = true
 nixe-memory.workspace = true
-twox-hash.workspace = true
-rspirv = "0.13"
-half = "2.7"
+nixe-shader-recompiler.workspace = true
 sha2.workspace = true
-
-[dev-dependencies]
-naga = { version = "30.0.0", features = ["wgsl-in"] }
-
 
 [features]
 performance-counters = ["nixe-memory/performance-counters"]

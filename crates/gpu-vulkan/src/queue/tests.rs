@@ -16,6 +16,7 @@ fn small_device(
         Arc::clone(&device.owner),
         device.queues().graphics_compute_family,
         configuration,
+        &device.dispatch,
     )
     .unwrap();
     Some(device)
@@ -334,7 +335,7 @@ fn staging_overflow_suballocates_small_transfers_and_preserves_unread_slices() {
         let (_, destination, ticket) = device.submission.reserve_readback(64).unwrap();
         let slot = &device.submission.slots[index];
         unsafe {
-            device.owner.device.cmd_copy_buffer(
+            device.dispatch.cmd_copy_buffer(
                 slot.command,
                 slot.upload_buffer(source).handle,
                 slot.readback_buffer(destination).handle,

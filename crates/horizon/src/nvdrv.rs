@@ -3,14 +3,11 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use nixe_gpu::{
-    GpuCacheConfiguration, GuestTimelinePoint, NeutralBackendRuntime, PresentationImageRequest,
-    ResidentImage,
-};
+use nixe_gpu::{GuestTimelinePoint, PresentationImageRequest, ResidentImage};
 
 use nixe_gpu_maxwell::{
-    MaxwellAddressSpaceId, MaxwellChannelId, MaxwellChannelOwner, MaxwellGpuAddressSpace,
-    MaxwellGpuChannel, MaxwellGpuProfile, SWITCH_1_GM20B_PROFILE,
+    MaxwellAddressSpaceId, MaxwellChannelConfiguration, MaxwellChannelId, MaxwellChannelOwner,
+    MaxwellGpuAddressSpace, MaxwellGpuProfile, SWITCH_1_GM20B_PROFILE,
 };
 use nixe_memory::{AddressSpaceId, CanonicalRangeTranslator, GuestVirtualAddress};
 
@@ -137,33 +134,7 @@ impl Default for NvDrvSession {
 impl NvDrvSession {
     #[must_use]
     pub fn new() -> Self {
-        let cache_configuration = GpuCacheConfiguration::default();
-        Self::new_with_executor(NvDrvGpuExecutor::new(None, cache_configuration))
-    }
-
-    #[must_use]
-    pub fn with_gpu_backend(
-        backend: Box<dyn NeutralBackendRuntime>,
-        cache_configuration: GpuCacheConfiguration,
-    ) -> Self {
-        Self::new_with_executor(NvDrvGpuExecutor::new(Some(backend), cache_configuration))
-    }
-
-    /// Selects the concrete host renderer once, before starting GPU workers.
-    #[must_use]
-    pub fn with_gpu_execution<
-        E: nixe_gpu::GpuExecution<
-                Commands = nixe_gpu::OperationSubmission,
-                ImageRequest = nixe_gpu::PresentationImageRequest,
-            >,
-    >(
-        execution: E,
-        cache_configuration: GpuCacheConfiguration,
-    ) -> Self {
-        Self::new_with_executor(NvDrvGpuExecutor::with_execution(
-            Some(execution),
-            cache_configuration,
-        ))
+        Self::new_with_executor(NvDrvGpuExecutor::new())
     }
 
     /// Startup composition; neither worker erases the selected command representation.
@@ -382,7 +353,7 @@ impl NvDrvSession {
                 .insert(fd, address_space);
         }
         if let Some(next_gpu_channel_id) = next_gpu_channel_id {
-            let channel = MaxwellGpuChannel::new(
+            let channel = MaxwellChannelConfiguration::new(
                 MaxwellChannelId::new(state.next_gpu_channel_id),
                 MaxwellChannelOwner::new(process_id),
                 state.gpu_profile,
@@ -423,17 +394,22 @@ impl NvDrvSession {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .unbind_address_space(address_space.id());
             }
-            if let Some(syncpoint) = state
+            if let Some((channel, syncpoint)) = state
                 .nvhost_gpu
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .close(fd)
             {
-                state
-                    .nvhost_control
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .release_channel_syncpoint(syncpoint);
+                if let Some(backend) = &state.gpu_backend {
+                    backend.close_channel(channel);
+                }
+                if let Some(syncpoint) = syncpoint {
+                    state
+                        .nvhost_control
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .release_channel_syncpoint(syncpoint);
+                }
             }
             state
                 .nvhost_control

@@ -80,7 +80,7 @@ impl VulkanResidency {
         let index = self.device.begin_recording()?;
         self.barriers.emit(&mut self.device);
         unsafe {
-            self.device.owner.device.cmd_fill_buffer(
+            self.device.dispatch.cmd_fill_buffer(
                 self.device.submission.slots[index].command,
                 buffer,
                 offset,
@@ -308,7 +308,7 @@ impl VulkanResidency {
         self.barriers.emit(&mut self.device);
         let index = self.device.begin_recording()?;
         unsafe {
-            self.device.owner.device.cmd_clear_color_image(
+            self.device.dispatch.cmd_clear_color_image(
                 self.device.submission.slots[index].command,
                 image,
                 layout,
@@ -360,7 +360,7 @@ impl VulkanResidency {
         self.barriers.emit(&mut self.device);
         let index = self.device.begin_recording()?;
         unsafe {
-            self.device.owner.device.cmd_clear_depth_stencil_image(
+            self.device.dispatch.cmd_clear_depth_stencil_image(
                 self.device.submission.slots[index].command,
                 image,
                 layout,
@@ -451,7 +451,7 @@ impl VulkanResidency {
         self.barriers.emit(&mut self.device);
         let slot = self.device.begin_recording()?;
         unsafe {
-            self.device.owner.device.cmd_resolve_image(
+            self.device.dispatch.cmd_resolve_image(
                 self.device.submission.slots[slot].command,
                 source,
                 source_layout,
@@ -524,7 +524,7 @@ impl VulkanResidency {
                 })
                 .image_extent(extent);
             unsafe {
-                self.device.owner.device.cmd_copy_image_to_buffer(
+                self.device.dispatch.cmd_copy_image_to_buffer(
                     command,
                     handle,
                     read_layout,
@@ -552,7 +552,7 @@ impl VulkanResidency {
                 })
                 .image_extent(extent);
             unsafe {
-                self.device.owner.device.cmd_copy_buffer_to_image(
+                self.device.dispatch.cmd_copy_buffer_to_image(
                     command,
                     scratch.handle,
                     handle,
@@ -605,7 +605,7 @@ impl VulkanResidency {
         self.barriers.emit(&mut self.device);
         let index = self.device.begin_recording()?;
         unsafe {
-            self.device.owner.device.cmd_copy_image(
+            self.device.dispatch.cmd_copy_image(
                 self.device.submission.slots[index].command,
                 source_handle,
                 source_layout,

@@ -13,7 +13,6 @@ pub(crate) use lowering::MaxwellShaderBufferSize;
 pub(crate) mod memory_copy;
 mod spa;
 mod threed;
-pub(crate) use lowering::lower_maxwell_three_d_operation_into_cache;
 pub(crate) use threed::MaxwellThreeDFrontendState;
 mod twod;
 
@@ -47,7 +46,7 @@ pub use memory_copy::{
     MaxwellMemoryCopyOperation, MaxwellMemoryCopyRemap,
 };
 #[cfg(test)]
-use threed::resolve_maxwell_three_d_resources_for_roles_with_staged_writes;
+use threed::resolve_resource_roles;
 pub use threed::{
     MAXWELL_BIND_GROUP_COUNT, MAXWELL_COLOR_TARGET_COUNT, MAXWELL_CONSTANT_BUFFER_SLOT_COUNT,
     MAXWELL_PIPELINE_SHADER_COUNT, MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT,
@@ -58,8 +57,8 @@ pub use threed::{
     MAXWELL_THREE_D_PRIMITIVE_AREA_MAX, MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,
     MAXWELL_THREE_D_SM_TIMEOUT_COUNTER_BIT_MAX, MAXWELL_VERTEX_ATTRIBUTE_COUNT,
     MAXWELL_VERTEX_STREAM_COUNT, MAXWELL_VIEWPORT_COUNT, MAXWELL_WINDOW_CLIP_COUNT,
-    MaxwellLoweredWork, MaxwellLoweringCache, MaxwellLoweringError, MaxwellShaderStage,
-    MaxwellTessellationModeError, MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAlphaFraction,
+    MaxwellLoweringError, MaxwellShaderStage, MaxwellTessellationModeError,
+    MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAlphaFraction,
     MaxwellThreeDAlphaToCoverageDither, MaxwellThreeDAlphaToCoverageOverride,
     MaxwellThreeDAntiAliasedLineEnable, MaxwellThreeDApiMandatedEarlyZ,
     MaxwellThreeDAttachmentReadiness, MaxwellThreeDAttributeDefaultVector,
@@ -132,10 +131,9 @@ pub use threed::{
     MaxwellThreeDShaderBindingState, MaxwellThreeDShaderCacheInvalidation,
     MaxwellThreeDShaderExceptionsEnable, MaxwellThreeDShaderExecutionState,
     MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderLocalMemoryState,
-    MaxwellThreeDShaderResourceUse, MaxwellThreeDShaderWatermarkRange,
-    MaxwellThreeDShaderWatermarkTarget, MaxwellThreeDSingleRopControl,
-    MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState, MaxwellThreeDStencilOp,
-    MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
+    MaxwellThreeDShaderWatermarkRange, MaxwellThreeDShaderWatermarkTarget,
+    MaxwellThreeDSingleRopControl, MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState,
+    MaxwellThreeDStencilOp, MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
     MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationPlan,
     MaxwellThreeDSynchronizationTrigger, MaxwellThreeDSyncpointCondition,
     MaxwellThreeDSyncpointIncrement, MaxwellThreeDSystemMemoryVolatile,
@@ -145,8 +143,7 @@ pub use threed::{
     MaxwellThreeDTiledCacheState, MaxwellThreeDTiledCacheTileSize,
     MaxwellThreeDTiledCacheUnknownConfig, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
     MaxwellThreeDTirModulationComponentSelect, MaxwellThreeDTirModulationFunction,
-    MaxwellThreeDTranslatedShader, MaxwellThreeDTranslatedShaders, MaxwellThreeDUnorm8,
-    MaxwellThreeDUnresolvedAddress, MaxwellThreeDVafL2CacheControl,
+    MaxwellThreeDUnorm8, MaxwellThreeDUnresolvedAddress, MaxwellThreeDVafL2CacheControl,
     MaxwellThreeDVertexArrayPrimitiveRestartEnable, MaxwellThreeDVertexAssemblyState,
     MaxwellThreeDVertexAttributeFormat, MaxwellThreeDVertexComponentWidths,
     MaxwellThreeDVertexIdUsesArrayStart, MaxwellThreeDVertexInputState,
@@ -162,9 +159,8 @@ pub use threed::{
     MaxwellThreeDZCullEnable, MaxwellThreeDZCullRegionFormat, MaxwellThreeDZCullRegionId,
     MaxwellThreeDZCullRegionLocation, MaxwellThreeDZCullState, MaxwellThreeDZCullStatsEnable,
     MaxwellThreeDZCullStencilFunction, MaxwellThreeDZCullSubregion,
-    MaxwellThreeDZPassPixelCountEnable, lower_maxwell_three_d_operation,
-    lower_maxwell_three_d_synchronization, resolve_maxwell_three_d_resources,
-    resolve_maxwell_three_d_resources_for_roles,
+    MaxwellThreeDZPassPixelCountEnable, lower_maxwell_three_d_synchronization,
+    resolve_maxwell_three_d_resources, resolve_maxwell_three_d_resources_for_roles,
 };
 pub use twod::{
     MAXWELL_TWO_D_CORRAL_SIZE_MAX, MAXWELL_TWO_D_NOTIFY_ADDRESS_UPPER_MAX, MaxwellTwoDBeta1,
@@ -284,7 +280,8 @@ pub(crate) struct MaxwellEngineEvent<'a> {
     /// Present for direct class methods; MME-expanded 3D effects have no compute state.
     pub(crate) compute: Option<&'a MaxwellComputeState>,
     /// Original decoded payload, borrowed only until the ordered consumer returns.
-    pub(crate) inline_words: Option<&'a [crate::MaxwellDecodedMethod]>,
+    pub(crate) instances: Option<(u32, u32)>,
+    pub(crate) inline_words: Option<crate::MaxwellMethodSpan<'a>>,
 }
 
 /// One validated host synchronization at its exact pushbuffer source.
@@ -666,10 +663,77 @@ fn emit_pending_operation<E>(
     consume: &mut impl for<'a> FnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
 ) -> Result<(), E> {
     consume(MaxwellEngineEvent {
+        instances: None,
         operation,
         three_d,
         compute,
         inline_words: None,
+    })
+}
+
+fn flush_before_method<E>(
+    channel: &mut MaxwellGpuChannel,
+    source: MaxwellMethodSource,
+    consume: &mut impl for<'a> FnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
+) -> Result<(), MaxwellEngineStreamError<E>> {
+    let class = channel.frontend().subchannel_binding(source.subchannel());
+    let state = channel.three_d_mut();
+    let mut emit = |operation, state: &MaxwellThreeDState, instances| {
+        consume(MaxwellEngineEvent {
+            operation,
+            three_d: state,
+            compute: None,
+            inline_words: None,
+            instances,
+        })
+    };
+    if class == Some(threed::CLASS) {
+        threed::draw::before_method(state, source, &mut emit)
+    } else {
+        threed::draw::flush(state, &mut emit)
+    }
+    .map_err(MaxwellEngineStreamError::Consumer)
+}
+fn route_operation<E>(
+    channel: &mut MaxwellGpuChannel,
+    operation: PendingEngineOperation,
+    consume: &mut impl for<'a> FnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    if matches!(operation, PendingEngineOperation::ThreeD(_)) {
+        threed::draw::operation(
+            channel.three_d_mut(),
+            operation,
+            &mut |operation, state, instances| {
+                consume(MaxwellEngineEvent {
+                    operation,
+                    three_d: state,
+                    compute: None,
+                    inline_words: None,
+                    instances,
+                })
+            },
+        )
+    } else {
+        emit_pending_operation(
+            operation,
+            channel.three_d(),
+            Some(channel.compute()),
+            consume,
+        )
+    }
+}
+pub(crate) fn finish_maxwell_engine_stream<E>(
+    channel: &mut MaxwellGpuChannel,
+    consume: &mut impl for<'a> FnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    threed::draw::flush(channel.three_d_mut(), &mut |operation, state, instances| {
+        consume(MaxwellEngineEvent {
+            operation,
+            three_d: state,
+            compute: None,
+            inline_words: None,
+            instances,
+        })
     })
 }
 
@@ -689,6 +753,16 @@ pub(crate) fn stream_maxwell_engine_packet<E>(
     consume: &mut impl for<'a> FnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
 ) -> Result<(), MaxwellEngineStreamError<E>> {
     let mut methods = methods;
+    if let MaxwellDecodedPacket::Methods(packet) = packet
+        && let Some(first) = packet.methods().first()
+        && let Some(subchannel) = packet.subchannel()
+    {
+        flush_before_method(
+            channel,
+            MaxwellMethodSource::decoded(first, subchannel),
+            consume,
+        )?;
+    }
     if methods.is_none()
         && mme_methods.is_empty()
         && bulk::stream_packet(channel, submission, packet, consume)?
@@ -713,6 +787,7 @@ pub(crate) fn stream_maxwell_engine_packet<E>(
             }
             flush_mme_methods(channel, mme_methods, mme_parameters, &mut methods, consume)?;
         }
+        flush_before_method(channel, method.source(), consume)?;
         if let Some((_, source)) = channel.three_d_mut().pending_notification
             && (method.source().subchannel() != source.subchannel()
                 || (!matches!(method.kind(), MaxwellMethodDispatchKind::HostMethod(_))
@@ -774,13 +849,8 @@ pub(crate) fn stream_maxwell_engine_packet<E>(
             let applied = dispatch_class_method(channel, method)
                 .map_err(MaxwellEngineStreamError::dispatch)?;
             if let Some(operation) = applied.operation {
-                emit_pending_operation(
-                    operation,
-                    channel.three_d(),
-                    Some(channel.compute()),
-                    consume,
-                )
-                .map_err(MaxwellEngineStreamError::Consumer)?;
+                route_operation(channel, operation, consume)
+                    .map_err(MaxwellEngineStreamError::Consumer)?;
                 channel.three_d_mut().complete_inline_draw();
             }
             if let Some(methods) = methods.as_deref_mut() {
@@ -796,6 +866,10 @@ pub(crate) fn stream_maxwell_engine_packet<E>(
         MaxwellMethodStreamError::Consumer(error) => error,
     })?;
     flush_mme_methods(channel, mme_methods, mme_parameters, &mut methods, consume)?;
+    // A packet is also the command-source fetch boundary. Complete an instance
+    // run before fetching another packet, which may synchronize and replace
+    // captured command storage. MME loops still form one native instanced draw.
+    finish_maxwell_engine_stream(channel, consume).map_err(MaxwellEngineStreamError::Consumer)?;
     // Maxwell register programming is not transactional across pushbuffer
     // packets. Related address, limit, format, and selector fields may form an
     // inconsistent intermediate snapshot while the guest moves from one valid
@@ -822,7 +896,15 @@ fn flush_mme_methods<E>(
         parameters,
         state,
         methods.as_deref_mut(),
-        &mut |operation, state| emit_pending_operation(operation, state, None, consume),
+        &mut |operation, state, instances| {
+            consume(MaxwellEngineEvent {
+                operation,
+                three_d: state,
+                compute: None,
+                inline_words: None,
+                instances,
+            })
+        },
     )
     .map_err(|error| match error {
         threed::MaxwellThreeDMmePreflightError::Dispatch(error) => {

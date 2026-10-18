@@ -26,8 +26,9 @@ pub(super) fn select_present_mode(
     }
 }
 
-/// Only read-only timeline queries cross the graphics-owner boundary.
+/// Native scheduling synchronization crosses the owner boundary without guest reads.
 struct Context {
+    recording: crate::dispatch::RecordingHandle,
     owner: Arc<DeviceOwner>,
     queues: crate::device::QueueSelection,
     timeline: vk::Semaphore,
@@ -37,10 +38,12 @@ struct Context {
 }
 impl Context {
     fn completed(&self) -> Result<u64, VulkanError> {
+        self.recording.check_failure()?;
         unsafe { self.owner.device.get_semaphore_counter_value(self.timeline) }
             .map_err(|e| VulkanError::vk("WSI graphics completion", e))
     }
     fn wait(&self, work: WorkTicket) -> Result<(), VulkanError> {
+        self.recording.finish()?;
         let semaphores = [self.timeline];
         let values = [work.tick()];
         let info = vk::SemaphoreWaitInfo::default()
@@ -484,7 +487,17 @@ impl Swapchains {
             .swapchains(&chains)
             .image_indices(&indices)
             .push_next(&mut release);
-        let result = unsafe { chain.loader.queue_present(self.present_queue, &info) };
+        // Binary WSI waits require an already submitted signal operation.
+        // This runs on the presenter; command preparation remains asynchronous.
+        device.recording.finish()?;
+        let result = {
+            let _queue = device
+                .owner
+                .queue_mutex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            unsafe { chain.loader.queue_present(self.present_queue, &info) }
+        };
         // OOM does not enqueue or consume the wait semaphore. Keep acquisition
         // for explicit release after graphics completion, not a never-signaled
         // presentation fence. Out-of-date/surface-lost do enqueue their waits.
@@ -607,6 +620,7 @@ impl Presenter {
             return Err(error);
         }
         let context = Context {
+            recording: device.dispatch.recording_handle(),
             owner: Arc::clone(&device.owner),
             queues: crate::device::QueueSelection {
                 graphics_compute_family: device.queues().graphics_compute_family,

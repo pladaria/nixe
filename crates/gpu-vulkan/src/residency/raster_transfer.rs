@@ -105,7 +105,7 @@ impl VulkanResidency {
             .clear_value(value);
         unsafe {
             self.device.dispatch.begin_rendering(command, &info);
-            self.device.owner.device.cmd_clear_attachments(
+            self.device.dispatch.cmd_clear_attachments(
                 command,
                 &[clear],
                 &[vk::ClearRect::default()
@@ -236,7 +236,7 @@ impl VulkanResidency {
         self.barriers.emit(&mut self.device);
         let slot = self.device.begin_recording()?;
         unsafe {
-            self.device.owner.device.cmd_blit_image(
+            self.device.dispatch.cmd_blit_image(
                 self.device.submission.slots[slot].command,
                 source,
                 src_layout,

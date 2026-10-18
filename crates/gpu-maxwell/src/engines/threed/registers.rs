@@ -249,10 +249,14 @@ pub(in crate::engines) fn constant_buffer_words(
     profile: &MaxwellGpuProfile,
     candidate: &mut MaxwellThreeDFrontendState,
     subchannel: crate::MaxwellPushbufferSubchannel,
-    words: &[crate::MaxwellDecodedMethod],
+    words: crate::MaxwellMethodSpan<'_>,
 ) -> Result<(MaxwellThreeDInlineConstantBufferUpload, usize), MaxwellEngineDispatchError> {
-    materialize(profile, candidate, dependencies(words[0].method()))?;
-    let first = crate::MaxwellMethodSource::decoded(words[0], subchannel);
+    materialize(
+        profile,
+        candidate,
+        dependencies(words.first().unwrap().method()),
+    )?;
+    let first = crate::MaxwellMethodSource::decoded(words.first().unwrap(), subchannel);
     let (_, _, upload) =
         preflight_constant_buffer_load(first, candidate)?.expect("CB data aperture");
     let upload = upload.expect("CB data produces an upload");
@@ -268,7 +272,7 @@ pub(in crate::engines) fn constant_buffer_words(
         u64::from(size - offset).min((1_u64 << 40) - upload.address().get() - u64::from(offset));
     let count = words.len().min((available / 4) as usize);
     debug_assert!(count != 0);
-    let last = crate::MaxwellMethodSource::decoded(words[count - 1], subchannel);
+    let last = crate::MaxwellMethodSource::decoded(words.get(count - 1).unwrap(), subchannel);
     candidate.apply(
         MaxwellThreeDStateWrite::ShaderBinding(
             MaxwellThreeDShaderBindingWrite::ConstantBufferLoadData {
@@ -280,15 +284,10 @@ pub(in crate::engines) fn constant_buffer_words(
         true,
     );
     let control = candidate.mme().shadow_ram_control().value().copied();
-    let mut recorded = 0_u32;
-    for word in words[..count].iter().rev() {
-        let bit = 1 << ((word.method().0 - 0x2390) / 4);
-        if recorded & bit == 0 {
-            let source = crate::MaxwellMethodSource::decoded(*word, subchannel);
-            candidate.record_raw_register(source);
-            candidate.mme_mut().track_shadow_register(control, source);
-            recorded |= bit;
-        }
+    for word in words.slice(..count).last_writes() {
+        let source = crate::MaxwellMethodSource::decoded(word, subchannel);
+        candidate.record_raw_register(source);
+        candidate.mme_mut().track_shadow_register(control, source);
     }
     Ok((upload, count))
 }
@@ -297,7 +296,7 @@ pub(in crate::engines) fn embedded_words(
     profile: &MaxwellGpuProfile,
     candidate: &mut MaxwellThreeDFrontendState,
     subchannel: crate::MaxwellPushbufferSubchannel,
-    words: &[crate::MaxwellDecodedMethod],
+    words: crate::MaxwellMethodSpan<'_>,
 ) -> Result<(MaxwellInlineToMemoryUpload, usize), MaxwellEngineDispatchError> {
     materialize(profile, candidate, 1 << 1)?;
     let count = words.len().min(
@@ -306,13 +305,13 @@ pub(in crate::engines) fn embedded_words(
             .inline_to_memory()
             .pending_words(),
     );
-    let first = crate::MaxwellMethodSource::decoded(words[0], subchannel);
+    let first = crate::MaxwellMethodSource::decoded(words.first().unwrap(), subchannel);
     let (_, _, upload) =
         inline_to_memory::preflight(first, candidate.operation_state().inline_to_memory())?
             .expect("embedded inline data");
     let upload = upload.expect("embedded inline data produces an upload");
     debug_assert!(count != 0);
-    let last = crate::MaxwellMethodSource::decoded(words[count - 1], subchannel);
+    let last = crate::MaxwellMethodSource::decoded(words.get(count - 1).unwrap(), subchannel);
     candidate.apply(
         MaxwellThreeDStateWrite::InlineToMemory(MaxwellThreeDInlineToMemoryStateWrite::Data {
             value: last.argument(),

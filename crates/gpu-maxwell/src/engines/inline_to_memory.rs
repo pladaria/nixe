@@ -815,9 +815,9 @@ fn invalid_encoding(
 pub(super) fn data_words(
     candidate: &mut MaxwellInlineToMemoryState,
     subchannel: crate::MaxwellPushbufferSubchannel,
-    words: &[crate::MaxwellDecodedMethod],
+    words: crate::MaxwellMethodSpan<'_>,
 ) -> Result<(MaxwellInlineToMemoryUpload, usize), MaxwellEngineDispatchError> {
-    let source = MaxwellMethodSource::decoded(words[0], subchannel);
+    let source = MaxwellMethodSource::decoded(words.first().unwrap(), subchannel);
     let pending = candidate.pending();
     let applied = preflight(
         MaxwellMethodDispatch::emitted_by_mme(source, CLASS),
@@ -835,7 +835,7 @@ pub(super) fn data_words(
     };
     let count = words.len().min((remaining.min(contiguous) / 4) as usize);
     debug_assert!(count != 0);
-    let last = MaxwellMethodSource::decoded(words[count - 1], subchannel);
+    let last = MaxwellMethodSource::decoded(words.get(count - 1).unwrap(), subchannel);
     candidate.apply(MaxwellInlineToMemoryStateWrite::Data {
         value: last.argument(),
         next_offset: pending.next_offset + count as u32 * 4,

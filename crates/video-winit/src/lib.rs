@@ -17,22 +17,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use nixe_config::WindowState;
-use nixe_gpu_wgpu::{WgpuPresentationContext, WgpuQueueAccess, resident_texture};
 use nixe_input::{
     EmulatedTouchContact, TOUCH_SCREEN_HEIGHT, TOUCH_SCREEN_WIDTH, TouchScreenReader,
     TouchScreenWriter, touch_screen_channel,
 };
 use nixe_video::{FrameMailbox, FrameNotifier, PresentationFrame};
-use wgpu::{
-    Backend, BindGroup, BindGroupLayout, Buffer, BufferDescriptor, BufferUsages, Color,
-    ColorTargetState, ColorWrites, CommandEncoderDescriptor, CurrentSurfaceTexture, Device,
-    FilterMode, FragmentState, Instance, LoadOp, MipmapFilterMode, Operations,
-    PipelineCompilationOptions, PipelineLayoutDescriptor, PresentMode, PrimitiveState, Queue,
-    RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
-    Sampler, SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor, ShaderSource,
-    ShaderStages, StoreOp, Surface, SurfaceConfiguration, TextureFormat, TextureSampleType,
-    TextureViewDescriptor, TextureViewDimension, VertexState,
-};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, Touch, TouchPhase, WindowEvent};
@@ -145,8 +134,6 @@ impl WindowFrontend {
                 stop_requested,
                 worker_completion: Arc::clone(&worker_completion),
                 frame_wakeup_pending,
-                context: None,
-                vsync: true,
                 pause_handler: None,
                 pause_key_down: false,
                 presenter: None,
@@ -184,20 +171,6 @@ impl WindowFrontend {
         self.touch_screen
             .take()
             .expect("window frontend touch-screen reader is taken only once")
-    }
-
-    /// Binds the one accelerated WGPU context before entering the event loop.
-    #[must_use]
-    pub fn with_gpu_context(mut self, context: WgpuPresentationContext) -> Self {
-        self.application.context = Some(context);
-        self
-    }
-
-    /// Selects host vertical synchronization before creating the presenter.
-    #[must_use]
-    pub fn with_vsync(mut self, vsync: bool) -> Self {
-        self.application.vsync = vsync;
-        self
     }
 
     /// Routes host pause requests to the emulation owner.
@@ -259,475 +232,6 @@ struct PresenterState {
     keyboard_redraw_at: Instant,
     screenshots: Option<screenshot::Screenshots>,
 }
-struct LegacyPresenter {
-    common: PresenterState,
-    instance: Instance,
-    surface: Surface<'static>,
-    device: Device,
-    queue: Queue,
-    queue_access: WgpuQueueAccess,
-    surface_configuration: SurfaceConfiguration,
-    bind_group_layout: BindGroupLayout,
-    sampler: Sampler,
-    pipeline: RenderPipeline,
-    sampling_buffer: Buffer,
-    frame_bind_group: Option<BindGroup>,
-    pending_frame: Option<Arc<PresentationFrame>>,
-    backend: nixe_gpu::BackendInstanceId,
-    configured: bool,
-    surface_reconfigure_pending: bool,
-}
-
-impl LegacyPresenter {
-    fn new(
-        window: Arc<Window>,
-        context: WgpuPresentationContext,
-        vsync: bool,
-    ) -> Result<Self, WindowError> {
-        let instance = context.instance().clone();
-        let surface = instance
-            .create_surface(Arc::clone(&window))
-            .map_err(WindowError::surface)?;
-        let adapter = context.adapter();
-        let adapter_info = adapter.get_info();
-        let backend_name = backend_name(adapter_info.backend);
-        log::info!(
-            "{backend_name} presenter sharing accelerated device {} ({})",
-            adapter_info.name,
-            adapter_info.driver
-        );
-        let device = context.device().clone();
-        let queue = context.queue().clone();
-        let queue_access = context.queue_access().clone();
-        let size = window.inner_size();
-        let mut surface_configuration = surface
-            .get_default_config(adapter, size.width.max(1), size.height.max(1))
-            .ok_or_else(WindowError::unsupported_surface)?;
-        // Guest presentation images currently carry display-ready UNORM bytes.
-        // Prefer a UNORM surface so WGPU does not apply an implicit sRGB encode
-        // and brighten the image during the final presentation pass.
-        if let Some(format) = surface
-            .get_capabilities(adapter)
-            .formats
-            .into_iter()
-            .find(|format| {
-                matches!(
-                    format,
-                    TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm
-                )
-            })
-        {
-            surface_configuration.format = format;
-        }
-        surface_configuration.present_mode = if vsync {
-            PresentMode::Fifo
-        } else {
-            PresentMode::Immediate
-        };
-        if !surface
-            .get_capabilities(adapter)
-            .present_modes
-            .contains(&surface_configuration.present_mode)
-        {
-            return Err(WindowError::device(
-                "surface does not support the requested VSync presentation mode",
-            ));
-        }
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Nixe frame bind group layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(32),
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let sampler = device.create_sampler(&SamplerDescriptor {
-            label: Some("Nixe nearest-neighbour sampler"),
-            mag_filter: FilterMode::Nearest,
-            min_filter: FilterMode::Nearest,
-            mipmap_filter: MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-        let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("Nixe frame presentation shader"),
-            source: ShaderSource::Wgsl(include_str!("present.wgsl").into()),
-        });
-        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: Some("Nixe frame pipeline layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("Nixe frame presentation pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: VertexState {
-                module: &shader,
-                entry_point: Some("vertex_main"),
-                compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[],
-            },
-            primitive: PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(FragmentState {
-                module: &shader,
-                entry_point: Some("fragment_main"),
-                compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(ColorTargetState {
-                    format: surface_configuration.format,
-                    blend: None,
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let sampling_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("Nixe frame sampling parameters"),
-            size: 32,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut presenter = Self {
-            common: PresenterState::new(window, backend_name),
-            instance,
-            surface,
-            device,
-            queue,
-            queue_access,
-            surface_configuration,
-            bind_group_layout,
-            sampler,
-            pipeline,
-            sampling_buffer,
-            frame_bind_group: None,
-            pending_frame: None,
-            backend: context.backend(),
-            configured: false,
-            surface_reconfigure_pending: false,
-        };
-        presenter.resize(size.width, size.height);
-        presenter.common.update_title();
-        Ok(presenter)
-    }
-
-    fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            self.configured = false;
-            self.surface_reconfigure_pending = false;
-            return;
-        }
-        if (self.configured || self.surface_reconfigure_pending)
-            && self.surface_configuration.width == width
-            && self.surface_configuration.height == height
-        {
-            return;
-        }
-        self.surface_configuration.width = width;
-        self.surface_configuration.height = height;
-        self.surface_reconfigure_pending = true;
-    }
-
-    fn resize_to_frame(&mut self) {
-        let Some((width, height)) = self.common.frame_dimensions else {
-            return;
-        };
-        let minimum =
-            LogicalSize::new(320.0, 180.0).to_physical::<u32>(self.common.window.scale_factor());
-        self.common
-            .window
-            .set_min_inner_size(Some(PhysicalSize::new(
-                minimum.width.min(width),
-                minimum.height.min(height),
-            )));
-        if let Some(size) = self
-            .common
-            .window
-            .request_inner_size(PhysicalSize::new(width, height))
-        {
-            self.resize(size.width, size.height);
-            self.common.window.request_redraw();
-        }
-    }
-
-    fn configure_surface_if_pending(&mut self) {
-        if !self.surface_reconfigure_pending {
-            return;
-        }
-        let _queue_access = self.queue_access.lock();
-        self.surface
-            .configure(&self.device, &self.surface_configuration);
-        self.configured = true;
-        self.surface_reconfigure_pending = false;
-    }
-
-    fn recreate_surface(&mut self) -> Result<(), WindowError> {
-        self.surface = self
-            .instance
-            .create_surface(Arc::clone(&self.common.window))
-            .map_err(WindowError::surface)?;
-        self.configured = false;
-        self.surface_reconfigure_pending = true;
-        Ok(())
-    }
-
-    fn bind_frame(&mut self, frame: Arc<PresentationFrame>) -> Result<(), WindowError> {
-        let image = frame.image();
-        if image.backend() != self.backend {
-            return Err(WindowError::resident(
-                "resident frame belongs to a different GPU backend instance",
-            ));
-        }
-        let texture = resident_texture(image).ok_or_else(|| {
-            WindowError::resident("resident frame payload is not owned by the WGPU backend")
-        })?;
-        // Scanout consumes encoded framebuffer bytes. Sampling an sRGB view
-        // would decode them a second time before writing our UNORM surface.
-        let view = texture.create_view(&TextureViewDescriptor {
-            format: Some(texture.format().remove_srgb_suffix()),
-            ..Default::default()
-        });
-        self.frame_bind_group = Some(self.create_frame_bind_group(&view));
-        self.common.frame_dimensions = Some((frame.width(), frame.height()));
-        let extent = image.description().extent();
-        let crop = frame.crop();
-        self.write_sampling(
-            [
-                crop.left as f32 / extent.width as f32,
-                crop.top as f32 / extent.height as f32,
-                crop.width as f32 / extent.width as f32,
-                crop.height as f32 / extent.height as f32,
-            ],
-            u32::from(frame.transform().flip_horizontal)
-                | (u32::from(frame.transform().flip_vertical) << 1)
-                | (u32::from(frame.transform().rotate_90_clockwise) << 2),
-        );
-        self.pending_frame = Some(frame);
-        Ok(())
-    }
-
-    fn touch_position(&self, position: PhysicalPosition<f64>) -> Option<(u32, u32)> {
-        let viewport = letterbox_viewport(
-            self.common
-                .frame_dimensions
-                .unwrap_or((TOUCH_SCREEN_WIDTH, TOUCH_SCREEN_HEIGHT)),
-            (
-                self.surface_configuration.width,
-                self.surface_configuration.height,
-            ),
-        );
-        map_touch_position(position, viewport)
-    }
-
-    fn create_frame_bind_group(&self, view: &wgpu::TextureView) -> BindGroup {
-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Nixe presentation image bind group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.sampling_buffer.as_entire_binding(),
-                },
-            ],
-        })
-    }
-
-    fn write_sampling(&self, crop: [f32; 4], transform: u32) {
-        let parameters = [
-            crop[0].to_bits(),
-            crop[1].to_bits(),
-            crop[2].to_bits(),
-            crop[3].to_bits(),
-            transform,
-            0,
-            0,
-            0,
-        ];
-        let _queue_access = self.queue_access.lock();
-        self.queue
-            .write_buffer(&self.sampling_buffer, 0, bytemuck::cast_slice(&parameters));
-    }
-
-    fn redraw(&mut self) -> Result<(), WindowError> {
-        self.configure_surface_if_pending();
-        if !self.configured {
-            return Ok(());
-        }
-        let (surface_texture, reconfigure_after_present) = match self.surface.get_current_texture()
-        {
-            CurrentSurfaceTexture::Success(texture) => (texture, false),
-            CurrentSurfaceTexture::Suboptimal(texture) => (texture, true),
-            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return Ok(()),
-            CurrentSurfaceTexture::Outdated => {
-                self.surface_reconfigure_pending = true;
-                self.common.window.request_redraw();
-                return Ok(());
-            }
-            CurrentSurfaceTexture::Lost => {
-                self.recreate_surface()?;
-                self.common.window.request_redraw();
-                return Ok(());
-            }
-            CurrentSurfaceTexture::Validation => {
-                return Err(WindowError::surface("surface texture validation failed"));
-            }
-        };
-        let view = surface_texture
-            .texture
-            .create_view(&TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("Nixe presentation command encoder"),
-            });
-        {
-            let attachments = [Some(RenderPassColorAttachment {
-                view: &view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: Operations {
-                    load: LoadOp::Clear(Color::BLACK),
-                    store: StoreOp::Store,
-                },
-            })];
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("Nixe frame presentation pass"),
-                color_attachments: &attachments,
-                ..Default::default()
-            });
-            if let (Some(frame_dimensions), Some(frame_bind_group)) =
-                (self.common.frame_dimensions, self.frame_bind_group.as_ref())
-                && !self
-                    .common
-                    .keyboard
-                    .as_ref()
-                    .is_some_and(keyboard::KeyboardOverlay::active)
-            {
-                let viewport = letterbox_viewport(
-                    frame_dimensions,
-                    (
-                        self.surface_configuration.width,
-                        self.surface_configuration.height,
-                    ),
-                );
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, frame_bind_group, &[]);
-                pass.set_viewport(
-                    viewport.x,
-                    viewport.y,
-                    viewport.width,
-                    viewport.height,
-                    0.0,
-                    1.0,
-                );
-                pass.draw(0..3, 0..1);
-            }
-        }
-        // egui uploads share the accelerated queue's synchronization boundary.
-        let ui_active = self
-            .common
-            .keyboard
-            .as_ref()
-            .is_some_and(keyboard::KeyboardOverlay::active);
-        let _ui_queue_access = ui_active.then(|| self.queue_access.lock());
-        if ui_active {
-            self.common.keyboard.as_mut().unwrap().encode(
-                self.common.keyboard_host.as_ref().unwrap(),
-                &self.common.window,
-                &self.device,
-                &self.queue,
-                &mut encoder,
-                &view,
-            );
-        }
-        // Encode only while the source frame lease is held. Requests made
-        // between frames wait for the next fresh frame, never sample a released
-        // swapchain image that the guest may already be rewriting.
-        let capture = if self.pending_frame.is_some() {
-            self.common.screenshots.as_mut().and_then(|screenshots| {
-                screenshots.encode(
-                    &self.device,
-                    &mut encoder,
-                    self.pending_frame.as_ref().expect("source frame lease"),
-                )
-            })
-        } else {
-            None
-        };
-        let submission;
-        {
-            let _queue_access = (!ui_active).then(|| self.queue_access.lock());
-            submission = self.queue.submit([encoder.finish()]);
-            self.queue.present(surface_texture);
-        }
-        #[cfg(feature = "performance-counters")]
-        if self.pending_frame.is_some() {
-            metrics::presented();
-        }
-        self.pending_frame = None;
-        if let Some(capture) = capture {
-            self.common
-                .screenshots
-                .as_mut()
-                .expect("capture requested")
-                .save(self.device.clone(), submission, capture);
-        }
-        drop(_ui_queue_access);
-        // AM completion can wake guest CPU work; never invoke it under the GPU queue lock.
-        if let Some(keyboard) = &mut self.common.keyboard {
-            keyboard.dispatch_submission();
-        }
-        if ui_active {
-            self.common.keyboard_redraw_at = Instant::now() + Duration::from_millis(16);
-        }
-        let now = Instant::now();
-        self.refresh_title(now);
-        if reconfigure_after_present {
-            self.surface_reconfigure_pending = true;
-            self.common.window.request_redraw();
-        }
-        Ok(())
-    }
-
-    fn refresh_title(&mut self, now: Instant) {
-        if self.common.frame_rate.refresh(now) {
-            self.common.update_title();
-        }
-    }
-}
-
 const TITLE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const FRAME_RATE_SMOOTHING_WEIGHT: f64 = 0.35;
 
@@ -775,17 +279,6 @@ impl FrameRateTracker {
 
     fn next_refresh(self) -> Instant {
         self.sample_started + TITLE_REFRESH_INTERVAL
-    }
-}
-
-const fn backend_name(backend: Backend) -> &'static str {
-    match backend {
-        Backend::Vulkan => "Vulkan",
-        Backend::Metal => "Metal",
-        Backend::Dx12 => "Direct3D 12",
-        Backend::Gl => "OpenGL",
-        Backend::BrowserWebGpu => "WebGPU",
-        Backend::Noop => "Noop",
     }
 }
 
@@ -937,8 +430,6 @@ struct PresenterApplication {
     stop_requested: Arc<AtomicBool>,
     worker_completion: Arc<WorkerCompletionState>,
     frame_wakeup_pending: Arc<AtomicBool>,
-    context: Option<WgpuPresentationContext>,
-    vsync: bool,
     pause_handler: Option<PauseHandler>,
     pause_key_down: bool,
     presenter: Option<Presenter>,
@@ -1003,38 +494,11 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
         if self.presenter.is_some() || self.failure.is_some() {
             return;
         }
-        let mut attributes = WindowAttributes::default()
-            .with_title("Nixe")
-            .with_inner_size(LogicalSize::new(1280.0, 720.0))
-            .with_min_inner_size(LogicalSize::new(320.0, 180.0));
-        if let Some(state) = self.initial_window_state {
-            attributes = attributes.with_inner_size(PhysicalSize::new(state.width, state.height));
-            if let Some((x, y)) = state.position {
-                attributes = attributes.with_position(PhysicalPosition::new(x, y));
-            }
-        }
-        let result = (|| {
-            let window = Arc::new(
-                event_loop
-                    .create_window(attributes)
-                    .map_err(WindowError::window)?,
-            );
-            let context = self.context.take().ok_or_else(|| {
-                WindowError::device("accelerated presentation context was not configured")
-            })?;
-            let mut presenter = Presenter::new(window, context, self.vsync)?;
-            presenter.screenshots = self.screenshots.take();
-            self.presenter = Some(presenter);
-            self.capture_window_state();
-            if let Some(presenter) = &self.presenter {
-                presenter.window.request_redraw();
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            self.failure = Some(error);
-            self.stop_requested.store(true, Ordering::Release);
-        }
+        self.failure = Some(WindowError::new(
+            "Vulkan startup",
+            "window device was not initialized",
+        ));
+        self.stop_requested.store(true, Ordering::Release);
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: FrontendEvent) {
@@ -1125,7 +589,7 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                             presenter.update_title();
                         }
                         Err(error) => {
-                            self.failure = Some(WindowError::device(error));
+                            self.failure = Some(WindowError::new("pause control", error));
                             self.stop_requested.store(true, Ordering::Release);
                         }
                     }
@@ -1144,7 +608,7 @@ impl ApplicationHandler<FrontendEvent> for PresenterApplication {
                 event_loop.exit();
             }
             WindowEvent::Occluded(occluded) => {
-                if let Some(Presenter::Native(presenter)) = &mut self.presenter {
+                if let Some(presenter) = &mut self.presenter {
                     presenter.set_occluded(occluded);
                     if let Some(presenter) = &self.presenter {
                         presenter.window.request_redraw();
@@ -1343,25 +807,6 @@ impl WindowError {
         Self::new("window creation", error)
     }
 
-    fn device(error: impl Display) -> Self {
-        Self::new("WGPU device binding", error)
-    }
-
-    fn resident(error: impl Display) -> Self {
-        Self::new("resident image presentation", error)
-    }
-
-    fn surface(error: impl Display) -> Self {
-        Self::new("WGPU surface", error)
-    }
-
-    fn unsupported_surface() -> Self {
-        Self::new(
-            "WGPU surface configuration",
-            "the selected adapter cannot present to the window",
-        )
-    }
-
     fn new(stage: &'static str, error: impl Display) -> Self {
         Self {
             stage,
@@ -1467,16 +912,6 @@ mod tests {
             tracker.next_refresh(),
             started + Duration::from_millis(1500)
         );
-    }
-
-    #[test]
-    fn every_wgpu_backend_has_a_stable_display_name() {
-        assert_eq!(backend_name(Backend::Vulkan), "Vulkan");
-        assert_eq!(backend_name(Backend::Metal), "Metal");
-        assert_eq!(backend_name(Backend::Dx12), "Direct3D 12");
-        assert_eq!(backend_name(Backend::Gl), "OpenGL");
-        assert_eq!(backend_name(Backend::BrowserWebGpu), "WebGPU");
-        assert_eq!(backend_name(Backend::Noop), "Noop");
     }
 
     #[test]

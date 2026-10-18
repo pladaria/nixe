@@ -13,8 +13,7 @@ use nixe_gpu::{FrontendSubmissionId, GuestTimelinePoint, ReservedTimelinePoint};
 use crate::{
     MaxwellAddressSpaceId, MaxwellChannelId, MaxwellChannelSchedulingPolicy,
     MaxwellFrontendDispatchError, MaxwellGpfifoCapture, MaxwellGpfifoSourceError,
-    MaxwellGpfifoSourceLocation, MaxwellGpuAddressSpace, MaxwellGpuChannel,
-    MaxwellValidatedGpfifoSubmission,
+    MaxwellGpfifoSourceLocation, MaxwellGpuAddressSpace, MaxwellValidatedGpfifoSubmission,
 };
 
 /// Global acceptance order assigned by one deterministic scheduler.
@@ -360,7 +359,7 @@ impl MaxwellScheduler {
     /// collection allocation or discover a mode mismatch.
     pub fn prepare_enqueue(
         &mut self,
-        channel: &MaxwellGpuChannel,
+        channel: &crate::MaxwellChannelConfiguration,
         submission: &MaxwellValidatedGpfifoSubmission,
         dependency: Option<GuestTimelinePoint>,
         will_reserve_completion: bool,
@@ -381,7 +380,7 @@ impl MaxwellScheduler {
     /// Enqueues complete work without reading commands or claiming progress.
     pub fn enqueue(
         &mut self,
-        channel: &MaxwellGpuChannel,
+        channel: &crate::MaxwellChannelConfiguration,
         submission: MaxwellValidatedGpfifoSubmission,
         dependency: Option<GuestTimelinePoint>,
         completion: Option<ReservedTimelinePoint>,
@@ -465,7 +464,7 @@ impl MaxwellScheduler {
 
     fn validate_enqueue(
         &self,
-        channel: &MaxwellGpuChannel,
+        channel: &crate::MaxwellChannelConfiguration,
         submission: &MaxwellValidatedGpfifoSubmission,
         dependency: Option<GuestTimelinePoint>,
         completion: Option<&ReservedTimelinePoint>,
@@ -481,7 +480,7 @@ impl MaxwellScheduler {
 
     fn validate_shape(
         &self,
-        channel: &MaxwellGpuChannel,
+        channel: &crate::MaxwellChannelConfiguration,
         submission: &MaxwellValidatedGpfifoSubmission,
         dependency: Option<GuestTimelinePoint>,
         has_completion: bool,
@@ -522,6 +521,7 @@ impl MaxwellScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MaxwellGpuChannel;
     use crate::{
         MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
         MaxwellChannelOwner, MaxwellGpfifoSubmitRequest, MaxwellMapRequest, SWITCH_1_GM20B_PROFILE,
@@ -598,7 +598,7 @@ mod tests {
     }
 
     fn submission(
-        channel: &MaxwellGpuChannel,
+        channel: &crate::MaxwellChannelConfiguration,
         address_space: &MaxwellGpuAddressSpace,
         frontend: u64,
     ) -> MaxwellValidatedGpfifoSubmission {
@@ -625,7 +625,7 @@ mod tests {
     }
 
     fn empty_submission(
-        channel: &MaxwellGpuChannel,
+        channel: &crate::MaxwellChannelConfiguration,
         address_space: &MaxwellGpuAddressSpace,
         frontend: u64,
     ) -> MaxwellValidatedGpfifoSubmission {

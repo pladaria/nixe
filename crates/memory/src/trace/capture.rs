@@ -16,7 +16,6 @@ const EVENTS_PER_THREAD: usize = 1_048_576;
 static CAPTURE: OnceLock<Capture> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static FRAMES_ONLY: AtomicBool = AtomicBool::new(false);
-static FORCE_INTERVAL_ONE: AtomicBool = AtomicBool::new(false);
 thread_local! {
     static BUFFER: RefCell<Option<Arc<Mutex<Buffer>>>> = const { RefCell::new(None) };
 }
@@ -48,10 +47,6 @@ struct Event {
 pub fn start() -> io::Result<()> {
     FRAMES_ONLY.store(
         std::env::var_os("NIXE_EXECUTION_TRACE_FRAMES_ONLY").is_some_and(|v| v == "1"),
-        Ordering::Relaxed,
-    );
-    FORCE_INTERVAL_ONE.store(
-        std::env::var_os("NIXE_TEST_SWAP_INTERVAL").is_some_and(|v| v == "1"),
         Ordering::Relaxed,
     );
     let Some(path) = std::env::var_os("NIXE_EXECUTION_TRACE") else {
@@ -89,18 +84,12 @@ pub fn start() -> io::Result<()> {
         })
         .map_err(|_| io::Error::other("execution capture already started"))?;
     ACTIVE.store(true, Ordering::Release);
+    let unix_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos() as u64;
+    event("clock_sync", unix_ns, 0, 0);
     Ok(())
-}
-
-/// Explicit benchmark override, unavailable in ordinary builds. Keep the
-/// requested interval in the trace; this is not a guest compatibility policy.
-#[inline]
-pub fn presentation_interval(requested: u32) -> u32 {
-    if requested == 2 && FORCE_INTERVAL_ONE.load(Ordering::Relaxed) {
-        1
-    } else {
-        requested
-    }
 }
 
 fn now(detailed: bool) -> Option<u64> {
@@ -161,11 +150,18 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
         && !matches!(
             name,
             "host_present"
+                | "clock_sync"
+                | "mme_upload"
+                | "mme_start"
+                | "mme_program"
+                | "frame_work"
+                | "frame_queue"
                 | "queue_buffer"
                 | "requested_interval"
                 | "vi_latch"
                 | "buffer_release"
-                | "vi_eligible"
+                | "vi_acquire"
+                | "frame_ready"
         )
     {
         return;

@@ -75,17 +75,11 @@ parallel_vcpus = true
 vsync = false
 
 [gpu]
-# Maximum working set retained by each shader cache. Entries are evicted by
-# least-recent use; this is a software budget rather than a hardware limit.
-# Values below six are rejected because one complete pipeline must fit.
+# Nonzero limits for native shader, pipeline and immutable descriptor caches.
 shader_cache_entries = 4096
-# Maximum number of neutral Maxwell pipelines retained in memory.
 pipeline_cache_entries = 8192
-# Maximum host-specialized WGPU variants retained for one neutral pipeline.
-pipeline_variants_per_resource = 256
-# Maximum host bind groups retained for one neutral descriptor table.
-bind_groups_per_descriptor_table = 64
-# Maximum accepted and persisted WGPU driver pipeline-cache size.
+descriptor_sets = 4096
+# Maximum size of a persisted native cache when disk persistence is configured.
 persistent_pipeline_cache_mib = 256
 
 # Use `cargo cli input` to get your controller's SDL gamepad information

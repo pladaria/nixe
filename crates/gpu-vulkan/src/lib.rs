@@ -41,9 +41,6 @@ pub use profile::{
 pub use queue::{QueueConfiguration, QueueUsage, ReadbackTicket, RecordingStatistics, WorkTicket};
 pub use validation::{ValidationMode, ValidationMonitor};
 
-#[cfg(test)]
-mod shader_tests;
-
 pub use residency::execution::{
     AttachmentSource, Binding, Dispatch, Draw, GraphicsParameters, IndexBuffer, PreparedDraw,
     PreparedGraphics, PreparedProgram, PreparedTargets, RenderAttachment, RenderingTargets,
@@ -55,3 +52,6 @@ pub mod vertex;
 mod native;
 pub mod presentation;
 pub use native::{NativeExecutionStatistics, NativeGpuExecution};
+
+#[cfg(test)]
+mod test_shaders;

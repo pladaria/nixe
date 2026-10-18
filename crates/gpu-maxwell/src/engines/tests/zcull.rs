@@ -276,38 +276,6 @@ fn mme_can_clear_zcull_conservatively_without_emitting_an_attachment_clear() {
 }
 
 #[test]
-fn zcull_geometry_does_not_fabricate_draw_resources_or_counter_operations() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x121c, 0);
-    for &(method, value, _) in CUBE_REGION {
-        dispatch_method(&mut channel, method / 4, value).unwrap();
-    }
-    let resources =
-        resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
-    assert!(matches!(
-        lower_maxwell_three_d_operation(
-            channel.three_d(),
-            &resources,
-            MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source: channel
-                    .three_d()
-                    .zcull()
-                    .region_location()
-                    .source()
-                    .unwrap(),
-                vertex_count: 3,
-            },
-            None,
-            FrontendSubmissionId::new(10),
-            Vec::new(),
-            &lowering_capabilities(BackendFeatures::empty()),
-            &mut MaxwellLoweringCache::default(),
-        ),
-        Err(MaxwellLoweringError::ShaderTranslationRequired)
-    ));
-}
-
-#[test]
 fn zcull_storage_retains_addresses_without_creating_attachment_operations() {
     let mut channel = three_d_channel();
     let before = channel.three_d().clone();

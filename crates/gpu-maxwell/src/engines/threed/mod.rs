@@ -5,6 +5,7 @@ mod color_reduction;
 mod constant_color;
 mod counters;
 mod coverage;
+pub(super) mod draw;
 mod falcon;
 mod inline_to_memory;
 mod instrumentation;
@@ -26,11 +27,7 @@ mod vertex;
 pub use tessellation::{MaxwellTessellationModeError, MaxwellThreeDTessellationMode};
 mod zcull;
 
-pub use super::lowering::{
-    MaxwellLoweredWork, MaxwellLoweringCache, MaxwellLoweringError, MaxwellThreeDOperationTrigger,
-    MaxwellThreeDShaderResourceUse, MaxwellThreeDTranslatedShader, MaxwellThreeDTranslatedShaders,
-    lower_maxwell_three_d_operation,
-};
+pub use super::lowering::{MaxwellLoweringError, MaxwellThreeDOperationTrigger};
 pub use bindings::{
     MAXWELL_BIND_GROUP_COUNT, MAXWELL_CONSTANT_BUFFER_SLOT_COUNT, MAXWELL_PIPELINE_SHADER_COUNT,
     MAXWELL_TESSELLATION_LOD_COUNT, MaxwellShaderStage, MaxwellThreeDBindGroupState,
@@ -148,7 +145,7 @@ pub use render_targets::{
 pub(crate) use resource::MaxwellThreeDResolvedResourceCache;
 #[cfg(test)]
 #[allow(unused_imports)]
-pub(crate) use resource::resolve_maxwell_three_d_resources_for_roles_with_staged_writes;
+pub(crate) use resource::resolve_resource_roles;
 pub use resource::{
     MaxwellThreeDDirtySubresource, MaxwellThreeDDirtySubresources, MaxwellThreeDGuestImageFormat,
     MaxwellThreeDMappingReference, MaxwellThreeDPreservedImageLayout, MaxwellThreeDResolvedBuffer,
@@ -180,10 +177,7 @@ pub use state::{
     MaxwellThreeDStateWrite, MaxwellThreeDViewportPixelCenter, MaxwellThreeDViewportState,
     MaxwellThreeDViewportZClipRange,
 };
-pub(crate) use state::{
-    MaxwellThreeDFrontendState, MaxwellThreeDResourceStateIdentity,
-    MaxwellThreeDShaderStateIdentity,
-};
+pub(crate) use state::{MaxwellThreeDFrontendState, MaxwellThreeDResourceStateIdentity};
 pub use tiled_cache::{
     MaxwellThreeDTiledCacheState, MaxwellThreeDTiledCacheStateWrite,
     MaxwellThreeDTiledCacheTileSize, MaxwellThreeDTiledCacheUnknownConfig,
@@ -1210,7 +1204,11 @@ pub(super) fn preflight_mme_call<E>(
     parameters: &mut Vec<u32>,
     candidate: &mut MaxwellThreeDFrontendState,
     observed_methods: Option<&mut Vec<MaxwellEngineMethodDispatch>>,
-    consume: &mut impl FnMut(PendingEngineOperation, &MaxwellThreeDState) -> Result<(), E>,
+    consume: &mut impl FnMut(
+        PendingEngineOperation,
+        &MaxwellThreeDState,
+        Option<(u32, u32)>,
+    ) -> Result<(), E>,
 ) -> Result<(), MaxwellThreeDMmePreflightError<E>> {
     let first = methods[0];
     let source = first.source();
@@ -1294,7 +1292,7 @@ struct MmeDispatchHost<'a, E, F> {
 
 impl<E, F> MaxwellThreeDMmeHost for MmeDispatchHost<'_, E, F>
 where
-    F: FnMut(PendingEngineOperation, &MaxwellThreeDState) -> Result<(), E>,
+    F: FnMut(PendingEngineOperation, &MaxwellThreeDState, Option<(u32, u32)>) -> Result<(), E>,
 {
     type Error = MaxwellThreeDMmePreflightError<E>;
 
@@ -1322,6 +1320,8 @@ where
             ));
         }
         let source = self.source.emitted_by_mme(method, argument);
+        draw::before_method(self.candidate, source, self.consume)
+            .map_err(MaxwellThreeDMmePreflightError::Consumer)?;
         let mut dispatch = MaxwellMethodDispatch::emitted_by_mme(source, CLASS);
         if write_plain_method(&mut dispatch, self.candidate)
             .map_err(MaxwellThreeDMmePreflightError::dispatch)?
@@ -1334,7 +1334,7 @@ where
         let prepared = preflight_with_shadow(self.profile, &mut dispatch, self.candidate)
             .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
         if let Some(operation) = lower_pending_operation(prepared.operation, self.candidate) {
-            (self.consume)(operation, self.candidate.operation_state())
+            draw::operation(self.candidate, operation, self.consume)
                 .map_err(MaxwellThreeDMmePreflightError::Consumer)?;
             self.candidate.complete_inline_draw();
         }
@@ -1480,13 +1480,13 @@ pub(super) fn write_plain_method(
 pub(super) fn inline_index_words(
     candidate: &mut MaxwellThreeDFrontendState,
     subchannel: crate::MaxwellPushbufferSubchannel,
-    words: &[crate::MaxwellDecodedMethod],
+    words: crate::MaxwellMethodSpan<'_>,
 ) -> Result<(), MaxwellEngineDispatchError> {
     candidate.append_index_values(
-        crate::MaxwellMethodSource::decoded(words[0], subchannel),
-        words.iter().map(|word| word.argument()),
+        crate::MaxwellMethodSource::decoded(words.first().unwrap(), subchannel),
+        words.arguments().iter().copied(),
     )?;
-    let last = crate::MaxwellMethodSource::decoded(*words.last().unwrap(), subchannel);
+    let last = crate::MaxwellMethodSource::decoded(words.last().unwrap(), subchannel);
     candidate.record_raw_register(last);
     let control = candidate.mme().shadow_ram_control().value().copied();
     candidate.mme_mut().track_shadow_register(control, last);
@@ -1564,6 +1564,7 @@ const REGISTER_FAMILIES: [RegisterFamily; 4096] = {
             0x2000..=0x217c if matches!((method - 0x2000) % 0x40, 0 | 4 | 12 | 16) => {
                 RegisterFamily::VertexAndBinding
             }
+            0x1240..=0x125c => RegisterFamily::VertexAndBinding,
             0x2400..=0x24fc if (method - 0x2400) % 0x20 == 0x10 => RegisterFamily::VertexAndBinding,
             _ => RegisterFamily::Other,
         };
@@ -3761,7 +3762,16 @@ fn preflight_vertex_and_binding_state(
         return Ok(Some((MaxwellThreeDStateWrite::VertexInput(write), name)));
     }
 
-    let binding = if (0x2000..0x2180).contains(&method) {
+    let binding = if (0x1240..0x1260).contains(&method) && method.is_multiple_of(4) {
+        Some((
+            B::GeometryPassthroughMask {
+                index: ((method - 0x1240) / 4) as u8,
+                value: raw,
+                source,
+            },
+            "SET_POST_VTG_SHADER_ATTRIB_SKIP_MASK",
+        ))
+    } else if (0x2000..0x2180).contains(&method) {
         let pipeline = ((method - 0x2000) / 0x40) as u8;
         let field = (method - 0x2000) % 0x40;
         match field {

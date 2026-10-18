@@ -237,7 +237,7 @@ impl VulkanResidency {
                     let descriptors = &mut self.device.submission.slots[index].descriptors;
                     descriptors.address = address;
                     descriptors.arena = Some(crate::queue::Arena {
-                        buffer: allocated,
+                        buffer: Arc::new(allocated),
                         cursor: 0,
                     });
                 }
@@ -275,6 +275,7 @@ impl VulkanResidency {
         self.barriers.emit(&mut self.device);
         let slot = &mut self.device.submission.slots[index];
         let command = slot.command;
+        self.device.dispatch.finish_recording()?;
         unsafe {
             if slot.bound_compute != pipeline {
                 owner

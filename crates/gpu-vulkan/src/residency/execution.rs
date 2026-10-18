@@ -63,12 +63,24 @@ fn shader_stage(stage: nixe_gpu::ShaderStage) -> vk::PipelineStageFlags2 {
 }
 #[derive(Clone)]
 pub enum Binding {
+    NullBuffer,
+    TexelBuffer {
+        buffer: BufferId,
+        offset: u64,
+        size: u64,
+        format: vk::Format,
+        element_bytes: u32,
+    },
     Buffer {
         buffer: BufferId,
         offset: u64,
         size: u64,
     },
     Image(ImageViewId),
+    CombinedImageSampler {
+        image: ImageViewId,
+        sampler: Arc<Sampler>,
+    },
     Sampler(Arc<Sampler>),
 }
 #[derive(Clone, Copy)]
@@ -95,6 +107,7 @@ pub struct PreparedProgram {
     pub(super) uses: Box<[Use]>,
     // Descriptor-order correspondence to the merged canonical access windows.
     binding_uses: Box<[Option<usize>]>,
+    buffer_alignments: Box<[u64]>,
     dynamic_offsets: Box<[u32]>,
 }
 impl PreparedProgram {
@@ -102,6 +115,7 @@ impl PreparedProgram {
         std::mem::size_of::<Self>()
             + std::mem::size_of_val(self.uses.as_ref())
             + std::mem::size_of_val(self.binding_uses.as_ref())
+            + std::mem::size_of_val(self.buffer_alignments.as_ref())
             + std::mem::size_of_val(self.dynamic_offsets.as_ref())
             + std::mem::size_of_val(self.resources.as_ref())
     }
@@ -135,6 +149,7 @@ impl VulkanResidency {
                 resources: Box::new([]),
                 uses: Box::new([]),
                 binding_uses: Box::new([]),
+                buffer_alignments: Box::new([]),
             },
             parameters,
         )
@@ -170,7 +185,12 @@ impl VulkanResidency {
             let stages = access.read | access.write;
             let mut flags = vk::AccessFlags2::empty();
             if !access.read.is_empty() {
-                flags |= if reflected.kind == vk::DescriptorType::SAMPLED_IMAGE {
+                flags |= if matches!(
+                    reflected.kind,
+                    vk::DescriptorType::SAMPLED_IMAGE
+                        | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                        | vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                ) {
                     vk::AccessFlags2::SHADER_SAMPLED_READ
                 } else if matches!(
                     reflected.kind,
@@ -186,16 +206,52 @@ impl VulkanResidency {
             }
             let scope = AccessScope::new(stages, flags);
             match binding {
+                Binding::NullBuffer => {
+                    if !self.device.profile().null_descriptor
+                        || !matches!(
+                            reflected.kind,
+                            vk::DescriptorType::STORAGE_BUFFER
+                                | vk::DescriptorType::STORAGE_BUFFER_DYNAMIC
+                                | vk::DescriptorType::UNIFORM_BUFFER
+                                | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                        )
+                    {
+                        return Err(VulkanError::InvalidResource(
+                            "null buffer descriptor is not supported for this binding",
+                        ));
+                    }
+                    resources.push(DescriptorResource::NullBuffer);
+                }
                 Binding::Buffer {
                     buffer,
                     offset,
                     size,
+                }
+                | Binding::TexelBuffer {
+                    buffer,
+                    offset,
+                    size,
+                    ..
                 } => {
                     self.check_buffer_range(*buffer, *offset, *size)?;
-                    resources.push(DescriptorResource::Buffer {
-                        buffer: self.buffer_lease(*buffer)?,
-                        offset: *offset,
-                        range: *size,
+                    let lease = self.buffer_lease(*buffer)?;
+                    resources.push(match binding {
+                        Binding::TexelBuffer {
+                            format,
+                            element_bytes,
+                            ..
+                        } => DescriptorResource::TexelBuffer {
+                            buffer: lease,
+                            offset: *offset,
+                            range: *size,
+                            format: *format,
+                            element_bytes: *element_bytes,
+                        },
+                        _ => DescriptorResource::Buffer {
+                            buffer: lease,
+                            offset: *offset,
+                            range: *size,
+                        },
                     });
                     if !stages.is_empty() {
                         uses.push(Use::Buffer {
@@ -206,7 +262,7 @@ impl VulkanResidency {
                         });
                     }
                 }
-                Binding::Image(view) => {
+                Binding::Image(view) | Binding::CombinedImageSampler { image: view, .. } => {
                     let image = self.image(view.image)?;
                     let description = image
                         .views
@@ -261,9 +317,19 @@ impl VulkanResidency {
                     }
                     // GENERAL is valid for sampled and storage descriptors. Selecting
                     // it here keeps a prepared descriptor immutable across hazards.
-                    resources.push(DescriptorResource::Image {
-                        view: self.image_view_lease(*view)?,
-                        layout: vk::ImageLayout::GENERAL,
+                    let view_lease = self.image_view_lease(*view)?;
+                    resources.push(match binding {
+                        Binding::CombinedImageSampler { sampler, .. } => {
+                            DescriptorResource::CombinedImageSampler {
+                                view: view_lease,
+                                layout: vk::ImageLayout::GENERAL,
+                                sampler: Arc::clone(sampler),
+                            }
+                        }
+                        _ => DescriptorResource::Image {
+                            view: view_lease,
+                            layout: vk::ImageLayout::GENERAL,
+                        },
                     });
                     for &plane in &image.planes {
                         if description.aspects.intersects(plane.aspect)
@@ -344,12 +410,28 @@ impl VulkanResidency {
             }
             merged.push(next);
         }
-        let binding_uses = bindings.iter().map(|binding| match binding {
-            Binding::Buffer { buffer, offset, size } => merged.iter().position(|usage| matches!(usage,
+        let binding_uses: Box<[_]> = bindings.iter().map(|binding| match binding {
+            Binding::Buffer { buffer, offset, size } | Binding::TexelBuffer { buffer, offset, size, .. } => merged.iter().position(|usage| matches!(usage,
                 Use::Buffer { id, offset: start, size: length, .. } if id == buffer && *start <= *offset && *offset + *size <= *start + *length
             )),
             _ => None,
         }).collect();
+        let limits = self.device.profile().limits;
+        let mut buffer_alignments: Box<[_]> = merged
+            .iter()
+            .map(|usage| match usage {
+                Use::Buffer { scope, .. } => scope.buffer_alignment(&limits),
+                _ => 1,
+            })
+            .collect();
+        for (binding, usage) in bindings.iter().zip(&binding_uses) {
+            if matches!(binding, Binding::TexelBuffer { .. })
+                && let Some(index) = usage
+            {
+                buffer_alignments[*index] =
+                    buffer_alignments[*index].max(limits.min_texel_buffer_offset_alignment);
+            }
+        }
         let dynamic_offsets = pipeline
             .layout
             .split_dynamic_offsets(&mut resources, &self.device.profile().limits, Vec::new())?
@@ -360,6 +442,7 @@ impl VulkanResidency {
             resources: resources.into_boxed_slice(),
             uses: merged.into_boxed_slice(),
             binding_uses,
+            buffer_alignments,
             dynamic_offsets,
         })
     }
@@ -369,11 +452,11 @@ impl VulkanResidency {
         vertices: &[VertexBuffer],
         inputs: Option<&buffer::DrawInputBatch>,
     ) -> Result<GraphicsStreams, VulkanError> {
-        let limits = self.device.profile().limits;
         let mut requests = program
             .uses
             .iter()
-            .map(|usage| match *usage {
+            .zip(&program.buffer_alignments)
+            .map(|(usage, &alignment)| match *usage {
                 Use::Buffer {
                     id,
                     offset,
@@ -383,7 +466,7 @@ impl VulkanResidency {
                     id,
                     offset,
                     size,
-                    alignment: scope.buffer_alignment(&limits),
+                    alignment,
                 }),
                 _ => None,
             })
@@ -424,16 +507,26 @@ impl VulkanResidency {
         for (resource, usage) in resources.iter_mut().zip(&program.binding_uses) {
             if let Some(index) = usage
                 && let Some((buffer, base)) = &streams[*index]
-                && let DescriptorResource::Buffer { offset, range, .. } = resource
             {
                 let Use::Buffer { offset: start, .. } = program.uses[*index] else {
                     unreachable!()
                 };
-                *resource = DescriptorResource::Buffer {
-                    buffer: Arc::clone(buffer),
-                    offset: base + *offset - start,
-                    range: *range,
-                };
+                match resource {
+                    DescriptorResource::Buffer {
+                        buffer: lease,
+                        offset,
+                        ..
+                    }
+                    | DescriptorResource::TexelBuffer {
+                        buffer: lease,
+                        offset,
+                        ..
+                    } => {
+                        *lease = Arc::clone(buffer);
+                        *offset = base + *offset - start;
+                    }
+                    _ => (),
+                }
             }
         }
         let limits = self.device.profile().limits;
@@ -540,11 +633,17 @@ impl VulkanResidency {
         resources: &[DescriptorResource],
     ) -> Result<Arc<BindingRecord>, VulkanError> {
         let limits = self.device.profile().limits;
+        let null_descriptor = self.device.profile().null_descriptor;
         let index = self.device.begin_recording()?;
         let descriptors = self.device.submission.slots[index]
             .stream_descriptors
             .get_or_insert_with(|| {
-                DescriptorCache::from_limits(Arc::clone(&self.device.owner), limits, 4096)
+                DescriptorCache::from_limits(
+                    Arc::clone(&self.device.owner),
+                    limits,
+                    4096,
+                    null_descriptor,
+                )
             });
         let before = descriptors.statistics();
         let result = descriptors.get(layout, resources);
@@ -587,8 +686,7 @@ impl VulkanResidency {
         {
             unsafe {
                 self.device
-                    .owner
-                    .device
+                    .dispatch
                     .cmd_push_constants(command, layout, stages, 0, push);
             }
             self.device.submission.statistics.push_updates += 1;
@@ -650,14 +748,12 @@ impl VulkanResidency {
         let command = self.program_bind(program, push)?;
         unsafe {
             match dispatch {
-                Dispatch::Direct([x, y, z]) => {
-                    self.device.owner.device.cmd_dispatch(command, x, y, z)
+                Dispatch::Direct([x, y, z]) => self.device.dispatch.cmd_dispatch(command, x, y, z),
+                Dispatch::Indirect { offset, .. } => {
+                    self.device
+                        .dispatch
+                        .cmd_dispatch_indirect(command, indirect.unwrap(), offset)
                 }
-                Dispatch::Indirect { offset, .. } => self
-                    .device
-                    .owner
-                    .device
-                    .cmd_dispatch_indirect(command, indirect.unwrap(), offset),
             }
         }
         self.program_written(program)?;

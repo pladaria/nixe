@@ -287,6 +287,7 @@ pub(crate) fn cache(api: ApiPreference, budget: u64) -> Option<VulkanResidency> 
             arena_bytes: 16 * 1024,
             overflow_bytes: 64 * 1024,
         },
+        &device.dispatch,
     )
     .unwrap();
     Some(VulkanResidency::new(device, budget).unwrap())
@@ -959,6 +960,7 @@ fn large_cpu_uploads_progress_with_bounded_staging_and_preserve_gpu_prefixes() {
             arena_bytes: 512,
             overflow_bytes: 0,
         },
+        &cache.device.dispatch,
     )
     .unwrap();
     let (allocation, range) = backing_allocation(4096, 4096, 0x34);
@@ -1009,6 +1011,7 @@ fn dense_cpu_images_upload_once_without_buffers_and_preserve_later_gpu_writes() 
             arena_bytes: 512,
             overflow_bytes: 0,
         },
+        &cache.device.dispatch,
     )
     .unwrap();
     let (allocation, physical) = backing_allocation(16384, 256, 0x73);
@@ -1151,6 +1154,7 @@ fn large_uploads_retain_streams_until_their_actual_consumer() {
             arena_bytes: 512,
             overflow_bytes: 0,
         },
+        &cache.device.dispatch,
     )
     .unwrap();
     let (stream_slot, stream) = cache.device.submission.reserve_upload(&[0x42; 64]).unwrap();
@@ -1171,7 +1175,7 @@ fn large_uploads_retain_streams_until_their_actual_consumer() {
         .readback_buffer(destination)
         .handle;
     unsafe {
-        cache.device.owner.device.cmd_copy_buffer(
+        cache.device.dispatch.cmd_copy_buffer(
             command,
             source.handle,
             target,

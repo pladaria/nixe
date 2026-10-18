@@ -4,8 +4,9 @@ use super::*;
 use crate::cache::*;
 use ash::vk;
 use nixe_gpu::{
-    ShaderResourceKind, ShaderStage,
-    ssa::{ResourceId, compile::Pending, spirv},
+    ShaderStage,
+    compilation::Pending,
+    shader_module::{self as spirv, ResourceId},
 };
 use rustc_hash::FxHashMap as HashMap;
 pub(crate) fn color_range() -> vk::ImageSubresourceRange {
@@ -85,8 +86,8 @@ fn shader(kind: u8) -> Arc<ShaderArtifact> {
             _ => include_bytes!("../../shaders/spv/ui.frag.spv"),
         };
         let bindings = [
-            ShaderResourceKind::SampledImage,
-            ShaderResourceKind::Sampler,
+            spirv::DescriptorKind::SampledImage,
+            spirv::DescriptorKind::Sampler,
         ]
         .into_iter()
         .enumerate()
@@ -94,6 +95,8 @@ fn shader(kind: u8) -> Arc<ShaderArtifact> {
             resource: ResourceId::new(i as u32),
             binding: i as u32,
             kind,
+            count: 1,
+            sampler: None,
             readable: true,
             writable: false,
         })
@@ -339,7 +342,7 @@ impl ScreenRenderer {
                         depth: 1,
                     });
                 unsafe {
-                    device.owner.device.cmd_copy_buffer_to_image(
+                    device.dispatch.cmd_copy_buffer_to_image(
                         command,
                         device.submission.slots[slot].upload_buffer(slice).handle,
                         texture.view.image.handle,
@@ -497,7 +500,7 @@ impl ScreenRenderer {
             .color_attachments(&attachments);
         unsafe {
             device.dispatch.begin_rendering(command, &info);
-            device.owner.device.cmd_draw(command, 3, 1, 0, 0);
+            device.dispatch.cmd_draw(command, 3, 1, 0, 0);
             device.dispatch.end_rendering(command);
         }
         Ok(())
@@ -655,21 +658,20 @@ impl ScreenRenderer {
                 let device = cache.device();
                 let command = device.submission.slots[slot].command;
                 unsafe {
-                    device.owner.device.cmd_bind_vertex_buffers(
+                    device.dispatch.cmd_bind_vertex_buffers(
                         command,
                         0,
                         &[vertex_handle],
                         &[vertices.offset],
                     );
-                    device.owner.device.cmd_bind_index_buffer(
+                    device.dispatch.cmd_bind_index_buffer(
                         command,
                         index_handle,
                         indices.offset,
                         vk::IndexType::UINT32,
                     );
                     device
-                        .owner
-                        .device
+                        .dispatch
                         .cmd_draw_indexed(command, count, 1, first, base, 0);
                 }
                 let work = cache.device_mut().work_ticket()?;

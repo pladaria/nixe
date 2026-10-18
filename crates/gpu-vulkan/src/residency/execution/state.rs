@@ -211,7 +211,7 @@ impl VulkanResidency {
         }
         self.device.submission.statistics.graphics_updates += 1;
         let p = &graphics.parameters;
-        let raw = &self.device.owner.device;
+        let raw = &self.device.dispatch;
         let command = slot.command;
         unsafe {
             raw.cmd_set_viewport(command, 0, &p.viewports);
@@ -235,28 +235,8 @@ impl VulkanResidency {
             {
                 raw.cmd_set_depth_bounds(command, p.depth_bounds[0], p.depth_bounds[1]);
             }
-            if let Some(state) = &self.device.dispatch.state {
-                let s = &p.state;
-                (state.cull)(command, s.cull);
-                (state.front)(command, s.front_face);
-                (state.depth_test)(command, u32::from(s.depth_test));
-                (state.depth_write)(command, u32::from(s.depth_write));
-                (state.depth_compare)(command, s.depth_compare);
-                (state.depth_bounds)(command, u32::from(s.depth_bounds));
-                (state.stencil_test)(command, u32::from(s.stencil_test));
-                for (face, stencil) in [
-                    (vk::StencilFaceFlags::FRONT, s.front),
-                    (vk::StencilFaceFlags::BACK, s.back),
-                ] {
-                    (state.stencil)(
-                        command,
-                        face,
-                        stencil.fail,
-                        stencil.pass,
-                        stencil.depth_fail,
-                        stencil.compare,
-                    );
-                }
+            if self.device.dispatch.state.is_some() {
+                self.device.dispatch.dynamic_state(command, &p.state);
             }
         }
         slot.graphics_parameters = Some(Arc::clone(&graphics.parameters));

@@ -1,21 +1,19 @@
 //! Isolate command-container retirement, excluding actual GPU work.
 use super::*;
 #[test]
-fn partial_retirement_preserves_suffix_and_compilation_cursor_across_wraps() {
+fn partial_retirement_preserves_suffix_across_wraps() {
     let mut execution =
-        MaxwellBackendExecution::<MaxwellLoweredWork>::begin(FrontendSubmissionId::new(1), None);
+        MaxwellBackendExecution::<NativeWork>::begin(FrontendSubmissionId::new(1), None);
     for cycle in 0..64 {
         execution.append_steps(
             (0..32)
                 .map(|_| MaxwellSubmissionExecutionStep::WaitForIdle)
-                .collect(),
+                .collect::<Vec<_>>(),
         );
-        execution.compilation_cursor = execution.steps.len();
         let prior = execution.steps.len();
         execution.next_step = 24;
         assert_eq!(execution.retire_consumed_steps(), 24);
         assert_eq!(execution.steps.len(), prior - 24);
-        assert_eq!(execution.compilation_cursor, prior - 24);
         assert_eq!(execution.next_step, 0);
         assert_eq!(execution.steps.len(), (cycle + 1) * 8);
         assert!(!execution.waiting_for_input());
@@ -38,16 +36,13 @@ fn command_prefix_retirement_throughput() {
             .unwrap()
     };
     for count in [1024usize, 8192] {
-        let mut execution = MaxwellBackendExecution::<MaxwellLoweredWork>::begin(
-            FrontendSubmissionId::new(1),
-            None,
-        );
+        let mut execution =
+            MaxwellBackendExecution::<NativeWork>::begin(FrontendSubmissionId::new(1), None);
         execution.append_steps(
             (0..count)
                 .map(|_| MaxwellSubmissionExecutionStep::WaitForIdle)
-                .collect(),
+                .collect::<Vec<_>>(),
         );
-        execution.compilation_cursor = count;
         let before = cpu_ns();
         let start = std::time::Instant::now();
         for _ in 0..count / 8 {

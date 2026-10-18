@@ -12,8 +12,6 @@ use nixe_config::{
     CpuBackendSelection, CpuConfig, DiagnosticsConfig, GuestLogsLevel, InitialOperationMode,
     TimeMode, WindowState,
 };
-use nixe_gpu::BackendInstanceId;
-use nixe_gpu_wgpu::{WgpuBackendConfiguration, initialize_backend};
 use nixe_horizon::{
     GuestLogLevel, HorizonDiagnostics, HorizonSvcDispatcher, HorizonSvcFault, OperationMode,
     SaveDataSystem, SettingsEnvironment, SystemLanguage, TimeEnvironment,
@@ -24,7 +22,6 @@ use nixe_input::{
     ProfiledControllerState, TouchScreenReader,
 };
 use nixe_loader_title::{NacpLanguage, SupportedLanguages, UserAccountSwitchLock};
-use nixe_memory::NonCpuDeviceId;
 use nixe_runtime::{
     CpuBackendConfig, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
     ProcessBuilder, ProcessExit, ProcessExitCause, ProcessRegistration, ProcessTeardownReport,
@@ -47,7 +44,7 @@ pub struct Arguments {
     pub log_level_override: Option<LogLevel>,
     pub identifier: String,
     pub headless: bool,
-    pub native_vulkan: Option<nixe_gpu_vulkan::DeviceOptions>,
+    pub vulkan: nixe_gpu_vulkan::DeviceOptions,
     pub cpu_backend_override: Option<CpuBackendSelection>,
     pub guest_logs_level_override: Option<GuestLogsLevel>,
     pub file_system_access_log_override: Option<bool>,
@@ -59,7 +56,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         log_level_override,
         identifier,
         headless,
-        native_vulkan,
+        vulkan,
         cpu_backend_override,
         guest_logs_level_override,
         file_system_access_log_override,
@@ -92,16 +89,6 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     );
     if let Some(backend) = cpu_backend_override {
         log::info!("CPU backend selection overridden by CLI: {backend:?}");
-    }
-    if native_vulkan.is_none() {
-        log::info!(
-            "GPU cache policy: shaders={} pipelines={} variants-per-pipeline={} bind-groups-per-table={} persistent-pipeline-cache={} MiB",
-            config.gpu.shader_entries(),
-            config.gpu.pipeline_entries(),
-            config.gpu.pipeline_variants_per_resource(),
-            config.gpu.bind_groups_per_descriptor_table(),
-            config.gpu.persistent_pipeline_cache_bytes() / (1024 * 1024)
-        );
     }
     log::info!("scanning configured title library");
     std::fs::create_dir_all(&config.filesystem.sd_card).map_err(|error| {
@@ -287,12 +274,9 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
             None
         }
     };
-    frontend = frontend.map(|frontend| {
-        frontend
-            .with_window_state(saved_window_state)
-            .with_vsync(config.video.vsync)
-    });
-    let (video_system, presentation_context) = if let Some(options) = native_vulkan {
+    frontend = frontend.map(|frontend| frontend.with_window_state(saved_window_state));
+    let video_system = {
+        let options = vulkan;
         let (device, native_presentation) = if let Some(frontend) = frontend.as_mut() {
             let (device, client) = frontend
                 .create_vulkan_device(options)
@@ -311,7 +295,13 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
             device,
             nixe_gpu_maxwell::MAXWELL_SHADER_NAMESPACE,
-            nixe_gpu_vulkan::cache::CacheConfiguration::default(),
+            nixe_gpu_vulkan::cache::CacheConfiguration {
+                shader_entries: config.gpu.shader_entries,
+                pipeline_entries: config.gpu.pipeline_entries,
+                descriptor_sets: config.gpu.descriptor_sets,
+                persistent_bytes: config.gpu.persistent_bytes,
+                ..Default::default()
+            },
             1024 * 1024 * 1024,
         )
         .map_err(|e| e.to_string())?;
@@ -320,32 +310,10 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
                 .attach_presentation(client, config.video.vsync)
                 .map_err(|e| e.to_string())?;
         }
-        let maxwell =
-            nixe_gpu_maxwell::MaxwellNativeFrontend::new(renderer.shader_translation_pool());
-        (
-            VideoSystem::with_gpu_frontend(presenter, renderer, maxwell),
-            None,
-        )
-    } else {
-        let gpu_backend = initialize_backend(
-            BackendInstanceId::new(1),
-            NonCpuDeviceId::new(1),
-            WgpuBackendConfiguration {
-                cache: config.gpu,
-                ..WgpuBackendConfiguration::default()
-            },
-        )
-        .map_err(|error| format!("cannot initialize accelerated GPU backend: {error}"))?;
-        log::info!(
-            "GPU backend initialized: api={:?} adapter={} driver={}",
-            gpu_backend.adapter.backend,
-            gpu_backend.adapter.name,
-            gpu_backend.adapter.driver
+        let maxwell = nixe_gpu_maxwell::MaxwellNativeFrontend::new(
+            renderer.device_profile().shader_compiler.clone(),
         );
-        let presentation_context = Some(gpu_backend.presentation_context());
-        let video_system =
-            VideoSystem::with_gpu_backend(presenter, gpu_backend.into_runtime(), config.gpu);
-        (video_system, presentation_context)
+        VideoSystem::with_gpu_frontend(presenter, renderer, maxwell)
     };
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
     // SDL initialization and final subsystem shutdown remain on the main thread.
@@ -379,11 +347,6 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
             audio_backend,
             trace_interpreter,
         ));
-    };
-    let frontend = if let Some(context) = presentation_context {
-        frontend.with_gpu_context(context)
-    } else {
-        frontend
     };
     let frontend =
         frontend.with_screenshots(title.name.clone(), config.filesystem.screenshots.clone());

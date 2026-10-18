@@ -1,4 +1,4 @@
-use super::super::threed::tessellation::{draw_state, validate_default_level_inputs};
+use super::super::threed::tessellation::draw_state;
 use super::*;
 use nixe_gpu::{
     TessellationControl, TessellationDomain, TessellationOutput, TessellationSpacing,
@@ -199,44 +199,4 @@ fn default_levels_preserve_bits_and_only_require_domain_consumed_lanes() {
         draw_state(channel.three_d()),
         Err(MaxwellLoweringError::IncompleteDraw(_))
     ));
-}
-
-#[test]
-fn evaluation_reads_cannot_consume_unprogrammed_domain_unused_levels() {
-    let control = TessellationControl::DefaultLevels {
-        outer: [0; 4],
-        inner: [0; 2],
-        defined: 0b01_0111,
-    };
-    let ir = nixe_gpu::ShaderIr::new(
-        ShaderStage::TessellationEvaluation,
-        vec![
-            nixe_gpu::ShaderInterfaceElement::new(
-                nixe_gpu::ShaderIoLocation::TessLevelInner,
-                1,
-                nixe_gpu::ShaderScalarType::Float32,
-                None,
-            )
-            .unwrap(),
-        ],
-        vec![],
-        vec![],
-        vec![],
-    );
-    assert!(matches!(
-        validate_default_level_inputs(control, &ir),
-        Err(MaxwellLoweringError::IncompleteDraw(
-            "default tessellation level consumed by evaluation shader"
-        ))
-    ));
-    validate_default_level_inputs(
-        TessellationControl::DefaultLevels {
-            outer: [0; 4],
-            inner: [0; 2],
-            defined: 0x3f,
-        },
-        &ir,
-    )
-    .unwrap();
-    validate_default_level_inputs(TessellationControl::Shader, &ir).unwrap();
 }

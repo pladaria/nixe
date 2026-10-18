@@ -1,10 +1,7 @@
 //! Native fetch replaces WebGPU integer/scaled pulling where Vulkan supports
 //! the format. 32-bit scaled values require only an SSA integer conversion.
 use ash::vk;
-use nixe_gpu::{
-    VertexFormat as F,
-    ssa::{self, artifact::ContentId},
-};
+use nixe_gpu::{VertexFormat as F, shader_identity::ContentId};
 #[derive(Clone, Copy, Debug)]
 pub struct VertexFetchFormat {
     pub format: vk::Format,
@@ -108,10 +105,4 @@ pub fn vertex_shader_identity(source: ContentId, scaled: &[(u32, bool)]) -> Cont
         .flat_map(|&(l, s)| l.to_le_bytes().into_iter().chain([u8::from(s)]))
         .collect();
     ContentId::of(b"nixe-native-vertex-fetch-v1", &[&source.0, &bytes])
-}
-pub fn legalize_scaled_vertex_inputs(
-    function: &mut ssa::Function,
-    scaled: &[(u32, bool)],
-) -> Result<(), ssa::Error> {
-    ssa::scale_vertex_inputs(function, scaled)
 }
