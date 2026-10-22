@@ -27,6 +27,14 @@ impl ProcessAddressSpace {
         }
     }
 
+    pub const fn width(self) -> nixe_memory::AddressWidth {
+        match self {
+            Self::Bit32 | Self::Bit32NoReserved => nixe_memory::AddressWidth::Bits32,
+            Self::Bit64Old => nixe_memory::AddressWidth::Bits36,
+            Self::Bit64 => nixe_memory::AddressWidth::Bits39,
+        }
+    }
+
     pub const fn exclusive_limit(self) -> u64 {
         match self {
             Self::Bit32 | Self::Bit32NoReserved => 1_u64 << 32,
@@ -169,7 +177,6 @@ impl ProcessMemoryLayout {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessBuildConfig {
     pub process_id: u64,
-    pub address_space_id: AddressSpaceId,
     pub target_platform: TargetPlatform,
     pub memory_layout_profile: ProcessMemoryLayoutProfile,
     pub image_base: GuestVirtualAddress,
@@ -183,7 +190,6 @@ impl Default for ProcessBuildConfig {
     fn default() -> Self {
         Self {
             process_id: 1,
-            address_space_id: AddressSpaceId::new(1),
             target_platform: TargetPlatform::Switch1,
             memory_layout_profile: ProcessMemoryLayoutProfile::Horizon2Plus,
             image_base: GuestVirtualAddress::new(DEFAULT_IMAGE_BASE),

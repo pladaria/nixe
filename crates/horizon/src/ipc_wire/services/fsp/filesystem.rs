@@ -1,7 +1,7 @@
 //! `IFileSystem` wire command decoding.
 
+use crate::ipc_wire::request::Request;
 use nixe_memory::GuestVirtualAddress;
-use nixe_runtime::ExceptionProcessContext;
 
 use crate::ipc_wire::IpcWireError;
 use crate::ipc_wire::io::{read_bytes, request_u32, request_u64};
@@ -13,8 +13,8 @@ use crate::{IpcRequest, MAX_IPC_PATH_BYTES, SemanticIpcObject};
 use super::abi::FS_MAX_PATH;
 use super::commands::FileSystemCommand;
 
-pub(super) fn decode(
-    process: &ExceptionProcessContext<'_>,
+pub(super) async fn decode(
+    process: &Request,
     object: &SemanticIpcObject,
     request: &CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -42,7 +42,7 @@ pub(super) fn decode(
                 return Ok(None);
             }
             Ok(Some(IpcRequest::DeleteFile {
-                path: read_path(process, hipc)?,
+                path: read_path(process, hipc).await?,
             }))
         }
         FileSystemCommand::GetEntryType => {
@@ -50,7 +50,7 @@ pub(super) fn decode(
                 return Ok(None);
             }
             Ok(Some(IpcRequest::GetEntryType {
-                path: read_path(process, hipc)?,
+                path: read_path(process, hipc).await?,
             }))
         }
         FileSystemCommand::Commit => {
@@ -73,7 +73,7 @@ pub(super) fn decode(
                 "create-file request omits its size",
             ))?;
             Ok(Some(IpcRequest::CreateFile {
-                path: read_path(process, hipc)?,
+                path: read_path(process, hipc).await?,
                 size,
                 option,
             }))
@@ -83,19 +83,19 @@ pub(super) fn decode(
                 return Ok(None);
             }
             Ok(Some(IpcRequest::CreateDirectory {
-                path: read_path(process, hipc)?,
+                path: read_path(process, hipc).await?,
             }))
         }
         // IFileSystem OpenFile/OpenDirectory use one input pointer path and a
         // u32 mode:
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L878-L893
         FileSystemCommand::OpenFile => Ok(Some(IpcRequest::OpenFile {
-            path: read_path(process, hipc)?,
+            path: read_path(process, hipc).await?,
             mode: request_u32(request.data, 0)
                 .ok_or(IpcWireError::Malformed("open-file request omits its mode"))?,
         })),
         FileSystemCommand::OpenDirectory => Ok(Some(IpcRequest::OpenDirectory {
-            path: read_path(process, hipc)?,
+            path: read_path(process, hipc).await?,
             mode: request_u32(request.data, 0).ok_or(IpcWireError::Malformed(
                 "open-directory request omits its mode",
             ))?,
@@ -103,10 +103,7 @@ pub(super) fn decode(
     }
 }
 
-fn read_path(
-    process: &ExceptionProcessContext<'_>,
-    hipc: &HipcRequest<'_>,
-) -> Result<String, IpcWireError> {
+async fn read_path(process: &Request, hipc: &HipcRequest<'_>) -> Result<String, IpcWireError> {
     enum InputDescriptor {
         Static(SendStaticDescriptor),
         Buffer(BufferDescriptor),
@@ -143,7 +140,7 @@ fn read_path(
     }
 
     let mut bytes = vec![0; size];
-    read_bytes(process, GuestVirtualAddress::new(address), &mut bytes)?;
+    read_bytes(process, GuestVirtualAddress::new(address), &mut bytes).await?;
     let nul = bytes
         .iter()
         .position(|byte| *byte == 0)

@@ -1,13 +1,13 @@
 use super::*;
 
 /// Builds an emulated process from a prepared launch plan.
-#[derive(Default)]
 pub struct ProcessBuilder {
     config: ProcessBuildConfig,
     virtual_clock: crate::VirtualClock,
     sd_card_root: Option<PathBuf>,
     cpu_backend: execution::CpuBackendConfig,
-    memory_backend: nixe_memory::DirectBackendPolicy,
+    machine: nixe_memory::Machine,
+    system: nixe_memory::MemoryAccount,
 }
 
 impl std::fmt::Debug for ProcessBuilder {
@@ -18,7 +18,7 @@ impl std::fmt::Debug for ProcessBuilder {
             .field("virtual_clock", &self.virtual_clock)
             .field("sd_card_root", &self.sd_card_root)
             .field("cpu_backend", &self.cpu_backend)
-            .field("memory_backend", &self.memory_backend)
+            .field("machine", &self.machine.identity())
             .finish()
     }
 }
@@ -27,8 +27,15 @@ impl ProcessBuilder {
     /// Creates a process builder using Switch 1 defaults.
     ///
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(machine: nixe_memory::Machine, system: nixe_memory::MemoryAccount) -> Self {
+        Self {
+            config: ProcessBuildConfig::default(),
+            virtual_clock: crate::VirtualClock::default(),
+            sd_card_root: None,
+            cpu_backend: execution::CpuBackendConfig::default(),
+            machine,
+            system,
+        }
     }
 
     #[must_use]
@@ -58,13 +65,6 @@ impl ProcessBuilder {
         self
     }
 
-    /// Selects checked or Linux direct process memory before CPU binding.
-    #[must_use]
-    pub const fn with_memory_backend(mut self, policy: nixe_memory::DirectBackendPolicy) -> Self {
-        self.memory_backend = policy;
-        self
-    }
-
     /// Prepares, maps, and initializes one runnable process.
     ///
     /// Packaged NSOs retain their dynamic relocations for the guest `rtld`.
@@ -81,10 +81,6 @@ impl ProcessBuilder {
         let stack_size = metadata.stack_size;
         let abi = metadata.abi;
         let random_entropy = generate_process_entropy()?;
-        let cpu = ProcessCpuContext::for_platform(
-            self.config.target_platform,
-            self.config.address_space_id,
-        );
         let placements = module_placements(plan, self.config.image_base, address_space)?;
         let modules = prepare_modules(plan, &placements, address_space)?;
         let process_code_start = modules
@@ -109,7 +105,7 @@ impl ProcessBuilder {
         // already been checked by the NPDM loader. Horizon uses its
         // HandleTableSize descriptor as the live per-process handle limit:
         // https://switchbrew.org/w/index.php?title=NPDM&oldid=14486#HandleTableSize
-        let mut handles = plan
+        let handles = plan
             .effective_policy()
             .and_then(|policy| policy.handle_table_size())
             .map_or_else(crate::HandleTable::new, |size| {
@@ -122,37 +118,40 @@ impl ProcessBuilder {
                 ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
             })?;
 
-        let mut memory = ExecutionMemory::new();
+        let user_limit = self
+            .config
+            .physical_memory_limit
+            .checked_sub(metadata.system_resource_size)
+            .ok_or_else(|| {
+                error(
+                    ProcessBuildStage::Mapping,
+                    "system resource reservation exceeds process RAM budget",
+                )
+            })?;
+        let account = self
+            .machine
+            .account(user_limit)
+            .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
+        let memory = crate::memory::ProcessMemory::new(
+            account,
+            self.system.clone(),
+            address_space.width(),
+            memory_layout.heap(),
+            metadata.system_resource_size,
+        )
+        .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
+        let cpu =
+            ProcessCpuContext::for_platform(self.config.target_platform, memory.space().identity());
         for module in &modules {
-            install_prepared_module(&mut memory, self.config.address_space_id, module)
-                .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
-            for mapping in module.mappings() {
-                let mutable = mapping.permissions().is_writable();
-                let purpose = match (matches!(abi, InitialProcessAbi::Homebrew), mutable) {
-                    (true, true) => MemoryMappingPurpose::ModuleCodeMutable,
-                    (true, false) => MemoryMappingPurpose::ModuleCodeStatic,
-                    (false, true) => MemoryMappingPurpose::CodeMutable,
-                    (false, false) => MemoryMappingPurpose::CodeStatic,
-                };
-                if !memory.set_mapping_purpose(
-                    self.config.address_space_id,
-                    GuestVirtualAddress::new(mapping.guest_address()),
-                    mapping.bytes().len() as u64,
-                    purpose,
-                ) {
-                    return Err(error(
-                        ProcessBuildStage::Mapping,
-                        "installed module mapping could not retain its purpose",
-                    ));
-                }
-            }
+            crate::install_prepared_module(
+                &memory,
+                module,
+                matches!(abi, InitialProcessAbi::Homebrew),
+            )
+            .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
         }
-        let code_size = u64::try_from(memory.physical_page_count())
-            .ok()
-            .and_then(|pages| pages.checked_mul(SYNTHETIC_PAGE_SIZE as u64))
-            .ok_or_else(|| error(ProcessBuildStage::Mapping, "process code size overflows"))?;
 
-        let stack_size = align_up(stack_size.max(SYNTHETIC_PAGE_SIZE as u64), TLS_SIZE)?;
+        let stack_size = align_up(stack_size.max(nixe_memory::PAGE_SIZE), TLS_SIZE)?;
         if stack_size + (RESOURCE_GUARD_SIZE * 3) + (TLS_SIZE * 2) > memory_layout.stack().size() {
             return Err(error(
                 ProcessBuildStage::Placement,
@@ -167,48 +166,33 @@ impl ProcessBuilder {
             .checked_add(RESOURCE_GUARD_SIZE)
             .ok_or_else(|| error(ProcessBuildStage::Placement, "TLS base overflows"))?;
         validate_range(address_space, tls_base.get(), TLS_SIZE)?;
-        install_zero_pages(
-            &mut memory,
-            self.config.address_space_id,
-            stack_bottom,
-            stack_size,
-        )?;
-        if !memory.set_mapping_purpose(
-            self.config.address_space_id,
-            stack_bottom,
-            stack_size,
-            MemoryMappingPurpose::Stack,
-        ) {
-            return Err(error(
-                ProcessBuildStage::Mapping,
-                "installed main stack could not retain its purpose",
-            ));
-        }
-        install_zero_pages(
-            &mut memory,
-            self.config.address_space_id,
-            tls_base,
-            TLS_SIZE,
-        )?;
-        if !memory.set_mapping_purpose(
-            self.config.address_space_id,
-            tls_base,
-            TLS_SIZE,
-            MemoryMappingPurpose::ThreadLocal,
-        ) {
-            return Err(error(
-                ProcessBuildStage::Mapping,
-                "installed TLS mapping could not retain its purpose",
-            ));
-        }
+        memory
+            .map_zeroed(
+                stack_bottom,
+                stack_size,
+                kernel_mapping(
+                    crate::memory::MemoryKind::Stack,
+                    MemoryPermissions::READ_WRITE,
+                ),
+            )
+            .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
+        memory
+            .map_zeroed(
+                tls_base,
+                TLS_SIZE,
+                kernel_mapping(
+                    crate::memory::MemoryKind::ThreadLocal,
+                    MemoryPermissions::READ_WRITE,
+                ),
+            )
+            .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
         let (abi_context, loader_return) = if matches!(abi, InitialProcessAbi::Homebrew) {
             let address = tls_base
                 .checked_add(TLS_SIZE + RESOURCE_GUARD_SIZE)
                 .ok_or_else(|| error(ProcessBuildStage::Placement, "ABI context overflows"))?;
-            validate_range(address_space, address.get(), SYNTHETIC_PAGE_SIZE as u64)?;
+            validate_range(address_space, address.get(), nixe_memory::PAGE_SIZE)?;
             install_homebrew_context(
-                &mut memory,
-                self.config.address_space_id,
+                &memory,
                 address,
                 main_thread_handle,
                 plan.homebrew_identity().ok_or_else(|| {
@@ -219,18 +203,10 @@ impl ProcessBuilder {
                 })?,
             )?;
             let loader_return = address
-                .checked_add(SYNTHETIC_PAGE_SIZE as u64 + RESOURCE_GUARD_SIZE)
+                .checked_add(nixe_memory::PAGE_SIZE + RESOURCE_GUARD_SIZE)
                 .ok_or_else(|| error(ProcessBuildStage::Placement, "loader return overflows"))?;
-            validate_range(
-                address_space,
-                loader_return.get(),
-                SYNTHETIC_PAGE_SIZE as u64,
-            )?;
-            install_homebrew_loader_return(
-                &mut memory,
-                self.config.address_space_id,
-                loader_return,
-            )?;
+            validate_range(address_space, loader_return.get(), nixe_memory::PAGE_SIZE)?;
+            install_homebrew_loader_return(&memory, loader_return)?;
             (Some(address), Some(loader_return))
         } else {
             (None, None)
@@ -266,52 +242,20 @@ impl ProcessBuilder {
         threads.insert(main_thread).map_err(|error| {
             ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
         })?;
-        let initial_mapped_size = u64::try_from(memory.physical_page_count())
-            .ok()
-            .and_then(|pages| pages.checked_mul(SYNTHETIC_PAGE_SIZE as u64))
-            .ok_or_else(|| {
-                error(
-                    ProcessBuildStage::Mapping,
-                    "process memory accounting overflows",
-                )
-            })?;
-        let memory_accounting = ProcessMemoryAccounting::new(
-            memory_layout.memory_capacity(),
-            initial_mapped_size,
-            code_size,
-            stack_size,
-            metadata.system_resource_size,
-        )
-        .ok_or_else(|| {
-            error(
-                ProcessBuildStage::Mapping,
-                "initial process mappings and system resource exceed the configured physical-memory limit",
-            )
-        })?;
         let cpu_process_id = execution::allocate_cpu_process_id().ok_or_else(|| {
             ProcessBuildError::new(
                 ProcessBuildStage::CpuInitialization,
                 "CPU process identity exhausted",
             )
         })?;
-        memory
-            .bind_cpu_memory_backend(
-                self.config.address_space_id,
-                address_space.exclusive_limit(),
-                self.memory_backend,
-            )
-            .map_err(|error| ProcessBuildError::new(ProcessBuildStage::CpuInitialization, error))?;
         let memory = std::sync::Arc::new(memory);
         let execution = execution::ProcessExecutionControl::new(
             execution::ProcessExecutionConfiguration {
                 virtual_clock: self.virtual_clock.clone(),
                 timer_frequency: self.config.architectural_timer_frequency,
                 cpu,
-                address_space_end: nixe_memory::GuestVirtualAddress::new(
-                    address_space.exclusive_limit(),
-                ),
             },
-            std::sync::Arc::clone(&memory),
+            std::sync::Arc::clone(memory.space()),
             cpu_process_id,
             &self.cpu_backend,
         )
@@ -324,7 +268,6 @@ impl ProcessBuilder {
             address_space,
             memory_layout,
             random_entropy,
-            memory_accounting,
             memory,
             modules: modules.into_boxed_slice(),
             entry_module,
@@ -339,9 +282,12 @@ impl ProcessBuilder {
                 .expect("validated stack region has a finite end"),
             free_thread_tls: std::collections::BTreeSet::new(),
             threads,
-            mounts: crate::ProcessMountNamespace::from_launch_plan(plan, self.sd_card_root.clone()),
-            handles,
-            address_waits: crate::AddressWaitRegistry::default(),
+            mounts: std::sync::Arc::new(crate::ProcessMountNamespace::from_launch_plan(
+                plan,
+                self.sd_card_root.clone(),
+            )),
+            handles: std::sync::Arc::new(handles),
+            address_waits: std::sync::Arc::default(),
             execution,
         };
         Ok(process)
@@ -460,7 +406,7 @@ fn module_placements(
     address_space: ProcessAddressSpace,
 ) -> Result<Vec<PreparationConfig>, ProcessBuildError> {
     let limit = address_space.exclusive_limit();
-    let mut next = align_up(first_base.get(), SYNTHETIC_PAGE_SIZE as u64)?;
+    let mut next = align_up(first_base.get(), nixe_memory::PAGE_SIZE)?;
     let mut placements = Vec::with_capacity(plan.modules().len());
     for module in plan.modules() {
         let extent = image_extent(module.image())?;
@@ -473,7 +419,7 @@ fn module_placements(
             next.checked_add(extent)
                 .and_then(|end| end.checked_add(MODULE_GUARD_SIZE))
                 .ok_or_else(|| error(ProcessBuildStage::Placement, "module placement overflows"))?,
-            SYNTHETIC_PAGE_SIZE as u64,
+            nixe_memory::PAGE_SIZE,
         )?;
     }
     Ok(placements)
@@ -524,41 +470,26 @@ fn prepare_modules(
         .collect()
 }
 
-fn install_zero_pages(
-    memory: &mut ExecutionMemory,
-    address_space: AddressSpaceId,
-    start: GuestVirtualAddress,
-    size: u64,
-) -> Result<(), ProcessBuildError> {
-    let zero = [0_u8; SYNTHETIC_PAGE_SIZE];
-    let page_count = usize::try_from(size / SYNTHETIC_PAGE_SIZE as u64).map_err(|_| {
-        error(
-            ProcessBuildStage::Mapping,
-            "resource page count is too large",
-        )
-    })?;
-    let requests = (0..page_count)
-        .map(|index| SyntheticRamPage {
-            virtual_address: start
-                .checked_add((index * SYNTHETIC_PAGE_SIZE) as u64)
-                .expect("validated resource range"),
-            bytes: &zero,
-            permissions: MemoryPermissions::READ_WRITE,
-        })
-        .collect::<Vec<_>>();
-    memory
-        .install_ram_pages_atomic(address_space, &requests)
-        .map_err(|failure| ProcessBuildError::new(ProcessBuildStage::Mapping, failure.reason))
+fn kernel_mapping(
+    kind: crate::memory::MemoryKind,
+    permissions: MemoryPermissions,
+) -> crate::memory::Mapping {
+    crate::memory::Mapping {
+        kind,
+        permissions,
+        uncached: false,
+        locked: false,
+        permission_locked: false,
+    }
 }
 
 fn install_homebrew_context(
-    memory: &mut ExecutionMemory,
-    address_space: AddressSpaceId,
+    memory: &crate::memory::ProcessMemory,
     address: GuestVirtualAddress,
     main_thread_handle: u32,
     identity: &crate::HomebrewIdentity,
 ) -> Result<(), ProcessBuildError> {
-    let mut page = [0_u8; SYNTHETIC_PAGE_SIZE];
+    let mut page = [0_u8; nixe_memory::PAGE_SIZE as usize];
     page[..4].copy_from_slice(&HOME_BREW_MAIN_THREAD_HANDLE_KEY.to_le_bytes());
     page[8..16].copy_from_slice(&u64::from(main_thread_handle).to_le_bytes());
     let argv_entry = HOME_BREW_CONFIG_ENTRY_SIZE;
@@ -587,49 +518,33 @@ fn install_homebrew_context(
     // The zeroed third 24-byte entry is EntryType_EndOfList and the argv
     // string is NUL-terminated by the zero-initialized ABI page.
     memory
-        .install_ram_pages_atomic(
-            address_space,
-            &[SyntheticRamPage {
-                virtual_address: address,
-                bytes: &page,
-                permissions: MemoryPermissions::READ,
-            }],
+        .map_initialized(
+            address,
+            &page,
+            kernel_mapping(crate::memory::MemoryKind::Data, MemoryPermissions::READ),
         )
-        .map_err(|failure| ProcessBuildError::new(ProcessBuildStage::Mapping, failure.reason))
+        .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))
 }
 
 fn install_homebrew_loader_return(
-    memory: &mut ExecutionMemory,
-    address_space: AddressSpaceId,
+    memory: &crate::memory::ProcessMemory,
     address: GuestVirtualAddress,
 ) -> Result<(), ProcessBuildError> {
-    let mut page = [0_u8; SYNTHETIC_PAGE_SIZE];
+    let mut page = [0_u8; nixe_memory::PAGE_SIZE as usize];
     // Execute a normal ExitProcess SVC on return. Runtime completion recognizes
     // this thread's stub source and retains X0 as the loader result; CPU backends
     // and native links need no special return-address interception.
     page[..4].copy_from_slice(&HOME_BREW_EXIT_PROCESS_INSTRUCTION.to_le_bytes());
     memory
-        .install_ram_pages_atomic(
-            address_space,
-            &[SyntheticRamPage {
-                virtual_address: address,
-                bytes: &page,
-                permissions: MemoryPermissions::READ_EXECUTE,
-            }],
+        .map_initialized(
+            address,
+            &page,
+            kernel_mapping(
+                crate::memory::MemoryKind::Code,
+                MemoryPermissions::READ_EXECUTE,
+            ),
         )
-        .map_err(|failure| ProcessBuildError::new(ProcessBuildStage::Mapping, failure.reason))?;
-    if !memory.set_mapping_purpose(
-        address_space,
-        address,
-        SYNTHETIC_PAGE_SIZE as u64,
-        MemoryMappingPurpose::CodeStatic,
-    ) {
-        return Err(error(
-            ProcessBuildStage::Mapping,
-            "loader return mapping could not retain its purpose",
-        ));
-    }
-    Ok(())
+        .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))
 }
 
 pub(super) fn initialize_thread(

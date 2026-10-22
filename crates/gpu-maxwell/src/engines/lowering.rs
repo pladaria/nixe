@@ -1214,7 +1214,7 @@ fn resolved_image(
 }
 
 /// Typed failure before any cache or backend effect is published.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum MaxwellLoweringError {
     ComputeLaunch(crate::MaxwellComputeLaunchError),
     BufferBacking(String),

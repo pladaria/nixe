@@ -643,16 +643,22 @@ impl VulkanDevice {
         } else {
             &mut slot.bound_graphics
         };
-        if *bound == pipeline.handle {
+        // Slot retention prevents this identity from being recycled while any
+        // queued bind or native use still refers to the pipeline object.
+        let identity = Arc::as_ptr(pipeline) as usize;
+        if *bound == identity {
             return Ok(());
         }
         unsafe {
-            self.dispatch
-                .cmd_bind_pipeline(slot.command, pipeline.bind_point, pipeline.handle);
+            self.dispatch.cmd_bind_pipeline(
+                slot.command,
+                pipeline.bind_point,
+                Arc::clone(pipeline),
+            );
         }
         self.submission.statistics.pipeline_binds += 1;
-        *bound = pipeline.handle;
-        if slot.pipeline_handles.insert(pipeline.handle) {
+        *bound = identity;
+        if slot.pipeline_handles.insert(identity) {
             slot.native_pipelines.push(Arc::clone(pipeline));
         }
         Ok(())

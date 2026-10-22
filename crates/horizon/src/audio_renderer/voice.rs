@@ -3,7 +3,8 @@
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/voice/voice_info.h
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/command/data_source/decode.cpp
 use super::update::{MemoryPool, UpdateError, wide, word};
-use nixe_memory::{CanonicalBackingRange, CanonicalRangeTranslationError};
+use super::worker::{RenderError, RenderMemory};
+use nixe_memory::{AllocationRange, MemoryError};
 
 use super::buffer::{Attachment, attach};
 #[derive(Debug)]
@@ -79,7 +80,7 @@ impl Voice {
         revision: u32,
         pools: &[Option<MemoryPool>],
         force: bool,
-        translate: &impl Fn(u64, u64) -> Result<CanonicalBackingRange, CanonicalRangeTranslationError>,
+        translate: &impl Fn(u64, u64) -> Result<Vec<AllocationRange>, MemoryError>,
         output: &mut [u8],
     ) -> Result<(), UpdateError> {
         if raw[9] == 0 {
@@ -146,20 +147,12 @@ impl Voice {
         self.stop_requested = raw[10] == 1 && self.params[10] != 1;
         let address = wide(raw, 0x48);
         let size = wide(raw, 0x50);
-        if self
-            .coefficients
-            .as_ref()
-            .map(|a| (a.address, a.backing.size()))
+        if self.coefficients.as_ref().map(|a| (a.address, a.bytes))
             != ((address != 0 && size != 0).then_some((address, size)))
         {
             self.coefficients = attach(address, size, pools, force, translate)?;
         }
-        if raw[11] == 6
-            && self
-                .coefficients
-                .as_ref()
-                .is_none_or(|a| a.backing.size() != 32)
-        {
+        if raw[11] == 6 && self.coefficients.as_ref().is_none_or(|a| a.bytes != 32) {
             return Err(UpdateError::Invalid);
         }
         for i in 0..4 {
@@ -191,7 +184,7 @@ impl Voice {
                 2 => u64::from(end) * channels as u64 * 2,
                 _ => u64::from(end) * channels as u64 * 4,
             };
-            if required > data.backing.size() {
+            if required > data.bytes {
                 return Err(UpdateError::Invalid);
             }
             let context = if raw[11] == 6 && revision >= 2 {
@@ -199,7 +192,7 @@ impl Voice {
             } else {
                 None
             };
-            if context.as_ref().is_some_and(|a| a.backing.size() != 6) {
+            if context.as_ref().is_some_and(|a| a.bytes != 6) {
                 return Err(UpdateError::Invalid);
             }
             self.buffers[i] = Some(WaveBuffer {
@@ -238,6 +231,7 @@ impl Voice {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn render(
         &mut self,
+        memory: &RenderMemory,
         revision: u32,
         scratch: &mut VoiceScratch,
         samples: usize,
@@ -245,7 +239,7 @@ impl Voice {
         previous_resources: &[[f32; 24]],
         mix: &mut [i32],
         mix_buffers: usize,
-    ) -> Result<(), Box<str>> {
+    ) -> Result<(), RenderError> {
         if self.params[9] == 0 {
             return Ok(());
         }
@@ -277,7 +271,10 @@ impl Voice {
         let mut coefficients = [0_i16; 16];
         if self.params[11] == 6 {
             let mut data = [0; 32];
-            self.coefficients.as_ref().unwrap().read(0, &mut data)?;
+            self.coefficients
+                .as_ref()
+                .unwrap()
+                .read(memory, 0, &mut data)?;
             for (out, input) in coefficients.iter_mut().zip(data.chunks_exact(2)) {
                 *out = i16::from_le_bytes(input.try_into().unwrap());
             }
@@ -317,7 +314,7 @@ impl Voice {
                     && let Some(context) = &buffer.context
                 {
                     let mut data = [0; 6];
-                    context.read(0, &mut data)?;
+                    context.read(memory, 0, &mut data)?;
                     c.adpcm = Adpcm {
                         header: u16::from_le_bytes(data[..2].try_into().unwrap()),
                         previous: i16::from_le_bytes(data[2..4].try_into().unwrap()),
@@ -327,6 +324,7 @@ impl Voice {
                 let available = (buffer.end - buffer.start - c.offset) as usize;
                 let take = available.min(count - written);
                 decode(
+                    memory,
                     buffer,
                     buffer.start + c.offset,
                     &mut scratch.decoded[prefix + written..prefix + written + take],
@@ -421,6 +419,7 @@ pub(super) struct VoiceScratch {
 }
 #[allow(clippy::too_many_arguments)]
 fn decode(
+    memory: &RenderMemory,
     buffer: &WaveBuffer,
     start: u32,
     output: &mut [i16],
@@ -430,7 +429,7 @@ fn decode(
     coefficients: &[i16; 16],
     context: &mut Adpcm,
     bytes: &mut Vec<u8>,
-) -> Result<(), Box<str>> {
+) -> Result<(), RenderError> {
     if output.is_empty() {
         return Ok(());
     }
@@ -438,10 +437,9 @@ fn decode(
         let first = start / 14;
         let last = (start as usize + output.len() - 1) / 14;
         let offset = u64::from(first) * 8;
-        let size =
-            ((last - first as usize + 1) * 8).min((buffer.data.backing.size() - offset) as usize);
+        let size = ((last - first as usize + 1) * 8).min((buffer.data.bytes - offset) as usize);
         bytes.resize(size, 0);
-        buffer.data.read(offset, bytes)?;
+        buffer.data.read(memory, offset, bytes)?;
         for (i, out) in output.iter_mut().enumerate() {
             let position = start as usize + i;
             let frame = (position / 14 - first as usize) * 8;
@@ -477,7 +475,7 @@ fn decode(
         bytes.resize(output.len() * channels * width, 0);
         buffer
             .data
-            .read(u64::from(start) * (channels * width) as u64, bytes)?;
+            .read(memory, u64::from(start) * (channels * width) as u64, bytes)?;
         for (i, out) in output.iter_mut().enumerate() {
             let p = (i * channels + channel) * width;
             *out = if width == 2 {
@@ -493,19 +491,13 @@ fn decode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nixe_memory::{CanonicalAllocation, MemoryPermissions};
-    fn memory(bytes: &[u8]) -> CanonicalBackingRange {
-        let allocation = CanonicalAllocation::zeroed(bytes.len(), 4096).unwrap();
-        allocation.write(0, bytes).unwrap();
-        allocation
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap()
-    }
+    use crate::{audio_renderer::worker::RenderMemory, test_memory::physical as memory};
     fn buffer(bytes: &[u8], end: u32) -> WaveBuffer {
         WaveBuffer {
             data: Attachment {
                 address: 0x1000,
-                backing: memory(bytes),
+                ranges: nixe_memory::CapturedMemory::new(memory(bytes)).unwrap(),
+                bytes: bytes.len() as u64,
                 pool: Some(0),
             },
             context: None,
@@ -528,6 +520,7 @@ mod tests {
         let mut whole = [0; 28];
         let mut context = Adpcm::default();
         decode(
+            &RenderMemory::testing(),
             &buffer,
             0,
             &mut whole,
@@ -544,6 +537,7 @@ mod tests {
         let mut split = [0; 28];
         let mut context = Adpcm::default();
         decode(
+            &RenderMemory::testing(),
             &buffer,
             0,
             &mut split[..9],
@@ -556,6 +550,7 @@ mod tests {
         )
         .unwrap();
         decode(
+            &RenderMemory::testing(),
             &buffer,
             9,
             &mut split[9..],
@@ -571,6 +566,7 @@ mod tests {
         let buffer = super::tests::buffer(&[0x0f, 0x78, 0, 0, 0, 0, 0, 0], 2);
         let mut clipped = [0; 2];
         decode(
+            &RenderMemory::testing(),
             &buffer,
             0,
             &mut clipped,
@@ -589,6 +585,7 @@ mod tests {
         let buffer = buffer(&[0x00, 0x17, 0x8f], 4);
         let mut output = [0; 4];
         decode(
+            &RenderMemory::testing(),
             &buffer,
             0,
             &mut output,
@@ -611,6 +608,7 @@ mod tests {
         let buffer = buffer(&bytes, 3);
         let mut output = [0; 2];
         decode(
+            &RenderMemory::testing(),
             &buffer,
             1,
             &mut output,
@@ -630,6 +628,7 @@ mod tests {
         let buffer = super::tests::buffer(&bytes, 4);
         let mut output = [0; 4];
         decode(
+            &RenderMemory::testing(),
             &buffer,
             0,
             &mut output,
@@ -672,7 +671,8 @@ mod tests {
             .collect();
         let pools = vec![Some(MemoryPool {
             address: 0x1000,
-            backing: memory(&bytes),
+            ranges: nixe_memory::CapturedMemory::new(memory(&bytes)).unwrap(),
+            bytes: bytes.len() as u64,
         })];
         let mut voice = Voice::default();
         voice
@@ -688,6 +688,7 @@ mod tests {
         let mut mix = vec![0; samples];
         voice
             .render(
+                &RenderMemory::testing(),
                 7,
                 &mut VoiceScratch::default(),
                 samples,
@@ -768,8 +769,10 @@ mod tests {
         .unwrap()
         .unwrap();
         let mut bytes = [0; 4];
-        mapped.read(0, &mut bytes).unwrap();
+        mapped
+            .read(&RenderMemory::testing(), 0, &mut bytes)
+            .unwrap();
         assert_eq!(bytes, [1, 2, 3, 4]);
-        assert_eq!(mapped.pool, None);
+        assert!((mapped.pool).is_none());
     }
 }

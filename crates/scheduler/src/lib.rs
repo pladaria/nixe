@@ -13,7 +13,7 @@ pub use lifecycle::{
 pub use scheduler::{
     Completion, Lease, LeaseGeneration, MigrationEffect, Readiness, ScheduledThreadConfig,
     ScheduledThreadView, SchedulerCommand, SchedulerDecision, SchedulerError, SchedulerState,
-    WakeToken,
+    WakeToken, YieldMigration,
 };
 pub use topology::{
     CoreSet, CoreSetError, MachineSchedulerProfile, MachineSchedulerProfileError, PriorityRange,

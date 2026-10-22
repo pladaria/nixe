@@ -3,7 +3,7 @@ use super::ioctl::{NvDrvIoctlOutcome, NvDrvIoctlRequest};
 use super::{NvDrvFileDescriptor, NvDrvSession, UnsupportedNvDrvOperation};
 
 /// Semantic NVIDIA service failure before Horizon response encoding.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum NvDrvServiceError {
     DriverResult(u32),
     Unsupported(UnsupportedNvDrvOperation),
@@ -75,12 +75,12 @@ mod tests {
 
     #[test]
     fn semantic_service_does_not_encode_horizon_wire_results() {
-        let session = NvDrvSession::new();
+        let session = NvDrvSession::new(crate::test_memory::machine());
         let service = NvDrvService::new(&session);
 
-        assert_eq!(
+        assert!(matches!(
             service.open(NvDrvDeviceKind::NvMap.path().as_bytes(), 7),
             Err(NvDrvServiceError::DriverResult(NV_NOT_INITIALIZED))
-        );
+        ));
     }
 }

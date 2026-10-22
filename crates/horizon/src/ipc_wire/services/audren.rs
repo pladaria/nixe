@@ -9,11 +9,22 @@ use crate::audio_renderer::update::{HEADER_SIZE, UpdateError, UpdateLayout};
 use crate::audio_renderer::{PARAMETER_SIZE, RendererParameters};
 use crate::{AudioRendererManagerSession, AudioRendererSession};
 
+impl From<crate::audio_renderer::RenderError> for crate::ipc_wire::IpcWireError {
+    fn from(error: crate::audio_renderer::RenderError) -> Self {
+        use crate::audio_renderer::RenderError;
+        match error {
+            RenderError::Memory(error) => Self::SystemMemory(error),
+            RenderError::Diagnostic(detail) => Self::AudioRenderer(detail),
+            RenderError::Stopped => Self::Cancelled,
+        }
+    }
+}
+
 fn update_error(error: UpdateError, token: u32) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     match error {
         UpdateError::Invalid => cmif_error(token, HorizonIpcResult::AUDIO_INVALID_UPDATE_INFO),
         UpdateError::Unsupported(detail) => Err(IpcWireError::AudioRenderer(detail)),
-        UpdateError::Mapping(error) => Err(IpcWireError::AudioRenderer(error.to_string().into())),
+        UpdateError::Mapping(error) => Err(IpcWireError::SystemMemory(std::sync::Arc::new(error))),
     }
 }
 
@@ -64,8 +75,8 @@ fn update_outputs(hipc: &HipcRequest<'_>, auto: bool) -> Result<[(u64, usize); 2
     Ok(result)
 }
 
-fn dispatch_update(
-    process: &ExceptionProcessContext<'_>,
+async fn dispatch_update(
+    process: &Request,
     session: &AudioRendererSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -98,7 +109,8 @@ fn dispatch_update(
         process,
         GuestVirtualAddress::new(input_address),
         &mut header,
-    )?;
+    )
+    .await?;
     let layout = match UpdateLayout::parse(&session.0.parameters, &header, input_size) {
         Ok(layout) => layout,
         Err(error) => return update_error(error, request.token),
@@ -116,29 +128,31 @@ fn dispatch_update(
         .try_reserve_exact(input_size)
         .map_err(|_| IpcWireError::HostResourceExhausted("reading an audio renderer update"))?;
     input.resize(input_size, 0);
-    read_bytes(process, GuestVirtualAddress::new(input_address), &mut input)?;
-    let mut state = session.0.update.lock().unwrap();
-    if let Some(error) = &state.failure {
-        return Err(IpcWireError::AudioRenderer(error.clone()));
-    }
-    let output = match state.update(&session.0.parameters, &layout, &input, |address, size| {
-        process.canonical_memory().translate_canonical_range(
-            process.cpu().address_space_id(),
-            GuestVirtualAddress::new(address),
-            size,
-            nixe_memory::MemoryPermissions::NONE,
-        )
-    }) {
-        Ok(output) => output,
-        Err(error) => return update_error(error, request.token),
+    read_bytes(process, GuestVirtualAddress::new(input_address), &mut input).await?;
+    let output = {
+        let mut state = session.0.update.take().await;
+        if let Some(error) = session.0.failure.get() {
+            return Err(error.clone().into());
+        }
+        let output = match state.update(&session.0.parameters, &layout, &input, |address, size| {
+            process.memory().space().capture(
+                GuestVirtualAddress::new(address),
+                size,
+                nixe_memory::MemoryPermissions::NONE,
+            )
+        }) {
+            Ok(output) => output,
+            Err(error) => return update_error(error, request.token),
+        };
+        session.0.event.clear();
+        output
     };
-    write_bytes(process, GuestVirtualAddress::new(output_address), &output)?;
-    session.0.event.clear();
+    write_bytes(process, GuestVirtualAddress::new(output_address), &output).await?;
     semantic_success(request.token, false, &[], &[], &[], None)
 }
 
-pub(in crate::ipc_wire) fn dispatch_audio_renderer_manager(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_audio_renderer_manager(
+    process: &mut Request,
     session: &AudioRendererManagerSession,
     backend: Option<&std::sync::Arc<dyn nixe_audio::AudioBackend>>,
     request: CmifRequest<'_>,
@@ -171,9 +185,8 @@ pub(in crate::ipc_wire) fn dispatch_audio_renderer_manager(
             .device(revision, aruid, backend.clone())
             .map_err(|error| IpcWireError::AudioBackend(error.0.into_boxed_str()))?;
         let handle = process
-            .handles_mut()
-            .insert(HorizonIpcObject::AudioDevice(device))
-            .map_err(|_| IpcWireError::HostResourceExhausted("opening an audio device session"))?;
+            .return_handle(HorizonIpcObject::AudioDevice(device))
+            .map_err(IpcWireError::Handle)?;
         log::debug!("opening audio device interface: revision={revision} aruid={aruid:#x}");
         return semantic_success(request.token, false, &[], &[], &[], Some(handle));
     }
@@ -214,19 +227,12 @@ pub(in crate::ipc_wire) fn dispatch_audio_renderer_manager(
         return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_ARGUMENT);
     };
     if opening {
-        let Some(work_memory) = process
-            .handles()
-            .get_as::<TransferMemoryObject>(hipc.copy_handles[0])
-            .cloned()
-        else {
+        let Some(work_memory) = process.copy_handle::<TransferMemoryObject>(0) else {
             return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_HANDLE);
         };
         let owner = hipc.copy_handles[1];
         if owner != crate::CURRENT_PROCESS_HANDLE {
-            let Some(owner) = process
-                .handles()
-                .get_as::<nixe_runtime::ProcessObject>(owner)
-            else {
+            let Some(owner) = process.copy_handle::<nixe_runtime::ProcessObject>(1) else {
                 return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_HANDLE);
             };
             if owner.process_id() != process.process_id() {
@@ -262,16 +268,14 @@ pub(in crate::ipc_wire) fn dispatch_audio_renderer_manager(
         );
         let Some(renderer) = session
             .open(params, work_memory, work_size, aruid, process.process_id())
-            .map_err(|error| IpcWireError::AudioRenderer(error.to_string().into_boxed_str()))?
+            .await
+            .map_err(IpcWireError::SystemMemory)?
         else {
             return cmif_error(request.token, HorizonIpcResult::AUDIO_OUT_OF_SESSIONS);
         };
         let handle = process
-            .handles_mut()
-            .insert(HorizonIpcObject::AudioRenderer(renderer))
-            .map_err(|_| {
-                IpcWireError::HostResourceExhausted("opening an audio renderer session")
-            })?;
+            .return_handle(HorizonIpcObject::AudioRenderer(renderer))
+            .map_err(IpcWireError::Handle)?;
         return semantic_success(request.token, false, &[], &[], &[], Some(handle));
     }
     log::debug!(
@@ -295,8 +299,8 @@ fn unsupported_variant<T>(
     ))
 }
 
-pub(in crate::ipc_wire) fn dispatch_audio_renderer(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_audio_renderer(
+    process: &mut Request,
     session: &AudioRendererSession,
     backend: Option<&std::sync::Arc<dyn nixe_audio::AudioBackend>>,
     request: CmifRequest<'_>,
@@ -304,7 +308,7 @@ pub(in crate::ipc_wire) fn dispatch_audio_renderer(
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let command = request.command_id;
     if matches!(command, 4 | 10) {
-        return dispatch_update(process, session, request, hipc);
+        return dispatch_update(process, session, request, hipc).await;
     }
     if !matches!(command, 0..=3 | 5..=9) {
         return unsupported_service_command("IAudioRenderer", command);
@@ -313,20 +317,21 @@ pub(in crate::ipc_wire) fn dispatch_audio_renderer(
         return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
     }
     let state = &session.0;
-    if let Some(error) = &state.update.lock().unwrap().failure {
-        return Err(IpcWireError::AudioRenderer(error.clone()));
+    if let Some(error) = state.failure.get() {
+        return Err(error.clone().into());
     }
     let value = match command {
         0 => state.parameters.sample_rate,
         1 => state.parameters.samples,
         2 => state.parameters.mixes,
-        3 => u32::from(!state.update.lock().unwrap().started),
+        3 => u32::from(!state.update.take().await.started),
         5 => {
             let backend = backend.ok_or_else(|| {
                 IpcWireError::AudioRenderer("Start requires a host audio backend".into())
             })?;
             state
                 .start(backend.as_ref())
+                .await
                 .map_err(IpcWireError::AudioRenderer)?;
             return semantic_success(request.token, false, &[], &[], &[], None);
         }
@@ -336,11 +341,8 @@ pub(in crate::ipc_wire) fn dispatch_audio_renderer(
         }
         7 => {
             let handle = process
-                .handles_mut()
-                .insert(state.event.clone())
-                .map_err(|_| {
-                    IpcWireError::HostResourceExhausted("copying an audio renderer event")
-                })?;
+                .return_handle(state.event.clone())
+                .map_err(IpcWireError::Handle)?;
             return semantic_success(request.token, false, &[], &[handle], &[], None);
         }
         8 => {

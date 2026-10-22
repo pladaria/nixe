@@ -1,4 +1,4 @@
-//! Bounded, versioned row windows amortize neighboring canonical CPU faults.
+//! Bounded native row windows amortize neighboring exact CPU demands.
 //! Missing windows share staging batches; only authoritative bytes are published.
 use super::image::ImagePiece;
 use super::*;
@@ -44,14 +44,14 @@ pub(super) struct ImageReadbacks {
     windows: FxHashMap<WindowKey, Box<[u8]>>,
     order: VecDeque<WindowKey>,
     bytes: usize,
-    pub(super) pending: FxHashMap<WindowKey, Vec<(CpuVisibilityRequest, Vec<Scatter>)>>,
+    pub(super) pending: FxHashMap<WindowKey, Vec<(nixe_memory::AccessRequestId, Vec<Scatter>)>>,
 }
 impl VulkanResidency {
     pub(super) fn record_cached_image_authorities(
         &mut self,
-        request: CpuVisibilityRequest,
+        request: nixe_memory::AccessRequestId,
         id: ImageId,
-        writes: &[Authority],
+        writes: &[nixe_gpu::authority::ResolvedBytes<Resource>],
     ) -> Result<bool, VulkanError> {
         let entry = self.image(id)?;
         let limit = self.device.submission.configuration.arena_bytes;
@@ -92,7 +92,7 @@ impl VulkanResidency {
             )?;
         }
         let bytes: u64 = needed.values().map(|(p, _)| p.length).sum();
-        // A page whose projected native working set cannot fit the bounded
+        // A demand whose projected native working set cannot fit the bounded
         // cache uses exact bounded regions rather than thrashing the directory.
         if bytes > limit.saturating_mul(2) || needed.len() > 32 {
             return Ok(false);
@@ -148,12 +148,12 @@ fn image_chunks(
     id: ImageId,
     version: u64,
     planes: &[WindowPlane],
-    write: &Authority,
+    write: &nixe_gpu::authority::ResolvedBytes<Resource>,
     mut visit: impl FnMut(WindowKey, ImagePiece, u64, u64, u64),
 ) -> Result<(), VulkanError> {
     let mut copied = 0;
-    while copied < write.end - write.start {
-        let logical = write.offset + copied;
+    while copied < write.bytes {
+        let logical = write.producer.expect("device readback source").native + copied;
         let window = planes
             .iter()
             .find(|p| logical >= p.plane.offset && logical < p.end)
@@ -194,8 +194,8 @@ fn image_chunks(
         } else {
             window.row_bytes - x
         };
-        let length = available.min(write.end - write.start - copied);
-        visit(key, piece, source, write.start + copied, length);
+        let length = available.min(write.bytes - copied);
+        visit(key, piece, source, write.logical + copied, length);
         copied += length;
     }
     Ok(())

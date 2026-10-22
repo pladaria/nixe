@@ -95,23 +95,22 @@ impl BinderRelayCommand {
 }
 
 fn vi_child(
-    process: &mut ExceptionProcessContext<'_>,
+    process: &mut Request,
     token: u32,
     kind: ViObjectKind,
     video: &VideoSystem,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let handle = process
-        .handles_mut()
-        .insert(HorizonIpcObject::Vi(ViSession::new(kind, video.clone())))
-        .map_err(|_| IpcWireError::HostResourceExhausted("installing a VI child handle"))?;
+        .return_handle(HorizonIpcObject::Vi(ViSession::new(kind, video.clone())))
+        .map_err(IpcWireError::Handle)?;
     Ok((
         encode_response(token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
         Some(handle),
     ))
 }
 
-pub(in crate::ipc_wire) fn dispatch_vi(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_vi(
+    process: &mut Request,
     session: &ViSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -222,7 +221,7 @@ pub(in crate::ipc_wire) fn dispatch_vi(
                         );
                     };
                     let native_window = crate::graphics::encode_native_window(layer.binder_id);
-                    write_descriptor_bytes(process, descriptor, &native_window)?;
+                    write_descriptor_bytes(process, descriptor, &native_window).await?;
                     Ok((
                         encode_response(
                             request.token,
@@ -245,7 +244,7 @@ pub(in crate::ipc_wire) fn dispatch_vi(
                     };
                     let descriptor = one_receive_buffer(hipc)?;
                     let native_window = crate::graphics::encode_native_window(layer.binder_id);
-                    write_descriptor_bytes(process, descriptor, &native_window)?;
+                    write_descriptor_bytes(process, descriptor, &native_window).await?;
                     let mut data = Vec::with_capacity(16);
                     data.extend_from_slice(&layer.id.to_le_bytes());
                     data.extend_from_slice(&(native_window.len() as u64).to_le_bytes());
@@ -300,9 +299,7 @@ pub(in crate::ipc_wire) fn dispatch_vi(
                             HorizonIpcResult::SF_PRECONDITION_VIOLATION,
                         );
                     };
-                    let handle = process.handles_mut().insert(event).map_err(|_| {
-                        IpcWireError::HostResourceExhausted("installing a VI event handle")
-                    })?;
+                    let handle = process.return_handle(event).map_err(IpcWireError::Handle)?;
                     Ok((
                         CmifResponse {
                             token: request.token,
@@ -418,7 +415,7 @@ pub(in crate::ipc_wire) fn dispatch_vi(
                     if command == ManagerDisplayCommand::CreateStray {
                         let descriptor = one_receive_buffer(hipc)?;
                         let native_window = crate::graphics::encode_native_window(layer.binder_id);
-                        write_descriptor_bytes(process, descriptor, &native_window)?;
+                        write_descriptor_bytes(process, descriptor, &native_window).await?;
                         let mut data = Vec::with_capacity(16);
                         data.extend_from_slice(&layer.id.to_le_bytes());
                         data.extend_from_slice(&(native_window.len() as u64).to_le_bytes());
@@ -450,7 +447,7 @@ pub(in crate::ipc_wire) fn dispatch_vi(
                 }
             }
         }
-        ViObjectKind::BinderRelay => dispatch_binder_relay(process, video, request, hipc),
+        ViObjectKind::BinderRelay => dispatch_binder_relay(process, video, request, hipc).await,
     }
 }
 
@@ -466,8 +463,8 @@ pub(in crate::ipc_wire) const fn vi_object_name(kind: ViObjectKind) -> &'static 
     }
 }
 
-fn dispatch_binder_relay(
-    process: &mut ExceptionProcessContext<'_>,
+async fn dispatch_binder_relay(
+    process: &mut Request,
     video: &VideoSystem,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -492,7 +489,8 @@ fn dispatch_binder_relay(
                 process,
                 GuestVirtualAddress::new(input.address),
                 &mut encoded,
-            )?;
+            )
+            .await?;
             let transaction =
                 video
                     .transact_binder(binder_id, code, &encoded)
@@ -518,7 +516,7 @@ fn dispatch_binder_relay(
                     ""
                 }
             );
-            write_descriptor_bytes(process, output, &transaction.reply)?;
+            write_descriptor_bytes(process, output, &transaction.reply).await?;
             if let Some(request) = transaction.queued {
                 video
                     .queue_graphic_buffer(binder_id, request)
@@ -537,9 +535,6 @@ fn dispatch_binder_relay(
                         }
                         crate::graphics::FramebufferError::Backend(reason) => {
                             IpcWireError::GraphicsBackend(reason)
-                        }
-                        crate::graphics::FramebufferError::Memory(error) => {
-                            IpcWireError::GraphicsBackend(error.to_string().into())
                         }
                         crate::graphics::FramebufferError::NvMap(_) => {
                             IpcWireError::Malformed("queued graphic-buffer image view is invalid")
@@ -573,9 +568,7 @@ fn dispatch_binder_relay(
             let Some(event) = video.binder_event(binder_id) else {
                 return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
             };
-            let handle = process.handles_mut().insert(event).map_err(|_| {
-                IpcWireError::HostResourceExhausted("installing a Binder event handle")
-            })?;
+            let handle = process.return_handle(event).map_err(IpcWireError::Handle)?;
             Ok((
                 CmifResponse {
                     token: request.token,

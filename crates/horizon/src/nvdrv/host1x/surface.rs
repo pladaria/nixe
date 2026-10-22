@@ -25,7 +25,7 @@ impl Surface {
             .next_back()
             .ok_or("VIC mapping was lost")?;
         let allocation =
-            GpuAllocationDescription::new(whole.size(), 1).map_err(|e| e.to_string())?;
+            GpuAllocationDescription::new(whole.bytes(), 1).map_err(|e| e.to_string())?;
         let bytes = usize::from(
             format
                 .plane_bytes_per_texel(0)
@@ -53,7 +53,7 @@ impl Surface {
             allocation,
             offset,
             whole
-                .snapshot_subrange(offset, self.length() as u64)
+                .slice(offset, self.length() as u64)
                 .map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;

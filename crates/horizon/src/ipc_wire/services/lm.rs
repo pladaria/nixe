@@ -45,8 +45,8 @@ impl LoggerCommand {
     }
 }
 
-pub(in crate::ipc_wire) fn dispatch_log_manager(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_log_manager(
+    process: &mut Request,
     manager: &LogManagerSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -83,7 +83,7 @@ pub(in crate::ipc_wire) fn dispatch_log_manager(
                         HorizonIpcResult::CMIF_TARGET_NOT_FOUND,
                     );
                 };
-                return dispatch_logger(process, &logger, request, hipc, guest_logs_level);
+                return dispatch_logger(process, &logger, request, hipc, guest_logs_level).await;
             }
         }
         None if is_domain => {
@@ -132,11 +132,8 @@ pub(in crate::ipc_wire) fn dispatch_log_manager(
                 return semantic_success(request.token, true, &[], &[], &[object_id], None);
             }
             let handle = process
-                .handles_mut()
-                .insert(HorizonIpcObject::Logger(logger))
-                .map_err(|_| {
-                    IpcWireError::HostResourceExhausted("installing an lm logger handle")
-                })?;
+                .return_handle(HorizonIpcObject::Logger(logger))
+                .map_err(IpcWireError::Handle)?;
             log::debug!("lm opened ILogger handle {handle:#x} for process {process_id}");
             Ok((
                 encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
@@ -146,8 +143,8 @@ pub(in crate::ipc_wire) fn dispatch_log_manager(
     }
 }
 
-pub(in crate::ipc_wire) fn dispatch_logger(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_logger(
+    process: &mut Request,
     logger: &LoggerSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -184,7 +181,7 @@ pub(in crate::ipc_wire) fn dispatch_logger(
             }
             let mut bytes = vec![0; size];
             if size != 0 {
-                read_bytes(process, GuestVirtualAddress::new(address), &mut bytes)?;
+                read_bytes(process, GuestVirtualAddress::new(address), &mut bytes).await?;
             }
 
             // Nintendo's logger returns success when the packet body is
@@ -194,7 +191,6 @@ pub(in crate::ipc_wire) fn dispatch_logger(
             let packet_result = match validate_log_packet_frame(&bytes) {
                 Ok(()) => {
                     bytes[..8].copy_from_slice(&logger.process_id().to_le_bytes());
-                    write_bytes(process, GuestVirtualAddress::new(address), &bytes[..8])?;
                     ingest_log_packet(logger, &bytes)
                 }
                 Err(reason) => Err(reason),

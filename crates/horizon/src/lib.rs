@@ -26,6 +26,9 @@ mod object;
 mod parcel;
 mod save_data;
 mod shared_font;
+mod system_memory;
+#[cfg(test)]
+mod test_memory;
 pub use shared_font::SharedFontSession;
 mod scheduler_profile;
 pub use save_data::SaveDataSystem;
@@ -42,8 +45,8 @@ pub use graphics::{
 pub use graphics_event::GraphicsEventSource;
 pub use hid::{HidInputError, HidSystem};
 pub use ipc::{
-    AddOnContentEntry, HorizonProcess, IpcDispatcher, IpcRequest, IpcResponse, IpcResultCode,
-    IpcService, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES,
+    AddOnContentEntry, IpcRequest, IpcResponse, IpcResultCode, IpcService, MAX_IPC_LIST_ENTRIES,
+    MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES,
 };
 pub use ipc_result::HorizonIpcResult;
 pub use ipc_wire::{HorizonIpcFault, UnsupportedServiceOperation};
@@ -78,3 +81,20 @@ pub use svc_dispatch::{
     HorizonScheduledDispatchError, HorizonSvcCoverageEntry, HorizonSvcDispatcher, HorizonSvcFault,
     HorizonSvcSupport, MAX_WAIT_HANDLES, PendingThreadWait,
 };
+
+#[cfg(test)]
+extern crate self as nixe_horizon;
+#[cfg(test)]
+#[path = "integration_tests/homebrew_acceptance.rs"]
+mod homebrew_integration_tests;
+#[cfg(test)]
+#[path = "integration_tests/synthetic_launch_matrix.rs"]
+mod launch_integration_tests;
+#[cfg(test)]
+#[path = "integration_tests/svc_dispatch.rs"]
+mod svc_integration_tests;
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../tests/support/mod.rs"]
+mod integration_test_support;

@@ -120,3 +120,32 @@ impl DerefMut for ScheduledProcess {
             .expect("scheduled test process remains registered")
     }
 }
+
+pub fn process_builder() -> nixe_runtime::ProcessBuilder {
+    let machine = nixe_memory::Machine::new(4 * 1024 * 1024 * 1024).unwrap();
+    let system = machine.account(512 * 1024 * 1024).unwrap();
+    nixe_runtime::ProcessBuilder::new(machine, system)
+}
+
+pub fn dispatcher(process: &RunnableProcess) -> nixe_horizon::HorizonSvcDispatcher {
+    dispatcher_with_clock(
+        process,
+        nixe_horizon::OperationMode::default(),
+        nixe_runtime::VirtualClock::default(),
+    )
+}
+
+pub fn dispatcher_with_clock(
+    process: &RunnableProcess,
+    mode: nixe_horizon::OperationMode,
+    clock: nixe_runtime::VirtualClock,
+) -> nixe_horizon::HorizonSvcDispatcher {
+    let account = process.memory().system_account();
+    nixe_horizon::HorizonSvcDispatcher::new(
+        process.memory().space().machine().clone(),
+        mode,
+        nixe_horizon::TimeEnvironment::new(account, clock, "UTC").unwrap(),
+        nixe_horizon::HidSystem::new(account).unwrap(),
+        nixe_horizon::SharedFontSession::new(account, None).unwrap(),
+    )
+}

@@ -2,12 +2,13 @@ use super::*;
 use crate::cache::*;
 use crate::residency::tests::backing_allocation;
 use ash::vk;
+use nixe_gpu::physical::PhysicalMapping;
 use nixe_gpu::{
     PresentationImageFormat as F,
     compilation::CompilePool,
     native::{GuestImageAspect, GuestImagePlane, NativePresentationImage},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[test]
 fn vsync_selects_the_requested_surface_mode_without_a_synchronized_fallback() {
@@ -21,30 +22,17 @@ fn vsync_selects_the_requested_surface_mode_without_a_synchronized_fallback() {
     assert!(wsi::select_present_mode(false, &[Mode::FIFO, Mode::MAILBOX]).is_err());
 }
 
-mod support {
-    use crate as nixe_gpu_vulkan;
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/device.rs"
-    ));
-}
+use crate::test_device as support;
 fn pipeline(
     renderer: &mut ScreenRenderer,
     compiler: &PipelineCompiler,
     kind: u8,
 ) -> Arc<NativePipeline> {
-    let started = Instant::now();
-    loop {
-        if let Some(p) = renderer
-            .pipeline(compiler, vk::Format::R8G8B8A8_UNORM, kind)
-            .unwrap()
-        {
-            return p;
-        }
-        assert!(started.elapsed() < Duration::from_secs(10));
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    renderer
+        .pipeline(compiler, vk::Format::R8G8B8A8_UNORM, kind)
+        .unwrap()
 }
+
 fn read(cache: &mut VulkanResidency, view: &AllocatedImageView, extent: [u32; 2]) -> Vec<u8> {
     read_in_layout(
         cache,
@@ -105,10 +93,15 @@ fn fragmented_cpu_scanout_refreshes_dirty_pages_and_preserves_old_snapshots() {
         return;
     };
     let monitor = device.validation_monitor();
-    let mut cache = VulkanResidency::new(device, 16 * 1024 * 1024).unwrap();
+    let mut cache = VulkanResidency::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+        device,
+        16 * 1024 * 1024,
+    )
+    .unwrap();
     let mut descriptors = DescriptorCache::new(cache.device(), 64);
     let mut frames = Frames::new();
-    let (allocation, physical) = backing_allocation(8192, 4096, 7);
+    let (allocation, physical) = backing_allocation(&cache, 8192, 4096, 7);
     // Reverse 16-byte fragments within each physical page: logical texels
     // retain a permutation even when every physical page becomes dirty.
     let mut segments = Vec::new();
@@ -116,19 +109,18 @@ fn fragmented_cpu_scanout_refreshes_dirty_pages_and_preserves_old_snapshots() {
     for page in 0..2 {
         for fragment in (0..256).rev() {
             let offset = page * 4096 + fragment * 16;
-            physical
-                .snapshot_subrange_into(offset, 16, &mut segments)
-                .unwrap();
+            segments.push(physical.slice(offset, 16).unwrap());
             offsets.push(offset as usize);
         }
     }
-    let backing = nixe_memory::CanonicalBackingRange::new(segments).unwrap();
+    let backing = PhysicalMapping::join(&segments).unwrap();
     let request = NativePresentationImage {
+        inputs: (backing).pin(0, (backing).bytes()).unwrap(),
         planes: Arc::from([GuestImagePlane {
             mip_level: 0,
             array_layer: 0,
             aspect: GuestImageAspect::Color,
-            backing,
+            footprint: crate::residency::tests::plane_geometry(backing, [64, 32], 256, 4),
             row_pitch: 256,
             bytes_per_block: 4,
         }]),
@@ -140,7 +132,7 @@ fn fragmented_cpu_scanout_refreshes_dirty_pages_and_preserves_old_snapshots() {
         .capture(&mut cache, request.clone(), &mut descriptors)
         .unwrap();
     let mut bytes: Vec<_> = (0..8192).map(|i| (i % 251) as u8).collect();
-    allocation.write(0, &bytes).unwrap();
+    crate::residency::tests::cpu_write(&mut cache, &allocation, 0, &bytes).unwrap();
     let before = cache.statistics().cpu_uploaded_bytes;
     let changed = frames
         .capture(&mut cache, request.clone(), &mut descriptors)
@@ -153,7 +145,7 @@ fn fragmented_cpu_scanout_refreshes_dirty_pages_and_preserves_old_snapshots() {
     // A later write affects only the second physical page. Acknowledging the
     // first refresh must not hide it or change the older immutable versions.
     bytes[4096..].fill(23);
-    allocation.write(4096, &bytes[4096..]).unwrap();
+    crate::residency::tests::cpu_write(&mut cache, &allocation, 4096, &bytes[4096..]).unwrap();
     let partial = frames
         .capture(&mut cache, request, &mut descriptors)
         .unwrap();
@@ -201,7 +193,12 @@ fn native_frame_snapshots_preserve_versions_crop_formats_and_every_transform() {
     let mut renderer = ScreenRenderer::new(&device).unwrap();
     let p = pipeline(&mut renderer, &compiler, 0);
     let packed = pipeline(&mut renderer, &compiler, 1);
-    let mut cache = VulkanResidency::new(device, 64 * 1024 * 1024).unwrap();
+    let mut cache = VulkanResidency::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+        device,
+        64 * 1024 * 1024,
+    )
+    .unwrap();
     let mut frames = Frames::new();
     const ORDER: [[u8; 6]; 8] = [
         [1, 2, 3, 4, 5, 6],
@@ -219,7 +216,7 @@ fn native_frame_snapshots_preserve_versions_crop_formats_and_every_transform() {
         } else {
             4
         };
-        let (allocation, backing) = backing_allocation(4 * 5 * bytes_per_pixel, 128, 199);
+        let (allocation, backing) = backing_allocation(&cache, 4 * 5 * bytes_per_pixel, 128, 199);
         let mut bytes = vec![199; 4 * 5 * bytes_per_pixel];
         let mut expected = [[0u8; 4]; 6];
         for y in 0..3 {
@@ -265,13 +262,19 @@ fn native_frame_snapshots_preserve_versions_crop_formats_and_every_transform() {
                 expected[y * 2 + x] = pixel;
             }
         }
-        allocation.write(0, &bytes).unwrap();
+        crate::residency::tests::cpu_write(&mut cache, &allocation, 0, &bytes).unwrap();
         let request = NativePresentationImage {
+            inputs: (backing.clone()).pin(0, (backing.clone()).bytes()).unwrap(),
             planes: Arc::from([GuestImagePlane {
                 mip_level: 0,
                 array_layer: 0,
                 aspect: GuestImageAspect::Color,
-                backing: backing.clone(),
+                footprint: crate::residency::tests::plane_geometry(
+                    backing.clone(),
+                    [4, 5],
+                    (4 * bytes_per_pixel) as u64,
+                    bytes_per_pixel as u32,
+                ),
                 row_pitch: (4 * bytes_per_pixel) as u64,
                 bytes_per_block: bytes_per_pixel as u32,
             }]),
@@ -283,7 +286,8 @@ fn native_frame_snapshots_preserve_versions_crop_formats_and_every_transform() {
             .capture(&mut cache, request.clone(), &mut descriptors)
             .unwrap();
         // Later CPU contents create a new version; they cannot change this lease.
-        allocation.write(0, &vec![0; bytes.len()]).unwrap();
+        crate::residency::tests::cpu_write(&mut cache, &allocation, 0, &vec![0; bytes.len()])
+            .unwrap();
         let changed = frames
             .capture(&mut cache, request, &mut descriptors)
             .unwrap();
@@ -376,7 +380,12 @@ fn native_ui_texture_updates_blending_clipping_and_free() {
     let mut samplers = SamplerCache::new(&device, 64);
     let mut renderer = ScreenRenderer::new(&device).unwrap();
     let p = pipeline(&mut renderer, &compiler, 2);
-    let mut cache = VulkanResidency::new(device, 64 * 1024 * 1024).unwrap();
+    let mut cache = VulkanResidency::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+        device,
+        64 * 1024 * 1024,
+    )
+    .unwrap();
     let id = egui::TextureId::Managed(0);
     for partial in [false, true] {
         let color = if partial {
@@ -548,16 +557,22 @@ fn opaque_scanout_requires_a_current_resident_producer() {
         return;
     };
     let monitor = device.validation_monitor();
-    let mut cache = VulkanResidency::new(device, 16 * 1024 * 1024).unwrap();
+    let mut cache = VulkanResidency::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+        device,
+        16 * 1024 * 1024,
+    )
+    .unwrap();
     let mut descriptors = DescriptorCache::new(cache.device(), 64);
     let mut frames = Frames::new();
-    let (allocation, backing) = backing_allocation(64, 128, 199);
+    let (allocation, backing) = backing_allocation(&cache, 64, 128, 199);
     let request = NativePresentationImage {
+        inputs: (backing.clone()).pin(0, (backing.clone()).bytes()).unwrap(),
         planes: Arc::from([GuestImagePlane {
             mip_level: 0,
             array_layer: 0,
             aspect: GuestImageAspect::Color,
-            backing: backing.clone(),
+            footprint: crate::residency::tests::plane_geometry(backing.clone(), [4, 4], 16, 4),
             row_pitch: 16,
             bytes_per_block: 4,
         }]),
@@ -578,7 +593,34 @@ fn opaque_scanout_requires_a_current_resident_producer() {
     };
     let image = cache
         .image_for(
-            backing,
+            crate::residency::tests::image_geometry(
+                backing,
+                NativeImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format: vk::Format::B8G8R8A8_UNORM,
+                    extent,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    usage: vk::ImageUsageFlags::TRANSFER_SRC
+                        | vk::ImageUsageFlags::TRANSFER_DST
+                        | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    flags: vk::ImageCreateFlags::empty(),
+                },
+                &[ImagePlane {
+                    offset: 0,
+                    row_pitch: 16,
+                    mip_level: 0,
+                    array_layer: 0,
+                    extent,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    block_extent: vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                    bytes_per_block: 4,
+                }],
+            ),
             NativeImageDescription {
                 image_type: vk::ImageType::TYPE_2D,
                 format: vk::Format::B8G8R8A8_UNORM,
@@ -623,8 +665,8 @@ fn opaque_scanout_requires_a_current_resident_producer() {
     assert_eq!(cache.statistics().native_readback_bytes, 0);
     // A real CPU demand first resolves the producer through the owner-local
     // visibility path; the later write then invalidates resident scanout.
-    crate::residency::tests::cpu_read(&mut cache, &request.planes[0].backing);
-    allocation.write(0, &[0; 64]).unwrap();
+    crate::residency::tests::cpu_read(&mut cache, request.planes[0].footprint.mapping());
+    crate::residency::tests::cpu_write(&mut cache, &allocation, 0, &[0; 64]).unwrap();
     assert!(
         frames
             .capture(&mut cache, request, &mut descriptors)
@@ -645,17 +687,23 @@ fn scanout_retargets_a_new_producer_and_ignores_undefined_padding() {
         return;
     };
     let monitor = device.validation_monitor();
-    let mut cache = VulkanResidency::new(device, 32 * 1024 * 1024).unwrap();
+    let mut cache = VulkanResidency::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+        device,
+        32 * 1024 * 1024,
+    )
+    .unwrap();
     let mut descriptors = DescriptorCache::new(cache.device(), 64);
     let mut frames = Frames::new();
-    let (_allocation, whole) = backing_allocation(96, 128, 199);
-    let prefix = whole.snapshot_subrange(0, 64).unwrap();
+    let (_allocation, whole) = backing_allocation(&cache, 96, 128, 199);
+    let prefix = whole.slice(0, 64).unwrap();
     let mut request = NativePresentationImage {
+        inputs: (prefix).pin(0, (prefix).bytes()).unwrap(),
         planes: Arc::from([GuestImagePlane {
             mip_level: 0,
             array_layer: 0,
             aspect: GuestImageAspect::Color,
-            backing: prefix,
+            footprint: crate::residency::tests::plane_geometry(prefix, [4, 4], 16, 4),
             row_pitch: 16,
             bytes_per_block: 4,
         }]),
@@ -673,7 +721,32 @@ fn scanout_retargets_a_new_producer_and_ignores_undefined_padding() {
     };
     let parent = cache
         .image_for_device_write(
-            whole,
+            crate::residency::tests::image_geometry(
+                whole,
+                NativeImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format: vk::Format::B8G8R8A8_UNORM,
+                    extent,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    flags: vk::ImageCreateFlags::empty(),
+                },
+                &[ImagePlane {
+                    offset: 0,
+                    row_pitch: 16,
+                    mip_level: 0,
+                    array_layer: 0,
+                    extent,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    block_extent: vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                    bytes_per_block: 4,
+                }],
+            ),
             NativeImageDescription {
                 image_type: vk::ImageType::TYPE_2D,
                 format: vk::Format::B8G8R8A8_UNORM,
@@ -829,15 +902,21 @@ fn dropping_a_frame_pool_retains_an_in_flight_snapshot_destination() {
             .tick()
     };
     let mut descriptors = DescriptorCache::new(&device, 64);
-    let mut cache = VulkanResidency::new(device, 16 * 1024 * 1024).unwrap();
+    let mut cache = VulkanResidency::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+        device,
+        16 * 1024 * 1024,
+    )
+    .unwrap();
     let mut frames = Frames::new();
-    let (_allocation, backing) = backing_allocation(64, 128, 199);
+    let (_allocation, backing) = backing_allocation(&cache, 64, 128, 199);
     let request = NativePresentationImage {
+        inputs: (backing).pin(0, (backing).bytes()).unwrap(),
         planes: Arc::from([GuestImagePlane {
             mip_level: 0,
             array_layer: 0,
             aspect: GuestImageAspect::Color,
-            backing,
+            footprint: crate::residency::tests::plane_geometry(backing, [4, 4], 16, 4),
             row_pitch: 16,
             bytes_per_block: 4,
         }]),

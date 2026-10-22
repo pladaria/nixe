@@ -5,7 +5,7 @@ mod compute;
 mod identity;
 mod image;
 mod interface;
-use crate::MaxwellGpuAddressSpace;
+use crate::MaxwellGpuMemory;
 use crate::execution::{MaxwellFrontend, MaxwellSubmissionExecutionError as Error};
 use identity::{DrawKey, ImageKey, ParameterKey, ProgramKey};
 use interface::ShaderInterface;
@@ -43,8 +43,16 @@ struct Prepared {
     draw: Arc<GuestDrawState>,
     roles: Arc<[MaxwellThreeDResourceRole]>,
 }
+#[derive(Clone, Eq, PartialEq)]
+struct PresentationKey {
+    backing: nixe_gpu::BackingView,
+    extent: [u32; 2],
+    format: nixe_gpu::PresentationImageFormat,
+    layout: nixe_gpu::ImageMemoryLayout,
+    row_pitch: u32,
+}
 pub struct MaxwellNativeFrontend {
-    presentation: Vec<(nixe_gpu::PresentationImageRequest, NativePresentationImage)>,
+    presentation: Vec<(PresentationKey, Arc<[GuestImagePlane]>)>,
     resources: super::super::threed::MaxwellThreeDResolvedResourceCache,
     draw_roles: Vec<MaxwellThreeDResourceRole>,
     code: Option<Code>,
@@ -134,7 +142,8 @@ impl MaxwellNativeFrontend {
     fn ensure_code(
         &mut self,
         state: &MaxwellThreeDState,
-        space: &MaxwellGpuAddressSpace,
+        space: &MaxwellGpuMemory,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<(), Error> {
         if self.code.as_ref().is_some_and(|code| {
             code.state.matches(state)
@@ -180,7 +189,7 @@ impl MaxwellNativeFrontend {
             Some(snapshot) => (
                 None,
                 snapshot
-                    .refresh(&requests, space, &mut self.capture_memory)
+                    .refresh(&requests, space, &mut self.capture_memory, access)
                     .map_err(compilation)?,
             ),
             None => (None, None),
@@ -205,6 +214,7 @@ impl MaxwellNativeFrontend {
                     requests,
                     &self.configuration,
                     &mut self.capture_memory,
+                    access,
                 )
                 .map_err(compilation)?,
             );
@@ -289,9 +299,10 @@ impl MaxwellNativeFrontend {
         &mut self,
         state: &MaxwellThreeDState,
         trigger: MaxwellThreeDOperationTrigger,
-        space: &MaxwellGpuAddressSpace,
+        space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
         instances: Option<(u32, u32)>,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<NativeWork, Error> {
         let begin = *state
             .vertex_input()
@@ -304,7 +315,7 @@ impl MaxwellNativeFrontend {
             ));
         }
         self.statistics.draws += 1;
-        self.ensure_code(state, space)?;
+        self.ensure_code(state, space, access)?;
         let code = self.code.as_ref().unwrap();
         let reuse_roles = self.prepared.as_ref().is_some_and(|p| {
             p.state.matches_parameters(state)
@@ -328,7 +339,15 @@ impl MaxwellNativeFrontend {
         };
         let resources = self
             .resources
-            .resolve_with_buffer_sizes(state, space, roles, &code.interface.sizes, false, 4096)
+            .resolve_with_buffer_sizes(
+                state,
+                space,
+                roles,
+                &code.interface.sizes,
+                false,
+                4096,
+                access,
+            )
             .map_err(Error::ThreeDResource)?;
         let prepared_roles = roles;
         let mut arguments = lowering(native_arguments(state, trigger))?;
@@ -623,7 +642,7 @@ impl MaxwellNativeFrontend {
                     backing: lowering(resolved_buffer(&resources, index))?
                         .view()
                         .backing()
-                        .range()
+                        .mapping()
                         .clone(),
                 })
             })
@@ -639,7 +658,7 @@ impl MaxwellNativeFrontend {
                 lowering(resolved_buffer(&resources, i))?
                     .view()
                     .backing()
-                    .range()
+                    .mapping()
                     .clone(),
                 match state
                     .vertex_input()
@@ -708,7 +727,11 @@ fn plane_metadata_bytes(image: &GuestImage) -> usize {
     image
         .planes
         .iter()
-        .map(|p| std::mem::size_of::<GuestImagePlane>() + p.backing.metadata_bytes())
+        .map(|p| {
+            std::mem::size_of::<GuestImagePlane>()
+                + std::mem::size_of::<nixe_gpu::physical::Footprint>()
+                + p.footprint.mapping().metadata_bytes()
+        })
         .sum()
 }
 
@@ -739,7 +762,7 @@ impl MaxwellNativeFrontend {
                 let index = lowering(resource_index(resources, role))?;
                 match &resources.resources()[index] {
                     MaxwellThreeDResolvedResource::Buffer(b) => {
-                        GuestBinding::Buffer(b.view().backing().range().clone())
+                        GuestBinding::Buffer(b.view().backing().mapping().clone())
                     }
                     MaxwellThreeDResolvedResource::Image(_) => GuestBinding::Image {
                         image: self.image(resources, index)?,
@@ -798,9 +821,7 @@ fn same_binding(a: &GuestBinding, b: &GuestBinding) -> bool {
         (GuestBinding::NullBuffer, GuestBinding::NullBuffer) => true,
         // Program preparation depends on physical bindings, not CPU content
         // epochs. Native consumption still checks visibility on every draw.
-        (GuestBinding::Buffer(a), GuestBinding::Buffer(b)) => {
-            a.byte_mapping_key() == b.byte_mapping_key()
-        }
+        (GuestBinding::Buffer(a), GuestBinding::Buffer(b)) => a == b,
         (
             GuestBinding::Image {
                 image: a,
@@ -864,38 +885,42 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
         &mut self,
         request: nixe_gpu::PresentationImageRequest,
     ) -> Result<NativePresentationImage, Error> {
-        if let Some((_, image)) = self.presentation.iter().find(|(key, _)| {
-            key.backing == request.backing
-                && key.width == request.width
-                && key.height == request.height
-                && key.format == request.format
-                && key.layout == request.layout
-                && key.row_pitch == request.row_pitch
-        }) {
-            let mut image = image.clone();
-            image.allow_canonical_import = request.allow_canonical_import;
-            return Ok(image);
-        }
-        let planes = image::presentation_planes(&request)?;
-        let image = NativePresentationImage {
+        let key = PresentationKey {
+            backing: request.backing.clone(),
+            extent: [request.width, request.height],
+            format: request.format,
+            layout: request.layout,
+            row_pitch: request.row_pitch,
+        };
+        let planes = if let Some((_, planes)) =
+            self.presentation.iter().find(|(cached, _)| *cached == key)
+        {
+            Arc::clone(planes)
+        } else {
+            let planes = image::presentation_planes(&request)?;
+            if self.presentation.len() == 16 {
+                self.presentation.remove(0);
+            }
+            self.presentation.push((key, Arc::clone(&planes)));
+            planes
+        };
+        Ok(NativePresentationImage {
+            inputs: request.inputs,
             planes,
             extent: [request.width, request.height],
             format: request.format,
             allow_canonical_import: request.allow_canonical_import,
-        };
-        if self.presentation.len() == 16 {
-            self.presentation.remove(0);
-        }
-        self.presentation.push((request, image.clone()));
-        Ok(image)
+        })
     }
+
     fn lower_three_d(
         &mut self,
         state: &MaxwellThreeDState,
         trigger: MaxwellThreeDOperationTrigger,
-        space: &MaxwellGpuAddressSpace,
+        space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
         instances: Option<(u32, u32)>,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<NativeWork, Error> {
         if let Some(mode) = state.render_enable().execution_mode()
             && mode != MaxwellThreeDRenderEnableMode::Enabled
@@ -905,14 +930,14 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             ));
         }
         if trigger.is_draw() {
-            return self.draw(state, trigger, space, frontend, instances);
+            return self.draw(state, trigger, space, frontend, instances, access);
         }
         lowering(validate_consumed_state(state, trigger))?;
         let mut roles = Vec::new();
         trigger.append_resource_roles(state, &mut roles);
         let resources = self
             .resources
-            .resolve(state, space, &roles, false, 4096)
+            .resolve(state, space, &roles, false, 4096, access)
             .map_err(Error::ThreeDResource)?;
         let clear = state.render_targets().clear();
         let surface = *clear
@@ -1010,11 +1035,12 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
     fn lower_launch(
         &mut self,
         launch: &super::super::compute::MaxwellResolvedComputeLaunch,
-        space: &MaxwellGpuAddressSpace,
+        space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<NativeWork, Error> {
         launch.validate_execution().map_err(Error::ComputeLaunch)?;
-        let capture = self.capture_compute(launch, space)?;
+        let capture = self.capture_compute(launch, space, access)?;
         let inputs = &capture.inputs;
         let code = if let Some(code) = self.captured_codes.get(&inputs.identity) {
             Arc::clone(code)
@@ -1026,7 +1052,7 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             code
         };
         let resources = launch
-            .native_resources(&inputs.stages[0].info, space)
+            .native_resources(&inputs.stages[0].info, space, access)
             .map_err(Error::ComputeLaunch)?;
         let mut bindings = Vec::new();
         for (resource, range) in resources {
@@ -1037,7 +1063,7 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             let retained = lowering(buffer::retain(&range))?;
             bindings.push((
                 resource,
-                GuestBinding::Buffer(retained.backing.range().clone()),
+                GuestBinding::Buffer(retained.backing.mapping().clone()),
             ));
         }
         if let Some(old) = &self.prepared_compute
@@ -1076,12 +1102,13 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
     fn lower_solid(
         &mut self,
         request: &crate::engines::MaxwellTwoDSolidOperation,
-        space: &MaxwellGpuAddressSpace,
+        space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<NativeWork, Error> {
         let resources = self
             .resources
-            .resolve_solid_image(request, space, 4096)
+            .resolve_solid_image(request, space, 4096, access)
             .map_err(Error::ThreeDResource)?;
         let image = lowering(resolved_image(&resources, 0))?;
         let value = lowering(resolve::solid_clear_value(
@@ -1107,13 +1134,14 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
     fn lower_blit(
         &mut self,
         request: &crate::MaxwellTwoDBlitOperation,
-        space: &MaxwellGpuAddressSpace,
+        space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<NativeWork, Error> {
         use super::super::twod::blit::BlitKind;
         let resources = self
             .resources
-            .resolve_color_images(request, space, 4096)
+            .resolve_color_images(request, space, 4096, access)
             .map_err(Error::ThreeDResource)?;
         let source = self.image(&resources, 0)?;
         let destination = self.image(&resources, 1)?;
@@ -1277,12 +1305,13 @@ impl Drop for MaxwellNativeFrontend {
 #[cfg(test)]
 mod producer_tests {
     use super::*;
+    use crate::MaxwellGpuAddressSpace;
     use crate::engines::twod::blit::{BlitKind, BlitSurface, BlitSurfaceLayout};
     use crate::{
         MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
         MaxwellMapRequest, SWITCH_1_GM20B_PROFILE,
     };
-    use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+    use nixe_memory::MemoryPermissions;
 
     #[test]
     fn alternating_native_shader_sources_share_code_and_observe_committed_changes() {
@@ -1305,15 +1334,9 @@ mod producer_tests {
                 .collect::<Vec<_>>()
         };
         let mov = |bits: u32| 0x0100_0000_0007_f000 | u64::from(bits) << 20;
-        allocation
-            .write(0, &encode(vertex, 0xe300_0000_0007_000f))
-            .unwrap();
-        allocation
-            .write(0x100, &encode(pixel, mov(1f32.to_bits())))
-            .unwrap();
-        allocation
-            .write(0x200, &encode(pixel, mov(2f32.to_bits())))
-            .unwrap();
+        crate::test_memory::write(&allocation, 0, &encode(vertex, 0xe300_0000_0007_000f)).unwrap();
+        crate::test_memory::write(&allocation, 0x100, &encode(pixel, mov(1f32.to_bits()))).unwrap();
+        crate::test_memory::write(&allocation, 0x200, &encode(pixel, mov(2f32.to_bits()))).unwrap();
         let mut channel = crate::engines::tests::three_d_channel();
         for (method, value) in [
             (0x2140, 0x50),
@@ -1331,15 +1354,33 @@ mod producer_tests {
         }
         let mut frontend = MaxwellNativeFrontend::new(Default::default());
 
-        frontend.ensure_code(channel.three_d(), &space).unwrap();
+        frontend
+            .ensure_code(
+                channel.three_d(),
+                space.memory(),
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
         let first = Arc::clone(&frontend.code.as_ref().unwrap().code);
         let interface = Arc::clone(&frontend.code.as_ref().unwrap().interface);
         assert_eq!(first.stages.len(), 2);
         crate::engines::tests::program_three_d(&mut channel, 0x2044, 0x200);
-        frontend.ensure_code(channel.three_d(), &space).unwrap();
+        frontend
+            .ensure_code(
+                channel.three_d(),
+                space.memory(),
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
         assert!(!Arc::ptr_eq(&first, &frontend.code.as_ref().unwrap().code));
         crate::engines::tests::program_three_d(&mut channel, 0x2044, 0x100);
-        frontend.ensure_code(channel.three_d(), &space).unwrap();
+        frontend
+            .ensure_code(
+                channel.three_d(),
+                space.memory(),
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
         assert!(Arc::ptr_eq(&first, &frontend.code.as_ref().unwrap().code));
         assert!(Arc::ptr_eq(
             &interface,
@@ -1348,13 +1389,19 @@ mod producer_tests {
         assert_eq!(frontend.statistics.shader_captures, 2);
         let word = mov(3f32.to_bits());
         write_shader_words(
-            &space,
+            space.memory(),
             &[
                 (address + 0x150, word as u32),
                 (address + 0x154, (word >> 32) as u32),
             ],
         );
-        frontend.ensure_code(channel.three_d(), &space).unwrap();
+        frontend
+            .ensure_code(
+                channel.three_d(),
+                space.memory(),
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
         assert_ne!(
             first.identity,
             frontend.code.as_ref().unwrap().code.identity
@@ -1364,20 +1411,22 @@ mod producer_tests {
 
     #[test]
     fn single_sample_downsample_is_a_filtered_blit_with_distinct_rectangles() {
-        let mut space =
-            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+        let machine = crate::test_memory::machine();
+        let mut space = MaxwellGpuAddressSpace::new(
+            machine.clone(),
+            MaxwellAddressSpaceId::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
         space
             .initialize(MaxwellAddressSpaceInitialization::default())
             .unwrap();
         let mut addresses = Vec::new();
         for i in 1..=2 {
-            let storage = CanonicalAllocation::zeroed(0x10000, 4096).unwrap();
+            let storage = crate::test_memory::allocate(&machine, 0x10000);
             let address = space
                 .map(MaxwellMapRequest {
                     allocation: MaxwellAllocationId::new(i),
-                    backing: storage
-                        .backing_range(MemoryPermissions::READ_WRITE)
-                        .unwrap(),
+                    backing: crate::test_memory::ranges(&storage),
                     backing_offset: 0,
                     size: 0x10000,
                     allocation_alignment: 4096,
@@ -1426,7 +1475,12 @@ mod producer_tests {
             },
         };
         let work = frontend
-            .lower_blit(&request, &space, FrontendSubmissionId::new(1))
+            .lower_blit(
+                &request,
+                space.memory(),
+                FrontendSubmissionId::new(1),
+                &mut crate::test_memory::apply,
+            )
             .unwrap();
         let NativeCommand::Blit {
             source_rectangle,

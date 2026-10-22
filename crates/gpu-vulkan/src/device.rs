@@ -39,9 +39,9 @@ pub struct SurfaceProfile {
 /// Construct before GPU workers start, then move this concrete value to the owner.
 pub struct VulkanDevice {
     pub(crate) owner: Arc<DeviceOwner>,
+    pub(crate) submission: QueueState,
     pub(crate) dispatch: Dispatch,
     pub(crate) queue: vk::Queue,
-    pub(crate) submission: QueueState,
     profile: DeviceProfile,
     queues: QueueSelection,
     surface: Option<SurfaceProfile>,

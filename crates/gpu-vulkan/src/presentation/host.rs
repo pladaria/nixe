@@ -41,8 +41,12 @@ impl Host {
             pending_surface: None,
         })
     }
-    pub fn pending(&self) -> bool {
-        self.dirty || self.capture.is_some() || self.client.0.lock().unwrap().pending.is_some()
+    pub(crate) fn completion_point(&self) -> Option<u64> {
+        self.capture
+            .as_ref()?
+            .pending
+            .front()
+            .map(|(ticket, _)| ticket.work().tick())
     }
     pub fn service(
         &mut self,
@@ -91,9 +95,9 @@ impl Host {
         {
             let frame = frames.get(&source.image)?;
             let kind = u8::from(frame.format == vk::Format::R16_UINT);
-            if let Some(pipeline) =
-                self.renderer
-                    .pipeline(pipelines, vk::Format::R8G8B8A8_UNORM, kind)?
+            let pipeline = self
+                .renderer
+                .pipeline(pipelines, vk::Format::R8G8B8A8_UNORM, kind)?;
             {
                 let extent = source.dimensions();
                 let image = cache.allocate_host_image(extent, vk::Format::R8G8B8A8_UNORM)?;
@@ -162,18 +166,12 @@ impl Host {
         let format = acquired.format;
         let screen = if let Some(source) = &self.source {
             let kind = u8::from(frames.get(&source.image)?.format == vk::Format::R16_UINT);
-            let Some(pipeline) = self.renderer.pipeline(pipelines, format, kind)? else {
-                return Ok(());
-            };
-            Some(pipeline)
+            Some(self.renderer.pipeline(pipelines, format, kind)?)
         } else {
             None
         };
         let ui_pipeline = if self.ui.is_some() {
-            let Some(pipeline) = self.renderer.pipeline(pipelines, format, 2)? else {
-                return Ok(());
-            };
-            Some(pipeline)
+            Some(self.renderer.pipeline(pipelines, format, 2)?)
         } else {
             None
         };

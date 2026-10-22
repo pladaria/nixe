@@ -125,6 +125,7 @@ pub struct RuntimeCoordinator {
     cpu_waits: BTreeMap<GuestThreadId, CpuWait>,
     adaptive_budget: AdaptiveExecutionBudget,
     parallel_budgets: BTreeMap<VirtualCpuId, AdaptiveExecutionBudget>,
+    next_preemption_ns: Option<u64>,
     completed_executions: VecDeque<CoordinatorExecution>,
 }
 
@@ -168,6 +169,9 @@ impl RuntimeCoordinator {
             execution_mode == VcpuExecutionMode::Deterministic,
         )
         .map_err(|error| CoordinatorError::WorkerStartup(error.kind()))?;
+        let next_preemption_ns = profile
+            .preemption_interval_ns()
+            .map(|interval| virtual_clock.scheduler_time_ns().saturating_add(interval));
         Ok(Self {
             scheduler: SchedulerState::new(profile),
             processes: BTreeMap::new(),
@@ -191,6 +195,7 @@ impl RuntimeCoordinator {
             cpu_waits: BTreeMap::new(),
             adaptive_budget,
             parallel_budgets,
+            next_preemption_ns,
             completed_executions: VecDeque::new(),
         })
     }
@@ -522,10 +527,9 @@ impl RuntimeCoordinator {
     ) {
         let _ = process.request_execution_stop();
         for &vcpu in installed {
-            let preparation = process.cpu_thread_teardown_state();
-            let _ = self.workers.retire_process(vcpu, process_id, preparation);
+            let _ = self.workers.retire_process(vcpu, process_id);
         }
-        let _ = process.complete_cpu_thread_retirement();
+        process.complete_cpu_thread_retirement();
     }
 
     fn retire_process_cpu_threads(
@@ -554,24 +558,14 @@ impl RuntimeCoordinator {
             .map(|descriptor| descriptor.id())
             .collect();
         for vcpu in vcpus {
-            let preparation = self
-                .processes
-                .get(&process_id)
-                .expect("the stopping process remains registered")
-                .cpu_thread_teardown_state();
             self.workers
-                .retire_process(vcpu, process_id, preparation)
+                .retire_process(vcpu, process_id)
                 .map_err(CoordinatorError::Worker)?;
         }
         self.processes
             .get_mut(&process_id)
             .expect("the stopped process remains registered")
-            .complete_cpu_thread_retirement()
-            .map_err(|fault| CoordinatorError::Execution {
-                process: process_id,
-                thread: main_thread,
-                error: ProcessExecutionError::Cpu { fault },
-            })?;
+            .complete_cpu_thread_retirement();
         Ok(())
     }
 
@@ -660,13 +654,29 @@ impl RuntimeCoordinator {
                 },
             ));
         }
-        let other_live = self
+        let other_live = self.other_live_threads(lease.process, lease.thread)?;
+        let process = self
             .processes
-            .get(&lease.process)
-            .ok_or(CoordinatorRouteError::UnknownProcess(lease.process))?
+            .get_mut(&lease.process)
+            .ok_or(CoordinatorRouteError::UnknownProcess(lease.process))?;
+        let result = process
+            .route_supervisor_call_for(lease.thread, lease.vcpu, stop, dispatcher, other_live)
+            .map_err(CoordinatorRouteError::Route)?;
+        self.commit_exception_result(lease.process, lease.thread, result)
+    }
+
+    fn other_live_threads(
+        &self,
+        process_id: ProcessId,
+        thread_id: GuestThreadId,
+    ) -> Result<bool, CoordinatorRouteError> {
+        Ok(self
+            .processes
+            .get(&process_id)
+            .ok_or(CoordinatorRouteError::UnknownProcess(process_id))?
             .threads()
             .iter()
-            .filter(|(id, _)| **id != lease.thread)
+            .filter(|(id, _)| **id != thread_id)
             .any(|(id, _)| {
                 self.scheduler.thread(*id).is_some_and(|thread| {
                     !matches!(
@@ -675,25 +685,59 @@ impl RuntimeCoordinator {
                             | nixe_scheduler::ThreadLifecycle::Faulted
                     )
                 })
-            });
-        let process = self
+            }))
+    }
+
+    /// Resumes only the current owned kernel operation. It consumes the old
+    /// wait generation without making guest code runnable between kernel phases.
+    pub fn resume_supervisor_call<F>(
+        &mut self,
+        token: WakeToken,
+        vcpu: VirtualCpuId,
+        source: nixe_cpu::location::LocationDescriptor,
+        continuation: impl FnOnce(
+            &mut crate::ExceptionDispatchContext<'_>,
+        ) -> crate::ExceptionDispatchOutcome<F>,
+    ) -> Result<Option<ExceptionHandlingResult<F>>, CoordinatorRouteError> {
+        let Some(thread) = self.scheduler.thread(token.thread).filter(|thread| {
+            thread.active_wait == Some(token)
+                && thread.lifecycle == nixe_scheduler::ThreadLifecycle::Waiting
+        }) else {
+            return Ok(None);
+        };
+        let process_id = thread.process;
+        let other_live = self.other_live_threads(process_id, token.thread)?;
+        self.release_wait_resources(token.thread);
+        self.scheduler
+            .apply(SchedulerCommand::ContinueWait(token))
+            .map_err(CoordinatorRouteError::Scheduler)?;
+        let result = self
             .processes
-            .get_mut(&lease.process)
-            .ok_or(CoordinatorRouteError::UnknownProcess(lease.process))?;
-        let result = process
-            .route_supervisor_call_for(lease.thread, lease.vcpu, stop, dispatcher, other_live)
+            .get_mut(&process_id)
+            .ok_or(CoordinatorRouteError::UnknownProcess(process_id))?
+            .resume_supervisor_call_for(token.thread, vcpu, source, other_live, continuation)
             .map_err(CoordinatorRouteError::Route)?;
+        self.commit_exception_result(process_id, token.thread, result)
+            .map(Some)
+    }
+
+    fn commit_exception_result<F>(
+        &mut self,
+        process_id: ProcessId,
+        thread_id: GuestThreadId,
+        result: ExceptionHandlingResult<F>,
+    ) -> Result<ExceptionHandlingResult<F>, CoordinatorRouteError> {
         let command = match &result {
             ExceptionHandlingResult::Resumed | ExceptionHandlingResult::Rejected(_) => {
-                Some(SchedulerCommand::MakeReady(lease.thread))
+                Some(SchedulerCommand::MakeReady(thread_id))
             }
             ExceptionHandlingResult::Suspended => None,
             ExceptionHandlingResult::Terminated { .. } => Some(SchedulerCommand::Terminate {
-                thread: lease.thread,
+                thread: thread_id,
                 faulted: false,
             }),
             ExceptionHandlingResult::Fault(_) => Some(SchedulerCommand::Terminate {
-                thread: lease.thread,
+                thread: thread_id,
                 faulted: true,
             }),
         };
@@ -707,34 +751,34 @@ impl RuntimeCoordinator {
                 .map_err(CoordinatorRouteError::Scheduler)?;
         }
         if terminal {
-            self.release_wait_resources(lease.thread);
+            self.release_wait_resources(thread_id);
             self.processes
-                .get_mut(&lease.process)
+                .get_mut(&process_id)
                 .expect("the terminal thread retains its owning process")
-                .address_waits_mut()
-                .release_thread(lease.thread);
-            self.priority_donations.retain(|donation| {
-                donation.owner != lease.thread && donation.waiter != lease.thread
-            });
+                .address_waits()
+                .lock()
+                .release_thread(thread_id);
+            self.priority_donations
+                .retain(|donation| donation.owner != thread_id && donation.waiter != thread_id);
             self.recompute_effective_priorities()
                 .map_err(CoordinatorRouteError::Scheduler)?;
             let reap_unreferenced = self
                 .processes
-                .get(&lease.process)
+                .get(&process_id)
                 .and_then(|process| {
-                    (process.main_thread_id() != lease.thread)
-                        .then(|| process.thread(lease.thread))
+                    (process.main_thread_id() != thread_id)
+                        .then(|| process.thread(thread_id))
                         .flatten()
                 })
                 .is_some_and(|thread| thread.object_identity_reference_count() == 1);
             if reap_unreferenced {
                 self.scheduler
-                    .apply(SchedulerCommand::Unregister(lease.thread))
+                    .apply(SchedulerCommand::Unregister(thread_id))
                     .map_err(CoordinatorRouteError::Scheduler)?;
                 self.processes
-                    .get_mut(&lease.process)
+                    .get_mut(&process_id)
                     .expect("the terminated thread retains its owning process")
-                    .reap_exited_thread(lease.thread)
+                    .reap_exited_thread(thread_id)
                     .expect("an unreferenced terminal thread can be reaped");
             }
         }
@@ -744,7 +788,7 @@ impl RuntimeCoordinator {
             ..
         } = &result
         {
-            self.terminate_remaining_process_threads(lease.process, lease.thread, *exit_code)?;
+            self.terminate_remaining_process_threads(process_id, thread_id, *exit_code)?;
         }
         Ok(result)
     }
@@ -769,7 +813,7 @@ impl RuntimeCoordinator {
             address_waiters: self
                 .processes
                 .values()
-                .map(|process| process.address_waits().waiter_count())
+                .map(|process| process.address_waits().lock().waiter_count())
                 .sum(),
         }
     }

@@ -63,8 +63,8 @@ impl UserSettingsCommand {
 // libnx uses both firmware commands with a fixed-size 0x100-byte output
 // pointer:
 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/set.c
-pub(in crate::ipc_wire) fn dispatch_system_settings(
-    process: &ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_system_settings(
+    process: &Request,
     request: CmifRequest<'_>,
     receive_statics: &ReceiveStatics,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
@@ -86,7 +86,8 @@ pub(in crate::ipc_wire) fn dispatch_system_settings(
                 process,
                 GuestVirtualAddress::new(descriptor.address),
                 &emulated_firmware_version(),
-            )?;
+            )
+            .await?;
             log::debug!("set:sys returned emulated firmware version 1.0.0");
             Ok((
                 encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
@@ -99,8 +100,8 @@ pub(in crate::ipc_wire) fn dispatch_system_settings(
 // Commands 1/3 are the pre-4.0 pointer-buffer forms; 5/6 are the current
 // map-alias forms:
 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/set.c
-pub(in crate::ipc_wire) fn dispatch_user_settings(
-    process: &ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_user_settings(
+    process: &Request,
     session: &UserSettingsSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -177,7 +178,7 @@ pub(in crate::ipc_wire) fn dispatch_user_settings(
             for language in &SystemLanguage::AVAILABLE[..count] {
                 codes.extend_from_slice(&language.code().to_le_bytes());
             }
-            write_descriptor_bytes(process, descriptor, &codes)?;
+            write_descriptor_bytes(process, descriptor, &codes).await?;
             let count = u32::try_from(count).expect("language table fits in a u32");
             log::debug!("set returned {count} available language codes");
             Ok((

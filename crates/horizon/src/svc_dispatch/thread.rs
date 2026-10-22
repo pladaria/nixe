@@ -37,7 +37,7 @@ impl HorizonSvcDispatcher {
         let Some(object_id) = context
             .process()
             .handles()
-            .get_as::<ThreadObject>(handle)
+            .lookup_as::<ThreadObject>(handle)
             .map(|thread| thread.thread_id())
         else {
             result(context, HorizonKernelResult::INVALID_HANDLE);
@@ -63,7 +63,7 @@ impl HorizonSvcDispatcher {
             context
                 .process()
                 .handles()
-                .get_as::<ThreadObject>(handle)
+                .lookup_as::<ThreadObject>(handle)
                 .map(|thread| thread.thread_id())
         };
         let Some(object_id) = object_id else {
@@ -163,24 +163,24 @@ impl HorizonSvcDispatcher {
         let context_size = 0x320;
         let address = GuestVirtualAddress::new(read_register(context.thread().state(), 0));
         let handle = read_register(context.thread().state(), 1) as u32;
-        let end = address.get().checked_add(context_size);
-        let mapping = context.process().memory().query_memory(
-            context.process().cpu().address_space_id(),
+        let ranges = match context.process().memory().space().capture(
             address,
-            GuestVirtualAddress::new(context.process().address_space_limit()),
-        );
-        if end.is_none_or(|end| {
-            mapping.as_ref().is_none_or(|mapping| {
-                mapping.base.get() > address.get()
-                    || mapping.base.get().saturating_add(mapping.size) < end
-                    || !mapping.permissions.contains(MemoryPermissions::WRITE)
-            })
-        }) {
-            result(context, HorizonKernelResult::INVALID_ADDRESS);
-            return resume();
-        }
+            context_size,
+            nixe_memory::MemoryPermissions::WRITE,
+        ) {
+            Ok(ranges) => ranges,
+            Err(error) => {
+                return reject(
+                    context,
+                    HorizonSvcFault::MemoryAccess {
+                        immediate: 0x33,
+                        fault: std::sync::Arc::new(error),
+                    },
+                );
+            }
+        };
         self.stage_thread_object_request(context, handle, "GetThreadContext3", |object_id| {
-            PendingRuntimeRequest::GetThreadContext { object_id, address }
+            PendingRuntimeRequest::GetThreadContext { object_id, ranges }
         })
     }
 }

@@ -5,7 +5,8 @@ use nixe_gpu_maxwell::{
     MaxwellFrontendDispatchBoundary, MaxwellGpfifoSourceError, MaxwellScheduleError,
     MaxwellUnsupportedGpfifoSubmission,
 };
-use nixe_memory::CanonicalRangeTranslationError;
+use nixe_memory::MemoryError;
+use std::sync::Arc;
 
 use super::device::{NvDrvDeviceKind, NvDrvFileDescriptor};
 use super::nvmap::NvMapHandle;
@@ -16,7 +17,7 @@ const MAX_DIAGNOSTIC_GUEST_BYTES: usize = 96;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum NvDrvValidationReason {
     UnsupportedOperation,
-    CanonicalBackingUnavailable,
+    PhysicalMemoryUnavailable,
     AddressSpaceUnavailable,
     AddressSpaceGenerationExhausted,
     AddressSpaceIdentityExhausted,
@@ -33,7 +34,7 @@ impl Display for NvDrvValidationReason {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::UnsupportedOperation => "unsupported-operation",
-            Self::CanonicalBackingUnavailable => "canonical-backing-unavailable",
+            Self::PhysicalMemoryUnavailable => "physical-memory-unavailable",
             Self::AddressSpaceUnavailable => "address-space-unavailable",
             Self::AddressSpaceGenerationExhausted => "address-space-generation-exhausted",
             Self::AddressSpaceIdentityExhausted => "address-space-identity-exhausted",
@@ -97,7 +98,7 @@ impl NvDrvErrorContext {
 }
 
 /// An `nvdrv` operation for which Nixe cannot yet provide faithful semantics.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum UnsupportedNvDrvOperation {
     OpenDevice {
         path: Box<[u8]>,
@@ -138,9 +139,9 @@ pub enum UnsupportedNvDrvOperation {
         frontend: FrontendSubmissionId,
         detail: Box<str>,
     },
-    CanonicalMemory {
+    PhysicalMemory {
         context: NvDrvErrorContext,
-        fault: CanonicalRangeTranslationError,
+        fault: Arc<MemoryError>,
     },
 }
 
@@ -157,7 +158,7 @@ impl UnsupportedNvDrvOperation {
             | Self::GpfifoSubmission { .. }
             | Self::GpfifoMemory { .. }
             | Self::GpfifoScheduling { .. }
-            | Self::CanonicalMemory { .. } => GraphicsGapKind::Ioctl,
+            | Self::PhysicalMemory { .. } => GraphicsGapKind::Ioctl,
             Self::ScheduledGpfifoSubmission { .. }
             | Self::GpuExecution { .. }
             | Self::Host1xExecution { .. } => GraphicsGapKind::GpuPacket,
@@ -254,10 +255,10 @@ impl Display for UnsupportedNvDrvOperation {
                 frontend,
                 detail
             ),
-            Self::CanonicalMemory { context, fault } => {
+            Self::PhysicalMemory { context, fault } => {
                 write!(
                     formatter,
-                    "nvdrv ioctl cannot establish canonical backing: device={} \
+                    "nvdrv ioctl cannot capture physical memory: device={} \
                      request={:#010x} fd={}",
                     context.device().path(),
                     context.request(),
@@ -289,10 +290,19 @@ fn write_bounded_guest_bytes(formatter: &mut Formatter<'_>, bytes: &[u8]) -> std
     formatter.write_str("\"")
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum NvDrvCallError {
     GuestResult(u32),
     Unsupported(UnsupportedNvDrvOperation),
+}
+
+impl Display for NvDrvCallError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GuestResult(result) => write!(f, "NVIDIA driver result {result:#x}"),
+            Self::Unsupported(operation) => Display::fmt(operation, f),
+        }
+    }
 }
 
 impl From<u32> for NvDrvCallError {

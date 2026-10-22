@@ -2,7 +2,8 @@ use nixe_gpu::{
     GpuVirtualAddress, GuestSyncpointId, GuestSyncpointValue, GuestTimeline, ImageFormat,
     MappingGeneration, ReservedTimelinePoint, TimelineInstanceId, TimelineOwnerId,
 };
-use nixe_memory::{CanonicalAllocation, CanonicalBackingRange, MemoryPermissions};
+use nixe_memory::Allocation;
+use nixe_memory::MemoryPermissions;
 
 use super::*;
 
@@ -278,8 +279,11 @@ fn use_mme_shadow_passthrough(channel: &mut MaxwellGpuChannel) {
 }
 
 fn resource_address_space() -> MaxwellGpuAddressSpace {
-    let mut address_space =
-        MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(9), SWITCH_1_GM20B_PROFILE);
+    let mut address_space = MaxwellGpuAddressSpace::new(
+        crate::test_memory::machine(),
+        MaxwellAddressSpaceId::new(9),
+        SWITCH_1_GM20B_PROFILE,
+    );
     address_space
         .initialize(MaxwellAddressSpaceInitialization::default())
         .unwrap();
@@ -288,11 +292,11 @@ fn resource_address_space() -> MaxwellGpuAddressSpace {
 
 fn map_resource(
     address_space: &mut MaxwellGpuAddressSpace,
-    backing: CanonicalBackingRange,
+    backing: Vec<nixe_memory::AllocationRange>,
     allocation: u64,
     kind: u8,
 ) -> MaxwellGpuMapping {
-    let size = backing.size();
+    let size = backing.iter().map(|range| range.bytes()).sum();
     address_space
         .map(MaxwellMapRequest {
             allocation: MaxwellAllocationId::new(allocation),

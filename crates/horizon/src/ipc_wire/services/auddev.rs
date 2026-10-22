@@ -30,8 +30,8 @@ fn output(hipc: &HipcRequest<'_>, auto: bool) -> Result<(u64, usize), IpcWireErr
     ))
 }
 
-pub(in crate::ipc_wire) fn dispatch_audio_device(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_audio_device(
+    process: &mut Request,
     session: &AudioDeviceSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -83,7 +83,7 @@ pub(in crate::ipc_wire) fn dispatch_audio_device(
             return cmif_error(request.token, HorizonIpcResult::AUDIO_INSUFFICIENT_BUFFER);
         }
         let mut name = [0; NAME_SIZE];
-        read_bytes(process, GuestVirtualAddress::new(address), &mut name)?;
+        read_bytes(process, GuestVirtualAddress::new(address), &mut name).await?;
         let Some(end) = name.iter().position(|&byte| byte == 0) else {
             return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_ARGUMENT);
         };
@@ -141,7 +141,8 @@ pub(in crate::ipc_wire) fn dispatch_audio_device(
                 process,
                 GuestVirtualAddress::new(address),
                 &data[..count * NAME_SIZE],
-            )?;
+            )
+            .await?;
         }
         let count_bytes = (count as u32).to_le_bytes();
         return semantic_success(
@@ -160,9 +161,8 @@ pub(in crate::ipc_wire) fn dispatch_audio_device(
             &session.output_event
         };
         let handle = process
-            .handles_mut()
-            .insert(event.clone())
-            .map_err(|_| IpcWireError::HostResourceExhausted("copying an audio device event"))?;
+            .return_handle(event.clone())
+            .map_err(IpcWireError::Handle)?;
         return semantic_success(request.token, false, &[], &[handle], &[], None);
     }
     let channels = session

@@ -22,7 +22,7 @@ pub(crate) struct BsdClientConfig {
 #[derive(Clone, Debug)]
 struct BsdClient {
     config: BsdClientConfig,
-    transfer_memory: TransferMemoryObject,
+    transfer_memory: Arc<TransferMemoryObject>,
     monitoring: bool,
 }
 
@@ -67,7 +67,7 @@ impl BsdSystem {
         &self,
         process_id: u64,
         config: BsdClientConfig,
-        transfer_memory: TransferMemoryObject,
+        transfer_memory: Arc<TransferMemoryObject>,
     ) -> Result<(), BsdRegistrationError> {
         let mut state = self
             .state
@@ -145,9 +145,6 @@ pub(crate) enum BsdMonitoringError {
 
 #[cfg(test)]
 mod tests {
-    use nixe_cpu::memory::MemoryPermissions;
-    use nixe_memory::{CanonicalAllocation, GuestVirtualAddress};
-
     use super::*;
 
     const CONFIG: BsdClientConfig = BsdClientConfig {
@@ -161,17 +158,8 @@ mod tests {
         socket_buffer_efficiency: 4,
     };
 
-    fn transfer_memory() -> TransferMemoryObject {
-        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        let backing = allocation
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap();
-        TransferMemoryObject::new(
-            GuestVirtualAddress::new(0x1000),
-            0x1000,
-            MemoryPermissions::NONE,
-            backing,
-        )
+    fn transfer_memory() -> Arc<TransferMemoryObject> {
+        crate::test_memory::transfer(&[0; 4096])
     }
 
     #[test]
@@ -185,7 +173,7 @@ mod tests {
             .register_client(7, CONFIG, transfer_memory())
             .unwrap();
 
-        assert_eq!(monitor_session.system().start_monitoring(7), Ok(()));
+        assert_eq!((monitor_session.system().start_monitoring(7)).unwrap(), ());
     }
 
     #[test]
@@ -205,22 +193,22 @@ mod tests {
     #[test]
     fn monitoring_rejects_an_unregistered_process() {
         let system = BsdSystem::default();
-        assert_eq!(
+        assert!(matches!(
             system.start_monitoring(7),
             Err(BsdMonitoringError::UnknownClient)
-        );
+        ));
         system
             .register_client(7, CONFIG, transfer_memory())
             .unwrap();
-        assert_eq!(system.start_monitoring(7), Ok(()));
-        assert_eq!(
+        assert_eq!((system.start_monitoring(7)).unwrap(), ());
+        assert!(matches!(
             system.start_monitoring(8),
             Err(BsdMonitoringError::UnknownClient)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             system.register_client(7, CONFIG, transfer_memory()),
             Err(BsdRegistrationError::AlreadyRegistered)
-        );
+        ));
     }
 
     #[test]
@@ -235,10 +223,11 @@ mod tests {
 
         let replacement = registry.open_session();
         assert_eq!(
-            replacement
+            (replacement
                 .system()
-                .register_client(7, CONFIG, transfer_memory()),
-            Ok(())
+                .register_client(7, CONFIG, transfer_memory()))
+            .unwrap(),
+            ()
         );
     }
 }

@@ -3,13 +3,11 @@
 use crate::{cache::*, *};
 use ash::vk;
 use nixe_gpu::{
-    BackendExecutionCompletion, BackendRuntimeError, BackendSubmissionToken,
-    BackendVisibilityRequester, ExecutionBatch, FrontendSubmissionId, GpuExecution,
-    PreparedStateId, ResidentImage,
+    BackendExecutionCompletion, BackendRuntimeError, BackendSubmissionToken, ExecutionBatch,
+    FrontendSubmissionId, GpuExecution, PreparedStateId, ResidentImage,
     native::*,
     shader_identity::{ContentId, ShaderNamespace},
 };
-use nixe_memory::{CpuVisibilityRequest, DeviceVisibilityPoint};
 use rustc_hash::FxHashMap as HashMap;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 mod completion;
@@ -42,10 +40,6 @@ enum Graphics {
         state: Arc<GuestDrawState>,
         graphics: GraphicsState,
     },
-    Pipeline {
-        pending: Pending<NativePipeline>,
-        state: Arc<GuestDrawState>,
-    },
     Ready {
         source: Arc<GuestDrawParameters>,
         state: crate::residency::execution::PreparedGraphicsState,
@@ -55,10 +49,6 @@ enum Graphics {
 enum Computing {
     Shader {
         pending: Pending<ShaderArtifact>,
-        source: Arc<GuestProgram>,
-    },
-    Pipeline {
-        pending: Pending<NativePipeline>,
         source: Arc<GuestProgram>,
     },
     Ready {
@@ -71,7 +61,6 @@ struct Completion {
     frontend: FrontendSubmissionId,
     token: BackendSubmissionToken,
     work: Option<WorkTicket>,
-    visibility: DeviceVisibilityPoint,
 }
 pub struct NativeGpuExecution {
     // Drop/join before residency destroys the timeline semaphore, including
@@ -95,16 +84,31 @@ pub struct NativeGpuExecution {
     computing: HashMap<PreparedStateId, Computing>,
     images: HashMap<images::ImageKey, Arc<GuestNativeImage>>,
     draw_arguments: Vec<Draw>,
-    affine_pipelines: HashMap<vk::Format, Pending<NativePipeline>>,
-    video_pipelines: HashMap<vk::Format, Pending<NativePipeline>>,
+    affine_pipelines: HashMap<vk::Format, Arc<NativePipeline>>,
+    video_pipelines: HashMap<vk::Format, Arc<NativePipeline>>,
     completions: VecDeque<Completion>,
     next: u64,
     pub statistics: NativeExecutionStatistics,
 }
-fn runtime(error: impl std::fmt::Display) -> BackendRuntimeError {
-    BackendRuntimeError::Backend(error.to_string().into())
+fn runtime(error: VulkanError) -> BackendRuntimeError {
+    match error {
+        VulkanError::Memory(cause) => BackendRuntimeError::Memory(cause),
+        error => BackendRuntimeError::Backend(error.to_string().into()),
+    }
 }
 impl NativeGpuExecution {
+    fn progress_accesses(&mut self) -> Result<(), BackendRuntimeError> {
+        self.residency.progress_device_accesses().map_err(runtime)?;
+        if self.residency.readback_submission_pending() {
+            self.residency.flush().map_err(runtime)?;
+        }
+        if let Some(wakeup) = &self.completion_wakeup
+            && let Some(point) = self.residency.readback_point()
+        {
+            wakeup.arm(point).map_err(runtime)?;
+        }
+        Ok(())
+    }
     pub fn attach_presentation(
         &mut self,
         client: crate::presentation::PresentationClient,
@@ -118,6 +122,7 @@ impl NativeGpuExecution {
         Ok(())
     }
     pub fn new(
+        memory: nixe_memory::Machine,
         device: VulkanDevice,
         namespace: ShaderNamespace,
         configuration: CacheConfiguration,
@@ -141,9 +146,13 @@ impl NativeGpuExecution {
         let pipelines = Arc::new(PipelineCompiler::new(&device, driver_pool, &configuration)?);
         let descriptors = DescriptorCache::new(&device, configuration.descriptor_sets);
         let samplers = SamplerCache::new(&device, configuration.sampler_entries);
-        let mut residency = VulkanResidency::new(device, resident_bytes)?;
+        let mut residency = VulkanResidency::new(memory, device, resident_bytes)?;
         residency.enable_sample_conversion(Arc::clone(&pipelines));
         let video_device = crate::residency::video::device_uuid(residency.device());
+        residency
+            .memory()
+            .enable_cpu_write_collection()
+            .map_err(VulkanError::from)?;
         Ok(Self {
             completion_wakeup: None,
             video: Default::default(),
@@ -215,49 +224,78 @@ impl NativeGpuExecution {
                 },
             );
         }
-        loop {
-            let ready = match &self.graphics[&id] {
-                Graphics::Ready { source, .. } => {
-                    if !Arc::ptr_eq(source, &state.parameters) {
-                        return Err(VulkanError::InvalidResource(
-                            "graphics identity was reused for different parameters",
-                        ));
-                    }
-                    return Ok(true);
+        let ready = match &self.graphics[&id] {
+            Graphics::Ready { source, .. } => {
+                if !Arc::ptr_eq(source, &state.parameters) {
+                    return Err(VulkanError::InvalidResource(
+                        "graphics identity was reused for different parameters",
+                    ));
                 }
-                Graphics::Shader { pending, .. } => pending.poll().map(|r| r.map(Either::Shader)),
-                Graphics::Pipeline { pending, .. } => {
-                    pending.poll().map(|r| r.map(Either::Pipeline))
+                return Ok(true);
+            }
+            Graphics::Shader { pending, .. } => pending.poll(),
+        };
+        let Some(ready) = ready else { return Ok(false) };
+        let ready = ready.map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
+        let old = self.graphics.remove(&id).unwrap();
+        match (old, ready) {
+            (
+                Graphics::Shader {
+                    state,
+                    graphics,
+                    pending,
+                },
+                mut shader,
+            ) => {
+                if let Some(tessellation) = state.parameters.tessellation
+                    && matches!(
+                        tessellation.control,
+                        nixe_gpu::TessellationControl::DefaultLevels { .. }
+                    )
+                {
+                    let interface = |kind| {
+                        shader.stages.iter().find(|stage| stage.stage == kind)
+                        .and_then(|stage| stage.guest.as_ref()).map(|stage| &stage.interface)
+                        .ok_or(VulkanError::InvalidResource("default tessellation control requires vertex and evaluation interfaces"))
+                    };
+                    let artifact = nixe_gpu::shader_module::synthetic::default_control(
+                        interface(nixe_gpu::ShaderStage::Vertex)?,
+                        interface(nixe_gpu::ShaderStage::TessellationEvaluation)?,
+                        u32::from(tessellation.input_control_points),
+                        tessellation.mode.domain,
+                        self.residency
+                            .device()
+                            .profile()
+                            .shader_compiler
+                            .profile
+                            .supported_spirv,
+                    )
+                    .map_err(|error| VulkanError::Compilation(error.to_string().into()))?;
+                    let control = CompiledStage::from_guest(artifact)
+                        .map_err(|error| VulkanError::Compilation(error.to_string().into()))?;
+                    let mut stages = shader.stages.to_vec();
+                    stages.insert(1, Arc::new(control));
+                    shader = Arc::new(ShaderArtifact::new(stages.into_boxed_slice()));
                 }
-            };
-            let Some(ready) = ready else { return Ok(false) };
-            let ready = ready.map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
-            let old = self.graphics.remove(&id).unwrap();
-            match (old, ready) {
-                (
-                    Graphics::Shader {
-                        state,
-                        graphics,
-                        pending,
-                    },
-                    Either::Shader(mut shader),
-                ) => {
-                    if let Some(tessellation) = state.parameters.tessellation
-                        && matches!(
-                            tessellation.control,
-                            nixe_gpu::TessellationControl::DefaultLevels { .. }
-                        )
-                    {
-                        let interface = |kind| {
-                            shader.stages.iter().find(|stage| stage.stage == kind)
-                            .and_then(|stage| stage.guest.as_ref()).map(|stage| &stage.interface)
-                            .ok_or(VulkanError::InvalidResource("default tessellation control requires vertex and evaluation interfaces"))
-                        };
-                        let artifact = nixe_gpu::shader_module::synthetic::default_control(
-                            interface(nixe_gpu::ShaderStage::Vertex)?,
-                            interface(nixe_gpu::ShaderStage::TessellationEvaluation)?,
-                            u32::from(tessellation.input_control_points),
-                            tessellation.mode.domain,
+                if state.parameters.topology == nixe_gpu::PrimitiveTopology::Quads {
+                    let geometry = {
+                        let vertex = shader
+                            .stages
+                            .iter()
+                            .find(|stage| stage.stage == nixe_gpu::ShaderStage::Vertex)
+                            .and_then(|stage| stage.guest.as_ref())
+                            .ok_or(VulkanError::InvalidResource(
+                                "quad assembly requires vertex interface metadata",
+                            ))?;
+                        let fragment = shader
+                            .stages
+                            .iter()
+                            .find(|stage| stage.stage == nixe_gpu::ShaderStage::Fragment)
+                            .and_then(|stage| stage.guest.as_ref());
+                        let artifact = nixe_gpu::shader_module::synthetic::quad_geometry(
+                            &vertex.interface,
+                            fragment.map(|stage| &stage.interface),
+                            state.parameters.provoking_first,
                             self.residency
                                 .device()
                                 .profile()
@@ -266,86 +304,48 @@ impl NativeGpuExecution {
                                 .supported_spirv,
                         )
                         .map_err(|error| VulkanError::Compilation(error.to_string().into()))?;
-                        let control = CompiledStage::from_guest(artifact)
-                            .map_err(|error| VulkanError::Compilation(error.to_string().into()))?;
-                        let mut stages = shader.stages.to_vec();
-                        stages.insert(1, Arc::new(control));
-                        shader = Arc::new(ShaderArtifact::new(stages.into_boxed_slice()));
-                    }
-                    if state.parameters.topology == nixe_gpu::PrimitiveTopology::Quads {
-                        let geometry = {
-                            let vertex = shader
-                                .stages
-                                .iter()
-                                .find(|stage| stage.stage == nixe_gpu::ShaderStage::Vertex)
-                                .and_then(|stage| stage.guest.as_ref())
-                                .ok_or(VulkanError::InvalidResource(
-                                    "quad assembly requires vertex interface metadata",
-                                ))?;
-                            let fragment = shader
-                                .stages
-                                .iter()
-                                .find(|stage| stage.stage == nixe_gpu::ShaderStage::Fragment)
-                                .and_then(|stage| stage.guest.as_ref());
-                            let artifact = nixe_gpu::shader_module::synthetic::quad_geometry(
-                                &vertex.interface,
-                                fragment.map(|stage| &stage.interface),
-                                state.parameters.provoking_first,
-                                self.residency
-                                    .device()
-                                    .profile()
-                                    .shader_compiler
-                                    .profile
-                                    .supported_spirv,
-                            )
-                            .map_err(|error| VulkanError::Compilation(error.to_string().into()))?;
-                            CompiledStage::from_guest(artifact).map_err(|error| {
-                                VulkanError::Compilation(error.to_string().into())
-                            })?
-                        };
-                        let mut stages = shader.stages.to_vec();
-                        stages.push(Arc::new(geometry));
-                        shader = Arc::new(ShaderArtifact::new(stages.into_boxed_slice()));
-                    }
-                    let pending = match self.pipelines.request(PipelineRecipe::Graphics {
-                        shader,
-                        state: graphics.clone(),
-                    }) {
-                        Ok(p) => p,
-                        Err(CompileError::Backpressure | CompileError::Budget) => {
-                            self.graphics.insert(
-                                id,
-                                Graphics::Shader {
-                                    pending,
-                                    state,
-                                    graphics,
-                                },
-                            );
-                            return Ok(false);
-                        }
-                        Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
+                        CompiledStage::from_guest(artifact)
+                            .map_err(|error| VulkanError::Compilation(error.to_string().into()))?
                     };
-                    self.graphics
-                        .insert(id, Graphics::Pipeline { pending, state });
+                    let mut stages = shader.stages.to_vec();
+                    stages.push(Arc::new(geometry));
+                    shader = Arc::new(ShaderArtifact::new(stages.into_boxed_slice()));
                 }
-                (Graphics::Pipeline { state, .. }, Either::Pipeline(pipeline)) => {
-                    let parameters = state::parameters(&state.parameters)?;
-                    let push = state::guest_push(&pipeline, Some(&state.parameters))?.into();
-                    let prepared = self
-                        .residency
-                        .prepare_graphics_state(pipeline, parameters)?;
-                    self.statistics.prepared_graphics += 1;
-                    self.graphics.insert(
-                        id,
-                        Graphics::Ready {
-                            source: Arc::clone(&state.parameters),
-                            state: prepared,
-                            push,
-                        },
-                    );
-                }
-                _ => unreachable!("compilation phase/result match"),
+                let pipeline = match self.pipelines.request(PipelineRecipe::Graphics {
+                    shader,
+                    state: graphics.clone(),
+                }) {
+                    Ok(p) => p,
+                    Err(CompileError::Backpressure | CompileError::Budget) => {
+                        self.graphics.insert(
+                            id,
+                            Graphics::Shader {
+                                pending,
+                                state,
+                                graphics,
+                            },
+                        );
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
+                };
+                let parameters = state::parameters(&state.parameters)?;
+                let push = state::guest_push(&pipeline, Some(&state.parameters))?.into();
+                let prepared = self
+                    .residency
+                    .prepare_graphics_state(pipeline, parameters)?;
+                self.statistics.prepared_graphics += 1;
+                self.graphics.insert(
+                    id,
+                    Graphics::Ready {
+                        source: Arc::clone(&state.parameters),
+                        state: prepared,
+                        push,
+                    },
+                );
+                Ok(true)
             }
+            _ => unreachable!("only shader preparation can be pending"),
         }
     }
     fn drawing(&mut self, source: &Arc<GuestDrawState>) -> Result<bool, VulkanError> {
@@ -401,7 +401,7 @@ impl NativeGpuExecution {
                 binding: v.binding,
                 buffer,
                 offset: 0,
-                size: v.backing.size(),
+                size: v.backing.bytes(),
             });
         }
         let index = source
@@ -418,7 +418,7 @@ impl NativeGpuExecution {
                 Ok::<_, VulkanError>(Some(IndexBuffer {
                     buffer,
                     offset: 0,
-                    size: backing.size(),
+                    size: backing.bytes(),
                     kind: match kind {
                         nixe_gpu::IndexType::Uint8 => vk::IndexType::UINT8_EXT,
                         nixe_gpu::IndexType::Uint16 => vk::IndexType::UINT16,
@@ -468,45 +468,37 @@ impl NativeGpuExecution {
                 },
             );
         }
-        loop {
-            let ready = match &self.computing[&id] {
-                Computing::Ready { .. } => return Ok(true),
-                Computing::Shader { pending, .. } => pending.poll().map(|r| r.map(Either::Shader)),
-                Computing::Pipeline { pending, .. } => {
-                    pending.poll().map(|r| r.map(Either::Pipeline))
-                }
-            };
-            let Some(ready) = ready else { return Ok(false) };
-            let ready = ready.map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
-            match (self.computing.remove(&id).unwrap(), ready) {
-                (Computing::Shader { source, pending }, Either::Shader(shader)) => {
-                    let pending = match self.pipelines.request(PipelineRecipe::Compute(shader)) {
-                        Ok(p) => p,
-                        Err(CompileError::Backpressure | CompileError::Budget) => {
-                            self.computing
-                                .insert(id, Computing::Shader { pending, source });
-                            return Ok(false);
-                        }
-                        Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
-                    };
-                    self.computing
-                        .insert(id, Computing::Pipeline { pending, source });
-                }
-                (Computing::Pipeline { source, .. }, Either::Pipeline(pipeline)) => {
-                    let bindings = self.bindings(&source, &pipeline)?;
-                    let push = state::guest_push(&pipeline, None)?;
-                    let program = self.residency.prepare_program(pipeline, &bindings)?;
-                    self.computing.insert(
-                        id,
-                        Computing::Ready {
-                            source,
-                            program,
-                            push,
-                        },
-                    );
-                }
-                _ => unreachable!("compilation phase/result match"),
+        let ready = match &self.computing[&id] {
+            Computing::Ready { .. } => return Ok(true),
+            Computing::Shader { pending, .. } => pending.poll(),
+        };
+        let Some(ready) = ready else { return Ok(false) };
+        let ready = ready.map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
+        match (self.computing.remove(&id).unwrap(), ready) {
+            (Computing::Shader { source, pending }, shader) => {
+                let pipeline = match self.pipelines.request(PipelineRecipe::Compute(shader)) {
+                    Ok(p) => p,
+                    Err(CompileError::Backpressure | CompileError::Budget) => {
+                        self.computing
+                            .insert(id, Computing::Shader { pending, source });
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
+                };
+                let bindings = self.bindings(&source, &pipeline)?;
+                let push = state::guest_push(&pipeline, None)?;
+                let program = self.residency.prepare_program(pipeline, &bindings)?;
+                self.computing.insert(
+                    id,
+                    Computing::Ready {
+                        source,
+                        program,
+                        push,
+                    },
+                );
+                Ok(true)
             }
+            _ => unreachable!("only shader preparation can be pending"),
         }
     }
     fn prepare_command(&mut self, command: &NativeCommand) -> Result<bool, VulkanError> {
@@ -532,13 +524,7 @@ impl NativeGpuExecution {
                     };
                     self.video_pipelines.insert(format, pending);
                 }
-                self.video_pipelines[&format]
-                    .poll()
-                    .map_or(Ok(false), |result| {
-                        result
-                            .map(|_| true)
-                            .map_err(|error| VulkanError::Compilation(error.to_string().into()))
-                    })
+                Ok(true)
             }
             NativeCommand::Blit {
                 destination,
@@ -559,11 +545,7 @@ impl NativeGpuExecution {
                     };
                     self.affine_pipelines.insert(format, pending);
                 }
-                match self.affine_pipelines[&format].poll() {
-                    None => Ok(false),
-                    Some(Ok(_)) => Ok(true),
-                    Some(Err(e)) => Err(VulkanError::Compilation(e.to_string().into())),
-                }
+                Ok(true)
             }
             _ => Ok(true),
         }
@@ -571,14 +553,14 @@ impl NativeGpuExecution {
     fn command(&mut self, command: &NativeCommand) -> Result<(), VulkanError> {
         match command {
             NativeCommand::WaitForIdle => self.residency.order_device()?,
-            NativeCommand::WriteMemory {
+            NativeCommand::ReportMemory {
                 target,
                 offset,
                 bytes,
-                after_prior_work,
+                fence,
             } => {
                 self.residency
-                    .write_memory(target.clone(), *offset, bytes, *after_prior_work)?;
+                    .report_memory(target.clone(), *offset, bytes, *fence)?;
             }
             NativeCommand::Sequence(commands) => self.record_commands(commands)?,
             NativeCommand::Draw { state, arguments } => {
@@ -597,7 +579,7 @@ impl NativeGpuExecution {
                     ));
                 }
                 self.residency
-                    .draws_streamed(draw, &[state::arguments(*arguments)], push, None)?;
+                    .draws_streamed(draw, &[state::arguments(*arguments)], push)?;
                 self.statistics.draws += 1;
                 self.statistics.warm_draws += u64::from(*recorded);
                 *recorded = true;
@@ -647,12 +629,7 @@ impl NativeGpuExecution {
             NativeCommand::Ordering(_) => {}
             NativeCommand::ConvertNv12 { images, transform } => {
                 let format = images::format(images[2].description.format());
-                let pipeline = self.video_pipelines[&format]
-                    .poll()
-                    .ok_or(VulkanError::InvalidResource(
-                        "video conversion pipeline is pending",
-                    ))?
-                    .map_err(|error| VulkanError::Compilation(error.to_string().into()))?;
+                let pipeline = Arc::clone(&self.video_pipelines[&format]);
                 let sources = [self.video_view(&images[0])?, self.video_view(&images[1])?];
                 let destination = self.image(&images[2])?.image;
                 let conversion =
@@ -680,60 +657,7 @@ impl NativeGpuExecution {
     }
     fn record_commands(&mut self, commands: &[NativeCommand]) -> Result<(), VulkanError> {
         let mut at = 0;
-        let mut streamed_until = 0;
-        let mut inputs = None;
-        let mut cpu_writes = nixe_memory::CanonicalWriteBatch::default();
         while at < commands.len() {
-            if let NativeCommand::WriteMemory {
-                target,
-                offset,
-                bytes,
-                after_prior_work: false,
-            } = &commands[at]
-                && !bytes.is_empty()
-                && offset
-                    .checked_add(bytes.len() as u64)
-                    .is_some_and(|end| end <= target.size())
-                && self
-                    .residency
-                    .inline_write_is_cpu(target, *offset, bytes.len() as u64)
-            {
-                cpu_writes
-                    .stage_with_resolver(target, *offset, bytes, &mut |_, request| {
-                        self.residency
-                            .materialize_cpu_page(request)
-                            .map_err(|error| {
-                                nixe_memory::VisibilityCoordinatorError::new(error.to_string())
-                            })
-                    })
-                    .map_err(|error| VulkanError::CanonicalMemory(error.to_string().into()))?;
-                at += 1;
-                continue;
-            }
-            if !cpu_writes.is_empty() {
-                std::mem::take(&mut cpu_writes)
-                    .commit_ordered()
-                    .map_err(|error| VulkanError::CanonicalMemory(error.to_string().into()))?;
-            }
-            if at >= streamed_until && matches!(commands[at], NativeCommand::Draw { .. }) {
-                streamed_until = at
-                    + commands[at..]
-                        .iter()
-                        .take_while(|command| matches!(command, NativeCommand::Draw { .. }))
-                        .count();
-                inputs = if streamed_until - at > 1 {
-                    Some(self.residency.capture_draw_inputs(
-                        commands[at..streamed_until].iter().map(|command| {
-                            let NativeCommand::Draw { state, .. } = command else {
-                                unreachable!()
-                            };
-                            &self.drawings[&state.identity].draw
-                        }),
-                    )?)
-                } else {
-                    None
-                };
-            }
             if let NativeCommand::Draw { state, arguments } = &commands[at]
                 && let Some(Drawing {
                     draw,
@@ -761,7 +685,7 @@ impl NativeGpuExecution {
                     end += 1;
                 }
                 self.residency
-                    .draws_streamed(draw, &self.draw_arguments, push, inputs.as_ref())?;
+                    .draws_streamed(draw, &self.draw_arguments, push)?;
                 self.statistics.draws += (end - at) as u64;
                 self.statistics.warm_draws += (end - at) as u64 - u64::from(!*recorded);
                 *recorded = true;
@@ -771,17 +695,19 @@ impl NativeGpuExecution {
                 at += 1;
             }
         }
-        if !cpu_writes.is_empty() {
-            cpu_writes
-                .commit_ordered()
-                .map_err(|error| VulkanError::CanonicalMemory(error.to_string().into()))?;
-        }
         Ok(())
     }
     fn record_batch(
         &mut self,
         batch: ExecutionBatch<'_, NativeSubmission>,
-    ) -> Result<(Option<WorkTicket>, DeviceVisibilityPoint), BackendRuntimeError> {
+    ) -> Result<Option<WorkTicket>, BackendRuntimeError> {
+        let memory = self.residency.memory().clone();
+        let cpu_writes = memory
+            .collect_cpu_writes()
+            .map_err(|error| runtime(VulkanError::from(error)))?;
+        self.residency
+            .consume_cpu_writes(cpu_writes)
+            .map_err(runtime)?;
         let _trace = nixe_gpu::trace::span(
             "backend_record",
             batch.commands.frontend.get(),
@@ -792,12 +718,10 @@ impl NativeGpuExecution {
         let started = std::time::Instant::now();
         self.record_commands(&batch.commands.commands)
             .map_err(runtime)?;
+        if batch.commands.final_segment {
+            self.residency.commit_buffer_downloads().map_err(runtime)?;
+        }
         let work = self.residency.device().preceding_work();
-        let visibility = self
-            .residency
-            .device_mut()
-            .visibility_point()
-            .map_err(runtime)?;
         // A guest delivery boundary is not a host queue dependency. Publish
         // accepted ownership now; visibility, presentation and completion
         // demand flush the owner. Bound batching to keep the GPU supplied even
@@ -819,11 +743,7 @@ impl NativeGpuExecution {
             self.residency.flush().map_err(runtime)?;
             self.recording_batch = None;
         } else {
-            self.residency.accept_recording().map_err(runtime)?;
             self.recording_batch = Some((work, pending));
-        }
-        if self.residency.device().submission.recording.is_none() {
-            self.residency.device_mut().end_visibility_scope();
         }
         nixe_gpu::trace::detail_event(
             "backend_accept",
@@ -841,15 +761,12 @@ impl NativeGpuExecution {
         }
         self.statistics.batches += 1;
         self.statistics.submits = self.residency.device().submitted_tick();
-        Ok((work, visibility))
+        Ok(work)
     }
     fn completion(
         &mut self,
         timeout: Option<Duration>,
     ) -> Result<Option<BackendExecutionCompletion>, VulkanError> {
-        if let Some(wakeup) = &self.completion_wakeup {
-            wakeup.check()?;
-        }
         let _trace = timeout.map(|_| nixe_gpu::trace::span("backend_completion", 1, 0, 0));
         let Some(front) = self.completions.front() else {
             return Ok(None);
@@ -861,32 +778,41 @@ impl NativeGpuExecution {
             true
         } else if let Some(timeout) = timeout {
             let work = front.work.unwrap();
-            if work.tick() > self.residency.device().submitted_tick() {
-                self.residency.flush()?;
-            }
             self.residency.device_mut().wait_for_work(work, timeout)?
         } else {
-            self.residency.device_mut().poll_progress()? >= front.work.unwrap().tick()
+            self.residency.device_mut().poll_work(front.work.unwrap())?
+                == crate::WorkStatus::Complete
         };
         if !ready {
             return Ok(None);
         };
+        self.video
+            .retire_sources(self.residency.device().completed_tick());
+        self.residency
+            .publish_buffer_downloads(self.residency.device().completed_tick())?;
         let completed = self.completions.pop_front().unwrap();
         Ok(Some(BackendExecutionCompletion::new(
             completed.frontend,
             completed.token,
-            completed.visibility,
         )))
     }
 }
-enum Either {
-    Shader(Arc<ShaderArtifact>),
-    Pipeline(Arc<NativePipeline>),
+impl Drop for NativeGpuExecution {
+    fn drop(&mut self) {
+        self.residency.memory().disable_cpu_write_collection();
+    }
 }
 impl GpuExecution for NativeGpuExecution {
     type Commands = NativeSubmission;
     type ImageRequest = NativePresentationImage;
     fn synchronize_command_sources(&mut self) -> Result<(), BackendRuntimeError> {
+        let memory = self.residency.memory().clone();
+        let cpu_writes = memory
+            .collect_cpu_writes()
+            .map_err(|error| runtime(VulkanError::from(error)))?;
+        self.residency
+            .consume_cpu_writes(cpu_writes)
+            .map_err(runtime)?;
         self.residency.flush().map_err(runtime)?;
         if let Some(work) = self.residency.device().preceding_work() {
             self.residency
@@ -899,19 +825,37 @@ impl GpuExecution for NativeGpuExecution {
     fn external_image_device(&self) -> Option<[u8; 16]> {
         self.video_device
     }
-    fn bind_host_wakeup(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
-        self.completion_wakeup = Some(completion::CompletionWakeup::new(
-            self.residency.device(),
-            Arc::clone(&wake),
-        ));
+    fn bind_host_wakeup(
+        &mut self,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), BackendRuntimeError> {
+        if self.completion_wakeup.is_some() {
+            return Err(runtime(VulkanError::InvalidResource(
+                "GPU owner wakeup is already bound",
+            )));
+        }
+        self.shaders.bind_wakeup(Arc::clone(&wake));
+        self.pipelines.bind_wakeup(Arc::clone(&wake));
+        self.completion_wakeup = Some(
+            completion::CompletionWakeup::new(self.residency.device(), Arc::clone(&wake))
+                .map_err(runtime)?,
+        );
         if let Some(host) = &self.host {
             host.client.bind_wakeup(wake);
         }
+        Ok(())
     }
     fn service_host(&mut self) -> Result<(), BackendRuntimeError> {
         let Some(mut host) = self.host.take() else {
             return Ok(());
         };
+        let memory = self.residency.memory().clone();
+        let cpu_writes = memory
+            .collect_cpu_writes()
+            .map_err(|error| runtime(VulkanError::from(error)))?;
+        self.residency
+            .consume_cpu_writes(cpu_writes)
+            .map_err(runtime)?;
         let result = host.service(
             &mut self.residency,
             &mut self.frames,
@@ -925,48 +869,52 @@ impl GpuExecution for NativeGpuExecution {
         self.host = Some(host);
         result.map_err(runtime)
     }
-    fn host_work_pending(&self) -> bool {
-        self.host.as_ref().is_some_and(|host| host.pending())
-    }
-    fn request_completion_wakeup(&mut self) -> Result<bool, BackendRuntimeError> {
+    fn request_completion_wakeup(&mut self) -> Result<(), BackendRuntimeError> {
         let Some(wakeup) = &self.completion_wakeup else {
-            return Ok(false);
+            return Ok(());
         };
-        let demand = self.residency.cpu_readback_point().map_err(runtime)?;
-        if self
-            .residency
-            .cpu_readback_submission_pending()
-            .map_err(runtime)?
-        {
+        let demand = self.residency.readback_point();
+        if self.residency.readback_submission_pending() {
             // Feed demanded downloads even while an older frontend completion
             // is pending, without an extra idle wake before their submission.
             self.residency.flush().map_err(runtime)?;
         }
-        let completed = self.residency.device().completed_tick();
         let point = self
             .completions
             .front()
             .and_then(|c| c.work)
             .map(WorkTicket::tick)
-            .filter(|&p| p > completed)
             .into_iter()
             .chain(demand)
+            .chain(
+                self.host
+                    .as_ref()
+                    .and_then(crate::presentation::Host::completion_point),
+            )
             .min();
         if let Some(point) = point {
-            if point > self.residency.device().submitted_tick() {
+            if point > self.residency.device().scheduled_tick() {
                 self.residency.flush().map_err(runtime)?;
             }
+            // Native progress may advance after the owner's logical poll.
+            // Registration must also deliver already-completed pending work.
             return wakeup.arm(point).map_err(runtime);
         }
-        // A logical completion can have no GPU ticket, or already be complete.
-        // No future timeline event can wake that owner: let it retire the ready
-        // prefix instead of sleeping indefinitely waiting for another delivery.
-        Ok(false)
+        // The owner polls the ready logical prefix before registration. With
+        // no remaining native point, there is no future timeline event to arm.
+        Ok(())
     }
     fn prepare(
         &mut self,
         batch: ExecutionBatch<'_, Self::Commands>,
     ) -> Result<bool, BackendRuntimeError> {
+        let memory = self.residency.memory().clone();
+        let cpu_writes = memory
+            .collect_cpu_writes()
+            .map_err(|error| runtime(VulkanError::from(error)))?;
+        self.residency
+            .consume_cpu_writes(cpu_writes)
+            .map_err(runtime)?;
         #[cfg(feature = "performance-counters")]
         let started = std::time::Instant::now();
         let _trace = nixe_gpu::trace::span(
@@ -994,6 +942,12 @@ impl GpuExecution for NativeGpuExecution {
         for c in &batch.commands.commands {
             ready &= self.prepare_command(c).map_err(runtime)?;
         }
+        if !ready {
+            batch
+                .commands
+                .retain_suspended_inputs()
+                .map_err(|error| runtime(VulkanError::from(error)))?;
+        }
         #[cfg(feature = "performance-counters")]
         nixe_gpu::metrics::record(
             nixe_gpu::metrics::Counter::BackendSubmissionNanoseconds,
@@ -1012,7 +966,7 @@ impl GpuExecution for NativeGpuExecution {
         batch: ExecutionBatch<'_, Self::Commands>,
     ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
         let frontend = batch.commands.frontend;
-        let (work, visibility) = self.record_batch(batch)?;
+        let work = self.record_batch(batch)?;
         let token = BackendSubmissionToken::new(
             self.residency.device().submission_instance(),
             self.next,
@@ -1023,70 +977,134 @@ impl GpuExecution for NativeGpuExecution {
             frontend,
             token,
             work,
-            visibility,
         });
         Ok(token)
     }
     fn poll_completion(
         &mut self,
     ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
+        let memory = self.residency.memory().clone();
+        let cpu_writes = memory
+            .collect_cpu_writes()
+            .map_err(|error| runtime(VulkanError::from(error)))?;
+        self.residency
+            .consume_cpu_writes(cpu_writes)
+            .map_err(runtime)?;
         self.completion(None).map_err(runtime)
     }
-    fn wait_for_completion(
+    fn access_memory(
         &mut self,
-    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
-        self.completion(Some(Duration::MAX)).map_err(runtime)
-    }
-    fn wait_for_completion_timeout(
-        &mut self,
-        t: Duration,
-    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
-        self.completion(Some(t)).map_err(runtime)
-    }
-    fn bind_visibility_requester(
-        &mut self,
-        r: Arc<dyn BackendVisibilityRequester>,
-    ) -> Result<(), BackendRuntimeError> {
+        ranges: Vec<nixe_memory::AllocationRange>,
+        operation: nixe_memory::AccessOperation,
+    ) -> Result<nixe_memory::AccessResult, BackendRuntimeError> {
+        let memory = self.residency.memory().clone();
+        let cpu_writes = memory
+            .collect_cpu_writes()
+            .map_err(|error| runtime(VulkanError::from(error)))?;
         self.residency
-            .visibility()
-            .bind_requester(r)
+            .consume_cpu_writes(cpu_writes)
+            .map_err(runtime)?;
+        self.residency
+            .access_memory(ranges, operation)
             .map_err(runtime)
     }
-    fn make_cpu_visible(
+    fn queue_device_access(
         &mut self,
-        r: CpuVisibilityRequest,
-    ) -> Result<Box<[u8]>, BackendRuntimeError> {
-        self.residency.materialize_cpu_page(r).map_err(runtime)
+        request: nixe_memory::DeviceAccessRequest,
+    ) -> Result<(), BackendRuntimeError> {
+        let memory = self.residency.memory().clone();
+        let cpu_writes = memory
+            .collect_cpu_writes()
+            .map_err(|error| runtime(VulkanError::from(error)))?;
+        self.residency
+            .consume_cpu_writes(cpu_writes)
+            .map_err(runtime)?;
+        self.residency
+            .queue_device_access(request)
+            .map_err(runtime)?;
+        self.progress_accesses()
     }
-    fn service_cpu_visibility(
+    fn cancel_device_access(
         &mut self,
-        request: CpuVisibilityRequest,
-    ) -> Result<Option<Box<[u8]>>, BackendRuntimeError> {
-        let result = self.residency.request_cpu_page(request).map_err(runtime)?;
-        if result.is_none() {
-            // CPU consumption is a submission boundary, not a completion wait.
-            // Do not leave its download behind unrelated inbox traffic or the
-            // ordinary command batching threshold.
-            if self
-                .residency
-                .cpu_readback_submission_pending()
-                .map_err(runtime)?
-            {
-                self.residency.flush().map_err(runtime)?;
-            }
-            if let Some(wakeup) = &self.completion_wakeup
-                && let Some(point) = self.residency.cpu_readback_point().map_err(runtime)?
-            {
-                wakeup.arm(point).map_err(runtime)?;
-            }
-        }
-        Ok(result)
+        request: nixe_memory::AccessRequestId,
+    ) -> Result<(), BackendRuntimeError> {
+        let memory = self.residency.memory().clone();
+        let cpu_writes = memory
+            .collect_cpu_writes()
+            .map_err(|error| runtime(VulkanError::from(error)))?;
+        self.residency
+            .consume_cpu_writes(cpu_writes)
+            .map_err(runtime)?;
+        self.residency
+            .cancel_device_access(request)
+            .map_err(runtime)?;
+        self.progress_accesses()
     }
-
+    fn progress_device_accesses(&mut self) -> Result<(), BackendRuntimeError> {
+        let memory = self.residency.memory().clone();
+        let cpu_writes = memory
+            .collect_cpu_writes()
+            .map_err(|error| runtime(VulkanError::from(error)))?;
+        self.residency
+            .consume_cpu_writes(cpu_writes)
+            .map_err(runtime)?;
+        self.progress_accesses()
+    }
+    fn fail_device_accesses(&mut self, cause: Arc<nixe_memory::MemoryError>) {
+        self.residency.fail_device_accesses(cause);
+    }
+    fn retire_physical_memory(
+        &mut self,
+        machine: nixe_memory::MachineId,
+        allocation: nixe_memory::AllocationId,
+        extents: &[nixe_memory::Extent],
+    ) -> Result<(), BackendRuntimeError> {
+        let memory = self.residency.memory().clone();
+        let cpu_writes = memory
+            .collect_cpu_writes()
+            .map_err(|error| runtime(VulkanError::from(error)))?;
+        self.residency
+            .consume_cpu_writes(cpu_writes)
+            .map_err(runtime)?;
+        self.residency
+            .retire_physical_memory(machine, allocation, extents)
+            .map_err(runtime)
+    }
+    fn release_guest_memory(
+        &mut self,
+        machine: nixe_memory::MachineId,
+        _: nixe_memory::AllocationId,
+    ) -> Result<(), BackendRuntimeError> {
+        self.residency.check_machine(machine).map_err(runtime)?;
+        self.progress_device_accesses()
+    }
+    fn allocation_pressure(
+        &mut self,
+        machine: nixe_memory::MachineId,
+        _: u64,
+    ) -> Result<(), BackendRuntimeError> {
+        let memory = self.residency.memory().clone();
+        let cpu_writes = memory
+            .collect_cpu_writes()
+            .map_err(|error| runtime(VulkanError::from(error)))?;
+        self.residency
+            .consume_cpu_writes(cpu_writes)
+            .map_err(runtime)?;
+        self.residency.check_machine(machine).map_err(runtime)?;
+        self.residency.flush().map_err(runtime)?;
+        self.progress_accesses()
+    }
     fn acquire_presentable_image(
         &mut self,
         request: NativePresentationImage,
     ) -> Result<ResidentImage, BackendRuntimeError> {
+        let memory = self.residency.memory().clone();
+        let cpu_writes = memory
+            .collect_cpu_writes()
+            .map_err(|error| runtime(VulkanError::from(error)))?;
+        self.residency
+            .consume_cpu_writes(cpu_writes)
+            .map_err(runtime)?;
         nixe_gpu::trace::event(
             "frame_work",
             self.statistics.draws,
@@ -1099,11 +1117,24 @@ impl GpuExecution for NativeGpuExecution {
             self.recording_statistics().draw_calls,
             self.residency.statistics().native_readback_bytes,
         );
+        nixe_gpu::trace::event(
+            "frame_memory",
+            self.residency.statistics().cpu_uploaded_bytes,
+            self.residency.statistics().cpu_streamed_bytes,
+            self.residency.statistics().gpu_copied_bytes,
+        );
         self.frames
             .capture(&mut self.residency, request, &mut self.descriptors)
             .map_err(runtime)
     }
     fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
+        let memory = self.residency.memory().clone();
+        let cpu_writes = memory
+            .collect_cpu_writes()
+            .map_err(|error| runtime(VulkanError::from(error)))?;
+        self.residency
+            .consume_cpu_writes(cpu_writes)
+            .map_err(runtime)?;
         if let Some(host) = &mut self.host {
             host.shutdown(&mut self.residency).map_err(runtime)?;
         }
@@ -1122,12 +1153,15 @@ impl GpuExecution for NativeGpuExecution {
             self.descriptors.statistics()
         );
         self.residency.flush().map_err(runtime)?;
+        self.residency.drain_buffer_downloads().map_err(runtime)?;
         while self
             .completion(Some(Duration::MAX))
             .map_err(runtime)?
             .is_some()
         {}
-        self.pipelines.checkpoint().map_err(runtime)?;
+        self.pipelines
+            .checkpoint()
+            .map_err(|error| runtime(VulkanError::Compilation(error.to_string().into())))?;
         self.residency
             .device()
             .validation_monitor()
@@ -1189,10 +1223,6 @@ fn append_instances(previous: &mut Draw, next: Draw) -> bool {
 fn command_count(command: &NativeCommand) -> usize {
     match command {
         NativeCommand::Sequence(commands) => commands.iter().map(command_count).sum(),
-        NativeCommand::WriteMemory {
-            after_prior_work: false,
-            ..
-        } => 0,
         _ => 1,
     }
 }

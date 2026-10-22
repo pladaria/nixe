@@ -86,11 +86,12 @@ impl TimeZoneCommand {
 
 // Static-service commands and returned child sessions follow libnx:
 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/time.c#L25-L80
-pub(in crate::ipc_wire) fn dispatch_time(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_time(
+    process: &mut Request,
     session: &TimeServiceSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
+    scheduling: &std::sync::Arc<crate::ipc_wire::operation::ServiceScheduling>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let target = match &request.domain {
         Some(DomainRequest::Close { object_id }) => {
@@ -142,7 +143,7 @@ pub(in crate::ipc_wire) fn dispatch_time(
     match target {
         TimeTarget::Root => dispatch_time_root(process, session, request, hipc),
         TimeTarget::Object(TimeObject::SystemClock(clock)) => {
-            dispatch_system_clock_target(Some(session), &clock, request, hipc)
+            dispatch_system_clock_target(Some(session), &clock, request, hipc, scheduling).await
         }
         TimeTarget::Object(TimeObject::SteadyClock(clock)) => {
             dispatch_steady_clock_target(Some(session), &clock, request)
@@ -154,7 +155,7 @@ pub(in crate::ipc_wire) fn dispatch_time(
 }
 
 fn dispatch_time_root(
-    process: &mut ExceptionProcessContext<'_>,
+    process: &mut Request,
     session: &TimeServiceSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -180,11 +181,8 @@ fn dispatch_time_root(
         )),
         TimeServiceCommand::SharedMemoryNativeHandle => {
             let handle = process
-                .handles_mut()
-                .insert(session.shared_memory())
-                .map_err(|_| {
-                    IpcWireError::HostResourceExhausted("installing a time shared-memory handle")
-                })?;
+                .return_handle(session.shared_memory())
+                .map_err(IpcWireError::Handle)?;
             log::debug!("time:u returned shared-memory handle {handle:#x}");
             return time_response(
                 session,
@@ -282,26 +280,26 @@ fn dispatch_time_root(
         TimeObject::SteadyClock(clock) => HorizonIpcObject::SteadyClock(clock),
         TimeObject::TimeZone(timezone) => HorizonIpcObject::TimeZone(timezone),
     };
-    let handle = process.handles_mut().insert(child).map_err(|_| {
-        IpcWireError::HostResourceExhausted("installing a time service child handle")
-    })?;
+    let handle = process.return_handle(child).map_err(IpcWireError::Handle)?;
     log::debug!("time:u {command:?} returned child session handle {handle:#x}");
     semantic_success(request.token, false, &[], &[], &[], Some(handle))
 }
 
-pub(in crate::ipc_wire) fn dispatch_system_clock(
+pub(in crate::ipc_wire) async fn dispatch_system_clock(
     session: &SystemClockSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
+    scheduling: &std::sync::Arc<crate::ipc_wire::operation::ServiceScheduling>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    dispatch_system_clock_target(None, session, request, hipc)
+    dispatch_system_clock_target(None, session, request, hipc, scheduling).await
 }
 
-fn dispatch_system_clock_target(
+async fn dispatch_system_clock_target(
     parent: Option<&TimeServiceSession>,
     session: &SystemClockSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
+    scheduling: &std::sync::Arc<crate::ipc_wire::operation::ServiceScheduling>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let Some(command) = SystemClockCommand::decode(request.command_id) else {
         return unsupported_service_command("ISystemClock", request.command_id);
@@ -350,10 +348,12 @@ fn dispatch_system_clock_target(
                 );
             }
             session
-                .set_current_time(i64::from_le_bytes(timestamp.try_into().unwrap()))
-                .map_err(|_| {
-                    IpcWireError::HostResourceExhausted("updating the emulated system clock")
-                })?;
+                .set_current_time(
+                    i64::from_le_bytes(timestamp.try_into().unwrap()),
+                    scheduling,
+                )
+                .await
+                .map_err(IpcWireError::SystemMemory)?;
             time_object_response(
                 parent,
                 request.token,

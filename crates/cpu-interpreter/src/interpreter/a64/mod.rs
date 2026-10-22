@@ -17,7 +17,7 @@ use nixe_memory::GuestVirtualAddress;
 use super::{InstructionStep, InterpreterContext, InterpreterError};
 
 pub(super) fn execute(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
 ) -> Result<InstructionStep, InterpreterError> {

@@ -1,7 +1,8 @@
 //! Optional native binding probe, excluded from the normal renderer build.
 use crate::{BufferBinding, VulkanError, VulkanResidency, device::DeviceOwner};
 use ash::vk;
-use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+use nixe_gpu::physical::PhysicalMapping;
+use nixe_memory::AllocationRange;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -67,21 +68,19 @@ impl VulkanResidency {
             {
                 continue;
             }
-            let allocation = CanonicalAllocation::zeroed(4096, 4096)
-                .map_err(|e| VulkanError::CanonicalMemory(e.to_string().into()))?;
-            allocation
-                .write(0, &0x44332211u32.to_ne_bytes().repeat(1024))
-                .map_err(|e| VulkanError::CanonicalMemory(e.to_string().into()))?;
-            let range = allocation
-                .backing_range(MemoryPermissions::READ_WRITE)
-                .map_err(|e| VulkanError::CanonicalMemory(e.to_string().into()))?;
+            let allocation = self.memory().account(4096)?.allocate(4096)?;
+            let range = AllocationRange::new(allocation.pin(), 0, 4096)?;
+            self.memory().write_resolved(
+                std::slice::from_ref(&range),
+                &0x44332211u32.to_ne_bytes().repeat(1024),
+            )?;
             let usage = vk::BufferUsageFlags::STORAGE_BUFFER
                 | if binding == BufferBinding::DescriptorSet {
                     vk::BufferUsageFlags::empty()
                 } else {
                     vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                 };
-            let buffer = self.buffer_for(range, usage)?;
+            let buffer = self.buffer_for(PhysicalMapping::new(&[range])?, usage)?;
             // Compile and establish residency before either clock starts.
             self.swap_rgba8_words_binding(buffer, 0, 1024, binding)?;
             let work = self.flush()?.expect("warmup recording");

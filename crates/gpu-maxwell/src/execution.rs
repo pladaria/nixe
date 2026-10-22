@@ -8,7 +8,6 @@ pub use lowerer::MaxwellFrontend;
 pub use work::{MaxwellWork, MaxwellWorkBatch, MaxwellWorkSegment};
 
 use std::{
-    collections::BTreeMap,
     fmt::{Display, Formatter},
     sync::Arc,
 };
@@ -17,12 +16,13 @@ use nixe_gpu::{
     CacheMaintenanceOperation, CommandDescriptionError, FrontendSubmissionId,
     FrontendSubmissionSegment, GuestTimelinePoint, ReservedTimelinePoint,
 };
-use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError, MemoryPermissions};
+use nixe_memory::MemoryPermissions;
+use nixe_memory::{AccessOperation, AccessResult, AllocationRange, MemoryError};
 
 use crate::MaxwellNativeFrontend;
 use crate::engines::{MaxwellEngineEvent, PendingEngineOperation};
 use crate::{
-    MaxwellComputeSynchronizationPlan, MaxwellGpuAccessError, MaxwellGpuAddressSpace,
+    MaxwellComputeSynchronizationPlan, MaxwellGpuAccessError, MaxwellGpuMemory,
     MaxwellHostSynchronizationKind, MaxwellLoweringError, MaxwellMemoryCopyError,
     MaxwellMemoryCopyOperation, MaxwellMethodSource, MaxwellResolvedRange,
     MaxwellThreeDResourceError, MaxwellThreeDSynchronizationError,
@@ -38,11 +38,12 @@ pub enum MaxwellSubmissionExecutionStep<W: MaxwellWork = NativeWork> {
         target: MaxwellResolvedRange,
     },
     WaitForIdle,
-    SemaphoreRelease {
+    SemaphoreWrite {
         source: MaxwellMethodSource,
         target: MaxwellResolvedRange,
         payload: u32,
         short: bool,
+        fence: bool,
     },
     InlineWrite {
         source: MaxwellMethodSource,
@@ -104,7 +105,7 @@ impl<W: MaxwellWork> MaxwellSubmissionExecutionPlan<W> {
 }
 
 /// Failure before guest completion publication at the Maxwell/backend bridge.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum MaxwellBackendExecutionError {
     Canonical(Box<MaxwellCanonicalExecutionError>),
     InvalidSubmission(CommandDescriptionError),
@@ -124,7 +125,7 @@ impl Display for MaxwellBackendExecutionError {
 impl std::error::Error for MaxwellBackendExecutionError {}
 
 /// Failure while executing ordered canonical-memory commands.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum MaxwellCanonicalExecutionError {
     StaleInlineTarget {
         source: MaxwellMethodSource,
@@ -132,7 +133,7 @@ pub enum MaxwellCanonicalExecutionError {
     },
     InlineWrite {
         source: MaxwellMethodSource,
-        error: CanonicalWriteBatchError,
+        error: Arc<MemoryError>,
     },
     MemoryCopyTransform {
         source: MaxwellMethodSource,
@@ -140,7 +141,7 @@ pub enum MaxwellCanonicalExecutionError {
     },
     MemoryCopyTransaction {
         source: MaxwellMethodSource,
-        error: CanonicalWriteBatchError,
+        error: Arc<MemoryError>,
     },
 }
 
@@ -154,10 +155,7 @@ impl Display for MaxwellCanonicalExecutionError {
                 )
             }
             Self::InlineWrite { source, error } => {
-                write!(
-                    formatter,
-                    "inline upload could not be staged atomically: {source}: {error}"
-                )
+                write!(formatter, "inline upload failed: {source}: {error}")
             }
             Self::MemoryCopyTransform { source, error } => {
                 write!(
@@ -166,10 +164,7 @@ impl Display for MaxwellCanonicalExecutionError {
                 )
             }
             Self::MemoryCopyTransaction { source, error } => {
-                write!(
-                    formatter,
-                    "memory copy transaction failed: {source}: {error}"
-                )
+                write!(formatter, "memory copy access failed: {source}: {error}")
             }
         }
     }
@@ -178,7 +173,7 @@ impl Display for MaxwellCanonicalExecutionError {
 impl std::error::Error for MaxwellCanonicalExecutionError {}
 
 /// Failure before any guest write, backend submission, or fence publication.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum MaxwellSubmissionExecutionError {
     ComputeLaunch(crate::MaxwellComputeLaunchError),
     InlineAddress {
@@ -250,12 +245,13 @@ impl std::error::Error for MaxwellSubmissionExecutionError {}
 /// Packet dispatch feeds effects into this value before applying following
 /// packets. Consequently a trigger's state can be consumed before later
 /// register writes and does not need submission-lifetime retention.
-pub(crate) struct MaxwellSubmissionPlanner<'a, L: MaxwellFrontend = MaxwellNativeFrontend> {
-    address_space: &'a MaxwellGpuAddressSpace,
+pub(crate) struct MaxwellSubmissionPlanner<'a, 'm, L: MaxwellFrontend = MaxwellNativeFrontend> {
+    address_space: &'a MaxwellGpuMemory,
     frontend: FrontendSubmissionId,
 
     completion: Option<&'a ReservedTimelinePoint>,
     cache: &'a mut L,
+    access: &'a mut nixe_gpu::MemoryAccess<'m>,
     steps: Vec<MaxwellSubmissionExecutionStep<L::Work>>,
     prior_work_pending: bool,
     completion_signal_count: u32,
@@ -263,7 +259,7 @@ pub(crate) struct MaxwellSubmissionPlanner<'a, L: MaxwellFrontend = MaxwellNativ
     inline_write_pending: bool,
 }
 
-impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
+impl<'a, 'm, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, 'm, L> {
     /// The GPU owner consumes every completed effect before translating the
     /// next one. Inline payloads remain coalesced until their consuming event.
     pub(crate) fn take_ready_steps(
@@ -279,17 +275,19 @@ impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
         self.frontend
     }
     pub(crate) fn new(
-        address_space: &'a MaxwellGpuAddressSpace,
+        address_space: &'a MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
 
         completion: Option<&'a ReservedTimelinePoint>,
         cache: &'a mut L,
+        access: &'a mut nixe_gpu::MemoryAccess<'m>,
     ) -> Self {
         Self {
             address_space,
             frontend,
             completion,
             cache,
+            access,
             steps: Vec::new(),
             prior_work_pending: false,
             completion_signal_count: 0,
@@ -340,28 +338,38 @@ impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
                     &launch,
                     compute.expect("compute launch has live state"),
                     self.address_space,
+                    self.access,
                 )
                 .map_err(MaxwellSubmissionExecutionError::ComputeLaunch)?;
-                let work = self
-                    .cache
-                    .lower_launch(&resolved, self.address_space, self.frontend)?;
+                let work = self.cache.lower_launch(
+                    &resolved,
+                    self.address_space,
+                    self.frontend,
+                    self.access,
+                )?;
                 self.steps.push(MaxwellSubmissionExecutionStep::Gpu(work));
                 self.prior_work_pending = true;
             }
             PendingEngineOperation::TwoDSolid(request) => {
                 let [x0, y0, x1, y1] = request.rectangle;
                 if x0 < x1 && y0 < y1 {
-                    let work =
-                        self.cache
-                            .lower_solid(&request, self.address_space, self.frontend)?;
+                    let work = self.cache.lower_solid(
+                        &request,
+                        self.address_space,
+                        self.frontend,
+                        self.access,
+                    )?;
                     self.steps.push(MaxwellSubmissionExecutionStep::Gpu(work));
                     self.prior_work_pending = true;
                 }
             }
             PendingEngineOperation::TwoDBlit(request) => {
-                let work = self
-                    .cache
-                    .lower_blit(&request, self.address_space, self.frontend)?;
+                let work = self.cache.lower_blit(
+                    &request,
+                    self.address_space,
+                    self.frontend,
+                    self.access,
+                )?;
                 self.steps.push(MaxwellSubmissionExecutionStep::Gpu(work));
                 self.prior_work_pending = true;
             }
@@ -389,11 +397,12 @@ impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
                                     MaxwellSubmissionExecutionError::InlineAddress { source, error }
                                 })?;
                         self.steps
-                            .push(MaxwellSubmissionExecutionStep::SemaphoreRelease {
+                            .push(MaxwellSubmissionExecutionStep::SemaphoreWrite {
                                 source,
                                 target,
                                 payload,
                                 short,
+                                fence: true,
                             });
                         if wait {
                             self.prior_work_pending = false;
@@ -510,11 +519,12 @@ impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
                     let target =
                         resolve_inline_target(self.address_space, address, 0, operation.source())?;
                     self.steps
-                        .push(MaxwellSubmissionExecutionStep::SemaphoreRelease {
+                        .push(MaxwellSubmissionExecutionStep::SemaphoreWrite {
                             source: operation.source(),
                             target,
                             payload,
                             short: true,
+                            fence: true,
                         });
                 }
                 self.prior_work_pending = true;
@@ -570,6 +580,7 @@ impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
                     self.address_space,
                     self.frontend,
                     instances,
+                    self.access,
                 )?;
                 self.steps.push(MaxwellSubmissionExecutionStep::Gpu(work));
                 self.prior_work_pending = true;
@@ -626,11 +637,12 @@ impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
                             error,
                         })?;
                     self.steps
-                        .push(MaxwellSubmissionExecutionStep::SemaphoreRelease {
+                        .push(MaxwellSubmissionExecutionStep::SemaphoreWrite {
                             source: report.source(),
                             target,
                             payload: report.payload(),
                             short,
+                            fence: report.is_fence(),
                         });
                 } else if let Some(operation) = three_d_synchronization_operation(plan) {
                     self.steps
@@ -825,13 +837,15 @@ impl<'a, L: MaxwellFrontend> MaxwellSubmissionPlanner<'a, L> {
 fn lower_test_pushbuffers(
     channel: &mut crate::MaxwellGpuChannel,
     pushbuffers: &[crate::MaxwellDecodedPushbuffer],
-    address_space: &MaxwellGpuAddressSpace,
+    address_space: &MaxwellGpuMemory,
     frontend: FrontendSubmissionId,
 
     completion: Option<&ReservedTimelinePoint>,
     cache: &mut MaxwellNativeFrontend,
 ) -> Result<MaxwellSubmissionExecutionPlan, MaxwellSubmissionExecutionError> {
-    let mut planner = MaxwellSubmissionPlanner::new(address_space, frontend, completion, cache);
+    let mut access = crate::test_memory::access(address_space.machine());
+    let mut planner =
+        MaxwellSubmissionPlanner::new(address_space, frontend, completion, cache, &mut access);
     let (mut mme_methods, mut mme_parameters) = planner.take_mme_scratch();
     for pushbuffer in pushbuffers {
         for packet in pushbuffer.packets() {
@@ -866,8 +880,6 @@ pub struct MaxwellBackendExecution<W: MaxwellWork = NativeWork> {
 
     steps: std::collections::VecDeque<MaxwellSubmissionExecutionStep<W>>,
     next_step: usize,
-    pre_writes: CanonicalWriteBatch,
-    pre_write_source: Option<CanonicalWriteSource>,
     batch: W::Batch,
     segments: BackendSegmentCursor,
     completion: Option<GuestTimelinePoint>,
@@ -893,8 +905,6 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
             frontend,
             steps: std::collections::VecDeque::new(),
             next_step: 0,
-            pre_writes: CanonicalWriteBatch::new(),
-            pre_write_source: None,
             batch: W::Batch::default(),
             segments: BackendSegmentCursor {
                 next: FrontendSubmissionSegment::FIRST,
@@ -917,7 +927,7 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
             "a completed delivery cannot append commands"
         );
         for step in steps {
-            self.segments.remaining_operations += usize::from(backend_step_emits_operation(&step));
+            self.segments.remaining_operations += usize::from(backend_step_prepares_work(&step));
             self.steps.push_back(step);
         }
     }
@@ -965,21 +975,11 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
         !self.sealed && self.next_step == self.steps.len()
     }
 
-    pub fn next_segment(
+    /// Resolve reads directly on the graphics owner, without endpoint reentry.
+    pub fn next_segment_with_memory(
         &mut self,
         gpu_timestamp: u64,
-    ) -> Result<Option<<W::Batch as MaxwellWorkBatch<W>>::Segment>, MaxwellBackendExecutionError>
-    {
-        self.next_segment_with_resolver(gpu_timestamp, &mut |coordinator, request| {
-            coordinator.make_cpu_visible(request)
-        })
-    }
-
-    /// Device owners resolve canonical demands inline, never through their own inbox.
-    pub fn next_segment_with_resolver(
-        &mut self,
-        gpu_timestamp: u64,
-        resolve: &mut nixe_memory::CpuVisibilityResolver<'_>,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<Option<<W::Batch as MaxwellWorkBatch<W>>::Segment>, MaxwellBackendExecutionError>
     {
         let _trace = nixe_gpu::trace::span(
@@ -1020,40 +1020,33 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
             let publishes_completion = matches!(
                 self.steps[self.next_step],
                 MaxwellSubmissionExecutionStep::NotificationWrite { .. }
-                    | MaxwellSubmissionExecutionStep::SemaphoreRelease { .. }
+                    | MaxwellSubmissionExecutionStep::SemaphoreWrite { fence: true, .. }
             );
-            match &self.steps[self.next_step] {
+            match &mut self.steps[self.next_step] {
                 // The PGRAPH notifier is timestamp:u64, info32:u32, info16:u16, status:u16.
                 // Hardware completion clears both information fields and status after prior work.
                 // https://envytools.readthedocs.io/en/latest/hw/graph/intro.html#notifiers
                 // https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/src/nvidia/src/kernel/gpu/mem_mgr/method_notification.c
-                MaxwellSubmissionExecutionStep::NotificationWrite { target, .. } => {
+                MaxwellSubmissionExecutionStep::NotificationWrite { source, target } => {
                     let _trace =
                         nixe_gpu::trace::span("canonical_notify", self.frontend.get(), 0, 0);
-                    commit_pending_backend_writes(
-                        &mut self.pre_writes,
-                        &mut self.pre_write_source,
-                    )?;
                     {
                         let mut bytes = [0u8; 16];
                         bytes[..8].copy_from_slice(&gpu_timestamp.to_le_bytes());
-                        append_device_write::<W>(&mut self.batch, target, &bytes, true);
+                        append_device_write::<W>(&mut self.batch, target, &bytes, *source, true)?;
                         self.segments.remaining_operations -= 1;
                     }
                     self.next_step += 1;
                 }
-                MaxwellSubmissionExecutionStep::SemaphoreRelease {
-                    source: _,
+                MaxwellSubmissionExecutionStep::SemaphoreWrite {
+                    source,
                     target,
                     payload,
                     short,
+                    fence,
                 } => {
                     let _trace =
                         nixe_gpu::trace::span("canonical_release", self.frontend.get(), 0, 0);
-                    commit_pending_backend_writes(
-                        &mut self.pre_writes,
-                        &mut self.pre_write_source,
-                    )?;
                     {
                         let mut bytes = [0u8; 16];
                         bytes[..4].copy_from_slice(&payload.to_le_bytes());
@@ -1062,17 +1055,14 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
                             &mut self.batch,
                             target,
                             &bytes[..if *short { 4 } else { 16 }],
-                            true,
-                        );
+                            *source,
+                            *fence,
+                        )?;
                         self.segments.remaining_operations -= 1;
                     }
                     self.next_step += 1;
                 }
                 MaxwellSubmissionExecutionStep::WaitForIdle => {
-                    commit_pending_backend_writes(
-                        &mut self.pre_writes,
-                        &mut self.pre_write_source,
-                    )?;
                     {
                         self.batch.wait_for_idle();
                         self.segments.remaining_operations -= 1;
@@ -1080,10 +1070,6 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
                     self.next_step += 1;
                 }
                 MaxwellSubmissionExecutionStep::Ordering(operation) => {
-                    commit_pending_backend_writes(
-                        &mut self.pre_writes,
-                        &mut self.pre_write_source,
-                    )?;
                     self.batch.break_rendering();
                     self.batch.ordering(operation);
                     self.segments.remaining_operations -= 1;
@@ -1096,28 +1082,30 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
                 } => {
                     let _trace =
                         nixe_gpu::trace::span("canonical_inline", self.frontend.get(), 0, 0);
-                    if self.inline_is_device_owned(target) {
-                        commit_pending_backend_writes(
-                            &mut self.pre_writes,
-                            &mut self.pre_write_source,
-                        )?;
-                        append_device_write::<W>(&mut self.batch, target, value, false);
-                    } else {
-                        stage_resolved_inline_write(
-                            target,
-                            value,
-                            *source,
-                            &mut self.pre_writes,
-                            resolve,
-                        )
-                        .map_err(|error| {
-                            MaxwellBackendExecutionError::Canonical(Box::new(error))
-                        })?;
-                        self.pre_write_source = Some(CanonicalWriteSource::Inline(*source));
-                    }
-                    {
-                        self.segments.remaining_operations -= 1;
-                    }
+                    let ranges = physical_subrange(target, 0, value.len()).map_err(|error| {
+                        MaxwellBackendExecutionError::Canonical(Box::new(
+                            MaxwellCanonicalExecutionError::InlineWrite {
+                                source: *source,
+                                error,
+                            },
+                        ))
+                    })?;
+                    // Earlier native consumers have already been recorded.
+                    // Consume this CPU-side upload before lowering its next
+                    // consumer, without a native preparation/delivery roundtrip.
+                    let result = access(
+                        ranges,
+                        AccessOperation::Write(std::mem::take(value).into_boxed_slice()),
+                    )
+                    .map_err(|error| {
+                        MaxwellBackendExecutionError::Canonical(Box::new(
+                            MaxwellCanonicalExecutionError::InlineWrite {
+                                source: *source,
+                                error,
+                            },
+                        ))
+                    })?;
+                    assert!(matches!(result, AccessResult::Written));
                     self.next_step += 1;
                 }
                 MaxwellSubmissionExecutionStep::MemoryCopy {
@@ -1126,23 +1114,12 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
                     destination,
                 } => {
                     let _trace = nixe_gpu::trace::span("canonical_copy", self.frontend.get(), 0, 0);
-                    stage_memory_copy(
-                        *operation,
-                        source,
-                        destination,
-                        &mut self.pre_writes,
-                        resolve,
-                    )
-                    .map_err(|error| MaxwellBackendExecutionError::Canonical(Box::new(error)))?;
-                    self.pre_write_source =
-                        Some(CanonicalWriteSource::MemoryCopy(operation.source()));
+                    stage_memory_copy(*operation, source, destination, access).map_err(
+                        |error| MaxwellBackendExecutionError::Canonical(Box::new(error)),
+                    )?;
                     self.next_step += 1;
                 }
                 MaxwellSubmissionExecutionStep::Gpu(work) => {
-                    commit_pending_backend_writes(
-                        &mut self.pre_writes,
-                        &mut self.pre_write_source,
-                    )?;
                     self.batch.work(work);
                     self.segments.remaining_operations -= 1;
                     self.next_step += 1;
@@ -1157,10 +1134,8 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
         }
 
         if !self.sealed {
-            commit_pending_backend_writes(&mut self.pre_writes, &mut self.pre_write_source)?;
             return self.take_segment();
         }
-        commit_pending_backend_writes(&mut self.pre_writes, &mut self.pre_write_source)?;
         if let Some(segment) = self.take_segment()? {
             return Ok(Some(segment));
         }
@@ -1178,16 +1153,6 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
                 MaxwellSubmissionExecutionStep::InlineWrite { .. }
                     | MaxwellSubmissionExecutionStep::MemoryCopy { .. }
             )
-    }
-
-    fn inline_is_device_owned(&self, target: &MaxwellResolvedRange) -> bool {
-        target.segments().iter().any(|mapping| {
-            mapping
-                .mapping()
-                .backing()
-                .subrange_is_cpu_visible(mapping.backing_offset(), mapping.size())
-                != Ok(true)
-        })
     }
 
     fn take_segment(
@@ -1210,38 +1175,33 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
     }
 }
 
-/// Retain the validated mapping and offset. Building a new page topology for
-/// every inline upload discards the stable range identity and allocates per write.
+/// The accepted native command owns exact physical pins until consumption.
 fn append_device_write<W: MaxwellWork>(
     batch: &mut W::Batch,
     target: &MaxwellResolvedRange,
     bytes: &[u8],
-    after_prior_work: bool,
-) {
-    let mut copied = 0;
-    for mapping in target.segments() {
-        let range = mapping.mapping().backing();
-        let offset = mapping.backing_offset();
-        let size = mapping.size() as usize;
-        batch.write_memory(
-            range.clone(),
-            offset,
-            &bytes[copied..copied + size],
-            after_prior_work,
-        );
-        copied += size;
-    }
-}
-
-fn commit_pending_backend_writes(
-    writes: &mut CanonicalWriteBatch,
-    source: &mut Option<CanonicalWriteSource>,
+    source: MaxwellMethodSource,
+    fence: bool,
 ) -> Result<(), MaxwellBackendExecutionError> {
-    if writes.is_empty() {
-        return Ok(());
+    let mut ranges = Vec::new();
+    for segment in target.segments() {
+        ranges.extend(
+            segment
+                .mapping()
+                .physical()
+                .pin(segment.backing_offset(), segment.size())
+                .map_err(|error| {
+                    MaxwellBackendExecutionError::Canonical(Box::new(
+                        MaxwellCanonicalExecutionError::InlineWrite {
+                            source,
+                            error: Arc::new(error),
+                        },
+                    ))
+                })?,
+        );
     }
-    commit_write_batch(std::mem::take(writes), source.take())
-        .map_err(|error| MaxwellBackendExecutionError::Canonical(Box::new(error)))
+    batch.report_memory(ranges, 0, bytes, fence);
+    Ok(())
 }
 
 struct BackendSegmentCursor {
@@ -1267,7 +1227,7 @@ impl BackendSegmentCursor {
 fn step_kind<W: MaxwellWork>(step: &MaxwellSubmissionExecutionStep<W>) -> u64 {
     match step {
         MaxwellSubmissionExecutionStep::WaitForIdle => 1,
-        MaxwellSubmissionExecutionStep::SemaphoreRelease { .. } => 2,
+        MaxwellSubmissionExecutionStep::SemaphoreWrite { .. } => 2,
         MaxwellSubmissionExecutionStep::NotificationWrite { .. } => 3,
         MaxwellSubmissionExecutionStep::MemoryCopy { .. } => 4,
         MaxwellSubmissionExecutionStep::InlineWrite { .. } => 5,
@@ -1285,15 +1245,10 @@ fn backend_step_prepares_work<W: MaxwellWork>(step: &MaxwellSubmissionExecutionS
     ) || matches!(
         step,
         MaxwellSubmissionExecutionStep::WaitForIdle
-            | MaxwellSubmissionExecutionStep::SemaphoreRelease { .. }
+            | MaxwellSubmissionExecutionStep::SemaphoreWrite { .. }
             | MaxwellSubmissionExecutionStep::NotificationWrite { .. }
     )
 }
-fn backend_step_emits_operation<W: MaxwellWork>(step: &MaxwellSubmissionExecutionStep<W>) -> bool {
-    backend_step_prepares_work(step)
-        || matches!(step, MaxwellSubmissionExecutionStep::InlineWrite { .. })
-}
-
 fn too_many_backend_segments() -> MaxwellBackendExecutionError {
     MaxwellBackendExecutionError::InvalidSubmission(
         CommandDescriptionError::TooManySubmissionSegments,
@@ -1329,123 +1284,82 @@ fn three_d_synchronization_operation(
     Some(maintenance)
 }
 
-#[derive(Clone, Copy)]
-enum CanonicalWriteSource {
-    Inline(MaxwellMethodSource),
-    MemoryCopy(MaxwellMethodSource),
-}
-
-fn commit_write_batch(
-    writes: CanonicalWriteBatch,
-    source: Option<CanonicalWriteSource>,
-) -> Result<(), MaxwellCanonicalExecutionError> {
-    writes.commit_ordered().map_err(|error| {
-        match source.expect("a non-empty canonical write batch has an ordered method source") {
-            CanonicalWriteSource::Inline(source) => {
-                MaxwellCanonicalExecutionError::InlineWrite { source, error }
-            }
-            CanonicalWriteSource::MemoryCopy(source) => {
-                MaxwellCanonicalExecutionError::MemoryCopyTransaction { source, error }
-            }
-        }
-    })
-}
-
 fn stage_memory_copy(
     operation: MaxwellMemoryCopyOperation,
     source: &MaxwellResolvedRange,
     destination: &MaxwellResolvedRange,
-    writes: &mut CanonicalWriteBatch,
-    resolve: &mut nixe_memory::CpuVisibilityResolver<'_>,
+    access: &mut nixe_gpu::MemoryAccess<'_>,
 ) -> Result<(), MaxwellCanonicalExecutionError> {
-    let mut source_bytes = memory_copy_buffer(operation.source_range_size(), operation.source())?;
-    read_memory_copy_bytes(
-        source,
-        &mut source_bytes,
-        writes,
-        operation.source(),
-        resolve,
-    )?;
-    if !operation.has_remap() {
-        // Read and stage only touched pages. In a cropped tiled transfer, the
-        // validated address span can include most of a surface before the first
-        // copied row. Do not repeatedly copy or invalidate that untouched prefix.
-        // Snapshot the source first so overlapping surfaces retain copy semantics.
-        let mut pages = BTreeMap::<usize, Vec<u8>>::new();
-        for region in operation.byte_regions() {
-            let (mut src, mut dst, mut count) =
-                region.map_err(
-                    |error| MaxwellCanonicalExecutionError::MemoryCopyTransform {
-                        source: operation.source(),
-                        error,
-                    },
-                )?;
-            while count != 0 {
-                const PAGE_BYTES: usize = 4096;
-                let base = dst & !(PAGE_BYTES - 1);
-                let page = match pages.entry(base) {
-                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        let size = (operation.destination_range_size() - base as u64)
-                            .min(PAGE_BYTES as u64);
-                        let mut bytes = memory_copy_buffer(size, operation.source())?;
-                        read_memory_copy_subrange(
-                            destination,
-                            base,
-                            &mut bytes,
-                            writes,
-                            operation.source(),
-                            resolve,
-                        )?;
-                        entry.insert(bytes)
-                    }
-                };
-                let offset = dst - base;
-                let size = count.min(page.len() - offset);
-                page[offset..offset + size].copy_from_slice(&source_bytes[src..src + size]);
-                src += size;
-                dst += size;
-                count -= size;
-            }
+    // Snapshot the complete source before any overlapping destination changes.
+    let ranges = physical_subrange(source, 0, source.size() as usize).map_err(|error| {
+        MaxwellCanonicalExecutionError::MemoryCopyTransaction {
+            source: operation.source(),
+            error,
         }
-        for (base, bytes) in pages {
-            stage_memory_copy_subrange(
-                destination,
-                base,
-                &bytes,
-                writes,
-                operation.source(),
-                resolve,
-            )?;
-        }
-        return Ok(());
-    }
-    let mut destination_bytes =
-        memory_copy_buffer(operation.destination_range_size(), operation.source())?;
-    read_memory_copy_bytes(
-        destination,
-        &mut destination_bytes,
-        writes,
-        operation.source(),
-        resolve,
-    )?;
-    operation
-        .copy_bytes(&source_bytes, &mut destination_bytes)
-        .map_err(
-            |error| MaxwellCanonicalExecutionError::MemoryCopyTransform {
+    })?;
+    let AccessResult::Read(source_bytes) =
+        access(ranges, AccessOperation::Read).map_err(|error| {
+            MaxwellCanonicalExecutionError::MemoryCopyTransaction {
                 source: operation.source(),
                 error,
-            },
-        )?;
-
-    stage_memory_copy_subrange(
-        destination,
-        0,
-        &destination_bytes,
-        writes,
-        operation.source(),
-        resolve,
-    )
+            }
+        })?
+    else {
+        unreachable!("read operation returns bytes")
+    };
+    if !operation.has_remap() {
+        let mut runs = operation
+            .byte_regions()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(
+                |error| MaxwellCanonicalExecutionError::MemoryCopyTransform {
+                    source: operation.source(),
+                    error,
+                },
+            )?;
+        runs.sort_unstable_by_key(|&(_, destination, _)| destination);
+        let mut i = 0;
+        while i < runs.len() {
+            let (src, dst, mut size) = runs[i];
+            i += 1;
+            while i < runs.len() && runs[i].0 == src + size && runs[i].1 == dst + size {
+                size += runs[i].2;
+                i += 1;
+            }
+            write_memory_copy_subrange(
+                destination,
+                dst,
+                &source_bytes[src..src + size],
+                operation.source(),
+                access,
+            )?;
+        }
+    } else {
+        let mut bytes = memory_copy_buffer(operation.destination_range_size(), operation.source())?;
+        operation
+            .copy_bytes(&source_bytes, &mut bytes)
+            .map_err(
+                |error| MaxwellCanonicalExecutionError::MemoryCopyTransform {
+                    source: operation.source(),
+                    error,
+                },
+            )?;
+        for span in operation.written_spans().map_err(|error| {
+            MaxwellCanonicalExecutionError::MemoryCopyTransform {
+                source: operation.source(),
+                error,
+            }
+        })? {
+            write_memory_copy_subrange(
+                destination,
+                span.start,
+                &bytes[span],
+                operation.source(),
+                access,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn memory_copy_segments(
@@ -1469,67 +1383,36 @@ fn memory_copy_segments(
     })
 }
 
-fn stage_memory_copy_subrange(
+fn physical_subrange(
+    range: &MaxwellResolvedRange,
+    offset: usize,
+    size: usize,
+) -> Result<Vec<AllocationRange>, Arc<MemoryError>> {
+    let mut ranges = Vec::new();
+    for (segment, backing_offset, indices) in memory_copy_segments(range, offset, size) {
+        ranges.extend(
+            segment
+                .mapping()
+                .physical()
+                .pin(backing_offset, indices.len() as u64)
+                .map_err(Arc::new)?,
+        );
+    }
+    Ok(ranges)
+}
+
+fn write_memory_copy_subrange(
     range: &MaxwellResolvedRange,
     offset: usize,
     bytes: &[u8],
-    writes: &mut CanonicalWriteBatch,
     source: MaxwellMethodSource,
-    resolve: &mut nixe_memory::CpuVisibilityResolver<'_>,
+    access: &mut nixe_gpu::MemoryAccess<'_>,
 ) -> Result<(), MaxwellCanonicalExecutionError> {
-    for (segment, backing_offset, indices) in memory_copy_segments(range, offset, bytes.len()) {
-        writes
-            .stage_with_resolver(
-                segment.mapping().backing(),
-                backing_offset,
-                &bytes[indices],
-                resolve,
-            )
-            .map_err(
-                |error| MaxwellCanonicalExecutionError::MemoryCopyTransaction { source, error },
-            )?;
-    }
-    Ok(())
-}
-
-fn read_memory_copy_bytes(
-    range: &MaxwellResolvedRange,
-    output: &mut [u8],
-    writes: &CanonicalWriteBatch,
-    source: MaxwellMethodSource,
-    resolve: &mut nixe_memory::CpuVisibilityResolver<'_>,
-) -> Result<(), MaxwellCanonicalExecutionError> {
-    if output.len() as u64 != range.size() {
-        return Err(MaxwellCanonicalExecutionError::MemoryCopyTransform {
-            source,
-            error: MaxwellMemoryCopyError::RangeSizeMismatch,
-        });
-    }
-    read_memory_copy_subrange(range, 0, output, writes, source, resolve)
-}
-
-fn read_memory_copy_subrange(
-    range: &MaxwellResolvedRange,
-    offset: usize,
-    output: &mut [u8],
-    writes: &CanonicalWriteBatch,
-    source: MaxwellMethodSource,
-    resolve: &mut nixe_memory::CpuVisibilityResolver<'_>,
-) -> Result<(), MaxwellCanonicalExecutionError> {
-    for (segment, backing_offset, indices) in memory_copy_segments(range, offset, output.len()) {
-        // read_overlay establishes CPU visibility and overlays preceding ordered
-        // writes; a separate canonical read would duplicate the same work.
-        writes
-            .read_overlay_with_resolver(
-                segment.mapping().backing(),
-                backing_offset,
-                &mut output[indices],
-                resolve,
-            )
-            .map_err(
-                |error| MaxwellCanonicalExecutionError::MemoryCopyTransaction { source, error },
-            )?;
-    }
+    let ranges = physical_subrange(range, offset, bytes.len())
+        .map_err(|error| MaxwellCanonicalExecutionError::MemoryCopyTransaction { source, error })?;
+    let result = access(ranges, AccessOperation::Write(bytes.into()))
+        .map_err(|error| MaxwellCanonicalExecutionError::MemoryCopyTransaction { source, error })?;
+    assert!(matches!(result, AccessResult::Written));
     Ok(())
 }
 
@@ -1553,63 +1436,8 @@ fn memory_copy_buffer(
     Ok(bytes)
 }
 
-fn stage_resolved_inline_write(
-    target: &MaxwellResolvedRange,
-    bytes: &[u8],
-    source: MaxwellMethodSource,
-    writes: &mut CanonicalWriteBatch,
-    resolve: &mut nixe_memory::CpuVisibilityResolver<'_>,
-) -> Result<(), MaxwellCanonicalExecutionError> {
-    if !target.permissions().contains(MemoryPermissions::WRITE) {
-        return Err(MaxwellCanonicalExecutionError::StaleInlineTarget {
-            source,
-            error: MaxwellGpuAccessError::PermissionDenied {
-                address: target.offset(),
-                required: MemoryPermissions::WRITE,
-                available: target.permissions(),
-            },
-        });
-    }
-    if target.size() != bytes.len() as u64 {
-        return Err(MaxwellCanonicalExecutionError::StaleInlineTarget {
-            source,
-            error: MaxwellGpuAccessError::OutputSizeMismatch {
-                expected: target.size(),
-                actual: bytes.len() as u64,
-            },
-        });
-    }
-
-    let mut copied = 0_usize;
-    for segment in target.segments() {
-        let size = usize::try_from(segment.size()).map_err(|_| {
-            MaxwellCanonicalExecutionError::StaleInlineTarget {
-                source,
-                error: MaxwellGpuAccessError::ArithmeticOverflow,
-            }
-        })?;
-        let end =
-            copied
-                .checked_add(size)
-                .ok_or(MaxwellCanonicalExecutionError::StaleInlineTarget {
-                    source,
-                    error: MaxwellGpuAccessError::ArithmeticOverflow,
-                })?;
-        writes
-            .stage_with_resolver(
-                segment.mapping().backing(),
-                segment.backing_offset(),
-                &bytes[copied..end],
-                resolve,
-            )
-            .map_err(|error| MaxwellCanonicalExecutionError::InlineWrite { source, error })?;
-        copied = end;
-    }
-    Ok(())
-}
-
 fn resolve_inline_target(
-    address_space: &MaxwellGpuAddressSpace,
+    address_space: &MaxwellGpuMemory,
     base: u64,
     offset: u32,
     source: MaxwellMethodSource,
@@ -1639,11 +1467,12 @@ fn execution_from_plan<W: MaxwellWork>(
 
 #[cfg(test)]
 mod tests {
+    use crate::MaxwellGpuAddressSpace;
     use nixe_gpu::{
         FrontendSubmissionId, GpuVirtualAddress, GuestSyncpointId, GuestSyncpointValue,
         GuestTimeline, MappingGeneration, TimelineInstanceId, TimelineOwnerId,
     };
-    use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+    use nixe_memory::MemoryPermissions;
 
     use super::*;
     use crate::engines::dispatch_maxwell_engine_packet;
@@ -1660,7 +1489,9 @@ mod tests {
     ) -> Result<Option<GuestTimelinePoint>, MaxwellBackendExecutionError> {
         assert!(!plan.requires_backend());
         let mut execution = execution_from_plan(plan);
-        while let Some(segment) = execution.next_segment(timestamp)? {
+        while let Some(segment) =
+            execution.next_segment_with_memory(timestamp, &mut crate::test_memory::apply)?
+        {
             assert!(
                 segment
                     .commands
@@ -1724,8 +1555,11 @@ mod tests {
     }
 
     fn address_space() -> MaxwellGpuAddressSpace {
-        let mut address_space =
-            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+        let mut address_space = MaxwellGpuAddressSpace::new(
+            crate::test_memory::machine(),
+            MaxwellAddressSpaceId::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
         address_space
             .initialize(MaxwellAddressSpaceInitialization::default())
             .unwrap();
@@ -1748,7 +1582,11 @@ mod tests {
         plan: MaxwellSubmissionExecutionPlan,
     ) -> Option<GuestTimelinePoint> {
         let mut execution = execution_from_plan(plan);
-        while execution.next_segment(0).unwrap().is_some() {
+        while execution
+            .next_segment_with_memory(0, &mut crate::test_memory::apply)
+            .unwrap()
+            .is_some()
+        {
             execution.accept_segment();
         }
         execution.completion()
@@ -1764,7 +1602,7 @@ mod tests {
         let plan = lower_test_pushbuffers(
             &mut channel,
             &[],
-            &address_space(),
+            address_space().memory(),
             FrontendSubmissionId::new(2),
             None,
             &mut MaxwellNativeFrontend::new(Default::default()),
@@ -1787,7 +1625,7 @@ mod tests {
             lower_test_pushbuffers(
                 &mut channel,
                 &[],
-                &address_space(),
+                address_space().memory(),
                 FrontendSubmissionId::new(2),
                 Some(&reservation),
                 &mut MaxwellNativeFrontend::new(Default::default()),
@@ -1814,11 +1652,13 @@ mod tests {
             let reservation = timeline.reserve(owner, guest_increments + 2).unwrap();
             let space = address_space();
             let mut cache = MaxwellNativeFrontend::new(Default::default());
+            let mut memory_access = crate::test_memory::access(space.memory().machine());
             let mut planner = MaxwellSubmissionPlanner::new(
-                &space,
+                space.memory(),
                 FrontendSubmissionId::new(2),
                 Some(&reservation),
                 &mut cache,
+                &mut memory_access,
             );
             planner.set_driver_completion_increments(2);
             // The driver contributes its increments only when execution completes.
@@ -1876,7 +1716,7 @@ mod tests {
         let plan = lower_test_pushbuffers(
             &mut channel,
             &[bind, increment.clone()],
-            &address_space(),
+            address_space().memory(),
             FrontendSubmissionId::new(2),
             Some(&reservation),
             &mut MaxwellNativeFrontend::new(Default::default()),
@@ -1890,7 +1730,7 @@ mod tests {
             lower_test_pushbuffers(
                 &mut channel,
                 &[increment.clone(), increment],
-                &address_space(),
+                address_space().memory(),
                 FrontendSubmissionId::new(2),
                 Some(&reservation),
                 &mut MaxwellNativeFrontend::new(Default::default()),
@@ -1927,7 +1767,7 @@ mod tests {
         let plan = lower_test_pushbuffers(
             &mut channel,
             &[bind, increment.clone(), increment, flush],
-            &address_space,
+            address_space.memory(),
             FrontendSubmissionId::new(2),
             Some(&reservation),
             &mut MaxwellNativeFrontend::new(Default::default()),
@@ -1945,13 +1785,11 @@ mod tests {
     #[test]
     fn cache_maintenance_without_wfi_preserves_pending_work_until_an_explicit_wait() {
         let mut address_space = address_space();
-        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let allocation = crate::test_memory::allocate(address_space.memory().machine(), 0x1000);
         let mapping = address_space
             .map(MaxwellMapRequest {
                 allocation: MaxwellAllocationId::new(1),
-                backing: allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
+                backing: crate::test_memory::ranges(&allocation),
                 backing_offset: 0,
                 size: 0x1000,
                 allocation_alignment: 0x1000,
@@ -2020,7 +1858,7 @@ mod tests {
                 tiled_barrier,
                 wait,
             ],
-            &address_space,
+            address_space.memory(),
             FrontendSubmissionId::new(2),
             None,
             &mut MaxwellNativeFrontend::new(Default::default()),
@@ -2065,12 +1903,12 @@ mod tests {
         ));
 
         let mut bytes = [0xff; 4];
-        allocation.read(0, &mut bytes).unwrap();
+        crate::test_memory::read(&allocation, 0, &mut bytes).unwrap();
         assert_eq!(bytes, [0; 4]);
 
         let completion = complete_backend_execution(plan);
         assert_eq!(completion, None);
-        allocation.read(0, &mut bytes).unwrap();
+        crate::test_memory::read(&allocation, 0, &mut bytes).unwrap();
         assert_eq!(bytes, 0xfeed_beef_u32.to_le_bytes());
     }
 
@@ -2079,14 +1917,13 @@ mod tests {
         for short in [false, true] {
             for with_backend in [false, true] {
                 let mut address_space = address_space();
-                let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-                allocation.write(0, &[0xcc; 16]).unwrap();
+                let allocation =
+                    crate::test_memory::allocate(address_space.memory().machine(), 0x1000);
+                crate::test_memory::write(&allocation, 0, &[0xcc; 16]).unwrap();
                 let mapping = address_space
                     .map(MaxwellMapRequest {
                         allocation: MaxwellAllocationId::new(1),
-                        backing: allocation
-                            .backing_range(MemoryPermissions::READ_WRITE)
-                            .unwrap(),
+                        backing: crate::test_memory::ranges(&allocation),
                         backing_offset: 0,
                         size: 0x1000,
                         allocation_alignment: 0x1000,
@@ -2125,34 +1962,38 @@ mod tests {
                 let plan = lower_test_pushbuffers(
                     &mut channel,
                     &packets,
-                    &address_space,
+                    address_space.memory(),
                     FrontendSubmissionId::new(2),
                     None,
                     &mut MaxwellNativeFrontend::new(Default::default()),
                 )
                 .unwrap();
-                let timestamp = 0x1234_5678_9abc_def0;
+                let timestamp = 0x1234_5678_9abc_def0u64;
                 let mut execution = execution_from_plan(plan);
-                let segment = execution.next_segment(timestamp).unwrap().unwrap();
-                let nixe_gpu::native::NativeCommand::WriteMemory {
-                    bytes,
-                    after_prior_work,
-                    ..
-                } = segment.commands.last().unwrap()
+                let segment = execution
+                    .next_segment_with_memory(timestamp, &mut crate::test_memory::apply)
+                    .unwrap()
+                    .unwrap();
+                let nixe_gpu::native::NativeCommand::ReportMemory { bytes, .. } =
+                    segment.commands.last().unwrap()
                 else {
                     panic!("expected ordered release")
                 };
-                assert!(*after_prior_work);
                 assert_eq!(bytes.len(), if short { 4 } else { 16 });
                 assert_eq!(&bytes[..4], &0xcafe_babe_u32.to_le_bytes());
                 if !short {
                     assert_eq!(&bytes[8..], &timestamp.to_le_bytes());
                 }
                 let mut unchanged = [0; 16];
-                allocation.read(0, &mut unchanged).unwrap();
+                crate::test_memory::read(&allocation, 0, &mut unchanged).unwrap();
                 assert_eq!(unchanged, [0xcc; 16]);
                 execution.accept_segment();
-                assert!(execution.next_segment(timestamp).unwrap().is_none());
+                assert!(
+                    execution
+                        .next_segment_with_memory(timestamp, &mut crate::test_memory::apply)
+                        .unwrap()
+                        .is_none()
+                );
             }
         }
     }
@@ -2161,14 +2002,12 @@ mod tests {
     fn notification_is_published_after_prior_backend_work_with_timer_and_completion_status() {
         for with_backend in [false, true] {
             let mut address_space = address_space();
-            let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-            allocation.write(0, &[0xcc; 16]).unwrap();
+            let allocation = crate::test_memory::allocate(address_space.memory().machine(), 0x1000);
+            crate::test_memory::write(&allocation, 0, &[0xcc; 16]).unwrap();
             let mapping = address_space
                 .map(MaxwellMapRequest {
                     allocation: MaxwellAllocationId::new(1),
-                    backing: allocation
-                        .backing_range(MemoryPermissions::READ_WRITE)
-                        .unwrap(),
+                    backing: crate::test_memory::ranges(&allocation),
                     backing_offset: 0,
                     size: 0x1000,
                     allocation_alignment: 0x1000,
@@ -2203,44 +2042,46 @@ mod tests {
             let plan = lower_test_pushbuffers(
                 &mut channel,
                 &packets,
-                &address_space,
+                address_space.memory(),
                 FrontendSubmissionId::new(2),
                 None,
                 &mut MaxwellNativeFrontend::new(Default::default()),
             )
             .unwrap();
-            let timestamp = 0x1234_5678_9abc_def0;
+            let timestamp = 0x1234_5678_9abc_def0u64;
             let mut execution = execution_from_plan(plan);
-            let segment = execution.next_segment(timestamp).unwrap().unwrap();
-            let nixe_gpu::native::NativeCommand::WriteMemory {
-                bytes,
-                after_prior_work,
-                ..
-            } = segment.commands.last().unwrap()
+            let segment = execution
+                .next_segment_with_memory(timestamp, &mut crate::test_memory::apply)
+                .unwrap()
+                .unwrap();
+            let nixe_gpu::native::NativeCommand::ReportMemory { bytes, .. } =
+                segment.commands.last().unwrap()
             else {
                 panic!("expected ordered notification")
             };
-            assert!(*after_prior_work);
             assert_eq!(&bytes[..8], &timestamp.to_le_bytes());
             assert_eq!(&bytes[8..], &[0; 8]);
             let mut unchanged = [0; 16];
-            allocation.read(0, &mut unchanged).unwrap();
+            crate::test_memory::read(&allocation, 0, &mut unchanged).unwrap();
             assert_eq!(unchanged, [0xcc; 16]);
             execution.accept_segment();
-            assert!(execution.next_segment(timestamp).unwrap().is_none());
+            assert!(
+                execution
+                    .next_segment_with_memory(timestamp, &mut crate::test_memory::apply)
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
     #[test]
     fn standalone_inline_to_memory_words_are_preflighted_and_committed_atomically() {
         let mut address_space = address_space();
-        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let allocation = crate::test_memory::allocate(address_space.memory().machine(), 0x1000);
         let mapping = address_space
             .map(MaxwellMapRequest {
                 allocation: MaxwellAllocationId::new(1),
-                backing: allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
+                backing: crate::test_memory::ranges(&allocation),
                 backing_offset: 0,
                 size: 0x1000,
                 allocation_alignment: 0x1000,
@@ -2292,7 +2133,7 @@ mod tests {
         let plan = lower_test_pushbuffers(
             &mut channel,
             &[data, invalidate],
-            &address_space,
+            address_space.memory(),
             FrontendSubmissionId::new(2),
             None,
             &mut MaxwellNativeFrontend::new(Default::default()),
@@ -2314,347 +2155,21 @@ mod tests {
         ));
 
         let mut bytes = [0xff; 8];
-        allocation.read(0, &mut bytes).unwrap();
+        crate::test_memory::read(&allocation, 0, &mut bytes).unwrap();
         assert_eq!(bytes, [0; 8]);
         complete_backend_execution(plan);
-        allocation.read(0, &mut bytes).unwrap();
+        crate::test_memory::read(&allocation, 0, &mut bytes).unwrap();
         assert_eq!(bytes, [0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]);
-    }
-
-    #[test]
-    fn native_inline_writes_preserve_order_and_completion_seals_its_producer() {
-        use nixe_gpu::native::{NativeCommand, NativeWork};
-        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
-        let mut space = address_space();
-        let address = space
-            .map(MaxwellMapRequest {
-                allocation: MaxwellAllocationId::new(1),
-                backing: allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
-                backing_offset: 0,
-                size: 4096,
-                allocation_alignment: 4096,
-                page_size: 0,
-                kind: 0,
-                cacheable: true,
-                permissions: MemoryPermissions::READ_WRITE,
-                fixed_offset: None,
-            })
-            .unwrap()
-            .offset()
-            .get();
-        let mut channel = MaxwellGpuChannel::new(
-            MaxwellChannelId::new(1),
-            MaxwellChannelOwner::new(1),
-            SWITCH_1_GM20B_PROFILE,
-        );
-        let plan = lower_test_pushbuffers(
-            &mut channel,
-            &[packet(
-                6,
-                0x10 / 4,
-                &[(address >> 32) as u32, address as u32, 0, 2 | (1 << 24)],
-            )],
-            &space,
-            FrontendSubmissionId::new(2),
-            None,
-            &mut MaxwellNativeFrontend::new(Default::default()),
-        )
-        .unwrap();
-        let MaxwellSubmissionExecutionStep::SemaphoreRelease { source, target, .. } =
-            &plan.steps[0]
-        else {
-            panic!("release expected")
-        };
-        let mut native_cache = MaxwellNativeFrontend::new(Default::default());
-        let mut planner = MaxwellSubmissionPlanner::new(
-            &space,
-            FrontendSubmissionId::new(2),
-            None,
-            &mut native_cache,
-        );
-        planner
-            .push_inline_write(address, 0, 0x1020, *source)
-            .unwrap();
-        planner
-            .push_inline_write(address, 4, 0x3344, *source)
-            .unwrap();
-        assert!(
-            planner.take_ready_steps().is_none(),
-            "coalesce incomplete inline payloads"
-        );
-        planner.flush_inline_writes();
-        planner.steps.push(MaxwellSubmissionExecutionStep::Ordering(
-            CacheMaintenanceOperation::FlushDirtyDeviceWrites,
-        ));
-        assert_eq!(planner.take_ready_steps().unwrap().len(), 2);
-        assert!(planner.take_ready_steps().is_none());
-        let plan = MaxwellSubmissionExecutionPlan::<NativeWork> {
-            frontend: FrontendSubmissionId::new(2),
-            completion: None,
-            steps: vec![
-                MaxwellSubmissionExecutionStep::InlineWrite {
-                    source: *source,
-                    target: target.clone(),
-                    value: 0x1020u32.to_le_bytes().to_vec(),
-                },
-                MaxwellSubmissionExecutionStep::Gpu(NativeWork {
-                    frontend: FrontendSubmissionId::new(2),
-                    command: NativeCommand::WaitForIdle,
-                }),
-                MaxwellSubmissionExecutionStep::InlineWrite {
-                    source: *source,
-                    target: target.clone(),
-                    value: 0x3344u32.to_le_bytes().to_vec(),
-                },
-                MaxwellSubmissionExecutionStep::SemaphoreRelease {
-                    source: *source,
-                    target: target.clone(),
-                    payload: 0x1234,
-                    short: true,
-                },
-                MaxwellSubmissionExecutionStep::InlineWrite {
-                    source: *source,
-                    target: target.clone(),
-                    value: 0x5678u32.to_le_bytes().to_vec(),
-                },
-                MaxwellSubmissionExecutionStep::WaitForIdle,
-            ]
-            .into_boxed_slice(),
-        };
-        let mut execution = execution_from_plan(plan);
-        let segment = execution
-            .next_segment_with_resolver(0x1234, &mut |_, _| {
-                panic!("device ordering must not demand CPU visibility")
-            })
-            .unwrap()
-            .unwrap();
-        assert!(!segment.final_segment);
-        assert!(matches!(
-            segment.commands.as_slice(),
-            [NativeCommand::WaitForIdle]
-        ));
-        let mut actual = [0; 4];
-        allocation.read(0, &mut actual).unwrap();
-        assert_eq!(
-            actual,
-            0x1020u32.to_le_bytes(),
-            "capture the earlier input before changing its bytes"
-        );
-        assert!(execution.awaiting_acceptance());
-        execution.accept_segment();
-        let release = execution
-            .next_segment_with_resolver(0x1234, &mut |_, _| {
-                panic!("accepted immutable inputs do not require GPU completion")
-            })
-            .unwrap()
-            .unwrap();
-        assert!(!release.final_segment);
-        assert!(matches!(
-            release.commands.as_slice(),
-            [NativeCommand::WriteMemory {
-                after_prior_work: true,
-                ..
-            }]
-        ));
-        allocation.read(0, &mut actual).unwrap();
-        assert_eq!(actual, 0x3344u32.to_le_bytes());
-        assert!(execution.awaiting_acceptance());
-        execution.accept_segment();
-        let tail = execution
-            .next_segment_with_resolver(0x1234, &mut |_, _| {
-                panic!("independent recording must not wait for producer completion")
-            })
-            .unwrap()
-            .unwrap();
-        assert!(tail.final_segment);
-        assert!(matches!(
-            tail.commands.as_slice(),
-            [NativeCommand::WaitForIdle]
-        ));
-        let mut actual = [0; 4];
-        allocation.read(0, &mut actual).unwrap();
-        assert_eq!(
-            actual,
-            0x5678u32.to_le_bytes(),
-            "a following independent CPU upload commits without waiting for completion"
-        );
-        execution.accept_segment();
-        assert!(execution.next_segment(0).unwrap().is_none());
-    }
-
-    #[test]
-    fn backend_canonical_operations_resolve_owned_pages_without_reentering_the_coordinator() {
-        use nixe_memory::{
-            CanonicalBackingRange, CpuVisibilityRequest, DeviceAccessDeclaration,
-            DeviceVisibilityPoint, DeviceVisibilityRequest, NonCpuDeviceId, VisibilityCoordinator,
-            VisibilityCoordinatorError,
-        };
-        struct InboxCoordinator;
-        impl VisibilityCoordinator for InboxCoordinator {
-            fn cache_cpu_page(
-                &self,
-                _: DeviceVisibilityRequest,
-                _: &[u8],
-            ) -> Result<(), VisibilityCoordinatorError> {
-                Ok(())
-            }
-            fn make_cpu_visible(
-                &self,
-                _: CpuVisibilityRequest,
-            ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
-                panic!("the GPU owner must not wait on its own visibility inbox")
-            }
-        }
-        for kind in 0..3 {
-            let allocation = CanonicalAllocation::zeroed(0x3000, 0x1000).unwrap();
-            let backing = allocation
-                .backing_range(MemoryPermissions::READ_WRITE)
-                .unwrap();
-            let mut space = address_space();
-            let address = space
-                .map(MaxwellMapRequest {
-                    allocation: MaxwellAllocationId::new(1),
-                    backing: backing.clone(),
-                    backing_offset: 0,
-                    size: 0x3000,
-                    allocation_alignment: 0x1000,
-                    page_size: 0,
-                    kind: 0,
-                    cacheable: true,
-                    permissions: MemoryPermissions::READ_WRITE,
-                    fixed_offset: None,
-                })
-                .unwrap()
-                .offset()
-                .get();
-            let resolve_range = |offset, size, permissions| {
-                space
-                    .resolve_range(
-                        GpuVirtualAddress::try_new(address + offset, 40).unwrap(),
-                        size,
-                        permissions,
-                    )
-                    .unwrap()
-            };
-            let mut channel = MaxwellGpuChannel::new(
-                MaxwellChannelId::new(1),
-                MaxwellChannelOwner::new(1),
-                SWITCH_1_GM20B_PROFILE,
-            );
-            let mut plan = lower_test_pushbuffers(
-                &mut channel,
-                &[packet(
-                    6,
-                    0x10 / 4,
-                    &[(address >> 32) as u32, address as u32, 0, 2],
-                )],
-                &space,
-                FrontendSubmissionId::new(2),
-                None,
-                &mut MaxwellNativeFrontend::new(Default::default()),
-            )
-            .unwrap();
-            let MaxwellSubmissionExecutionStep::SemaphoreRelease { source, .. } = plan.steps[0]
-            else {
-                panic!("expected a host release")
-            };
-            let operation = MaxwellMemoryCopyOperation::byte_copy(
-                address,
-                address + 0x1000,
-                crate::MaxwellMemoryCopyLayout::Pitch { pitch: 8 },
-                crate::MaxwellMemoryCopyLayout::Pitch { pitch: 8 },
-                4,
-                2,
-                source,
-            )
-            .unwrap();
-            let target = resolve_range(0x2000, 16, MemoryPermissions::WRITE);
-            let tail = match kind {
-                0 => MaxwellSubmissionExecutionStep::InlineWrite {
-                    source,
-                    target,
-                    value: vec![0x77; 16],
-                },
-                1 => MaxwellSubmissionExecutionStep::SemaphoreRelease {
-                    source,
-                    target,
-                    payload: 0x1234_5678,
-                    short: false,
-                },
-                _ => MaxwellSubmissionExecutionStep::NotificationWrite { source, target },
-            };
-            plan.steps = vec![
-                MaxwellSubmissionExecutionStep::MemoryCopy {
-                    operation,
-                    source: resolve_range(0, 12, MemoryPermissions::READ),
-                    destination: resolve_range(0x1000, 12, MemoryPermissions::WRITE),
-                },
-                tail,
-            ]
-            .into_boxed_slice();
-            let pages: Vec<_> = backing.segments().iter().map(|p| p.page()).collect();
-            let declaration = DeviceAccessDeclaration::write(
-                NonCpuDeviceId::new(1),
-                DeviceVisibilityPoint::new(1),
-                DeviceVisibilityPoint::new(2),
-            )
-            .unwrap();
-            let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(InboxCoordinator);
-            CanonicalBackingRange::prepare_resident_device_accesses(
-                [(&backing, declaration)],
-                coordinator.as_ref(),
-            )
-            .unwrap();
-            CanonicalBackingRange::publish_device_writes([(&backing, declaration)], coordinator)
-                .unwrap();
-            let mut requests = Vec::new();
-            let mut execution = execution_from_plan(plan);
-            let timestamp: u64 = 0x1234_5678_9abc_def0;
-            let segment = execution
-                .next_segment_with_resolver(timestamp, &mut |_, request| {
-                    requests.push(request.page);
-                    let index = pages.iter().position(|page| *page == request.page).unwrap();
-                    Ok(vec![[0x11, 0x22, 0x33][index]; request.size].into_boxed_slice())
-                })
-                .unwrap()
-                .unwrap();
-            assert_eq!(requests, pages[..2]);
-            let nixe_gpu::native::NativeCommand::WriteMemory { bytes, .. } =
-                segment.commands.last().unwrap()
-            else {
-                panic!("expected device write")
-            };
-            let expected = match kind {
-                0 => vec![0x77; 16],
-                1 => [
-                    0x1234_5678u32.to_le_bytes().as_slice(),
-                    &[0; 4],
-                    &timestamp.to_le_bytes(),
-                ]
-                .concat(),
-                _ => [timestamp.to_le_bytes().as_slice(), &[0; 8]].concat(),
-            };
-            assert_eq!(bytes.as_ref(), expected);
-            execution.accept_segment();
-            assert!(execution.next_segment(timestamp).unwrap().is_none());
-            assert!(execution.is_finished());
-            let mut actual = [0; 0x2000];
-            allocation.read(0, &mut actual).unwrap();
-            let mut expected = [0x22; 0x1000];
-            expected[..4].fill(0x11);
-            expected[8..12].fill(0x11);
-            assert_eq!(actual[..0x1000], [0x11; 0x1000]);
-            assert_eq!(actual[0x1000..0x2000], expected);
-        }
     }
 
     #[test]
     fn dma_copy_converts_captured_rgba_pitch_rows_to_block_linear_storage() {
         const TEXTURE_SIZE: usize = 256 * 256 * 4;
-        let source_allocation = CanonicalAllocation::zeroed(TEXTURE_SIZE, 0x1000).unwrap();
-        let destination_allocation = CanonicalAllocation::zeroed(TEXTURE_SIZE, 0x1000).unwrap();
+        let mut address_space = address_space();
+        let source_allocation =
+            crate::test_memory::allocate(address_space.memory().machine(), TEXTURE_SIZE as u64);
+        let destination_allocation =
+            crate::test_memory::allocate(address_space.memory().machine(), TEXTURE_SIZE as u64);
         let mut linear = vec![0_u8; TEXTURE_SIZE];
         for y in 0..256_u32 {
             for x in 0..256_u32 {
@@ -2667,15 +2182,12 @@ mod tests {
                 ]);
             }
         }
-        source_allocation.write(0, &linear).unwrap();
+        crate::test_memory::write(&source_allocation, 0, &linear).unwrap();
 
-        let mut address_space = address_space();
         let source_mapping = address_space
             .map(MaxwellMapRequest {
                 allocation: MaxwellAllocationId::new(10),
-                backing: source_allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
+                backing: crate::test_memory::ranges(&source_allocation),
                 backing_offset: 0,
                 size: TEXTURE_SIZE as u64,
                 allocation_alignment: 0x1000,
@@ -2689,9 +2201,7 @@ mod tests {
         let destination_mapping = address_space
             .map(MaxwellMapRequest {
                 allocation: MaxwellAllocationId::new(11),
-                backing: destination_allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
+                backing: crate::test_memory::ranges(&destination_allocation),
                 backing_offset: 0,
                 size: TEXTURE_SIZE as u64,
                 allocation_alignment: 0x1000,
@@ -2757,7 +2267,7 @@ mod tests {
         let plan = lower_test_pushbuffers(
             &mut channel,
             &[launch],
-            &address_space,
+            address_space.memory(),
             FrontendSubmissionId::new(2),
             None,
             &mut MaxwellNativeFrontend::new(Default::default()),
@@ -2765,7 +2275,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             plan.steps(),
-            [MaxwellSubmissionExecutionStep::MemoryCopy { operation, .. }, MaxwellSubmissionExecutionStep::SemaphoreRelease { payload: 0x1234_5678, short: true, .. }]
+            [MaxwellSubmissionExecutionStep::MemoryCopy { operation, .. }, MaxwellSubmissionExecutionStep::SemaphoreWrite { payload: 0x1234_5678, short: true, .. }]
                 if operation.source_address() == source_address
                     && operation.destination_address() == destination_address
                     && operation.source_range_size() == TEXTURE_SIZE as u64
@@ -2773,25 +2283,28 @@ mod tests {
         ));
 
         let mut execution = execution_from_plan(plan);
-        let segment = execution.next_segment(0).unwrap().unwrap();
-        let [
-            nixe_gpu::native::NativeCommand::WriteMemory {
-                bytes,
-                after_prior_work: true,
-                ..
-            },
-        ] = segment.commands.as_slice()
+        let segment = execution
+            .next_segment_with_memory(0, &mut crate::test_memory::apply)
+            .unwrap()
+            .unwrap();
+        let [nixe_gpu::native::NativeCommand::ReportMemory { bytes, .. }] =
+            segment.commands.as_slice()
         else {
             panic!("expected ordered DMA release")
         };
         assert_eq!(bytes.as_ref(), &0x1234_5678u32.to_le_bytes());
         execution.accept_segment();
-        assert!(execution.next_segment(0).unwrap().is_none());
+        assert!(
+            execution
+                .next_segment_with_memory(0, &mut crate::test_memory::apply)
+                .unwrap()
+                .is_none()
+        );
         let mut completion = [0; 4];
-        source_allocation.read(0, &mut completion).unwrap();
+        crate::test_memory::read(&source_allocation, 0, &mut completion).unwrap();
         assert_eq!(&completion, &linear[..4]);
         let mut tiled = vec![0_u8; TEXTURE_SIZE];
-        destination_allocation.read(0, &mut tiled).unwrap();
+        crate::test_memory::read(&destination_allocation, 0, &mut tiled).unwrap();
         for (x, y, offset) in [
             (0_u32, 0_u32, 0_usize),
             (4, 0, 32),
@@ -2811,21 +2324,19 @@ mod tests {
 
     #[test]
     fn two_d_point_copy_preserves_pixels_outside_a_cropped_tiled_rectangle() {
-        let input = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        let output = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        let linear: Vec<_> = (0..0x1000).map(|i| (i % 251) as u8).collect();
-        input.write(0, &linear).unwrap();
-        output.write(0, &[0xaa; 0x1000]).unwrap();
         let mut space = address_space();
+        let input = crate::test_memory::allocate(space.memory().machine(), 0x1000);
+        let output = crate::test_memory::allocate(space.memory().machine(), 0x1000);
+        let linear: Vec<_> = (0..0x1000).map(|i| (i % 251) as u8).collect();
+        crate::test_memory::write(&input, 0, &linear).unwrap();
+        crate::test_memory::write(&output, 0, &[0xaa; 0x1000]).unwrap();
         let mut addresses = Vec::new();
         for (index, allocation) in [&input, &output].into_iter().enumerate() {
             addresses.push(
                 space
                     .map(MaxwellMapRequest {
                         allocation: MaxwellAllocationId::new(index as u64 + 20),
-                        backing: allocation
-                            .backing_range(MemoryPermissions::READ_WRITE)
-                            .unwrap(),
+                        backing: crate::test_memory::ranges(allocation),
                         backing_offset: 0,
                         size: 0x1000,
                         allocation_alignment: 0x1000,
@@ -2891,7 +2402,7 @@ mod tests {
         let plan = lower_test_pushbuffers(
             &mut channel,
             &[launch],
-            &space,
+            space.memory(),
             frontend,
             None,
             &mut MaxwellNativeFrontend::new(Default::default()),
@@ -2903,7 +2414,7 @@ mod tests {
         ));
         execute_canonical_test_plan(plan, 0).unwrap();
         let mut actual = [0; 0x1000];
-        output.read(0, &mut actual).unwrap();
+        crate::test_memory::read(&output, 0, &mut actual).unwrap();
         let mut expected = [0xaa; 0x1000];
         // Independent GOB reference: 128-byte rows, two GOBs high per block.
         for y in 0..3 {
@@ -2925,18 +2436,18 @@ mod tests {
             let setup = packet(3, method / 4, &[value]);
             dispatch_maxwell_engine_packet(&mut channel, frontend, &setup.packets()[0]).unwrap();
         }
-        output.write(0, &[0xaa; 0x1000]).unwrap();
+        crate::test_memory::write(&output, 0, &[0xaa; 0x1000]).unwrap();
         let plan = lower_test_pushbuffers(
             &mut channel,
             &[packet(3, 0x08dc / 4, &[0])],
-            &space,
+            space.memory(),
             frontend,
             None,
             &mut MaxwellNativeFrontend::new(Default::default()),
         )
         .unwrap();
         execute_canonical_test_plan(plan, 0).unwrap();
-        output.read(0, &mut actual).unwrap();
+        crate::test_memory::read(&output, 0, &mut actual).unwrap();
         assert_eq!(actual, expected);
         for (method, value) in [(0x088c, 0), (0x08d0, 0), (0x08d8, 0)] {
             let setup = packet(3, method / 4, &[value]);

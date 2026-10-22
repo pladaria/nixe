@@ -10,7 +10,6 @@ use nixe_gpu::{
     GuestSyncpointValue, GuestTimelinePoint, ImageMemoryLayout, PresentationImageFormat,
     PresentationImageRequest, ResidentImage,
 };
-use nixe_memory::CanonicalCpuWriteDependency;
 use nixe_runtime::{EventObject, ExternalEventSource, ReadableEventObject, WritableEventObject};
 use nixe_video::{DisplayClock, FrameCrop, FrameMailbox, FrameTransform, PresentationFrame};
 
@@ -254,21 +253,16 @@ pub struct GraphicsTeardownReport {
     pub allocations_released: usize,
 }
 
-impl Default for VideoSystem {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl VideoSystem {
     #[must_use]
-    pub fn new() -> Self {
-        Self::with_nvdrv(None, NvDrvSession::new())
+    pub fn new(machine: nixe_memory::Machine) -> Self {
+        Self::with_nvdrv(None, NvDrvSession::new(machine))
     }
 
     /// Composes concrete native Maxwell work with its renderer before workers start.
     #[must_use]
     pub fn with_gpu_frontend<E, L>(
+        machine: nixe_memory::Machine,
         presenter: Option<FrameMailbox>,
         execution: E,
         frontend: L,
@@ -282,7 +276,7 @@ impl VideoSystem {
     {
         Self::with_nvdrv(
             presenter,
-            NvDrvSession::with_gpu_frontend(execution, frontend),
+            NvDrvSession::with_gpu_frontend(machine, execution, frontend),
         )
     }
 
@@ -340,11 +334,11 @@ impl VideoSystem {
     /// worker-finished event is handled.
     #[must_use]
     pub fn teardown(&self) -> GraphicsTeardownReport {
+        let nvdrv = self.nvdrv().teardown();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let nvdrv = state.nvdrv.teardown();
         let report = GraphicsTeardownReport {
             layers_released: state.layers.len(),
             queues_released: state.queues.len(),
@@ -965,7 +959,6 @@ pub enum FramebufferError {
     Unsupported(&'static str),
     Backend(Box<str>),
     NvMap(crate::NvMapViewError),
-    Memory(nixe_memory::CanonicalRangeAccessError),
 }
 
 impl Display for FramebufferError {
@@ -977,9 +970,6 @@ impl Display for FramebufferError {
             }
             Self::Backend(reason) => write!(formatter, "GPU presentation export failed: {reason}"),
             Self::NvMap(error) => write!(formatter, "queued nvmap image access failed: {error}"),
-            Self::Memory(error) => {
-                write!(formatter, "queued image memory observation failed: {error}")
-            }
         }
     }
 }
@@ -1569,19 +1559,23 @@ fn presentable_image_request(
             layer_stride: pixel_size,
         })
     };
-    let backing = object
-        .backing()
-        .ok_or(FramebufferError::Malformed(
-            "queued graphic buffer has no canonical storage",
-        ))?
-        .snapshot_subrange(u64::from(plane.offset), pixel_size)
-        .map_err(|_| FramebufferError::Malformed("queued image plane range is invalid"))?;
+    let inputs = nixe_memory::capture_subrange(
+        object.ranges().ok_or(FramebufferError::Malformed(
+            "queued graphic buffer has no physical storage",
+        ))?,
+        u64::from(plane.offset),
+        pixel_size,
+    )
+    .map_err(|_| FramebufferError::Malformed("queued image plane range is invalid"))?;
+    let physical = nixe_gpu::physical::PhysicalMapping::new(&inputs).map_err(|_| {
+        FramebufferError::Malformed("queued image plane has invalid physical mapping")
+    })?;
     let allocation = GpuAllocationDescription::new(
         u64::from(object.size()),
         u64::from(
             object
                 .allocation_metadata()
-                .expect("a canonically backed nvmap object has allocation metadata")
+                .expect("a physically backed nvmap object has allocation metadata")
                 .alignment(),
         ),
     )
@@ -1590,11 +1584,9 @@ fn presentable_image_request(
         GpuAllocationId::new(object.id().raw()),
         allocation,
         u64::from(plane.offset),
-        backing,
+        physical,
     )
     .map_err(|_| FramebufferError::Malformed("queued presentation view is invalid"))?;
-    let cpu_writes =
-        CanonicalCpuWriteDependency::capture(backing.range()).map_err(FramebufferError::Memory)?;
     Ok(PresentationImageRequest {
         allow_canonical_import,
         backing,
@@ -1603,7 +1595,7 @@ fn presentable_image_request(
         format,
         layout,
         row_pitch: plane.pitch,
-        cpu_writes,
+        inputs,
     })
 }
 
@@ -1689,19 +1681,22 @@ pub(crate) fn encode_native_window(binder_id: i32) -> [u8; 0x3c] {
 
 #[cfg(test)]
 mod tests {
-    use nixe_cpu::memory::{ExecutionMemory, MemoryMappingPurpose, ProcessMemory};
     use nixe_gpu::{
         BackendExecutionCompletion, BackendInstanceId, BackendRuntimeError, BackendSubmissionToken,
         ImageDescription, ImageDimension, ImageExtent, ImageFormat, ImageKind, SampleCount,
     };
-    use nixe_memory::{AddressSpaceId, GuestVirtualAddress, MemoryPermissions};
+    use nixe_memory::{AddressWidth, GuestVirtualAddress, Machine, MemoryPermissions};
+    use nixe_runtime::{
+        ProcessVirtualRegion,
+        memory::{Mapping, MemoryKind, ProcessMemory},
+    };
     use nixe_video::FrameNotifier;
 
     use super::*;
 
     #[test]
     fn display_deadline_advances_without_input_samples() {
-        let video = VideoSystem::default();
+        let video = VideoSystem::new(Machine::new(64 * 1024 * 1024).unwrap());
         let first = video.next_display_deadline();
         assert!(first > Duration::ZERO);
         assert_eq!(video.advance(first - Duration::from_nanos(1)).unwrap(), 0);
@@ -1737,7 +1732,8 @@ mod tests {
     }
 
     fn video_with_rgba_nvmap() -> (VideoSystem, i32, GraphicBuffer) {
-        configure_rgba_nvmap(VideoSystem::default())
+        let machine = Machine::new(64 * 1024 * 1024).unwrap();
+        configure_rgba_nvmap(VideoSystem::new(machine.clone()), machine)
     }
 
     fn rgb565_block_buffer(nvmap_id: u32) -> GraphicBuffer {
@@ -1766,20 +1762,37 @@ mod tests {
         }
     }
 
-    fn configure_rgba_nvmap(video: VideoSystem) -> (VideoSystem, i32, GraphicBuffer) {
+    fn configure_rgba_nvmap(
+        video: VideoSystem,
+        machine: Machine,
+    ) -> (VideoSystem, i32, GraphicBuffer) {
         let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
         let nvdrv = video.nvdrv();
-        let memory = ExecutionMemory::new();
-        let address_space = AddressSpaceId::new(44);
+        let account = machine.account(64 * 1024 * 1024).unwrap();
+        let allocation = account.allocate(0x1000).unwrap();
+        let memory = ProcessMemory::new(
+            account,
+            machine.account(64 * 1024 * 1024).unwrap(),
+            AddressWidth::Bits32,
+            ProcessVirtualRegion::new(GuestVirtualAddress::new(0x1000000), 0x400000),
+            0,
+        )
+        .unwrap();
+        let address_space = memory.space().identity();
         let address = GuestVirtualAddress::new(0x4000);
         memory
-            .resize_zeroed_mapping(
-                address_space,
+            .map(
                 address,
+                allocation,
                 0,
                 0x1000,
-                MemoryPermissions::READ_WRITE,
-                MemoryMappingPurpose::Normal,
+                Mapping {
+                    kind: MemoryKind::Heap,
+                    permissions: MemoryPermissions::READ_WRITE,
+                    uncached: false,
+                    locked: false,
+                    permission_locked: false,
+                },
             )
             .unwrap();
         nvdrv.initialize(0);
@@ -1845,31 +1858,50 @@ mod tests {
             Ok(None)
         }
 
-        fn wait_for_completion(
+        fn access_memory(
             &mut self,
-        ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
-            Ok(None)
+            _: Vec<nixe_memory::AllocationRange>,
+            _: nixe_memory::AccessOperation,
+        ) -> Result<nixe_memory::AccessResult, BackendRuntimeError> {
+            unreachable!("presentation fixture consumes no guest memory")
         }
-
-        fn wait_for_completion_timeout(
+        fn queue_device_access(
             &mut self,
-            _: Duration,
-        ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
-            Ok(None)
+            _: nixe_memory::DeviceAccessRequest,
+        ) -> Result<(), BackendRuntimeError> {
+            unreachable!("presentation fixture has no device-written memory")
         }
-
-        fn bind_visibility_requester(
+        fn cancel_device_access(
             &mut self,
-            _requester: Arc<dyn nixe_gpu::BackendVisibilityRequester>,
+            _: nixe_memory::AccessRequestId,
+        ) -> Result<(), BackendRuntimeError> {
+            unreachable!("presentation fixture has no pending access")
+        }
+        fn progress_device_accesses(&mut self) -> Result<(), BackendRuntimeError> {
+            Ok(())
+        }
+        fn fail_device_accesses(&mut self, _: Arc<nixe_memory::MemoryError>) {}
+        fn retire_physical_memory(
+            &mut self,
+            _: nixe_memory::MachineId,
+            _: nixe_memory::AllocationId,
+            _: &[nixe_memory::Extent],
         ) -> Result<(), BackendRuntimeError> {
             Ok(())
         }
-
-        fn make_cpu_visible(
+        fn release_guest_memory(
             &mut self,
-            _request: nixe_memory::CpuVisibilityRequest,
-        ) -> Result<Box<[u8]>, BackendRuntimeError> {
-            unreachable!("resident presentation must not request CPU visibility")
+            _: nixe_memory::MachineId,
+            _: nixe_memory::AllocationId,
+        ) -> Result<(), BackendRuntimeError> {
+            Ok(())
+        }
+        fn allocation_pressure(
+            &mut self,
+            _: nixe_memory::MachineId,
+            _: u64,
+        ) -> Result<(), BackendRuntimeError> {
+            Ok(())
         }
 
         fn acquire_presentable_image(
@@ -1930,7 +1962,7 @@ mod tests {
     #[test]
     fn failed_or_lost_resident_image_reply_stops_presentation() {
         for failure in [Some("image preparation failed"), None] {
-            let video = VideoSystem::default();
+            let video = VideoSystem::new(Machine::new(64 * 1024 * 1024).unwrap());
             let (sender, receiver) = std::sync::mpsc::channel();
             video
                 .state
@@ -2052,7 +2084,7 @@ mod tests {
 
     #[test]
     fn layers_have_stable_distinct_binder_objects() {
-        let video = VideoSystem::default();
+        let video = VideoSystem::new(Machine::new(64 * 1024 * 1024).unwrap());
         let first = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
         let second = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
         assert_ne!(first.id, second.id);
@@ -2062,7 +2094,7 @@ mod tests {
 
     #[test]
     fn closing_a_vi_connection_preserves_the_managed_layer_and_shared_session_ownership() {
-        let video = VideoSystem::default();
+        let video = VideoSystem::new(Machine::new(64 * 1024 * 1024).unwrap());
         let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
         let session = ViSession::new(ViObjectKind::ApplicationDisplay, video.clone());
         let cloned = session.clone();
@@ -2082,7 +2114,7 @@ mod tests {
 
     #[test]
     fn layer_geometry_and_binder_references_are_retained() {
-        let video = VideoSystem::default();
+        let video = VideoSystem::new(Machine::new(64 * 1024 * 1024).unwrap());
         let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
 
         assert!(video.set_layer_position(layer.id, 12.5, -4.0));
@@ -2101,7 +2133,7 @@ mod tests {
 
     #[test]
     fn graphics_teardown_releases_layers_queues_and_nvdrv_state() {
-        let video = VideoSystem::default();
+        let video = VideoSystem::new(Machine::new(64 * 1024 * 1024).unwrap());
         let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
         let nvdrv = video.nvdrv();
         nvdrv.initialize(0);
@@ -2288,7 +2320,7 @@ mod tests {
                 status(queue.transact(11, &disconnect(api)).unwrap(), false),
                 0
             );
-            assert_eq!(queue.connected_api, None);
+            assert!((queue.connected_api).is_none());
             assert_eq!(queue.next_acquire_sequence, 0);
             assert!(!queue.blocked_this_advance);
             assert_eq!(
@@ -2302,7 +2334,7 @@ mod tests {
                 status(queue.transact(10, &connect(api)).unwrap(), true),
                 -22
             );
-            assert_eq!(queue.connected_api, None);
+            assert!((queue.connected_api).is_none());
         }
     }
 
@@ -2561,7 +2593,7 @@ mod tests {
 
     #[test]
     fn swap_interval_holds_the_previous_frame_without_throttling_other_producers() {
-        let (video, binder, buffer) = configure_rgba_nvmap(VideoSystem::default());
+        let (video, binder, buffer) = video_with_rgba_nvmap();
         let other = video.create_layer(DEFAULT_DISPLAY_ID).unwrap().binder_id;
         queue_headless_test_frame(&video, binder, &buffer, 0, 2, Box::default());
         queue_headless_test_frame(&video, binder, &buffer, 1, 1, Box::default());
@@ -2586,7 +2618,7 @@ mod tests {
 
     #[test]
     fn zero_swap_interval_does_not_wait_for_refresh_but_keeps_real_acquire_fences() {
-        let (video, binder, buffer) = configure_rgba_nvmap(VideoSystem::default());
+        let (video, binder, buffer) = video_with_rgba_nvmap();
         let syncpoint = GuestSyncpointId::new(11);
         video.nvdrv().install_test_timeline(syncpoint);
         queue_headless_test_frame(
@@ -2615,7 +2647,7 @@ mod tests {
 
     #[test]
     fn a_long_host_pause_does_not_replay_missed_refreshes_as_a_present_burst() {
-        let (video, binder, buffer) = configure_rgba_nvmap(VideoSystem::default());
+        let (video, binder, buffer) = video_with_rgba_nvmap();
         queue_headless_test_frame(&video, binder, &buffer, 0, 3, Box::default());
         queue_headless_test_frame(&video, binder, &buffer, 1, 1, Box::default());
         queue_headless_test_frame(&video, binder, &buffer, 2, 1, Box::default());
@@ -2632,12 +2664,14 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut backend = ResidentTestRuntime::new();
         backend.preparation_gate = Some((entered_tx, release_rx));
+        let machine = Machine::new(64 * 1024 * 1024).unwrap();
         let video = VideoSystem::with_gpu_frontend(
+            machine.clone(),
             Some(mailbox.clone()),
             backend,
             nixe_gpu_maxwell::MaxwellNativeFrontend::new(Default::default()),
         );
-        let (video, binder_id, buffer) = configure_rgba_nvmap(video);
+        let (video, binder_id, buffer) = configure_rgba_nvmap(video, machine);
         let syncpoint = GuestSyncpointId::new(11);
         video.nvdrv().install_test_timeline(syncpoint);
         {

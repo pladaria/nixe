@@ -7,62 +7,72 @@ impl VulkanResidency {
     /// https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdCopyImage.html
     pub(crate) fn resident_frame_source(
         &self,
-        backing: &CanonicalBackingRange,
+        footprint: &Arc<Footprint>,
         description: NativeImageDescription,
         planes: &[ImagePlane],
     ) -> Option<ImageId> {
-        // Only the first physical byte selects the overlap bucket. Expanding
-        // an entire tiled scanout here defeats its compact address mapping.
-        let first_byte = backing.snapshot_subrange(0, 1).ok()?;
-        let first = first_byte.segments().first()?;
-        let page = self.index.pages.get(&first.page())?;
-        page.resources().find_map(|resource| {
-            let Resource::Image(id) = *resource else {
-                return None;
-            };
-            let entry = self.image(id).ok()?;
-            let producer = entry.description;
-            let plane = entry.planes.first()?;
-            let requested = planes[0];
-            let compatible = NativeImageDescription {
-                format: producer.format,
-                usage: producer.usage,
-                flags: producer.flags,
-                extent: producer.extent,
-                ..description
-            };
-            // A taller resident attachment can contain the exact visible scanout
-            // prefix. Verify native geometry and the physical byte projection;
-            // padding is never imported, sampled, or reported initialized.
-            if entry.decoded.is_some()
-                || producer != compatible
-                || producer.extent.width != description.extent.width
-                || producer.extent.height < description.extent.height
-                || entry.planes.len() != 1
-                || plane.offset != 0
-                || requested.offset != 0
-                || plane.row_pitch != requested.row_pitch
-                || plane.bytes_per_block != requested.bytes_per_block
-                || plane.block_extent != requested.block_extent
-                || plane.aspect != requested.aspect
-                || format::copy_block(producer.format, vk::ImageAspectFlags::COLOR)
-                    != format::copy_block(description.format, vk::ImageAspectFlags::COLOR)
-                || self
-                    .require_resident_frame(
-                        id,
-                        [description.extent.width, description.extent.height],
-                    )
-                    .is_err()
-            {
-                return None;
-            }
-            let projection = entry
-                .contents
-                .backing
-                .snapshot_subrange(0, backing.size())
-                .ok()?;
-            same_bytes(&projection, backing).then_some(id)
-        })
+        let mut resolved = None;
+        self.authority
+            .resource_candidates(footprint)
+            .into_iter()
+            .find_map(|resource| {
+                let Resource::Image(id) = resource else {
+                    return None;
+                };
+                let entry = self.image(id).ok()?;
+                let producer = entry.description;
+                let plane = entry.planes.first()?;
+                let requested = planes[0];
+                let compatible = NativeImageDescription {
+                    format: producer.format,
+                    usage: producer.usage,
+                    flags: producer.flags,
+                    extent: producer.extent,
+                    ..description
+                };
+                // A taller resident attachment can contain the exact visible scanout
+                // prefix. Verify native geometry and the physical byte projection;
+                // padding is never imported, sampled, or reported initialized.
+                if entry.decoded.is_some()
+                    || producer != compatible
+                    || producer.extent.width != description.extent.width
+                    || producer.extent.height < description.extent.height
+                    || entry.planes.len() != 1
+                    || plane.offset != 0
+                    || requested.offset != 0
+                    || plane.row_pitch != requested.row_pitch
+                    || plane.bytes_per_block != requested.bytes_per_block
+                    || plane.block_extent != requested.block_extent
+                    || plane.aspect != requested.aspect
+                    || format::copy_block(producer.format, vk::ImageAspectFlags::COLOR)
+                        != format::copy_block(description.format, vk::ImageAspectFlags::COLOR)
+                    || self
+                        .require_resident_frame(
+                            id,
+                            [description.extent.width, description.extent.height],
+                        )
+                        .is_err()
+                {
+                    return None;
+                }
+                if entry.contents.geometry.as_slice() == std::slice::from_ref(footprint) {
+                    return Some(id);
+                }
+                // A taller attachment or another mapping can expose the same
+                // visible bytes. Prove each requested physical byte's current
+                // native source; an overlap candidate alone is insufficient.
+                let parts = resolved
+                    .get_or_insert_with(|| self.authority.resolve_footprint(footprint).ok());
+                parts
+                    .as_ref()?
+                    .iter()
+                    .all(|part| {
+                        part.producer.is_some_and(|source| {
+                            source.resource == Resource::Image(id) && source.native == part.logical
+                        })
+                    })
+                    .then_some(id)
+            })
     }
     pub(crate) fn require_resident_frame(
         &self,
@@ -90,7 +100,12 @@ impl VulkanResidency {
                 .invalid
                 .iter()
                 .any(|&(offset, length)| offset < bytes && length != 0)
-            || (!allow_cpu_refresh && !entry.contents.cpu.remains_current())
+            || entry
+                .contents
+                .device
+                .iter()
+                .any(ResourceObservation::is_invalid)
+            || (!allow_cpu_refresh && entry.contents.cpu.iter().any(Observation::is_invalid))
         {
             return Err(VulkanError::InvalidResource(
                 "opaque framebuffer has no current resident producer; canonical import is forbidden",

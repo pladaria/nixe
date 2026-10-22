@@ -1,17 +1,3 @@
-//! Portable CPU memory contracts and backends.
-//!
-//! Frontends and engines reach the final process address space through these
-//! traits. They never consume loader images or file storage; retained direct
-//! backing addresses remain canonical-memory acceleration facts.
-
-mod common;
+//! Architectural memory values consumed by instruction semantics.
 mod contracts;
-mod execution;
-mod synthetic;
-
 pub use contracts::*;
-pub use execution::{
-    CpuMemoryBackendError, ExecutionMemory, ExecutionMemoryLease, MappingEpoch, NativeAtomicResult,
-    NativeMemoryAccess, NativeMemorySession,
-};
-pub use synthetic::SyntheticMemory;

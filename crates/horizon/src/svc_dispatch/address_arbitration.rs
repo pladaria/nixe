@@ -5,14 +5,21 @@
 //! https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/svc/kern_svc_address_arbiter.cpp
 //! https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/kern_k_address_arbiter.cpp
 
-use super::synchronization::read_process_wide_key_word;
+use super::address_word::{AddressWord, address_word_fault};
 use super::*;
-use nixe_cpu::memory::{MemoryAccessClass, MemoryAlignment, MemoryOrdering};
 use nixe_runtime::AddressWaitResult;
 
 // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/include/mesosphere/kern_k_memory_layout.hpp
 const KERNEL_ADDRESS_START: u64 = 0u64.wrapping_sub(1 << 39);
 const KERNEL_ADDRESS_END: u64 = 0u64.wrapping_sub(0x20_0000);
+
+#[derive(Debug)]
+pub(super) struct AddressWaitCheck {
+    word: AddressWord,
+    kind: u32,
+    value: i32,
+    timeout: i64,
+}
 
 impl HorizonSvcDispatcher {
     pub(super) fn wait_for_address(
@@ -30,12 +37,13 @@ impl HorizonSvcDispatcher {
 
         let thread = context.thread().id();
         let now = self.virtual_time_ns();
-        let waits = context
-            .process_mut()
-            .address_waits_mut()
-            .priority_waits_mut();
-        waits.expire(now);
-        if let Some(completion) = waits.take_result(thread) {
+        let (completion, waiting) = {
+            let mut state = context.process().address_waits().lock();
+            state.expire_address_waits(now);
+            let waits = state.priority_waits_mut();
+            (waits.take_result(thread), waits.contains(thread))
+        };
+        if let Some(completion) = completion {
             self.finish_wait(thread.get(), 0x34);
             result(
                 context,
@@ -46,49 +54,147 @@ impl HorizonSvcDispatcher {
             );
             return resume();
         }
-        if waits.contains(thread) {
-            // A retry is a continuation of the original wait: do not repeat
-            // the comparison or decrement, or restart its deadline.
+        if waiting {
             return ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry);
         }
 
-        let can_wait = if kind == 1 {
-            match decrement_if_less_than(context, address, value) {
-                Ok(can_wait) => can_wait,
-                Err(fault) => return memory_fault(context, 0x34, fault),
-            }
+        let permissions = if kind == 1 {
+            MemoryPermissions::READ_WRITE
         } else {
-            let observed = match read_process_wide_key_word(context, address) {
-                Ok(observed) => observed as i32,
-                Err(fault) => return memory_fault(context, 0x34, fault),
-            };
-            if kind == 0 {
-                observed < value
-            } else {
-                observed == value
-            }
+            MemoryPermissions::READ
         };
-        if !can_wait {
-            result(context, HorizonKernelResult::INVALID_STATE);
-            return resume();
-        }
-        // DecrementAndWaitIfLessThan updates even with a zero timeout.
-        if timeout == 0 {
-            result(context, HorizonKernelResult::TIMED_OUT);
-            return resume();
-        }
+        let word = match AddressWord::capture(context, address, permissions) {
+            Ok(word) => word,
+            Err(error) => return self.fail_address_wait_check(context, std::sync::Arc::new(error)),
+        };
         let deadline = (timeout > 0).then(|| now.saturating_add(timeout as u64));
-        // Routing and applying staged effects run under the coordinator's
-        // exclusive ownership, before another SVC can signal this address.
-        // Registration needs the scheduler's current effective priority.
-        match self.queue_runtime_request(
+        self.suspend_for_runtime_request(
             thread,
-            PendingRuntimeRequest::RegisterAddressWait { address, deadline },
+            PendingRuntimeRequest::RegisterAddressWait {
+                address,
+                deadline,
+                check: AddressWaitCheck {
+                    word,
+                    kind,
+                    value,
+                    timeout,
+                },
+                source: context.source(),
+                vcpu: context.thread().vcpu(),
+            },
             "WaitForAddress",
-        ) {
-            Ok(()) => ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry),
-            Err(fault) => ExceptionDispatchOutcome::Fault(fault),
-        }
+        )
+    }
+
+    pub(super) fn start_address_wait_check(
+        &mut self,
+        context: &mut ExceptionDispatchContext<'_>,
+        address: u64,
+        check: AddressWaitCheck,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        let thread = context.thread().id();
+        let waits = context.process().address_waits().clone();
+        let clock = self.virtual_clock.clone();
+        let source = context.source();
+        let vcpu = context.thread().vcpu();
+        let deadline = self
+            .pending_wakes
+            .get(&thread.get())
+            .and_then(|wait| wait.deadline);
+        let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
+        let running = lifetime.clone();
+        self.start_owned_svc(context, lifetime, deadline, async move {
+            let turn = waits.address_operation(address, thread, &clock).await;
+            running
+                .begin()
+                .map_err(|_| runtime_fault("WaitForAddress cancelled before its word operation"))?;
+            let compared: Result<bool, std::sync::Arc<nixe_memory::MemoryError>> = async {
+                let mut observed = check.word.read_owned().await?;
+                loop {
+                    let matches = if check.kind == 2 {
+                        observed as i32 == check.value
+                    } else {
+                        (observed as i32) < check.value
+                    };
+                    if !matches {
+                        return Ok(false);
+                    }
+                    if check.kind != 1 {
+                        return Ok(true);
+                    }
+                    let (previous, written) = check
+                        .word
+                        .compare_exchange_owned(observed, observed.wrapping_sub(1))
+                        .await?;
+                    if written {
+                        return Ok(true);
+                    }
+                    observed = previous;
+                }
+            }
+            .await;
+            let now = clock.scheduler_time_ns();
+            let code = {
+                let mut state = waits.lock();
+                let queue = state.priority_waits_mut();
+                match compared {
+                    Ok(true) => {
+                        queue.finish_check(thread, now, check.timeout == 0);
+                        queue
+                            .take_result(thread)
+                            .map(|completion| match completion {
+                                AddressWaitResult::Signalled => HorizonKernelResult::SUCCESS,
+                                AddressWaitResult::TimedOut => HorizonKernelResult::TIMED_OUT,
+                            })
+                    }
+                    Ok(false) => {
+                        queue.remove(thread);
+                        Some(HorizonKernelResult::INVALID_STATE)
+                    }
+                    Err(error) => {
+                        queue.remove(thread);
+                        if error.is_access_fault() {
+                            Some(HorizonKernelResult::INVALID_CURRENT_MEMORY)
+                        } else {
+                            return Err(HorizonSvcFault::MemoryAccess {
+                                immediate: 0x34,
+                                fault: error,
+                            });
+                        }
+                    }
+                }
+            };
+            drop(turn);
+            Ok(super::memory_wait::SvcCompletion::kernel(
+                source,
+                vcpu,
+                move |dispatcher, context| {
+                    if let Some(code) = code {
+                        dispatcher.finish_wait(thread.get(), 0x34);
+                        result(context, code);
+                        resume()
+                    } else {
+                        ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
+                    }
+                },
+            ))
+        })
+    }
+
+    fn fail_address_wait_check(
+        &mut self,
+        context: &mut ExceptionDispatchContext<'_>,
+        error: std::sync::Arc<nixe_memory::MemoryError>,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        let thread = context.thread().id();
+        context
+            .process()
+            .address_waits()
+            .lock()
+            .priority_waits_mut()
+            .remove(thread);
+        self.finish_wait(thread.get(), 0x34);
+        address_word_fault(context, 0x34, error)
     }
 
     pub(super) fn signal_to_address(
@@ -103,53 +209,88 @@ impl HorizonSvcDispatcher {
             result(context, code);
             return resume();
         }
-        let now = self.virtual_time_ns();
-        let waits = context
-            .process_mut()
-            .address_waits_mut()
-            .priority_waits_mut();
-        waits.expire(now);
-        let waiting = if kind == 2 {
-            waits.waiting_count(address)
+        let word = if kind == 0 {
+            None
         } else {
-            0
-        };
-        if kind != 0 {
-            let replacement = if kind == 1 || waiting == 0 {
-                value.wrapping_add(1)
-            } else if count <= 0 || waiting <= count as usize {
-                value.wrapping_sub(1)
-            } else {
-                value
-            };
-            let equal = if replacement == value {
-                match read_process_wide_key_word(context, address) {
-                    Ok(observed) => observed as i32 == value,
-                    Err(fault) => return memory_fault(context, 0x35, fault),
-                }
-            } else {
-                match compare_exchange(context, address, value as u32, replacement as u32) {
-                    Ok(observed) => observed == value as u32,
-                    Err(fault) => return memory_fault(context, 0x35, fault),
-                }
-            };
-            if !equal {
-                result(context, HorizonKernelResult::INVALID_STATE);
-                return resume();
+            match AddressWord::capture(context, address, MemoryPermissions::READ) {
+                Ok(word) => Some(word),
+                Err(error) => return address_word_fault(context, 0x35, std::sync::Arc::new(error)),
             }
-        }
-        let count = if count <= 0 {
-            usize::MAX
-        } else {
-            count as usize
         };
-        context
-            .process_mut()
-            .address_waits_mut()
-            .priority_waits_mut()
-            .signal(address, count);
-        result(context, HorizonKernelResult::SUCCESS);
-        resume()
+        let waits = context.process().address_waits().clone();
+        let clock = self.virtual_clock.clone();
+        let thread = context.thread().id();
+        let source = context.source();
+        let vcpu = context.thread().vcpu();
+        let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
+        let running = lifetime.clone();
+        self.start_owned_svc(context, lifetime, None, async move {
+            let turn = waits.address_operation(address, thread, &clock).await;
+            running.begin().map_err(|_| {
+                runtime_fault("SignalToAddress cancelled before its word operation")
+            })?;
+            let limit = if count <= 0 {
+                usize::MAX
+            } else {
+                count as usize
+            };
+            let (targets, more) = waits.lock().priority_waits().signal_targets(address, limit);
+            let replacement = signal_replacement(kind, value, count, targets.is_empty(), more);
+            let equal = if let Some(word) = word {
+                if replacement == value {
+                    word.read_owned()
+                        .await
+                        .map(|observed| observed == value as u32)
+                } else {
+                    word.compare_exchange_owned(value as u32, replacement as u32)
+                        .await
+                        .map(|(_, written)| written)
+                }
+            } else {
+                Ok(true)
+            };
+            let code = match equal {
+                Ok(true) => {
+                    waits.lock().priority_waits_mut().complete_signal(&targets);
+                    HorizonKernelResult::SUCCESS
+                }
+                Ok(false) => HorizonKernelResult::INVALID_STATE,
+                Err(error) if error.is_access_fault() => {
+                    HorizonKernelResult::INVALID_CURRENT_MEMORY
+                }
+                Err(fault) => {
+                    return Err(HorizonSvcFault::MemoryAccess {
+                        immediate: 0x35,
+                        fault,
+                    });
+                }
+            };
+            drop(turn);
+            Ok(super::memory_wait::SvcCompletion::kernel(
+                source,
+                vcpu,
+                move |_, context| {
+                    result(context, code);
+                    resume()
+                },
+            ))
+        })
+    }
+}
+
+// The unbounded-count case uses a distinct decrement from the bounded case.
+// https://github.com/eden-emulator/mirror/blob/master/src/core/hle/kernel/k_address_arbiter.cpp
+fn signal_replacement(kind: u32, value: i32, count: i32, empty: bool, more: bool) -> i32 {
+    if kind == 0 {
+        value
+    } else if kind == 1 || empty {
+        value.wrapping_add(1)
+    } else if count <= 0 {
+        value.wrapping_sub(2)
+    } else if !more {
+        value.wrapping_sub(1)
+    } else {
+        value
     }
 }
 
@@ -165,96 +306,27 @@ fn validate_address(address: u64, kind: u32) -> Option<HorizonKernelResult> {
     }
 }
 
-fn decrement_if_less_than(
-    context: &ExceptionDispatchContext<'_>,
-    address: u64,
-    value: i32,
-) -> Result<bool, DataAccessFault> {
-    // Horizon's CanAccessAtomic validates writable, normal memory even when
-    // the comparison fails. Consume that requirement without a dummy write.
-    // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/include/mesosphere/arch/arm64/kern_cpu.hpp
-    let process = context.process();
-    let (region, mapping) = process
-        .memory()
-        .query_page(
-            process.cpu().address_space_id(),
-            GuestVirtualAddress::new(address),
-        )
-        .ok_or_else(|| {
-            DataAccessFault::new(
-                process.cpu().address_space_id(),
-                GuestVirtualAddress::new(address),
-                nixe_cpu::memory::DataAccessKind::Write,
-                DataAccessFaultReason::Unmapped,
-            )
-        })?;
-    if region != MemoryRegionKind::Ram
-        || !mapping.permissions.contains(MemoryPermissions::READ_WRITE)
-    {
-        return Err(DataAccessFault::new(
-            process.cpu().address_space_id(),
-            GuestVirtualAddress::new(address),
-            nixe_cpu::memory::DataAccessKind::Write,
-            DataAccessFaultReason::AtomicRegionUnsupported,
-        ));
-    }
-    let mut observed = read_process_wide_key_word(context, address)?;
-    loop {
-        if observed as i32 >= value {
-            return Ok(false);
+#[cfg(test)]
+mod tests {
+    use super::signal_replacement;
+    #[test]
+    fn conditional_signal_updates_match_bounded_and_unbounded_wait_counts() {
+        for (kind, count, empty, more, expected) in [
+            (0, 0, false, false, 9),
+            (1, 1, false, false, 10),
+            (2, 0, true, false, 10),
+            (2, -1, false, false, 7),
+            (2, 0, false, false, 7),
+            (2, 1, false, false, 8),
+            (2, 1, false, true, 9),
+            (2, 4, false, false, 8),
+        ] {
+            assert_eq!(signal_replacement(kind, 9, count, empty, more), expected);
         }
-        let previous = compare_exchange(context, address, observed, observed.wrapping_sub(1))?;
-        if previous == observed {
-            return Ok(true);
-        }
-        observed = previous;
-    }
-}
-
-pub(super) fn compare_exchange(
-    context: &ExceptionDispatchContext<'_>,
-    address: u64,
-    expected: u32,
-    replacement: u32,
-) -> Result<u32, DataAccessFault> {
-    let access = MemoryAccess::new(
-        MemoryAccessSize::Word,
-        MemoryAlignment::Natural,
-        MemoryOrdering::AcquireRelease,
-        MemoryAccessClass::Atomic,
-    );
-    context
-        .process()
-        .memory()
-        .atomic_compare_exchange(
-            context.process().cpu().address_space_id(),
-            GuestVirtualAddress::new(address),
-            access,
-            MemoryValue::U32(expected),
-            MemoryValue::U32(replacement),
-        )
-        .map(|result| match result.previous {
-            MemoryValue::U32(value) => value,
-            _ => unreachable!("word compare-exchange returns a word"),
-        })
-}
-
-fn memory_fault(
-    context: &mut ExceptionDispatchContext<'_>,
-    immediate: u32,
-    fault: DataAccessFault,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    if matches!(
-        fault.reason,
-        DataAccessFaultReason::Unmapped
-            | DataAccessFaultReason::ReadPermissionDenied
-            | DataAccessFaultReason::WritePermissionDenied
-            | DataAccessFaultReason::AddressOverflow
-            | DataAccessFaultReason::AtomicRegionUnsupported
-    ) {
-        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-        resume()
-    } else {
-        ExceptionDispatchOutcome::Fault(HorizonSvcFault::GuestMemory { immediate, fault })
+        assert_eq!(signal_replacement(1, i32::MAX, 1, false, false), i32::MIN);
+        assert_eq!(
+            signal_replacement(2, i32::MIN, 0, false, false),
+            i32::MAX - 1
+        );
     }
 }

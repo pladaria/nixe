@@ -39,6 +39,7 @@ struct SessionRequest {
     id: u64,
     owner: SessionRequestOwner,
     message: SessionMessage,
+    cancelled: bool,
 }
 
 /// Process/thread identity of one synchronous session request owner.
@@ -84,10 +85,16 @@ impl Drop for SessionEndpointLease {
             SessionEndpoint::Server => state.server_open = false,
             SessionEndpoint::Client => state.client_open = false,
         }
-        state.queued.clear();
-        state.current = None;
-        state.responses.clear();
+        let requests = (
+            std::mem::take(&mut state.queued),
+            state.current.take(),
+            std::mem::take(&mut state.responses),
+        );
         state.pending_by_owner.clear();
+        drop(state);
+        // Transported handles may finalize shared/transfer memory or another
+        // session. Finalizers never run under the session state lock.
+        drop(requests);
         self.identity
             .wake_generation
             .fetch_add(1, Ordering::Release);
@@ -242,9 +249,12 @@ impl SessionObject {
         let id = state.next_request_id;
         state.next_request_id = state.next_request_id.saturating_add(1);
         state.pending_by_owner.insert(owner, id);
-        state
-            .queued
-            .push_back(SessionRequest { id, owner, message });
+        state.queued.push_back(SessionRequest {
+            id,
+            owner,
+            message,
+            cancelled: false,
+        });
         drop(state);
         self.identity
             .wake_generation
@@ -267,7 +277,11 @@ impl SessionObject {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(request_id) = state.pending_by_owner.get(&owner).copied() else {
-            return Ok(None);
+            return if state.server_open {
+                Ok(None)
+            } else {
+                Err(SessionError::PeerClosed)
+            };
         };
         if let Some(response) = state.responses.remove(&request_id) {
             state.pending_by_owner.remove(&owner);
@@ -288,6 +302,38 @@ impl SessionObject {
             return Err(SessionError::PeerClosed);
         }
         Ok(Some(SessionRequestResult::Waiting))
+    }
+
+    /// Cancels one client's accepted request. A server-owned current request
+    /// remains current until its reply acknowledges cancellation; it cannot be
+    /// confused with the next request from another client thread.
+    pub fn cancel_request(&self, owner: SessionRequestOwner) -> Result<bool, SessionError> {
+        if self.endpoint != SessionEndpoint::Client {
+            return Err(SessionError::WrongEndpoint);
+        }
+        let (queued, response) = {
+            let mut state = self
+                .identity
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(id) = state.pending_by_owner.remove(&owner) else {
+                return Ok(false);
+            };
+            let index = state.queued.iter().position(|request| request.id == id);
+            let queued = index.and_then(|index| state.queued.remove(index));
+            if let Some(current) = state.current.as_mut().filter(|request| request.id == id) {
+                current.cancelled = true;
+            }
+            (queued, state.responses.remove(&id))
+        };
+        drop(queued);
+        drop(response);
+        self.identity
+            .wake_generation
+            .fetch_add(1, Ordering::Release);
+        self.identity.wake_event.signal();
+        Ok(true)
     }
 
     pub fn receive(&self) -> Result<SessionMessage, SessionError> {
@@ -335,6 +381,15 @@ impl SessionObject {
             return Err(SessionError::PeerClosed);
         }
         let request = state.current.take().ok_or(SessionError::NoRequest)?;
+        if request.cancelled {
+            drop(state);
+            drop(request);
+            self.identity
+                .wake_generation
+                .fetch_add(1, Ordering::Release);
+            self.identity.wake_event.signal();
+            return Err(SessionError::PeerClosed);
+        }
         debug_assert_eq!(
             state.pending_by_owner.get(&request.owner),
             Some(&request.id)
@@ -363,5 +418,78 @@ impl Drop for SessionIdentity {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             port.active_sessions = port.active_sessions.saturating_sub(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    fn owner(thread_id: u64) -> SessionRequestOwner {
+        SessionRequestOwner {
+            process_id: 1,
+            thread_id,
+        }
+    }
+
+    #[test]
+    fn cancelling_a_current_request_preserves_server_reply_ownership() {
+        let (server, client) = SessionObject::create_pair();
+        client
+            .request(owner(1), SessionMessage::Buffer(vec![1]))
+            .unwrap();
+        assert_eq!(server.receive().unwrap(), SessionMessage::Buffer(vec![1]));
+        assert!(client.cancel_request(owner(1)).unwrap());
+        client
+            .request(owner(2), SessionMessage::Buffer(vec![2]))
+            .unwrap();
+        assert_eq!(server.receive(), Err(SessionError::ReplyPending));
+        assert_eq!(
+            server.reply(SessionMessage::Buffer(vec![3])),
+            Err(SessionError::PeerClosed)
+        );
+        assert_eq!(server.receive().unwrap(), SessionMessage::Buffer(vec![2]));
+        server.reply(SessionMessage::Buffer(vec![4])).unwrap();
+        assert_eq!(client.poll_request(owner(1)).unwrap(), None);
+        assert_eq!(
+            client.poll_request(owner(2)).unwrap(),
+            Some(SessionRequestResult::Response(SessionMessage::Buffer(
+                vec![4]
+            )))
+        );
+    }
+
+    #[derive(Debug)]
+    struct Finalizer {
+        session: SessionObject,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Drop for Finalizer {
+        fn drop(&mut self) {
+            let _signalled = self.session.is_signalled();
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[test]
+    fn cancelling_a_queued_request_destroys_transferred_objects_outside_the_session_lock() {
+        let (server, client) = SessionObject::create_pair();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let object = HandleObject::new(Finalizer {
+            session: client.clone(),
+            calls: calls.clone(),
+        });
+        client
+            .request(
+                owner(1),
+                SessionMessage::TransportedBuffer {
+                    bytes: vec![],
+                    copy_handles: vec![Some(object)],
+                    move_handles: vec![],
+                },
+            )
+            .unwrap();
+        assert!(client.cancel_request(owner(1)).unwrap());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(server.receive(), Err(SessionError::NoRequest));
+        assert!(!client.cancel_request(owner(1)).unwrap());
     }
 }

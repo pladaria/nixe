@@ -450,7 +450,6 @@ impl VulkanResidency {
         &mut self,
         program: &PreparedProgram,
         vertices: &[VertexBuffer],
-        inputs: Option<&buffer::DrawInputBatch>,
     ) -> Result<GraphicsStreams, VulkanError> {
         let mut requests = program
             .uses
@@ -479,7 +478,7 @@ impl VulkanResidency {
                 alignment: 4,
             })
         }));
-        let mut streams = self.stream_buffers_with_inputs(&requests, inputs)?;
+        let mut streams = self.stream_buffers(&requests)?;
         let vertices = streams.split_off(program.uses.len());
         let program_mask = streams.iter().map(Option::is_some).collect();
         if streams.iter().all(Option::is_none) {
@@ -546,14 +545,18 @@ impl VulkanResidency {
             vertices,
         })
     }
-    pub(super) fn program_access(&mut self, program: &PreparedProgram) -> Result<(), VulkanError> {
+    pub(super) fn program_access(
+        &mut self,
+        program: &PreparedProgram,
+    ) -> Result<smallvec::SmallVec<[WriterId; 16]>, VulkanError> {
         self.program_access_except(program, &[])
     }
     fn program_access_except(
         &mut self,
         program: &PreparedProgram,
         streamed: &[bool],
-    ) -> Result<(), VulkanError> {
+    ) -> Result<smallvec::SmallVec<[WriterId; 16]>, VulkanError> {
+        let mut writers = smallvec::SmallVec::new();
         for (index, &resource) in program.uses.iter().enumerate() {
             if streamed.get(index).copied().unwrap_or(false) {
                 continue;
@@ -569,14 +572,24 @@ impl VulkanResidency {
                     // Preserve bytes not actually written by a conditional shader
                     // store, even in a descriptor classified as write-only.
                     if scope.writes() {
-                        self.prepare_write(Resource::Buffer(id), offset, size)?;
+                        writers.push(self.prepare_write(Resource::Buffer(id), offset, size)?);
                     }
                     self.buffer_access_range(id, offset, size, scope)?;
                 }
                 Use::Image { id, plane, scope } => {
-                    self.ensure_image_initialized(id, plane, transfers::full_rect(plane))?;
+                    // A sampled view can include an unwritten native border.
+                    // Refresh actual producers without claiming that every texel
+                    // in the view was consumed or importing undefined padding.
+                    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
                     if scope.writes() {
-                        self.prepare_image_rect(id, plane, transfers::full_rect(plane))?;
+                        self.ensure_image_initialized(id, plane, transfers::full_rect(plane))?;
+                        writers.push(self.prepare_image_rect(
+                            id,
+                            plane,
+                            transfers::full_rect(plane),
+                        )?);
+                    } else {
+                        self.ensure_image(id)?;
                     }
                     self.image_access_subresources(
                         id,
@@ -587,7 +600,7 @@ impl VulkanResidency {
                 }
             }
         }
-        Ok(())
+        Ok(writers)
     }
     pub(super) fn program_written(&mut self, program: &PreparedProgram) -> Result<(), VulkanError> {
         for &resource in &program.uses {
@@ -597,7 +610,7 @@ impl VulkanResidency {
                     offset,
                     size,
                     scope,
-                } if scope.writes() => self.record_authority(Resource::Buffer(id), offset, size)?,
+                } if scope.writes() => self.finish_buffer_write(id, offset, size)?,
                 Use::Image { id, plane, scope } if scope.writes() => {
                     self.finish_image_rect(id, plane, transfers::full_rect(plane))?
                 }
@@ -737,7 +750,7 @@ impl VulkanResidency {
                 return self.device.work_ticket();
             }
         }
-        self.program_access(program)?;
+        let writers = self.program_access(program)?;
         let indirect = match dispatch {
             Dispatch::Indirect { buffer, offset } => {
                 Some(self.indirect_buffer(buffer, offset, 12)?)
@@ -746,16 +759,16 @@ impl VulkanResidency {
         };
         self.barriers.emit(&mut self.device);
         let command = self.program_bind(program, push)?;
-        unsafe {
+        self.publish_effect(&writers, |device| unsafe {
             match dispatch {
-                Dispatch::Direct([x, y, z]) => self.device.dispatch.cmd_dispatch(command, x, y, z),
+                Dispatch::Direct([x, y, z]) => device.dispatch.cmd_dispatch(command, x, y, z),
                 Dispatch::Indirect { offset, .. } => {
-                    self.device
+                    device
                         .dispatch
                         .cmd_dispatch_indirect(command, indirect.unwrap(), offset)
                 }
             }
-        }
+        })?;
         self.program_written(program)?;
         self.device.work_ticket()
     }

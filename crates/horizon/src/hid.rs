@@ -1,12 +1,16 @@
-use std::collections::BTreeSet;
-use std::sync::{Mutex, OnceLock};
+use std::collections::{BTreeSet, VecDeque};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
-use nixe_cpu::memory::ExecutionMemory;
 use nixe_input::{EmulatedControllerState, EmulatedTouchScreenState};
+use nixe_memory::{
+    Access, AccessResult, MemoryAccount, MemoryError, MemoryPermissions, PendingAccess,
+};
 use nixe_runtime::{
-    EventObject, ExternalEventSource, HandleError, ReadableEventObject, SharedMemoryObject,
-    WritableEventObject,
+    EventObject, ExternalEventSource, ReadableEventObject, SharedMemoryObject, WritableEventObject,
 };
 
 const HID_SHARED_MEMORY_SIZE: usize = 0x40000;
@@ -61,12 +65,36 @@ pub(crate) fn vibration_device_position(handle: u32) -> Option<u32> {
     Some(u32::from(device_index) + 1)
 }
 
-/// Host-controlled producer for Horizon's HID shared memory.
-#[derive(Debug)]
+/// System-owned controller state. Clones share configuration and one producer.
+#[derive(Clone, Debug)]
 pub struct HidSystem {
-    shared_memory: OnceLock<SharedMemoryObject>,
-    infrared: OnceLock<crate::object::IrsSession>,
+    state: Arc<HidState>,
+    producer: Arc<Mutex<HidProducer>>,
+}
+
+#[derive(Debug)]
+struct HidState {
+    shared_memory: SharedMemoryObject,
+    infrared: crate::object::IrsSession,
     style_events: [OnceLock<(WritableEventObject, ReadableEventObject)>; 10],
+    connected: AtomicBool,
+    configuration: Mutex<HidConfiguration>,
+    vibration_output: Mutex<Option<nixe_input::VibrationOutput>>,
+    completion_events: Mutex<Option<nixe_runtime::ExternalEventSender>>,
+}
+
+impl Drop for HidState {
+    fn drop(&mut self) {
+        if let Some(output) = self.vibration_output.get_mut().unwrap()
+            && let Err(error) = output.stop()
+        {
+            log::error!("cannot stop Horizon HID vibration: {error}");
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HidProducer {
     sampling_number: u64,
     touch_screen_sampling_number: u64,
     touch_screen: Lifo,
@@ -78,44 +106,92 @@ pub struct HidSystem {
     home: Lifo,
     capture: Lifo,
     connected: bool,
-    configuration: Mutex<HidConfiguration>,
-    vibration_output: Option<nixe_input::VibrationOutput>,
+    publication: Publication,
+    latest_controller: Option<(Option<EmulatedControllerState>, Duration)>,
+    latest_touch: Option<(EmulatedTouchScreenState, Duration)>,
 }
 
-impl Drop for HidSystem {
-    fn drop(&mut self) {
-        if let Some(output) = &self.vibration_output
-            && let Err(error) = output.stop()
-        {
-            log::error!("cannot stop Horizon HID vibration: {error}");
+#[derive(Debug, Default)]
+struct Publication {
+    writes: VecDeque<(usize, Box<[u8]>, bool)>,
+    pending: Option<PendingAccess>,
+    connected: Option<bool>,
+    signal_style: bool,
+}
+impl Publication {
+    fn write(&mut self, offset: usize, bytes: &[u8]) {
+        self.writes.push_back((offset, bytes.into(), false));
+    }
+    fn write_u8(&mut self, offset: usize, value: u8) {
+        self.write(offset, &[value]);
+    }
+    fn write_u32(&mut self, offset: usize, value: u32) {
+        self.write(offset, &value.to_le_bytes());
+    }
+    fn write_u64(&mut self, offset: usize, value: u64) {
+        self.write(offset, &value.to_le_bytes());
+    }
+
+    // Entry writes precede their headers even when a device owns the bytes.
+    // Only one batch is in flight; newer host input is coalesced before any
+    // sampling number or LIFO position advances.
+    fn poll(&mut self, state: &HidState) -> Result<bool, HidInputError> {
+        if let Some(pending) = &mut self.pending {
+            match pending.poll() {
+                None => return Ok(false),
+                Some(Err(error)) => return Err(HidInputError::Memory(error)),
+                Some(Ok(AccessResult::Written)) => self.pending = None,
+                Some(Ok(_)) => {
+                    return Err(HidInputError::Memory(Arc::new(MemoryError::Execution(
+                        "invalid HID write completion".into(),
+                    ))));
+                }
+            }
         }
+        while let Some((offset, bytes, release)) = self.writes.pop_front() {
+            if release {
+                std::sync::atomic::fence(Ordering::Release);
+            }
+            match state
+                .shared_memory
+                .write(offset, &bytes)
+                .map_err(|e| HidInputError::Memory(Arc::new(e)))?
+            {
+                Access::Ready(()) => {}
+                Access::Pending(mut access) => {
+                    let events = state.completion_events.lock().unwrap().clone();
+                    access.set_waker(Arc::new(move || {
+                        if let Some(events) = &events {
+                            events.notify_host_service(ExternalEventSource::Input);
+                        }
+                    }));
+                    self.pending = Some(access);
+                    return Ok(false);
+                }
+            }
+        }
+        if let Some(connected) = self.connected.take() {
+            state.connected.store(connected, Ordering::Release);
+        }
+        Ok(true)
     }
 }
 
-#[derive(Debug)]
 /// Failures from HID shared-memory publication or host actuator output.
+#[derive(Debug)]
 pub enum HidInputError {
-    SharedMemory(HandleError),
+    Memory(Arc<MemoryError>),
     Vibration(nixe_input::VibrationError),
 }
-
 impl std::fmt::Display for HidInputError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SharedMemory(error) => error.fmt(f),
+            Self::Memory(error) => error.fmt(f),
             Self::Vibration(error) => error.fmt(f),
         }
     }
 }
-
 impl std::error::Error for HidInputError {}
-
-impl From<HandleError> for HidInputError {
-    fn from(error: HandleError) -> Self {
-        Self::SharedMemory(error)
-    }
-}
-
 impl From<nixe_input::VibrationError> for HidInputError {
     fn from(error: nixe_input::VibrationError) -> Self {
         Self::Vibration(error)
@@ -150,67 +226,70 @@ impl Default for Lifo {
 }
 
 impl Lifo {
-    fn publish(
-        &mut self,
-        memory: &SharedMemoryObject,
-        offset: usize,
-        entry: &[u8],
-    ) -> Result<(), HandleError> {
+    fn publish(&mut self, writes: &mut Publication, offset: usize, entry: &[u8]) {
         self.tail = (self.tail + 1) % LIFO_CAPACITY;
         self.count = (self.count + 1).min(LIFO_CAPACITY);
-        memory.write(offset + 0x20 + self.tail as usize * entry.len(), entry)?;
+        writes.write(offset + 0x20 + self.tail as usize * entry.len(), entry);
         let mut header = [0; 24];
         put_u64(&mut header, 0, LIFO_CAPACITY);
         put_u64(&mut header, 8, self.tail);
         put_u64(&mut header, 16, self.count);
-        memory.write(offset + 8, &header)
-    }
-}
-
-impl Default for HidSystem {
-    fn default() -> Self {
-        Self::new()
+        writes.writes.push_back((offset + 8, header.into(), true));
     }
 }
 
 impl HidSystem {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            shared_memory: OnceLock::new(),
-            infrared: OnceLock::new(),
-            style_events: std::array::from_fn(|_| OnceLock::new()),
-            sampling_number: 0,
-            touch_screen_sampling_number: 0,
-            touch_screen: Lifo::default(),
-            mouse: Lifo::default(),
-            keyboard: Lifo::default(),
-            peripheral_sampling_number: 0,
-            full_key: Lifo::default(),
-            six_axis: Lifo::default(),
-            home: Lifo::default(),
-            capture: Lifo::default(),
-            connected: false,
-            configuration: Mutex::new(HidConfiguration::default()),
-            vibration_output: None,
-        }
+    pub fn new(account: &MemoryAccount) -> Result<Self, Arc<MemoryError>> {
+        let allocation = account
+            .allocate(HID_SHARED_MEMORY_SIZE as u64)
+            .map_err(Arc::new)?;
+        let shared_memory =
+            SharedMemoryObject::new(allocation, HID_SHARED_MEMORY_SIZE, MemoryPermissions::READ)
+                .map_err(|e| Arc::new(MemoryError::Execution(e.to_string().into())))?;
+        let infrared = crate::object::IrsSession::new(account)?;
+        Ok(Self {
+            state: Arc::new(HidState {
+                shared_memory,
+                infrared,
+                style_events: std::array::from_fn(|_| OnceLock::new()),
+                connected: AtomicBool::new(false),
+                configuration: Mutex::new(HidConfiguration::default()),
+                vibration_output: Mutex::new(None),
+                completion_events: Mutex::new(None),
+            }),
+            producer: Arc::new(Mutex::new(HidProducer {
+                sampling_number: 0,
+                touch_screen_sampling_number: 0,
+                touch_screen: Lifo::default(),
+                mouse: Lifo::default(),
+                keyboard: Lifo::default(),
+                peripheral_sampling_number: 0,
+                full_key: Lifo::default(),
+                six_axis: Lifo::default(),
+                home: Lifo::default(),
+                capture: Lifo::default(),
+                connected: false,
+                publication: Publication::default(),
+                latest_controller: None,
+                latest_touch: None,
+            })),
+        })
     }
-
-    pub(crate) fn set_vibration_output(&mut self, output: nixe_input::VibrationOutput) {
-        self.vibration_output = Some(output);
+    pub(crate) fn set_completion_events(&self, events: nixe_runtime::ExternalEventSender) {
+        *self.state.completion_events.lock().unwrap() = Some(events);
     }
-
+    pub(crate) fn set_vibration_output(&self, output: nixe_input::VibrationOutput) {
+        *self.state.vibration_output.lock().unwrap() = Some(output);
+    }
     pub(crate) fn send_vibration_values(
         &self,
         values: &[(u32, nixe_input::VibrationValue)],
     ) -> Option<Result<(), nixe_input::VibrationError>> {
-        let output = self.vibration_output.as_ref()?;
+        let output = self.state.vibration_output.lock().unwrap().clone()?;
         let mut actuators = [None; 2];
-        // Only player one FullKey is currently published by this HID producer.
-        // Valid handles for other Npads address disconnected actuators.
         for &(handle, value) in values {
             let [style, npad_id, device_index, _] = handle.to_le_bytes();
-            if self.connected && style == 3 && npad_id == 0 {
+            if self.state.connected.load(Ordering::Acquire) && style == 3 && npad_id == 0 {
                 actuators[usize::from(device_index)] = Some(value);
             }
         }
@@ -220,47 +299,73 @@ impl HidSystem {
             output.send_values(actuators)
         })
     }
-
-    /// Controller-support applets use the same connection state published to HID.
     pub(crate) fn connected_full_key_id(&self) -> Option<u32> {
-        self.connected.then_some(0)
+        self.state.connected.load(Ordering::Acquire).then_some(0)
+    }
+    pub(crate) fn infrared_session(&self) -> crate::object::IrsSession {
+        self.state.infrared.clone()
+    }
+    pub fn shared_memory(&self) -> SharedMemoryObject {
+        self.state.shared_memory.clone()
     }
 
-    pub(crate) fn infrared_session(
-        &self,
-        memory: &ExecutionMemory,
-    ) -> Result<crate::object::IrsSession, HandleError> {
-        if let Some(session) = self.infrared.get() {
-            return Ok(session.clone());
+    /// Advances already accepted writes without consuming another host sample.
+    pub fn poll_publication(&self) -> Result<(), HidInputError> {
+        let signal = {
+            let mut producer = self.producer.lock().unwrap();
+            let mut signal = false;
+            loop {
+                if !producer.publication.poll(&self.state)? {
+                    break;
+                }
+                signal |= std::mem::take(&mut producer.publication.signal_style);
+                if let Some((sample, delta)) = producer.latest_controller.take() {
+                    let mut publication = Publication::default();
+                    producer.prepare_controller(
+                        &self.state,
+                        &mut publication,
+                        sample.as_ref(),
+                        delta,
+                    )?;
+                    if let Some((touch, delta)) = producer.latest_touch.take() {
+                        producer.prepare_touch(&self.state, &mut publication, &touch, delta);
+                    }
+                    producer.publication = publication;
+                } else if let Some((sample, delta)) = producer.latest_touch.take() {
+                    let mut publication = Publication::default();
+                    producer.prepare_touch(&self.state, &mut publication, &sample, delta);
+                    producer.publication = publication;
+                } else {
+                    break;
+                }
+            }
+            signal
+        };
+        if signal {
+            self.signal_player_one_style_change();
         }
-        let session = crate::object::IrsSession::new(memory)?;
-        let _ = self.infrared.set(session);
-        Ok(self.infrared.get().expect("IRS initialized").clone())
+        Ok(())
     }
-
-    pub fn shared_memory(
+    pub fn publish(
         &self,
-        memory: &ExecutionMemory,
-    ) -> Result<SharedMemoryObject, HandleError> {
-        if let Some(shared) = self.shared_memory.get() {
-            return Ok(shared.clone());
-        }
-        let shared = SharedMemoryObject::for_process(
-            memory,
-            HID_SHARED_MEMORY_SIZE,
-            nixe_cpu::memory::MemoryPermissions::READ,
-        )?;
-        let _ = self.shared_memory.set(shared);
-        Ok(self
-            .shared_memory
-            .get()
-            .expect("HID allocation initialized")
-            .clone())
+        state: Option<&EmulatedControllerState>,
+        delta: Duration,
+    ) -> Result<(), HidInputError> {
+        self.producer.lock().unwrap().latest_controller = Some((state.copied(), delta));
+        self.poll_publication()
+    }
+    pub fn publish_touch_screen(
+        &self,
+        state: &EmulatedTouchScreenState,
+        delta: Duration,
+    ) -> Result<(), HidInputError> {
+        self.producer.lock().unwrap().latest_touch = Some((*state, delta));
+        self.poll_publication()
     }
 
     pub(crate) fn acquire_style_event(&self, id: u32) -> Option<ReadableEventObject> {
         let index = npad_index(id)?;
-        let (writable, readable) = self.style_events[index]
+        let (writable, readable) = self.state.style_events[index]
             .get_or_init(|| EventObject::create_pair_with_source(ExternalEventSource::Input));
         // Acquiring also signals the event so a client can inspect the initial
         // style. Later signals follow publication of a changed style tag.
@@ -270,13 +375,14 @@ impl HidSystem {
     }
 
     fn signal_player_one_style_change(&self) {
-        if let Some((event, _)) = self.style_events[0].get() {
+        if let Some((event, _)) = self.state.style_events[0].get() {
             event.signal();
         }
     }
 
     pub(crate) fn activate_npad(&self) {
         let mut configuration = self
+            .state
             .configuration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -284,35 +390,40 @@ impl HidSystem {
     }
 
     pub(crate) fn activate_touch_screen(&self) {
-        self.configuration
+        self.state
+            .configuration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .touch_screen_active = true;
     }
 
     pub(crate) fn activate_mouse(&self) {
-        self.configuration
+        self.state
+            .configuration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .mouse_active = true;
     }
 
     pub(crate) fn activate_keyboard(&self) {
-        self.configuration
+        self.state
+            .configuration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .keyboard_active = true;
     }
 
     pub(crate) fn set_supported_npad_style_set(&self, style_set: u32) {
-        self.configuration
+        self.state
+            .configuration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .supported_style_set = style_set;
     }
 
     pub(crate) fn supported_npad_style_set(&self) -> u32 {
-        self.configuration
+        self.state
+            .configuration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .supported_style_set
@@ -323,7 +434,8 @@ impl HidSystem {
         if ids.iter().any(|id| !matches!(*id, 0..=7 | 0x10 | 0x20)) {
             return false;
         }
-        self.configuration
+        self.state
+            .configuration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .supported_ids = ids;
@@ -337,7 +449,8 @@ impl HidSystem {
         if !matches!(hold_type, 0 | 1) {
             return false;
         }
-        self.configuration
+        self.state
+            .configuration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .npad_joy_hold_type = hold_type;
@@ -345,29 +458,32 @@ impl HidSystem {
     }
 
     pub(crate) fn npad_joy_hold_type(&self) -> u64 {
-        self.configuration
+        self.state
+            .configuration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .npad_joy_hold_type
     }
 
-    pub(crate) fn set_npad_joy_assignment_mode_dual(&self, id: u32) -> Result<bool, HandleError> {
+    pub(crate) async fn set_npad_joy_assignment_mode_dual(
+        &self,
+        id: u32,
+    ) -> Result<bool, Arc<MemoryError>> {
         let Some(index) = npad_index(id) else {
             return Ok(false);
         };
-        // Assignment controls splitting/joining Joy-Con, not FullKey input.
-        // The supported FullKey producer cannot have a single Joy-Con to
-        // reconnect; publish the requested Dual mode in this Npad's metadata.
-        // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/hid.h
-        self.write_u32(
+        crate::system_memory::write(
+            &self.state.shared_memory,
             NPAD_OFFSET + index * NPAD_ENTRY_SIZE + 4,
-            NPAD_JOY_ASSIGNMENT_DUAL,
-        )?;
+            &NPAD_JOY_ASSIGNMENT_DUAL.to_le_bytes(),
+        )
+        .await?;
         Ok(true)
     }
 
     pub(crate) fn set_six_axis_sensor_active(&self, handle: u32, active: bool) {
         let mut configuration = self
+            .state
             .configuration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -377,21 +493,24 @@ impl HidSystem {
             configuration.active_six_axis_handles.remove(&handle);
         }
     }
+}
 
+impl HidProducer {
     /// Publishes one complete touch-screen sample.
-    pub fn publish_touch_screen(
+    fn prepare_touch(
         &mut self,
+        system: &HidState,
+        writes: &mut Publication,
         state: &EmulatedTouchScreenState,
         delta: Duration,
-    ) -> Result<(), HandleError> {
-        if self.shared_memory.get().is_none()
-            || !self
-                .configuration
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .touch_screen_active
+    ) {
+        if !system
+            .configuration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .touch_screen_active
         {
-            return Ok(());
+            return;
         }
         self.touch_screen_sampling_number = self.touch_screen_sampling_number.saturating_add(1);
         let mut entry = [0_u8; TOUCH_SCREEN_ENTRY_SIZE];
@@ -418,27 +537,23 @@ impl HidSystem {
         // HidTouchScreenStateAtomicStorage is 0x298 bytes and carries up to 16
         // contacts in the public libnx ABI:
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/hid.h#L666-L713
-        self.touch_screen.publish(
-            self.shared_memory.get().expect("HID initialized"),
-            TOUCH_SCREEN_OFFSET,
-            &entry,
-        )
+        self.touch_screen
+            .publish(writes, TOUCH_SCREEN_OFFSET, &entry)
     }
 
     /// Publishes one player-one Pro Controller sample.
     ///
     /// `None` transitions the shared state to a disconnected NPad. Repeated
     /// disconnected updates are ignored.
-    pub fn publish(
+    fn prepare_controller(
         &mut self,
+        system: &HidState,
+        writes: &mut Publication,
         state: Option<&EmulatedControllerState>,
         delta: Duration,
     ) -> Result<(), HidInputError> {
-        if self.shared_memory.get().is_none() {
-            return Ok(());
-        }
         let (publish_player_one, publish_six_axis, mouse_active, keyboard_active) = {
-            let configuration = self
+            let configuration = system
                 .configuration
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -463,33 +578,29 @@ impl HidSystem {
                 let mut entry = [0; MOUSE_ENTRY_SIZE];
                 put_u64(&mut entry, 0, self.peripheral_sampling_number);
                 put_u64(&mut entry, 8, self.peripheral_sampling_number);
-                self.mouse
-                    .publish(self.shared_memory.get().unwrap(), MOUSE_OFFSET, &entry)?;
+                self.mouse.publish(writes, MOUSE_OFFSET, &entry);
             }
             if keyboard_active {
                 let mut entry = [0; KEYBOARD_ENTRY_SIZE];
                 put_u64(&mut entry, 0, self.peripheral_sampling_number);
                 put_u64(&mut entry, 8, self.peripheral_sampling_number);
-                self.keyboard.publish(
-                    self.shared_memory.get().unwrap(),
-                    KEYBOARD_OFFSET,
-                    &entry,
-                )?;
+                self.keyboard.publish(writes, KEYBOARD_OFFSET, &entry);
             }
         }
         let Some(state) = state.filter(|_| publish_player_one) else {
             if self.connected {
-                if let Some(output) = &self.vibration_output {
+                if let Some(output) = system.vibration_output.lock().unwrap().clone() {
                     output.stop()?;
                 }
                 self.sampling_number = self.sampling_number.saturating_add(1);
-                self.memory().write(NPAD_OFFSET, &[0; NPAD_ENTRY_SIZE])?;
+                writes.write(NPAD_OFFSET, &[0; NPAD_ENTRY_SIZE]);
                 self.full_key = Lifo::default();
                 self.six_axis = Lifo::default();
-                self.publish_system_button(HOME_BUTTON_LIFO_OFFSET, false, true)?;
-                self.publish_system_button(CAPTURE_BUTTON_LIFO_OFFSET, false, false)?;
+                self.publish_system_button(writes, HOME_BUTTON_LIFO_OFFSET, false, true);
+                self.publish_system_button(writes, CAPTURE_BUTTON_LIFO_OFFSET, false, false);
                 self.connected = false;
-                self.signal_player_one_style_change();
+                writes.signal_style = true;
+                writes.connected = Some(self.connected);
             }
             return Ok(());
         };
@@ -497,16 +608,16 @@ impl HidSystem {
         self.sampling_number = self.sampling_number.saturating_add(1);
         let style_changed = !self.connected;
         if style_changed {
-            self.write_u32(NPAD_OFFSET, NPAD_STYLE_FULL_KEY)?;
-            self.write_u32(NPAD_OFFSET + 4, NPAD_JOY_ASSIGNMENT_DUAL)?;
-            self.write_u32(NPAD_OFFSET + 8, 0)?;
-            self.write_u32(NPAD_OFFSET + 0x4188, NPAD_DEVICE_TYPE_FULL_KEY)?;
-            self.write_u64(
+            writes.write_u32(NPAD_OFFSET, NPAD_STYLE_FULL_KEY);
+            writes.write_u32(NPAD_OFFSET + 4, NPAD_JOY_ASSIGNMENT_DUAL);
+            writes.write_u32(NPAD_OFFSET + 8, 0);
+            writes.write_u32(NPAD_OFFSET + 0x4188, NPAD_DEVICE_TYPE_FULL_KEY);
+            writes.write_u64(
                 NPAD_OFFSET + 0x4190,
                 1 << 3 | 1 << 11 | 1 << 13 | 1 << 14 | 1 << 15,
-            )?;
-            self.write_u32(NPAD_OFFSET + 0x419c, 4)?;
-            self.write_u8(NPAD_OFFSET + 0x41ac, APPLET_FOOTER_SWITCH_PRO_CONTROLLER)?;
+            );
+            writes.write_u32(NPAD_OFFSET + 0x419c, 4);
+            writes.write_u8(NPAD_OFFSET + 0x41ac, APPLET_FOOTER_SWITCH_PRO_CONTROLLER);
             self.connected = true;
         }
 
@@ -519,11 +630,8 @@ impl HidSystem {
         put_i32(&mut common, 32, i32::from(state.right_stick.x));
         put_i32(&mut common, 36, i32::from(state.right_stick.y));
         put_u32(&mut common, 40, NPAD_ATTRIBUTE_CONNECTED);
-        self.full_key.publish(
-            self.shared_memory.get().expect("HID initialized"),
-            NPAD_OFFSET + FULL_KEY_LIFO_OFFSET,
-            &common,
-        )?;
+        self.full_key
+            .publish(writes, NPAD_OFFSET + FULL_KEY_LIFO_OFFSET, &common);
 
         if publish_six_axis {
             let mut sensor = [0_u8; SIX_AXIS_ENTRY_SIZE];
@@ -560,27 +668,31 @@ impl HidSystem {
                 }
                 put_u32(&mut sensor, 96, SIX_AXIS_ATTRIBUTE_CONNECTED);
             }
-            self.six_axis.publish(
-                self.shared_memory.get().expect("HID initialized"),
-                NPAD_OFFSET + FULL_KEY_SIX_AXIS_LIFO_OFFSET,
-                &sensor,
-            )?;
+            self.six_axis
+                .publish(writes, NPAD_OFFSET + FULL_KEY_SIX_AXIS_LIFO_OFFSET, &sensor);
         }
 
-        self.publish_system_button(HOME_BUTTON_LIFO_OFFSET, state.buttons.home, true)?;
-        self.publish_system_button(CAPTURE_BUTTON_LIFO_OFFSET, state.buttons.capture, false)?;
+        self.publish_system_button(writes, HOME_BUTTON_LIFO_OFFSET, state.buttons.home, true);
+        self.publish_system_button(
+            writes,
+            CAPTURE_BUTTON_LIFO_OFFSET,
+            state.buttons.capture,
+            false,
+        );
         if style_changed {
-            self.signal_player_one_style_change();
+            writes.signal_style = true;
+            writes.connected = Some(self.connected);
         }
         Ok(())
     }
 
     fn publish_system_button(
         &mut self,
+        writes: &mut Publication,
         lifo_offset: usize,
         pressed: bool,
         home: bool,
-    ) -> Result<(), HandleError> {
+    ) {
         let lifo = if home {
             &mut self.home
         } else {
@@ -590,29 +702,7 @@ impl HidSystem {
         put_u64(&mut entry, 0, self.sampling_number);
         put_u64(&mut entry, 8, self.sampling_number);
         put_u64(&mut entry, 16, u64::from(pressed));
-        lifo.publish(
-            self.shared_memory.get().expect("HID initialized"),
-            lifo_offset,
-            &entry,
-        )
-    }
-
-    fn write_u8(&self, offset: usize, value: u8) -> Result<(), HandleError> {
-        self.memory().write(offset, &[value])
-    }
-
-    fn write_u32(&self, offset: usize, value: u32) -> Result<(), HandleError> {
-        self.memory().write(offset, &value.to_le_bytes())
-    }
-
-    fn write_u64(&self, offset: usize, value: u64) -> Result<(), HandleError> {
-        self.memory().write(offset, &value.to_le_bytes())
-    }
-
-    fn memory(&self) -> &SharedMemoryObject {
-        self.shared_memory
-            .get()
-            .expect("HID memory initialized before publication")
+        lifo.publish(writes, lifo_offset, &entry)
     }
 }
 
@@ -676,13 +766,35 @@ mod tests {
 
     use super::*;
 
+    fn hid() -> HidSystem {
+        let machine = nixe_memory::Machine::new(2 * 1024 * 1024).unwrap();
+        HidSystem::new(&machine.account(machine.arena().capacity()).unwrap()).unwrap()
+    }
+    fn read(memory: &SharedMemoryObject, offset: usize, destination: &mut [u8]) {
+        let nixe_memory::Access::Ready(bytes) = memory.read(offset, destination.len()).unwrap()
+        else {
+            panic!("private HID fixture unexpectedly requires device access")
+        };
+        destination.copy_from_slice(&bytes);
+    }
+    fn ready<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let std::task::Poll::Ready(value) = future
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+        else {
+            panic!("private HID fixture unexpectedly parked")
+        };
+        value
+    }
+
     #[test]
     fn peripheral_activation_publishes_idle_samples_only_after_activation() {
-        let mut hid = HidSystem::new();
-        let shared = hid.shared_memory(&ExecutionMemory::new()).unwrap();
+        let hid = hid();
+        let shared = hid.shared_memory();
         hid.publish(None, Duration::ZERO).unwrap();
         let mut before = [0; 0x800];
-        shared.read(MOUSE_OFFSET, &mut before).unwrap();
+        read(&shared, MOUSE_OFFSET, &mut before);
         assert_eq!(before, [0; 0x800]);
         hid.activate_mouse();
         hid.activate_keyboard();
@@ -694,12 +806,12 @@ mod tests {
             (KEYBOARD_OFFSET, KEYBOARD_ENTRY_SIZE),
         ] {
             let mut header = [0; 32];
-            shared.read(offset, &mut header).unwrap();
+            read(&shared, offset, &mut header);
             assert_eq!(u64::from_le_bytes(header[8..16].try_into().unwrap()), 17);
             assert_eq!(u64::from_le_bytes(header[16..24].try_into().unwrap()), 2);
             assert_eq!(u64::from_le_bytes(header[24..32].try_into().unwrap()), 17);
             let mut entry = vec![0; size];
-            shared.read(offset + 32 + 2 * size, &mut entry).unwrap();
+            read(&shared, offset + 32 + 2 * size, &mut entry);
             assert_eq!(u64::from_le_bytes(entry[..8].try_into().unwrap()), 20);
             assert_eq!(u64::from_le_bytes(entry[8..16].try_into().unwrap()), 20);
             assert!(entry[16..].iter().all(|value| *value == 0));
@@ -708,40 +820,50 @@ mod tests {
 
     #[test]
     fn publication_updates_the_mapped_pages_without_synchronization() {
-        use nixe_cpu::memory::{MemoryPermissions, ProcessMemory};
-        use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
-        let memory = ExecutionMemory::new();
-        let mut hid = HidSystem::new();
-        let shared = hid.shared_memory(&memory).unwrap();
-        let space = AddressSpaceId::new(1);
+        use nixe_memory::{
+            Access, AddressSpace, AddressWidth, GuestVirtualAddress, Machine, MemoryPermissions,
+        };
+        let machine = Machine::new(2 * 1024 * 1024).unwrap();
+        let account = machine.account(machine.arena().capacity()).unwrap();
+        let hid = HidSystem::new(&account).unwrap();
+        let shared = hid.shared_memory();
+        let space = AddressSpace::new(machine, AddressWidth::Bits32).unwrap();
         let address = GuestVirtualAddress::new(0x1000);
-        memory
-            .map_shared_backing(space, address, shared.backing(), MemoryPermissions::READ)
+        space
+            .map(
+                address,
+                shared.allocation().clone(),
+                0,
+                HID_SHARED_MEMORY_SIZE as u64,
+                MemoryPermissions::READ,
+            )
             .unwrap();
         configure_player_one(&hid, false);
         hid.publish(Some(&EmulatedControllerState::default()), Duration::ZERO)
             .unwrap();
         let mut style = [0; 4];
-        memory
-            .read_bytes(
-                space,
-                address.checked_add(NPAD_OFFSET as u64).unwrap(),
-                &mut style,
-            )
-            .unwrap();
+        assert!(matches!(
+            space
+                .read_into(address.checked_add(NPAD_OFFSET as u64).unwrap(), &mut style)
+                .unwrap(),
+            Access::Ready(())
+        ));
         assert_eq!(u32::from_le_bytes(style), NPAD_STYLE_FULL_KEY);
-        assert!(memory.write_bytes(space, address, &[1]).is_err());
+        assert!(matches!(
+            space.write(address, &[1]),
+            Err(nixe_memory::MemoryError::PermissionDenied { .. })
+        ));
     }
 
     fn read_u32(memory: &SharedMemoryObject, offset: usize) -> u32 {
         let mut bytes = [0; 4];
-        memory.read(offset, &mut bytes).unwrap();
+        read(memory, offset, &mut bytes);
         u32::from_le_bytes(bytes)
     }
 
     fn read_u64(memory: &SharedMemoryObject, offset: usize) -> u64 {
         let mut bytes = [0; 8];
-        memory.read(offset, &mut bytes).unwrap();
+        read(memory, offset, &mut bytes);
         u64::from_le_bytes(bytes)
     }
 
@@ -756,8 +878,8 @@ mod tests {
 
     #[test]
     fn style_event_copies_track_published_connection_changes() {
-        let mut hid = HidSystem::new();
-        let memory = hid.shared_memory(&ExecutionMemory::new()).unwrap();
+        let hid = hid();
+        let memory = hid.shared_memory();
         let event = hid.acquire_style_event(0).unwrap();
         assert!(event.is_signalled());
         let copy = hid.acquire_style_event(0).unwrap();
@@ -789,8 +911,8 @@ mod tests {
 
     #[test]
     fn publishes_atomic_multitouch_samples_after_activation() {
-        let mut hid = HidSystem::new();
-        let memory = hid.shared_memory(&ExecutionMemory::new()).unwrap();
+        let hid = hid();
+        let memory = hid.shared_memory();
         let (writer, mut reader) = touch_screen_channel();
         let first = EmulatedTouchContact {
             finger_id: 3,
@@ -845,11 +967,11 @@ mod tests {
 
     #[test]
     fn publishes_player_one_full_key_state_and_disconnects_it() {
-        let mut hid = HidSystem::new();
+        let hid = hid();
         configure_player_one(&hid, false);
         // Joy-Con orientation must not rotate a FullKey controller's input.
         assert!(hid.set_npad_joy_hold_type(1));
-        let memory = hid.shared_memory(&ExecutionMemory::new()).unwrap();
+        let memory = hid.shared_memory();
         let state = EmulatedControllerState {
             buttons: EmulatedButtonState {
                 a: true,
@@ -864,7 +986,7 @@ mod tests {
         };
         hid.publish(Some(&state), Duration::from_millis(5)).unwrap();
 
-        assert!(hid.set_npad_joy_assignment_mode_dual(0).unwrap());
+        assert!(ready(hid.set_npad_joy_assignment_mode_dual(0)).unwrap());
         assert_eq!(read_u32(&memory, NPAD_OFFSET + 4), NPAD_JOY_ASSIGNMENT_DUAL);
         assert_eq!(read_u32(&memory, NPAD_OFFSET), NPAD_STYLE_FULL_KEY);
         assert_eq!(read_u64(&memory, NPAD_OFFSET + 0x38), 0);
@@ -882,9 +1004,9 @@ mod tests {
 
     #[test]
     fn publishes_motion_and_system_buttons() {
-        let mut hid = HidSystem::new();
+        let hid = hid();
         configure_player_one(&hid, true);
-        let memory = hid.shared_memory(&ExecutionMemory::new()).unwrap();
+        let memory = hid.shared_memory();
         let state = EmulatedControllerState {
             buttons: EmulatedButtonState {
                 home: true,
@@ -935,8 +1057,8 @@ mod tests {
 
     #[test]
     fn lifos_wrap_and_restart_cleanly_after_disconnection() {
-        let mut hid = HidSystem::new();
-        let memory = hid.shared_memory(&ExecutionMemory::new()).unwrap();
+        let hid = hid();
+        let memory = hid.shared_memory();
         configure_player_one(&hid, true);
         for _ in 0..40 {
             hid.publish(
@@ -964,8 +1086,8 @@ mod tests {
 
     #[test]
     fn configuration_gates_npad_and_six_axis_publication() {
-        let mut hid = HidSystem::new();
-        let memory = hid.shared_memory(&ExecutionMemory::new()).unwrap();
+        let hid = hid();
+        let memory = hid.shared_memory();
         let state = EmulatedControllerState::default();
 
         hid.publish(Some(&state), Duration::from_millis(5)).unwrap();

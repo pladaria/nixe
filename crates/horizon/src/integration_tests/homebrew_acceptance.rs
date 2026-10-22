@@ -1,0 +1,511 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
+use nixe_horizon::{
+    DirectoryEntryKind, HorizonSvcSupport, IpcRequest, IpcResponse, IpcResultCode, IpcService,
+};
+use nixe_runtime::{
+    CpuBackendConfig, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
+    ProcessBuilder, ProcessExitCause, ProcessLifecycle,
+};
+
+use support::ScheduledProcess;
+
+use crate::integration_test_support as support;
+
+fn reference_process_builder() -> ProcessBuilder {
+    support::process_builder().with_cpu_backend(CpuBackendConfig::Jit)
+}
+
+fn asset(relative: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("roms/homebrew")
+        .join(relative)
+}
+
+fn parse_number(value: &str) -> usize {
+    usize::from_str_radix(value.strip_prefix("0x").unwrap_or(value), 16).unwrap()
+}
+
+fn materialize_fixture(path: &Path) -> Vec<u8> {
+    let source = fs::read_to_string(path).expect("acceptance fixture must be readable");
+    let mut image = None;
+    for (line_number, raw) in source.lines().enumerate() {
+        let line = raw.split('#').next().unwrap().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        match fields.as_slice() {
+            ["size", size] if image.is_none() => image = Some(vec![0; parse_number(size)]),
+            ["u32", offset, value] => {
+                let image = image.as_mut().expect("size must precede writes");
+                let offset = parse_number(offset);
+                let value = u32::try_from(parse_number(value)).unwrap().to_le_bytes();
+                image[offset..offset + value.len()].copy_from_slice(&value);
+            }
+            ["bytes", offset, value] => {
+                let image = image.as_mut().expect("size must precede writes");
+                let offset = parse_number(offset);
+                assert!(value.len().is_multiple_of(2));
+                let bytes = (0..value.len())
+                    .step_by(2)
+                    .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+                    .collect::<Vec<_>>();
+                image[offset..offset + bytes.len()].copy_from_slice(&bytes);
+            }
+            ["fill", offset, size, value] => {
+                let image = image.as_mut().expect("size must precede writes");
+                let offset = parse_number(offset);
+                let size = parse_number(size);
+                let value = u8::try_from(parse_number(value)).unwrap();
+                image[offset..offset + size].fill(value);
+            }
+            _ => panic!("invalid fixture directive at line {}", line_number + 1),
+        }
+    }
+    image.expect("fixture must declare its size")
+}
+
+#[test]
+fn jit_minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
+    minimal_nro_loader_return(CpuBackendConfig::Jit);
+}
+
+fn minimal_nro_loader_return(backend: CpuBackendConfig) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("minimal-a64.nro");
+    fs::write(
+        &path,
+        materialize_fixture(&asset("acceptance/minimal-a64.nro.fixture")),
+    )
+    .unwrap();
+    let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
+    let mut process = ScheduledProcess::new(
+        support::process_builder()
+            .with_cpu_backend(backend)
+            .build(&plan)
+            .unwrap(),
+    );
+    let state = process.main_thread().state();
+    assert_ne!(
+        state.read_x(A64Register::General(A64GeneralRegister::new(0).unwrap())),
+        0
+    );
+    assert_eq!(
+        state.read_x(A64Register::General(A64GeneralRegister::new(1).unwrap())),
+        u64::MAX
+    );
+    assert_eq!(
+        state.read_x(A64Register::General(A64GeneralRegister::new(30).unwrap())),
+        process.main_thread().loader_return.unwrap().get()
+    );
+
+    let mut dispatcher = support::dispatcher(&process);
+    let first = process.run_slice(16).unwrap();
+    assert!(matches!(
+        first.stop,
+        ExecutionStop::SupervisorCall {
+            immediate: 0x10,
+            ..
+        }
+    ));
+    assert!(matches!(
+        process
+            .route_supervisor_call(&first.stop, &mut dispatcher)
+            .unwrap(),
+        ExceptionHandlingResult::Resumed
+    ));
+
+    let second = process.run_slice(16).unwrap();
+    let stub = process.main_thread().loader_return.unwrap();
+    assert_eq!(second.progress, 4); // MOV, LDP, RET, then the loader's SVC.
+    assert_eq!(second.context.as_ref().unwrap().pc, stub);
+    assert!(matches!(
+        second.stop,
+        ExecutionStop::LoaderReturn { source, result_code: 0 } if source.pc == stub
+    ));
+    assert_eq!(process.lifecycle(), ProcessLifecycle::Exited);
+    assert_eq!(
+        process.exit().unwrap().cause,
+        ProcessExitCause::LoaderReturned
+    );
+    assert_eq!(dispatcher.coverage().len(), 1);
+    assert_eq!(dispatcher.coverage()[0].immediate, 0x10);
+    assert_eq!(
+        dispatcher.coverage()[0].support,
+        HorizonSvcSupport::Complete
+    );
+
+    let teardown = process.teardown();
+    assert_eq!(teardown.previous_lifecycle, ProcessLifecycle::Exited);
+    assert!(teardown.threads_released > 0);
+    assert!(teardown.physical_pages_released > 0);
+}
+
+#[test]
+fn configured_sd_card_exposes_bounded_host_files_without_following_symlinks() {
+    let directory = tempfile::tempdir().unwrap();
+    let nro_path = directory.path().join("minimal-a64.nro");
+    let nro = materialize_fixture(&asset("acceptance/minimal-a64.nro.fixture"));
+    fs::write(&nro_path, &nro).unwrap();
+    let sd_card = directory.path().join("sdmc");
+    fs::create_dir(&sd_card).unwrap();
+    fs::write(sd_card.join("hello.txt"), b"hello from sdmc").unwrap();
+    fs::create_dir(sd_card.join("switch")).unwrap();
+
+    let plan = Launcher::build(LauncherInput::new(&nro_path)).unwrap();
+    let process = ScheduledProcess::new(
+        reference_process_builder()
+            .with_sd_card_root(fs::canonicalize(&sd_card).unwrap())
+            .build(&plan)
+            .unwrap(),
+    );
+    let fsp = crate::IpcSession::new(IpcService::FileSystem);
+    let IpcResponse::Object(filesystem) = crate::ipc::dispatch_session(
+        process.mounts(),
+        &fsp,
+        IpcRequest::OpenSdCardFileSystem,
+        crate::FileSystemAccessLogMode::None,
+    )
+    .unwrap() else {
+        panic!("opening sdmc: must return a filesystem object");
+    };
+    let IpcResponse::Object(root) = crate::ipc::dispatch_semantic_object(
+        process.mounts(),
+        &filesystem,
+        IpcRequest::OpenDirectory {
+            path: "/".into(),
+            mode: 3,
+        },
+    )
+    .unwrap() else {
+        panic!("opening the SD-card root must return a directory object");
+    };
+    let IpcResponse::DirectoryEntries(entries) = crate::ipc::dispatch_semantic_object(
+        process.mounts(),
+        &root,
+        IpcRequest::ReadDirectory { max_entries: 8 },
+    )
+    .unwrap() else {
+        panic!("reading the SD-card root must return directory entries");
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (entry.name(), entry.kind()))
+            .collect::<Vec<_>>(),
+        [
+            (".nixe", DirectoryEntryKind::Directory),
+            ("hello.txt", DirectoryEntryKind::File),
+            ("switch", DirectoryEntryKind::Directory),
+        ]
+    );
+
+    let IpcResponse::Object(launcher_directory) = crate::ipc::dispatch_semantic_object(
+        process.mounts(),
+        &filesystem,
+        IpcRequest::OpenDirectory {
+            path: "/.nixe".into(),
+            mode: 3,
+        },
+    )
+    .unwrap() else {
+        panic!("opening the virtual launcher directory must return a directory object");
+    };
+    let IpcResponse::DirectoryEntries(entries) = crate::ipc::dispatch_semantic_object(
+        process.mounts(),
+        &launcher_directory,
+        IpcRequest::ReadDirectory { max_entries: 8 },
+    )
+    .unwrap() else {
+        panic!("reading the virtual launcher directory must return entries");
+    };
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name(), "launch.nro");
+    assert_eq!(entries[0].kind(), DirectoryEntryKind::File);
+    assert_eq!(entries[0].size(), nro.len() as u64);
+
+    let IpcResponse::Object(launched_nro) = crate::ipc::dispatch_semantic_object(
+        process.mounts(),
+        &filesystem,
+        IpcRequest::OpenFile {
+            path: "/.nixe/launch.nro".into(),
+            mode: 1,
+        },
+    )
+    .unwrap() else {
+        panic!("opening the launched NRO must return a file object");
+    };
+    {
+        let IpcResponse::Size(value) = crate::ipc::dispatch_semantic_object(
+            process.mounts(),
+            &launched_nro,
+            IpcRequest::GetFileSize,
+        )
+        .unwrap() else {
+            panic!("response payload")
+        };
+        assert_eq!(value, nro.len() as u64);
+    };
+    {
+        let IpcResponse::Data(value) = crate::ipc::dispatch_semantic_object(
+            process.mounts(),
+            &launched_nro,
+            IpcRequest::ReadFile {
+                offset: 0,
+                size: 0x20,
+            },
+        )
+        .unwrap() else {
+            panic!("response payload")
+        };
+        assert_eq!(value, nro[..0x20].to_vec());
+    };
+    assert!(matches!(
+        crate::ipc::dispatch_semantic_object(
+            process.mounts(),
+            &filesystem,
+            IpcRequest::OpenFile {
+                path: "/.nixe/launch.nro".into(),
+                mode: 3,
+            }
+        ),
+        Err(IpcResultCode::ACCESS_DENIED)
+    ));
+
+    let IpcResponse::Object(file) = crate::ipc::dispatch_semantic_object(
+        process.mounts(),
+        &filesystem,
+        IpcRequest::OpenFile {
+            path: "/hello.txt".into(),
+            mode: 1,
+        },
+    )
+    .unwrap() else {
+        panic!("opening an SD-card file must return a file object");
+    };
+    {
+        let IpcResponse::Data(value) = crate::ipc::dispatch_semantic_object(
+            process.mounts(),
+            &file,
+            IpcRequest::ReadFile {
+                offset: 0,
+                size: 64,
+            },
+        )
+        .unwrap() else {
+            panic!("response payload")
+        };
+        assert_eq!(value, b"hello from sdmc".to_vec());
+    };
+    assert!(matches!(
+        crate::ipc::dispatch_semantic_object(
+            process.mounts(),
+            &filesystem,
+            IpcRequest::CreateDirectory {
+                path: "/config".into(),
+            }
+        )
+        .unwrap(),
+        IpcResponse::None
+    ));
+    assert!(matches!(
+        crate::ipc::dispatch_semantic_object(
+            process.mounts(),
+            &filesystem,
+            IpcRequest::CreateFile {
+                path: "/config/settings.bin".into(),
+                size: 4,
+                option: 0,
+            }
+        )
+        .unwrap(),
+        IpcResponse::None
+    ));
+    let IpcResponse::Object(settings) = crate::ipc::dispatch_semantic_object(
+        process.mounts(),
+        &filesystem,
+        IpcRequest::OpenFile {
+            path: "/config/settings.bin".into(),
+            mode: 3,
+        },
+    )
+    .unwrap() else {
+        panic!("opening a writable SD-card file must return a file object");
+    };
+    assert!(matches!(
+        crate::ipc::dispatch_semantic_object(
+            process.mounts(),
+            &settings,
+            IpcRequest::WriteFile {
+                offset: 1,
+                data: b"xyz".to_vec(),
+                flush: true,
+            }
+        )
+        .unwrap(),
+        IpcResponse::None
+    ));
+    {
+        let IpcResponse::Data(value) = crate::ipc::dispatch_semantic_object(
+            process.mounts(),
+            &settings,
+            IpcRequest::ReadFile { offset: 0, size: 4 },
+        )
+        .unwrap() else {
+            panic!("response payload")
+        };
+        assert_eq!(value, b"\0xyz".to_vec());
+    };
+    assert!(matches!(
+        crate::ipc::dispatch_semantic_object(
+            process.mounts(),
+            &settings,
+            IpcRequest::SetFileSize { size: 2 }
+        )
+        .unwrap(),
+        IpcResponse::None
+    ));
+    assert_eq!(
+        fs::read(sd_card.join("config/settings.bin")).unwrap(),
+        b"\0x"
+    );
+    assert!(matches!(
+        crate::ipc::dispatch_semantic_object(
+            process.mounts(),
+            &filesystem,
+            IpcRequest::OpenFile {
+                path: "/../outside".into(),
+                mode: 1,
+            }
+        ),
+        Err(IpcResultCode::INVALID_ARGUMENT)
+    ));
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(directory.path(), sd_card.join("escape")).unwrap();
+        assert!(matches!(
+            crate::ipc::dispatch_semantic_object(
+                process.mounts(),
+                &filesystem,
+                IpcRequest::OpenFile {
+                    path: "/escape/nixe.toml".into(),
+                    mode: 1,
+                }
+            ),
+            Err(IpcResultCode::ACCESS_DENIED)
+        ));
+    }
+}
+
+#[test]
+fn launched_nro_overlay_does_not_require_a_host_sd_card_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let nro_path = directory.path().join("minimal-a64.nro");
+    let nro = materialize_fixture(&asset("acceptance/minimal-a64.nro.fixture"));
+    fs::write(&nro_path, &nro).unwrap();
+
+    let plan = Launcher::build(LauncherInput::new(&nro_path)).unwrap();
+    let process = ScheduledProcess::new(reference_process_builder().build(&plan).unwrap());
+    let fsp = crate::IpcSession::new(IpcService::FileSystem);
+    let IpcResponse::Object(filesystem) = crate::ipc::dispatch_session(
+        process.mounts(),
+        &fsp,
+        IpcRequest::OpenSdCardFileSystem,
+        crate::FileSystemAccessLogMode::None,
+    )
+    .unwrap() else {
+        panic!("the launch overlay must provide an SD-card filesystem");
+    };
+    let IpcResponse::Object(file) = crate::ipc::dispatch_semantic_object(
+        process.mounts(),
+        &filesystem,
+        IpcRequest::OpenFile {
+            path: "/.nixe/launch.nro".into(),
+            mode: 1,
+        },
+    )
+    .unwrap() else {
+        panic!("the launch overlay must expose the complete NRO");
+    };
+    {
+        let IpcResponse::Data(value) = crate::ipc::dispatch_semantic_object(
+            process.mounts(),
+            &file,
+            IpcRequest::ReadFile {
+                offset: 0x10,
+                size: 4,
+            },
+        )
+        .unwrap() else {
+            panic!("response payload")
+        };
+        assert_eq!(value, b"NRO0".to_vec());
+    };
+}
+
+#[test]
+fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initialization() {
+    let path = asset("templates/application/application.nro");
+    let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
+    let mut process = ScheduledProcess::new(reference_process_builder().build(&plan).unwrap());
+    let mut dispatcher = support::dispatcher(&process);
+    let mut executed = 0_u64;
+
+    loop {
+        let report = process.run_slice(512).unwrap();
+        executed += report.progress;
+        assert!(
+            executed <= 100_000,
+            "libnx startup exceeded its acceptance bound"
+        );
+        match &report.stop {
+            ExecutionStop::BudgetExhausted => {}
+            ExecutionStop::SupervisorCall { .. } => {
+                let outcome = process
+                    .route_supervisor_call(&report.stop, &mut dispatcher)
+                    .unwrap();
+                match outcome {
+                    ExceptionHandlingResult::Resumed => {
+                        if dispatcher.video_system().active_layer_count() > 0 {
+                            break;
+                        }
+                    }
+                    _ => panic!(
+                        "libnx SVC failed at {stop}: {outcome:?}",
+                        stop = report.stop
+                    ),
+                }
+            }
+            stop => panic!("libnx startup stopped before video initialization: {stop}"),
+        }
+    }
+
+    assert!(
+        executed > 10_800,
+        "libnx did not initialize the filesystem and reach video initialization: executed={executed}"
+    );
+    let coverage = dispatcher.coverage();
+    for immediate in [0x01, 0x02, 0x03, 0x06, 0x13, 0x29] {
+        assert!(
+            coverage.iter().any(|entry| {
+                entry.immediate == immediate && entry.support != HorizonSvcSupport::Unsupported
+            }),
+            "libnx did not exercise required SVC {immediate:#x}"
+        );
+    }
+    for immediate in [0x1f, 0x21] {
+        assert!(
+            coverage.iter().any(|entry| {
+                entry.immediate == immediate
+                    && entry.support != HorizonSvcSupport::Unsupported
+                    && entry.resumed > 0
+            }),
+            "missing supported successful SVC {immediate:#x}; coverage={coverage:?}"
+        );
+    }
+}

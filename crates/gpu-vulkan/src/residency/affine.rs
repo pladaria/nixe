@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 pub fn affine_pipeline(
     compiler: &PipelineCompiler,
     format: vk::Format,
-) -> Result<Pending<NativePipeline>, CompileError> {
+) -> Result<Arc<NativePipeline>, CompileError> {
     static SHADER: OnceLock<Arc<ShaderArtifact>> = OnceLock::new();
     let shader = SHADER.get_or_init(|| {
         Arc::new(ShaderArtifact::new(Box::new([

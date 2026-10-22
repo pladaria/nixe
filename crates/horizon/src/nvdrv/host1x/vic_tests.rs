@@ -2,13 +2,15 @@ use super::super::Mapping;
 use super::super::video::gob_offset;
 use super::*;
 use crate::nvdrv::nvmap::{NvMapAllocationMetadata, NvMapCpuMapping, NvMapObjects, NvMapOwner};
-use nixe_memory::{AddressSpaceId, CanonicalAllocation, GuestVirtualAddress, MemoryPermissions};
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[test]
 fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
-    let allocation = CanonicalAllocation::zeroed(0x20000, 4096).unwrap();
+    let machine = crate::test_memory::machine();
+    let allocation = machine.account(0x20000).unwrap().allocate(0x20000).unwrap();
+    let input = nixe_memory::AllocationRange::new(allocation.pin(), 0, 0x20000).unwrap();
     let mut nvmap = NvMapObjects::default();
     let owner = NvMapOwner::new(1);
     let handle = nvmap.create(owner, 0x20000).unwrap();
@@ -18,9 +20,7 @@ fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
             handle,
             NvMapAllocationMetadata::new(0, 0, 4096, 0),
             NvMapCpuMapping::new(AddressSpaceId::new(1), GuestVirtualAddress::new(0x1000)),
-            allocation
-                .backing_range(MemoryPermissions::READ_WRITE)
-                .unwrap(),
+            Arc::from([input.clone()]),
         )
         .unwrap();
     let object = nvmap
@@ -29,6 +29,7 @@ fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
     let mappings = Arc::new(BTreeMap::from([(
         0x1000,
         Mapping {
+            physical: nixe_gpu::physical::PhysicalMapping::new(object.ranges().unwrap()).unwrap(),
             object,
             references: 1,
         },
@@ -80,7 +81,9 @@ fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
     }
     put(&mut config, slot + 0xa0, 1023);
     put(&mut config, slot + 0xa4, 0x2050);
-    allocation.write(0, &config).unwrap();
+    machine
+        .write_resolved(&[input.slice(0, config.len() as u64).unwrap()], &config)
+        .unwrap();
     let mut luma = vec![0; 2048];
     let mut uv = vec![0; 2048];
     for y in 0..16 {
@@ -94,8 +97,12 @@ fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
             uv[gob_offset(x + 1, y, 128, 1)] = 192;
         }
     }
-    allocation.write(0x1000, &luma).unwrap();
-    allocation.write(0x2000, &uv).unwrap();
+    machine
+        .write_resolved(&[input.slice(0x1000, luma.len() as u64).unwrap()], &luma)
+        .unwrap();
+    machine
+        .write_resolved(&[input.slice(0x2000, uv.len() as u64).unwrap()], &uv)
+        .unwrap();
     let mut registers = vec![0; 0x446];
     registers[0x1c2] = 0x10;
     registers[0x100] = 0x20;
@@ -103,7 +110,10 @@ fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
     registers[0x1c8] = 0x100;
     execute(&registers, &mappings).unwrap();
     let mut result = vec![0; 8192];
-    allocation.read(0xf000, &mut result).unwrap();
+    crate::test_memory::read(
+        &[input.slice(0xf000, result.len() as u64).unwrap()],
+        &mut result,
+    );
     for y in 0..16 {
         for x in 0..128 {
             let pixel =
@@ -118,14 +128,21 @@ fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
             if col < 3 { 256u64 << (col * 20) } else { 0 } | if col == 1 { 1 << 63 } else { 0 };
         config[slot + 0x80 + col * 8..slot + 0x88 + col * 8].copy_from_slice(&value.to_le_bytes());
     }
-    allocation.write(0, &config).unwrap();
+    machine
+        .write_resolved(&[input.slice(0, config.len() as u64).unwrap()], &config)
+        .unwrap();
     execute(&registers, &mappings).unwrap();
     let mut general = vec![0; result.len()];
-    allocation.read(0xf000, &mut general).unwrap();
+    crate::test_memory::read(
+        &[input.slice(0xf000, general.len() as u64).unwrap()],
+        &mut general,
+    );
     assert_eq!(general, result);
     // Reject fractional/scaled rectangles rather than copying the wrong source area.
     put(&mut config, slot + 0x24, ((width - 1) << 16) + 1);
-    allocation.write(0, &config).unwrap();
+    machine
+        .write_resolved(&[input.slice(0, config.len() as u64).unwrap()], &config)
+        .unwrap();
     assert!(
         execute(&registers, &mappings)
             .unwrap_err()

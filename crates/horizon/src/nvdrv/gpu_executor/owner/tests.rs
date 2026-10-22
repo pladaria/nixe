@@ -3,7 +3,7 @@ use nixe_gpu::BackendExecutionCompletion;
 use nixe_gpu::ExecutionBatch;
 use nixe_gpu::{BackendRuntimeError, CacheMaintenanceOperation};
 use nixe_gpu_vulkan::{ApiPreference, VulkanDevice, WorkTicket};
-use nixe_memory::{CanonicalPageId, DeviceVisibilityPoint, NonCpuDeviceId};
+use nixe_memory::{AccessOperation, AccessResult, AllocationRange, Machine};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -22,11 +22,14 @@ impl Drop for ReleasePreparationOnDrop {
 }
 
 struct QueueFixture {
+    memory: Machine,
+    effect: AllocationRange,
     device: VulkanDevice,
     pending: VecDeque<(FrontendSubmissionId, WorkTicket)>,
     preparation_ready: Arc<AtomicBool>,
     started_wait: Option<mpsc::Sender<()>>,
     completed: mpsc::Sender<BackendExecutionCompletion>,
+    completion_wakeups: usize,
 }
 impl QueueFixture {
     fn complete(&mut self) -> Option<BackendExecutionCompletion> {
@@ -37,31 +40,9 @@ impl QueueFixture {
         self.pending.pop_front();
         // No resource/canonical write exists in this fixture. Real residency
         // completes its ownership effects before constructing this record.
-        let completion = BackendExecutionCompletion::new(
-            frontend,
-            work.submission(),
-            DeviceVisibilityPoint::new(0),
-        );
+        let completion = BackendExecutionCompletion::new(frontend, work.submission());
         self.completed.send(completion).unwrap();
         Some(completion)
-    }
-    fn wait(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
-        if let Some(started) = self.started_wait.take() {
-            started.send(()).unwrap();
-        }
-        if !self.preparation_ready.load(Ordering::Acquire) {
-            thread::sleep(timeout);
-            return Ok(None);
-        }
-        if let Some((_, work)) = self.pending.front() {
-            self.device
-                .wait_for_work(*work, timeout)
-                .map_err(|e| BackendRuntimeError::Backend(e.to_string().into()))?;
-        }
-        Ok(self.complete())
     }
 }
 impl GpuExecution for QueueFixture {
@@ -86,6 +67,9 @@ impl GpuExecution for QueueFixture {
         self.device
             .work_ticket()
             .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))?;
+        self.memory
+            .write_resolved(std::slice::from_ref(&self.effect), &[0xa5; 16])
+            .map_err(|error| BackendRuntimeError::Memory(Arc::new(error)))?;
         Ok(())
     }
     fn submit(
@@ -118,31 +102,61 @@ impl GpuExecution for QueueFixture {
             .map_err(|e| BackendRuntimeError::Backend(e.to_string().into()))?;
         Ok(self.complete())
     }
-    fn wait_for_completion(
-        &mut self,
-    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
-        self.wait(Duration::MAX)
+    fn request_completion_wakeup(&mut self) -> Result<(), BackendRuntimeError> {
+        self.completion_wakeups += 1;
+        Ok(())
     }
-    fn wait_for_completion_timeout(
+    fn access_memory(
         &mut self,
-        timeout: Duration,
-    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
-        self.wait(timeout)
+        ranges: Vec<AllocationRange>,
+        operation: AccessOperation,
+    ) -> Result<AccessResult, BackendRuntimeError> {
+        self.memory
+            .apply_resolved_access(&ranges, &operation)
+            .map_err(|e| BackendRuntimeError::Memory(Arc::new(e)))
     }
-    fn bind_visibility_requester(
+    fn queue_device_access(
         &mut self,
-        _: Arc<dyn BackendVisibilityRequester>,
+        request: nixe_memory::DeviceAccessRequest,
+    ) -> Result<(), BackendRuntimeError> {
+        let result = self
+            .memory
+            .apply_resolved_access(request.ranges(), request.operation())
+            .map_err(Arc::new);
+        request.finish(result);
+        Ok(())
+    }
+    fn cancel_device_access(
+        &mut self,
+        _: nixe_memory::AccessRequestId,
     ) -> Result<(), BackendRuntimeError> {
         Ok(())
     }
-    fn make_cpu_visible(
+    fn progress_device_accesses(&mut self) -> Result<(), BackendRuntimeError> {
+        Ok(())
+    }
+    fn fail_device_accesses(&mut self, _: Arc<nixe_memory::MemoryError>) {}
+    fn retire_physical_memory(
         &mut self,
-        request: CpuVisibilityRequest,
-    ) -> Result<Box<[u8]>, BackendRuntimeError> {
-        // An independent visibility request must be routed while preparation
-        // is blocked; this fixture has no device-written canonical pages.
-        assert_eq!(request.visible_at, DeviceVisibilityPoint::new(0));
-        Ok(vec![0x5a; request.size].into_boxed_slice())
+        _: nixe_memory::MachineId,
+        _: nixe_memory::AllocationId,
+        _: &[nixe_memory::Extent],
+    ) -> Result<(), BackendRuntimeError> {
+        Ok(())
+    }
+    fn release_guest_memory(
+        &mut self,
+        _: nixe_memory::MachineId,
+        _: nixe_memory::AllocationId,
+    ) -> Result<(), BackendRuntimeError> {
+        Ok(())
+    }
+    fn allocation_pressure(
+        &mut self,
+        _: nixe_memory::MachineId,
+        _: u64,
+    ) -> Result<(), BackendRuntimeError> {
+        Ok(())
     }
     fn acquire_presentable_image(
         &mut self,
@@ -160,7 +174,7 @@ impl GpuExecution for QueueFixture {
 }
 
 #[test]
-fn native_gpu_completion_and_cpu_visibility_progress_on_the_command_owner() {
+fn owned_memory_access_waits_until_the_current_effect_is_consumed() {
     use super::super::super::super::{
         NvDrvDescriptorOwner, NvDrvDeviceKind, NvDrvFileDescriptor, NvDrvPermissionProfile,
         NvDrvSessionId,
@@ -169,6 +183,13 @@ fn native_gpu_completion_and_cpu_visibility_progress_on_the_command_owner() {
         return;
     };
     let validation = device.validation_monitor();
+    let memory = Machine::new(4096).unwrap();
+    let allocation = memory.account(4096).unwrap().allocate(4096).unwrap();
+    let input = AllocationRange::new(allocation.pin(), 0, 16).unwrap();
+    memory
+        .write_resolved(std::slice::from_ref(&input), &[0x5a; 16])
+        .unwrap();
+
     let preparation_ready = Arc::new(AtomicBool::new(false));
     let _release = ReleasePreparationOnDrop(Arc::clone(&preparation_ready));
     let budget = GpuWorkBudget::default();
@@ -180,11 +201,14 @@ fn native_gpu_completion_and_cpu_visibility_progress_on_the_command_owner() {
     let (started, waited) = mpsc::channel();
     let (completed_tx, completed) = mpsc::channel();
     let backend = Rc::new(RefCell::new(Some(QueueFixture {
+        memory: memory.clone(),
+        effect: input.clone(),
         device,
         pending: VecDeque::new(),
         preparation_ready: Arc::clone(&preparation_ready),
         started_wait: Some(started),
         completed: completed_tx,
+        completion_wakeups: 0,
     })));
     let mut owner = Owner::new(&receiver, Rc::clone(&backend), &budget);
     let execution = MaxwellBackendExecution::<nixe_gpu::native::NativeWork>::begin(
@@ -211,61 +235,46 @@ fn native_gpu_completion_and_cpu_visibility_progress_on_the_command_owner() {
         ),
     ]);
     let warm_sender = sender.clone();
+    let producer_memory = memory.clone();
+    let producer_input = input.clone();
     let producer = thread::spawn(move || {
         waited.recv_timeout(Duration::from_secs(3)).unwrap();
-        let (reply, result) = mpsc::sync_channel(1);
-        sender
-            .send(GpuMessage::CpuVisibility {
-                request: CpuVisibilityRequest {
-                    page: CanonicalPageId::new(
-                        nixe_memory::BackingStoreId::new(1),
-                        nixe_memory::GuestPhysicalPageId::new(1),
-                    ),
-                    size: 16,
-                    device: NonCpuDeviceId::new(1),
-                    visible_at: DeviceVisibilityPoint::new(0),
-                },
-                reply,
-            })
+        let (request, mut pending) = producer_memory
+            .prepare_device_access(vec![producer_input], AccessOperation::Read)
             .unwrap();
-        assert_eq!(
-            result
-                .recv_timeout(Duration::from_secs(3))
-                .unwrap()
-                .unwrap()
-                .as_ref(),
-            &[0x5a; 16]
-        );
+        let (wake, completed) = mpsc::sync_channel(1);
+        pending.set_waker(Arc::new(move || {
+            let _ = wake.try_send(());
+        }));
+        sender.send(GpuMessage::MemoryAccess(request)).unwrap();
+        // Compiler workers own captured inputs. Readiness must not depend on
+        // servicing a later guest memory operation ahead of this command list.
         preparation_ready.store(true, Ordering::Release);
         sender.send(GpuMessage::Wake).unwrap();
+        completed.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            matches!(pending.poll().unwrap().unwrap(), AccessResult::Read(bytes) if bytes.as_ref() == [0xa5; 16])
+        );
     });
     assert!(owner.consume(&mut work).unwrap().is_none());
+    assert_eq!(
+        backend.borrow().as_ref().unwrap().completion_wakeups,
+        0,
+        "compiler readiness and admitted RAM access must not submit unrelated work"
+    );
     assert!(work.execution.waiting_for_input());
-    let (reply, warm_reply) = mpsc::sync_channel(1);
-    warm_sender
-        .send(GpuMessage::CpuVisibility {
-            request: CpuVisibilityRequest {
-                page: CanonicalPageId::new(
-                    nixe_memory::BackingStoreId::new(1),
-                    nixe_memory::GuestPhysicalPageId::new(2),
-                ),
-                size: 16,
-                device: NonCpuDeviceId::new(1),
-                visible_at: DeviceVisibilityPoint::new(0),
-            },
-            reply,
-        })
+    let (request, mut warm_reply) = memory
+        .prepare_device_access(vec![input], AccessOperation::Read)
         .unwrap();
+    warm_sender.send(GpuMessage::MemoryAccess(request)).unwrap();
     work.execution.append_steps(vec![
         nixe_gpu_maxwell::MaxwellSubmissionExecutionStep::Ordering(
             CacheMaintenanceOperation::InvalidateDeviceReadCaches,
         ),
     ]);
     assert!(owner.consume(&mut work).unwrap().is_none());
-    assert_eq!(
-        warm_reply.try_recv().unwrap().unwrap().as_ref(),
-        &[0x5a; 16]
-    );
+    assert!(matches!(warm_reply.poll().unwrap().unwrap(),
+        AccessResult::Read(bytes) if bytes.as_ref() == [0xa5; 16]));
     assert!(
         !work.execution.is_finished(),
         "the next guest command has not arrived"

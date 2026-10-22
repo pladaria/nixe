@@ -1,6 +1,6 @@
 //! Linux native-fault runtime shared by CPU execution frontends.
 //!
-//! The signal handler performs only bounded slot lookup, fixed-stub attribution,
+//! The signal handler performs only bounded worker lookup,
 //! context capture, and register redirection. JIT fault attribution and
 //! emulator policy run after `sigreturn` on a preallocated dispatcher stack.
 
@@ -16,14 +16,9 @@ use std::ptr::NonNull;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-use nixe_cpu::memory::{
-    CpuMemory, DataAccessFault, DataAccessKind, DirectFaultResolution, MemoryAccess,
-    MemoryAccessClass, MemoryAccessSize, MemoryOrdering, MemoryValue,
-};
-use nixe_memory::{AddressSpaceId, DIRECT_PAGE_SIZE, DirectAddressSpaceView, GuestVirtualAddress};
+use nixe_memory::PAGE_SIZE;
 
 const MAX_WORKER_SLOTS: usize = 128;
-const MAX_UNCHANGED_RETRIES: usize = 8;
 const SIGNAL_STACK_SIZE: usize = 64 * 1024;
 const DISPATCH_STACK_SIZE: usize = 64 * 1024;
 // Linux UAPI `siginfo.h` values not exported by every libc target module.
@@ -35,99 +30,6 @@ const MAX_X86_FPSTATE_SIZE: usize = 64 * 1024;
 const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
 #[cfg(target_arch = "x86_64")]
 const FP_XSTATE_SW_BYTES_OFFSET: usize = 464;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NativeMemoryAccessKind {
-    Read,
-    Write,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NativeMemoryAccess {
-    pub address_space: AddressSpaceId,
-    pub guest_pc: GuestVirtualAddress,
-    pub kind: NativeMemoryAccessKind,
-    pub size: u8,
-    pub element_index: u8,
-}
-
-/// One exact native instruction interval which may access a direct arena.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NativeFaultSite {
-    pub native_start: usize,
-    pub native_end: usize,
-    pub access: NativeMemoryAccess,
-}
-
-/// Immutable metadata for one finalized native function.
-#[derive(Clone, Debug)]
-struct NativeFaultRegion {
-    native_start: usize,
-    native_end: usize,
-    sites: Box<[NativeFaultSite]>,
-}
-
-/// Immutable attribution for fixed native memory stubs, published as a whole
-/// before a worker becomes active. Dynarmic resolves its own live code-cache metadata outside the handler.
-/// Signal-context lookup only reads this table: no locks, allocations or
-/// incremental publication, and no retained retired code.
-struct NativeFaultRegistry {
-    regions: Box<[NativeFaultRegion]>,
-}
-
-impl NativeFaultRegistry {
-    fn new(mut regions: Vec<NativeFaultRegion>) -> Result<Self, FaultRuntimeError> {
-        regions.sort_unstable_by_key(|region| region.native_start);
-        for region in &regions {
-            validate_region(region)?;
-        }
-        if regions
-            .windows(2)
-            .any(|pair| pair[0].native_end > pair[1].native_start)
-        {
-            return Err(FaultRuntimeError::new("native fault regions overlap"));
-        }
-        Ok(Self {
-            regions: regions.into_boxed_slice(),
-        })
-    }
-
-    fn find(&self, native_pc: usize) -> Option<&NativeFaultSite> {
-        let index = self
-            .regions
-            .partition_point(|region| region.native_start <= native_pc)
-            .checked_sub(1)?;
-        let region = &self.regions[index];
-        if native_pc >= region.native_end {
-            return None;
-        }
-        let site_index = region
-            .sites
-            .partition_point(|site| site.native_start <= native_pc)
-            .checked_sub(1)?;
-        let site = &region.sites[site_index];
-        (native_pc < site.native_end).then_some(site)
-    }
-}
-
-fn validate_region(region: &NativeFaultRegion) -> Result<(), FaultRuntimeError> {
-    if region.native_start >= region.native_end
-        || region.sites.iter().any(|site| {
-            site.native_start < region.native_start
-                || site.native_start >= site.native_end
-                || site.native_end > region.native_end
-        })
-        || region
-            .sites
-            .windows(2)
-            .any(|pair| pair[0].native_end > pair[1].native_start)
-    {
-        return Err(FaultRuntimeError::new(
-            "native fault registry contains invalid or overlapping ranges",
-        ));
-    }
-    Ok(())
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -170,7 +72,6 @@ struct FaultSlot {
     dispatching: AtomicBool,
     arena_base: AtomicUsize,
     arena_guard_end: AtomicUsize,
-    registry: AtomicPtr<NativeFaultRegistry>,
     dispatcher_fp_control: AtomicU64,
     dispatcher_fp_status: AtomicU64,
     dispatcher: AtomicUsize,
@@ -181,10 +82,9 @@ struct FaultSlot {
     signal: AtomicI32,
     fault_address: AtomicUsize,
     native_pc: AtomicUsize,
-    site: AtomicPtr<NativeFaultSite>,
     retry_pc: AtomicUsize,
     retry_address: AtomicUsize,
-    retry_count: AtomicUsize,
+    retry_pending: AtomicBool,
     context: UnsafeCell<MaybeUninit<libc::ucontext_t>>,
     #[cfg(target_arch = "aarch64")]
     signal_frame: AtomicUsize,
@@ -258,7 +158,6 @@ impl FaultSlot {
             dispatching: AtomicBool::new(false),
             arena_base: AtomicUsize::new(0),
             arena_guard_end: AtomicUsize::new(0),
-            registry: AtomicPtr::new(std::ptr::null_mut()),
             dispatcher_fp_control: AtomicU64::new(0),
             dispatcher_fp_status: AtomicU64::new(0),
             dispatcher: AtomicUsize::new(0),
@@ -269,10 +168,9 @@ impl FaultSlot {
             signal: AtomicI32::new(0),
             fault_address: AtomicUsize::new(0),
             native_pc: AtomicUsize::new(0),
-            site: AtomicPtr::new(std::ptr::null_mut()),
             retry_pc: AtomicUsize::new(0),
             retry_address: AtomicUsize::new(0),
-            retry_count: AtomicUsize::new(0),
+            retry_pending: AtomicBool::new(false),
             context: UnsafeCell::new(MaybeUninit::uninit()),
             #[cfg(target_arch = "aarch64")]
             signal_frame: AtomicUsize::new(0),
@@ -400,13 +298,13 @@ struct GuardedStack {
 
 impl GuardedStack {
     fn new(usable_size: usize) -> Result<Self, FaultRuntimeError> {
-        if usable_size == 0 || !usable_size.is_multiple_of(DIRECT_PAGE_SIZE) {
+        if usable_size == 0 || !usable_size.is_multiple_of(PAGE_SIZE as usize) {
             return Err(FaultRuntimeError::new(
                 "guarded stack size is not a nonzero host-page multiple",
             ));
         }
         let mapping_size = usable_size
-            .checked_add(DIRECT_PAGE_SIZE * 2)
+            .checked_add(PAGE_SIZE as usize * 2)
             .ok_or_else(|| FaultRuntimeError::new("guarded stack reservation overflows"))?;
         let mapping = unsafe {
             libc::mmap(
@@ -423,7 +321,7 @@ impl GuardedStack {
         }
         let mapping = NonNull::new(mapping)
             .ok_or_else(|| FaultRuntimeError::new("guarded stack reservation returned null"))?;
-        let usable = unsafe { mapping.cast::<u8>().add(DIRECT_PAGE_SIZE) };
+        let usable = unsafe { mapping.cast::<u8>().add(PAGE_SIZE as usize) };
         if unsafe {
             libc::mprotect(
                 usable.as_ptr().cast(),
@@ -534,7 +432,6 @@ impl WorkerFaultContext {
         }
         let slot = unsafe { self.slot.as_ref() };
         slot.active.store(false, Ordering::Release);
-        slot.registry.store(std::ptr::null_mut(), Ordering::Relaxed);
         slot.dispatcher.store(0, Ordering::Relaxed);
         slot.opaque.store(std::ptr::null_mut(), Ordering::Relaxed);
         if unsafe { libc::sigaltstack(&self.previous_stack, std::ptr::null_mut()) } != 0 {
@@ -565,7 +462,6 @@ impl WorkerFaultContext {
         }
         Ok(CapturedFault {
             slot: self.slot,
-            site: None,
             lifetime: std::marker::PhantomData,
         })
     }
@@ -573,7 +469,6 @@ impl WorkerFaultContext {
     /// Capture faults without installing a second native-PC registry. The
     /// dispatcher attributes `CapturedFault::native_pc()` through the execution
     /// owner's already-protected directory, after returning from the signal.
-    /// Fixed interpreter stubs publish a batch snapshot for each slice.
     /// The landing leaf installs the invocation owner's saved caller FP state
     /// before entering Rust. Retry restores the untouched captured guest state;
     /// it neither commits FPSR nor changes the frontend's FP ownership fields.
@@ -586,8 +481,7 @@ impl WorkerFaultContext {
     /// capture, resolution and retry. The dispatcher must reject unattributed
     /// PCs with a fatal disposition, never infer attribution from an arena
     /// address alone. `FatalUnattributed` identifies this diagnostic precisely.
-    /// It must not use `CapturedFault::site`, unwind, or return `Retry` without
-    /// repairing the captured access. To complete the access through a JIT
+    /// It must not unwind or return `Retry` without repairing the captured access. To complete the access through a JIT
     /// callback, return the disposition from `CapturedFault::call_on_resume`.
     /// `Escape` skips gateway Rust frames: those
     /// frames must own no destructors, and the caller must restore FP and guest
@@ -597,21 +491,13 @@ impl WorkerFaultContext {
     /// host, saved on this worker, and safe for ordinary dispatcher Rust work.
     pub unsafe fn invoke_captured(
         &mut self,
-        arena: DirectAddressSpaceView,
+        arena: std::ops::Range<usize>,
         caller_fp: [u64; 2],
         dispatcher: FaultDispatcher,
         opaque: *mut libc::c_void,
         invocation: NativeInvocation,
     ) -> Result<InvocationOutcome, FaultRuntimeError> {
-        unsafe {
-            self.begin_capture(
-                arena,
-                std::ptr::null_mut(),
-                Some(caller_fp),
-                dispatcher,
-                opaque,
-            )
-        }?;
+        unsafe { self.begin_capture(arena, caller_fp, dispatcher, opaque) }?;
         unsafe { self.invoke_active(invocation) }
     }
 
@@ -627,41 +513,15 @@ impl WorkerFaultContext {
                 invocation.gateway,
             )
         };
-        self.end_batch()?;
+        self.end_capture()?;
         self.escaped = escaped != 0;
         Ok(invocation_outcome(escaped, unsafe { self.slot.as_ref() }))
     }
 
-    /// Publishes one stable arena/registry/dispatcher snapshot for a batch of
-    /// fixed direct accesses, normally one interpreter slice.
-    ///
-    /// # Safety
-    ///
-    /// `registry`, `opaque`, the arena and everything reachable from the
-    /// dispatcher must outlive the matching [`Self::end_batch`].
-    unsafe fn begin_batch(
-        &mut self,
-        arena: DirectAddressSpaceView,
-        registry: &NativeFaultRegistry,
-        dispatcher: FaultDispatcher,
-        opaque: *mut libc::c_void,
-    ) -> Result<(), FaultRuntimeError> {
-        unsafe {
-            self.begin_capture(
-                arena,
-                std::ptr::from_ref(registry).cast_mut(),
-                None,
-                dispatcher,
-                opaque,
-            )
-        }
-    }
-
     unsafe fn begin_capture(
         &mut self,
-        arena: DirectAddressSpaceView,
-        registry: *mut NativeFaultRegistry,
-        caller_fp: Option<[u64; 2]>,
+        arena: std::ops::Range<usize>,
+        caller_fp: [u64; 2],
         dispatcher: FaultDispatcher,
         opaque: *mut libc::c_void,
     ) -> Result<(), FaultRuntimeError> {
@@ -670,12 +530,17 @@ impl WorkerFaultContext {
                 "native fault context was invoked after unregistration",
             ));
         }
-        let end = arena
-            .base
-            .checked_add(arena.address_space_size)
-            .ok_or_else(|| FaultRuntimeError::new("direct arena end overflows"))?;
-        let guard_end = end
-            .checked_add(DIRECT_PAGE_SIZE)
+        if arena.start >= arena.end
+            || !arena.start.is_multiple_of(PAGE_SIZE as usize)
+            || !arena.end.is_multiple_of(PAGE_SIZE as usize)
+        {
+            return Err(FaultRuntimeError::new(
+                "native arena bounds are not a nonempty page-aligned interval",
+            ));
+        }
+        let guard_end = arena
+            .end
+            .checked_add(PAGE_SIZE as usize)
             .ok_or_else(|| FaultRuntimeError::new("direct arena guard end overflows"))?;
         let slot = unsafe { self.slot.as_ref() };
         if slot.active.load(Ordering::Acquire) {
@@ -683,21 +548,18 @@ impl WorkerFaultContext {
                 "native fault context is already active",
             ));
         }
-        if let Some([control, status]) = caller_fp {
-            #[cfg(target_arch = "x86_64")]
-            let control = control | status;
-            slot.dispatcher_fp_control.store(control, Ordering::Relaxed);
-            slot.dispatcher_fp_status.store(status, Ordering::Relaxed);
-        }
+        let [control, status] = caller_fp;
+        #[cfg(target_arch = "x86_64")]
+        let control = control | status;
+        slot.dispatcher_fp_control.store(control, Ordering::Relaxed);
+        slot.dispatcher_fp_status.store(status, Ordering::Relaxed);
         self.escaped = false;
-        slot.arena_base.store(arena.base, Ordering::Relaxed);
+        slot.arena_base.store(arena.start, Ordering::Relaxed);
         slot.arena_guard_end.store(guard_end, Ordering::Relaxed);
-        slot.registry.store(registry, Ordering::Relaxed);
         slot.dispatcher
             .store(dispatcher as usize, Ordering::Relaxed);
         slot.opaque.store(opaque, Ordering::Relaxed);
-        slot.site.store(std::ptr::null_mut(), Ordering::Relaxed);
-        slot.retry_count.store(0, Ordering::Relaxed);
+        slot.retry_pending.store(false, Ordering::Relaxed);
         if slot
             .active
             .compare_exchange(false, true, Ordering::Release, Ordering::Acquire)
@@ -710,46 +572,21 @@ impl WorkerFaultContext {
         Ok(())
     }
 
-    /// Ends a previously published fixed-access batch.
-    fn end_batch(&mut self) -> Result<(), FaultRuntimeError> {
+    /// End the current native invocation before releasing its code and RAM lifetime.
+    fn end_capture(&mut self) -> Result<(), FaultRuntimeError> {
         if self.tid == 0 {
             return Err(FaultRuntimeError::new(
-                "native fault context batch ended after unregistration",
+                "native fault capture ended after unregistration",
             ));
         }
         let slot = unsafe { self.slot.as_ref() };
         if !slot.active.load(Ordering::Acquire) {
-            return Err(FaultRuntimeError::new(
-                "native fault context batch is not active",
-            ));
+            return Err(FaultRuntimeError::new("native fault capture is not active"));
         }
         slot.active.store(false, Ordering::Release);
-        slot.registry.store(std::ptr::null_mut(), Ordering::Relaxed);
         slot.dispatcher.store(0, Ordering::Relaxed);
         slot.opaque.store(std::ptr::null_mut(), Ordering::Relaxed);
         Ok(())
-    }
-
-    /// Invokes one fixed memory stub while a batch snapshot is active.
-    ///
-    /// # Safety
-    ///
-    /// `context` must point to the stub call layout and `entry` must be one of
-    /// the immutable functions registered in the active registry.
-    unsafe fn invoke_stub_in_batch(
-        &mut self,
-        context: *mut libc::c_void,
-        entry: usize,
-    ) -> Result<InvocationOutcome, FaultRuntimeError> {
-        let slot = unsafe { self.slot.as_ref() };
-        if self.tid == 0 || !slot.active.load(Ordering::Acquire) {
-            return Err(FaultRuntimeError::new(
-                "native fault context stub batch is not active",
-            ));
-        }
-        let escaped = unsafe { nixe_direct_stub_invoke(self.slot.as_ptr().cast(), context, entry) };
-        self.escaped = escaped != 0;
-        Ok(invocation_outcome(escaped, slot))
     }
 }
 
@@ -759,7 +596,7 @@ fn invocation_outcome(escaped: u32, slot: &FaultSlot) -> InvocationOutcome {
     } else {
         InvocationOutcome::Escaped
     };
-    slot.retry_count.store(0, Ordering::Relaxed);
+    slot.retry_pending.store(false, Ordering::Relaxed);
     outcome
 }
 
@@ -775,501 +612,6 @@ impl Drop for WorkerFaultContext {
 pub enum InvocationOutcome {
     Returned,
     Escaped,
-}
-
-/// Failure returned by the fixed interpreter direct-memory frontend.
-#[derive(Debug)]
-pub enum DirectMemoryAccessError {
-    DataFault(DataAccessFault),
-    Backend(Box<str>),
-    Runtime(FaultRuntimeError),
-}
-
-impl Display for DirectMemoryAccessError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DataFault(fault) => write!(formatter, "direct memory data fault: {fault:?}"),
-            Self::Backend(detail) => formatter.write_str(detail),
-            Self::Runtime(error) => Display::fmt(error, formatter),
-        }
-    }
-}
-
-impl std::error::Error for DirectMemoryAccessError {}
-
-/// Process-bound fixed-stub frontend used by the reference interpreter.
-///
-/// Binding selects this object once for a LinuxDirect process. Accesses contain
-/// no page-table walk or permission test; host protection remains the access
-/// authority. Recoverable first-write and visibility faults retry the exact
-/// native load or store after the shared page transition completes.
-pub struct DirectMemoryFrontend {
-    arena: DirectAddressSpaceView,
-    address_space: AddressSpaceId,
-    dispatcher_context: Box<MemoryDispatcherContext>,
-}
-
-/// Active interpreter slice borrowing, never owning, the OS-worker registration.
-/// Neither the frontend nor worker can be reused until the snapshot is cleared.
-pub struct DirectMemorySlice<'a> {
-    frontend: &'a mut DirectMemoryFrontend,
-    worker: &'a mut WorkerFaultContext,
-    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-struct MemoryDispatcherContext {
-    current_call: AtomicPtr<StubCall>,
-    arena_base: usize,
-    address_space: AddressSpaceId,
-}
-
-impl DirectMemoryFrontend {
-    /// # Safety
-    ///
-    /// The arena must remain alive and unchanged for every call made through
-    /// this frontend. Higher-level CPU frontends validate the view against the
-    /// currently borrowed `CpuMemory` before beginning each slice.
-    pub unsafe fn new(
-        arena: DirectAddressSpaceView,
-        address_space: AddressSpaceId,
-    ) -> Result<Self, FaultRuntimeError> {
-        Ok(Self {
-            arena,
-            address_space,
-            dispatcher_context: Box::new(MemoryDispatcherContext {
-                current_call: AtomicPtr::new(std::ptr::null_mut()),
-                arena_base: arena.base,
-                address_space,
-            }),
-        })
-    }
-
-    /// Publishes the stable fault snapshot once for an interpreter slice.
-    pub fn begin_slice<'a>(
-        &'a mut self,
-        worker: &'a mut NativeWorker,
-    ) -> Result<DirectMemorySlice<'a>, FaultRuntimeError> {
-        let arena = self.arena;
-        let registry = memory_stub_registry()?;
-        let opaque = std::ptr::from_ref(self.dispatcher_context.as_ref())
-            .cast_mut()
-            .cast();
-        let worker = worker.faults()?;
-        unsafe { worker.begin_batch(arena, registry, dispatch_memory_stub_fault, opaque) }?;
-        Ok(DirectMemorySlice {
-            frontend: self,
-            worker,
-            _thread_bound: std::marker::PhantomData,
-        })
-    }
-}
-
-impl DirectMemorySlice<'_> {
-    pub fn read(
-        &mut self,
-        memory: &dyn CpuMemory,
-        address: GuestVirtualAddress,
-        access: MemoryAccess,
-    ) -> Result<MemoryValue, DirectMemoryAccessError> {
-        let size = validate_direct_access(access)?;
-        let Some(pointer) = self.frontend.direct_pointer(address, size) else {
-            return memory
-                .read(self.frontend.address_space, address, access)
-                .map(|result| result.value)
-                .map_err(DirectMemoryAccessError::DataFault);
-        };
-        let mut call = StubCall::new(pointer, 0, memory);
-        self.invoke(&mut call, memory_stub(size, DataAccessKind::Read))?;
-        call.finish()?;
-        Ok(MemoryValue::from_bits(size, call.output))
-    }
-
-    pub fn write(
-        &mut self,
-        memory: &dyn CpuMemory,
-        address: GuestVirtualAddress,
-        access: MemoryAccess,
-        value: MemoryValue,
-    ) -> Result<(), DirectMemoryAccessError> {
-        let size = validate_direct_access(access)?;
-        if value.size() != size {
-            return Err(DirectMemoryAccessError::Backend(
-                "direct store value does not match its access width".into(),
-            ));
-        }
-        let Some(pointer) = self.frontend.direct_pointer(address, size) else {
-            return memory
-                .write(self.frontend.address_space, address, access, value)
-                .map(|_| ())
-                .map_err(DirectMemoryAccessError::DataFault);
-        };
-        // Fixed interpreter stubs have no inline monitor protocol. A page
-        // activated for exclusives therefore uses the checked physical writer;
-        // unmonitored RAM keeps its existing native store. The batch's mapping
-        // lease also excludes first activation between this test and the store.
-        let entry = self.frontend.arena.exclusive_page_table
-            + (address.get() as usize / DIRECT_PAGE_SIZE) * std::mem::size_of::<usize>();
-        if unsafe { &*(entry as *const std::sync::atomic::AtomicUsize) }.load(Ordering::Acquire) > 1
-        {
-            return memory
-                .write(self.frontend.address_space, address, access, value)
-                .map(|_| ())
-                .map_err(DirectMemoryAccessError::DataFault);
-        }
-        let mut call = StubCall::new(pointer, value.bits(), memory);
-        self.invoke(&mut call, memory_stub(size, DataAccessKind::Write))?;
-        call.finish()
-    }
-
-    fn invoke(
-        &mut self,
-        call: &mut StubCall,
-        entry: usize,
-    ) -> Result<InvocationOutcome, DirectMemoryAccessError> {
-        let call_pointer = std::ptr::from_mut(call);
-        self.frontend
-            .dispatcher_context
-            .current_call
-            .store(call_pointer, Ordering::Release);
-        let outcome = unsafe { self.worker.invoke_stub_in_batch(call_pointer.cast(), entry) };
-        self.frontend
-            .dispatcher_context
-            .current_call
-            .store(std::ptr::null_mut(), Ordering::Release);
-        outcome.map_err(DirectMemoryAccessError::Runtime)
-    }
-}
-
-impl Drop for DirectMemorySlice<'_> {
-    fn drop(&mut self) {
-        self.worker
-            .end_batch()
-            .expect("a borrowed direct-memory slice ends on its OS worker");
-    }
-}
-
-impl DirectMemoryFrontend {
-    fn direct_pointer(
-        &self,
-        address: GuestVirtualAddress,
-        size: MemoryAccessSize,
-    ) -> Option<usize> {
-        let address = address.get();
-        let bytes = size.bytes();
-        if address >= self.arena.address_space_size as u64 {
-            return None;
-        }
-        if bytes != 1 {
-            let last = address.checked_add((bytes - 1) as u64)?;
-            let page_offset = address & (DIRECT_PAGE_SIZE as u64 - 1);
-            if last >= self.arena.address_space_size as u64
-                || page_offset > (DIRECT_PAGE_SIZE - bytes) as u64
-            {
-                return None;
-            }
-        }
-        self.arena.base.checked_add(address as usize)
-    }
-}
-
-fn validate_direct_access(
-    access: MemoryAccess,
-) -> Result<MemoryAccessSize, DirectMemoryAccessError> {
-    if access.ordering != MemoryOrdering::Relaxed || access.class != MemoryAccessClass::Normal {
-        return Err(DirectMemoryAccessError::Backend(
-            "direct stubs accept only relaxed ordinary accesses".into(),
-        ));
-    }
-    Ok(access.size)
-}
-
-#[repr(C)]
-struct StubCall {
-    pointer: usize,
-    value: u128,
-    output: u128,
-    memory: *const dyn CpuMemory,
-    data_fault: Option<DataAccessFault>,
-    backend_error: Option<Box<str>>,
-}
-
-impl StubCall {
-    fn new(pointer: usize, value: u128, memory: &dyn CpuMemory) -> Self {
-        let memory = unsafe { std::mem::transmute::<&dyn CpuMemory, *const dyn CpuMemory>(memory) };
-        Self {
-            pointer,
-            value,
-            output: 0,
-            memory,
-            data_fault: None,
-            backend_error: None,
-        }
-    }
-
-    fn finish(&mut self) -> Result<(), DirectMemoryAccessError> {
-        if let Some(fault) = self.data_fault.take() {
-            return Err(DirectMemoryAccessError::DataFault(fault));
-        }
-        if let Some(detail) = self.backend_error.take() {
-            return Err(DirectMemoryAccessError::Backend(detail));
-        }
-        Ok(())
-    }
-}
-
-unsafe extern "C" fn dispatch_memory_stub_fault(
-    opaque: *mut libc::c_void,
-    fault: *mut CapturedFault,
-) -> FaultDisposition {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let context = unsafe { &*opaque.cast::<MemoryDispatcherContext>() };
-        let call = context.current_call.load(Ordering::Acquire);
-        if call.is_null() {
-            return FaultDisposition::Fatal;
-        }
-        let call = unsafe { &mut *call };
-        let site = unsafe { &*fault }.site();
-        let size = match site.access.size {
-            1 => MemoryAccessSize::Byte,
-            2 => MemoryAccessSize::Halfword,
-            4 => MemoryAccessSize::Word,
-            8 => MemoryAccessSize::Doubleword,
-            16 => MemoryAccessSize::Quadword,
-            _ => return FaultDisposition::Fatal,
-        };
-        if site.access.element_index != 0 {
-            return FaultDisposition::Fatal;
-        }
-        let kind = match site.access.kind {
-            NativeMemoryAccessKind::Read => DataAccessKind::Read,
-            NativeMemoryAccessKind::Write => DataAccessKind::Write,
-        };
-        let memory = unsafe { &*call.memory };
-        let Some(guest_address) = call.pointer.checked_sub(context.arena_base) else {
-            return FaultDisposition::Fatal;
-        };
-        match memory.resolve_direct_fault(
-            context.address_space,
-            GuestVirtualAddress::new(guest_address as u64),
-            size,
-            kind,
-        ) {
-            DirectFaultResolution::Retry => FaultDisposition::Retry,
-            DirectFaultResolution::Cold => {
-                // Fixed stubs enter only after checked page-local RAM eligibility.
-                call.backend_error = Some(
-                    "eligible fixed memory stub unexpectedly requires typed completion".into(),
-                );
-                FaultDisposition::Escape
-            }
-            DirectFaultResolution::Fault(fault) => {
-                call.data_fault = Some(fault);
-                FaultDisposition::Escape
-            }
-            DirectFaultResolution::Fatal(detail) => {
-                call.backend_error = Some(detail);
-                FaultDisposition::Escape
-            }
-        }
-    }))
-    .unwrap_or(FaultDisposition::Fatal)
-}
-
-fn memory_stub(size: MemoryAccessSize, kind: DataAccessKind) -> usize {
-    match (kind, size) {
-        (DataAccessKind::Read, MemoryAccessSize::Byte) => function_address(nixe_direct_stub_read_1),
-        (DataAccessKind::Read, MemoryAccessSize::Halfword) => {
-            function_address(nixe_direct_stub_read_2)
-        }
-        (DataAccessKind::Read, MemoryAccessSize::Word) => function_address(nixe_direct_stub_read_4),
-        (DataAccessKind::Read, MemoryAccessSize::Doubleword) => {
-            function_address(nixe_direct_stub_read_8)
-        }
-        (DataAccessKind::Read, MemoryAccessSize::Quadword) => {
-            function_address(nixe_direct_stub_read_16)
-        }
-        (DataAccessKind::Write, MemoryAccessSize::Byte) => {
-            function_address(nixe_direct_stub_write_1)
-        }
-        (DataAccessKind::Write, MemoryAccessSize::Halfword) => {
-            function_address(nixe_direct_stub_write_2)
-        }
-        (DataAccessKind::Write, MemoryAccessSize::Word) => {
-            function_address(nixe_direct_stub_write_4)
-        }
-        (DataAccessKind::Write, MemoryAccessSize::Doubleword) => {
-            function_address(nixe_direct_stub_write_8)
-        }
-        (DataAccessKind::Write, MemoryAccessSize::Quadword) => {
-            function_address(nixe_direct_stub_write_16)
-        }
-    }
-}
-
-fn function_address(function: unsafe extern "C" fn(*mut libc::c_void)) -> usize {
-    function as *const () as usize
-}
-
-fn memory_stub_registry() -> Result<&'static NativeFaultRegistry, FaultRuntimeError> {
-    static REGISTRY: OnceLock<Result<NativeFaultRegistry, FaultRuntimeError>> = OnceLock::new();
-    REGISTRY
-        .get_or_init(|| {
-            NativeFaultRegistry::new(vec![
-                memory_stub_region(
-                    function_address(nixe_direct_stub_read_1),
-                    std::ptr::addr_of!(nixe_direct_stub_read_1_end).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_read_1_fault).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_read_1_after).addr(),
-                    DataAccessKind::Read,
-                    1,
-                ),
-                memory_stub_region(
-                    function_address(nixe_direct_stub_read_2),
-                    std::ptr::addr_of!(nixe_direct_stub_read_2_end).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_read_2_fault).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_read_2_after).addr(),
-                    DataAccessKind::Read,
-                    2,
-                ),
-                memory_stub_region(
-                    function_address(nixe_direct_stub_read_4),
-                    std::ptr::addr_of!(nixe_direct_stub_read_4_end).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_read_4_fault).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_read_4_after).addr(),
-                    DataAccessKind::Read,
-                    4,
-                ),
-                memory_stub_region(
-                    function_address(nixe_direct_stub_read_8),
-                    std::ptr::addr_of!(nixe_direct_stub_read_8_end).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_read_8_fault).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_read_8_after).addr(),
-                    DataAccessKind::Read,
-                    8,
-                ),
-                memory_stub_region(
-                    function_address(nixe_direct_stub_read_16),
-                    std::ptr::addr_of!(nixe_direct_stub_read_16_end).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_read_16_fault).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_read_16_after).addr(),
-                    DataAccessKind::Read,
-                    16,
-                ),
-                memory_stub_region(
-                    function_address(nixe_direct_stub_write_1),
-                    std::ptr::addr_of!(nixe_direct_stub_write_1_end).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_write_1_fault).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_write_1_after).addr(),
-                    DataAccessKind::Write,
-                    1,
-                ),
-                memory_stub_region(
-                    function_address(nixe_direct_stub_write_2),
-                    std::ptr::addr_of!(nixe_direct_stub_write_2_end).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_write_2_fault).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_write_2_after).addr(),
-                    DataAccessKind::Write,
-                    2,
-                ),
-                memory_stub_region(
-                    function_address(nixe_direct_stub_write_4),
-                    std::ptr::addr_of!(nixe_direct_stub_write_4_end).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_write_4_fault).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_write_4_after).addr(),
-                    DataAccessKind::Write,
-                    4,
-                ),
-                memory_stub_region(
-                    function_address(nixe_direct_stub_write_8),
-                    std::ptr::addr_of!(nixe_direct_stub_write_8_end).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_write_8_fault).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_write_8_after).addr(),
-                    DataAccessKind::Write,
-                    8,
-                ),
-                memory_stub_region(
-                    function_address(nixe_direct_stub_write_16),
-                    std::ptr::addr_of!(nixe_direct_stub_write_16_end).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_write_16_fault).addr(),
-                    std::ptr::addr_of!(nixe_direct_stub_write_16_after).addr(),
-                    DataAccessKind::Write,
-                    16,
-                ),
-            ])
-        })
-        .as_ref()
-        .map_err(Clone::clone)
-}
-
-fn memory_stub_region(
-    native_start: usize,
-    native_end: usize,
-    site_start: usize,
-    site_end: usize,
-    kind: DataAccessKind,
-    size: u8,
-) -> NativeFaultRegion {
-    NativeFaultRegion {
-        native_start,
-        native_end,
-        sites: Box::from([NativeFaultSite {
-            native_start: site_start,
-            native_end: site_end,
-            access: NativeMemoryAccess {
-                address_space: AddressSpaceId::new(0),
-                guest_pc: GuestVirtualAddress::new(0),
-                kind: match kind {
-                    DataAccessKind::Read => NativeMemoryAccessKind::Read,
-                    DataAccessKind::Write => NativeMemoryAccessKind::Write,
-                },
-                size,
-                element_index: 0,
-            },
-        }]),
-    }
-}
-
-unsafe extern "C" {
-    fn nixe_direct_stub_read_1(call: *mut libc::c_void);
-    fn nixe_direct_stub_read_2(call: *mut libc::c_void);
-    fn nixe_direct_stub_read_4(call: *mut libc::c_void);
-    fn nixe_direct_stub_read_8(call: *mut libc::c_void);
-    fn nixe_direct_stub_read_16(call: *mut libc::c_void);
-    fn nixe_direct_stub_write_1(call: *mut libc::c_void);
-    fn nixe_direct_stub_write_2(call: *mut libc::c_void);
-    fn nixe_direct_stub_write_4(call: *mut libc::c_void);
-    fn nixe_direct_stub_write_8(call: *mut libc::c_void);
-    fn nixe_direct_stub_write_16(call: *mut libc::c_void);
-    static nixe_direct_stub_read_1_fault: u8;
-    static nixe_direct_stub_read_1_after: u8;
-    static nixe_direct_stub_read_1_end: u8;
-    static nixe_direct_stub_read_2_fault: u8;
-    static nixe_direct_stub_read_2_after: u8;
-    static nixe_direct_stub_read_2_end: u8;
-    static nixe_direct_stub_read_4_fault: u8;
-    static nixe_direct_stub_read_4_after: u8;
-    static nixe_direct_stub_read_4_end: u8;
-    static nixe_direct_stub_read_8_fault: u8;
-    static nixe_direct_stub_read_8_after: u8;
-    static nixe_direct_stub_read_8_end: u8;
-    static nixe_direct_stub_read_16_fault: u8;
-    static nixe_direct_stub_read_16_after: u8;
-    static nixe_direct_stub_read_16_end: u8;
-    static nixe_direct_stub_write_1_fault: u8;
-    static nixe_direct_stub_write_1_after: u8;
-    static nixe_direct_stub_write_1_end: u8;
-    static nixe_direct_stub_write_2_fault: u8;
-    static nixe_direct_stub_write_2_after: u8;
-    static nixe_direct_stub_write_2_end: u8;
-    static nixe_direct_stub_write_4_fault: u8;
-    static nixe_direct_stub_write_4_after: u8;
-    static nixe_direct_stub_write_4_end: u8;
-    static nixe_direct_stub_write_8_fault: u8;
-    static nixe_direct_stub_write_8_after: u8;
-    static nixe_direct_stub_write_8_end: u8;
-    static nixe_direct_stub_write_16_fault: u8;
-    static nixe_direct_stub_write_16_after: u8;
-    static nixe_direct_stub_write_16_end: u8;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1300,11 +642,6 @@ unsafe extern "C" {
         entry: usize,
         gateway: NativeGateway,
     ) -> u32;
-    fn nixe_direct_stub_invoke(
-        slot: *mut libc::c_void,
-        context: *mut libc::c_void,
-        entry: usize,
-    ) -> u32;
     fn nixe_direct_fault_landing_pad();
     fn nixe_direct_escape_now(pc: usize, sp: usize) -> !;
     #[cfg(target_arch = "x86_64")]
@@ -1326,19 +663,13 @@ unsafe extern "C" fn nixe_direct_prepare_escape(
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn nixe_direct_fault_dispatch(slot: *mut FaultSlot) -> ! {
-    // Lock order for every production dispatcher is deliberately one-way:
-    // immutable captured/site data -> memory mapping snapshot -> backing/page
-    // transition -> mapping revalidation/protection publication. The signal
-    // handler owns none of those locks, and fault-time resolution never tries
-    // to acquire the exclusive execution gate while its caller holds a shared
-    // native-execution lease.
+    // The signal handler captures registers only. The owning JIT attributes the
+    // PC and resolves memory outside the handler, using its live code directory.
+    // The JIT owns attribution, as in Dynarmic's SigHandler::SigAction:
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/backend/exception_handler_posix.cpp
     let slot = unsafe { &*slot };
-    // A pending native retry at the same PC and failing byte after a claimed
-    // repair is fatal BEFORE asking policy to repair again. JIT callback
-    // continuations complete the access and leave no pending retry. Fixed
-    // stubs retain their existing retry bound.
-    if slot.registry.load(Ordering::Relaxed).is_null()
-        && slot.retry_count.load(Ordering::Relaxed) != 0
+    // A claimed repair must make progress before policy is called again.
+    if slot.retry_pending.load(Ordering::Relaxed)
         && slot.retry_pc.load(Ordering::Relaxed) == slot.native_pc.load(Ordering::Relaxed)
         && slot.retry_address.load(Ordering::Relaxed) == slot.fault_address.load(Ordering::Relaxed)
     {
@@ -1351,7 +682,6 @@ unsafe extern "C" fn nixe_direct_fault_dispatch(slot: *mut FaultSlot) -> ! {
     let dispatcher = unsafe { std::mem::transmute::<usize, FaultDispatcher>(dispatcher) };
     let mut fault = CapturedFault {
         slot: unsafe { NonNull::new_unchecked(slot as *const FaultSlot as *mut FaultSlot) },
-        site: unsafe { slot.site.load(Ordering::Acquire).as_ref() },
         lifetime: std::marker::PhantomData,
     };
     let disposition = unsafe { dispatcher(slot.opaque.load(Ordering::Relaxed), &mut fault) };
@@ -1360,23 +690,13 @@ unsafe extern "C" fn nixe_direct_fault_dispatch(slot: *mut FaultSlot) -> ! {
             if disposition == FaultDisposition::Retry {
                 let native_pc = slot.native_pc.load(Ordering::Relaxed);
                 let fault_address = slot.fault_address.load(Ordering::Relaxed);
-                let repeated = slot.retry_pc.load(Ordering::Relaxed) == native_pc
-                    && slot.retry_address.load(Ordering::Relaxed) == fault_address;
-                let attempts = if repeated {
-                    slot.retry_count.fetch_add(1, Ordering::Relaxed) + 1
-                } else {
-                    slot.retry_pc.store(native_pc, Ordering::Relaxed);
-                    slot.retry_address.store(fault_address, Ordering::Relaxed);
-                    slot.retry_count.store(1, Ordering::Relaxed);
-                    1
-                };
-                if attempts > MAX_UNCHANGED_RETRIES {
-                    fatal::terminate(slot, fatal::Reason::RetryLimit);
-                }
+                slot.retry_pc.store(native_pc, Ordering::Relaxed);
+                slot.retry_address.store(fault_address, Ordering::Relaxed);
+                slot.retry_pending.store(true, Ordering::Relaxed);
             } else {
                 // The callback resumes after the completed access. A later
                 // fault at the same PC/address can be another loop iteration.
-                slot.retry_count.store(0, Ordering::Relaxed);
+                slot.retry_pending.store(false, Ordering::Relaxed);
             }
             #[cfg(target_arch = "x86_64")]
             {
@@ -1472,15 +792,7 @@ unsafe extern "C" fn signal_handler(
     let context = context.cast::<libc::ucontext_t>();
     let arena_base = slot.arena_base.load(Ordering::Relaxed);
     let arena_guard_end = slot.arena_guard_end.load(Ordering::Relaxed);
-    let registry = slot.registry.load(Ordering::Acquire);
-    let site = (!registry.is_null())
-        .then(|| unsafe { &*registry }.find(native_pc))
-        .flatten();
     if fault_address < arena_base || fault_address >= arena_guard_end {
-        slot.dispatching.store(false, Ordering::Release);
-        unsafe { chain_or_reraise(signal, info, context.cast()) };
-    }
-    if !registry.is_null() && site.is_none() {
         slot.dispatching.store(false, Ordering::Release);
         unsafe { chain_or_reraise(signal, info, context.cast()) };
     }
@@ -1544,12 +856,6 @@ unsafe extern "C" fn signal_handler(
     slot.signal.store(signal, Ordering::Relaxed);
     slot.fault_address.store(fault_address, Ordering::Relaxed);
     slot.native_pc.store(native_pc, Ordering::Relaxed);
-    slot.site.store(
-        site.map_or(std::ptr::null_mut(), |site| {
-            std::ptr::from_ref(site).cast_mut()
-        }),
-        Ordering::Release,
-    );
     let dispatch_top = slot.dispatcher_stack_top.load(Ordering::Acquire);
     unsafe { redirect_to_landing(&mut *context, slot, dispatch_top) };
 }
@@ -1747,46 +1053,10 @@ nixe_direct_memory_invoke:
     ret
     .size nixe_direct_memory_invoke,.-nixe_direct_memory_invoke
 
-    .globl nixe_direct_stub_invoke
-    .type nixe_direct_stub_invoke,@function
-nixe_direct_stub_invoke:
-    push rbp
-    mov rbp,rsp
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    sub rsp,8
-    mov r12,rsi
-    mov r13,rdx
-    mov rsi,rsp
-    lea rdx,[rip+.Ldirect_stub_escape]
-    call nixe_direct_prepare_escape
-    mov rdi,r12
-    call r13
-    xor eax,eax
-    jmp .Ldirect_stub_return
-.Ldirect_stub_escape:
-    mov eax,1
-.Ldirect_stub_return:
-    add rsp,8
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    pop rbp
-    ret
-    .size nixe_direct_stub_invoke,.-nixe_direct_stub_invoke
-
     .globl nixe_direct_fault_landing_pad
     .type nixe_direct_fault_landing_pad,@function
 nixe_direct_fault_landing_pad:
-    cmp qword ptr [rdi+{registry}],0
-    jne 1f
     ldmxcsr [rdi+{dispatcher_fp_control}]
-1:
     sub rsp,8
     call nixe_direct_fault_dispatch
     ud2
@@ -1855,90 +1125,7 @@ nixe_direct_retry_trampoline:
     rflags = const offset_of!(ResumeRecord, rflags),
     fpstate = const offset_of!(ResumeRecord, fpstate),
     xstate_features = const offset_of!(ResumeRecord, xstate_features),
-    registry = const offset_of!(FaultSlot, registry),
     dispatcher_fp_control = const offset_of!(FaultSlot, dispatcher_fp_control),
-);
-
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    r#"
-    .text
-    .macro DIRECT_READ name
-    .globl nixe_direct_stub_read_\name
-    .type nixe_direct_stub_read_\name,@function
-nixe_direct_stub_read_\name:
-    mov rax,[rdi]
-    .globl nixe_direct_stub_read_\name\()_fault
-nixe_direct_stub_read_\name\()_fault:
-    .if \name == 16
-    movdqu xmm0,xmmword ptr [rax]
-    .elseif \name == 1
-    movzx eax,byte ptr [rax]
-    .elseif \name == 2
-    movzx eax,word ptr [rax]
-    .elseif \name == 4
-    mov eax,dword ptr [rax]
-    .else
-    mov rax,qword ptr [rax]
-    .endif
-    .globl nixe_direct_stub_read_\name\()_after
-nixe_direct_stub_read_\name\()_after:
-    .if \name == 16
-    movdqu xmmword ptr [rdi+{output}],xmm0
-    .else
-    mov [rdi+{output}],rax
-    .endif
-    ret
-    .globl nixe_direct_stub_read_\name\()_end
-nixe_direct_stub_read_\name\()_end:
-    .size nixe_direct_stub_read_\name,.-nixe_direct_stub_read_\name
-    .endm
-
-    DIRECT_READ 1
-    DIRECT_READ 2
-    DIRECT_READ 4
-    DIRECT_READ 8
-    DIRECT_READ 16
-
-    .macro DIRECT_WRITE name
-    .globl nixe_direct_stub_write_\name
-    .type nixe_direct_stub_write_\name,@function
-nixe_direct_stub_write_\name:
-    mov rax,[rdi]
-    .if \name == 16
-    movdqu xmm0,xmmword ptr [rdi+{value}]
-    .else
-    mov rdx,[rdi+{value}]
-    .endif
-    .globl nixe_direct_stub_write_\name\()_fault
-nixe_direct_stub_write_\name\()_fault:
-    .if \name == 16
-    movdqu xmmword ptr [rax],xmm0
-    .elseif \name == 1
-    mov byte ptr [rax],dl
-    .elseif \name == 2
-    mov word ptr [rax],dx
-    .elseif \name == 4
-    mov dword ptr [rax],edx
-    .else
-    mov qword ptr [rax],rdx
-    .endif
-    .globl nixe_direct_stub_write_\name\()_after
-nixe_direct_stub_write_\name\()_after:
-    ret
-    .globl nixe_direct_stub_write_\name\()_end
-nixe_direct_stub_write_\name\()_end:
-    .size nixe_direct_stub_write_\name,.-nixe_direct_stub_write_\name
-    .endm
-
-    DIRECT_WRITE 1
-    DIRECT_WRITE 2
-    DIRECT_WRITE 4
-    DIRECT_WRITE 8
-    DIRECT_WRITE 16
-"#,
-    value = const offset_of!(StubCall, value),
-    output = const offset_of!(StubCall, output),
 );
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -2227,36 +1414,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Barrier;
 
-    use nixe_cpu::memory::{ExecutionMemory, MemoryPermissions};
-    use nixe_memory::{
-        CanonicalBackingPage, CanonicalBackingStore, CanonicalRangeTranslator, ContentGeneration,
-        CpuVisibilityRequest, DeviceAccessDeclaration, DeviceVisibilityPoint,
-        DeviceVisibilityRequest, DirectArena, DirectBackendPolicy, DirectMapRequest,
-        DirectProtectRequest, DirectProtection, GuestPhysicalPageId, NonCpuDeviceId,
-        VisibilityCoordinator, VisibilityCoordinatorError, VisibilityState,
-    };
-
-    struct DeviceWriteback {
-        bytes: Box<[u8]>,
-    }
-
-    impl VisibilityCoordinator for DeviceWriteback {
-        fn cache_cpu_page(
-            &self,
-            _request: DeviceVisibilityRequest,
-            _canonical_bytes: &[u8],
-        ) -> Result<(), VisibilityCoordinatorError> {
-            Ok(())
-        }
-
-        fn make_cpu_visible(
-            &self,
-            _request: CpuVisibilityRequest,
-        ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
-            Ok(self.bytes.clone())
-        }
-    }
-
     #[repr(C)]
     struct SyntheticContext {
         address: *const u8,
@@ -2280,21 +1437,13 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     unsafe extern "C" {
         fn nixe_x86_retry_probe(context: *mut libc::c_void);
-        static nixe_x86_retry_probe_fault: u8;
-        static nixe_x86_retry_probe_end: u8;
         fn nixe_x86_retry_store_probe(context: *mut libc::c_void);
-        static nixe_x86_retry_store_probe_fault: u8;
-        static nixe_x86_retry_store_probe_end: u8;
     }
 
     #[cfg(target_arch = "aarch64")]
     unsafe extern "C" {
         fn nixe_aarch64_retry_probe(context: *mut libc::c_void);
-        static nixe_aarch64_retry_probe_fault: u8;
-        static nixe_aarch64_retry_probe_end: u8;
         fn nixe_aarch64_retry_store_probe(context: *mut libc::c_void);
-        static nixe_aarch64_retry_store_probe_fault: u8;
-        static nixe_aarch64_retry_store_probe_end: u8;
     }
 
     #[inline(never)]
@@ -2339,14 +1488,8 @@ mod tests {
         opaque: *mut libc::c_void,
         _fault: *mut CapturedFault,
     ) -> FaultDisposition {
-        let arena = unsafe { &*opaque.cast::<DirectArena>() };
-        arena
-            .protect_ranges(&[DirectProtectRequest {
-                guest_address: 0x1000,
-                size: 4096,
-                protection: DirectProtection::Read,
-            }])
-            .unwrap();
+        let arena = unsafe { &*opaque.cast::<TestArena>() };
+        arena.protect(libc::PROT_READ);
         FaultDisposition::Retry
     }
 
@@ -2354,19 +1497,13 @@ mod tests {
         opaque: *mut libc::c_void,
         _fault: *mut CapturedFault,
     ) -> FaultDisposition {
-        let arena = unsafe { &*opaque.cast::<DirectArena>() };
-        arena
-            .protect_ranges(&[DirectProtectRequest {
-                guest_address: 0x1000,
-                size: 4096,
-                protection: DirectProtection::ReadWrite,
-            }])
-            .unwrap();
+        let arena = unsafe { &*opaque.cast::<TestArena>() };
+        arena.protect(libc::PROT_READ | libc::PROT_WRITE);
         FaultDisposition::Retry
     }
 
     struct ConcurrentRetry {
-        arena: Arc<DirectArena>,
+        arena: Arc<TestArena>,
         faults: Barrier,
     }
 
@@ -2376,14 +1513,7 @@ mod tests {
     ) -> FaultDisposition {
         let retry = unsafe { &*opaque.cast::<ConcurrentRetry>() };
         retry.faults.wait();
-        retry
-            .arena
-            .protect_ranges(&[DirectProtectRequest {
-                guest_address: 0x1000,
-                size: 4096,
-                protection: DirectProtection::Read,
-            }])
-            .unwrap();
+        retry.arena.protect(libc::PROT_READ);
         FaultDisposition::Retry
     }
 
@@ -2477,59 +1607,76 @@ mod tests {
         unsafe { libc::_exit(77) }
     }
 
-    fn fixture() -> (DirectArena, Arc<NativeFaultRegistry>) {
-        let store = CanonicalBackingStore::allocate().unwrap();
-        let page = CanonicalBackingPage::initialized(
-            &store,
-            GuestPhysicalPageId::new(1),
-            &vec![0x5a; 4096],
-            ContentGeneration::INITIAL,
-        )
-        .unwrap();
-        let backing = page.direct_backing().unwrap();
-        let arena = DirectArena::new(0x4000).unwrap();
-        arena
-            .map_pages(&[DirectMapRequest {
-                guest_address: 0x1000,
-                backing: &backing,
-                protection: DirectProtection::None,
-            }])
-            .unwrap();
-        let start = faulting_read as *const () as usize;
-        let site = NativeFaultSite {
-            native_start: start,
-            native_end: start + 256,
-            access: NativeMemoryAccess {
-                address_space: AddressSpaceId::new(1),
-                guest_pc: GuestVirtualAddress::new(0x8000),
-                kind: NativeMemoryAccessKind::Read,
-                size: 1,
-                element_index: 0,
-            },
-        };
-        let registry = NativeFaultRegistry::new(vec![NativeFaultRegion {
-            native_start: start,
-            native_end: start + 256,
-            sites: Box::from([site]),
-        }])
-        .unwrap();
-        (arena, Arc::new(registry))
+    struct TestArena(usize);
+    unsafe impl Send for TestArena {}
+    unsafe impl Sync for TestArena {}
+    impl TestArena {
+        fn new() -> Self {
+            let pointer = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    0x5000,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(pointer, libc::MAP_FAILED);
+            unsafe { pointer.cast::<u8>().add(0x1000).write_bytes(0x5a, 0x1000) };
+            let arena = Self(pointer as usize);
+            arena.protect(libc::PROT_NONE);
+            arena
+        }
+        fn range(&self) -> std::ops::Range<usize> {
+            self.0..self.0 + 0x4000
+        }
+        fn protect(&self, protection: i32) {
+            assert_eq!(
+                unsafe { libc::mprotect((self.0 + 0x1000) as *mut _, 0x1000, protection) },
+                0
+            );
+        }
+    }
+    impl Drop for TestArena {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { libc::munmap(self.0 as *mut _, 0x5000) }, 0);
+        }
+    }
+    fn caller_fp() -> [u64; 2] {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut mxcsr = 0u32;
+            unsafe {
+                core::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack, preserves_flags))
+            };
+            [u64::from(mxcsr), 0]
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let control: u64;
+            let status: u64;
+            unsafe {
+                core::arch::asm!("mrs {},fpcr", "mrs {},fpsr", out(reg) control, out(reg) status, options(nostack, preserves_flags))
+            };
+            [control, status]
+        }
     }
 
     #[test]
     fn attributed_fault_dispatches_after_sigreturn_and_retries_once() {
-        let (arena, registry) = fixture();
-        let view = arena.view();
+        let arena = TestArena::new();
+        let arena_range = arena.range();
         let mut context = SyntheticContext {
-            address: (view.base + 0x1000) as *const u8,
+            address: (arena_range.start + 0x1000) as *const u8,
             observed: 0,
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
             worker
-                .begin_batch(
-                    view,
-                    &registry,
+                .begin_capture(
+                    arena_range.clone(),
+                    caller_fp(),
                     retry,
                     std::ptr::from_ref(&arena).cast_mut().cast(),
                 )
@@ -2547,28 +1694,28 @@ mod tests {
 
     #[test]
     fn simultaneous_workers_retry_their_native_load_after_one_page_transition() {
-        let (arena, registry) = fixture();
+        let arena = TestArena::new();
         let arena = Arc::new(arena);
-        let view = arena.view();
+        let arena_range = arena.range();
         let retry = Arc::new(ConcurrentRetry {
             arena: Arc::clone(&arena),
             faults: Barrier::new(3),
         });
         let workers = (0..2)
             .map(|_| {
-                let registry = Arc::clone(&registry);
                 let retry = Arc::clone(&retry);
+                let arena_range = arena_range.clone();
                 std::thread::spawn(move || {
                     let mut context = SyntheticContext {
-                        address: (view.base + 0x1000) as *const u8,
+                        address: (arena_range.start + 0x1000) as *const u8,
                         observed: 0,
                     };
                     let mut worker = WorkerFaultContext::register().unwrap();
                     let outcome = unsafe {
                         worker
-                            .begin_batch(
-                                view,
-                                &registry,
+                            .begin_capture(
+                                arena_range.clone(),
+                                caller_fp(),
                                 retry_concurrently,
                                 Arc::as_ptr(&retry).cast_mut().cast(),
                             )
@@ -2599,37 +1746,19 @@ mod tests {
         if !std::arch::is_x86_feature_detected!("avx") {
             return;
         }
-        let (arena, _) = fixture();
-        let view = arena.view();
+        let arena = TestArena::new();
+        let arena_range = arena.range();
         let start = nixe_x86_retry_probe as *const () as usize;
-        let registry = Arc::new(
-            NativeFaultRegistry::new(vec![NativeFaultRegion {
-                native_start: start,
-                native_end: std::ptr::addr_of!(nixe_x86_retry_probe_end).addr(),
-                sites: Box::from([NativeFaultSite {
-                    native_start: std::ptr::addr_of!(nixe_x86_retry_probe_fault).addr(),
-                    native_end: std::ptr::addr_of!(nixe_x86_retry_probe_fault).addr() + 1,
-                    access: NativeMemoryAccess {
-                        address_space: AddressSpaceId::new(1),
-                        guest_pc: GuestVirtualAddress::new(0x8000),
-                        kind: NativeMemoryAccessKind::Read,
-                        size: 1,
-                        element_index: 0,
-                    },
-                }]),
-            }])
-            .unwrap(),
-        );
         let mut context = X86RetryContext {
-            address: (view.base + 0x1000) as *const u8,
+            address: (arena_range.start + 0x1000) as *const u8,
             preserved: 0,
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
             worker
-                .begin_batch(
-                    view,
-                    &registry,
+                .begin_capture(
+                    arena_range.clone(),
+                    caller_fp(),
                     retry,
                     std::ptr::from_ref(&arena).cast_mut().cast(),
                 )
@@ -2649,28 +1778,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn x86_retry_executes_the_faulting_store_once() {
-        let (arena, _) = fixture();
-        let view = arena.view();
+        let arena = TestArena::new();
+        let arena_range = arena.range();
         let start = nixe_x86_retry_store_probe as *const () as usize;
-        let registry = Arc::new(
-            NativeFaultRegistry::new(vec![NativeFaultRegion {
-                native_start: start,
-                native_end: std::ptr::addr_of!(nixe_x86_retry_store_probe_end).addr(),
-                sites: Box::from([NativeFaultSite {
-                    native_start: std::ptr::addr_of!(nixe_x86_retry_store_probe_fault).addr(),
-                    native_end: std::ptr::addr_of!(nixe_x86_retry_store_probe_fault).addr() + 1,
-                    access: NativeMemoryAccess {
-                        address_space: AddressSpaceId::new(1),
-                        guest_pc: GuestVirtualAddress::new(0x8000),
-                        kind: NativeMemoryAccessKind::Write,
-                        size: 8,
-                        element_index: 0,
-                    },
-                }]),
-            }])
-            .unwrap(),
-        );
-        let address = view.base + 0x1000;
+        let address = arena_range.start + 0x1000;
         let mut context = X86RetryContext {
             address: address as *const u8,
             preserved: 0,
@@ -2678,9 +1789,9 @@ mod tests {
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
             worker
-                .begin_batch(
-                    view,
-                    &registry,
+                .begin_capture(
+                    arena_range.clone(),
+                    caller_fp(),
                     retry_write,
                     std::ptr::from_ref(&arena).cast_mut().cast(),
                 )
@@ -2703,37 +1814,19 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn aarch64_retry_restores_gprs_nzcv_fp_and_simd_state() {
-        let (arena, _) = fixture();
-        let view = arena.view();
+        let arena = TestArena::new();
+        let arena_range = arena.range();
         let start = nixe_aarch64_retry_probe as *const () as usize;
-        let registry = Arc::new(
-            NativeFaultRegistry::new(vec![NativeFaultRegion {
-                native_start: start,
-                native_end: std::ptr::addr_of!(nixe_aarch64_retry_probe_end).addr(),
-                sites: Box::from([NativeFaultSite {
-                    native_start: std::ptr::addr_of!(nixe_aarch64_retry_probe_fault).addr(),
-                    native_end: std::ptr::addr_of!(nixe_aarch64_retry_probe_fault).addr() + 4,
-                    access: NativeMemoryAccess {
-                        address_space: AddressSpaceId::new(1),
-                        guest_pc: GuestVirtualAddress::new(0x8000),
-                        kind: NativeMemoryAccessKind::Read,
-                        size: 1,
-                        element_index: 0,
-                    },
-                }]),
-            }])
-            .unwrap(),
-        );
         let mut context = Aarch64RetryContext {
-            address: (view.base + 0x1000) as *const u8,
+            address: (arena_range.start + 0x1000) as *const u8,
             preserved: 0,
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
             worker
-                .begin_batch(
-                    view,
-                    &registry,
+                .begin_capture(
+                    arena_range.clone(),
+                    caller_fp(),
                     retry,
                     std::ptr::from_ref(&arena).cast_mut().cast(),
                 )
@@ -2753,28 +1846,10 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn aarch64_retry_executes_the_faulting_store_in_place() {
-        let (arena, _) = fixture();
-        let view = arena.view();
+        let arena = TestArena::new();
+        let arena_range = arena.range();
         let start = nixe_aarch64_retry_store_probe as *const () as usize;
-        let registry = Arc::new(
-            NativeFaultRegistry::new(vec![NativeFaultRegion {
-                native_start: start,
-                native_end: std::ptr::addr_of!(nixe_aarch64_retry_store_probe_end).addr(),
-                sites: Box::from([NativeFaultSite {
-                    native_start: std::ptr::addr_of!(nixe_aarch64_retry_store_probe_fault).addr(),
-                    native_end: std::ptr::addr_of!(nixe_aarch64_retry_store_probe_fault).addr() + 4,
-                    access: NativeMemoryAccess {
-                        address_space: AddressSpaceId::new(1),
-                        guest_pc: GuestVirtualAddress::new(0x8000),
-                        kind: NativeMemoryAccessKind::Write,
-                        size: 8,
-                        element_index: 0,
-                    },
-                }]),
-            }])
-            .unwrap(),
-        );
-        let address = view.base + 0x1000;
+        let address = arena_range.start + 0x1000;
         let mut context = Aarch64RetryContext {
             address: address as *const u8,
             preserved: 0,
@@ -2782,9 +1857,9 @@ mod tests {
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
             worker
-                .begin_batch(
-                    view,
-                    &registry,
+                .begin_capture(
+                    arena_range.clone(),
+                    caller_fp(),
                     retry_write,
                     std::ptr::from_ref(&arena).cast_mut().cast(),
                 )
@@ -2803,16 +1878,21 @@ mod tests {
 
     #[test]
     fn attributed_fault_can_escape_without_retrying_the_access() {
-        let (arena, registry) = fixture();
-        let view = arena.view();
+        let arena = TestArena::new();
+        let arena_range = arena.range();
         let mut context = SyntheticContext {
-            address: (view.base + 0x1000) as *const u8,
+            address: (arena_range.start + 0x1000) as *const u8,
             observed: 0,
         };
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
             worker
-                .begin_batch(view, &registry, escape, std::ptr::null_mut())
+                .begin_capture(
+                    arena_range.clone(),
+                    caller_fp(),
+                    escape,
+                    std::ptr::null_mut(),
+                )
                 .unwrap();
             worker.invoke_active(NativeInvocation {
                 gateway,
@@ -2827,20 +1907,20 @@ mod tests {
 
     #[test]
     fn attributed_sigbus_is_distinguished_and_can_escape() {
-        let (arena, registry) = fixture();
-        let view = arena.view();
+        let arena = TestArena::new();
+        let arena_range = arena.range();
         let name = CString::new("nixe-direct-sigbus-test").unwrap();
         let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
         assert!(fd >= 0);
         assert_eq!(
-            unsafe { libc::ftruncate(fd, DIRECT_PAGE_SIZE as libc::off_t) },
+            unsafe { libc::ftruncate(fd, PAGE_SIZE as usize as libc::off_t) },
             0
         );
-        let target = (view.base + 0x1000) as *mut libc::c_void;
+        let target = (arena_range.start + 0x1000) as *mut libc::c_void;
         let mapped = unsafe {
             libc::mmap(
                 target,
-                DIRECT_PAGE_SIZE,
+                PAGE_SIZE as usize,
                 libc::PROT_READ,
                 libc::MAP_SHARED | libc::MAP_FIXED,
                 fd,
@@ -2856,7 +1936,12 @@ mod tests {
         let mut worker = WorkerFaultContext::register().unwrap();
         let outcome = unsafe {
             worker
-                .begin_batch(view, &registry, escape, std::ptr::null_mut())
+                .begin_capture(
+                    arena_range.clone(),
+                    caller_fp(),
+                    escape,
+                    std::ptr::null_mut(),
+                )
                 .unwrap();
             worker.invoke_active(NativeInvocation {
                 gateway,
@@ -2866,14 +1951,9 @@ mod tests {
         }
         .unwrap();
         assert_eq!(outcome, InvocationOutcome::Escaped);
-        drop(registry);
         {
             let fault = worker.escaped_fault().unwrap();
             assert_eq!(fault.fault_address(), target.addr());
-            assert!(
-                fault.site.is_none(),
-                "escaped image cannot borrow the old registry"
-            );
             assert!(fault.native_pc() >= faulting_read as *const () as usize);
             assert!(fault.integer(0).is_some());
             assert!(fault.integer(32).is_none());
@@ -2882,16 +1962,16 @@ mod tests {
             assert!(fault.fp().is_some());
         }
         unsafe {
-            worker.begin_batch(
-                view,
-                memory_stub_registry().unwrap(),
+            worker.begin_capture(
+                arena_range.clone(),
+                caller_fp(),
                 escape,
                 std::ptr::null_mut(),
             )
         }
         .unwrap();
         assert!(worker.escaped_fault().is_err());
-        worker.end_batch().unwrap();
+        worker.end_capture().unwrap();
         assert!(
             worker.escaped_fault().is_err(),
             "a new batch invalidates the old capture"
@@ -2940,20 +2020,19 @@ mod tests {
 
     #[test]
     fn unregistered_worker_cannot_touch_a_replacement_batch() {
-        let (arena, _) = fixture();
+        let arena = TestArena::new();
         let mut worker = WorkerFaultContext::register().unwrap();
         worker.unregister().unwrap();
         let mut replacement = WorkerFaultContext::register().unwrap();
         // Reuse the original slot and leave the replacement snapshot active.
         let slot = unsafe { replacement.slot.as_ref() };
         slot.active.store(true, Ordering::Release);
-        assert!(worker.end_batch().is_err());
+        assert!(worker.end_capture().is_err());
         assert!(
             unsafe {
                 worker.begin_capture(
-                    arena.view(),
-                    std::ptr::null_mut(),
-                    None,
+                    arena.range(),
+                    caller_fp(),
                     reject_fault,
                     std::ptr::null_mut(),
                 )
@@ -2961,7 +2040,7 @@ mod tests {
             .is_err()
         );
         assert!(slot.active.load(Ordering::Acquire));
-        replacement.end_batch().unwrap();
+        replacement.end_capture().unwrap();
     }
 
     #[test]
@@ -2985,275 +2064,6 @@ mod tests {
         );
         let replacement = WorkerFaultContext::register().unwrap();
         assert_eq!(replacement.registered_tid(), tid);
-    }
-
-    #[test]
-    fn dropping_a_direct_slice_clears_the_snapshot_but_retains_the_os_worker() {
-        let (arena, _) = fixture();
-        let mut worker = NativeWorker::default();
-        assert!(worker.faults.is_none());
-        let mut frontend =
-            unsafe { DirectMemoryFrontend::new(arena.view(), AddressSpaceId::new(7)) }.unwrap();
-        let slice = frontend.begin_slice(&mut worker).unwrap();
-        let tid = slice.worker.registered_tid();
-        let slot = slice.worker.slot;
-        assert!(unsafe { slot.as_ref() }.active.load(Ordering::Acquire));
-        drop(slice);
-        assert!(!unsafe { slot.as_ref() }.active.load(Ordering::Acquire));
-        drop(frontend);
-        assert_eq!(unsafe { slot.as_ref() }.tid.load(Ordering::Acquire), tid);
-        worker.finish().unwrap();
-        assert!(worker.faults.is_none());
-        assert!(
-            SLOTS
-                .get()
-                .unwrap()
-                .iter()
-                .all(|slot| slot.tid.load(Ordering::Acquire) != tid)
-        );
-        let replacement = WorkerFaultContext::register().unwrap();
-        assert_eq!(replacement.registered_tid(), tid);
-    }
-
-    #[test]
-    fn native_fault_registry_sorts_regions_and_rejects_overlapping_metadata() {
-        let registry = NativeFaultRegistry::new(vec![
-            fake_region(0x2000, 0x2100),
-            fake_region(0x1000, 0x1100),
-        ])
-        .unwrap();
-        assert!(registry.find(0x1018).is_some());
-        assert!(registry.find(0x2018).is_some());
-        assert!(
-            NativeFaultRegistry::new(vec![
-                fake_region(0x1000, 0x1100),
-                fake_region(0x1080, 0x1180),
-            ])
-            .is_err()
-        );
-        let invalid = NativeFaultRegion {
-            native_start: 0x2000,
-            native_end: 0x2100,
-            sites: Box::from([fake_site(0x2010, 0x2050), fake_site(0x2040, 0x2060)]),
-        };
-        assert!(NativeFaultRegistry::new(vec![invalid]).is_err());
-        assert!(NativeFaultRegistry::new(vec![fake_region(0x2000, 0x2000)]).is_err());
-    }
-
-    #[test]
-    fn direct_frontend_retries_the_faulting_stub_after_gpu_writeback() {
-        let mut memory = ExecutionMemory::new();
-        let space = AddressSpaceId::new(1);
-        let address = GuestVirtualAddress::new(0x1000);
-        let page = GuestPhysicalPageId::new(1);
-        assert!(memory.add_ram_page(page));
-        assert!(memory.map_page(space, address, page, MemoryPermissions::READ_WRITE));
-        memory
-            .bind_cpu_memory_backend(space, 0x4000, DirectBackendPolicy::Required)
-            .unwrap();
-        let range = memory
-            .translate_canonical_range(
-                space,
-                address,
-                DIRECT_PAGE_SIZE as u64,
-                MemoryPermissions::READ,
-            )
-            .unwrap();
-        let mut bytes = vec![0; DIRECT_PAGE_SIZE];
-        bytes[9] = 0xa5;
-        let coordinator: Arc<dyn VisibilityCoordinator> = Arc::new(DeviceWriteback {
-            bytes: bytes.into_boxed_slice(),
-        });
-        let declaration = DeviceAccessDeclaration::write(
-            NonCpuDeviceId::new(4),
-            DeviceVisibilityPoint::new(11),
-            DeviceVisibilityPoint::new(12),
-        )
-        .unwrap();
-        nixe_memory::CanonicalBackingRange::prepare_resident_device_accesses(
-            [(&range, declaration)],
-            coordinator.as_ref(),
-        )
-        .unwrap();
-        nixe_memory::CanonicalBackingRange::publish_device_writes(
-            [(&range, declaration)],
-            Arc::clone(&coordinator),
-        )
-        .unwrap();
-        assert!(matches!(
-            range.segments()[0].visibility_state(),
-            VisibilityState::GpuNewer { .. }
-        ));
-
-        let mut frontend = unsafe {
-            DirectMemoryFrontend::new(memory.direct_address_space_view(space).unwrap(), space)
-        }
-        .unwrap();
-        let mut worker = NativeWorker::default();
-        let mut frontend = frontend.begin_slice(&mut worker).unwrap();
-        let value = frontend
-            .read(
-                &memory,
-                GuestVirtualAddress::new(address.get() + 9),
-                MemoryAccess::normal(MemoryAccessSize::Byte),
-            )
-            .unwrap();
-
-        assert_eq!(value, MemoryValue::U8(0xa5));
-        assert_eq!(
-            range.segments()[0].visibility_state(),
-            VisibilityState::Clean
-        );
-    }
-
-    #[test]
-    fn direct_frontend_round_trips_one_native_quadword() {
-        let mut memory = ExecutionMemory::new();
-        let space = AddressSpaceId::new(1);
-        let address = GuestVirtualAddress::new(0x1010);
-        let page = GuestPhysicalPageId::new(1);
-        assert!(memory.add_ram_page(page));
-        assert!(memory.map_page(
-            space,
-            GuestVirtualAddress::new(0x1000),
-            page,
-            MemoryPermissions::READ_WRITE,
-        ));
-        memory
-            .bind_cpu_memory_backend(space, 0x4000, DirectBackendPolicy::Required)
-            .unwrap();
-        let mut frontend = unsafe {
-            DirectMemoryFrontend::new(memory.direct_address_space_view(space).unwrap(), space)
-        }
-        .unwrap();
-        let mut worker = NativeWorker::default();
-        let mut frontend = frontend.begin_slice(&mut worker).unwrap();
-        let value = MemoryValue::U128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
-
-        frontend
-            .write(
-                &memory,
-                address,
-                MemoryAccess::normal(MemoryAccessSize::Quadword),
-                value,
-            )
-            .unwrap();
-        assert_eq!(
-            frontend
-                .read(
-                    &memory,
-                    address,
-                    MemoryAccess::normal(MemoryAccessSize::Quadword),
-                )
-                .unwrap(),
-            value,
-        );
-    }
-
-    #[test]
-    fn direct_frontend_confines_each_native_stub_to_one_page() {
-        let (arena, _) = fixture();
-        let frontend =
-            unsafe { DirectMemoryFrontend::new(arena.view(), AddressSpaceId::new(1)) }.unwrap();
-        let page_end = DIRECT_PAGE_SIZE as u64;
-
-        assert!(
-            frontend
-                .direct_pointer(
-                    GuestVirtualAddress::new(page_end - 1),
-                    MemoryAccessSize::Byte,
-                )
-                .is_some()
-        );
-        assert!(
-            frontend
-                .direct_pointer(
-                    GuestVirtualAddress::new(page_end - 1),
-                    MemoryAccessSize::Halfword,
-                )
-                .is_none()
-        );
-        assert!(
-            frontend
-                .direct_pointer(
-                    GuestVirtualAddress::new(page_end - 16),
-                    MemoryAccessSize::Quadword,
-                )
-                .is_some()
-        );
-        assert!(
-            frontend
-                .direct_pointer(
-                    GuestVirtualAddress::new(page_end - 15),
-                    MemoryAccessSize::Quadword,
-                )
-                .is_none()
-        );
-        assert!(
-            frontend
-                .direct_pointer(GuestVirtualAddress::new(0x4000), MemoryAccessSize::Byte)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn immutable_registry_attributes_only_exact_sites_across_pages_and_gaps() {
-        let registry = NativeFaultRegistry::new(vec![
-            NativeFaultRegion {
-                native_start: 0x1000,
-                native_end: 0x4000,
-                sites: Box::from([
-                    fake_site(0x1010, 0x1020),
-                    fake_site(0x1ff8, 0x2008),
-                    fake_site(0x3010, 0x3020),
-                ]),
-            },
-            fake_region(0x4000, 0x4100),
-        ])
-        .unwrap();
-        for (start, end) in [
-            (0x1010, 0x1020),
-            (0x1ff8, 0x2008),
-            (0x3010, 0x3020),
-            (0x4010, 0x4020),
-        ] {
-            for pc in [start, end - 1] {
-                assert_eq!(registry.find(pc), Some(&fake_site(start, end)));
-            }
-            assert!(registry.find(start - 1).is_none());
-            assert!(registry.find(end).is_none());
-        }
-        for pc in [0, 0xfff, 0x1000, 0x3fff, 0x4000, 0x4100, usize::MAX] {
-            assert!(registry.find(pc).is_none());
-        }
-        assert!(
-            NativeFaultRegistry::new(Vec::new())
-                .unwrap()
-                .find(0)
-                .is_none()
-        );
-    }
-
-    fn fake_region(start: usize, end: usize) -> NativeFaultRegion {
-        NativeFaultRegion {
-            native_start: start,
-            native_end: end,
-            sites: Box::from([fake_site(start + 0x10, start + 0x20)]),
-        }
-    }
-
-    fn fake_site(start: usize, end: usize) -> NativeFaultSite {
-        NativeFaultSite {
-            native_start: start,
-            native_end: end,
-            access: NativeMemoryAccess {
-                address_space: AddressSpaceId::new(1),
-                guest_pc: GuestVirtualAddress::new(0x8000),
-                kind: NativeMemoryAccessKind::Read,
-                size: 1,
-                element_index: 0,
-            },
-        }
     }
 
     #[test]
@@ -3304,33 +2114,21 @@ mod tests {
                 0,
             );
         }
-        let (arena, default_registry) = fixture();
-        let view = arena.view();
+        let arena = TestArena::new();
+        let arena_range = arena.range();
         let mut context = SyntheticContext {
             address: if case == "outside_address" || case == "chain" {
                 std::ptr::null()
             } else {
-                (view.base + 0x1000) as *const u8
+                (arena_range.start + 0x1000) as *const u8
             },
             observed: 0,
-        };
-        let registry = if case == "outside_pc" {
-            Arc::new(
-                NativeFaultRegistry::new(vec![NativeFaultRegion {
-                    native_start: faulting_read as *const () as usize,
-                    native_end: faulting_read as *const () as usize + 256,
-                    sites: Box::from([]),
-                }])
-                .unwrap(),
-            )
-        } else {
-            default_registry
         };
         let dispatcher = match case.as_str() {
             "nested" => nested_fault,
             "retry_livelock" => retry_without_progress,
             "captured_retry_livelock" => captured_retry_without_progress,
-            "captured_unattributed" => reject_unattributed,
+            "captured_unattributed" | "outside_pc" => reject_unattributed,
             "captured_panic" => panicking_dispatcher,
             "dispatcher_fatal" | "closed_diagnostic_pipe" => reject_fault,
             _ => escape,
@@ -3357,7 +2155,7 @@ mod tests {
             };
             let _ = unsafe {
                 worker.invoke_captured(
-                    view,
+                    arena_range.start..arena_range.start + arena_range.len(),
                     caller_fp,
                     dispatcher,
                     std::ptr::from_mut(&mut calls).cast(),
@@ -3372,7 +2170,7 @@ mod tests {
         }
         let _ = unsafe {
             worker
-                .begin_batch(view, &registry, dispatcher, std::ptr::null_mut())
+                .begin_capture(arena_range, caller_fp(), dispatcher, std::ptr::null_mut())
                 .unwrap();
             worker.invoke_active(NativeInvocation {
                 gateway,
@@ -3423,9 +2221,9 @@ mod tests {
             let diagnostic = String::from_utf8_lossy(&output.stderr);
             let reason = match case {
                 "nested" => Some("nested-dispatch-fault"),
-                "retry_livelock" => Some("retry-limit"),
+                "retry_livelock" => Some("retry-without-progress"),
                 "captured_retry_livelock" => Some("retry-without-progress"),
-                "captured_unattributed" => Some("unattributed-native-pc"),
+                "captured_unattributed" | "outside_pc" => Some("unattributed-native-pc"),
                 "captured_panic" => Some("dispatcher-panicked"),
                 "dispatcher_fatal" => Some("dispatcher-rejected"),
                 _ => None,
@@ -3458,62 +2256,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn concurrent_first_writers_make_progress_on_one_physical_page() {
-        let mut memory = ExecutionMemory::new();
-        let space = AddressSpaceId::new(1);
-        let address = GuestVirtualAddress::new(0x1000);
-        let page = GuestPhysicalPageId::new(1);
-        assert!(memory.add_ram_page(page));
-        assert!(memory.map_page(space, address, page, MemoryPermissions::READ_WRITE));
-        memory
-            .bind_cpu_memory_backend(space, 0x4000, DirectBackendPolicy::Required)
-            .unwrap();
-        let range = memory
-            .translate_canonical_range(space, address, 1, MemoryPermissions::READ)
-            .unwrap();
-        let cpu_writes = nixe_memory::CanonicalCpuWriteDependency::capture(&range).unwrap();
-        let view = memory.direct_address_space_view(space).unwrap();
-        let memory = Arc::new(memory);
-        let barrier = Arc::new(Barrier::new(3));
-
-        let workers = [0x11_u8, 0x22]
-            .into_iter()
-            .map(|value| {
-                let memory = Arc::clone(&memory);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    let mut direct = unsafe { DirectMemoryFrontend::new(view, space) }.unwrap();
-                    let mut worker = NativeWorker::default();
-                    let mut direct = direct.begin_slice(&mut worker).unwrap();
-                    barrier.wait();
-                    direct
-                        .write(
-                            memory.as_ref(),
-                            address,
-                            MemoryAccess::normal(MemoryAccessSize::Byte),
-                            MemoryValue::U8(value),
-                        )
-                        .unwrap();
-                })
-            })
-            .collect::<Vec<_>>();
-        barrier.wait();
-        for worker in workers {
-            worker.join().unwrap();
-        }
-
-        assert!(!cpu_writes.remains_current());
-        let MemoryValue::U8(observed) = memory
-            .read(space, address, MemoryAccess::normal(MemoryAccessSize::Byte))
-            .unwrap()
-            .value
-        else {
-            unreachable!()
-        };
-        assert!(matches!(observed, 0x11 | 0x22));
     }
 }
 
@@ -3556,47 +2298,13 @@ nixe_direct_memory_invoke:
     ret
     .size nixe_direct_memory_invoke,.-nixe_direct_memory_invoke
 
-    .globl nixe_direct_stub_invoke
-    .type nixe_direct_stub_invoke,%function
-nixe_direct_stub_invoke:
-    stp x29,x30,[sp,#-16]!
-    mov x29,sp
-    stp x19,x20,[sp,#-16]!
-    stp x21,x22,[sp,#-16]!
-    stp x23,x24,[sp,#-16]!
-    stp x25,x26,[sp,#-16]!
-    stp x27,x28,[sp,#-16]!
-    mov x19,x1
-    mov x20,x2
-    mov x1,sp
-    adr x2,.Ldirect_stub_escape
-    bl nixe_direct_prepare_escape
-    mov x0,x19
-    blr x20
-    mov w0,#0
-    b .Ldirect_stub_return
-.Ldirect_stub_escape:
-    mov w0,#1
-.Ldirect_stub_return:
-    ldp x27,x28,[sp],#16
-    ldp x25,x26,[sp],#16
-    ldp x23,x24,[sp],#16
-    ldp x21,x22,[sp],#16
-    ldp x19,x20,[sp],#16
-    ldp x29,x30,[sp],#16
-    ret
-    .size nixe_direct_stub_invoke,.-nixe_direct_stub_invoke
-
     .globl nixe_direct_fault_landing_pad
     .type nixe_direct_fault_landing_pad,%function
 nixe_direct_fault_landing_pad:
-    ldr x9,[x0,#{registry}]
-    cbnz x9,1f
     ldr x9,[x0,#{dispatcher_fp_control}]
     msr fpcr,x9
     ldr x9,[x0,#{dispatcher_fp_status}]
     msr fpsr,x9
-1:
     bl nixe_direct_fault_dispatch
     brk #0
     .size nixe_direct_fault_landing_pad,.-nixe_direct_fault_landing_pad
@@ -3619,69 +2327,6 @@ nixe_direct_retry_signal_frame:
 "#
     ,
     sys_rt_sigreturn = const libc::SYS_rt_sigreturn,
-    registry = const offset_of!(FaultSlot, registry),
     dispatcher_fp_control = const offset_of!(FaultSlot, dispatcher_fp_control),
     dispatcher_fp_status = const offset_of!(FaultSlot, dispatcher_fp_status),
-);
-
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    r#"
-    .text
-    .macro DIRECT_READ name, instruction, result
-    .globl nixe_direct_stub_read_\name
-    .type nixe_direct_stub_read_\name,%function
-nixe_direct_stub_read_\name:
-    ldr x9,[x0]
-    .globl nixe_direct_stub_read_\name\()_fault
-nixe_direct_stub_read_\name\()_fault:
-    \instruction \result,[x9]
-    .globl nixe_direct_stub_read_\name\()_after
-nixe_direct_stub_read_\name\()_after:
-    .if \name == 16
-    str q10,[x0,#{output}]
-    .else
-    str x10,[x0,#{output}]
-    .endif
-    ret
-    .globl nixe_direct_stub_read_\name\()_end
-nixe_direct_stub_read_\name\()_end:
-    .size nixe_direct_stub_read_\name,.-nixe_direct_stub_read_\name
-    .endm
-
-    DIRECT_READ 1, ldrb, w10
-    DIRECT_READ 2, ldrh, w10
-    DIRECT_READ 4, ldr, w10
-    DIRECT_READ 8, ldr, x10
-    DIRECT_READ 16, ldr, q10
-
-    .macro DIRECT_WRITE name, instruction, source
-    .globl nixe_direct_stub_write_\name
-    .type nixe_direct_stub_write_\name,%function
-nixe_direct_stub_write_\name:
-    ldr x9,[x0]
-    .if \name == 16
-    ldr q10,[x0,#{value}]
-    .else
-    ldr x10,[x0,#{value}]
-    .endif
-    .globl nixe_direct_stub_write_\name\()_fault
-nixe_direct_stub_write_\name\()_fault:
-    \instruction \source,[x9]
-    .globl nixe_direct_stub_write_\name\()_after
-nixe_direct_stub_write_\name\()_after:
-    ret
-    .globl nixe_direct_stub_write_\name\()_end
-nixe_direct_stub_write_\name\()_end:
-    .size nixe_direct_stub_write_\name,.-nixe_direct_stub_write_\name
-    .endm
-
-    DIRECT_WRITE 1, strb, w10
-    DIRECT_WRITE 2, strh, w10
-    DIRECT_WRITE 4, str, w10
-    DIRECT_WRITE 8, str, x10
-    DIRECT_WRITE 16, str, q10
-"#,
-    value = const offset_of!(StubCall, value),
-    output = const offset_of!(StubCall, output),
 );

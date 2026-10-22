@@ -1,14 +1,15 @@
 //! Fixed guest workloads for architecture comparisons, using encodings already
 //! covered by tests/differential.rs. Reports wall time separately from JIT ticks.
 use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState};
-use nixe_cpu::memory::{ExecutionMemory, MemoryPermissions};
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
-use nixe_cpu_jit::{JitProcess, JitRunRequest, JitThread, ThreadState};
-use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
-use std::{sync::Arc, time::Instant};
-const SPACE: AddressSpaceId = AddressSpaceId::new(7);
+use nixe_cpu_jit::{JitProcess, JitRunRequest, ThreadState};
+use nixe_memory::{
+    AddressSpace, AddressWidth, AllocationRange, GuestVirtualAddress, Machine, MemoryPermissions,
+    PAGE_SIZE,
+};
+use std::time::Instant;
 struct Timer;
 impl ArchitecturalTimer for Timer {
     fn snapshot(&self) -> TimerSnapshot {
@@ -54,58 +55,62 @@ fn main() {
         "invalidate" | "invalidate-batch" => &[0xd2800540, 0xd4000001],
         _ => &[0xd4000001],
     };
-    let mut memory = ExecutionMemory::new();
-    for id in [1, 2] {
-        assert!(memory.add_ram_page(GuestPhysicalPageId::new(id)));
-    }
-    memory
-        .initialize_ram(
-            GuestPhysicalPageId::new(1),
-            0,
-            &code
-                .iter()
-                .flat_map(|i| i.to_le_bytes())
-                .collect::<Vec<_>>(),
+    let machine = Machine::new(2 * PAGE_SIZE).unwrap();
+    let account = machine.account(2 * PAGE_SIZE).unwrap();
+    let executable = account.allocate(PAGE_SIZE).unwrap();
+    let data = account.allocate(PAGE_SIZE).unwrap();
+    let encoded: Vec<_> = code.iter().flat_map(|word| word.to_le_bytes()).collect();
+    machine
+        .write_resolved(
+            &[AllocationRange::new(executable.pin(), 0, encoded.len() as u64).unwrap()],
+            &encoded,
         )
         .unwrap();
-    for (address, id, permissions) in [
-        (0x1000, 1, MemoryPermissions::READ_EXECUTE),
-        (0x2000, 2, MemoryPermissions::READ_WRITE),
-        (0x3000, 2, MemoryPermissions::READ_WRITE),
-    ] {
-        assert!(memory.map_page(
-            SPACE,
-            GuestVirtualAddress::new(address),
-            GuestPhysicalPageId::new(id),
-            permissions
-        ));
+    let code_word = AllocationRange::new(executable.pin(), 0, 4).unwrap();
+    let memory = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
+    memory
+        .map(
+            GuestVirtualAddress::new(0x1000),
+            executable.clone(),
+            0,
+            PAGE_SIZE,
+            MemoryPermissions::READ_EXECUTE,
+        )
+        .unwrap();
+    for address in [0x2000, 0x3000] {
+        memory
+            .map(
+                GuestVirtualAddress::new(address),
+                data.clone(),
+                0,
+                PAGE_SIZE,
+                MemoryPermissions::READ_WRITE,
+            )
+            .unwrap();
     }
     if workload == "invalidate-batch" {
         // Two compiled aliases and fourteen uncompiled aliases of one page.
-        for address in (0x4000..0x13000).step_by(4096) {
-            assert!(memory.map_page(
-                SPACE,
-                GuestVirtualAddress::new(address),
-                GuestPhysicalPageId::new(1),
-                MemoryPermissions::READ_EXECUTE,
-            ));
+        for address in (0x4000..0x13000).step_by(PAGE_SIZE as usize) {
+            memory
+                .map(
+                    GuestVirtualAddress::new(address),
+                    executable.clone(),
+                    0,
+                    PAGE_SIZE,
+                    MemoryPermissions::READ_EXECUTE,
+                )
+                .unwrap();
         }
     }
-    memory
-        .bind_cpu_memory_backend(SPACE, 0x20000, nixe_memory::DirectBackendPolicy::Required)
-        .unwrap();
-    let memory = Arc::new(memory);
-    let process = Arc::new(
-        JitProcess::new(
-            ProcessCpuContext::for_platform(TargetPlatform::Switch1, SPACE),
-            memory.clone(),
-            19_200_000,
-        )
-        .unwrap(),
-    );
+    let process = JitProcess::new(
+        ProcessCpuContext::for_platform(TargetPlatform::Switch1, memory.identity()),
+        memory,
+        19_200_000,
+    )
+    .unwrap();
     let mut cores = [
-        JitThread::new(process.clone()).unwrap(),
-        JitThread::new(process.clone()).unwrap(),
+        process.create_thread().unwrap(),
+        process.create_thread().unwrap(),
     ];
     let mut states = [ThreadState::default(), ThreadState::default()];
     let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
@@ -181,10 +186,9 @@ fn main() {
                 } else {
                     1
                 } {
-                    memory
-                        .overwrite_mapped_ram(
-                            SPACE,
-                            GuestVirtualAddress::new(0x1000),
+                    machine
+                        .write_resolved(
+                            std::slice::from_ref(&code_word),
                             &instruction.to_le_bytes(),
                         )
                         .unwrap();
@@ -222,10 +226,7 @@ fn main() {
         );
     }
     #[cfg(feature = "performance-counters")]
-    for (name, value) in nixe_cpu_jit::metrics::snapshot()
-        .into_iter()
-        .chain(nixe_memory::metrics::snapshot())
-    {
+    for (name, value) in nixe_cpu_jit::metrics::snapshot() {
         println!("{name}={value}");
     }
 }

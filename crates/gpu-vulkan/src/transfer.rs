@@ -1,5 +1,4 @@
 //! Minimal real copy recorder sharing the owner timeline, arenas and retirement.
-//! Ordered guest resource access/barrier generation is expanded in task 06.
 use crate::{AllocationMode, MemoryLocation, ReadbackTicket, VulkanDevice, VulkanError};
 use ash::vk;
 impl VulkanDevice {
@@ -208,18 +207,20 @@ impl VulkanDevice {
         self.readback(ticket)
     }
 }
-fn host_read_barrier(
+pub(crate) fn host_read_barrier(
     device: &VulkanDevice,
     command: vk::CommandBuffer,
     buffer: vk::Buffer,
     offset: u64,
     size: u64,
 ) {
+    // Publish the download to the host and order the next GPU write when this
+    // completed arena slice is recycled. A counter query alone adds no barrier.
     let barrier = [vk::BufferMemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::COPY)
         .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-        .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-        .dst_access_mask(vk::AccessFlags2::HOST_READ)
+        .dst_stage_mask(vk::PipelineStageFlags2::HOST | vk::PipelineStageFlags2::COPY)
+        .dst_access_mask(vk::AccessFlags2::HOST_READ | vk::AccessFlags2::TRANSFER_WRITE)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .buffer(buffer)

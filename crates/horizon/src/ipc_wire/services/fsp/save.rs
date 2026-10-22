@@ -2,15 +2,15 @@
 use super::super::response::{encode_semantic_response, semantic_error};
 use crate::ipc_wire::io::has_ipc_descriptors;
 use crate::ipc_wire::message::{CmifRequest, HipcRequest};
+use crate::ipc_wire::request::Request;
 use crate::ipc_wire::{IpcWireError, UnsupportedServiceOperation};
 use crate::{
-    HorizonIpcObject, HorizonIpcResult, HostDirectoryFileSystem, IpcResponse, IpcSession,
-    SaveDataSystem, SemanticIpcObject,
+    HorizonIpcResult, HostDirectoryFileSystem, IpcResponse, IpcSession, SaveDataSystem,
+    SemanticIpcObject,
 };
-use nixe_runtime::ExceptionProcessContext;
 
-pub(in crate::ipc_wire::services) fn open_save_data(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire::services) async fn open_save_data(
+    process: &mut Request,
     session: &IpcSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -75,16 +75,13 @@ pub(in crate::ipc_wire::services) fn open_save_data(
     };
     let object =
         SemanticIpcObject::HostDirectoryFileSystem(HostDirectoryFileSystem::from_save(volume));
-    let handle = process
-        .handles_mut()
-        .insert(HorizonIpcObject::SemanticObject(object))
-        .map_err(|_| IpcWireError::Internal("save-data child handle allocation failed"))?;
     encode_semantic_response(
         process,
         Some(session),
         None,
         request,
         hipc,
-        IpcResponse::Handle(handle),
+        IpcResponse::Object(object),
     )
+    .await
 }

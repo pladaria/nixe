@@ -139,7 +139,7 @@ mod tests {
         put_u32(&mut count, 48, 1);
         let hipc = HipcRequest::decode(&count).unwrap();
         let request = CmifRequest::decode(&hipc, false).unwrap();
-        assert_eq!(decode_root_request(&request, &hipc).unwrap(), None);
+        assert!((decode_root_request(&request, &hipc).unwrap()).is_none());
 
         let mut list = [0_u8; COMMAND_BUFFER_SIZE];
         put_u32(&mut list, 0, 4 | (1 << 24));
@@ -170,6 +170,6 @@ mod tests {
         put_u32(&mut without_pid, 24, 2);
         let hipc = HipcRequest::decode(&without_pid).unwrap();
         let request = CmifRequest::decode(&hipc, false).unwrap();
-        assert_eq!(decode_root_request(&request, &hipc).unwrap(), None);
+        assert!((decode_root_request(&request, &hipc).unwrap()).is_none());
     }
 }

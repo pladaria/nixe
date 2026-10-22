@@ -19,9 +19,10 @@ pub use shader::recompiler::MAXWELL_SHADER_NAMESPACE;
 pub use address_space::{
     MAX_MAPPING_DUMP_ENTRIES, MaxwellAddressSpaceError, MaxwellAddressSpaceId,
     MaxwellAddressSpaceInitialization, MaxwellAllocationId, MaxwellGpuAccessError,
-    MaxwellGpuAddressSpace, MaxwellGpuMapping, MaxwellMapRequest, MaxwellMappingDiagnostic,
-    MaxwellMappingDump, MaxwellMappingId, MaxwellResolvedMapping, MaxwellResolvedRange,
-    MaxwellSparseMapping, MaxwellSparseRemapRequest, MaxwellVaRegion, MaxwellVaReservation,
+    MaxwellGpuAddressSpace, MaxwellGpuMapping, MaxwellGpuMemory, MaxwellGpuTranslation,
+    MaxwellMapRequest, MaxwellMappingDiagnostic, MaxwellMappingDump, MaxwellMappingId,
+    MaxwellResolvedMapping, MaxwellResolvedRange, MaxwellSparseMapping, MaxwellSparseRemapRequest,
+    MaxwellVaRegion, MaxwellVaReservation,
 };
 pub use channel::{
     MaxwellChannelConfiguration, MaxwellChannelDriverState, MaxwellChannelError,
@@ -178,8 +179,7 @@ pub use execution::{
 };
 
 pub use frontend::{
-    MAXWELL_FRONTEND_DIAGNOSTIC_WORDS, MaxwellCommandSourceScratch, MaxwellFrontendDiagnostic,
-    MaxwellFrontendDispatchError, diagnose_maxwell_frontend, stream_maxwell_frontend,
+    MaxwellCommandSourceScratch, MaxwellFrontendDispatchError, stream_maxwell_frontend,
 };
 pub use gpfifo::{
     MAXWELL_GPFIFO_CAPTURE_SOURCES, MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellDecodedGpfifoSubmission,
@@ -229,3 +229,6 @@ pub use engines::{
 };
 
 pub use shader::recompiler;
+
+#[cfg(test)]
+mod test_memory;

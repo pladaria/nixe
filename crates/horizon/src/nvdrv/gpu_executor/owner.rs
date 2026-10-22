@@ -4,35 +4,6 @@
 use super::*;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
-
-type VisibilityResult = Result<Box<[u8]>, VisibilityCoordinatorError>;
-struct LocalVisibility {
-    identity: Arc<()>,
-    resolve: Box<dyn Fn(CpuVisibilityRequest) -> VisibilityResult>,
-}
-thread_local! {
-    static LOCAL_VISIBILITY: RefCell<Option<LocalVisibility>> = const { RefCell::new(None) };
-}
-struct VisibilityScope;
-impl Drop for VisibilityScope {
-    fn drop(&mut self) {
-        LOCAL_VISIBILITY.with(|slot| {
-            slot.borrow_mut().take();
-        });
-    }
-}
-pub(super) fn local_visibility(
-    identity: &Arc<()>,
-    request: CpuVisibilityRequest,
-) -> Option<VisibilityResult> {
-    LOCAL_VISIBILITY.with(|slot| {
-        let slot = slot.borrow();
-        slot.as_ref()
-            .filter(|local| Arc::ptr_eq(&local.identity, identity))
-            .map(|local| (local.resolve)(request))
-    })
-}
 
 struct GpuWork<W: MaxwellWork> {
     clock: nixe_runtime::VirtualClock,
@@ -58,7 +29,7 @@ pub(super) fn run<L, E>(
     backend: Rc<RefCell<Option<E>>>,
     frontend: L,
     budget: &GpuWorkBudget,
-    identity: Arc<()>,
+    endpoint: &GpuMemoryEndpoint,
 ) -> Result<(), GpuExecutorFailure>
 where
     L: MaxwellFrontend,
@@ -67,25 +38,28 @@ where
             ImageRequest = <L::Work as MaxwellWork>::ImageRequest,
         >,
 {
-    let local_backend = Rc::clone(&backend);
-    LOCAL_VISIBILITY.with(|slot| {
-        assert!(slot.borrow().is_none());
-        *slot.borrow_mut() = Some(LocalVisibility {
-            identity,
-            resolve: Box::new(move |request| {
-                local_backend.try_borrow_mut()
-                    .map_err(|_| VisibilityCoordinatorError::new("recursive canonical visibility while native recording owns the backend"))?
-                    .as_mut().ok_or_else(|| VisibilityCoordinatorError::new("canonical GPU read requires an accelerated backend"))?
-                    .make_cpu_visible(request).map_err(|error| VisibilityCoordinatorError::new(error.to_string()))
-            }),
-        });
-    });
-    let _scope = VisibilityScope;
     let mut frontend = frontend;
     let mut owner = Owner::new(&receiver, backend, budget);
-    let result = owner.run(&mut frontend);
+    let mut result = owner.run(&mut frontend);
     let shutting_down = budget.is_stopped();
-    owner.cancel();
+    let cause = result
+        .as_ref()
+        .err()
+        .and_then(|error| error.memory_cause.clone())
+        .unwrap_or_else(|| {
+            Arc::new(MemoryError::Execution(result.as_ref().err().map_or_else(
+                || "GPU owner stopped".into(),
+                |error| error.to_string().into(),
+            )))
+        });
+    if let Err(error) = &mut result {
+        error.memory_cause = Some(Arc::clone(&cause));
+    }
+    endpoint.stop(Arc::clone(&cause));
+    if let Some(backend) = owner.backend.borrow_mut().as_mut() {
+        backend.fail_device_accesses(Arc::clone(&cause));
+    }
+    owner.cancel(&cause);
     if shutting_down { Ok(()) } else { result }
 }
 
@@ -98,7 +72,6 @@ struct Owner<
     backend: Rc<RefCell<Option<E>>>,
     budget: &'a GpuWorkBudget,
     deferred: VecDeque<GpuMessage>,
-    visibility: CpuVisibilityQueue,
     sources: nixe_gpu_maxwell::MaxwellCommandSourceScratch,
     pending: VecDeque<PendingWork<W>>,
     conversions: VecDeque<PendingConversion>,
@@ -118,7 +91,6 @@ where
             backend,
             budget,
             deferred: VecDeque::new(),
-            visibility: CpuVisibilityQueue::default(),
             sources: Default::default(),
             pending: VecDeque::new(),
             conversions: VecDeque::new(),
@@ -130,6 +102,7 @@ where
         detail: impl Into<Box<str>>,
     ) -> GpuExecutorFailure {
         GpuExecutorFailure {
+            memory_cause: None,
             frontend,
             boundary: None,
             detail: detail.into(),
@@ -137,10 +110,12 @@ where
     }
     fn poll(&mut self) -> Result<(), GpuExecutorFailure> {
         let mut backend = self.backend.borrow_mut();
-        self.visibility.progress(backend.as_mut());
         let Some(runtime) = backend.as_mut() else {
             return Ok(());
         };
+        runtime
+            .progress_device_accesses()
+            .map_err(|error| self.runtime_failure(FrontendSubmissionId::new(0), error))?;
         runtime
             .service_host()
             .map_err(|error| self.failure(FrontendSubmissionId::new(0), error.to_string()))?;
@@ -181,37 +156,102 @@ where
         Ok(())
     }
     fn flush_progress(&mut self) -> Result<(), GpuExecutorFailure> {
-        if self.pending.is_empty() && self.conversions.is_empty() && self.visibility.is_empty() {
-            return Ok(());
-        }
-        if let Some(runtime) = self.backend.borrow_mut().as_mut() {
-            runtime
-                .request_completion_wakeup()
-                .map_err(|error| self.failure(FrontendSubmissionId::new(0), error.to_string()))?;
-        }
-        Ok(())
+        // Each caller has polled its ready prefix. Registration also delivers
+        // an immediate wake if native completion raced with that poll.
+        self.backend
+            .borrow_mut()
+            .as_mut()
+            .map_or(Ok(()), |runtime| {
+                runtime
+                    .request_completion_wakeup()
+                    .map_err(|error| self.failure(FrontendSubmissionId::new(0), error.to_string()))
+            })
     }
-    fn service_control(&mut self, message: GpuMessage) {
-        match message {
-            GpuMessage::CpuVisibility { request, reply } => {
-                self.visibility
-                    .request(self.backend.borrow_mut().as_mut(), request, reply)
-            }
-            GpuMessage::Wake => self.visibility.progress(self.backend.borrow_mut().as_mut()),
-            message => self.deferred.push_back(message),
+    fn runtime_failure(
+        &self,
+        frontend: FrontendSubmissionId,
+        error: nixe_gpu::BackendRuntimeError,
+    ) -> GpuExecutorFailure {
+        let mut failure = self.failure(frontend, error.to_string());
+        if let nixe_gpu::BackendRuntimeError::Memory(cause) = error {
+            failure.memory_cause = Some(cause);
         }
+        failure
+    }
+    fn service_control(&mut self, message: GpuMessage) -> Result<(), GpuExecutorFailure> {
+        let result = match message {
+            GpuMessage::MemoryAccess(request) => {
+                if let Some(backend) = self.backend.borrow_mut().as_mut() {
+                    backend.queue_device_access(request)
+                } else {
+                    request.finish(Err(Arc::new(MemoryError::Execution(
+                        "GPU backend is unavailable".into(),
+                    ))));
+                    Ok(())
+                }
+            }
+            GpuMessage::CancelMemory(request) => self
+                .backend
+                .borrow_mut()
+                .as_mut()
+                .map_or(Ok(()), |backend| backend.cancel_device_access(request)),
+            GpuMessage::GuestMemoryReleased {
+                machine,
+                allocation,
+            } => self
+                .backend
+                .borrow_mut()
+                .as_mut()
+                .map_or(Ok(()), |backend| {
+                    backend.release_guest_memory(machine, allocation)
+                }),
+            GpuMessage::PhysicalRetired {
+                machine,
+                allocation,
+                extents,
+            } => self
+                .backend
+                .borrow_mut()
+                .as_mut()
+                .map_or(Ok(()), |backend| {
+                    backend.retire_physical_memory(machine, allocation, &extents)
+                }),
+            GpuMessage::AllocationPressure { machine, bytes } => self
+                .backend
+                .borrow_mut()
+                .as_mut()
+                .map_or(Ok(()), |backend| {
+                    backend.allocation_pressure(machine, bytes)
+                }),
+            GpuMessage::Wake => self
+                .backend
+                .borrow_mut()
+                .as_mut()
+                .map_or(Ok(()), GpuExecution::progress_device_accesses),
+            message => {
+                self.deferred.push_back(message);
+                Ok(())
+            }
+        };
+        result.map_err(|error| self.runtime_failure(FrontendSubmissionId::new(0), error))
     }
     fn service_ready_control(&mut self) -> Result<(), GpuExecutorFailure> {
+        // Eden ticks CPU coherency requests after PrepareDraw has consumed its
+        // resources, including when native compilation had to wait. A request
+        // must not resolve against authority missing that pending effect.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+        while matches!(self.deferred.front(), Some(GpuMessage::MemoryAccess(_))) {
+            let message = self.deferred.pop_front().unwrap();
+            self.service_control(message)?;
+        }
         let mut wake = false;
         while let Ok(message) = self.receiver.try_recv() {
             wake |= matches!(message, GpuMessage::Wake);
-            self.service_control(message);
+            self.service_control(message)?;
         }
+        self.poll()?;
         if wake && self.budget.take_progress_request() {
             self.flush_progress()?;
-        }
-        if wake || !self.visibility.is_empty() {
-            self.poll()?;
         }
         Ok(())
     }
@@ -239,33 +279,18 @@ where
                 message
             } else {
                 self.flush_progress()?;
-                let pending = !self.pending.is_empty()
-                    || !self.conversions.is_empty()
-                    || !self.visibility.is_empty()
-                    || self
-                        .backend
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(GpuExecution::host_work_pending);
-                if !pending {
-                    match self.receiver.recv() {
-                        Ok(message) => {
-                            self.service_control(message);
-                            continue;
-                        }
-                        Err(_) => return Ok(()),
-                    }
-                }
-                match self.receiver.recv_timeout(Duration::from_millis(1)) {
+                match self.receiver.recv() {
                     Ok(message) => message,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                    Err(_) => return Ok(()),
                 }
             };
             match message {
-                GpuMessage::Wake | GpuMessage::CpuVisibility { .. } => {
-                    self.service_control(message)
-                }
+                GpuMessage::Wake
+                | GpuMessage::MemoryAccess(_)
+                | GpuMessage::CancelMemory(_)
+                | GpuMessage::GuestMemoryReleased { .. }
+                | GpuMessage::PhysicalRetired { .. }
+                | GpuMessage::AllocationPressure { .. } => self.service_control(message)?,
                 message => self.execute(frontend, &mut channels, message)?,
             }
         }
@@ -329,7 +354,7 @@ where
                 self.conversion(work, reply)
             }
             message => {
-                self.service_control(message);
+                self.service_control(message)?;
                 Ok(())
             }
         }
@@ -426,6 +451,20 @@ where
                 &address_space,
                 frontend,
                 &mut sources,
+                &mut |ranges, operation| {
+                    let mut backend = source_backend.borrow_mut();
+                    let backend = backend.as_mut().ok_or_else(|| {
+                        Arc::new(MemoryError::Invalid(
+                            "graphics memory access requires an accelerated backend",
+                        ))
+                    })?;
+                    backend
+                        .access_memory(ranges, operation)
+                        .map_err(|error| match error {
+                            nixe_gpu::BackendRuntimeError::Memory(cause) => cause,
+                            other => Arc::new(MemoryError::Execution(other.to_string().into())),
+                        })
+                },
                 &mut || {
                     source_backend
                         .borrow_mut()
@@ -446,6 +485,7 @@ where
         };
         self.sources = sources;
         let tail = result.map_err(|failure| GpuExecutorFailure {
+            memory_cause: None,
             frontend: id,
             detail: failure.to_string().into(),
             boundary: Some((
@@ -480,18 +520,23 @@ where
             let segment = {
                 let mut backend = self.backend.borrow_mut();
                 work.execution
-                    .next_segment_with_resolver(
+                    .next_segment_with_memory(
                         nixe_gpu_maxwell::maxwell_gpu_timestamp(work.clock.scheduler_time_ns()),
-                        &mut |_, request| {
+                        &mut |ranges, operation| {
                             backend
                                 .as_mut()
                                 .ok_or_else(|| {
-                                    VisibilityCoordinatorError::new(
-                                        "canonical GPU read requires an accelerated backend",
-                                    )
+                                    Arc::new(MemoryError::Invalid(
+                                        "graphics memory access requires an accelerated backend",
+                                    ))
                                 })?
-                                .make_cpu_visible(request)
-                                .map_err(|error| VisibilityCoordinatorError::new(error.to_string()))
+                                .access_memory(ranges, operation)
+                                .map_err(|error| match error {
+                                    nixe_gpu::BackendRuntimeError::Memory(cause) => cause,
+                                    other => {
+                                        Arc::new(MemoryError::Execution(other.to_string().into()))
+                                    }
+                                })
                         },
                     )
                     .map_err(|error| self.failure(id, error.to_string()))?
@@ -565,23 +610,31 @@ where
         if self.budget.take_progress_request() {
             self.flush_progress()?;
         }
-        match self.receiver.recv_timeout(Duration::from_millis(1)) {
+        // Compiler completion has its own wakeup. Waiting for it does not
+        // require submission or guest-visible completion of unrelated work.
+        match self.receiver.recv() {
+            Ok(message @ GpuMessage::MemoryAccess(_)) => {
+                // Keep the existing between-effect control priority and FIFO
+                // order without servicing guest memory inside preparation.
+                let index = self
+                    .deferred
+                    .iter()
+                    .position(|pending| !matches!(pending, GpuMessage::MemoryAccess(_)))
+                    .unwrap_or(self.deferred.len());
+                self.deferred.insert(index, message);
+                Ok(())
+            }
             Ok(message) => {
-                self.service_control(message);
+                self.service_control(message)?;
                 Ok(())
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.flush_progress()?;
-                Ok(())
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.failure(
+            Err(_) => Err(self.failure(
                 FrontendSubmissionId::new(0),
                 "GPU inbox disconnected during command consumption",
             )),
         }
     }
-    fn cancel(&mut self) {
-        self.visibility.cancel();
+    fn cancel(&mut self, cause: &Arc<MemoryError>) {
         for pending in self.conversions.drain(..) {
             let _ = pending.reply.send(Err("GPU owner is shutting down".into()));
         }
@@ -589,9 +642,7 @@ where
         let deferred = self.deferred.drain(..).chain(self.receiver.try_iter());
         for message in deferred {
             match message {
-                GpuMessage::CpuVisibility { reply, .. } => {
-                    let _ = reply.send(Err("GPU owner is shutting down".into()));
-                }
+                GpuMessage::MemoryAccess(request) => request.finish(Err(Arc::clone(cause))),
                 GpuMessage::ConvertNv12 { reply, .. } | GpuMessage::DecodedPlanes { reply, .. } => {
                     let _ = reply.send(Err("GPU owner is shutting down".into()));
                 }
@@ -607,6 +658,7 @@ fn publish_completion<W: MaxwellWork>(work: GpuWork<W>) -> Result<(), GpuExecuto
     let id = work.execution.frontend();
     if work.execution.completion() != work.reservation.as_ref().map(ReservedTimelinePoint::point) {
         return Err(GpuExecutorFailure {
+            memory_cause: None,
             frontend: id,
             boundary: None,
             detail: "GPU completion does not match its reserved timeline".into(),
@@ -618,6 +670,7 @@ fn publish_completion<W: MaxwellWork>(work: GpuWork<W>) -> Result<(), GpuExecuto
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .complete_channel_submission(work.descriptor, work.request, &reservation)
             .map_err(|error| GpuExecutorFailure {
+                memory_cause: None,
                 frontend: id,
                 boundary: None,
                 detail: format!("guest completion publication failed: {error:?}").into(),

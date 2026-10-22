@@ -3,7 +3,10 @@
 //! NVDEC TBL uses 64x8-byte GOBs and at least two GOBs per block:
 //! https://github.com/averne/FFmpeg/blob/nvtegra/libavutil/hwcontext_nvtegra.c
 use super::Mapping;
-use nixe_memory::{CanonicalBackingRange, CanonicalPageId, CanonicalWriteBatch};
+use nixe_gpu::physical::PhysicalMapping;
+use nixe_memory::{
+    Access, AccessOperation, AccessResult, AllocationId, AllocationRange, ArenaOffset, MachineId,
+};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::Arc;
@@ -27,16 +30,6 @@ unsafe extern "C" {
     fn nixe_video_transfer_free(target: *mut c_void);
     fn nixe_video_error() -> *const c_char;
     fn nixe_video_frame_free(frame: *mut c_void);
-    fn nixe_video_frame_copy(
-        frame: *mut c_void,
-        fd: i32,
-        semaphore_fd: i32,
-        allocation_size: u64,
-        uuid: *const u8,
-        row_pitch: u64,
-        chroma_offset: u64,
-        initialize: c_int,
-    ) -> c_int;
     fn nixe_nvdec_destroy(decoder: *mut c_void);
     fn nixe_nvdec_error(decoder: *const c_void) -> *const c_char;
     fn nixe_nvdec_send(
@@ -107,28 +100,6 @@ impl nixe_gpu::DeviceImageSource for CudaFrame {
             Ok(())
         }
     }
-    fn copy_nv12(&self, target: nixe_gpu::ExternalImageBuffer) -> Result<(), Box<str>> {
-        let result = unsafe {
-            nixe_video_frame_copy(
-                self.0,
-                target.fd,
-                target.semaphore_fd,
-                target.allocation_size,
-                target.device_uuid.as_ptr(),
-                target.row_pitch,
-                target.chroma_offset,
-                c_int::from(target.initialize),
-            )
-        };
-        if result < 0 {
-            Err(unsafe { CStr::from_ptr(nixe_video_error()) }
-                .to_string_lossy()
-                .into_owned()
-                .into_boxed_str())
-        } else {
-            Ok(())
-        }
-    }
 }
 
 fn video_error() -> Box<str> {
@@ -164,7 +135,7 @@ pub(super) fn region(
     mappings: &Mappings,
     address: u64,
     length: usize,
-) -> Result<(CanonicalBackingRange, u64), String> {
+) -> Result<(&Arc<PhysicalMapping>, u64), String> {
     let (&base, mapping) = mappings
         .range(..=u32::try_from(address).map_err(|_| "Host1x address exceeds 32 bits")?)
         .next_back()
@@ -178,36 +149,90 @@ pub(super) fn region(
             "Host1x memory access outside object: address={address:#x} length={length:#x}"
         ));
     }
-    Ok((
-        mapping
-            .object
-            .backing()
-            .ok_or("Host1x object has no canonical backing")?
-            .clone(),
-        offset,
-    ))
+    Ok((&mapping.physical, offset))
+}
+/// Runs only on the Host1x worker. No driver, channel or nvmap lock is held
+/// while another device completes this exact physical operation.
+fn access(ranges: &[AllocationRange], operation: AccessOperation) -> Result<AccessResult, String> {
+    let machine = ranges
+        .first()
+        .ok_or("Host1x access has no physical spans")?
+        .allocation()
+        .machine();
+    match machine
+        .access_captured(ranges, operation)
+        .map_err(|e| e.to_string())?
+    {
+        Access::Ready(result) => Ok(result),
+        Access::Pending(pending) => pending.wait().map_err(|e| e.to_string()),
+    }
 }
 pub(super) fn read(mappings: &Mappings, address: u64, length: usize) -> Result<Vec<u8>, String> {
-    let (backing, offset) = region(mappings, address, length)?;
-    let mut bytes = vec![0; length];
-    backing
-        .read(offset, &mut bytes)
+    let (physical, offset) = region(mappings, address, length)?;
+    let ranges = physical
+        .pin(offset, length as u64)
         .map_err(|e| e.to_string())?;
-    Ok(bytes)
+    let AccessResult::Read(bytes) = access(&ranges, AccessOperation::Read)? else {
+        unreachable!("read returns bytes")
+    };
+    Ok(bytes.into_vec())
 }
+/// One write names only modified runs. Padding and masked components are not
+/// read back or overwritten merely because they share pages with the output.
+pub(super) fn write_spans(
+    physical: &PhysicalMapping,
+    offset: u64,
+    bytes: &[u8],
+    mut spans: Vec<std::ops::Range<usize>>,
+) -> Result<(), String> {
+    spans.sort_unstable_by_key(|span| span.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for span in spans {
+        if let Some(last) = merged.last_mut()
+            && last.end >= span.start
+        {
+            last.end = last.end.max(span.end);
+        } else {
+            merged.push(span);
+        }
+    }
+    let mut ranges = Vec::new();
+    let mut payload = Vec::new();
+    for span in merged {
+        let data = bytes
+            .get(span.clone())
+            .ok_or("Host1x write exceeds captured output")?;
+        ranges.extend(
+            physical
+                .pin(offset + span.start as u64, data.len() as u64)
+                .map_err(|e| e.to_string())?,
+        );
+        payload.extend_from_slice(data);
+    }
+    if ranges.is_empty() {
+        return Ok(());
+    }
+    assert!(matches!(
+        access(&ranges, AccessOperation::Write(payload.into_boxed_slice()))?,
+        AccessResult::Written
+    ));
+    Ok(())
+}
+
 pub(super) fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
-fn surface_identity(mappings: &Mappings, address: u64) -> Result<(CanonicalPageId, u64), String> {
-    let (backing, offset) = region(mappings, address, 1)?;
-    let mut skip = offset;
-    for segment in backing.segments() {
-        if skip < segment.size() {
-            return Ok((segment.page(), segment.offset() + skip));
-        }
-        skip -= segment.size();
-    }
-    Err("NVDEC surface has no canonical byte identity".into())
+fn surface_identity(
+    mappings: &Mappings,
+    address: u64,
+) -> Result<(MachineId, AllocationId, ArenaOffset), String> {
+    let (physical, offset) = region(mappings, address, 1)?;
+    let spans = physical.slice(offset, 1).map_err(|e| e.to_string())?;
+    let span = spans
+        .spans()
+        .first()
+        .ok_or("NVDEC surface has no physical identity")?;
+    Ok((physical.machine(), span.allocation, span.start))
 }
 pub(super) fn gob_offset(x: usize, y: usize, pitch: usize, log2_height: u32) -> usize {
     let height = 1usize << log2_height;
@@ -237,7 +262,7 @@ pub(super) struct NvDec {
     decoder: *mut c_void,
     next_origin: u64,
     outputs: BTreeMap<u64, Output>,
-    surfaces: BTreeMap<[(CanonicalPageId, u64); 2], u64>,
+    surfaces: BTreeMap<[(MachineId, AllocationId, ArenaOffset); 2], u64>,
 }
 // The codec is exclusively owned by one Host1x worker and never accessed concurrently.
 unsafe impl Send for NvDec {}
@@ -557,7 +582,6 @@ impl Output {
     }
 
     fn write(&self, planes: [*const u8; 3], strides: [i32; 3]) -> Result<(), String> {
-        let mut writes = CanonicalWriteBatch::new();
         for chroma in [false, true] {
             let pitch = if chroma {
                 self.chroma_pitch
@@ -578,9 +602,7 @@ impl Output {
             let address = if chroma { self.chroma } else { self.luma };
             let (backing, offset) = region(&self.mappings, address, length)?;
             let mut bytes = vec![0; length];
-            backing
-                .read(offset, &mut bytes)
-                .map_err(|e| e.to_string())?;
+            let mut spans = Vec::with_capacity(rows * width.div_ceil(16));
             // A GOB stores each 16-byte horizontal run contiguously. Copy runs
             // rather than recomputing the block-linear address for every byte.
             // Preserve padding in the backing snapshot, including partial runs.
@@ -598,6 +620,7 @@ impl Output {
                 for x in (0..width).step_by(16) {
                     let count = (width - x).min(16);
                     let target = gob_offset(x, y, pitch, self.block_height);
+                    spans.push(target..target + count);
                     if let Some(luma) = luma {
                         bytes[target..target + count].copy_from_slice(&luma[x..x + count]);
                     } else {
@@ -615,11 +638,9 @@ impl Output {
                     }
                 }
             }
-            writes
-                .stage(&backing, offset, &bytes)
-                .map_err(|e| e.to_string())?;
+            write_spans(backing, offset, &bytes, spans)?;
         }
-        writes.commit_ordered().map_err(|e| e.to_string())
+        Ok(())
     }
 }
 
@@ -627,12 +648,12 @@ impl Output {
 mod tests {
     use super::*;
     use crate::nvdrv::nvmap::{NvMapAllocationMetadata, NvMapCpuMapping, NvMapObjects, NvMapOwner};
-    use nixe_memory::{
-        AddressSpaceId, CanonicalAllocation, GuestVirtualAddress, MemoryPermissions,
-    };
+    use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
     #[test]
     fn decoded_gob_runs_preserve_partial_rows_chroma_and_padding() {
-        let allocation = CanonicalAllocation::zeroed(0x10000, 4096).unwrap();
+        let machine = crate::test_memory::machine();
+        let allocation = machine.account(0x10000).unwrap().allocate(0x10000).unwrap();
+        let input = nixe_memory::AllocationRange::new(allocation.pin(), 0, 0x10000).unwrap();
         let mut nvmap = NvMapObjects::default();
         let owner = NvMapOwner::new(1);
         let handle = nvmap.create(owner, 0x10000).unwrap();
@@ -642,20 +663,20 @@ mod tests {
                 handle,
                 NvMapAllocationMetadata::new(0, 0, 4096, 0),
                 NvMapCpuMapping::new(AddressSpaceId::new(1), GuestVirtualAddress::new(0x1000)),
-                allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
+                Arc::from([input.clone()]),
             )
             .unwrap();
-        let mappings = Arc::new(BTreeMap::from([(
-            0x1000,
+        let mappings = Arc::new(BTreeMap::from([(0x1000, {
+            let object = nvmap
+                .object_snapshot_by_owned_handle(owner, handle)
+                .unwrap();
             Mapping {
-                object: nvmap
-                    .object_snapshot_by_owned_handle(owner, handle)
+                physical: nixe_gpu::physical::PhysicalMapping::new(object.ranges().unwrap())
                     .unwrap(),
+                object,
                 references: 1,
-            },
-        )]));
+            }
+        })]));
         let width = 67usize;
         let height = 37usize;
         let y = (0..73 * height).map(|i| (i * 7) as u8).collect::<Vec<_>>();
@@ -665,7 +686,12 @@ mod tests {
         let v = (0..39 * height.div_ceil(2))
             .map(|i| (255usize.wrapping_sub(i * 5)) as u8)
             .collect::<Vec<_>>();
-        allocation.write(0, &vec![0xa5; 0x10000]).unwrap();
+        machine
+            .write_resolved(
+                &[input.slice(0, vec![0xa5; 0x10000].len() as u64).unwrap()],
+                &vec![0xa5; 0x10000],
+            )
+            .unwrap();
         let output = Output {
             mappings,
             luma: 0x2000,
@@ -696,9 +722,12 @@ mod tests {
                 }
             }
             let mut actual = vec![0; length];
-            allocation
-                .read(if chroma { 0x4000 } else { 0x1000 }, &mut actual)
-                .unwrap();
+            crate::test_memory::read(
+                &[input
+                    .slice(if chroma { 0x4000 } else { 0x1000 }, actual.len() as u64)
+                    .unwrap()],
+                &mut actual,
+            );
             assert_eq!(actual, expected);
             let pitch = if chroma { width.div_ceil(2) * 2 } else { width };
             for row in 0..rows {
@@ -719,16 +748,16 @@ mod tests {
         let mut objects = Vec::new();
         for base in [0x1000, 0x2000] {
             let handle = nvmap.create(owner, 4096).unwrap();
-            let storage = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+            let machine = crate::test_memory::machine();
+            let storage = machine.account(4096).unwrap().allocate(4096).unwrap();
+            let input = nixe_memory::AllocationRange::new(storage.pin(), 0, 4096).unwrap();
             nvmap
                 .allocate(
                     owner,
                     handle,
                     NvMapAllocationMetadata::new(0, 0, 4096, 0),
                     NvMapCpuMapping::new(AddressSpaceId::new(1), GuestVirtualAddress::new(base)),
-                    storage
-                        .backing_range(MemoryPermissions::READ_WRITE)
-                        .unwrap(),
+                    Arc::from([input.clone()]),
                 )
                 .unwrap();
             objects.push(
@@ -740,6 +769,8 @@ mod tests {
         let original = Arc::new(BTreeMap::from([(
             0x1000,
             Mapping {
+                physical: nixe_gpu::physical::PhysicalMapping::new(objects[0].ranges().unwrap())
+                    .unwrap(),
                 object: objects[0].clone(),
                 references: 1,
             },
@@ -748,6 +779,10 @@ mod tests {
             (
                 0x1000,
                 Mapping {
+                    physical: nixe_gpu::physical::PhysicalMapping::new(
+                        objects[1].ranges().unwrap(),
+                    )
+                    .unwrap(),
                     object: objects[1].clone(),
                     references: 1,
                 },
@@ -755,6 +790,10 @@ mod tests {
             (
                 0x3000,
                 Mapping {
+                    physical: nixe_gpu::physical::PhysicalMapping::new(
+                        objects[0].ranges().unwrap(),
+                    )
+                    .unwrap(),
                     object: objects[0].clone(),
                     references: 1,
                 },

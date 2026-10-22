@@ -1,28 +1,21 @@
 //! Completion and visibility contracts for the concrete GPU owner.
 use crate::{BackendSubmissionToken, FrontendSubmissionId, ResourceDependency};
-use nixe_memory::{CpuVisibilityRequest, DeviceVisibilityPoint, VisibilityCoordinatorError};
 use std::fmt::{Display, Formatter};
 
-/// Evidence that host execution and canonical device ownership both finished.
+/// Evidence that the native producer prefix finished.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackendExecutionCompletion {
     frontend: FrontendSubmissionId,
     submission: BackendSubmissionToken,
-    visibility: DeviceVisibilityPoint,
 }
 
 impl BackendExecutionCompletion {
-    /// Construct only after host execution and canonical ownership have completed.
+    /// Construct only after the native producer prefix has completed.
     #[must_use]
-    pub const fn new(
-        frontend: FrontendSubmissionId,
-        submission: BackendSubmissionToken,
-        visibility: DeviceVisibilityPoint,
-    ) -> Self {
+    pub const fn new(frontend: FrontendSubmissionId, submission: BackendSubmissionToken) -> Self {
         Self {
             frontend,
             submission,
-            visibility,
         }
     }
 
@@ -35,28 +28,13 @@ impl BackendExecutionCompletion {
     pub const fn submission(self) -> BackendSubmissionToken {
         self.submission
     }
-
-    #[must_use]
-    pub const fn visibility(self) -> DeviceVisibilityPoint {
-        self.visibility
-    }
-}
-
-/// Blocking request path from canonical memory to the sole backend owner.
-pub trait BackendVisibilityRequester: Send + Sync {
-    fn make_cpu_visible(
-        &self,
-        request: CpuVisibilityRequest,
-    ) -> Result<Box<[u8]>, VisibilityCoordinatorError>;
 }
 
 /// Typed failure at the neutral runtime boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum BackendRuntimeError {
     UnknownResource(ResourceDependency),
-    InvalidVisibilityDeclaration,
-    VisibilityPointExhausted,
-    Visibility(Box<str>),
+    Memory(std::sync::Arc<nixe_memory::MemoryError>),
     Backend(Box<str>),
 }
 
@@ -66,16 +44,17 @@ impl Display for BackendRuntimeError {
             Self::UnknownResource(resource) => {
                 write!(formatter, "neutral runtime does not own {resource:?}")
             }
-            Self::InvalidVisibilityDeclaration => {
-                formatter.write_str("neutral runtime produced an invalid visibility declaration")
-            }
-            Self::VisibilityPointExhausted => {
-                formatter.write_str("neutral runtime visibility points are exhausted")
-            }
-            Self::Visibility(error) => write!(formatter, "canonical visibility failed: {error}"),
+            Self::Memory(error) => write!(formatter, "physical memory access failed: {error}"),
             Self::Backend(error) => write!(formatter, "neutral backend failed: {error}"),
         }
     }
 }
 
-impl std::error::Error for BackendRuntimeError {}
+impl std::error::Error for BackendRuntimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Memory(cause) => Some(cause.as_ref()),
+            _ => None,
+        }
+    }
+}

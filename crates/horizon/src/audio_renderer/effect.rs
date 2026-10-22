@@ -2,7 +2,7 @@
 mod reverb;
 use super::buffer::{Attachment, attach};
 use super::update::{MemoryPool, UpdateError, wide, word};
-use nixe_memory::CanonicalRangeTranslationError;
+use nixe_memory::{AllocationRange, MemoryError};
 
 #[derive(Debug, Default)]
 pub(super) enum Effect {
@@ -43,13 +43,7 @@ impl Effect {
         sample_rate: u32,
         pools: &[Option<MemoryPool>],
         force: bool,
-        translate: &impl Fn(
-            u64,
-            u64,
-        ) -> Result<
-            nixe_memory::CanonicalBackingRange,
-            CanonicalRangeTranslationError,
-        >,
+        translate: &impl Fn(u64, u64) -> Result<Vec<AllocationRange>, MemoryError>,
         started: bool,
     ) -> Result<u8, UpdateError> {
         if raw[0] == 0 {
@@ -177,12 +171,11 @@ mod tests {
     }
     #[test]
     fn updates_wait_for_worker_consumption_and_preserve_tail_and_workbuffer_ownership() {
-        use nixe_memory::{CanonicalAllocation, MemoryPermissions};
-        let memory = CanonicalAllocation::zeroed(4096, 4096).unwrap();
-        let backing = memory.backing_range(MemoryPermissions::READ_WRITE).unwrap();
+        let ranges = crate::test_memory::physical(&vec![0; 4096]);
         let pools = vec![Some(MemoryPool {
             address: 0x1000,
-            backing,
+            ranges: nixe_memory::CapturedMemory::new(ranges).unwrap(),
+            bytes: 4096,
         })];
         let mut effect = Effect::default();
         let mut raw = packet();

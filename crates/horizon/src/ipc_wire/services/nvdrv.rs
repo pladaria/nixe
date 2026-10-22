@@ -34,13 +34,14 @@ impl NvDrvCommand {
     }
 }
 
-pub(in crate::ipc_wire) fn dispatch_nvdrv(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_nvdrv(
+    process: &mut Request,
     session: &NvDrvSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
     caller_thread_id: u64,
     clock: &nixe_runtime::VirtualClock,
+    scheduling: &std::sync::Arc<crate::ipc_wire::operation::ServiceScheduling>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let service = NvDrvService::new(session);
     let Some(command) = NvDrvCommand::decode(request.command_id) else {
@@ -92,7 +93,8 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
                 process,
                 GuestVirtualAddress::new(descriptor.address),
                 &mut path,
-            )?;
+            )
+            .await?;
             let (fd, error) = match service.open(&path, process.process_id()) {
                 Ok(fd) => (fd.raw(), crate::nvdrv::NV_SUCCESS),
                 Err(NvDrvServiceError::DriverResult(error)) => (0, error),
@@ -139,7 +141,8 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
                     process,
                     GuestVirtualAddress::new(input_descriptor.address),
                     &mut input,
-                )?;
+                )
+                .await?;
             }
             log::trace!(
                 "nvdrv ioctl input: fd={fd:#010x} request={ioctl:#010x} input-size={} input-prefix={:02x?}",
@@ -160,40 +163,49 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
                     process,
                     GuestVirtualAddress::new(input_descriptor.address),
                     &mut additional_input,
-                )?;
+                )
+                .await?;
             }
-            let response = service
-                .ioctl(crate::nvdrv::NvDrvIoctlRequest {
-                    fd: NvDrvFileDescriptor::new(fd),
-                    request: ioctl,
-                    input: &input,
-                    inline: if let Some(buffer) = buffers.additional_output {
-                        crate::nvdrv::NvDrvInlineBuffer::Output(
-                            usize::try_from(buffer.size).map_err(|_| {
-                                IpcWireError::Malformed("nvdrv inline output is too large")
-                            })?,
-                        )
-                    } else if command == NvDrvCommand::Ioctl2 {
-                        crate::nvdrv::NvDrvInlineBuffer::Input(&additional_input)
-                    } else {
-                        crate::nvdrv::NvDrvInlineBuffer::None
-                    },
-                    process_id: process.process_id(),
-                    address_space: process.cpu().address_space_id(),
-                    translator: process.canonical_memory(),
-                    caller: crate::nvdrv::NvDrvIoctlCaller {
-                        thread_id: caller_thread_id,
-                        clock,
-                    },
-                })
-                .map_err(IpcWireError::UnsupportedNvDrv)?;
-            let response = match response {
-                NvDrvIoctlOutcome::Complete(response) => response,
-                NvDrvIoctlOutcome::PendingSubmission(wait) => {
-                    return Err(IpcWireError::PendingGpuSubmission(wait));
-                }
-                NvDrvIoctlOutcome::PendingSyncpointWait(wait) => {
-                    return Err(IpcWireError::PendingNvDrv(wait));
+            let response = loop {
+                let response = service
+                    .ioctl(crate::nvdrv::NvDrvIoctlRequest {
+                        fd: NvDrvFileDescriptor::new(fd),
+                        request: ioctl,
+                        input: &input,
+                        inline: if let Some(buffer) = buffers.additional_output {
+                            crate::nvdrv::NvDrvInlineBuffer::Output(
+                                usize::try_from(buffer.size).map_err(|_| {
+                                    IpcWireError::Malformed("nvdrv inline output is too large")
+                                })?,
+                            )
+                        } else if command == NvDrvCommand::Ioctl2 {
+                            crate::nvdrv::NvDrvInlineBuffer::Input(&additional_input)
+                        } else {
+                            crate::nvdrv::NvDrvInlineBuffer::None
+                        },
+                        process_id: process.process_id(),
+                        address_space: process.cpu().address_space_id(),
+                        memory: process.memory(),
+                        caller: crate::nvdrv::NvDrvIoctlCaller {
+                            thread_id: caller_thread_id,
+                            clock,
+                        },
+                    })
+                    .map_err(IpcWireError::UnsupportedNvDrv)?;
+                match response {
+                    NvDrvIoctlOutcome::Complete(response) => break response,
+                    NvDrvIoctlOutcome::PendingHost1x(capture) => {
+                        break capture
+                            .finish()
+                            .await
+                            .map_err(IpcWireError::UnsupportedNvDrv)?;
+                    }
+                    NvDrvIoctlOutcome::PendingSubmission(wait) => {
+                        scheduling.wait(wait.wake_event(), None).await?;
+                    }
+                    NvDrvIoctlOutcome::PendingSyncpointWait(wait) => {
+                        scheduling.wait(wait.wake_event(), wait.remaining()).await?;
+                    }
                 }
             };
             if response.driver_result != crate::nvdrv::NV_SUCCESS {
@@ -226,10 +238,10 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
                 );
             }
             if let Some(output_descriptor) = buffers.output {
-                write_descriptor_bytes(process, output_descriptor, &response.output)?;
+                write_descriptor_bytes(process, output_descriptor, &response.output).await?;
             }
             if let Some(output) = buffers.additional_output {
-                write_descriptor_bytes(process, output, &response.additional_output)?;
+                write_descriptor_bytes(process, output, &response.additional_output).await?;
             }
             Ok((
                 encode_response(
@@ -262,16 +274,12 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
             };
             if hipc.copy_handles.len() != 2
                 || hipc.copy_handles[0] != crate::CURRENT_PROCESS_HANDLE
-                || process
-                    .handles()
-                    .get_as::<TransferMemoryObject>(hipc.copy_handles[1])
-                    .is_none()
+                || process.copy_handle::<TransferMemoryObject>(1).is_none()
             {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let transfer = process
-                .handles()
-                .get_as::<TransferMemoryObject>(hipc.copy_handles[1])
+                .copy_handle::<TransferMemoryObject>(1)
                 .expect("validated transfer memory");
             if u64::from(transfer_size) > transfer.size() || transfer_size == 0 {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
@@ -308,9 +316,7 @@ pub(in crate::ipc_wire) fn dispatch_nvdrv(
                 .query_event(NvDrvFileDescriptor::new(fd), event_id, process.process_id())
                 .map_err(IpcWireError::UnsupportedNvDrv)?;
             let handle = if let Some(event) = event {
-                Some(process.handles_mut().insert(event).map_err(|_| {
-                    IpcWireError::HostResourceExhausted("installing an nvdrv event handle")
-                })?)
+                Some(process.return_handle(event).map_err(IpcWireError::Handle)?)
             } else {
                 None
             };
@@ -647,13 +653,13 @@ mod tests {
     #[test]
     fn write_only_ioctl_accepts_the_libnx_null_output_placeholder() {
         assert_eq!(
-            ioctl_descriptors(buffer(0x1000, 40), buffer(0, 0), 0x4028_4109),
-            Ok(NvIoctlBuffers {
+            (ioctl_descriptors(buffer(0x1000, 40), buffer(0, 0), 0x4028_4109)).unwrap(),
+            NvIoctlBuffers {
                 additional_output: None,
                 input: Some(buffer(0x1000, 40)),
                 additional_input: None,
                 output: None,
-            })
+            }
         );
     }
 
@@ -678,13 +684,13 @@ mod tests {
                 )
             };
             assert_eq!(
-                decode(input_pointer, output_pointer),
-                Ok(NvIoctlBuffers {
+                (decode(input_pointer, output_pointer)).unwrap(),
+                NvIoctlBuffers {
                     additional_output: None,
                     input: Some(input),
                     additional_input: None,
                     output: Some(output),
-                })
+                }
             );
             // Non-empty pointers remain invalid even when the map-alias side
             // has the expected size: no pointer transfer was negotiated.
@@ -708,40 +714,40 @@ mod tests {
                 ..buffer(0x2000, 0)
             };
             assert_eq!(
-                ioctl_descriptors(unused, buffer(0x1000, 4), 0x8004_4701),
-                Ok(NvIoctlBuffers {
+                (ioctl_descriptors(unused, buffer(0x1000, 4), 0x8004_4701)).unwrap(),
+                NvIoctlBuffers {
                     additional_output: None,
                     input: None,
                     additional_input: None,
                     output: Some(buffer(0x1000, 4)),
-                })
+                }
             );
             assert_eq!(
-                ioctl_descriptors(buffer(0x1000, 40), unused, 0x4028_4109),
-                Ok(NvIoctlBuffers {
+                (ioctl_descriptors(buffer(0x1000, 40), unused, 0x4028_4109)).unwrap(),
+                NvIoctlBuffers {
                     additional_output: None,
                     input: Some(buffer(0x1000, 40)),
                     additional_input: None,
                     output: None,
-                })
+                }
             );
         }
     }
 
     #[test]
     fn ioctl_direction_rejects_a_non_empty_inactive_side() {
-        assert_eq!(
+        assert!(matches!(
             ioctl_descriptors(buffer(0x1000, 40), buffer(0x2000, 40), 0x4028_4109),
             Err(IpcWireError::Malformed(
                 "nvdrv ioctl without output carries a non-empty output buffer"
             ))
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             ioctl_descriptors(buffer(0x1000, 4), buffer(0x2000, 4), 0x8004_4701),
             Err(IpcWireError::Malformed(
                 "nvdrv ioctl without input carries a non-empty input buffer"
             ))
-        );
+        ));
     }
 
     #[test]
@@ -780,7 +786,7 @@ mod tests {
             index: 0,
         };
         assert_eq!(
-            nv_ioctl2_buffer_descriptors(
+            (nv_ioctl2_buffer_descriptors(
                 &[
                     pointer,
                     SendStaticDescriptor {
@@ -795,13 +801,14 @@ mod tests {
                     size: 0
                 }]),
                 0x4028_4109,
-            ),
-            Ok(NvIoctlBuffers {
+            ))
+            .unwrap(),
+            NvIoctlBuffers {
                 additional_output: None,
                 input: Some(input),
                 additional_input: Some(additional),
                 output: None,
-            })
+            }
         );
     }
 
@@ -836,13 +843,13 @@ mod tests {
             )
         };
         assert_eq!(
-            decode(&pointers, output_pointer),
-            Ok(NvIoctlBuffers {
+            (decode(&pointers, output_pointer)).unwrap(),
+            NvIoctlBuffers {
                 additional_output: None,
                 input: Some(input),
                 additional_input: Some(additional),
                 output: Some(output),
-            })
+            }
         );
         for index in 0..pointers.len() {
             pointers[index].size = 1;

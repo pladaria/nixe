@@ -15,12 +15,12 @@ pub trait MaxwellWorkSegment: Send {
 pub trait MaxwellWorkBatch<W: MaxwellWork + ?Sized>: Default + Send {
     type Segment: MaxwellWorkSegment;
     fn wait_for_idle(&mut self);
-    fn write_memory(
+    fn report_memory(
         &mut self,
-        target: nixe_memory::CanonicalBackingRange,
+        target: Vec<nixe_memory::AllocationRange>,
         offset: u64,
         bytes: &[u8],
-        after_prior_work: bool,
+        fence: bool,
     );
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
@@ -68,19 +68,19 @@ impl MaxwellWorkBatch<nixe_gpu::native::NativeWork> for NativeWorkBatch {
         self.commands
             .push(nixe_gpu::native::NativeCommand::WaitForIdle);
     }
-    fn write_memory(
+    fn report_memory(
         &mut self,
-        target: nixe_memory::CanonicalBackingRange,
+        target: Vec<nixe_memory::AllocationRange>,
         offset: u64,
         bytes: &[u8],
-        after_prior_work: bool,
+        fence: bool,
     ) {
         self.commands
-            .push(nixe_gpu::native::NativeCommand::WriteMemory {
+            .push(nixe_gpu::native::NativeCommand::ReportMemory {
                 target,
                 offset,
                 bytes: Arc::from(bytes),
-                after_prior_work,
+                fence,
             });
     }
     fn len(&self) -> usize {
@@ -100,12 +100,12 @@ impl MaxwellWorkBatch<nixe_gpu::native::NativeWork> for NativeWorkBatch {
         segment: FrontendSubmissionSegment,
         final_segment: bool,
     ) -> Result<Self::Segment, MaxwellBackendExecutionError> {
-        Ok(nixe_gpu::native::NativeSubmission {
+        Ok(nixe_gpu::native::NativeSubmission::new(
             frontend,
             segment,
             final_segment,
-            commands: std::mem::take(&mut self.commands),
-        })
+            std::mem::take(&mut self.commands),
+        ))
     }
 
     fn recycle_segment(&mut self, mut segment: Self::Segment) {

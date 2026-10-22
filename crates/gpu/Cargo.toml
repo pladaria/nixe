@@ -15,4 +15,4 @@ nixe-shader-recompiler.workspace = true
 sha2.workspace = true
 
 [features]
-performance-counters = ["nixe-memory/performance-counters"]
+performance-counters = []

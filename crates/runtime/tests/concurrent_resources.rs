@@ -7,16 +7,16 @@ use nixe_runtime::{
 
 #[test]
 fn failed_cross_process_handle_transfer_keeps_source_ownership() {
-    let mut source = HandleTable::new();
+    let source = HandleTable::new();
     let source_handle = source.insert(EventObject::new()).unwrap();
-    let mut destination = HandleTable::with_capacity_limit(1);
+    let destination = HandleTable::with_capacity_limit(1);
     destination.insert(ThreadObject::new(2)).unwrap();
 
     assert_eq!(
-        source.transfer_to(&mut destination, source_handle),
+        source.transfer_to(&destination, source_handle),
         Err(HandleError::Exhausted)
     );
-    assert!(source.get(source_handle).is_some());
+    assert!(source.lookup(source_handle).is_some());
     assert_eq!(source.len(), 1);
     assert_eq!(destination.len(), 1);
 }

@@ -5,7 +5,7 @@ impl Dispatch {
         &self,
         command: vk::CommandBuffer,
         point: vk::PipelineBindPoint,
-        pipeline: vk::Pipeline,
+        pipeline: std::sync::Arc<crate::cache::NativePipeline>,
     ) {
         self.recorder.push(Command::BindPipeline {
             command,

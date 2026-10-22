@@ -2,22 +2,23 @@
 use super::nvhost_ctrl::NvHostControl;
 use super::{NvDrvDeviceDescriptor, NvDrvValidationReason};
 use nixe_gpu::{
-    BackendSubmissionToken, BackendVisibilityRequester, FrontendSubmissionId, GpuExecution,
-    PresentationImageRequest, ReservedTimelinePoint, ResidentImage,
+    BackendSubmissionToken, FrontendSubmissionId, GpuExecution, PresentationImageRequest,
+    ReservedTimelinePoint, ResidentImage,
 };
 use nixe_gpu_maxwell::{
     MaxwellBackendExecution, MaxwellChannelConfiguration, MaxwellFrontend, MaxwellFrontendDispatch,
-    MaxwellFrontendDispatchBoundary, MaxwellGpuAddressSpace, MaxwellWork, MaxwellWorkBatch,
+    MaxwellFrontendDispatchBoundary, MaxwellGpuMemory, MaxwellWork, MaxwellWorkBatch,
     MaxwellWorkSegment, stream_maxwell_frontend,
 };
-use nixe_memory::{CpuVisibilityRequest, VisibilityCoordinatorError};
+use nixe_memory::{
+    AccessRequestId, AllocationId, DeviceAccessEndpoint, DeviceAccessRequest, Extent, Machine,
+    MachineId, MemoryError,
+};
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-mod visibility;
-use visibility::CpuVisibilityQueue;
 mod owner;
 
 // Admission includes real outstanding GPU completion, not a second command queue.
@@ -25,10 +26,11 @@ const MAX_GPU_SUBMISSIONS_IN_FLIGHT: usize = 3;
 type WorkCommands<W> =
     <<<W as MaxwellWork>::Batch as MaxwellWorkBatch<W>>::Segment as MaxwellWorkSegment>::Commands;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(super) struct GpuExecutorFailure {
     frontend: FrontendSubmissionId,
     detail: Box<str>,
+    memory_cause: Option<Arc<MemoryError>>,
     pub(super) boundary: Option<(
         NvDrvDeviceDescriptor,
         u32,
@@ -63,7 +65,7 @@ pub(super) struct GpuSubmission {
     request: u32,
     dispatch: MaxwellFrontendDispatch,
     channel: MaxwellChannelConfiguration,
-    address_space: MaxwellGpuAddressSpace,
+    address_space: MaxwellGpuMemory,
     reservation: Option<ReservedTimelinePoint>,
     control: Arc<Mutex<NvHostControl>>,
     permit: GpuFrontendPermit,
@@ -79,7 +81,7 @@ impl GpuSubmission {
         request: u32,
         dispatch: MaxwellFrontendDispatch,
         channel: MaxwellChannelConfiguration,
-        address_space: MaxwellGpuAddressSpace,
+        address_space: MaxwellGpuMemory,
         reservation: Option<ReservedTimelinePoint>,
         control: Arc<Mutex<NvHostControl>>,
         permit: GpuFrontendPermit,
@@ -131,9 +133,20 @@ enum GpuMessage {
         reply: mpsc::SyncSender<Result<ResidentImage, Box<str>>>,
     },
     Wake,
-    CpuVisibility {
-        request: CpuVisibilityRequest,
-        reply: mpsc::SyncSender<Result<Box<[u8]>, Box<str>>>,
+    MemoryAccess(DeviceAccessRequest),
+    CancelMemory(AccessRequestId),
+    GuestMemoryReleased {
+        machine: MachineId,
+        allocation: AllocationId,
+    },
+    PhysicalRetired {
+        machine: MachineId,
+        allocation: AllocationId,
+        extents: Box<[Extent]>,
+    },
+    AllocationPressure {
+        machine: MachineId,
+        bytes: u64,
     },
 }
 
@@ -248,26 +261,57 @@ impl Drop for GpuFrontendPermit {
         self.budget.writable.signal();
     }
 }
-struct GpuVisibilityRequester {
+struct GpuMemoryEndpoint {
     sender: mpsc::Sender<GpuMessage>,
-    identity: Arc<()>,
+    stopped: Mutex<Option<Arc<MemoryError>>>,
 }
-impl BackendVisibilityRequester for GpuVisibilityRequester {
-    fn make_cpu_visible(
-        &self,
-        request: CpuVisibilityRequest,
-    ) -> Result<Box<[u8]>, VisibilityCoordinatorError> {
-        if let Some(result) = owner::local_visibility(&self.identity, request) {
-            return result;
+impl GpuMemoryEndpoint {
+    fn stop(&self, cause: Arc<MemoryError>) {
+        *self.stopped.lock().unwrap() = Some(cause);
+    }
+}
+impl DeviceAccessEndpoint for GpuMemoryEndpoint {
+    fn submit(&self, request: DeviceAccessRequest) {
+        let stopped = self.stopped.lock().unwrap();
+        if let Some(cause) = stopped.as_ref().map(Arc::clone) {
+            drop(stopped);
+            request.finish(Err(cause));
+            return;
         }
-        let (reply, result) = mpsc::sync_channel(1);
-        self.sender
-            .send(GpuMessage::CpuVisibility { request, reply })
-            .map_err(|_| VisibilityCoordinatorError::new("GPU owner stopped"))?;
-        result
-            .recv()
-            .map_err(|_| VisibilityCoordinatorError::new("GPU visibility reply was lost"))?
-            .map_err(VisibilityCoordinatorError::new)
+        let result = self.sender.send(GpuMessage::MemoryAccess(request));
+        drop(stopped);
+        if let Err(mpsc::SendError(GpuMessage::MemoryAccess(request))) = result {
+            let cause = self.stopped.lock().unwrap().clone().unwrap_or_else(|| {
+                Arc::new(MemoryError::Execution("GPU owner disconnected".into()))
+            });
+            request.finish(Err(cause));
+        }
+    }
+    fn cancel(&self, request: AccessRequestId) {
+        let _ = self.sender.send(GpuMessage::CancelMemory(request));
+    }
+    fn allocation_released(&self, machine: MachineId, allocation: AllocationId) {
+        let _ = self.sender.send(GpuMessage::GuestMemoryReleased {
+            machine,
+            allocation,
+        });
+    }
+    fn physical_retired(
+        &self,
+        machine: MachineId,
+        allocation: AllocationId,
+        extents: Box<[Extent]>,
+    ) {
+        let _ = self.sender.send(GpuMessage::PhysicalRetired {
+            machine,
+            allocation,
+            extents,
+        });
+    }
+    fn allocation_pressure(&self, machine: MachineId, bytes: u64) {
+        let _ = self
+            .sender
+            .send(GpuMessage::AllocationPressure { machine, bytes });
     }
 }
 /// Guest deliveries, CPU visibility and presentation share one GPU owner inbox.
@@ -277,6 +321,7 @@ pub(super) struct NvDrvGpuExecutor {
     failure: Arc<Mutex<Option<GpuExecutorFailure>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     budget: Arc<GpuWorkBudget>,
+    _memory_endpoint: Arc<GpuMemoryEndpoint>,
 }
 impl std::fmt::Debug for NvDrvGpuExecutor {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
@@ -287,13 +332,14 @@ impl std::fmt::Debug for NvDrvGpuExecutor {
     }
 }
 impl NvDrvGpuExecutor {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(machine: Machine) -> Self {
         Self::with_frontend(
+            machine,
             None::<std::convert::Infallible>,
             nixe_gpu_maxwell::MaxwellNativeFrontend::new(Default::default()),
         )
     }
-    pub(super) fn with_frontend<E, L>(mut backend: Option<E>, cache: L) -> Self
+    pub(super) fn with_frontend<E, L>(machine: Machine, mut backend: Option<E>, cache: L) -> Self
     where
         L: MaxwellFrontend,
         E: GpuExecution<
@@ -307,31 +353,44 @@ impl NvDrvGpuExecutor {
         let (sender, receiver) = mpsc::channel();
         let failure = Arc::new(Mutex::new(None));
         let budget = Arc::new(GpuWorkBudget::default());
-        let identity = Arc::new(());
-        let requester: Arc<dyn BackendVisibilityRequester> = Arc::new(GpuVisibilityRequester {
+        let endpoint = Arc::new(GpuMemoryEndpoint {
             sender: sender.clone(),
-            identity: Arc::clone(&identity),
+            stopped: Mutex::new(None),
         });
-        let binding_failure = backend.as_mut().and_then(|backend| {
-            backend
-                .bind_visibility_requester(requester)
-                .err()
-                .map(|error| error.to_string().into_boxed_str())
-        });
+        let route: Arc<dyn DeviceAccessEndpoint> = endpoint.clone();
+        machine.set_device_endpoint(&route);
+        let mut binding_failure = None;
         if let Some(backend) = backend.as_mut() {
             let wake = sender.clone();
-            backend.bind_host_wakeup(Arc::new(move || {
+            if let Err(error) = backend.bind_host_wakeup(Arc::new(move || {
                 let _ = wake.send(GpuMessage::Wake);
-            }));
+            })) {
+                let detail = error.to_string().into_boxed_str();
+                let cause = match error {
+                    nixe_gpu::BackendRuntimeError::Memory(cause) => cause,
+                    _ => Arc::new(MemoryError::Execution(detail.clone())),
+                };
+                endpoint.stop(Arc::clone(&cause));
+                // Binding failed before this executor was exposed. Drain the
+                // exact operations accepted by its already-published endpoint.
+                while let Ok(message) = receiver.try_recv() {
+                    if let GpuMessage::MemoryAccess(request) = message {
+                        request.finish(Err(Arc::clone(&cause)));
+                    }
+                }
+                binding_failure.get_or_insert((detail, cause));
+            }
         }
         let worker_failure = Arc::clone(&failure);
         let worker_budget = Arc::clone(&budget);
+        let owner_endpoint = Arc::clone(&endpoint);
         let worker = thread::Builder::new()
             .name("nixe-gpu".into())
             .spawn(move || {
                 let backend = std::rc::Rc::new(std::cell::RefCell::new(backend));
-                let result = if let Some(detail) = binding_failure {
+                let result = if let Some((detail, cause)) = binding_failure {
                     Err(GpuExecutorFailure {
+                        memory_cause: Some(cause),
                         boundary: None,
                         frontend: FrontendSubmissionId::new(0),
                         detail,
@@ -342,10 +401,19 @@ impl NvDrvGpuExecutor {
                         std::rc::Rc::clone(&backend),
                         cache,
                         &worker_budget,
-                        identity,
+                        &owner_endpoint,
                     )
                 };
                 worker_budget.stop();
+                if let Err(error) = &result {
+                    let cause = error.memory_cause.clone().unwrap_or_else(|| {
+                        Arc::new(MemoryError::Execution(error.to_string().into()))
+                    });
+                    owner_endpoint.stop(Arc::clone(&cause));
+                    if let Some(backend) = backend.borrow_mut().as_mut() {
+                        backend.fail_device_accesses(cause);
+                    }
+                }
                 let teardown = backend
                     .borrow_mut()
                     .as_mut()
@@ -353,6 +421,7 @@ impl NvDrvGpuExecutor {
                     .transpose();
                 let error = result.err().or_else(|| {
                     teardown.err().map(|error| GpuExecutorFailure {
+                        memory_cause: None,
                         boundary: None,
                         frontend: FrontendSubmissionId::new(0),
                         detail: format!("GPU teardown failed: {error}").into(),
@@ -371,6 +440,7 @@ impl NvDrvGpuExecutor {
             failure,
             worker: Mutex::new(Some(worker)),
             budget,
+            _memory_endpoint: endpoint,
         }
     }
     pub(super) fn close_channel(&self, channel: nixe_gpu_maxwell::MaxwellChannelId) {
@@ -397,11 +467,13 @@ impl NvDrvGpuExecutor {
             .clone();
         let Some(sender) = sender else {
             return Err(GpuExecutorFailure {
+                memory_cause: None,
                 frontend,
                 detail: "GPU executor is torn down".into(),
                 boundary: None,
             });
         };
+        nixe_memory::trace::detail_event("gpu_submission_queued", frontend.get(), 0, 0);
         sender
             .send(GpuMessage::Submission(GpuQueuedSubmission {
                 submission,
@@ -409,6 +481,7 @@ impl NvDrvGpuExecutor {
             }))
             .map_err(|_| {
                 self.failure().unwrap_or(GpuExecutorFailure {
+                    memory_cause: None,
                     frontend,
                     detail: "GPU frontend owner stopped before accepting work".into(),
                     boundary: None,
@@ -422,6 +495,7 @@ impl NvDrvGpuExecutor {
         self.require_healthy()?;
         self.budget.reserve().ok_or_else(|| {
             self.failure().unwrap_or(GpuExecutorFailure {
+                memory_cause: None,
                 boundary: None,
                 frontend: FrontendSubmissionId::new(0),
                 detail: "GPU executor stopped before ordered frontend lowering".into(),
@@ -527,6 +601,7 @@ impl NvDrvGpuExecutor {
         self.require_healthy()?;
         let Some(wake) = self.budget.request_progress() else {
             return Err(self.failure().unwrap_or(GpuExecutorFailure {
+                memory_cause: None,
                 boundary: None,
                 frontend: FrontendSubmissionId::new(0),
                 detail: "GPU executor is torn down".into(),
@@ -544,6 +619,7 @@ impl NvDrvGpuExecutor {
             Ok(())
         } else {
             Err(self.failure().unwrap_or(GpuExecutorFailure {
+                memory_cause: None,
                 boundary: None,
                 frontend: FrontendSubmissionId::new(0),
                 detail: "GPU owner stopped before progress was requested".into(),
@@ -562,6 +638,7 @@ impl NvDrvGpuExecutor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or_else(|| GpuExecutorFailure {
+                memory_cause: None,
                 boundary: None,
                 frontend: FrontendSubmissionId::new(0),
                 detail: "GPU executor is torn down".into(),
@@ -571,6 +648,7 @@ impl NvDrvGpuExecutor {
             .send(GpuMessage::PresentImage { request, reply })
             .map_err(|_| {
                 self.failure().unwrap_or(GpuExecutorFailure {
+                    memory_cause: None,
                     boundary: None,
                     frontend: FrontendSubmissionId::new(0),
                     detail: "GPU backend owner stopped before exporting a resident image".into(),
@@ -607,6 +685,7 @@ impl NvDrvGpuExecutor {
                 .failure
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(GpuExecutorFailure {
+                memory_cause: None,
                 boundary: None,
                 frontend: FrontendSubmissionId::new(0),
                 detail: "GPU command owner panicked".into(),

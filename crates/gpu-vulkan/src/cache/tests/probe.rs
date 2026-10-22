@@ -349,22 +349,20 @@ fn compare_monolithic_and_library_pipeline_creation_and_warm_execution() {
             ] {
                 let mut state = GraphicsState::color(vk::Format::R8G8B8A8_UNORM);
                 state.colors[0].1.write_mask = mask;
-                let pipeline = ready(
-                    pipelines
-                        .request(PipelineRecipe::Graphics {
-                            shader: Arc::clone(shader),
-                            state,
-                        })
-                        .unwrap(),
-                );
-                cold.push(pipeline.metrics.wall_ns as f64);
-                if let Some(ns) = pipeline.metrics.driver_ns {
+                let pipeline = pipelines
+                    .request(PipelineRecipe::Graphics {
+                        shader: Arc::clone(shader),
+                        state,
+                    })
+                    .unwrap();
+                cold.push(pipeline.metrics().unwrap().wall_ns as f64);
+                if let Some(ns) = pipeline.metrics().unwrap().driver_ns {
                     feedback.push(ns as f64);
                 }
-                linking.push(pipeline.metrics.link_ns as f64);
-                libs_wall += pipeline.metrics.library_wall_ns;
-                libs_driver += pipeline.metrics.library_driver_ns.unwrap_or(0);
-                cache_hits += u32::from(pipeline.metrics.application_cache_hit);
+                linking.push(pipeline.metrics().unwrap().link_ns as f64);
+                libs_wall += pipeline.metrics().unwrap().library_wall_ns;
+                libs_driver += pipeline.metrics().unwrap().library_driver_ns.unwrap_or(0);
+                cache_hits += u32::from(pipeline.metrics().unwrap().application_cache_hit);
                 if mask == vk::ColorComponentFlags::RGBA {
                     draws.push((index, pipeline));
                 }

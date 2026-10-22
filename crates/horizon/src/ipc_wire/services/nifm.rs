@@ -21,7 +21,7 @@ impl NetworkInterfaceManagerCommand {
 }
 
 pub(in crate::ipc_wire) fn dispatch_network_interface(
-    process: &mut ExceptionProcessContext<'_>,
+    process: &mut Request,
     manager: &NetworkInterfaceManagerSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -90,7 +90,7 @@ pub(in crate::ipc_wire) fn dispatch_network_interface(
 }
 
 fn dispatch_network_interface_manager(
-    process: &mut ExceptionProcessContext<'_>,
+    process: &mut Request,
     manager: &NetworkInterfaceManagerSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -139,13 +139,8 @@ fn dispatch_network_interface_manager(
                 )
             } else {
                 let handle = process
-                    .handles_mut()
-                    .insert(HorizonIpcObject::NetworkGeneralService(service))
-                    .map_err(|_| {
-                        IpcWireError::HostResourceExhausted(
-                            "installing a network general-service handle",
-                        )
-                    })?;
+                    .return_handle(HorizonIpcObject::NetworkGeneralService(service))
+                    .map_err(IpcWireError::Handle)?;
                 log::debug!("nifm:u opened IGeneralService handle {handle:#x}");
                 Ok((
                     encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
@@ -157,7 +152,7 @@ fn dispatch_network_interface_manager(
 }
 
 pub(in crate::ipc_wire) fn dispatch_network_general_service(
-    process: &mut ExceptionProcessContext<'_>,
+    process: &mut Request,
     manager: Option<&NetworkInterfaceManagerSession>,
     _service: &NetworkGeneralServiceSession,
     request: CmifRequest<'_>,
@@ -201,17 +196,14 @@ pub(in crate::ipc_wire) fn dispatch_network_general_service(
         semantic_success(request.token, true, &[], &[], &[id], None)
     } else {
         let handle = process
-            .handles_mut()
-            .insert(HorizonIpcObject::NetworkRequest(session))
-            .map_err(|_| {
-                IpcWireError::HostResourceExhausted("installing a network request handle")
-            })?;
+            .return_handle(HorizonIpcObject::NetworkRequest(session))
+            .map_err(IpcWireError::Handle)?;
         semantic_success(request.token, false, &[], &[], &[], Some(handle))
     }
 }
 
 pub(in crate::ipc_wire) fn dispatch_network_request(
-    process: &mut ExceptionProcessContext<'_>,
+    process: &mut Request,
     is_domain: bool,
     session: &NetworkRequestSession,
     request: CmifRequest<'_>,
@@ -239,9 +231,7 @@ pub(in crate::ipc_wire) fn dispatch_network_request(
         2 => {
             let mut handles = [0; 2];
             for (handle, event) in handles.iter_mut().zip(session.events()) {
-                *handle = process.handles_mut().insert(event).map_err(|_| {
-                    IpcWireError::HostResourceExhausted("installing a network request event")
-                })?;
+                *handle = process.return_handle(event).map_err(IpcWireError::Handle)?;
             }
             semantic_success(request.token, is_domain, &[], &handles, &[], None)
         }

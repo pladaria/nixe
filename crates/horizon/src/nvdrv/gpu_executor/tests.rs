@@ -1,6 +1,81 @@
 use super::*;
 
 #[test]
+fn channel_acceptance_stays_ordered_until_its_submission_is_queued() {
+    use super::super::{NV_SUCCESS, NvDrvInlineBuffer, NvDrvIoctlCaller, NvDrvSession};
+    use std::time::{Duration, Instant};
+
+    let session = NvDrvSession::new(crate::test_memory::machine());
+    session.initialize(0);
+    let nvmap = session.open(b"/dev/nvmap", 1).unwrap();
+    let space = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
+    let channel = session.open(b"/dev/nvhost-gpu", 1).unwrap();
+    session
+        .ioctl(channel, 0x4004_4801, &nvmap.raw().to_le_bytes())
+        .unwrap();
+    session
+        .ioctl(space, 0x4004_4101, &channel.raw().to_le_bytes())
+        .unwrap();
+    let mut allocate = [0; 32];
+    allocate[..4].copy_from_slice(&8u32.to_le_bytes());
+    assert_eq!(
+        session.ioctl(channel, 0xc020_481a, &allocate).unwrap().1,
+        NV_SUCCESS
+    );
+    let (gpu, executor) = {
+        let state = session.state.lock().unwrap();
+        (
+            state.nvhost_gpu.clone(),
+            state.gpu_backend.as_ref().unwrap().clone(),
+        )
+    };
+    // Hold the real enqueue boundary, after capacity admission but before the
+    // owner can observe this submission. No GPU or timing hook is required.
+    let sender = executor.sender.lock().unwrap();
+    let submitting = session.clone();
+    let worker = thread::spawn(move || {
+        let mut input = [0; 24];
+        input[12..16].copy_from_slice(&4u32.to_le_bytes());
+        submitting.ioctl_inner(
+            channel,
+            0xc018_481b,
+            &input,
+            NvDrvInlineBuffer::Input(&[]),
+            None,
+            NvDrvIoctlCaller {
+                thread_id: 1,
+                clock: &nixe_runtime::VirtualClock::default(),
+            },
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut acceptance_was_released = false;
+    let mut admission_started = false;
+    while Instant::now() < deadline {
+        admission_started |= executor.budget.state.lock().unwrap().active != 0;
+        if admission_started
+            && let Ok(guard) = gpu.try_lock()
+            && guard.accepted_submission_count() != 0
+        {
+            acceptance_was_released = true;
+            break;
+        }
+        thread::yield_now();
+    }
+    drop(sender);
+    let accepted = worker.join().unwrap().unwrap();
+    assert!(
+        matches!(accepted, super::super::NvDrvIoctlOutcome::Complete(response)
+        if response.driver_result == NV_SUCCESS)
+    );
+    assert!(admission_started, "submission never reached admission");
+    assert!(
+        !acceptance_was_released,
+        "another ioctl could accept a later fence before the first submission was queued"
+    );
+}
+
+#[test]
 fn admission_bounds_real_deliveries_and_teardown_wakes_capacity_waiters() {
     let budget = Arc::new(GpuWorkBudget::default());
     let mut permits = Vec::new();
@@ -34,7 +109,7 @@ fn progress_notifications_are_coalesced_without_a_capture_frontier() {
     assert!(budget.take_progress_request());
     assert!(!budget.take_progress_request());
     budget.stop();
-    assert_eq!(budget.request_progress(), None);
+    assert!((budget.request_progress()).is_none());
 }
 #[test]
 fn presentation_cannot_overtake_a_frontend_delivery() {
@@ -42,16 +117,22 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
         NvDrvDescriptorOwner, NvDrvDeviceKind, NvDrvFileDescriptor, NvDrvPermissionProfile,
         NvDrvSessionId,
     };
+    use nixe_gpu::physical::PhysicalMapping;
     use nixe_gpu::{BackingView, GpuAllocationId, ImageMemoryLayout, PresentationImageFormat};
     use nixe_gpu_maxwell::{
         MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellChannelId,
-        MaxwellChannelOwner, MaxwellGpfifoSubmitRequest, MaxwellGpuChannel, MaxwellScheduler,
-        SWITCH_1_GM20B_PROFILE, decode_gpfifo_submission, resolve_gpfifo_submission,
+        MaxwellChannelOwner, MaxwellGpfifoSubmitRequest, MaxwellGpuAddressSpace, MaxwellGpuChannel,
+        MaxwellScheduler, SWITCH_1_GM20B_PROFILE, decode_gpfifo_submission,
+        resolve_gpfifo_submission,
     };
-    use nixe_memory::{CanonicalAllocation, CanonicalCpuWriteDependency, MemoryPermissions};
+    use nixe_memory::{AllocationRange, Machine};
 
-    let mut address_space =
-        MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+    let machine = Machine::new(4096).unwrap();
+    let mut address_space = MaxwellGpuAddressSpace::new(
+        machine.clone(),
+        MaxwellAddressSpaceId::new(1),
+        SWITCH_1_GM20B_PROFILE,
+    );
     address_space
         .initialize(MaxwellAddressSpaceInitialization::default())
         .unwrap();
@@ -74,23 +155,23 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
     )
     .unwrap();
     let retained = resolve_gpfifo_submission(
-        &channel,
+        &channel.configuration(),
         FrontendSubmissionId::new(1),
         decoded,
-        &address_space,
+        address_space.memory(),
     )
     .unwrap();
     let mut scheduler = MaxwellScheduler::default();
-    scheduler.enqueue(&channel, retained, None, None).unwrap();
+    scheduler
+        .enqueue(&channel.configuration(), retained, None, None)
+        .unwrap();
     let dispatch = scheduler
-        .dispatch_next(true, &address_space)
+        .dispatch_next(true, address_space.memory())
         .unwrap()
         .unwrap();
-    let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-    let backing = allocation
-        .backing_range(MemoryPermissions::READ_WRITE)
-        .unwrap();
-    let cpu_writes = CanonicalCpuWriteDependency::capture(&backing).unwrap();
+    let allocation = machine.account(4096).unwrap().allocate(4096).unwrap();
+    let input = AllocationRange::new(allocation.pin(), 0, 4096).unwrap();
+    let backing = PhysicalMapping::new(std::slice::from_ref(&input)).unwrap();
     let image = PresentationImageRequest {
         allow_canonical_import: false,
         backing: BackingView::new(
@@ -108,9 +189,9 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
             layer_stride: 4,
         },
         row_pitch: 4,
-        cpu_writes,
+        inputs: vec![input],
     };
-    let executor = NvDrvGpuExecutor::new();
+    let executor = NvDrvGpuExecutor::new(machine);
     let GpuSubmissionAdmission::Ready(permit) = executor.reserve_submission().unwrap() else {
         panic!()
     };
@@ -127,7 +208,7 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
                 0xc018_481b,
                 dispatch,
                 channel.configuration(),
-                address_space,
+                address_space.memory().clone(),
                 None,
                 Arc::new(Mutex::new(NvHostControl::default())),
                 permit,

@@ -5,6 +5,7 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
+nixe-memory.workspace = true
 sdl3.workspace = true
 nixe-audio.workspace = true
 nixe-applets.workspace = true
@@ -26,7 +27,6 @@ nixe-loader-executable.workspace = true
 nixe-loader-storage.workspace = true
 nixe-loader-title.workspace = true
 nixe-runtime.workspace = true
-nixe-memory.workspace = true
 nixe-scheduler.workspace = true
 nixe-video.workspace = true
 nixe-video-winit.workspace = true

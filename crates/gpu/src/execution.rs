@@ -4,14 +4,23 @@
 //! with static dispatch; it does not require a validated backend/driver stack.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use nixe_memory::CpuVisibilityRequest;
+use nixe_memory::{
+    AccessOperation, AccessRequestId, AccessResult, AllocationRange, DeviceAccessRequest,
+};
 
 use crate::{
-    BackendExecutionCompletion, BackendRuntimeError, BackendSubmissionToken,
-    BackendVisibilityRequester, ResidentImage,
+    BackendExecutionCompletion, BackendRuntimeError, BackendSubmissionToken, ResidentImage,
 };
+
+/// Owner-local execution of accepted physical memory operations. The caller
+/// consumes returned bytes before delegating native work; it never calls its
+/// own asynchronous device endpoint.
+pub type MemoryAccess<'a> = dyn FnMut(
+        Vec<AllocationRange>,
+        AccessOperation,
+    ) -> Result<AccessResult, Arc<nixe_memory::MemoryError>>
+    + 'a;
 
 /// Frontend-owned identity of an immutable prepared state revision.
 ///
@@ -52,26 +61,27 @@ pub struct ExecutionBatch<'a, C> {
 ///
 /// Access descriptions express guest effects in operation order. Canonical CPU
 /// visibility is coordinated by nixe-memory; host hazards, queue ticks and
-/// Vulkan barriers belong to the renderer. Poll/wait report ordered completion
+/// Vulkan barriers belong to the renderer. Poll reports ordered completion
 /// only after host work and required canonical ownership transitions finish.
 pub trait GpuExecution: Send + 'static {
     type Commands: Send + 'static;
     type ImageRequest: Send + 'static;
     /// Host control is serviced by the same concrete owner, outside draw loops.
-    fn bind_host_wakeup(&mut self, _wake: Arc<dyn Fn() + Send + Sync>) {}
+    fn bind_host_wakeup(
+        &mut self,
+        _wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), BackendRuntimeError> {
+        Ok(())
+    }
     fn service_host(&mut self) -> Result<(), BackendRuntimeError> {
         Ok(())
     }
-    fn host_work_pending(&self) -> bool {
-        false
-    }
     /// Submit a required progress point and arrange a wakeup on completion.
-    /// Returns true only when a completion notification is armed. Without a
-    /// future event (including an already-ready logical completion), return
-    /// false so the owner can use its bounded wait/retirement contract. The
-    /// queue owner retains all submission, retirement and publication authority.
-    fn request_completion_wakeup(&mut self) -> Result<bool, BackendRuntimeError> {
-        Ok(false)
+    /// The owner polls before registration. If native work completes in that
+    /// interval, invoke the bound wakeup immediately rather than losing it.
+    /// The queue owner retains all submission, retirement and publication authority.
+    fn request_completion_wakeup(&mut self) -> Result<(), BackendRuntimeError> {
+        Ok(())
     }
     /// Complete preceding native work before fetching a SYNC_WAIT command source.
     fn synchronize_command_sources(&mut self) -> Result<(), BackendRuntimeError> {
@@ -104,34 +114,37 @@ pub trait GpuExecution: Send + 'static {
     fn poll_completion(
         &mut self,
     ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError>;
-    /// Progresses outstanding work even when no later batch arrives.
-    fn wait_for_completion(
+    /// Direct owner-local physical operation; no endpoint/TLS callback.
+    fn access_memory(
         &mut self,
-    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError>;
-    /// A bounded GPU wait lets the owner revisit its control inbox. Timeout
-    /// returns None and must never publish completion or release admission.
-    fn wait_for_completion_timeout(
+        ranges: Vec<AllocationRange>,
+        operation: AccessOperation,
+    ) -> Result<AccessResult, BackendRuntimeError>;
+    /// External operations own their exact inputs and their sole completion.
+    fn queue_device_access(
         &mut self,
-        timeout: Duration,
-    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError>;
-    fn bind_visibility_requester(
-        &mut self,
-        requester: Arc<dyn BackendVisibilityRequester>,
+        request: DeviceAccessRequest,
     ) -> Result<(), BackendRuntimeError>;
-    /// The owner resolves its own requests directly, never through its inbox.
-    fn make_cpu_visible(
+    fn cancel_device_access(&mut self, request: AccessRequestId)
+    -> Result<(), BackendRuntimeError>;
+    fn progress_device_accesses(&mut self) -> Result<(), BackendRuntimeError>;
+    fn fail_device_accesses(&mut self, cause: Arc<nixe_memory::MemoryError>);
+    fn retire_physical_memory(
         &mut self,
-        request: CpuVisibilityRequest,
-    ) -> Result<Box<[u8]>, BackendRuntimeError>;
-    /// Services an external CPU demand. None retains the demand with the owner;
-    /// the backend must arrange a host wakeup when its producer can progress.
-    /// Executors without deferred visibility keep their synchronous contract.
-    fn service_cpu_visibility(
+        machine: nixe_memory::MachineId,
+        allocation: nixe_memory::AllocationId,
+        extents: &[nixe_memory::Extent],
+    ) -> Result<(), BackendRuntimeError>;
+    fn release_guest_memory(
         &mut self,
-        request: CpuVisibilityRequest,
-    ) -> Result<Option<Box<[u8]>>, BackendRuntimeError> {
-        self.make_cpu_visible(request).map(Some)
-    }
+        machine: nixe_memory::MachineId,
+        allocation: nixe_memory::AllocationId,
+    ) -> Result<(), BackendRuntimeError>;
+    fn allocation_pressure(
+        &mut self,
+        machine: nixe_memory::MachineId,
+        bytes: u64,
+    ) -> Result<(), BackendRuntimeError>;
     fn acquire_presentable_image(
         &mut self,
         request: Self::ImageRequest,
@@ -162,27 +175,45 @@ impl GpuExecution for std::convert::Infallible {
     ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
         match *self {}
     }
-    fn wait_for_completion(
+    fn access_memory(
         &mut self,
-    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
+        _: Vec<AllocationRange>,
+        _: AccessOperation,
+    ) -> Result<AccessResult, BackendRuntimeError> {
         match *self {}
     }
-    fn wait_for_completion_timeout(
-        &mut self,
-        _timeout: Duration,
-    ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
+    fn queue_device_access(&mut self, _: DeviceAccessRequest) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
-    fn bind_visibility_requester(
+    fn cancel_device_access(&mut self, _: AccessRequestId) -> Result<(), BackendRuntimeError> {
+        match *self {}
+    }
+    fn progress_device_accesses(&mut self) -> Result<(), BackendRuntimeError> {
+        match *self {}
+    }
+    fn fail_device_accesses(&mut self, _: Arc<nixe_memory::MemoryError>) {
+        match *self {}
+    }
+    fn retire_physical_memory(
         &mut self,
-        _requester: Arc<dyn BackendVisibilityRequester>,
+        _: nixe_memory::MachineId,
+        _: nixe_memory::AllocationId,
+        _: &[nixe_memory::Extent],
     ) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
-    fn make_cpu_visible(
+    fn release_guest_memory(
         &mut self,
-        _request: CpuVisibilityRequest,
-    ) -> Result<Box<[u8]>, BackendRuntimeError> {
+        _: nixe_memory::MachineId,
+        _: nixe_memory::AllocationId,
+    ) -> Result<(), BackendRuntimeError> {
+        match *self {}
+    }
+    fn allocation_pressure(
+        &mut self,
+        _: nixe_memory::MachineId,
+        _: u64,
+    ) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
     fn acquire_presentable_image(

@@ -152,7 +152,8 @@ impl RuntimeCoordinator {
         self.processes
             .get_mut(&view.process)
             .ok_or(ThreadOperationError::Internal)?
-            .address_waits_mut()
+            .address_waits()
+            .lock()
             .change_priority(info.thread, view.effective_priority);
         Ok(())
     }
@@ -236,6 +237,7 @@ impl RuntimeCoordinator {
             .processes
             .get(&process_id)
             .ok_or(ThreadOperationError::Internal)?;
+        let waits = process.address_waits().lock();
         let previous_count = self.priority_donations.len();
         self.priority_donations.retain(|donation| {
             !addresses.contains(&donation.key)
@@ -243,16 +245,15 @@ impl RuntimeCoordinator {
                     .scheduler
                     .thread(donation.owner)
                     .is_none_or(|owner| owner.process != process_id)
-                || (process.address_waits().owner(donation.key) == Some(donation.owner)
-                    && process
-                        .address_waits()
+                || (waits.owner(donation.key) == Some(donation.owner)
+                    && waits
                         .pending_threads(donation.key)
                         .any(|waiter| waiter == donation.waiter))
         });
         let mut changed = self.priority_donations.len() != previous_count;
         for address in addresses {
-            if let Some(owner) = process.address_waits().owner(*address) {
-                for waiter in process.address_waits().pending_threads(*address) {
+            if let Some(owner) = waits.owner(*address) {
+                for waiter in waits.pending_threads(*address) {
                     changed |= self.priority_donations.insert(PriorityDonation {
                         owner,
                         waiter,
@@ -261,6 +262,7 @@ impl RuntimeCoordinator {
                 }
             }
         }
+        drop(waits);
         // An uncontended lock handoff changes no donation edge. Keep the
         // established priorities without rebuilding every process's graph.
         if changed {
@@ -275,7 +277,8 @@ impl RuntimeCoordinator {
             .ok_or(ThreadOperationError::Internal)?;
         let scheduler = &self.scheduler;
         process
-            .address_waits_mut()
+            .address_waits()
+            .lock()
             .refresh_mutex_priorities(|thread| {
                 scheduler
                     .thread(thread)
@@ -370,7 +373,8 @@ impl RuntimeCoordinator {
                 self.processes
                     .get_mut(&process_id)
                     .expect("thread owns a process")
-                    .address_waits_mut()
+                    .address_waits()
+                    .lock()
                     .change_priority(thread, priority);
             }
         }
@@ -410,7 +414,8 @@ impl RuntimeCoordinator {
             self.processes
                 .get_mut(&process_id)
                 .expect("the process was validated")
-                .address_waits_mut()
+                .address_waits()
+                .lock()
                 .release_thread(thread);
             self.priority_donations
                 .retain(|donation| donation.owner != thread && donation.waiter != thread);

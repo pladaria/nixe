@@ -42,8 +42,8 @@ impl AccountCommand {
     }
 }
 
-pub(in crate::ipc_wire) fn dispatch_account(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_account(
+    process: &mut Request,
     session: &AccountSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -97,7 +97,7 @@ pub(in crate::ipc_wire) fn dispatch_account(
 
     match target {
         AccountTarget::Root => {
-            dispatch_account_root(process, session, request, hipc, user_account_switch_locked)
+            dispatch_account_root(process, session, request, hipc, user_account_switch_locked).await
         }
         AccountTarget::Profile(profile) => dispatch_account_profile(profile, request, hipc, true),
         AccountTarget::BaasManagerForApplication(manager) => {
@@ -106,8 +106,8 @@ pub(in crate::ipc_wire) fn dispatch_account(
     }
 }
 
-fn dispatch_account_root(
-    process: &mut ExceptionProcessContext<'_>,
+async fn dispatch_account_root(
+    process: &mut Request,
     session: &AccountSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -147,11 +147,8 @@ fn dispatch_account_root(
                 semantic_success(request.token, true, &[], &[], &[object], None)
             } else {
                 let handle = process
-                    .handles_mut()
-                    .insert(HorizonIpcObject::AccountProfile(profile))
-                    .map_err(|_| {
-                        IpcWireError::HostResourceExhausted("opening account profile session")
-                    })?;
+                    .return_handle(HorizonIpcObject::AccountProfile(profile))
+                    .map_err(IpcWireError::Handle)?;
                 semantic_success(request.token, false, &[], &[], &[], Some(handle))
             }
         }
@@ -193,7 +190,7 @@ fn dispatch_account_root(
             }
             let mut users = [0; 128];
             users[..16].copy_from_slice(&session.user().id().encode());
-            write_bytes(process, GuestVirtualAddress::new(pointer.address), &users)?;
+            write_bytes(process, GuestVirtualAddress::new(pointer.address), &users).await?;
             account_response(session, request.token, HorizonIpcResult::SUCCESS)
         }
         // Account registration requires a system profile-creation UI. Nixe
@@ -373,13 +370,8 @@ fn dispatch_account_root(
                 ))
             } else {
                 let handle = process
-                    .handles_mut()
-                    .insert(HorizonIpcObject::AccountManagerForApplication(manager))
-                    .map_err(|_| {
-                        IpcWireError::HostResourceExhausted(
-                            "installing an account application-manager handle",
-                        )
-                    })?;
+                    .return_handle(HorizonIpcObject::AccountManagerForApplication(manager))
+                    .map_err(IpcWireError::Handle)?;
                 log::debug!(
                     "acc:u0 opened IManagerForApplication handle {handle:#x} for user {} ({})",
                     user.name(),

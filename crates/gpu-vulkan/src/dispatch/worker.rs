@@ -1,6 +1,6 @@
 //! Recycled bounded native jobs, containing no guest-memory references.
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::queue::progress::{NativeFailure, SubmissionProgress};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -13,24 +13,33 @@ pub(crate) struct QueueSubmission {
     pub waits: smallvec::SmallVec<[vk::SemaphoreSubmitInfo<'static>; 1]>,
     pub signals: smallvec::SmallVec<[vk::SemaphoreSubmitInfo<'static>; 2]>,
     pub tick: u64,
-    pub submitted: Arc<AtomicU64>,
+    pub progress: Arc<SubmissionProgress>,
 }
 // SAFETY: submit entries contain native handles and scalar parameters. The
 // enqueue boundary rejects pNext; each parameter array is owned by this job.
 unsafe impl Send for QueueSubmission {}
-#[derive(Clone, Copy)]
-enum NativeFailure {
-    Vulkan {
-        operation: &'static str,
-        result: vk::Result,
-    },
-    Panicked,
+struct WorkerScope {
+    failure: Arc<OnceLock<NativeFailure>>,
+    active: Option<(Arc<SubmissionProgress>, u64)>,
 }
-struct WorkerScope(Arc<OnceLock<NativeFailure>>);
+impl WorkerScope {
+    fn fail(&self, cause: NativeFailure) {
+        if let Some((progress, tick)) = &self.active {
+            progress.fail(*tick, cause.clone());
+        }
+        let _ = self.failure.set(cause);
+    }
+}
 impl Drop for WorkerScope {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            let _ = self.0.set(NativeFailure::Panicked);
+            if let Some((progress, tick)) = &self.active {
+                let failed = (*tick).max(progress.submitted().saturating_add(1));
+                progress.fail(failed, NativeFailure::Panicked);
+                let _ = self.failure.set(progress.failure().unwrap().cause);
+            } else {
+                let _ = self.failure.set(NativeFailure::Panicked);
+            }
         }
     }
 }
@@ -39,6 +48,8 @@ enum Work {
     Begin {
         pool: vk::CommandPool,
         command: vk::CommandBuffer,
+        tick: u64,
+        progress: Arc<SubmissionProgress>,
     },
     Submit(QueueSubmission),
     Finish(mpsc::SyncSender<()>),
@@ -75,14 +86,39 @@ impl Recorder {
         let worker = thread::Builder::new()
             .name("nixe-vk-record".into())
             .spawn(move || {
-                let _scope = WorkerScope(Arc::clone(&worker_failure));
+                let mut scope = WorkerScope {
+                    failure: Arc::clone(&worker_failure),
+                    active: None,
+                };
                 let mut draw = None;
                 while let Ok(work) = receiver.recv() {
+                    match &work {
+                        Work::Begin { tick, progress, .. }
+                        | Work::Submit(QueueSubmission { tick, progress, .. }) => {
+                            scope.active = Some((Arc::clone(progress), *tick));
+                            if let Some(failure) = progress.failure().filter(|f| *tick >= f.tick) {
+                                let _ = worker_failure.set(failure.cause);
+                            }
+                        }
+                        _ => {}
+                    }
+                    if let Some((progress, tick)) = &scope.active
+                        && progress.cancelled()
+                        && *tick > progress.submitted()
+                    {
+                        progress.fail(*tick, NativeFailure::Stopped);
+                        let _ = worker_failure.set(progress.failure().unwrap().cause);
+                    }
                     match work {
                         Work::Commands(mut commands) => {
                             if worker_failure.get().is_none() {
                                 for command in commands.drain(..) {
-                                    append_draw(&mut draw, command, &device, &functions);
+                                    if let Err(error) =
+                                        append_draw(&mut draw, command, &device, &functions)
+                                    {
+                                        scope.fail(error);
+                                        break;
+                                    }
                                 }
                             } else {
                                 commands.clear();
@@ -91,9 +127,16 @@ impl Recorder {
                                 break;
                             }
                         }
-                        Work::Begin { pool, command } => {
-                            flush_draw(&mut draw, &device, &functions);
+                        Work::Begin {
+                            pool,
+                            command,
+                            tick,
+                            progress,
+                        } => {
                             if worker_failure.get().is_none() {
+                                if let Err(error) = flush_draw(&mut draw, &device, &functions) {
+                                    scope.fail(error);
+                                }
                                 let result = unsafe {
                                     device.reset_command_pool(
                                         pool,
@@ -121,13 +164,21 @@ impl Recorder {
                                     })
                                 });
                                 if let Err(error) = result {
+                                    progress.fail(tick, error.clone());
                                     let _ = worker_failure.set(error);
                                 }
+                            } else {
+                                draw = None;
+                                progress.fail(tick, worker_failure.get().unwrap().clone());
                             }
                         }
                         Work::Submit(work) => {
-                            flush_draw(&mut draw, &device, &functions);
+                            let _trace =
+                                nixe_gpu::trace::span("native_finalize_submit", work.tick, 0, 0);
                             if worker_failure.get().is_none() {
+                                if let Err(error) = flush_draw(&mut draw, &device, &functions) {
+                                    scope.fail(error);
+                                }
                                 let result = unsafe { device.end_command_buffer(work.command) }
                                     .map_err(|result| NativeFailure::Vulkan {
                                         operation: "vkEndCommandBuffer",
@@ -140,9 +191,30 @@ impl Recorder {
                                             .command_buffer_infos(&commands)
                                             .wait_semaphore_infos(&work.waits)
                                             .signal_semaphore_infos(&work.signals);
+                                        let lock_trace = nixe_gpu::trace::span(
+                                            "native_queue_lock_wait",
+                                            work.tick,
+                                            0,
+                                            0,
+                                        );
                                         let _queue = queue_mutex
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        drop(lock_trace);
+                                        if let Some(failure) =
+                                            work.progress.failure().filter(|f| work.tick >= f.tick)
+                                        {
+                                            return Err(failure.cause);
+                                        }
+                                        if work.progress.cancelled() {
+                                            return Err(NativeFailure::Stopped);
+                                        }
+                                        let submit_trace = nixe_gpu::trace::span(
+                                            "native_queue_submit",
+                                            work.tick,
+                                            0,
+                                            0,
+                                        );
                                         #[cfg(feature = "performance-counters")]
                                         let started = std::time::Instant::now();
                                         let result = unsafe {
@@ -154,9 +226,17 @@ impl Recorder {
                                             )
                                         };
                                         #[cfg(feature = "performance-counters")]
+                                        let submit_ns = started.elapsed().as_nanos() as u64;
+                                        if result == vk::Result::SUCCESS {
+                                            // Record the actual native use before diagnostics or
+                                            // any other fallible work can unwind this worker.
+                                            work.progress.submitted_successfully(work.tick);
+                                        }
+                                        drop(submit_trace);
+                                        #[cfg(feature = "performance-counters")]
                                         nixe_gpu::metrics::record(
                                             nixe_gpu::metrics::Counter::HostQueueSubmitNanoseconds,
-                                            started.elapsed().as_nanos() as u64,
+                                            submit_ns,
                                         );
                                         if result == vk::Result::SUCCESS {
                                             Ok(())
@@ -169,7 +249,6 @@ impl Recorder {
                                     });
                                 match result {
                                     Ok(()) => {
-                                        work.submitted.store(work.tick, Ordering::Release);
                                         nixe_gpu::metrics::record(
                                             nixe_gpu::metrics::Counter::HostQueueSubmissions,
                                             1,
@@ -182,19 +261,34 @@ impl Recorder {
                                         );
                                     }
                                     Err(error) => {
+                                        work.progress.fail(work.tick, error.clone());
                                         let _ = worker_failure.set(error);
                                     }
                                 }
+                            } else {
+                                draw = None;
+                                work.progress
+                                    .fail(work.tick, worker_failure.get().unwrap().clone());
                             }
                         }
                         Work::Finish(reply) => {
-                            flush_draw(&mut draw, &device, &functions);
+                            if worker_failure.get().is_none() {
+                                if let Err(error) = flush_draw(&mut draw, &device, &functions) {
+                                    scope.fail(error);
+                                }
+                            } else {
+                                draw = None;
+                            }
                             let _ = reply.send(());
                         }
                         Work::Stop => break,
                     }
                 }
-                flush_draw(&mut draw, &device, &functions);
+                if worker_failure.get().is_none()
+                    && let Err(error) = flush_draw(&mut draw, &device, &functions)
+                {
+                    scope.fail(error);
+                }
             })
             .map_err(|error| {
                 VulkanError::Loader(format!("Vulkan recording worker: {error}").into())
@@ -223,14 +317,11 @@ impl Recorder {
 }
 impl RecordingHandle {
     pub(crate) fn check_failure(&self) -> Result<(), VulkanError> {
-        self.inner.failure.get().map_or(Ok(()), |failure| {
-            Err(match *failure {
-                NativeFailure::Vulkan { operation, result } => VulkanError::vk(operation, result),
-                NativeFailure::Panicked => {
-                    VulkanError::InvalidResource("Vulkan native scheduler panicked")
-                }
-            })
-        })
+        self.native_failure()
+            .map_or(Ok(()), |failure| Err(failure.error()))
+    }
+    pub(crate) fn native_failure(&self) -> Option<NativeFailure> {
+        self.inner.failure.get().cloned()
     }
     pub(crate) fn is_device_lost(&self) -> bool {
         self.inner.failure.get().is_some_and(|failure| {
@@ -297,8 +388,15 @@ impl RecordingHandle {
         &self,
         pool: vk::CommandPool,
         command: vk::CommandBuffer,
+        tick: u64,
+        progress: Arc<SubmissionProgress>,
     ) -> Result<(), VulkanError> {
-        self.enqueue(Work::Begin { pool, command })
+        self.enqueue(Work::Begin {
+            pool,
+            command,
+            tick,
+            progress,
+        })
     }
     pub(crate) fn submit(&self, work: QueueSubmission) -> Result<(), VulkanError> {
         if work
@@ -332,6 +430,14 @@ impl RecordingHandle {
             Ok(())
         }
     }
+    pub(crate) fn discard_pending(&self) {
+        self.inner
+            .producer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .commands
+            .clear();
+    }
 }
 impl Drop for Recorder {
     fn drop(&mut self) {
@@ -342,19 +448,24 @@ impl Drop for Recorder {
         }
     }
 }
-fn flush_draw(draw: &mut Option<Command>, device: &Device, functions: &Functions) {
+fn flush_draw(
+    draw: &mut Option<Command>,
+    device: &Device,
+    functions: &Functions,
+) -> Result<(), NativeFailure> {
     if let Some(draw) = draw.take() {
         // SAFETY: each parameter was captured while the owner retained the
         // resources in its command slot. The ordered submit job follows this recording.
-        unsafe { draw.execute(device, functions) };
+        unsafe { draw.execute(device, functions) }?;
     }
+    Ok(())
 }
 fn append_draw(
     draw: &mut Option<Command>,
     command: Command,
     device: &Device,
     functions: &Functions,
-) {
+) -> Result<(), NativeFailure> {
     match (&mut *draw, &command) {
         (
             Some(Command::Draw {
@@ -378,7 +489,7 @@ fn append_draw(
         {
             if let Some(total) = old_instances.checked_add(*instances) {
                 *old_instances = total;
-                return;
+                return Ok(());
             }
         }
         (
@@ -406,18 +517,19 @@ fn append_draw(
         {
             if let Some(total) = old_instances.checked_add(*instances) {
                 *old_instances = total;
-                return;
+                return Ok(());
             }
         }
         _ => {}
     }
-    flush_draw(draw, device, functions);
+    flush_draw(draw, device, functions)?;
     if matches!(command, Command::Draw { .. } | Command::DrawIndexed { .. }) {
         *draw = Some(command);
     } else {
         // SAFETY: same retained-parameter contract as flush_draw.
-        unsafe { command.execute(device, functions) };
+        unsafe { command.execute(device, functions) }?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -466,20 +578,42 @@ mod tests {
         };
         Recorder::new(device, functions, Arc::new(Mutex::new(()))).unwrap()
     }
-    fn submission(queue: u64, tick: u64, submitted: &Arc<AtomicU64>) -> QueueSubmission {
+    fn submission(queue: u64, tick: u64, submitted: &Arc<SubmissionProgress>) -> QueueSubmission {
         QueueSubmission {
             queue: vk::Queue::from_raw(queue),
             command: vk::CommandBuffer::null(),
             waits: Default::default(),
             signals: Default::default(),
             tick,
-            submitted: Arc::clone(submitted),
+            progress: Arc::clone(submitted),
         }
+    }
+    #[test]
+    fn worker_panic_wakes_waiters_and_preserves_the_last_native_submission() {
+        let progress = Arc::new(SubmissionProgress::default());
+        progress.submitted_successfully(3);
+        let failure = Arc::new(OnceLock::new());
+        let pending = Arc::clone(&progress);
+        let waiting = thread::spawn(move || pending.wait_submitted(4, None));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scope = WorkerScope {
+                failure: Arc::clone(&failure),
+                active: Some((Arc::clone(&progress), 3)),
+            };
+            panic!("injected native worker panic");
+        }));
+        assert!(result.is_err());
+        assert!(matches!(
+            waiting.join().unwrap(),
+            Err(VulkanError::SubmissionFailed { tick: 4, .. })
+        ));
+        assert_eq!(progress.submitted(), 3);
+        assert!(matches!(failure.get(), Some(NativeFailure::Panicked)));
     }
     #[test]
     fn failed_submission_retains_the_last_real_tick_and_stops_following_work() {
         let recorder = recorder();
-        let submitted = Arc::new(AtomicU64::new(0));
+        let submitted = Arc::new(SubmissionProgress::default());
         recorder
             .handle
             .submit(submission(1, 3, &submitted))
@@ -495,7 +629,7 @@ mod tests {
                 result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
             })
         ));
-        assert_eq!(submitted.load(Ordering::Acquire), 3);
+        assert_eq!(submitted.submitted(), 3);
         assert!(matches!(
             recorder.handle.submit(submission(1, 5, &submitted)),
             Err(VulkanError::Vulkan {
@@ -503,6 +637,6 @@ mod tests {
                 result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
             })
         ));
-        assert_eq!(submitted.load(Ordering::Acquire), 3);
+        assert_eq!(submitted.submitted(), 3);
     }
 }

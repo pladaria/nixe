@@ -96,35 +96,61 @@ pub(super) fn terminate(
     }
 }
 
-pub(super) fn break_process(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let reason = read_register(context.thread().state(), 0);
-    let info = read_register(context.thread().state(), 1);
-    let size = read_register(context.thread().state(), 2);
-    if reason & 0x8000_0000 != 0 {
-        result(context, HorizonKernelResult::SUCCESS);
-        return resume();
-    }
-    let payload = usize::try_from(size)
-        .ok()
-        .filter(|size| (1..=nixe_runtime::MAX_GUEST_BREAK_PAYLOAD_BYTES).contains(size))
-        .and_then(|size| {
-            let mut bytes = vec![0; size];
-            match crate::ipc_wire::read_bytes(
-                context.process(),
-                GuestVirtualAddress::new(info),
-                &mut bytes,
-            ) {
-                Ok(()) => nixe_runtime::GuestBreakPayload::new(&bytes),
-                Err(error) => {
-                    log::debug!(
-                        "svcBreak payload could not be captured: info={info:#x} size={size:#x} error={error:?}"
-                    );
-                    None
-                }
+impl HorizonSvcDispatcher {
+    pub(super) fn break_process(
+        &mut self,
+        context: &mut ExceptionDispatchContext<'_>,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        let reason = read_register(context.thread().state(), 0);
+        let info = read_register(context.thread().state(), 1);
+        let size = read_register(context.thread().state(), 2);
+        if reason & 0x8000_0000 != 0 {
+            result(context, HorizonKernelResult::SUCCESS);
+            return resume();
+        }
+        let Some(count) = usize::try_from(size)
+            .ok()
+            .filter(|size| (1..=nixe_runtime::MAX_GUEST_BREAK_PAYLOAD_BYTES).contains(size))
+        else {
+            return break_termination(reason, info, size, None);
+        };
+        let mut bytes = [0; nixe_runtime::MAX_GUEST_BREAK_PAYLOAD_BYTES];
+        match context
+            .process()
+            .memory()
+            .space()
+            .read_into(GuestVirtualAddress::new(info), &mut bytes[..count])
+        {
+            Ok(nixe_memory::Access::Ready(())) => break_termination(
+                reason,
+                info,
+                size,
+                nixe_runtime::GuestBreakPayload::new(&bytes[..count]),
+            ),
+            Err(error) if error.is_access_fault() => break_termination(reason, info, size, None),
+            Err(error) => ExceptionDispatchOutcome::Fault(HorizonSvcFault::MemoryAccess {
+                immediate: 0x26,
+                fault: std::sync::Arc::new(error),
+            }),
+            Ok(nixe_memory::Access::Pending(access)) => {
+                self.defer_svc_read(context, 0x26, access, move |_, _, bytes| {
+                    break_termination(
+                        reason,
+                        info,
+                        size,
+                        nixe_runtime::GuestBreakPayload::new(&bytes),
+                    )
+                })
             }
-        });
+        }
+    }
+}
+fn break_termination(
+    reason: u64,
+    info: u64,
+    size: u64,
+    payload: Option<nixe_runtime::GuestBreakPayload>,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     ExceptionDispatchOutcome::Terminate {
         scope: ExceptionTerminationScope::Process,
         exit_code: reason,
@@ -137,6 +163,35 @@ pub(super) fn break_process(
     }
 }
 
+use nixe_runtime::memory::{Mapping, MappingError, MemoryKind};
+use std::sync::Arc;
+
+fn mapping(kind: MemoryKind, permissions: MemoryPermissions) -> Mapping {
+    Mapping {
+        kind,
+        permissions,
+        uncached: false,
+        locked: false,
+        permission_locked: false,
+    }
+}
+fn mapping_result(
+    context: &mut ExceptionDispatchContext<'_>,
+    outcome: Result<(), MappingError>,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    match outcome {
+        Ok(()) => {
+            result(context, HorizonKernelResult::SUCCESS);
+            resume()
+        }
+        Err(fault) => reject(
+            context,
+            HorizonSvcFault::MemoryMapping {
+                fault: Arc::new(fault),
+            },
+        ),
+    }
+}
 pub(super) fn set_memory_permission(
     context: &mut ExceptionDispatchContext<'_>,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
@@ -149,157 +204,91 @@ pub(super) fn set_memory_permission(
         3 => MemoryPermissions::READ_WRITE,
         _ => return reject(context, HorizonSvcFault::InvalidMemoryPermission { raw }),
     };
-    let end = start.get().checked_add(size);
-    let query = context.process().memory().query_memory(
-        context.process().cpu().address_space_id(),
-        start,
-        GuestVirtualAddress::new(context.process().address_space_limit()),
-    );
-    let valid_range = query.is_some_and(|query| {
-        query.purpose.allows_reprotect()
-            && query.base.get() <= start.get()
-            && end.is_some_and(|end| query.base.get().saturating_add(query.size) >= end)
-    });
-    if !valid_range {
-        return reject(
-            context,
-            HorizonSvcFault::InvalidMemoryState {
-                immediate: 0x02,
-                address: start,
-                purpose: query.map_or(MemoryMappingPurpose::Normal, |query| query.purpose),
-            },
-        );
-    }
-    match context
-        .process()
-        .set_memory_permissions(start, size, permissions)
-    {
-        Ok(()) => {
-            result(context, HorizonKernelResult::SUCCESS);
-            resume()
-        }
-        Err(fault) => reject(context, HorizonSvcFault::MemoryProtection { fault }),
-    }
+    let outcome = context.process().memory().protect(start, size, permissions);
+    mapping_result(context, outcome)
 }
-
 pub(super) fn map_memory(
     context: &mut ExceptionDispatchContext<'_>,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let (destination, source, size) = match memory_alias_arguments(context) {
-        Ok(arguments) => arguments,
+        Ok(args) => args,
         Err(code) => {
             result(context, code);
             return resume();
         }
     };
-    let Some(source_query) = query_complete_range(context, source, size).filter(|query| {
-        query.region == Some(MemoryRegionKind::Ram)
-            && query.permissions == MemoryPermissions::READ_WRITE
-            && query.attributes == MemoryAttributes::NONE
-            && allows_memory_alias_source(query.purpose)
+    let before = match context.process().memory().query(source) {
+        Ok(info) if info.base.get() + info.bytes >= source.get() + size => info.mapping,
+        _ => None,
+    };
+    let Some(before) = before.filter(|before| {
+        matches!(
+            before.kind,
+            MemoryKind::Heap | MemoryKind::MutableCode | MemoryKind::MutableModuleCode
+        ) && before.permissions == MemoryPermissions::READ_WRITE
+            && !before.locked
+            && !before.uncached
+            && !before.permission_locked
     }) else {
         result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
         return resume();
     };
-    let destination_is_free = query_complete_range(context, destination, size)
-        .is_some_and(|query| query.region.is_none());
-    if !destination_is_free {
-        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-        return resume();
-    }
-
-    let source_before = mapping_properties(source_query);
-    let source_after = MemoryMappingProperties::new(
-        MemoryPermissions::NONE,
-        source_query.purpose,
-        MemoryAttributes::PERMISSION_LOCKED,
-    );
-    let destination_properties = MemoryMappingProperties::new(
-        MemoryPermissions::READ_WRITE,
-        MemoryMappingPurpose::Stack,
-        MemoryAttributes::NONE,
-    );
-    // Horizon moves user access from the source to a Stack-state virtual alias;
-    // both ranges retain the same physical pages. Public reference, pinned to
-    // the implementation used for these state transitions:
-    // https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_page_table_base.cpp#L961-L1020
-    match context.process().map_memory_alias(
-        destination,
+    let after = Mapping {
+        permissions: MemoryPermissions::NONE,
+        locked: true,
+        ..before
+    };
+    let outcome = context.process().memory().map_alias(
         source,
+        destination,
         size,
-        source_before,
-        source_after,
-        destination_properties,
-    ) {
-        Ok(()) => {
-            log::debug!("mapped memory alias from {source} to {destination} ({size:#x} bytes)");
-            result(context, HorizonKernelResult::SUCCESS);
-            resume()
-        }
-        Err(fault) => reject(context, HorizonSvcFault::MemoryAlias { fault }),
-    }
+        before,
+        after,
+        mapping(MemoryKind::Stack, MemoryPermissions::READ_WRITE),
+    );
+    mapping_result(context, outcome)
 }
-
 pub(super) fn unmap_memory(
     context: &mut ExceptionDispatchContext<'_>,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let (destination, source, size) = match memory_alias_arguments(context) {
-        Ok(arguments) => arguments,
+        Ok(args) => args,
         Err(code) => {
             result(context, code);
             return resume();
         }
     };
-    let Some(source_query) = query_complete_range(context, source, size).filter(|query| {
-        query.region == Some(MemoryRegionKind::Ram)
-            && query.permissions == MemoryPermissions::NONE
-            && query.attributes == MemoryAttributes::PERMISSION_LOCKED
-            && allows_memory_alias_source(query.purpose)
+    let before = match context.process().memory().query(source) {
+        Ok(info) if info.base.get() + info.bytes >= source.get() + size => info.mapping,
+        _ => None,
+    };
+    let Some(before) = before.filter(|before| {
+        matches!(
+            before.kind,
+            MemoryKind::Heap | MemoryKind::MutableCode | MemoryKind::MutableModuleCode
+        ) && before.permissions == MemoryPermissions::NONE
+            && before.locked
+            && !before.uncached
+            && !before.permission_locked
     }) else {
         result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
         return resume();
     };
-    let Some(destination_query) =
-        query_complete_range(context, destination, size).filter(|query| {
-            query.region == Some(MemoryRegionKind::Ram)
-                && query.permissions == MemoryPermissions::READ_WRITE
-                && query.purpose == MemoryMappingPurpose::Stack
-                && query.attributes == MemoryAttributes::NONE
-        })
-    else {
-        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-        return resume();
+    let restored = Mapping {
+        permissions: MemoryPermissions::READ_WRITE,
+        locked: false,
+        ..before
     };
-
-    let source_before = mapping_properties(source_query);
-    let source_after = MemoryMappingProperties::new(
-        MemoryPermissions::READ_WRITE,
-        source_query.purpose,
-        MemoryAttributes::NONE,
-    );
-    let destination_properties = mapping_properties(destination_query);
-    // Unmapping must verify that the Stack range still contains the exact page
-    // group borrowed from the locked source before restoring source access:
-    // https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_page_table_base.cpp#L1022-L1083
-    match context.process().unmap_memory_alias(
-        destination,
+    let outcome = context.process().memory().unmap_alias(
         source,
+        destination,
         size,
-        source_before,
-        source_after,
-        destination_properties,
-    ) {
-        Ok(()) => {
-            log::debug!(
-                "unmapped memory alias from {destination} and restored {source} ({size:#x} bytes)"
-            );
-            result(context, HorizonKernelResult::SUCCESS);
-            resume()
-        }
-        Err(fault) => reject(context, HorizonSvcFault::MemoryAlias { fault }),
-    }
+        before,
+        restored,
+        mapping(MemoryKind::Stack, MemoryPermissions::READ_WRITE),
+    );
+    mapping_result(context, outcome)
 }
-
 fn memory_alias_arguments(
     context: &ExceptionDispatchContext<'_>,
 ) -> Result<(GuestVirtualAddress, GuestVirtualAddress, u64), HorizonKernelResult> {
@@ -337,77 +326,28 @@ fn memory_alias_arguments(
     Ok((destination, source, size))
 }
 
-fn query_complete_range(
-    context: &ExceptionDispatchContext<'_>,
-    start: GuestVirtualAddress,
-    size: u64,
-) -> Option<MemoryQueryResult> {
-    let end = start.get().checked_add(size)?;
-    context
-        .process()
-        .memory()
-        .query_memory(
-            context.process().cpu().address_space_id(),
-            start,
-            GuestVirtualAddress::new(context.process().address_space_limit()),
-        )
-        .filter(|query| {
-            query.base.get() <= start.get()
-                && query
-                    .base
-                    .get()
-                    .checked_add(query.size)
-                    .is_some_and(|query_end| query_end >= end)
-        })
-}
-
-fn mapping_properties(query: MemoryQueryResult) -> MemoryMappingProperties {
-    MemoryMappingProperties::new(query.permissions, query.purpose, query.attributes)
-}
-
-fn allows_memory_alias_source(purpose: MemoryMappingPurpose) -> bool {
-    matches!(
-        purpose,
-        MemoryMappingPurpose::CodeMutable
-            | MemoryMappingPurpose::ModuleCodeMutable
-            | MemoryMappingPurpose::Heap
-    )
-}
-
 pub(super) fn map_shared_memory(
     context: &mut ExceptionDispatchContext<'_>,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let handle = read_register(context.thread().state(), 0) as u32;
     let start = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
     let size = read_register(context.thread().state(), 2);
-    let raw_permissions = read_register(context.thread().state(), 3) as u32;
-    let permissions = match raw_permissions {
+    let raw = read_register(context.thread().state(), 3) as u32;
+    let permissions = match raw {
         1 => MemoryPermissions::READ,
         3 => MemoryPermissions::READ_WRITE,
-        _ => {
-            return reject(
-                context,
-                HorizonSvcFault::InvalidMemoryPermission {
-                    raw: raw_permissions,
-                },
-            );
-        }
+        _ => return reject(context, HorizonSvcFault::InvalidMemoryPermission { raw }),
     };
-    let Some(shared_memory) = context
+    let Some(shared) = context
         .process()
         .handles()
-        .get_as::<SharedMemoryObject>(handle)
-        .cloned()
+        .lookup_as::<SharedMemoryObject>(handle)
+        .map(std::sync::Arc::unwrap_or_clone)
     else {
         result(context, HorizonKernelResult::INVALID_HANDLE);
         return resume();
     };
-    // Public ABI validation and register order:
-    // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#MapSharedMemory
-    if size == 0
-        || !size.is_multiple_of(USER_BUFFER_ALIGNMENT)
-        || usize::try_from(size).ok() != Some(shared_memory.size())
-    {
+    if size == 0 || !size.is_multiple_of(USER_BUFFER_ALIGNMENT) || size != shared.size() as u64 {
         result(context, HorizonKernelResult::INVALID_SIZE);
         return resume();
     }
@@ -420,91 +360,96 @@ pub(super) fn map_shared_memory(
         result(context, HorizonKernelResult::INVALID_ADDRESS);
         return resume();
     }
-    if !shared_memory.remote_permissions().contains(permissions) {
+    if !shared.remote_permissions().contains(permissions) {
         result(context, HorizonKernelResult::INVALID_STATE);
         return resume();
     }
-    match context
-        .process()
-        .map_shared_memory(start, &shared_memory, permissions)
-    {
-        Ok(()) => {
-            log::debug!("mapped shared memory handle {handle:#x} at {start} ({size:#x} bytes)");
-            result(context, HorizonKernelResult::SUCCESS);
-            resume()
-        }
-        Err(fault) => reject(context, HorizonSvcFault::MemoryMapping { fault }),
-    }
+    let outcome = context.process().memory().map(
+        start,
+        shared.allocation().clone(),
+        0,
+        size,
+        mapping(MemoryKind::Shared, permissions),
+    );
+    mapping_result(context, outcome)
 }
-
+pub(super) fn unmap_shared_memory(
+    context: &mut ExceptionDispatchContext<'_>,
+) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+    let handle = read_register(context.thread().state(), 0) as u32;
+    let start = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
+    let size = read_register(context.thread().state(), 2);
+    let Some(shared) = context
+        .process()
+        .handles()
+        .lookup_as::<SharedMemoryObject>(handle)
+        .map(std::sync::Arc::unwrap_or_clone)
+    else {
+        result(context, HorizonKernelResult::INVALID_HANDLE);
+        return resume();
+    };
+    if size == 0 || !size.is_multiple_of(USER_BUFFER_ALIGNMENT) || size != shared.size() as u64 {
+        result(context, HorizonKernelResult::INVALID_SIZE);
+        return resume();
+    }
+    if !start.is_aligned_to(USER_BUFFER_ALIGNMENT) {
+        result(context, HorizonKernelResult::INVALID_ADDRESS);
+        return resume();
+    }
+    let outcome = context.process().memory().query(start).and_then(|info| {
+        let expected = info
+            .mapping
+            .filter(|mapping| mapping.kind == MemoryKind::Shared)
+            .ok_or(MappingError::StateMismatch)?;
+        context
+            .process()
+            .memory()
+            .unmap_shared(start, shared.allocation(), size, expected)
+    });
+    mapping_result(context, outcome)
+}
 pub(super) fn create_transfer_memory(
     context: &mut ExceptionDispatchContext<'_>,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    // Public ABI and validation reference:
-    // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#CreateTransferMemory
-    let address = read_register(context.thread().state(), 1);
+    let start = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
     let size = read_register(context.thread().state(), 2);
-    let raw_permissions = read_register(context.thread().state(), 3) as u32;
-    let permissions = match raw_permissions {
+    let raw = read_register(context.thread().state(), 3) as u32;
+    let permissions = match raw {
         0 => MemoryPermissions::NONE,
         1 => MemoryPermissions::READ,
         3 => MemoryPermissions::READ_WRITE,
-        raw => return reject(context, HorizonSvcFault::InvalidMemoryPermission { raw }),
+        _ => return reject(context, HorizonSvcFault::InvalidMemoryPermission { raw }),
     };
     if size == 0 || !size.is_multiple_of(USER_BUFFER_ALIGNMENT) {
         result(context, HorizonKernelResult::INVALID_SIZE);
         return resume();
     }
-    if !address.is_multiple_of(USER_BUFFER_ALIGNMENT)
-        || address
+    if !start.is_aligned_to(USER_BUFFER_ALIGNMENT)
+        || start
+            .get()
             .checked_add(size)
             .is_none_or(|end| end > context.process().address_space_limit())
     {
         result(context, HorizonKernelResult::INVALID_ADDRESS);
         return resume();
     }
-    let start = GuestVirtualAddress::new(address);
-    let query = context.process().memory().query_memory(
-        context.process().cpu().address_space_id(),
+    let transfer = match TransferMemoryObject::new(
+        Arc::clone(context.process().memory()),
         start,
-        GuestVirtualAddress::new(context.process().address_space_limit()),
-    );
-    if !query.is_some_and(|query| {
-        query.base.get() <= address
-            && query
-                .base
-                .get()
-                .checked_add(query.size)
-                .is_some_and(|end| end >= address.saturating_add(size))
-    }) {
-        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
-        return resume();
-    }
-    let backing = match context
-        .process()
-        .canonical_memory()
-        .translate_canonical_range(
-            context.process().cpu().address_space_id(),
-            start,
-            size,
-            MemoryPermissions::NONE,
-        ) {
-        Ok(backing) => backing,
+        size,
+        permissions,
+    ) {
+        Ok(transfer) => transfer,
         Err(fault) => {
             return reject(
                 context,
-                HorizonSvcFault::CanonicalMemory {
-                    immediate: 0x15,
-                    fault,
+                HorizonSvcFault::MemoryMapping {
+                    fault: Arc::new(fault),
                 },
             );
         }
     };
-    match context
-        .process_mut()
-        .handles_mut()
-        .insert(TransferMemoryObject::new(start, size, permissions, backing))
-    {
+    match context.process_mut().handles().insert(transfer) {
         Ok(handle) => {
             result(context, HorizonKernelResult::SUCCESS);
             write_register(context.thread_mut().state_mut(), 1, u64::from(handle));
@@ -513,104 +458,25 @@ pub(super) fn create_transfer_memory(
     }
     resume()
 }
-
-pub(super) fn unmap_shared_memory(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let handle = read_register(context.thread().state(), 0) as u32;
-    let start = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
-    let size = read_register(context.thread().state(), 2);
-    let Some(shared_memory) = context
-        .process()
-        .handles()
-        .get_as::<SharedMemoryObject>(handle)
-        .cloned()
-    else {
-        result(context, HorizonKernelResult::INVALID_HANDLE);
-        return resume();
-    };
-    if size == 0
-        || !size.is_multiple_of(USER_BUFFER_ALIGNMENT)
-        || usize::try_from(size).ok() != Some(shared_memory.size())
-    {
-        result(context, HorizonKernelResult::INVALID_SIZE);
-        return resume();
-    }
-    if !start.is_aligned_to(USER_BUFFER_ALIGNMENT) {
-        result(context, HorizonKernelResult::INVALID_ADDRESS);
-        return resume();
-    }
-    match context.process().unmap_shared_memory(start, &shared_memory) {
-        Ok(()) => {
-            log::debug!("unmapped shared memory handle {handle:#x} from {start} ({size:#x} bytes)");
-            result(context, HorizonKernelResult::SUCCESS);
-            resume()
-        }
-        Err(fault) => reject(context, HorizonSvcFault::MemoryMapping { fault }),
-    }
-}
-
 pub(super) fn set_memory_attribute(
     context: &mut ExceptionDispatchContext<'_>,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let start = GuestVirtualAddress::new(read_register(context.thread().state(), 0));
     let size = read_register(context.thread().state(), 1);
-    let raw_mask = read_register(context.thread().state(), 2) as u32;
-    let raw_value = read_register(context.thread().state(), 3) as u32;
-    let uncached = MemoryAttributes::UNCACHED.bits();
-    let permission_locked = MemoryAttributes::PERMISSION_LOCKED.bits();
-    let valid_update = (raw_mask == uncached && raw_value & !uncached == 0)
-        || (raw_mask == permission_locked && raw_value == permission_locked);
-    if !valid_update {
-        return reject(
-            context,
-            HorizonSvcFault::InvalidMemoryAttribute {
-                mask: raw_mask,
-                value: raw_value,
-            },
-        );
-    }
-    let (Some(mask), Some(value)) = (
-        MemoryAttributes::from_bits(raw_mask),
-        MemoryAttributes::from_bits(raw_value),
-    ) else {
-        return reject(
-            context,
-            HorizonSvcFault::InvalidMemoryAttribute {
-                mask: raw_mask,
-                value: raw_value,
-            },
-        );
-    };
-    let end = start.get().checked_add(size);
-    let query = context.process().memory().query_memory(
-        context.process().cpu().address_space_id(),
-        start,
-        GuestVirtualAddress::new(context.process().address_space_limit()),
-    );
-    let valid_range = query.is_some_and(|query| {
-        query.purpose.allows_attribute_change()
-            && query.base.get() <= start.get()
-            && end.is_some_and(|end| query.base.get().saturating_add(query.size) >= end)
-    });
-    if !valid_range {
-        return reject(
-            context,
-            HorizonSvcFault::InvalidMemoryState {
-                immediate: 0x03,
-                address: start,
-                purpose: query.map_or(MemoryMappingPurpose::Normal, |query| query.purpose),
-            },
-        );
-    }
-    match context
-        .process()
-        .set_memory_attributes(start, size, mask, value)
-    {
-        Ok(()) => {
-            result(context, HorizonKernelResult::SUCCESS);
-            resume()
+    let mask = read_register(context.thread().state(), 2) as u32;
+    let value = read_register(context.thread().state(), 3) as u32;
+    let outcome = match (mask, value) {
+        (8, 0 | 8) => context
+            .process()
+            .memory()
+            .set_uncached(start, size, value != 0),
+        (16, 16) => context.process().memory().lock_permissions(start, size),
+        _ => {
+            return reject(
+                context,
+                HorizonSvcFault::InvalidMemoryAttribute { mask, value },
+            );
         }
-        Err(fault) => reject(context, HorizonSvcFault::MemoryProtection { fault }),
-    }
+    };
+    mapping_result(context, outcome)
 }

@@ -309,7 +309,7 @@ mod tests {
         for (immediate, expected_names) in cases {
             let decoded = decode_horizon_svc(immediate).unwrap();
             assert_eq!(decoded.documented_names(), expected_names);
-            assert_eq!(decoded.unambiguous_name(), None);
+            assert!((decoded.unambiguous_name()).is_none());
         }
     }
 

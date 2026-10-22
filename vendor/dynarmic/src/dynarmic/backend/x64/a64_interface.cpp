@@ -226,6 +226,16 @@ public:
     void ClearExclusiveState() {
         jit_state.exclusive_state = 0;
     }
+    void SetPhysicalExclusiveReservation(u64 address, u64 identity, u64 version, u64 device_version, u8 bytes, Vector expected) {
+        ASSERT(!is_executing);
+        jit_state.physical_exclusive_address = address;
+        jit_state.physical_exclusive_identity = identity;
+        jit_state.physical_exclusive_version = version;
+        jit_state.physical_exclusive_device_version = device_version;
+        jit_state.physical_exclusive_size = bytes;
+        jit_state.physical_exclusive_expected = expected;
+        jit_state.exclusive_state = 1;
+    }
 
     bool IsExecuting() const {
         return is_executing;
@@ -435,6 +445,9 @@ void Jit::SetPstate(u32 value) {
 
 void Jit::ClearExclusiveState() {
     impl->ClearExclusiveState();
+}
+void Jit::SetPhysicalExclusiveReservation(u64 address, u64 identity, u64 version, u64 device_version, u8 bytes, Vector expected) {
+    impl->SetPhysicalExclusiveReservation(address, identity, version, device_version, bytes, expected);
 }
 
 bool Jit::IsExecuting() const {

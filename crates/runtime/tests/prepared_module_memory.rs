@@ -1,20 +1,17 @@
 use std::sync::Arc;
 
-use nixe_cpu::error::InstructionFetchFaultReason;
-use nixe_cpu::memory::{
-    CpuMemory, DataAccessFaultReason, InstructionMemory, MemoryAccess, MemoryAccessSize,
-    MemoryPermissions, MemoryValue, SyntheticInstallStage, SyntheticMemory,
-};
 use nixe_loader_executable::{
     ExternalSymbol, NroLoader, NsoLoader, PreparationConfig, PreparedModule, SymbolResolution,
 };
 use nixe_loader_storage::{FormatLoader, Storage, StorageError, StorageRef};
-use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
+use nixe_memory::{
+    Access, AccessResult, AddressWidth, GuestVirtualAddress, Machine, MemoryPermissions, PAGE_SIZE,
+};
 use nixe_runtime::{
-    BackendInstallError, InstallStage, ModuleMemoryBackend, PageRequest, install_prepared_module,
+    install_prepared_module,
+    memory::{MemoryKind, ProcessMemory},
 };
 
-const SPACE: AddressSpaceId = AddressSpaceId::new(9);
 const BASE: u64 = 0x7100_0000;
 
 #[derive(Debug)]
@@ -162,237 +159,265 @@ fn prepare_execute_only_nso(base: u64) -> PreparedModule {
         .unwrap()
 }
 
+fn memory(machine: &Machine) -> ProcessMemory {
+    ProcessMemory::new(
+        machine.account(16 * PAGE_SIZE).unwrap(),
+        machine.account(machine.arena().capacity()).unwrap(),
+        AddressWidth::Bits32,
+        nixe_runtime::ProcessVirtualRegion::new(GuestVirtualAddress::new(0x1000000), 0x400000),
+        0,
+    )
+    .unwrap()
+}
+fn read(memory: &ProcessMemory, address: u64, bytes: usize) -> Vec<u8> {
+    let mut result = vec![0; bytes];
+    assert!(matches!(
+        memory
+            .space()
+            .read_into(GuestVirtualAddress::new(address), &mut result)
+            .unwrap(),
+        Access::Ready(())
+    ));
+    result
+}
+fn fetch(memory: &ProcessMemory, address: u64) -> u32 {
+    let ranges = memory
+        .space()
+        .capture(
+            GuestVirtualAddress::new(address),
+            4,
+            MemoryPermissions::EXECUTE,
+        )
+        .unwrap();
+    let (result, _) = memory
+        .account()
+        .machine()
+        .access_code_captured(ranges)
+        .unwrap();
+    let Access::Ready(AccessResult::Read(bytes)) = result else {
+        panic!("private code must be ready")
+    };
+    u32::from_le_bytes(bytes[..].try_into().unwrap())
+}
+
 #[test]
-fn prepared_mappings_are_observable_only_through_cpu_memory_contracts() {
+fn executable_segments_preserve_bytes_relocations_bss_permissions_and_holes() {
+    let machine = Machine::new(32 * PAGE_SIZE).unwrap();
+    let memory = memory(&machine);
     let first = prepare_nro(BASE);
     let second = prepare_nro(BASE + 0x10_0000);
-    let mut memory = SyntheticMemory::new();
-
-    install_prepared_module(&mut memory, SPACE, &first).unwrap();
-    install_prepared_module(&mut memory, SPACE, &second).unwrap();
-
-    let fetched = memory
-        .fetch32(SPACE, GuestVirtualAddress::new(first.entry_address()))
-        .unwrap();
-    assert_eq!(fetched.bits, 0xd503_201f);
-    let read_only = memory
-        .read(
-            SPACE,
-            GuestVirtualAddress::new(BASE + 0x3000),
-            MemoryAccess::normal(MemoryAccessSize::Word),
-        )
-        .unwrap();
-    assert_eq!(read_only.value, MemoryValue::U32(0x2222_2222));
-    let writable = GuestVirtualAddress::new(BASE + 0x5000);
+    install_prepared_module(&memory, &first, true).unwrap();
+    install_prepared_module(&memory, &second, true).unwrap();
+    assert_eq!(fetch(&memory, first.entry_address()), 0xd503_201f);
     assert_eq!(
-        memory
-            .read(
-                SPACE,
-                writable,
-                MemoryAccess::normal(MemoryAccessSize::Doubleword)
-            )
-            .unwrap()
-            .value,
-        MemoryValue::U64(BASE + 0x123)
+        read(&memory, BASE + 0x3000, 4),
+        0x2222_2222_u32.to_le_bytes()
     );
-    memory
-        .write(
-            SPACE,
-            writable,
-            MemoryAccess::normal(MemoryAccessSize::Word),
-            MemoryValue::U32(0xaabb_ccdd),
-        )
-        .unwrap();
     assert_eq!(
-        memory
-            .read(
-                SPACE,
-                writable,
-                MemoryAccess::normal(MemoryAccessSize::Word)
-            )
-            .unwrap()
-            .value,
-        MemoryValue::U32(0xaabb_ccdd)
+        read(&memory, BASE + 0x5000, 8),
+        (BASE + 0x123).to_le_bytes()
     );
-    for address in [BASE + 0x6000, BASE + 0x6320, BASE + 0x6fff] {
-        assert_eq!(
+    assert!(matches!(
+        memory
+            .space()
+            .write_value(GuestVirtualAddress::new(BASE + 0x5000), 4, 0xaabb_ccdd)
+            .unwrap(),
+        Access::Ready(())
+    ));
+    assert_eq!(
+        read(&memory, BASE + 0x5000, 4),
+        0xaabb_ccdd_u32.to_le_bytes()
+    );
+    assert_eq!(read(&memory, BASE + 0x6000, 0x1000), vec![0; 0x1000]);
+    for address in [BASE, BASE + 0x3000] {
+        assert!(
             memory
-                .read(
-                    SPACE,
-                    GuestVirtualAddress::new(address),
-                    MemoryAccess::normal(MemoryAccessSize::Byte)
-                )
-                .unwrap()
-                .value,
-            MemoryValue::U8(0)
+                .space()
+                .write_value(GuestVirtualAddress::new(address), 1, 1)
+                .is_err()
         );
     }
-    assert_eq!(
+    assert!(
         memory
-            .write(
-                SPACE,
-                GuestVirtualAddress::new(BASE + 0x3000),
-                MemoryAccess::normal(MemoryAccessSize::Byte),
-                MemoryValue::U8(1)
+            .space()
+            .capture(
+                GuestVirtualAddress::new(BASE + 0x5000),
+                4,
+                MemoryPermissions::EXECUTE
             )
-            .unwrap_err()
-            .reason,
-        DataAccessFaultReason::WritePermissionDenied
-    );
-    assert_eq!(
-        memory
-            .write(
-                SPACE,
-                GuestVirtualAddress::new(BASE),
-                MemoryAccess::normal(MemoryAccessSize::Byte),
-                MemoryValue::U8(1)
-            )
-            .unwrap_err()
-            .reason,
-        DataAccessFaultReason::WritePermissionDenied
-    );
-    assert_eq!(
-        memory.fetch32(SPACE, writable).unwrap_err().reason,
-        InstructionFetchFaultReason::ExecutePermissionDenied
-    );
-
-    let page_addresses = [
-        BASE,
-        BASE + 0x1000,
-        BASE + 0x3000,
-        BASE + 0x5000,
-        BASE + 0x6000,
-    ];
-    let identities = page_addresses.map(|address| {
-        memory
-            .mapping_info(SPACE, GuestVirtualAddress::new(address))
-            .unwrap()
-            .physical_page
-    });
-    for (index, identity) in identities.iter().enumerate() {
-        assert!(!identities[..index].contains(identity));
-    }
-    for address in page_addresses {
-        assert_ne!(
-            memory
-                .mapping_info(SPACE, GuestVirtualAddress::new(address))
-                .unwrap()
-                .permissions,
-            MemoryPermissions::READ_WRITE_EXECUTE
-        );
-    }
-    assert_eq!(
-        memory
-            .mapping_info(SPACE, GuestVirtualAddress::new(BASE))
-            .unwrap()
-            .permissions,
-        MemoryPermissions::READ_EXECUTE
+            .is_err()
     );
     assert!(
         memory
-            .mapping_info(SPACE, GuestVirtualAddress::new(BASE + 0x2000))
+            .query(GuestVirtualAddress::new(BASE + 0x2000))
+            .unwrap()
+            .mapping
             .is_none()
     );
-    assert!(
+    let text = memory
+        .query(GuestVirtualAddress::new(BASE))
+        .unwrap()
+        .mapping
+        .unwrap();
+    assert_eq!(text.kind, MemoryKind::ModuleCode);
+    assert_eq!(text.permissions, MemoryPermissions::READ_EXECUTE);
+    assert_eq!(
         memory
-            .mapping_info(SPACE, GuestVirtualAddress::new(second.entry_address()))
-            .is_some()
+            .query(GuestVirtualAddress::new(BASE + 0x5000))
+            .unwrap()
+            .mapping
+            .unwrap()
+            .kind,
+        MemoryKind::MutableModuleCode
     );
+    let mut identities = std::collections::BTreeSet::new();
+    for module in [&first, &second] {
+        for segment in module.mappings() {
+            for address in
+                (segment.guest_address()..segment.guest_end()).step_by(PAGE_SIZE as usize)
+            {
+                let translation = memory
+                    .space()
+                    .translate(GuestVirtualAddress::new(address), MemoryPermissions::NONE)
+                    .unwrap();
+                assert!(identities.insert(translation.physical));
+            }
+        }
+    }
+    assert_eq!(
+        memory.account().used_bytes(),
+        identities.len() as u64 * PAGE_SIZE
+    );
+    memory.close().unwrap();
+    assert_eq!(machine.statistics().allocated_bytes, 0);
 }
 
 #[test]
 fn execute_only_text_fetches_but_rejects_data_reads() {
+    let machine = Machine::new(16 * PAGE_SIZE).unwrap();
+    let memory = memory(&machine);
     let module = prepare_execute_only_nso(BASE);
-    let mut memory = SyntheticMemory::new();
-    install_prepared_module(&mut memory, SPACE, &module).unwrap();
-    let entry = GuestVirtualAddress::new(module.entry_address());
-
-    assert_eq!(memory.fetch32(SPACE, entry).unwrap().bits, 0xd503_201f);
-    assert_eq!(
+    install_prepared_module(&memory, &module, false).unwrap();
+    assert_eq!(fetch(&memory, module.entry_address()), 0xd503_201f);
+    assert!(
         memory
-            .read(SPACE, entry, MemoryAccess::normal(MemoryAccessSize::Word))
-            .unwrap_err()
-            .reason,
-        DataAccessFaultReason::ReadPermissionDenied
+            .space()
+            .read_value(GuestVirtualAddress::new(module.entry_address()), 4)
+            .is_err()
     );
-    assert_eq!(
-        memory.mapping_info(SPACE, entry).unwrap().permissions,
-        MemoryPermissions::EXECUTE
-    );
-}
-
-#[test]
-fn collisions_and_every_backend_stage_roll_back_the_complete_module() {
-    let module = prepare_nro(BASE);
-    let mut occupied = SyntheticMemory::new();
-    install_prepared_module(&mut occupied, SPACE, &module).unwrap();
-    let pages_before = occupied.physical_page_count();
-    let dependency_before = occupied
-        .fetch32(SPACE, GuestVirtualAddress::new(module.entry_address()))
+    let text = memory
+        .query(GuestVirtualAddress::new(BASE))
         .unwrap()
-        .physical_page;
-    let collision = install_prepared_module(&mut occupied, SPACE, &module).unwrap_err();
-    assert_eq!(collision.stage(), InstallStage::Preflight);
-    assert_eq!(occupied.physical_page_count(), pages_before);
-    assert_eq!(
-        occupied
-            .fetch32(SPACE, GuestVirtualAddress::new(module.entry_address()))
-            .unwrap()
-            .physical_page,
-        dependency_before
-    );
-
-    for (synthetic_stage, expected_stage) in [
-        (SyntheticInstallStage::Preflight, InstallStage::Preflight),
-        (SyntheticInstallStage::Allocation, InstallStage::Allocation),
-        (
-            SyntheticInstallStage::Initialization,
-            InstallStage::Initialization,
-        ),
-        (
-            SyntheticInstallStage::Publication,
-            InstallStage::Publication,
-        ),
-    ] {
-        let mut memory = SyntheticMemory::new();
-        memory.inject_install_failure(synthetic_stage, 1, "requested failure");
-        let error = install_prepared_module(&mut memory, SPACE, &module).unwrap_err();
-        assert_eq!(error.module_id(), module.module_id());
-        assert_eq!(error.stage(), expected_stage);
-        assert_eq!(error.cause(), "requested failure");
-        assert_eq!(memory.physical_page_count(), 0);
-        assert!(
-            memory
-                .mapping_info(SPACE, GuestVirtualAddress::new(BASE))
-                .is_none()
-        );
-    }
-}
-
-struct GeometryBackend(usize);
-
-impl ModuleMemoryBackend for GeometryBackend {
-    fn page_size(&self) -> usize {
-        self.0
-    }
-
-    fn install_pages_atomic(
-        &mut self,
-        _: AddressSpaceId,
-        _: &[PageRequest<'_>],
-    ) -> Result<(), BackendInstallError> {
-        panic!("invalid geometry must be rejected before calling the backend")
-    }
+        .mapping
+        .unwrap();
+    assert_eq!(text.permissions, MemoryPermissions::EXECUTE);
+    assert_eq!(text.kind, MemoryKind::Code);
 }
 
 #[test]
-fn incompatible_backend_page_geometry_fails_during_runtime_preflight() {
+fn failed_construction_releases_earlier_segments_and_cannot_change_another_process() {
+    let machine = Machine::new(32 * PAGE_SIZE).unwrap();
     let module = prepare_nro(BASE);
-    for page_size in [0, 8192] {
-        let error =
-            install_prepared_module(&mut GeometryBackend(page_size), SPACE, &module).unwrap_err();
-        assert_eq!(error.module_id(), module.module_id());
-        assert_eq!(error.stage(), InstallStage::Preflight);
-        assert!(error.cause().contains("page"));
+    let first = memory(&machine);
+    install_prepared_module(&first, &module, false).unwrap();
+    let used = machine.statistics().allocated_bytes;
+    let original = first
+        .space()
+        .translate(GuestVirtualAddress::new(BASE), MemoryPermissions::EXECUTE)
+        .unwrap();
+    {
+        let second = ProcessMemory::new(
+            machine.account(3 * PAGE_SIZE).unwrap(),
+            machine.account(machine.arena().capacity()).unwrap(),
+            AddressWidth::Bits32,
+            nixe_runtime::ProcessVirtualRegion::new(GuestVirtualAddress::new(0x1000000), 0x400000),
+            0,
+        )
+        .unwrap();
+        assert!(install_prepared_module(&second, &module, false).is_err());
+        assert_eq!(fetch(&first, BASE), 0xd503_201f);
     }
+    assert_eq!(machine.statistics().allocated_bytes, used);
+    let collision = install_prepared_module(&first, &module, false).unwrap_err();
+    assert_eq!(collision.module_id(), module.module_id());
+    assert_eq!(machine.statistics().allocated_bytes, used);
+    let after = first
+        .space()
+        .translate(GuestVirtualAddress::new(BASE), MemoryPermissions::EXECUTE)
+        .unwrap();
+    assert_eq!(after.physical, original.physical);
+    assert_eq!(after.allocation, original.allocation);
+    first.close().unwrap();
+    assert_eq!(machine.statistics().allocated_bytes, 0);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_loader_prepared_image_executes_on_the_canonical_native_process() {
+    use nixe_cpu::{
+        execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState},
+        platform::TargetPlatform,
+        profile::ProcessCpuContext,
+        state::a64::{A64GeneralRegister, A64Register},
+    };
+    use nixe_cpu_jit::{JitProcess, JitRunRequest, ThreadState};
+    struct Timer;
+    impl ArchitecturalTimer for Timer {
+        fn snapshot(&self) -> TimerSnapshot {
+            TimerSnapshot {
+                counter: 0,
+                frequency: 19_200_000,
+            }
+        }
+    }
+    let mut bytes = synthetic_nro();
+    put_u32(&mut bytes, 0, 0x14000020); // B to the program after the header.
+    put_u32(&mut bytes, 0x80, 0xd28000e0); // MOV X0,#7.
+    put_u32(&mut bytes, 0x84, 0xd40000e1); // SVC #7.
+    let image = NroLoader::load(storage(bytes))
+        .unwrap()
+        .prepare(
+            PreparationConfig {
+                image_base: BASE,
+                address_limit: BASE + 0x10_0000,
+            },
+            &unresolved,
+        )
+        .unwrap();
+    let machine = Machine::new(16 * PAGE_SIZE).unwrap();
+    let memory = memory(&machine);
+    install_prepared_module(&memory, &image, true).unwrap();
+    let space = memory.space();
+    let process = JitProcess::new(
+        ProcessCpuContext::new(TargetPlatform::Switch1, space.identity()),
+        Arc::clone(space),
+        19_200_000,
+    )
+    .unwrap();
+    let mut thread = process.create_thread().unwrap();
+    let mut state = ThreadState::default();
+    state.set_pc(image.entry_address());
+    let report = thread
+        .run_slice(
+            &mut nixe_cpu_direct_memory::NativeWorker::default(),
+            JitRunRequest {
+                state: &mut state,
+                instruction_budget: 1000,
+                timer: &Timer,
+                events: &VcpuEventState::default(),
+                capture_context: false,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        report.stop,
+        CpuExit::SupervisorCall { immediate: 7, .. }
+    ));
+    assert_eq!(
+        state.read_x(A64Register::General(A64GeneralRegister::new(0).unwrap())),
+        7
+    );
+    assert!(process.try_shutdown().unwrap());
+    memory.close().unwrap();
+    assert_eq!(machine.statistics().allocated_bytes, 0);
 }

@@ -6,7 +6,7 @@ use nixe_gpu::{
     ShaderStage,
     shader_module::{self as spirv, ResourceId},
 };
-use std::{sync::OnceLock, time::Duration};
+use std::sync::OnceLock;
 
 pub(super) struct SampleConversion {
     compiler: Arc<PipelineCompiler>,
@@ -118,11 +118,7 @@ impl VulkanResidency {
                     state: GraphicsState::color(target_format),
                 })
                 .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
-            let pipeline = loop {
-                if let Some(result) = pending.wait_timeout(Duration::from_millis(1)) {
-                    break result.map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
-                }
-            };
+            let pipeline = pending;
             conversion.pipelines[stencil as usize] = Some(Arc::clone(&pipeline));
             pipeline
         };

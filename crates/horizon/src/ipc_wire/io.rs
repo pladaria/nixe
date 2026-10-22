@@ -1,19 +1,14 @@
 //! Checked CMIF response encoding, scalar decoding, and guest-memory access.
 
-use nixe_cpu::memory::{
-    CpuMemory, DataAccessFault, DataAccessFaultReason, DataAccessKind, MemoryAccess,
-    MemoryAccessSize, MemoryPermissions, MemoryRegionKind, MemoryValue, ProcessMemory,
-    SYNTHETIC_PAGE_SIZE,
-};
+use crate::ipc_wire::request::Request;
 use nixe_memory::GuestVirtualAddress;
-use nixe_runtime::ExceptionProcessContext;
 
 use super::IpcWireError;
 use super::message::{BufferDescriptor, CmifResponse, HipcRequest, ReceiveStatics};
 use crate::HorizonIpcResult;
 
-pub(super) fn write_descriptor_bytes(
-    process: &ExceptionProcessContext<'_>,
+pub(super) async fn write_descriptor_bytes(
+    process: &Request,
     descriptor: BufferDescriptor,
     bytes: &[u8],
 ) -> Result<(), IpcWireError> {
@@ -25,7 +20,7 @@ pub(super) fn write_descriptor_bytes(
             "service response exceeds its output descriptor",
         ));
     }
-    write_bytes(process, GuestVirtualAddress::new(descriptor.address), bytes)
+    write_bytes(process, GuestVirtualAddress::new(descriptor.address), bytes).await
 }
 
 pub(super) fn has_ipc_descriptors(hipc: &HipcRequest<'_>) -> bool {
@@ -129,132 +124,40 @@ pub(super) fn decode_service_name(encoded: &[u8]) -> Option<&[u8]> {
     }
 }
 
-pub(crate) fn read_bytes(
-    process: &ExceptionProcessContext<'_>,
+pub(crate) async fn read_bytes(
+    process: &Request,
     start: GuestVirtualAddress,
     output: &mut [u8],
 ) -> Result<(), IpcWireError> {
-    process
-        .memory()
-        .read_bytes(process.cpu().address_space_id(), start, output)
-        .map_err(IpcWireError::GuestMemory)
+    process.read(start, output).await
 }
-
-pub(crate) fn write_bytes(
-    process: &ExceptionProcessContext<'_>,
+pub(crate) async fn write_bytes(
+    process: &Request,
     start: GuestVirtualAddress,
     bytes: &[u8],
 ) -> Result<(), IpcWireError> {
-    process
-        .memory()
-        .write_bytes(process.cpu().address_space_id(), start, bytes)
-        .map_err(IpcWireError::GuestMemory)
+    process.write(start, bytes).await
 }
-
 pub(crate) fn validate_writable_ram_range(
-    process: &ExceptionProcessContext<'_>,
+    process: &Request,
     start: GuestVirtualAddress,
-    size: usize,
+    bytes: usize,
 ) -> Result<(), IpcWireError> {
-    let address_space = process.cpu().address_space_id();
-    let end = start.get().checked_add(size as u64).ok_or_else(|| {
-        IpcWireError::GuestMemory(DataAccessFault::new(
-            address_space,
-            start,
-            DataAccessKind::Write,
-            DataAccessFaultReason::AddressOverflow,
-        ))
-    })?;
-    let limit = process.address_space_limit();
-    let mut cursor = start;
-    while cursor.get() < end {
-        // Only the destination's pages matter. QueryMemory finds maximal
-        // mapping boundaries and can scan the entire heap for an eight-byte
-        // audio release list. Both CPU memory backends use 4 KiB pages.
-        let mapping = if cursor.get() < limit {
-            process.memory().query_page(address_space, cursor)
-        } else {
-            None
-        };
-        let Some((region, mapping)) = mapping else {
-            return Err(IpcWireError::GuestMemory(DataAccessFault::new(
-                address_space,
-                cursor,
-                DataAccessKind::Write,
-                DataAccessFaultReason::Unmapped,
-            )));
-        };
-        if region != MemoryRegionKind::Ram {
-            return Err(IpcWireError::GuestMemory(DataAccessFault::new(
-                address_space,
-                cursor,
-                DataAccessKind::Write,
-                DataAccessFaultReason::Device(
-                    "IPC response buffer must be backed by ordinary RAM".into(),
-                ),
-            )));
-        }
-        if !mapping.permissions.contains(MemoryPermissions::WRITE) {
-            return Err(IpcWireError::GuestMemory(DataAccessFault::new(
-                address_space,
-                cursor,
-                DataAccessKind::Write,
-                DataAccessFaultReason::WritePermissionDenied,
-            )));
-        }
-        let page_end = (cursor.get() | (SYNTHETIC_PAGE_SIZE as u64 - 1)).saturating_add(1);
-        cursor = GuestVirtualAddress::new(page_end.min(end));
-    }
-    Ok(())
+    process.validate_write(start, bytes)
 }
-
-pub(super) fn write_response(
-    process: &ExceptionProcessContext<'_>,
+pub(super) async fn write_response(
+    process: &Request,
     start: GuestVirtualAddress,
     capacity: usize,
     response: &[u8],
 ) -> Result<(), IpcWireError> {
     if response.len() > capacity {
         return Err(IpcWireError::Internal(
-            "encoded IPC response exceeds its prevalidated command buffer",
+            "encoded response exceeds its accepted command buffer",
         ));
     }
-    write_bytes(process, start, response).map_err(|error| match error {
-        IpcWireError::GuestMemory(fault) => IpcWireError::ResponseCommit(fault),
-        error => error,
-    })
+    process.write(start, response).await
 }
-
-pub(super) fn read_byte(
-    process: &ExceptionProcessContext<'_>,
-    address: GuestVirtualAddress,
-) -> Result<u8, IpcWireError> {
-    let value = process
-        .memory()
-        .read(
-            process.cpu().address_space_id(),
-            address,
-            MemoryAccess::normal(MemoryAccessSize::Byte),
-        )
-        .map_err(IpcWireError::GuestMemory)?
-        .value;
-    let MemoryValue::U8(value) = value else {
-        unreachable!("byte access returns a byte value")
-    };
-    Ok(value)
-}
-
-pub(super) fn add(
-    address: GuestVirtualAddress,
-    offset: usize,
-) -> Result<GuestVirtualAddress, IpcWireError> {
-    let offset = u64::try_from(offset)
-        .map_err(|_| IpcWireError::Malformed("guest address offset overflows"))?;
-    address
-        .checked_add(offset)
-        .ok_or(IpcWireError::Malformed("guest address overflows"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,8 +166,8 @@ mod tests {
     fn service_names_require_canonical_zero_padding() {
         assert_eq!(decode_service_name(b"fsp-srv\0"), Some(&b"fsp-srv"[..]));
         assert_eq!(decode_service_name(b"aoc:u\0\0\0"), Some(&b"aoc:u"[..]));
-        assert_eq!(decode_service_name(b"\0\0\0\0\0\0\0\0"), None);
-        assert_eq!(decode_service_name(b"fs\0bad!!"), None);
+        assert!((decode_service_name(b"\0\0\0\0\0\0\0\0")).is_none());
+        assert!((decode_service_name(b"fs\0bad!!")).is_none());
     }
 
     #[test]

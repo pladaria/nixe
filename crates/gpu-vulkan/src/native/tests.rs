@@ -1,14 +1,9 @@
 use super::*;
 use crate::residency::tests::{backing_allocation, cpu_read};
+pub(super) use crate::test_device as support;
+use nixe_gpu::physical::PhysicalMapping;
 use nixe_gpu::*;
 use std::time::Instant;
-pub(super) mod support {
-    use crate as nixe_gpu_vulkan;
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/device.rs"
-    ));
-}
 fn ready(execution: &mut NativeGpuExecution, submission: &NativeSubmission) {
     let started = Instant::now();
     while !execution
@@ -23,6 +18,13 @@ fn ready(execution: &mut NativeGpuExecution, submission: &NativeSubmission) {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+fn finish_next(
+    execution: &mut NativeGpuExecution,
+) -> Result<Option<BackendExecutionCompletion>, VulkanError> {
+    execution.residency.flush()?;
+    execution.completion(Some(Duration::from_secs(5)))
 }
 
 fn captured_vertex_fragment(
@@ -177,105 +179,6 @@ fn instance_groups_require_matching_geometry_and_contiguous_nonoverflowing_ids()
 }
 
 #[test]
-fn known_completion_versions_do_not_create_gpu_work_and_stale_acknowledgements_cannot_erase_them() {
-    use nixe_memory::VisibilityCoordinator as _;
-    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
-        return;
-    };
-    let monitor = device.validation_monitor();
-    let mut execution = NativeGpuExecution::new(
-        device,
-        ShaderNamespace {
-            guest: *b"host-effect-test",
-            isa: 1,
-        },
-        CacheConfiguration::default(),
-        4 * 1024 * 1024,
-    )
-    .unwrap();
-    execution.bind_host_wakeup(Arc::new(|| {}));
-    let (_, backing) = backing_allocation(4096, 4096, 0x25);
-    let mut previous: Option<CpuVisibilityRequest> = None;
-    for value in 1..=64u8 {
-        let batch = NativeSubmission {
-            frontend: FrontendSubmissionId::new(u64::from(value)),
-            segment: FrontendSubmissionSegment::FIRST,
-            final_segment: true,
-            commands: vec![NativeCommand::WriteMemory {
-                target: backing.clone(),
-                offset: 64,
-                bytes: Arc::from([value; 16]),
-                after_prior_work: true,
-            }],
-        };
-        ready(&mut execution, &batch);
-        execution
-            .submit(ExecutionBatch { commands: &batch })
-            .unwrap();
-        assert!(
-            !execution.request_completion_wakeup().unwrap(),
-            "a logical producer without GPU work must retire without a future wake"
-        );
-        assert!(execution.poll_completion().unwrap().is_some());
-        let page = backing.pages().next().unwrap();
-        let nixe_memory::VisibilityState::GpuNewer { device, visible_at } = page.visibility_state()
-        else {
-            panic!("ordered logical producer")
-        };
-        let request = CpuVisibilityRequest {
-            page: page.identity(),
-            size: page.size(),
-            device,
-            visible_at,
-        };
-        if let Some(old) = previous {
-            assert!(visible_at > old.visible_at);
-        }
-        let bytes = execution.service_cpu_visibility(request).unwrap().unwrap();
-        if let Some(old) = previous {
-            execution
-                .residency
-                .visibility()
-                .release_cpu_page(old)
-                .unwrap();
-        }
-        assert_eq!(&bytes[64..80], &[value; 16]);
-        assert!(bytes[..64].iter().chain(&bytes[80..]).all(|&b| b == 0x25));
-        previous = Some(request);
-        assert_eq!(execution.residency.device().submitted_tick(), 0);
-        assert!(execution.residency.device().submission.slots.is_empty());
-    }
-    assert_eq!(
-        &cpu_read(&mut execution.residency, &backing)[64..80],
-        &[64; 16]
-    );
-    assert_eq!(execution.residency.statistics().native_readback_bytes, 0);
-    let source = execution
-        .residency
-        .buffer_for_deferred_import(
-            backing.snapshot_subrange(64, 16).unwrap(),
-            vk::BufferUsageFlags::TRANSFER_SRC,
-        )
-        .unwrap();
-    let (_, destination_backing) = backing_allocation(16, 16, 0);
-    let destination = execution
-        .residency
-        .buffer_for_deferred_import(destination_backing, vk::BufferUsageFlags::TRANSFER_DST)
-        .unwrap();
-    execution
-        .residency
-        .copy_buffer(source, 0, destination, 0, 16)
-        .unwrap();
-    assert_eq!(
-        execution.residency.read_buffer(destination, 0, 16).unwrap(),
-        [64; 16]
-    );
-    execution.teardown().unwrap();
-    drop(execution);
-    monitor.check().unwrap();
-}
-
-#[test]
 fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {
         return;
@@ -283,6 +186,7 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
     let monitor = device.validation_monitor();
     let owner = Arc::clone(&device.owner);
     let mut execution = NativeGpuExecution::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
         device,
         ShaderNamespace {
             guest: *b"async-page-test!",
@@ -292,7 +196,7 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
         4 * 1024 * 1024,
     )
     .unwrap();
-    let (_allocation, backing) = backing_allocation(4096, 4096, 0x25);
+    let (_allocation, backing) = backing_allocation(&execution.residency, 4096, 4096, 0x25);
     let id = execution
         .residency
         .buffer_for(backing.clone(), vk::BufferUsageFlags::TRANSFER_DST)
@@ -325,20 +229,19 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
         )
         .unwrap();
     let (wake, wakes) = std::sync::mpsc::channel();
-    execution.bind_host_wakeup(Arc::new(move || {
-        let _ = wake.send(());
-    }));
-    let page = backing.pages().next().unwrap();
-    let nixe_memory::VisibilityState::GpuNewer { device, visible_at } = page.visibility_state()
-    else {
-        panic!("GPU producer")
-    };
-    let request = CpuVisibilityRequest {
-        page: page.identity(),
-        size: page.size(),
-        device,
-        visible_at,
-    };
+    execution
+        .bind_host_wakeup(Arc::new(move || {
+            let _ = wake.send(());
+        }))
+        .unwrap();
+    let (request, mut pending) = execution
+        .residency
+        .memory()
+        .prepare_device_access(
+            backing.pin(0, backing.bytes()).unwrap(),
+            nixe_memory::AccessOperation::Read,
+        )
+        .unwrap();
     let (release, release_when_recorded) = std::sync::mpsc::channel();
     let signal_owner = Arc::clone(&owner);
     let watchdog = std::thread::spawn(move || {
@@ -353,26 +256,28 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
         .unwrap();
         independent
     });
-    assert!(execution.service_cpu_visibility(request).unwrap().is_none());
+    execution.queue_device_access(request).unwrap();
+    assert!(pending.poll().is_none());
     assert!(
-        execution.residency.cpu_readback_point().unwrap().unwrap()
-            <= execution.residency.device().submitted_tick(),
+        execution.residency.readback_point().unwrap()
+            <= execution.residency.device().scheduled_tick(),
         "a CPU demand must submit its download before unrelated recording"
     );
-    let batch = NativeSubmission {
-        frontend: FrontendSubmissionId::new(1),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: true,
-        commands: vec![NativeCommand::WaitForIdle],
-    };
+    let batch = NativeSubmission::new(
+        FrontendSubmissionId::new(1),
+        FrontendSubmissionSegment::FIRST,
+        true,
+        vec![NativeCommand::WaitForIdle],
+    );
     ready(&mut execution, &batch);
     execution
         .submit(ExecutionBatch { commands: &batch })
         .unwrap();
-    let submitted = execution.residency.device().submitted_tick();
-    assert!(execution.service_cpu_visibility(request).unwrap().is_none());
+    let submitted = execution.residency.device().scheduled_tick();
+    execution.progress_device_accesses().unwrap();
+    assert!(pending.poll().is_none());
     assert_eq!(
-        execution.residency.device().submitted_tick(),
+        execution.residency.device().scheduled_tick(),
         submitted,
         "retrying an already submitted demand must not split independent recording"
     );
@@ -383,7 +288,19 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
         watchdog.join().unwrap(),
         "unknown GPU data blocked independent recording"
     );
-    let result = execution.service_cpu_visibility(request).unwrap().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let result = loop {
+        execution.progress_device_accesses().unwrap();
+        if let Some(result) = pending.poll() {
+            let nixe_memory::AccessResult::Read(bytes) = result.unwrap() else {
+                panic!("expected read")
+            };
+            break bytes;
+        }
+        wakes
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+    };
     assert_eq!(&result[9..13], &[0x43; 4]);
     assert!(
         result[..9]
@@ -411,7 +328,6 @@ fn completion_observer_wakes_earlier_work_before_a_blocked_later_target() {
     let owner = Arc::clone(&device.owner);
     let first = device.work_ticket().unwrap();
     device.flush().unwrap();
-    assert!(device.wait_for_work(first, Duration::from_secs(5)).unwrap());
     let mut kind =
         vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
     let gate = unsafe {
@@ -440,11 +356,13 @@ fn completion_observer_wakes_earlier_work_before_a_blocked_later_target() {
         Arc::new(move || {
             let _ = notify.send(());
         }),
-    );
-    assert!(observer.arm(later.tick()).unwrap());
-    assert!(observer.arm(first.tick()).unwrap());
+    )
+    .unwrap();
+    observer.arm(later.tick()).unwrap();
+    observer.arm(first.tick()).unwrap();
     let earlier_notified = notifications.recv_timeout(Duration::from_secs(1)).is_ok();
-    let completed_rearm = observer.arm(first.tick()).unwrap();
+    observer.arm(first.tick()).unwrap();
+    let completed_notified = notifications.recv_timeout(Duration::from_secs(1)).is_ok();
     // Unblock and drain even when the regression assertion will fail. A GPU
     // dependency held by the test must not strand device destruction.
     unsafe {
@@ -464,12 +382,76 @@ fn completion_observer_wakes_earlier_work_before_a_blocked_later_target() {
         "a later blocked ticket must not hide an earlier completion"
     );
     assert!(
-        !completed_rearm,
-        "a consumed completion notification cannot promise another wake"
+        completed_notified,
+        "an already reached action must run immediately"
     );
     assert!(
         later_notified,
         "the later request must remain armed after the earlier wake"
+    );
+}
+
+#[test]
+fn completed_native_work_still_wakes_its_pending_logical_completion() {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let monitor = device.validation_monitor();
+    let mut execution = NativeGpuExecution::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+        device,
+        ShaderNamespace {
+            guest: *b"completed-wakeup",
+            isa: 1,
+        },
+        CacheConfiguration::default(),
+        4 * 1024 * 1024,
+    )
+    .unwrap();
+    let (_allocation, whole) = backing_allocation(&execution.residency, 4096, 4096, 0x19);
+    let submission = NativeSubmission::new(
+        FrontendSubmissionId::new(1),
+        FrontendSubmissionSegment::FIRST,
+        true,
+        vec![NativeCommand::ReportMemory {
+            fence: true,
+            target: whole.pin(0, whole.bytes()).unwrap(),
+            offset: 64,
+            bytes: Arc::from([0x37; 16]),
+        }],
+    );
+    let (notify, notifications) = std::sync::mpsc::channel();
+    execution
+        .bind_host_wakeup(Arc::new(move || {
+            let _ = notify.send(());
+        }))
+        .unwrap();
+    ready(&mut execution, &submission);
+    let token = execution
+        .submit(ExecutionBatch {
+            commands: &submission,
+        })
+        .unwrap();
+    let work = execution.completions.front().unwrap().work.unwrap();
+    execution.residency.flush().unwrap();
+    assert!(
+        execution
+            .residency
+            .device_mut()
+            .wait_for_work(work, Duration::from_secs(5))
+            .unwrap()
+    );
+    // Native progress can advance after the owner's poll while the logical
+    // completion is still queued. Registration must deliver that action.
+    execution.request_completion_wakeup().unwrap();
+    let notified = notifications.recv_timeout(Duration::from_secs(1)).is_ok();
+    let completed = execution.poll_completion().unwrap().unwrap();
+    assert_eq!(completed.submission(), token);
+    drop(execution);
+    monitor.check().unwrap();
+    assert!(
+        notified,
+        "completed native work must not strand its logical owner"
     );
 }
 
@@ -481,6 +463,7 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     let monitor = device.validation_monitor();
     let owner = Arc::clone(&device.owner);
     let mut execution = NativeGpuExecution::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
         device,
         ShaderNamespace {
             guest: *b"ordered-effects!",
@@ -490,8 +473,8 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         4 * 1024 * 1024,
     )
     .unwrap();
-    let (_allocation, whole) = backing_allocation(4096, 4096, 0x19);
-    let target = whole.snapshot_subrange(64, 16).unwrap();
+    let (_allocation, whole) = backing_allocation(&execution.residency, 4096, 4096, 0x19);
+    let target = whole.slice(64, 16).unwrap();
     let mut kind =
         vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
     let semaphore = unsafe {
@@ -501,39 +484,41 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         )
     }
     .unwrap();
-    let submission = |frontend, value| NativeSubmission {
-        frontend: FrontendSubmissionId::new(frontend),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: true,
-        commands: vec![
-            NativeCommand::WriteMemory {
-                target: whole.clone(),
-                offset: 128,
-                bytes: Arc::from([0xa3; 16]),
-                after_prior_work: false,
-            },
-            NativeCommand::WaitForIdle,
-            NativeCommand::WriteMemory {
-                target: whole.clone(),
-                offset: 64,
-                bytes: Arc::from([value ^ 0xff; 16]),
-                after_prior_work: true,
-            },
-            // A preceding producer in this same recording has not published
-            // canonical ownership yet. The inline update must still remain on
-            // the device rather than taking the CPU upload path.
-            NativeCommand::WriteMemory {
-                target: whole.clone(),
-                offset: 64,
-                bytes: Arc::from([value; 16]),
-                after_prior_work: false,
-            },
-        ],
+    let submission = |frontend, value| {
+        NativeSubmission::new(
+            FrontendSubmissionId::new(frontend),
+            FrontendSubmissionSegment::FIRST,
+            true,
+            vec![
+                NativeCommand::ReportMemory {
+                    fence: true,
+                    target: whole.pin(0, whole.bytes()).unwrap(),
+                    offset: 128,
+                    bytes: Arc::from([0xa3; 16]),
+                },
+                NativeCommand::WaitForIdle,
+                NativeCommand::ReportMemory {
+                    fence: true,
+                    target: whole.pin(0, whole.bytes()).unwrap(),
+                    offset: 64,
+                    bytes: Arc::from([value ^ 0xff; 16]),
+                },
+                // A later release supersedes only the same exact bytes.
+                NativeCommand::ReportMemory {
+                    fence: true,
+                    target: whole.pin(0, whole.bytes()).unwrap(),
+                    offset: 64,
+                    bytes: Arc::from([value; 16]),
+                },
+            ],
+        )
     };
     let (woken, wakeups) = std::sync::mpsc::channel();
-    execution.bind_host_wakeup(Arc::new(move || {
-        let _ = woken.send(());
-    }));
+    execution
+        .bind_host_wakeup(Arc::new(move || {
+            let _ = woken.send(());
+        }))
+        .unwrap();
     let first = submission(1, 0x37);
     ready(&mut execution, &first);
     execution
@@ -549,7 +534,7 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
             &[],
         )
         .unwrap();
-    assert!(execution.request_completion_wakeup().unwrap());
+    execution.request_completion_wakeup().unwrap();
     assert!(execution.poll_completion().unwrap().is_none());
 
     let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -579,27 +564,25 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         .submit(ExecutionBatch { commands: &second })
         .unwrap();
     assert!(execution.poll_completion().unwrap().is_none());
-    let page = whole.pages().next().unwrap();
-    let nixe_memory::VisibilityState::GpuNewer { device, visible_at } = page.visibility_state()
-    else {
-        panic!("pending native producer")
-    };
-    let request = CpuVisibilityRequest {
-        page: page.identity(),
-        size: page.size(),
-        device,
-        visible_at,
-    };
+    let (request, mut pending) = execution
+        .residency
+        .memory()
+        .prepare_device_access(
+            whole.pin(0, whole.bytes()).unwrap(),
+            nixe_memory::AccessOperation::Read,
+        )
+        .unwrap();
+    execution.queue_device_access(request).unwrap();
     assert!(
-        execution.service_cpu_visibility(request).unwrap().is_none(),
+        pending.poll().is_none(),
         "an external CPU demand must leave recording available while the GPU is blocked"
     );
-    let independent = NativeSubmission {
-        frontend: FrontendSubmissionId::new(90),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: true,
-        commands: vec![NativeCommand::WaitForIdle],
-    };
+    let independent = NativeSubmission::new(
+        FrontendSubmissionId::new(90),
+        FrontendSubmissionSegment::FIRST,
+        true,
+        vec![NativeCommand::WaitForIdle],
+    );
     ready(&mut execution, &independent);
     execution
         .submit(ExecutionBatch {
@@ -630,7 +613,7 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     wakeups
         .recv_timeout(Duration::from_secs(1))
         .expect("an idle owner must wake without another submission");
-    while execution.wait_for_completion().unwrap().is_some() {}
+    while finish_next(&mut execution).unwrap().is_some() {}
     let id = execution
         .residency
         .buffer_for_deferred_import(target, vk::BufferUsageFlags::TRANSFER_DST)
@@ -647,62 +630,61 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         .write_buffer(id, 0, &[0xa7; 16])
         .unwrap();
     assert_eq!(written.consumed, 16);
-    execution.residency.accept_recording().unwrap();
     assert_eq!(
         &cpu_read(&mut execution.residency, &whole)[64..80],
         &[0xa7; 16]
     );
     // A host-authored release attaches to the existing real producer prefix.
-    // It must not invent an empty submission; subsequent GPU work is distinct.
-    let prefix = NativeSubmission {
-        frontend: FrontendSubmissionId::new(3),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: true,
-        commands: vec![NativeCommand::WriteMemory {
-            target: whole.clone(),
+    // It must not invent an empty submission. A following literal release can
+    // share the same preceding producer ticket.
+    let prefix = NativeSubmission::new(
+        FrontendSubmissionId::new(3),
+        FrontendSubmissionSegment::FIRST,
+        true,
+        vec![NativeCommand::ReportMemory {
+            fence: true,
+            target: whole.pin(0, whole.bytes()).unwrap(),
             offset: 64,
             bytes: Arc::from([0xb3; 16]),
-            after_prior_work: true,
         }],
-    };
+    );
     ready(&mut execution, &prefix);
     let uploaded_before_release = execution.residency.statistics().cpu_uploaded_bytes;
     execution
         .submit(ExecutionBatch { commands: &prefix })
         .unwrap();
     let released_tick = execution.completions.back().unwrap().work.unwrap().tick();
-    assert!(released_tick <= execution.residency.device().submitted_tick());
     assert_eq!(
         execution.residency.statistics().cpu_uploaded_bytes,
         uploaded_before_release,
         "a CPU-only completion effect must not upload its known payload"
     );
-    let following = NativeSubmission {
-        frontend: FrontendSubmissionId::new(4),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: true,
-        commands: vec![NativeCommand::WriteMemory {
-            target: whole.clone(),
+    let following = NativeSubmission::new(
+        FrontendSubmissionId::new(4),
+        FrontendSubmissionSegment::FIRST,
+        true,
+        vec![NativeCommand::ReportMemory {
+            fence: true,
+            target: whole.pin(0, whole.bytes()).unwrap(),
             offset: 128,
             bytes: Arc::from([0xc3; 16]),
-            after_prior_work: false,
         }],
-    };
+    );
     ready(&mut execution, &following);
     execution
         .submit(ExecutionBatch {
             commands: &following,
         })
         .unwrap();
-    assert!(execution.completions.back().unwrap().work.unwrap().tick() > released_tick);
+    assert!(execution.completions.back().unwrap().work.unwrap().tick() >= released_tick);
     let source = execution
         .residency
         .buffer_for_deferred_import(
-            whole.snapshot_subrange(64, 16).unwrap(),
+            whole.slice(64, 16).unwrap(),
             vk::BufferUsageFlags::TRANSFER_SRC,
         )
         .unwrap();
-    let (_copied, copied) = backing_allocation(16, 16, 0);
+    let (_copied, copied) = backing_allocation(&execution.residency, 16, 16, 0);
     let destination = execution
         .residency
         .buffer_for_deferred_import(copied.clone(), vk::BufferUsageFlags::TRANSFER_DST)
@@ -734,7 +716,6 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
             .consumed,
         4
     );
-    execution.residency.accept_recording().unwrap();
     let bytes = cpu_read(&mut execution.residency, &whole);
     assert_eq!(&bytes[64..68], &[0xb3; 4]);
     assert_eq!(&bytes[68..72], &[0xd5; 4]);
@@ -758,6 +739,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let monitor = device.validation_monitor();
     let shader = captured_vertex_fragment(&device.profile().shader_compiler);
     let mut execution = NativeGpuExecution::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
         device,
         ShaderNamespace {
             guest: *b"nixe-native-test",
@@ -770,7 +752,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         4 * 1024 * 1024,
     )
     .unwrap();
-    let (pixels, backing) = backing_allocation(256, 256, 0);
+    let (pixels, backing) = backing_allocation(&execution.residency, 256, 256, 0);
     let description = ImageDescription::new(
         ImageDimension::Two,
         ImageExtent::new(8, 8, 1).unwrap(),
@@ -790,25 +772,26 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             mip_level: 0,
             array_layer: 0,
             aspect: GuestImageAspect::Color,
-            backing: backing.clone(),
+            footprint: crate::residency::tests::plane_geometry(backing.clone(), [8, 8], 32, 4),
             row_pitch: 32,
             bytes_per_block: 4,
         }]),
     };
-    let (vertices, vertex_backing) = backing_allocation(256, 256, 0);
-    let vertex_backing = vertex_backing.snapshot_subrange(0, 72).unwrap();
+    let (vertices, vertex_backing) = backing_allocation(&execution.residency, 256, 256, 0);
+    let vertex_backing = vertex_backing.slice(0, 72).unwrap();
     let words: [f32; 18] = [
         -1., -1., 0., 0., 1., 0., 3., -1., 0., 0., 1., 0., -1., 3., 0., 0., 1., 0.,
     ];
-    vertices
-        .write(
-            0,
-            &words
-                .into_iter()
-                .flat_map(f32::to_le_bytes)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    crate::residency::tests::cpu_write(
+        &mut execution.residency,
+        &vertices,
+        0,
+        &words
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let state = Arc::new(GuestDrawState {
         identity: PreparedStateId::new(1, 1),
         program: Arc::new(GuestProgram {
@@ -889,12 +872,12 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             instance_count: 1,
         },
     };
-    let submission = NativeSubmission {
-        frontend: FrontendSubmissionId::new(1),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: true,
-        commands: vec![draw; 16],
-    };
+    let submission = NativeSubmission::new(
+        FrontendSubmissionId::new(1),
+        FrontendSubmissionSegment::FIRST,
+        true,
+        vec![draw; 16],
+    );
     ready(&mut execution, &submission);
     assert_eq!(execution.statistics.prepared_draws, 1);
     // Identical recompiled code can have a new allocation after cold-cache
@@ -906,11 +889,12 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     assert!(execution.graphics(&Arc::new(recaptured)).unwrap());
     assert_eq!(execution.statistics.prepared_graphics, prepared_graphics);
     for frontend in 1..=2 {
-        let submission = NativeSubmission {
-            frontend: FrontendSubmissionId::new(frontend),
-            commands: submission.commands.clone(),
-            ..submission
-        };
+        let submission = NativeSubmission::new(
+            FrontendSubmissionId::new(frontend),
+            submission.segment,
+            submission.final_segment,
+            submission.commands.clone(),
+        );
         ready(&mut execution, &submission);
         execution
             .submit(ExecutionBatch {
@@ -918,11 +902,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             })
             .unwrap();
         assert_eq!(
-            execution
-                .wait_for_completion_timeout(Duration::from_secs(5))
-                .unwrap()
-                .unwrap()
-                .frontend(),
+            finish_next(&mut execution).unwrap().unwrap().frontend(),
             submission.frontend
         );
         let stats = execution.recording_statistics();
@@ -939,46 +919,51 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     assert!(execution.residency.statistics().cpu_streamed_bytes > 0);
     // Acceptance of a read snapshot need not submit a command buffer. A
     // following CPU write is uploaded after that read, with a native WAR edge.
-    let prefix = NativeSubmission {
-        frontend: FrontendSubmissionId::new(3),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: false,
-        commands: submission.commands.clone(),
-    };
+    let prefix = NativeSubmission::new(
+        FrontendSubmissionId::new(3),
+        FrontendSubmissionSegment::FIRST,
+        false,
+        submission.commands.clone(),
+    );
     ready(&mut execution, &prefix);
     let first = execution
         .submit(ExecutionBatch { commands: &prefix })
         .unwrap();
     assert!(execution.poll_completion().unwrap().is_none());
-    match backing.pages().next().unwrap().visibility_state() {
-        nixe_memory::VisibilityState::GpuNewer { device, .. } => {
-            assert_eq!(first.instance().get(), device.get());
-        }
-        state => panic!("accepted write must carry its actual native owner: {state:?}"),
-    }
+    assert_eq!(
+        first.instance(),
+        execution
+            .residency
+            .device()
+            .submission
+            .ticket(0)
+            .submission()
+            .instance()
+    );
     let mut red = words;
     for color in red.chunks_exact_mut(6) {
         color[3] = 1.;
         color[4] = 0.;
     }
-    vertices
-        .write(
-            0,
-            &red.into_iter()
-                .flat_map(f32::to_le_bytes)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    crate::residency::tests::cpu_write(
+        &mut execution.residency,
+        &vertices,
+        0,
+        &red.into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let mut changed = (*state).clone();
     changed.identity = PreparedStateId::new(2, 1);
     Arc::make_mut(&mut changed.parameters).identity = PreparedStateId::new(3, 1);
     Arc::make_mut(&mut changed.parameters).scissor.x = 4;
     Arc::make_mut(&mut changed.parameters).scissor.width = 4;
-    let final_segment = NativeSubmission {
-        frontend: prefix.frontend,
-        segment: prefix.segment,
-        final_segment: true,
-        commands: vec![NativeCommand::Draw {
+    let final_segment = NativeSubmission::new(
+        prefix.frontend,
+        prefix.segment,
+        true,
+        vec![NativeCommand::Draw {
             state: Arc::new(changed),
             arguments: DrawArguments::NonIndexed {
                 first_vertex: 0,
@@ -987,7 +972,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                 instance_count: 1,
             },
         }],
-    };
+    );
     ready(&mut execution, &final_segment);
     let second = execution
         .submit(ExecutionBatch {
@@ -995,17 +980,11 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         })
         .unwrap();
     assert_ne!(first, second);
-    let a = execution
-        .wait_for_completion_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
-    let b = execution
-        .wait_for_completion_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
+    let a = finish_next(&mut execution).unwrap().unwrap();
+    let b = finish_next(&mut execution).unwrap().unwrap();
     assert_eq!(a.submission(), first);
     assert_eq!(b.submission(), second);
-    assert_eq!(a.visibility(), b.visibility());
+    assert_eq!(a.submission().instance(), b.submission().instance());
     assert_eq!(execution.recording_statistics().pipeline_binds, 3);
     let bytes = cpu_read(&mut execution.residency, &backing);
     for (index, pixel) in bytes.chunks_exact(4).enumerate() {
@@ -1021,12 +1000,12 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     // A CPU/frontend demand after accepting an unfinished native delivery
     // must find a pending producer, force its submission and observe its bytes.
     // Returning the preceding green/red image would silently read stale data.
-    let pending = NativeSubmission {
-        frontend: FrontendSubmissionId::new(4),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: false,
-        commands: submission.commands.clone(),
-    };
+    let pending = NativeSubmission::new(
+        FrontendSubmissionId::new(4),
+        FrontendSubmissionSegment::FIRST,
+        false,
+        submission.commands.clone(),
+    );
     ready(&mut execution, &pending);
     let submitted = execution.residency.device().queue_usage().submitted_tick;
     let token = execution
@@ -1037,19 +1016,17 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         submitted,
         "acceptance alone need not submit the native command buffer"
     );
-    assert!(backing.pages().all(|page| matches!(
-        page.visibility_state(),
-        nixe_memory::VisibilityState::GpuNewer { .. }
-    )));
-    vertices
-        .write(
-            0,
-            &words
-                .into_iter()
-                .flat_map(f32::to_le_bytes)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+
+    crate::residency::tests::cpu_write(
+        &mut execution.residency,
+        &vertices,
+        0,
+        &words
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let repeated = execution
         .submit(ExecutionBatch { commands: &pending })
         .unwrap();
@@ -1061,33 +1038,26 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     assert!(bytes.chunks_exact(4).all(|pixel| pixel == [0, 255, 0, 255]));
     assert!(execution.residency.device().queue_usage().submitted_tick > submitted);
     assert_eq!(
-        execution
-            .wait_for_completion_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap()
-            .submission(),
+        finish_next(&mut execution).unwrap().unwrap().submission(),
         token
     );
     assert_eq!(
-        execution
-            .wait_for_completion_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap()
-            .submission(),
+        finish_next(&mut execution).unwrap().unwrap().submission(),
         repeated
     );
     // Different bindings and scissors across frontend deliveries share native
     // rendering, but preserve draw order and their own prepared semantics.
-    let (other_vertices, other_backing) = backing_allocation(256, 256, 0);
-    other_vertices
-        .write(
-            0,
-            &red.into_iter()
-                .flat_map(f32::to_le_bytes)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-    let other_backing = other_backing.snapshot_subrange(0, 72).unwrap();
+    let (other_vertices, other_backing) = backing_allocation(&execution.residency, 256, 256, 0);
+    crate::residency::tests::cpu_write(
+        &mut execution.residency,
+        &other_vertices,
+        0,
+        &red.into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let other_backing = other_backing.slice(0, 72).unwrap();
     let mut other = (*state).clone();
     other.identity = PreparedStateId::new(10, 1);
     other.vertices[0].backing = other_backing;
@@ -1101,11 +1071,11 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let scopes = execution.recording_statistics().rendering_scopes;
     let mut sent = Vec::new();
     for (index, current) in [&other, &state, &clipped].into_iter().enumerate() {
-        let submission = NativeSubmission {
-            frontend: FrontendSubmissionId::new(10 + index as u64),
-            segment: FrontendSubmissionSegment::FIRST,
-            final_segment: false,
-            commands: vec![NativeCommand::Draw {
+        let submission = NativeSubmission::new(
+            FrontendSubmissionId::new(10 + index as u64),
+            FrontendSubmissionSegment::FIRST,
+            false,
+            vec![NativeCommand::Draw {
                 state: Arc::clone(current),
                 arguments: DrawArguments::NonIndexed {
                     first_vertex: 0,
@@ -1114,7 +1084,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                     instance_count: 1,
                 },
             }],
-        };
+        );
         ready(&mut execution, &submission);
         sent.push(
             execution
@@ -1130,8 +1100,6 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     );
     assert!(execution.statistics.reused_graphics > 0);
     assert!(execution.statistics.reused_programs > 0);
-    assert!(execution.residency.statistics().cpu_stream_hits > 0);
-    assert!(execution.residency.statistics().attachment_publication_hits >= 2);
     let bytes = cpu_read(&mut execution.residency, &backing);
     for (index, pixel) in bytes.chunks_exact(4).enumerate() {
         assert_eq!(
@@ -1145,18 +1113,14 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     }
     for token in sent {
         assert_eq!(
-            execution
-                .wait_for_completion_timeout(Duration::from_secs(5))
-                .unwrap()
-                .unwrap()
-                .submission(),
+            finish_next(&mut execution).unwrap().unwrap().submission(),
             token
         );
     }
     // CPU updates between accepted draws must preserve distinct read snapshots,
     // including shader descriptors, without ending rendering or submitting early.
-    let (uniform, uniform_backing) = backing_allocation(256, 256, 0);
-    let uniform_backing = uniform_backing.snapshot_subrange(0, 16).unwrap();
+    let (uniform, uniform_backing) = backing_allocation(&execution.residency, 256, 256, 0);
+    let uniform_backing = uniform_backing.slice(0, 16).unwrap();
     let encode = |rgba: [f32; 4]| {
         rgba.into_iter()
             .flat_map(f32::to_le_bytes)
@@ -1176,11 +1140,11 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let uniform_draw = Arc::new(uniform_draw);
     // Parameter identity is independent of shader identity. Preparing an
     // alternative shader with the same parameters must retain both variants.
-    let variant = NativeSubmission {
-        frontend: FrontendSubmissionId::new(19),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: false,
-        commands: vec![NativeCommand::Draw {
+    let variant = NativeSubmission::new(
+        FrontendSubmissionId::new(19),
+        FrontendSubmissionSegment::FIRST,
+        false,
+        vec![NativeCommand::Draw {
             state: Arc::clone(&uniform_draw),
             arguments: DrawArguments::NonIndexed {
                 first_vertex: 0,
@@ -1189,7 +1153,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                 instance_count: 1,
             },
         }],
-    };
+    );
     ready(&mut execution, &variant);
     assert!(execution.graphics(&state).unwrap());
     let mut inputs = Vec::new();
@@ -1205,11 +1169,11 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             parameters.scissor.x = if index == 1 { 4 } else { 0 };
             parameters.scissor.width = 4;
         }
-        let submission = NativeSubmission {
-            frontend: FrontendSubmissionId::new(20 + index as u64),
-            segment: FrontendSubmissionSegment::FIRST,
-            final_segment: true,
-            commands: vec![NativeCommand::Draw {
+        let submission = NativeSubmission::new(
+            FrontendSubmissionId::new(20 + index as u64),
+            FrontendSubmissionSegment::FIRST,
+            true,
+            vec![NativeCommand::Draw {
                 state: Arc::new(draw),
                 arguments: DrawArguments::NonIndexed {
                     first_vertex: 0,
@@ -1218,14 +1182,14 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                     instance_count: 1,
                 },
             }],
-        };
+        );
         ready(&mut execution, &submission);
         inputs.push((submission, encode(rgba)));
     }
     let scopes = execution.recording_statistics().rendering_scopes;
     let mut sent = Vec::new();
     for (submission, bytes) in &inputs {
-        uniform.write(0, bytes).unwrap();
+        crate::residency::tests::cpu_write(&mut execution.residency, &uniform, 0, bytes).unwrap();
         sent.push(
             execution
                 .submit(ExecutionBatch {
@@ -1251,66 +1215,10 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     }
     for token in sent {
         assert_eq!(
-            execution
-                .wait_for_completion_timeout(Duration::from_secs(5))
-                .unwrap()
-                .unwrap()
-                .submission(),
+            finish_next(&mut execution).unwrap().unwrap().submission(),
             token
         );
     }
-    // Inline uploads between draws preserve each immutable input snapshot in a
-    // single native batch, without forcing a host submission or a GPU write for
-    // ordinary CPU storage. All states were prepared before these writes.
-    let mut commands = Vec::new();
-    for (submission, bytes) in &inputs {
-        commands.push(NativeCommand::WriteMemory {
-            target: uniform_backing.clone(),
-            offset: 0,
-            bytes: Arc::from(bytes.as_slice()),
-            after_prior_work: false,
-        });
-        commands.extend(submission.commands.iter().cloned());
-    }
-    let inline = NativeSubmission {
-        frontend: FrontendSubmissionId::new(30),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: true,
-        commands,
-    };
-    ready(&mut execution, &inline);
-    let submitted = execution.residency.device().submitted_tick();
-    let readbacks = execution.residency.statistics().native_readback_bytes;
-    let scopes = execution.recording_statistics().rendering_scopes;
-    execution
-        .submit(ExecutionBatch { commands: &inline })
-        .unwrap();
-    assert_eq!(execution.residency.device().submitted_tick(), submitted);
-    assert_eq!(
-        execution.residency.statistics().native_readback_bytes,
-        readbacks
-    );
-    assert_eq!(
-        execution.recording_statistics().rendering_scopes - scopes,
-        1
-    );
-    assert!(uniform_backing.pages().all(|page| matches!(
-        page.visibility_state(),
-        nixe_memory::VisibilityState::Clean | nixe_memory::VisibilityState::CpuNewer
-    )));
-    let bytes = cpu_read(&mut execution.residency, &backing);
-    for (index, pixel) in bytes.chunks_exact(4).enumerate() {
-        assert_eq!(
-            pixel,
-            if index % 8 < 4 {
-                &[0, 0, 255, 255]
-            } else {
-                &[255, 0, 0, 255]
-            }
-        );
-    }
-    assert!(execution.wait_for_completion().unwrap().is_some());
-
     // Reusing immutable preparations must not pin temporary arena descriptors
     // into the persistent pool. Completed slots recycle them repeatedly.
     let updates = execution.descriptors.statistics().updates;
@@ -1320,10 +1228,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         execution
             .submit(ExecutionBatch { commands: repeated })
             .unwrap();
-        execution
-            .wait_for_completion_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        finish_next(&mut execution).unwrap().unwrap();
     }
     assert_eq!(execution.descriptors.statistics().updates, updates);
     assert!(
@@ -1350,11 +1255,11 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         .write_buffer(native_uniform, 0, &encode([1., 1., 0., 1.]))
         .unwrap();
     assert_eq!(upload.consumed, 16);
-    let submission = NativeSubmission {
-        frontend: FrontendSubmissionId::new(30),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: true,
-        commands: vec![NativeCommand::Draw {
+    let submission = NativeSubmission::new(
+        FrontendSubmissionId::new(30),
+        FrontendSubmissionSegment::FIRST,
+        true,
+        vec![NativeCommand::Draw {
             state: Arc::clone(&uniform_draw),
             arguments: DrawArguments::NonIndexed {
                 first_vertex: 0,
@@ -1363,7 +1268,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                 instance_count: 1,
             },
         }],
-    };
+    );
     ready(&mut execution, &submission);
     execution
         .submit(ExecutionBatch {
@@ -1376,10 +1281,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             .chunks_exact(4)
             .all(|pixel| pixel == [255, 255, 0, 255])
     );
-    execution
-        .wait_for_completion_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
+    finish_next(&mut execution).unwrap().unwrap();
     // Retained guest preparations must not pin the persistent host descriptor
     // budget. Force a two-set recording slot and retain many different binding
     // templates, proving pressure splits recording without dropping any draw.
@@ -1394,22 +1296,28 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let mut retained = Vec::new();
     let before = execution.statistics.draws;
     for index in 0..32 {
-        let (allocation, backing) = backing_allocation(256, 256, 0);
-        allocation.write(0, &encode([0., 1., 0., 1.])).unwrap();
+        let (allocation, backing) = backing_allocation(&execution.residency, 256, 256, 0);
+        crate::residency::tests::cpu_write(
+            &mut execution.residency,
+            &allocation,
+            0,
+            &encode([0., 1., 0., 1.]),
+        )
+        .unwrap();
         let mut source = (*uniform_draw).clone();
         source.identity = PreparedStateId::new(1000 + index, 1);
         let mut program = (*source.program).clone();
         program.identity = PreparedStateId::new(2000 + index, 1);
         program.bindings = Box::new([(
             uniform_color_resource(),
-            GuestBinding::Buffer(backing.snapshot_subrange(0, 16).unwrap()),
+            GuestBinding::Buffer(backing.slice(0, 16).unwrap()),
         )]);
         source.program = Arc::new(program);
-        let submission = NativeSubmission {
-            frontend: FrontendSubmissionId::new(1000 + index),
-            segment: FrontendSubmissionSegment::FIRST,
-            final_segment: true,
-            commands: vec![NativeCommand::Draw {
+        let submission = NativeSubmission::new(
+            FrontendSubmissionId::new(1000 + index),
+            FrontendSubmissionSegment::FIRST,
+            true,
+            vec![NativeCommand::Draw {
                 state: Arc::new(source),
                 arguments: DrawArguments::NonIndexed {
                     first_vertex: 0,
@@ -1418,7 +1326,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                     instance_count: 1,
                 },
             }],
-        };
+        );
         ready(&mut execution, &submission);
         execution
             .submit(ExecutionBatch {
@@ -1444,21 +1352,22 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
 fn contiguous_instances_preserve_vertex_inputs(
     execution: &mut NativeGpuExecution,
     state: &Arc<GuestDrawState>,
-    backing: &nixe_memory::CanonicalBackingRange,
+    backing: &PhysicalMapping,
 ) {
-    let (colors, color_backing) = backing_allocation(256, 256, 0);
+    let (colors, color_backing) = backing_allocation(&execution.residency, 256, 256, 0);
     let values: [f32; 18] = [
         0., 0., 0., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 1.,
     ];
-    colors
-        .write(
-            0,
-            &values
-                .into_iter()
-                .flat_map(f32::to_le_bytes)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    crate::residency::tests::cpu_write(
+        &mut execution.residency,
+        &colors,
+        0,
+        &values
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let mut draw = (**state).clone();
     draw.identity = PreparedStateId::new(3001, 1);
     let parameters = Arc::make_mut(&mut draw.parameters);
@@ -1480,7 +1389,7 @@ fn contiguous_instances_preserve_vertex_inputs(
     let mut buffers = draw.vertices.to_vec();
     buffers.push(GuestVertexBuffer {
         binding: 1,
-        backing: color_backing.snapshot_subrange(0, 72).unwrap(),
+        backing: color_backing.slice(0, 72).unwrap(),
     });
     draw.vertices = buffers.into();
     let draw = Arc::new(draw);
@@ -1501,12 +1410,12 @@ fn contiguous_instances_preserve_vertex_inputs(
             (3..6).map(|id| vec![command(id)]).collect()
         };
         for commands in groups {
-            let submission = NativeSubmission {
-                frontend: FrontendSubmissionId::new(3000),
-                segment: FrontendSubmissionSegment::FIRST,
-                final_segment: true,
+            let submission = NativeSubmission::new(
+                FrontendSubmissionId::new(3000),
+                FrontendSubmissionSegment::FIRST,
+                true,
                 commands,
-            };
+            );
             ready(execution, &submission);
             execution
                 .submit(ExecutionBatch {
@@ -1520,7 +1429,7 @@ fn contiguous_instances_preserve_vertex_inputs(
             execution.recording_statistics().draw_calls - before,
             if grouped { 1 } else { 3 }
         );
-        while execution.wait_for_completion().unwrap().is_some() {}
+        while finish_next(execution).unwrap().is_some() {}
     }
 }
 
@@ -1528,19 +1437,20 @@ fn window_depth_reconstructs_reads_and_clamps_exports(
     execution: &mut NativeGpuExecution,
     state: &Arc<GuestDrawState>,
 ) {
-    let (vertices, vertex_backing) = backing_allocation(256, 256, 0);
+    let (vertices, vertex_backing) = backing_allocation(&execution.residency, 256, 256, 0);
     let data = [
         -1_f32, -1., 0.25, 0., 0., 0., 3., -1., 0.25, 0., 0., 0., -1., 3., 0.25, 0., 0., 0.,
     ];
-    vertices
-        .write(
-            0,
-            &data
-                .into_iter()
-                .flat_map(f32::to_le_bytes)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    crate::residency::tests::cpu_write(
+        &mut execution.residency,
+        &vertices,
+        0,
+        &data
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     for (index, (transform, explicit)) in [
         (None, false),
         (Some([2., -1.]), false),
@@ -1551,13 +1461,18 @@ fn window_depth_reconstructs_reads_and_clamps_exports(
     .into_iter()
     .enumerate()
     {
-        let (pixels, color_backing) = backing_allocation(256, 256, 0);
-        let (_, depth_backing) = backing_allocation(256, 256, 0);
+        let (pixels, color_backing) = backing_allocation(&execution.residency, 256, 256, 0);
+        let (_allocation_3, depth_backing) = backing_allocation(&execution.residency, 256, 256, 0);
         let mut draw = (**state).clone();
         draw.identity = PreparedStateId::new(4000 + index as u64, 1);
-        draw.vertices[0].backing = vertex_backing.snapshot_subrange(0, 72).unwrap();
+        draw.vertices[0].backing = vertex_backing.slice(0, 72).unwrap();
         draw.colors[0].planes = Arc::from([GuestImagePlane {
-            backing: color_backing.clone(),
+            footprint: crate::residency::tests::plane_geometry(
+                color_backing.clone(),
+                [8, 8],
+                32,
+                4,
+            ),
             ..draw.colors[0].planes[0].clone()
         }]);
         let mut depth = draw.colors[0].clone();
@@ -1573,7 +1488,12 @@ fn window_depth_reconstructs_reads_and_clamps_exports(
         .unwrap();
         depth.planes = Arc::from([GuestImagePlane {
             aspect: GuestImageAspect::Depth,
-            backing: depth_backing.clone(),
+            footprint: crate::residency::tests::plane_geometry(
+                depth_backing.clone(),
+                [8, 8],
+                32,
+                4,
+            ),
             ..depth.planes[0].clone()
         }]);
         draw.depth_stencil = Some(depth);
@@ -1612,11 +1532,11 @@ fn window_depth_reconstructs_reads_and_clamps_exports(
             &execution.device_profile().shader_compiler,
             Some((header, instructions)),
         );
-        let submission = NativeSubmission {
-            frontend: FrontendSubmissionId::new(4000 + index as u64),
-            segment: FrontendSubmissionSegment::FIRST,
-            final_segment: true,
-            commands: vec![NativeCommand::Draw {
+        let submission = NativeSubmission::new(
+            FrontendSubmissionId::new(4000 + index as u64),
+            FrontendSubmissionSegment::FIRST,
+            true,
+            vec![NativeCommand::Draw {
                 state: Arc::new(draw),
                 arguments: DrawArguments::NonIndexed {
                     first_vertex: 0,
@@ -1625,7 +1545,7 @@ fn window_depth_reconstructs_reads_and_clamps_exports(
                     instance_count: 1,
                 },
             }],
-        };
+        );
         ready(execution, &submission);
         execution
             .submit(ExecutionBatch {
@@ -1662,11 +1582,11 @@ fn render_area_preserves_undefined_padding(
     execution: &mut NativeGpuExecution,
     state: &Arc<GuestDrawState>,
 ) {
-    let (_, backing) = backing_allocation(256, 256, 0x73);
+    let (_allocation_4, backing) = backing_allocation(&execution.residency, 256, 256, 0x73);
     let mut draw = (**state).clone();
     draw.identity = PreparedStateId::new(100, 1);
     draw.colors[0].planes = Arc::from([GuestImagePlane {
-        backing: backing.clone(),
+        footprint: crate::residency::tests::plane_geometry(backing.clone(), [8, 8], 32, 4),
         ..draw.colors[0].planes[0].clone()
     }]);
     draw.colors[0].canonical_texels = false;
@@ -1688,11 +1608,11 @@ fn render_area_preserves_undefined_padding(
         first_instance: 0,
         instance_count: 1,
     };
-    let first = NativeSubmission {
-        frontend: FrontendSubmissionId::new(100),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: false,
-        commands: vec![
+    let first = NativeSubmission::new(
+        FrontendSubmissionId::new(100),
+        FrontendSubmissionSegment::FIRST,
+        false,
+        vec![
             NativeCommand::Clear {
                 image: image.clone(),
                 rectangle: area,
@@ -1703,20 +1623,20 @@ fn render_area_preserves_undefined_padding(
                 arguments,
             },
         ],
-    };
+    );
     let parameters = Arc::make_mut(&mut draw.parameters);
     parameters.identity = PreparedStateId::new(102, 1);
     parameters.scissor.x = 3;
     draw.identity = PreparedStateId::new(103, 1);
-    let second = NativeSubmission {
-        frontend: FrontendSubmissionId::new(101),
-        segment: FrontendSubmissionSegment::FIRST,
-        final_segment: false,
-        commands: vec![NativeCommand::Draw {
+    let second = NativeSubmission::new(
+        FrontendSubmissionId::new(101),
+        FrontendSubmissionSegment::FIRST,
+        false,
+        vec![NativeCommand::Draw {
             state: Arc::new(draw),
             arguments,
         }],
-    };
+    );
     let scopes = execution.recording_statistics().rendering_scopes;
     for submission in [&first, &second] {
         ready(execution, submission);
@@ -1787,6 +1707,7 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
     };
     let monitor = device.validation_monitor();
     let mut execution = NativeGpuExecution::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
         device,
         ShaderNamespace {
             guest: *b"nixe-native-test",
@@ -1798,11 +1719,9 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
     .unwrap();
     let plane = |format: ImageFormat, width, height| {
         let bpp = format.plane_bytes_per_texel(0).unwrap() as u64;
-        let (_, backing) = backing_allocation(4096, 4096, 0xa5);
-        let backing = backing
-            .snapshot_subrange(0, u64::from(width * height) * bpp)
-            .unwrap();
-        GuestImage {
+        let (_allocation_5, backing) = backing_allocation(&execution.residency, 4096, 4096, 0xa5);
+        let backing = backing.slice(0, u64::from(width * height) * bpp).unwrap();
+        let image = GuestImage {
             sample_grid: [1, 1],
             canonical_texels: true,
             swizzle: Swizzle::IDENTITY,
@@ -1820,15 +1739,21 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
                 mip_level: 0,
                 array_layer: 0,
                 aspect: GuestImageAspect::Color,
-                backing,
+                footprint: crate::residency::tests::plane_geometry(
+                    backing,
+                    [width, height],
+                    u64::from(width) * bpp,
+                    bpp as u32,
+                ),
                 row_pitch: u64::from(width) * bpp,
                 bytes_per_block: bpp as u32,
             }]),
-        }
+        };
+        (_allocation_5, image)
     };
-    let y = plane(ImageFormat::R8Unorm, 5, 3);
-    let uv = plane(ImageFormat::Rg8Unorm, 3, 2);
-    let output = plane(ImageFormat::Bgra8Unorm, 4, 2);
+    let (_y, y) = plane(ImageFormat::R8Unorm, 5, 3);
+    let (_uv, uv) = plane(ImageFormat::Rg8Unorm, 3, 2);
+    let (_output, output) = plane(ImageFormat::Bgra8Unorm, 4, 2);
     let transform = Nv12ColorTransform {
         coefficients: [
             [256, 0, 128, -4096],
@@ -1845,11 +1770,11 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
     for frame in 0..4 {
         let ys: Arc<[u8]> = (0..15).map(|i| (i * 11 + frame * 13) as u8).collect();
         let uvs: Arc<[u8]> = (0..12).map(|i| (i * 7 + frame * 9) as u8).collect();
-        let submission = NativeSubmission {
-            frontend: FrontendSubmissionId::new(frame as u64 + 1),
-            segment: FrontendSubmissionSegment::FIRST,
-            final_segment: true,
-            commands: vec![
+        let submission = NativeSubmission::new(
+            FrontendSubmissionId::new(frame as u64 + 1),
+            FrontendSubmissionSegment::FIRST,
+            true,
+            vec![
                 NativeCommand::UploadPlanes {
                     images: Box::new([y.clone(), uv.clone()]),
                     widths: [5, 3],
@@ -1860,18 +1785,18 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
                     transform,
                 },
             ],
-        };
+        );
         ready(&mut execution, &submission);
         execution
             .submit(ExecutionBatch {
                 commands: &submission,
             })
             .unwrap();
-        execution
-            .wait_for_completion_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
-        let pixels = cpu_read(&mut execution.residency, &output.planes[0].backing);
+        finish_next(&mut execution).unwrap().unwrap();
+        let pixels = cpu_read(
+            &mut execution.residency,
+            output.planes[0].footprint.mapping(),
+        );
         for row in 0..2 {
             for column in 0..4 {
                 let sx = column + 1;
@@ -1945,6 +1870,7 @@ fn captured_compute_dispatch_reuses_prepared_pipeline_without_old_ir() {
         shared_memory_bytes: 0,
     });
     let mut execution = NativeGpuExecution::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
         device,
         ShaderNamespace {
             guest: *b"new-compute-test",
@@ -1955,23 +1881,20 @@ fn captured_compute_dispatch_reuses_prepared_pipeline_without_old_ir() {
     )
     .unwrap();
     for value in 1..=2 {
-        let batch = NativeSubmission {
-            frontend: FrontendSubmissionId::new(value),
-            segment: FrontendSubmissionSegment::FIRST,
-            final_segment: true,
-            commands: vec![NativeCommand::Dispatch {
+        let batch = NativeSubmission::new(
+            FrontendSubmissionId::new(value),
+            FrontendSubmissionSegment::FIRST,
+            true,
+            vec![NativeCommand::Dispatch {
                 program: Arc::clone(&program),
                 groups: [value as u32, 1, 1],
             }],
-        };
+        );
         ready(&mut execution, &batch);
         execution
             .submit(ExecutionBatch { commands: &batch })
             .unwrap();
-        execution
-            .wait_for_completion_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        finish_next(&mut execution).unwrap().unwrap();
     }
     assert_eq!(execution.statistics.dispatches, 2);
     assert_eq!(execution.computing.len(), 1);
@@ -1987,6 +1910,7 @@ fn recorder_prefixes_retain_gpu_versions_without_allocating_completion_records()
         };
         let monitor = device.validation_monitor();
         let mut execution = NativeGpuExecution::new(
+            nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
             device,
             ShaderNamespace {
                 guest: *b"prefix-recording",
@@ -1996,7 +1920,7 @@ fn recorder_prefixes_retain_gpu_versions_without_allocating_completion_records()
             4 * 1024 * 1024,
         )
         .unwrap();
-        let (_, backing) = backing_allocation(4096, 4096, 0x19);
+        let (_allocation_6, backing) = backing_allocation(&execution.residency, 4096, 4096, 0x19);
         let buffer = execution
             .residency
             .buffer_for(backing.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
@@ -2010,17 +1934,17 @@ fn recorder_prefixes_retain_gpu_versions_without_allocating_completion_records()
             16
         );
         for value in 1..=128u8 {
-            let prefix = NativeSubmission {
-                frontend: FrontendSubmissionId::new(1),
-                segment: FrontendSubmissionSegment::FIRST,
-                final_segment: false,
-                commands: vec![NativeCommand::WriteMemory {
-                    target: backing.clone(),
+            let prefix = NativeSubmission::new(
+                FrontendSubmissionId::new(1),
+                FrontendSubmissionSegment::FIRST,
+                false,
+                vec![NativeCommand::ReportMemory {
+                    fence: true,
+                    target: backing.pin(0, backing.bytes()).unwrap(),
                     offset: 64,
                     bytes: Arc::from([value; 16]),
-                    after_prior_work: true,
                 }],
-            };
+            );
             ready(&mut execution, &prefix);
             execution
                 .record(ExecutionBatch { commands: &prefix })
@@ -2029,7 +1953,7 @@ fn recorder_prefixes_retain_gpu_versions_without_allocating_completion_records()
             assert!(execution.poll_completion().unwrap().is_none());
         }
         assert_eq!(execution.statistics.batches, 128);
-        assert_eq!(execution.residency.device().submitted_tick(), 0);
+        assert_eq!(execution.residency.device().scheduled_tick(), 0);
         if read_before_final {
             let bytes = cpu_read(&mut execution.residency, &backing);
             assert_eq!(&bytes[..16], &[0x37; 16]);
@@ -2040,21 +1964,18 @@ fn recorder_prefixes_retain_gpu_versions_without_allocating_completion_records()
             );
             assert!(execution.poll_completion().unwrap().is_none());
         }
-        let tail = NativeSubmission {
-            frontend: FrontendSubmissionId::new(1),
-            segment: FrontendSubmissionSegment::FIRST,
-            final_segment: true,
-            commands: vec![NativeCommand::WaitForIdle],
-        };
+        let tail = NativeSubmission::new(
+            FrontendSubmissionId::new(1),
+            FrontendSubmissionSegment::FIRST,
+            true,
+            vec![NativeCommand::WaitForIdle],
+        );
         ready(&mut execution, &tail);
         let token = execution
             .submit(ExecutionBatch { commands: &tail })
             .unwrap();
         assert_eq!(execution.completions.len(), 1);
-        let completed = execution
-            .wait_for_completion_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        let completed = finish_next(&mut execution).unwrap().unwrap();
         assert_eq!(completed.submission(), token);
         let bytes = cpu_read(&mut execution.residency, &backing);
         assert_eq!(&bytes[..16], &[0x37; 16]);

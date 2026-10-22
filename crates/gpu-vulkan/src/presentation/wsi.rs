@@ -29,6 +29,7 @@ pub(super) fn select_present_mode(
 /// Native scheduling synchronization crosses the owner boundary without guest reads.
 struct Context {
     recording: crate::dispatch::RecordingHandle,
+    progress: Arc<crate::queue::progress::SubmissionProgress>,
     owner: Arc<DeviceOwner>,
     queues: crate::device::QueueSelection,
     timeline: vk::Semaphore,
@@ -38,19 +39,33 @@ struct Context {
 }
 impl Context {
     fn completed(&self) -> Result<u64, VulkanError> {
-        self.recording.check_failure()?;
         unsafe { self.owner.device.get_semaphore_counter_value(self.timeline) }
             .map_err(|e| VulkanError::vk("WSI graphics completion", e))
     }
-    fn wait(&self, work: WorkTicket) -> Result<(), VulkanError> {
-        self.recording.finish()?;
+    fn drain(&self, work: WorkTicket) -> Result<(), VulkanError> {
+        // Only teardown drains the worker. A failed/canceled queued tick is
+        // never a native use, but an earlier accepted tick still needs retiring.
+        let _ = self.recording.finish();
+        if self
+            .progress
+            .failure()
+            .is_some_and(|failure| failure.cause.device_lost())
+        {
+            return Ok(());
+        }
+        let tick = work.tick().min(self.progress.submitted());
+        if tick == 0 {
+            return Ok(());
+        }
         let semaphores = [self.timeline];
-        let values = [work.tick()];
+        let values = [tick];
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
-        unsafe { self.owner.device.wait_semaphores(&info, u64::MAX) }
-            .map_err(|e| VulkanError::vk("WSI graphics drain", e))
+        match unsafe { self.owner.device.wait_semaphores(&info, u64::MAX) } {
+            Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => Ok(()),
+            Err(error) => Err(VulkanError::vk("WSI graphics drain", error)),
+        }
     }
 }
 struct Image {
@@ -473,6 +488,9 @@ impl Swapchains {
         frame: Acquired,
         work: WorkTicket,
     ) -> Result<bool, VulkanError> {
+        // Binary WSI waits require an already submitted signal operation.
+        // Confirm it before resetting a fence that teardown may still need.
+        device.progress.wait_submitted(work.tick(), None)?;
         let chain = self.current.as_mut().unwrap();
         let image = &mut chain.images[frame.index as usize];
         unsafe { device.owner.device.reset_fences(&[image.present]) }
@@ -487,9 +505,8 @@ impl Swapchains {
             .swapchains(&chains)
             .image_indices(&indices)
             .push_next(&mut release);
-        // Binary WSI waits require an already submitted signal operation.
-        // This runs on the presenter; command preparation remains asynchronous.
-        device.recording.finish()?;
+        chain.last_work = Some(work);
+        self.acquires[frame.acquire].work = Some(work);
         let result = {
             let _queue = device
                 .owner
@@ -510,8 +527,6 @@ impl Swapchains {
             return Err(VulkanError::vk("vkQueuePresentKHR", result.unwrap_err()));
         }
         image.presented = true;
-        chain.last_work = Some(work);
-        self.acquires[frame.acquire].work = Some(work);
         self.held = None;
         match result {
             Ok(suboptimal) => {
@@ -527,7 +542,7 @@ impl Swapchains {
     }
     pub fn shutdown(&mut self, device: &Context) -> Result<(), VulkanError> {
         if let Some(work) = self.current.as_ref().and_then(|c| c.last_work) {
-            device.wait(work)?;
+            device.drain(work)?;
         }
         if let Some((_, acquire, _)) = self.held.take() {
             unsafe {
@@ -536,6 +551,13 @@ impl Swapchains {
                     .device
                     .wait_for_fences(&[self.acquires[acquire].fence], true, u64::MAX)
             }
+            .or_else(|error| {
+                if error == vk::Result::ERROR_DEVICE_LOST {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
             .map_err(|e| VulkanError::vk("final acquire completion", e))?;
             // Destruction needs completed acquire/graphics/presentation uses,
             // not a separate release of an unused acquired image. No continuing
@@ -544,7 +566,7 @@ impl Swapchains {
         }
         for chain in self.current.iter().chain(&self.retired) {
             if let Some(work) = chain.last_work {
-                device.wait(work)?;
+                device.drain(work)?;
             }
             let fences: Vec<_> = chain
                 .images
@@ -554,6 +576,13 @@ impl Swapchains {
                 .collect();
             if !fences.is_empty() {
                 unsafe { device.owner.device.wait_for_fences(&fences, true, u64::MAX) }
+                    .or_else(|error| {
+                        if error == vk::Result::ERROR_DEVICE_LOST {
+                            Ok(())
+                        } else {
+                            Err(error)
+                        }
+                    })
                     .map_err(|e| VulkanError::vk("final presentation release", e))?;
             }
         }
@@ -621,6 +650,7 @@ impl Presenter {
         }
         let context = Context {
             recording: device.dispatch.recording_handle(),
+            progress: Arc::clone(&device.submission.progress),
             owner: Arc::clone(&device.owner),
             queues: crate::device::QueueSelection {
                 graphics_compute_family: device.queues().graphics_compute_family,

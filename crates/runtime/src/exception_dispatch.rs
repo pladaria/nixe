@@ -5,22 +5,13 @@
 //! execution loop applies. Neither side assumes the interpreter or JIT backend.
 
 use crate::GuestCpuState;
+use crate::memory::ProcessMemory;
 use nixe_cpu::location::LocationDescriptor;
-use nixe_cpu::{
-    memory::{
-        ExecutionMemory, MemoryAliasError, MemoryAliasRequest, MemoryAttributes,
-        MemoryMappingError, MemoryMappingProperties, MemoryMappingPurpose, MemoryPermissions,
-        MemoryProtectionError, ProcessMemory,
-    },
-    profile::ProcessCpuContext,
-};
-use nixe_memory::CanonicalRangeTranslator;
-use nixe_memory::MemoryInvalidationSource;
+use nixe_cpu::profile::ProcessCpuContext;
 use nixe_scheduler::{GuestThreadId, VirtualCpuId};
 
 use crate::{
-    AddressWaitRegistry, HandleTable, ProcessMemoryAccounting, ProcessMemoryLayout,
-    ProcessMountNamespace, ThreadObject,
+    AddressWaitRegistry, HandleTable, ProcessMemoryLayout, ProcessMountNamespace, ThreadObject,
 };
 
 /// Maximum number of guest bytes retained from a fatal break payload.
@@ -70,18 +61,11 @@ impl std::fmt::Debug for GuestBreakPayload {
 
 pub use nixe_cpu::execution::ExceptionDispatchRequest;
 
-pub(crate) trait MemoryMutationControl {
-    fn request_mapping_safepoint(&self);
-    fn publish_memory_invalidation(&self, cursor: nixe_memory::MemoryInvalidationCursor);
-}
-
 pub(crate) struct ExceptionProcessResources<'a> {
-    pub memory: &'a ExecutionMemory,
-    pub mapping_control: &'a dyn MemoryMutationControl,
-    pub canonical_memory: &'a dyn CanonicalRangeTranslator,
-    pub mounts: &'a ProcessMountNamespace,
-    pub handles: &'a mut HandleTable,
-    pub address_waits: &'a mut AddressWaitRegistry,
+    pub memory: &'a std::sync::Arc<ProcessMemory>,
+    pub mounts: &'a std::sync::Arc<ProcessMountNamespace>,
+    pub handles: &'a std::sync::Arc<HandleTable>,
+    pub address_waits: &'a std::sync::Arc<AddressWaitRegistry>,
 }
 
 /// Guest continuation selected after handling an exception.
@@ -188,13 +172,10 @@ pub struct ExceptionProcessContext<'a> {
     memory_layout: ProcessMemoryLayout,
     random_entropy: [u64; 4],
     thread_policy: Option<crate::process::ThreadPolicy>,
-    memory_accounting: &'a mut ProcessMemoryAccounting,
-    memory: &'a ExecutionMemory,
-    mapping_control: &'a dyn MemoryMutationControl,
-    canonical_memory: &'a dyn CanonicalRangeTranslator,
-    mounts: &'a ProcessMountNamespace,
-    handles: &'a mut HandleTable,
-    address_waits: &'a mut AddressWaitRegistry,
+    memory: &'a std::sync::Arc<ProcessMemory>,
+    mounts: &'a std::sync::Arc<ProcessMountNamespace>,
+    handles: &'a std::sync::Arc<HandleTable>,
+    address_waits: &'a std::sync::Arc<AddressWaitRegistry>,
 }
 
 #[derive(Clone, Copy)]
@@ -220,7 +201,6 @@ impl<'a> ExceptionProcessContext<'a> {
 
     pub(crate) const fn new(
         metadata: ExceptionProcessMetadata,
-        memory_accounting: &'a mut ProcessMemoryAccounting,
         resources: ExceptionProcessResources<'a>,
     ) -> Self {
         Self {
@@ -230,10 +210,7 @@ impl<'a> ExceptionProcessContext<'a> {
             memory_layout: metadata.memory_layout,
             random_entropy: metadata.random_entropy,
             thread_policy: metadata.thread_policy,
-            memory_accounting,
             memory: resources.memory,
-            mapping_control: resources.mapping_control,
-            canonical_memory: resources.canonical_memory,
             mounts: resources.mounts,
             handles: resources.handles,
             address_waits: resources.address_waits,
@@ -268,53 +245,30 @@ impl<'a> ExceptionProcessContext<'a> {
         }
     }
 
-    /// Returns the currently committed heap size.
-    #[must_use]
-    pub const fn heap_size(&self) -> u64 {
-        self.memory_accounting.heap_size()
+    pub fn heap_size(&self) -> u64 {
+        self.memory.heap_size()
     }
-
-    /// Updates heap accounting after an atomic memory resize succeeds.
-    pub fn set_heap_size(&mut self, size: u64) {
-        self.memory_accounting.commit_heap_size(size);
+    pub fn total_user_physical_memory_size(&self) -> u64 {
+        self.memory.accounting().total_user_physical_memory_size()
     }
-
-    /// Returns whether a heap resize stays within the shared physical limit.
-    #[must_use]
-    pub const fn can_resize_heap(&self, size: u64) -> bool {
-        self.memory_accounting.can_resize_heap(size)
+    pub fn used_user_physical_memory_size(&self) -> u64 {
+        self.memory.accounting().used_user_physical_memory_size()
     }
-
-    #[must_use]
-    pub const fn total_user_physical_memory_size(&self) -> u64 {
-        self.memory_accounting.total_user_physical_memory_size()
-    }
-
-    #[must_use]
-    pub const fn used_user_physical_memory_size(&self) -> u64 {
-        self.memory_accounting.used_user_physical_memory_size()
-    }
-
-    #[must_use]
-    pub const fn total_non_system_user_physical_memory_size(&self) -> u64 {
-        self.memory_accounting
+    pub fn total_non_system_user_physical_memory_size(&self) -> u64 {
+        self.memory
+            .accounting()
             .total_non_system_user_physical_memory_size()
     }
-
-    #[must_use]
-    pub const fn used_non_system_user_physical_memory_size(&self) -> u64 {
-        self.memory_accounting
+    pub fn used_non_system_user_physical_memory_size(&self) -> u64 {
+        self.memory
+            .accounting()
             .used_non_system_user_physical_memory_size()
     }
-
-    #[must_use]
-    pub const fn total_system_resource_size(&self) -> u64 {
-        self.memory_accounting.total_system_resource_size()
+    pub fn total_system_resource_size(&self) -> u64 {
+        self.memory.accounting().total_system_resource_size()
     }
-
-    #[must_use]
-    pub const fn used_system_resource_size(&self) -> u64 {
-        self.memory_accounting.used_system_resource_size()
+    pub fn used_system_resource_size(&self) -> u64 {
+        self.memory.accounting().used_system_resource_size()
     }
 
     /// Returns the immutable CPU profile and address-space identity of the
@@ -326,177 +280,32 @@ impl<'a> ExceptionProcessContext<'a> {
 
     /// Returns the current process's canonical execution memory.
     #[must_use]
-    pub const fn memory(&self) -> &ExecutionMemory {
+    pub const fn memory(&self) -> &std::sync::Arc<ProcessMemory> {
         self.memory
-    }
-
-    pub fn map_shared_memory(
-        &self,
-        start: nixe_memory::GuestVirtualAddress,
-        object: &crate::SharedMemoryObject,
-        permissions: MemoryPermissions,
-    ) -> Result<(), MemoryMappingError> {
-        self.mapping_control.request_mapping_safepoint();
-        self.memory.map_shared_backing(
-            self.cpu.address_space_id(),
-            start,
-            object.backing(),
-            permissions,
-        )?;
-        self.mapping_control
-            .publish_memory_invalidation(self.memory.invalidation_cursor());
-        Ok(())
-    }
-
-    pub fn resize_memory_mapping(
-        &self,
-        start: nixe_memory::GuestVirtualAddress,
-        old_size: u64,
-        new_size: u64,
-        permissions: MemoryPermissions,
-        purpose: MemoryMappingPurpose,
-    ) -> Result<(), MemoryMappingError> {
-        self.mapping_control.request_mapping_safepoint();
-        self.memory.resize_zeroed_mapping(
-            self.cpu.address_space_id(),
-            start,
-            old_size,
-            new_size,
-            permissions,
-            purpose,
-        )?;
-        self.mapping_control
-            .publish_memory_invalidation(self.memory.invalidation_cursor());
-        Ok(())
-    }
-
-    pub fn unmap_shared_memory(
-        &self,
-        start: nixe_memory::GuestVirtualAddress,
-        object: &crate::SharedMemoryObject,
-    ) -> Result<(), MemoryMappingError> {
-        self.mapping_control.request_mapping_safepoint();
-        self.memory
-            .unmap_shared_backing(self.cpu.address_space_id(), start, object.backing())?;
-        self.mapping_control
-            .publish_memory_invalidation(self.memory.invalidation_cursor());
-        Ok(())
-    }
-
-    pub fn map_memory_alias(
-        &self,
-        destination: nixe_memory::GuestVirtualAddress,
-        source: nixe_memory::GuestVirtualAddress,
-        size: u64,
-        source_before: MemoryMappingProperties,
-        source_after: MemoryMappingProperties,
-        destination_properties: MemoryMappingProperties,
-    ) -> Result<(), MemoryAliasError> {
-        self.mapping_control.request_mapping_safepoint();
-        self.memory.map_alias(MemoryAliasRequest::new(
-            self.cpu.address_space_id(),
-            destination,
-            source,
-            size,
-            source_before,
-            source_after,
-            destination_properties,
-        ))?;
-        self.mapping_control
-            .publish_memory_invalidation(self.memory.invalidation_cursor());
-        Ok(())
-    }
-
-    pub fn unmap_memory_alias(
-        &self,
-        destination: nixe_memory::GuestVirtualAddress,
-        source: nixe_memory::GuestVirtualAddress,
-        size: u64,
-        source_before: MemoryMappingProperties,
-        source_after: MemoryMappingProperties,
-        destination_properties: MemoryMappingProperties,
-    ) -> Result<(), MemoryAliasError> {
-        self.mapping_control.request_mapping_safepoint();
-        self.memory.unmap_alias(MemoryAliasRequest::new(
-            self.cpu.address_space_id(),
-            destination,
-            source,
-            size,
-            source_before,
-            source_after,
-            destination_properties,
-        ))?;
-        self.mapping_control
-            .publish_memory_invalidation(self.memory.invalidation_cursor());
-        Ok(())
-    }
-
-    pub fn set_memory_permissions(
-        &self,
-        start: nixe_memory::GuestVirtualAddress,
-        size: u64,
-        permissions: MemoryPermissions,
-    ) -> Result<(), MemoryProtectionError> {
-        self.mapping_control.request_mapping_safepoint();
-        self.memory
-            .set_permissions(self.cpu.address_space_id(), start, size, permissions)?;
-        self.mapping_control
-            .publish_memory_invalidation(self.memory.invalidation_cursor());
-        Ok(())
-    }
-
-    pub fn set_memory_attributes(
-        &self,
-        start: nixe_memory::GuestVirtualAddress,
-        size: u64,
-        mask: MemoryAttributes,
-        value: MemoryAttributes,
-    ) -> Result<(), MemoryProtectionError> {
-        self.mapping_control.request_mapping_safepoint();
-        self.memory
-            .set_attributes(self.cpu.address_space_id(), start, size, mask, value)?;
-        self.mapping_control
-            .publish_memory_invalidation(self.memory.invalidation_cursor());
-        Ok(())
-    }
-
-    /// Returns pointer-free translation into retained canonical backing.
-    #[must_use]
-    pub const fn canonical_memory(&self) -> &dyn CanonicalRangeTranslator {
-        self.canonical_memory
     }
 
     /// Returns the current process filesystem namespace.
     #[must_use]
-    pub const fn mounts(&self) -> &ProcessMountNamespace {
+    pub const fn mounts(&self) -> &std::sync::Arc<ProcessMountNamespace> {
         self.mounts
     }
 
     /// Returns the current process handle table.
     #[must_use]
-    pub const fn handles(&self) -> &HandleTable {
-        self.handles
-    }
-
-    /// Returns mutable handle access for syscall and IPC operations.
-    pub const fn handles_mut(&mut self) -> &mut HandleTable {
+    pub const fn handles(&self) -> &std::sync::Arc<HandleTable> {
         self.handles
     }
 
     #[must_use]
-    pub const fn address_waits(&self) -> &AddressWaitRegistry {
+    pub const fn address_waits(&self) -> &std::sync::Arc<AddressWaitRegistry> {
         self.address_waits
     }
 
-    pub const fn address_waits_mut(&mut self) -> &mut AddressWaitRegistry {
-        self.address_waits
-    }
-
-    /// Borrows the immutable mount namespace and mutable handle table together.
+    /// Borrows the immutable mounts and internally synchronized handle table.
     ///
     /// Platform IPC adapters need both resources for an atomic service lookup
     /// without making the generic runtime depend on a console protocol.
-    pub fn mounts_and_handles_mut(&mut self) -> (&ProcessMountNamespace, &mut HandleTable) {
+    pub fn mounts_and_handles(&self) -> (&ProcessMountNamespace, &HandleTable) {
         (self.mounts, self.handles)
     }
 }
@@ -563,16 +372,28 @@ impl<'a> ExceptionThreadContext<'a> {
 
 /// Complete current process/thread view supplied to runtime exception policy.
 pub struct ExceptionDispatchContext<'a> {
+    source: LocationDescriptor,
     process: ExceptionProcessContext<'a>,
     thread: ExceptionThreadContext<'a>,
 }
 
 impl<'a> ExceptionDispatchContext<'a> {
     pub(crate) const fn new(
+        source: LocationDescriptor,
         process: ExceptionProcessContext<'a>,
         thread: ExceptionThreadContext<'a>,
     ) -> Self {
-        Self { process, thread }
+        Self {
+            source,
+            process,
+            thread,
+        }
+    }
+
+    /// Original instruction location, retained across owned kernel phases.
+    #[must_use]
+    pub const fn source(&self) -> LocationDescriptor {
+        self.source
     }
 
     #[must_use]

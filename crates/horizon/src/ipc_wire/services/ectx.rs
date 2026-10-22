@@ -87,7 +87,7 @@ mod tests {
         let hipc = HipcRequest::decode(&create).unwrap();
         let cmif = CmifRequest::decode(&hipc, true).unwrap();
         let (response, handle) = dispatch_error_context_writer(&session, cmif, &hipc).unwrap();
-        assert_eq!(handle, None);
+        assert!((handle).is_none());
         assert_eq!(u32::from_le_bytes(response[16..20].try_into().unwrap()), 1);
         let id = u32::from_le_bytes(response[48..52].try_into().unwrap());
         assert_eq!(id, 2);

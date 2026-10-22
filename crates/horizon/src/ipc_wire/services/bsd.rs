@@ -23,7 +23,7 @@ impl BsdCommand {
 }
 
 pub(in crate::ipc_wire) fn dispatch_bsd(
-    process: &mut ExceptionProcessContext<'_>,
+    process: &mut Request,
     session: &BsdSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -89,11 +89,7 @@ pub(in crate::ipc_wire) fn dispatch_bsd(
             {
                 return invalid_header(session, request.token);
             }
-            let Some(transfer_memory) = process
-                .handles()
-                .get_as::<TransferMemoryObject>(hipc.copy_handles[0])
-                .cloned()
-            else {
+            let Some(transfer_memory) = process.copy_handle::<TransferMemoryObject>(0) else {
                 return invalid_header(session, request.token);
             };
             if declared_transfer_size != transfer_memory.size() {
@@ -225,6 +221,6 @@ mod tests {
                 socket_buffer_efficiency: 8,
             })
         );
-        assert_eq!(decode_client_config(&data[..0x1f]), None);
+        assert!((decode_client_config(&data[..0x1f])).is_none());
     }
 }

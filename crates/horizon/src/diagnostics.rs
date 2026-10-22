@@ -118,7 +118,7 @@ mod tests {
             GuestLogLevel::Inherit.resolve(GuestLogSeverity::Fatal),
             Some(log::Level::Error)
         );
-        assert_eq!(GuestLogLevel::Off.resolve(GuestLogSeverity::Info), None);
+        assert!((GuestLogLevel::Off.resolve(GuestLogSeverity::Info)).is_none());
         assert_eq!(
             GuestLogLevel::Debug.resolve(GuestLogSeverity::Error),
             Some(log::Level::Debug)

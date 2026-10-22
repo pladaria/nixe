@@ -322,11 +322,12 @@ impl VulkanResidency {
         Ok(())
     }
     pub fn with_recording_policy(
+        memory: Machine,
         device: VulkanDevice,
         bytes: u64,
         policy: RecordingPolicy,
     ) -> Result<Self, VulkanError> {
-        let mut cache = Self::new(device, bytes)?;
+        let mut cache = Self::new(memory, device, bytes)?;
         cache.unified_layouts = cache.device.profile().unified_image_layouts
             && policy.layouts == LayoutPolicy::Automatic;
         cache.barrier_policy = policy.barriers;

@@ -1,11 +1,5 @@
 use super::*;
-mod support {
-    use crate as nixe_gpu_vulkan;
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/device.rs"
-    ));
-}
+use crate::test_device as support;
 
 fn small_device(
     api: crate::ApiPreference,
@@ -29,6 +23,151 @@ mod gate {
     ));
 }
 use gate::Gate;
+
+#[test]
+#[ignore = "Explicit diagnostic: delays the native submit thread to measure zero-time polling"]
+fn profile_zero_timeout_submission_acknowledgement() {
+    let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let ticket = device.enqueue_buffer_readback(&[13; 64]).unwrap();
+    let queue_mutex = Arc::clone(&device.owner.queue_mutex);
+    let (held, ready) = std::sync::mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _guard = queue_mutex.lock().unwrap();
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        ready.recv().unwrap();
+        device.flush().unwrap();
+        let begin = std::time::Instant::now();
+        let completed = device.wait_for_work(ticket.work(), Duration::ZERO).unwrap();
+        eprintln!(
+            "zero-time-poll elapsed_ms={} completed={completed}",
+            begin.elapsed().as_secs_f64() * 1000.0,
+        );
+    });
+    assert!(device.wait_for_work(ticket.work(), Duration::MAX).unwrap());
+    assert_eq!(device.readback(ticket).unwrap(), [13; 64]);
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+fn queued_zero_query_and_finite_wait_do_not_drain_the_recording_worker() {
+    let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let work = device.work_ticket().unwrap();
+    assert_eq!(device.poll_work(work).unwrap(), WorkStatus::Pending);
+    assert_eq!(device.queue_usage().scheduled_tick, 0);
+    let queue_mutex = Arc::clone(&device.owner.queue_mutex);
+    let (held, ready) = std::sync::mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _guard = queue_mutex.lock().unwrap();
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        ready.recv().unwrap();
+        device.flush().unwrap();
+        let begin = Instant::now();
+        assert!(!device.wait_for_work(work, Duration::ZERO).unwrap());
+        assert!(begin.elapsed() < Duration::from_millis(50));
+        assert_eq!(device.queue_usage().scheduled_tick, work.tick());
+        assert_eq!(device.queue_usage().submitted_tick, 0);
+        let begin = Instant::now();
+        assert!(
+            !device
+                .wait_for_work(work, Duration::from_millis(20))
+                .unwrap()
+        );
+        assert!(begin.elapsed() < Duration::from_millis(100));
+    });
+    assert!(device.wait_for_work(work, Duration::from_secs(5)).unwrap());
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+fn finite_wait_shares_one_deadline_across_submission_and_gpu_execution() {
+    let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let mut gate = Gate::new(&device);
+    let work = device.work_ticket().unwrap();
+    let queue_mutex = Arc::clone(&device.owner.queue_mutex);
+    let (held, ready) = std::sync::mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _guard = queue_mutex.lock().unwrap();
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(120));
+        });
+        ready.recv().unwrap();
+        unsafe {
+            device.submission.flush(
+                device.queue,
+                &device.dispatch,
+                &[vk::SemaphoreSubmitInfo::default()
+                    .semaphore(gate.handle)
+                    .value(1)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)],
+                &[],
+            )
+        }
+        .unwrap();
+        gate.last_use = work.tick();
+        let begin = Instant::now();
+        assert!(
+            !device
+                .wait_for_work(work, Duration::from_millis(180))
+                .unwrap()
+        );
+        let elapsed = begin.elapsed();
+        eprintln!(
+            "combined-deadline elapsed_ms={}",
+            elapsed.as_secs_f64() * 1000.0
+        );
+        assert!(elapsed >= Duration::from_millis(170));
+        assert!(elapsed < Duration::from_millis(260));
+        // Under contention the deadline may expire before native submission.
+        // A timeout bounds the wait; it does not guarantee worker progress.
+        assert_eq!(device.completed_tick(), 0);
+        gate.signal();
+    });
+    assert!(device.wait_for_work(work, Duration::from_secs(5)).unwrap());
+    assert_eq!(device.queue_usage().submitted_tick, work.tick());
+    drop(gate);
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+#[ignore = "Explicit physical-GPU throughput diagnostic, outside game measurement windows"]
+fn profile_native_transfer_roundtrip() {
+    let Some(mut device) = support::device_for_test_with_validation(
+        crate::ApiPreference::Auto,
+        crate::ValidationMode::Disabled,
+    ) else {
+        return;
+    };
+    let bytes: Vec<_> = (0..1024 * 1024).map(|i| (i * 37) as u8).collect();
+    assert_eq!(device.transfer_round_trip(&bytes).unwrap(), bytes);
+    let begin = std::time::Instant::now();
+    for _ in 0..64 {
+        assert_eq!(device.transfer_round_trip(&bytes).unwrap(), bytes);
+    }
+    eprintln!(
+        "native-roundtrip iterations=64 bytes_per_iteration={} seconds={}",
+        bytes.len(),
+        begin.elapsed().as_secs_f64(),
+    );
+}
 
 fn exercise_reuse(api: crate::ApiPreference) {
     let configuration = QueueConfiguration {
@@ -127,9 +266,10 @@ fn exercise_reuse(api: crate::ApiPreference) {
         );
     }
     assert!(device.readback(stale).is_err());
-    // The final signal has no following data/message/explicit flush. Waiting
-    // submits that exact recording ticket and observes its own real completion.
+    // Seal a final signal explicitly; waiting only observes its real completion.
     let final_work = device.work_ticket().unwrap();
+    assert!(!device.wait_for_work(final_work, Duration::ZERO).unwrap());
+    assert_eq!(device.flush().unwrap(), Some(final_work));
     assert!(
         device
             .wait_for_work(final_work, Duration::from_secs(5))
@@ -269,6 +409,13 @@ fn shutdown_drains_accepted_work_and_cancels_unsubmitted_work() {
     let validation = device.validation_monitor();
     let accepted = device.enqueue_buffer_readback(&[1; 64]).unwrap();
     let submitted = device.flush().unwrap().unwrap();
+    assert!(
+        device
+            .submission
+            .progress
+            .wait_submitted(submitted.tick(), None)
+            .unwrap()
+    );
     let cancelled = device.enqueue_buffer_readback(&[2; 64]).unwrap();
     assert!(cancelled.work().tick() > submitted.tick());
     device.shutdown().unwrap();
@@ -296,13 +443,10 @@ fn foreign_tickets_and_terminal_device_errors_never_publish_completion() {
     let error = device
         .submission
         .error("loss fixture", vk::Result::ERROR_DEVICE_LOST);
-    assert!(matches!(
-        error,
-        VulkanError::Vulkan {
-            result: vk::Result::ERROR_DEVICE_LOST,
-            ..
-        }
-    ));
+    assert!(
+        matches!(error, VulkanError::SubmissionFailed { tick: 1, cause }
+        if matches!(*cause, VulkanError::Vulkan { result: vk::Result::ERROR_DEVICE_LOST, .. }))
+    );
     assert_eq!(device.queue_usage().completed_tick, 0);
     assert!(matches!(
         device.work_ticket(),
@@ -355,6 +499,48 @@ fn staging_overflow_suballocates_small_transfers_and_preserves_unread_slices() {
         assert_eq!(device.readback(ticket).unwrap(), [value as u8; 64]);
     }
     assert_eq!(device.queue_usage().overflow_capacity, 0);
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+fn prior_native_use_retires_after_a_later_failure_without_submitting_dependent_ticks() {
+    use crate::queue::progress::NativeFailure;
+    let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let a = device.work_ticket().unwrap();
+    device.flush().unwrap();
+    device
+        .submission
+        .progress
+        .wait_submitted(a.tick(), None)
+        .unwrap();
+    let queue_mutex = Arc::clone(&device.owner.queue_mutex);
+    let held = queue_mutex.lock().unwrap();
+    let b = device.work_ticket().unwrap();
+    device.flush().unwrap();
+    let c = device.work_ticket().unwrap();
+    device.flush().unwrap();
+    // Inject the scheduler outcome, without claiming to fault the native driver.
+    device.submission.progress.fail(
+        b.tick(),
+        NativeFailure::Vulkan {
+            operation: "injected native submit failure",
+            result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        },
+    );
+    assert!(device.wait_for_work(a, Duration::from_secs(5)).unwrap());
+    for work in [b, c] {
+        assert!(matches!(device.wait_for_work(work, Duration::ZERO),
+            Err(VulkanError::SubmissionFailed { tick, .. }) if tick == b.tick()));
+    }
+    drop(held);
+    assert!(device.shutdown().is_err());
+    assert_eq!(device.queue_usage().submitted_tick, a.tick());
+    assert_eq!(device.queue_usage().completed_tick, a.tick());
+    assert_eq!(device.queue_usage().command_pools, 0);
     drop(device);
     validation.check().unwrap();
 }

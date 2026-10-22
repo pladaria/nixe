@@ -222,7 +222,7 @@ impl VulkanResidency {
                 "resolve consumes undefined or discarded samples",
             ));
         }
-        self.prepare_image_rect(destination, d, rect)?;
+        let writer = self.prepare_image_rect(destination, d, rect)?;
         let source = self.attachment_access(
             source,
             AccessScope::new(
@@ -264,16 +264,17 @@ impl VulkanResidency {
             });
         self.barriers.emit(&mut self.device);
         let slot = self.device.begin_recording()?;
-        unsafe {
-            self.device.dispatch.cmd_resolve_image(
-                self.device.submission.slots[slot].command,
+        let command = self.device.submission.slots[slot].command;
+        self.publish_effect(&[writer], |device| unsafe {
+            device.dispatch.cmd_resolve_image(
+                command,
                 source,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 target,
                 layout,
                 &[region],
             );
-        }
+        })?;
         self.finish_image_rect(destination, d, rect)?;
         self.device.work_ticket()
     }

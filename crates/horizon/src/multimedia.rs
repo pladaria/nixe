@@ -106,14 +106,14 @@ mod tests {
             .request(6, decoder, Some((307_200_000, -1)))
             .unwrap();
         assert_eq!(
-            session.clone().request(7, decoder, None),
-            Ok(Some(307_200_000))
+            (session.clone().request(7, decoder, None)).unwrap(),
+            Some(307_200_000)
         );
-        assert_eq!(session.request(3, 6, None), Ok(Some(0)));
+        assert_eq!((session.request(3, 6, None)).unwrap(), Some(0));
         assert!(session.request(6, decoder, Some((200, 100))).is_err());
-        assert_eq!(session.request(3, 5, None), Ok(Some(307_200_000)));
+        assert_eq!((session.request(3, 5, None)).unwrap(), Some(307_200_000));
         session.request(1, 5, None).unwrap();
         assert!(session.request(7, decoder, None).is_err());
-        assert_eq!(session.request(7, encoder, None), Ok(Some(0)));
+        assert_eq!((session.request(7, encoder, None)).unwrap(), Some(0));
     }
 }

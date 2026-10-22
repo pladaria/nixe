@@ -38,12 +38,28 @@ impl PriorityRange {
 pub struct VirtualCpuDescriptor {
     id: VirtualCpuId,
     cluster: u32,
+    rotation_priority: Option<i32>,
 }
 
 impl VirtualCpuDescriptor {
     #[must_use]
     pub const fn new(id: VirtualCpuId, cluster: u32) -> Self {
-        Self { id, cluster }
+        Self {
+            id,
+            cluster,
+            rotation_priority: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_rotation_priority(mut self, priority: i32) -> Self {
+        self.rotation_priority = Some(priority);
+        self
+    }
+
+    #[must_use]
+    pub const fn rotation_priority(&self) -> Option<i32> {
+        self.rotation_priority
     }
 
     #[must_use]
@@ -62,6 +78,8 @@ pub struct MachineSchedulerProfile {
     vcpus: Arc<[VirtualCpuDescriptor]>,
     priorities: PriorityRange,
     default_timeslice_instructions: u64,
+    preemption_interval_ns: Option<u64>,
+    migration_priority: Option<i32>,
 }
 
 impl MachineSchedulerProfile {
@@ -88,7 +106,38 @@ impl MachineSchedulerProfile {
             vcpus: vcpus.into(),
             priorities,
             default_timeslice_instructions,
+            preemption_interval_ns: None,
+            migration_priority: None,
         })
+    }
+
+    pub fn with_preemption(
+        mut self,
+        interval_ns: u64,
+        migration_priority: i32,
+    ) -> Result<Self, MachineSchedulerProfileError> {
+        if interval_ns == 0
+            || !self.priorities.contains(migration_priority)
+            || self.vcpus.iter().any(|core| {
+                core.rotation_priority
+                    .is_some_and(|priority| !self.priorities.contains(priority))
+            })
+        {
+            return Err(MachineSchedulerProfileError::InvalidPreemptionPolicy);
+        }
+        self.preemption_interval_ns = Some(interval_ns);
+        self.migration_priority = Some(migration_priority);
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn preemption_interval_ns(&self) -> Option<u64> {
+        self.preemption_interval_ns
+    }
+
+    #[must_use]
+    pub const fn migration_priority(&self) -> Option<i32> {
+        self.migration_priority
     }
 
     #[must_use]
@@ -178,6 +227,7 @@ pub enum MachineSchedulerProfileError {
     DuplicateVirtualCpu(VirtualCpuId),
     InvalidPriorityRange { highest: i32, lowest: i32 },
     ZeroTimeslice,
+    InvalidPreemptionPolicy,
 }
 
 impl Display for MachineSchedulerProfileError {
@@ -191,6 +241,9 @@ impl Display for MachineSchedulerProfileError {
                 formatter,
                 "invalid priority range: highest {highest} is numerically greater than lowest {lowest}"
             ),
+            Self::InvalidPreemptionPolicy => {
+                formatter.write_str("invalid periodic preemption policy")
+            }
             Self::ZeroTimeslice => formatter.write_str("scheduler timeslice must be non-zero"),
         }
     }

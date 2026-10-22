@@ -1,99 +1,6 @@
-//! Shared contracts and value types for CPU memory backends.
-
-use std::fmt::{Display, Formatter};
-
-use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress, MappingGeneration};
-
-use crate::error::InstructionFetchFault;
-use crate::memory::ExecutionMemoryLease;
-
+//! Architectural memory values and instruction-access contract.
 pub use nixe_memory::MemoryPermissions;
-
-/// Page size used by the synthetic and production memory backends.
-pub const SYNTHETIC_PAGE_SIZE: usize = 4096;
-
-/// Stage of an atomic synthetic RAM installation.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum SyntheticInstallStage {
-    /// Request validation before resources are created.
-    Preflight,
-    /// Private physical-page allocation.
-    Allocation,
-    /// Private physical-page initialization.
-    Initialization,
-    /// Atomic virtual-mapping publication.
-    Publication,
-}
-
-/// One ephemeral page request for [`SyntheticMemory::install_ram_pages_atomic`].
-#[derive(Clone, Copy, Debug)]
-pub struct SyntheticRamPage<'a> {
-    /// Page-aligned guest virtual address.
-    pub virtual_address: GuestVirtualAddress,
-    /// Exact initialized contents of one synthetic page.
-    pub bytes: &'a [u8],
-    /// Final guest-visible permissions.
-    pub permissions: MemoryPermissions,
-}
-
-/// Failure of an atomic synthetic RAM installation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SyntheticInstallError {
-    /// Stage which rejected the request.
-    pub stage: SyntheticInstallStage,
-    /// Guest page associated with the failure, when available.
-    pub address: Option<GuestVirtualAddress>,
-    /// Backend-specific diagnostic.
-    pub reason: Box<str>,
-}
-
-impl Display for SyntheticInstallError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "synthetic RAM installation failed")?;
-        if let Some(address) = self.address {
-            write!(formatter, " at {address}")?;
-        }
-        write!(formatter, " during {:?}: {}", self.stage, self.reason)
-    }
-}
-
-impl std::error::Error for SyntheticInstallError {}
-
-/// Observable identity and permissions of one synthetic virtual mapping.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct SyntheticMappingInfo {
-    /// Runtime-owned physical-page identity.
-    pub physical_page: GuestPhysicalPageId,
-    /// Version of this virtual mapping and its access metadata.
-    pub mapping_generation: MappingGeneration,
-    /// Exact guest-visible mapping permissions.
-    pub permissions: MemoryPermissions,
-    /// Runtime-visible mapping attributes.
-    pub attributes: MemoryAttributes,
-    /// Runtime-assigned semantic state of the mapping.
-    pub purpose: MemoryMappingPurpose,
-}
-
-/// One checked A64 instruction and its canonical physical-page identity.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct FetchedInstruction {
-    pub bits: u32,
-    pub physical_page: GuestPhysicalPageId,
-}
-
-/// Read-only instruction view of a final process address space.
-///
-/// Implementations enforce execute permission and the alignment implied by the
-/// operation. Returned integers are canonical bit patterns; implementations
-/// must decode guest bytes explicitly and never rely on host endianness.
-pub trait InstructionMemory: Send + Sync {
-    /// Fetches one A64 word at a four-byte-aligned address.
-    fn fetch32(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Result<FetchedInstruction, InstructionFetchFault>;
-}
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 /// Width of one architectural data access.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -136,19 +43,6 @@ pub enum MemoryAlignment {
     Bytes16,
 }
 
-impl MemoryAlignment {
-    pub(super) const fn bytes(self, size: MemoryAccessSize) -> u8 {
-        match self {
-            Self::Unaligned => 1,
-            Self::Natural => size as u8,
-            Self::Bytes2 => 2,
-            Self::Bytes4 => 4,
-            Self::Bytes8 => 8,
-            Self::Bytes16 => 16,
-        }
-    }
-}
-
 /// Ordering required by the architectural operation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MemoryOrdering {
@@ -183,26 +77,6 @@ impl MemoryOrdering {
             self,
             Self::Acquire | Self::AcquireRelease | Self::SequentiallyConsistent
         )
-    }
-}
-
-pub(crate) fn begin_ordered_write(ordering: MemoryOrdering) {
-    use core::sync::atomic::{Ordering, fence};
-
-    match ordering {
-        MemoryOrdering::SequentiallyConsistent => fence(Ordering::SeqCst),
-        ordering if ordering.has_release() => fence(Ordering::Release),
-        _ => {}
-    }
-}
-
-pub(crate) fn complete_ordered_read(ordering: MemoryOrdering) {
-    use core::sync::atomic::{Ordering, fence};
-
-    match ordering {
-        MemoryOrdering::SequentiallyConsistent => fence(Ordering::SeqCst),
-        ordering if ordering.has_acquire() => fence(Ordering::Acquire),
-        _ => {}
     }
 }
 
@@ -369,7 +243,7 @@ impl MemoryAccess {
     }
 }
 
-/// Typed scalar/vector bit pattern transferred by [`CpuMemory`].
+/// Typed scalar/vector bit pattern transferred by instruction memory operations.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MemoryValue {
     /// 8-bit bits.
@@ -419,30 +293,6 @@ impl MemoryValue {
             MemoryAccessSize::Doubleword => Self::U64(bits as u64),
             MemoryAccessSize::Quadword => Self::U128(bits),
         }
-    }
-
-    pub(super) fn from_le_slice(size: MemoryAccessSize, bytes: &[u8]) -> Self {
-        let mut value = [0_u8; 16];
-        value[..bytes.len()].copy_from_slice(bytes);
-        let bits = u128::from_le_bytes(value);
-        match size {
-            MemoryAccessSize::Byte => Self::U8(bits as u8),
-            MemoryAccessSize::Halfword => Self::U16(bits as u16),
-            MemoryAccessSize::Word => Self::U32(bits as u32),
-            MemoryAccessSize::Doubleword => Self::U64(bits as u64),
-            MemoryAccessSize::Quadword => Self::U128(bits),
-        }
-    }
-
-    pub(super) fn copy_le_bytes(self, destination: &mut [u8]) {
-        let bits = match self {
-            Self::U8(value) => u128::from(value),
-            Self::U16(value) => u128::from(value),
-            Self::U32(value) => u128::from(value),
-            Self::U64(value) => u128::from(value),
-            Self::U128(value) => value,
-        };
-        destination.copy_from_slice(&bits.to_le_bytes()[..destination.len()]);
     }
 }
 
@@ -674,6 +524,23 @@ pub enum DataAccessFaultReason {
     Injected(Box<str>),
 }
 
+impl From<&nixe_memory::MemoryError> for DataAccessFaultReason {
+    fn from(error: &nixe_memory::MemoryError) -> Self {
+        match error {
+            nixe_memory::MemoryError::Unmapped(_) => Self::Unmapped,
+            nixe_memory::MemoryError::PermissionDenied { required, .. } => {
+                if required.contains(nixe_memory::MemoryPermissions::WRITE) {
+                    Self::WritePermissionDenied
+                } else {
+                    Self::ReadPermissionDenied
+                }
+            }
+            nixe_memory::MemoryError::AddressRange { .. } => Self::AddressOverflow,
+            error => Self::HostBacking(error.to_string().into()),
+        }
+    }
+}
+
 /// Precise failure of an interpreter-visible data access.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct DataAccessFault {
@@ -685,21 +552,6 @@ pub struct DataAccessFault {
     pub kind: DataAccessKind,
     /// Structured reason.
     pub reason: DataAccessFaultReason,
-}
-
-/// Policy result for an attributed direct native memory fault.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DirectFaultResolution {
-    /// Host protection and page state have been repaired; retry the exact
-    /// native instruction with its captured host context.
-    Retry,
-    /// Valid access requires typed completion after leaving native execution.
-    /// No device read/write or guest operation has been performed by resolution.
-    Cold,
-    /// Guest-visible invalid access. The raw operation is not completed.
-    Fault(DataAccessFault),
-    /// A CPU-visible eligible mapping faulted despite its published host view.
-    Fatal(Box<str>),
 }
 
 impl DataAccessFault {
@@ -730,71 +582,10 @@ pub enum CacheMaintenanceKind {
     InstructionPrefetch,
 }
 
-/// Engine-facing semantic memory contract shared by every CPU provider.
-pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
-    /// Returns the immutable process-level memory backend selected at binding.
-    fn cpu_memory_backend(&self, _address_space: AddressSpaceId) -> nixe_memory::CpuMemoryBackend {
-        nixe_memory::CpuMemoryBackend::Checked
-    }
-
-    /// Cold diagnostic explaining the immutable backend selection.
-    fn cpu_memory_backend_reason(&self, _address_space: AddressSpaceId) -> Box<str> {
-        "checked backend selected by this memory implementation".into()
-    }
-
-    /// Returns the direct arena bound once for generated code or native stubs.
-    fn direct_address_space_view(
-        &self,
-        _address_space: AddressSpaceId,
-    ) -> Option<nixe_memory::DirectAddressSpaceView> {
-        None
-    }
-
-    /// Stable transition-gate identity used only to validate a direct
-    /// execution lease at a frontend boundary.
-    fn execution_gate_identity(&self) -> Option<usize> {
-        None
-    }
-
-    /// Acquires a fresh mapping-stability proof immediately before native
-    /// direct-memory entry. Checked backends do not need one.
-    fn acquire_execution_lease(&self) -> Option<ExecutionMemoryLease<'_>> {
-        None
-    }
-
-    /// Classifies the complete original subaccess, not the host's first failing
-    /// byte. The caller retains its execution lease and checks guest alignment
-    /// first. Resolution never executes MMIO or the guest operation itself.
-    fn resolve_direct_fault(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        _size: MemoryAccessSize,
-        kind: DataAccessKind,
-    ) -> DirectFaultResolution {
-        DirectFaultResolution::Fault(DataAccessFault::new(
-            address_space,
-            address,
-            kind,
-            DataAccessFaultReason::HostBacking(
-                "memory backend cannot resolve a native direct fault".into(),
-            ),
-        ))
-    }
-
-    /// Resolve an atomic read/write fault without executing the transaction.
-    /// Validate read and write permissions before repairing RAM. The caller
-    /// retains its execution lease and checks natural alignment first.
-    fn resolve_direct_atomic_fault(
-        &self,
-        _address_space: AddressSpaceId,
-        _address: GuestVirtualAddress,
-        _size: MemoryAccessSize,
-    ) -> DirectFaultResolution {
-        DirectFaultResolution::Cold
-    }
-
-    /// Performs one complete architectural read.
+/// Architectural data accesses used by the shared instruction semantics.
+/// Mapping policy and native admission belong to their concrete owners.
+pub trait InstructionMemoryAccess {
+    type Reservation: Copy;
     fn read(
         &self,
         address_space: AddressSpaceId,
@@ -802,7 +593,6 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
         access: MemoryAccess,
     ) -> Result<DataReadResult, DataAccessFault>;
 
-    /// Performs one complete architectural write.
     fn write(
         &self,
         address_space: AddressSpaceId,
@@ -811,10 +601,6 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
         value: MemoryValue,
     ) -> Result<DataWriteResult, DataAccessFault>;
 
-    /// Atomically reads, transforms, and writes one naturally aligned RAM
-    /// scalar. The transaction linearizes by canonical physical identity, so
-    /// every virtual alias and every CPU engine observes one modification
-    /// order. Device atomics require a future explicit device contract.
     fn atomic_read_modify_write(
         &self,
         address_space: AddressSpaceId,
@@ -824,8 +610,6 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
         operand: MemoryValue,
     ) -> Result<AtomicMemoryResult, DataAccessFault>;
 
-    /// Atomically compares the complete scalar bit pattern and conditionally
-    /// replaces it. The returned `previous` value is the architectural result.
     fn atomic_compare_exchange(
         &self,
         address_space: AddressSpaceId,
@@ -835,21 +619,10 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
         replacement: MemoryValue,
     ) -> Result<AtomicMemoryResult, DataAccessFault>;
 
-    /// Applies the host-side ordering required by an architectural barrier.
-    /// Domain and access remain explicit so both CPU backends implement the
-    /// same architectural operation without sharing backend-private code.
     fn memory_barrier(&self, barrier: BarrierOperation) {
         apply_host_memory_barrier(barrier);
     }
 
-    /// Applies one architecturally visible cache-maintenance operation.
-    ///
-    /// Canonical RAM is coherent, so data maintenance reconciles ownership
-    /// rather than modelling a host cache. Instruction invalidation publishes
-    /// through the neutral memory-invalidation stream consumed by every engine.
-    /// Ordinary guest stores deliberately do not invalidate translated code:
-    /// valid A64 self-modifying code makes new instructions visible with an IC
-    /// maintenance operation.
     fn maintain_cache(
         &self,
         address_space: AddressSpaceId,
@@ -857,108 +630,21 @@ pub trait CpuMemory: InstructionMemory + nixe_memory::MemoryInvalidationSource {
         address: Option<GuestVirtualAddress>,
     ) -> Result<(), DataAccessFault>;
 
-    /// Inspect only the page containing `address`, without reading backing or
-    /// coalescing adjacent pages. Single-word access checks must not scan an
-    /// entire heap to discover boundaries they do not consume.
-    fn query_page(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-    ) -> Option<(MemoryRegionKind, MemoryMappingProperties)>;
-
-    /// Queries the maximal contiguous mapping state containing `address`.
-    ///
-    /// `end_exclusive` is supplied by the process address-space policy and
-    /// bounds both mapped and unmapped results.
-    fn query_memory(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        end_exclusive: GuestVirtualAddress,
-    ) -> Option<MemoryQueryResult>;
-
-    /// Loads a value and returns the backend identity required by a local
-    /// exclusive monitor.
     fn load_exclusive(
         &self,
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
         access: MemoryAccess,
-    ) -> Result<(DataReadResult, crate::exclusive::ExclusiveReservation), DataAccessFault>;
+    ) -> Result<(DataReadResult, Self::Reservation), DataAccessFault>;
 
-    /// Store only while the captured physical write version is still valid.
-    /// Intervening writes invalidate the reservation, including ABA.
     fn store_exclusive(
         &self,
         address_space: AddressSpaceId,
         address: GuestVirtualAddress,
         access: MemoryAccess,
         value: MemoryValue,
-        reservation: crate::exclusive::ExclusiveReservation,
+        reservation: Self::Reservation,
     ) -> Result<(DataWriteResult, bool), DataAccessFault>;
-}
-
-/// Runtime-facing mutation contract for a process address space.
-///
-/// Execution engines consume [`CpuMemory`]. Kernel policy receives this
-/// narrower extension only while applying validated mapping operations, which
-/// keeps Horizon concepts out of the CPU crate.
-pub trait ProcessMemory: CpuMemory {
-    /// Copies a checked RAM range into host storage while resolving each
-    /// spanned mapping under one bounded memory transaction.
-    fn read_bytes(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        output: &mut [u8],
-    ) -> Result<(), DataAccessFault>;
-
-    /// Atomically copies host bytes into a completely validated writable RAM
-    /// range and publishes one content mutation per affected physical page.
-    fn write_bytes(
-        &self,
-        address_space: AddressSpaceId,
-        address: GuestVirtualAddress,
-        bytes: &[u8],
-    ) -> Result<(), DataAccessFault>;
-
-    /// Atomically resizes a zero-initialized mapping from its fixed base.
-    fn resize_zeroed_mapping(
-        &self,
-        address_space: AddressSpaceId,
-        start: GuestVirtualAddress,
-        old_size: u64,
-        new_size: u64,
-        permissions: MemoryPermissions,
-        purpose: MemoryMappingPurpose,
-    ) -> Result<(), MemoryMappingError>;
-
-    /// Atomically aliases existing RAM pages at an unmapped destination while
-    /// replacing the source mapping metadata.
-    fn map_alias(&self, request: MemoryAliasRequest) -> Result<(), MemoryAliasError>;
-
-    /// Atomically removes an alias after verifying its physical identity and
-    /// restores the source mapping metadata.
-    fn unmap_alias(&self, request: MemoryAliasRequest) -> Result<(), MemoryAliasError>;
-
-    /// Atomically replaces permissions on a complete page-aligned mapped range.
-    fn set_permissions(
-        &self,
-        address_space: AddressSpaceId,
-        start: GuestVirtualAddress,
-        size: u64,
-        permissions: MemoryPermissions,
-    ) -> Result<(), MemoryProtectionError>;
-
-    /// Atomically updates selected attributes on a mapped page-aligned range.
-    fn set_attributes(
-        &self,
-        address_space: AddressSpaceId,
-        start: GuestVirtualAddress,
-        size: u64,
-        mask: MemoryAttributes,
-        value: MemoryAttributes,
-    ) -> Result<(), MemoryProtectionError>;
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1013,20 +699,6 @@ pub struct MemoryProtectionError {
     pub address_space: AddressSpaceId,
     pub address: GuestVirtualAddress,
     pub reason: MemoryProtectionErrorReason,
-}
-
-/// Callback interface used by synthetic MMIO pages.
-pub trait SyntheticMmio: Send {
-    /// Reads a value at a page-relative byte offset.
-    fn read(&mut self, offset: u64, access: MemoryAccess) -> Result<MemoryValue, Box<str>>;
-
-    /// Writes a value at a page-relative byte offset.
-    fn write(
-        &mut self,
-        offset: u64,
-        access: MemoryAccess,
-        value: MemoryValue,
-    ) -> Result<(), Box<str>>;
 }
 
 #[cfg(test)]

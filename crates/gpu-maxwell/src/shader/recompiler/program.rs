@@ -29,10 +29,10 @@ impl CapturedProgram {
                             .map(|read| {
                                 read.bytes.len()
                             + read.mappings.len() * std::mem::size_of::<crate::MaxwellGpuMapping>()
-                            + std::mem::size_of_val(read.snapshot.segments())
+                            + read.physical.metadata_bytes()
                             // Shared page tracking and mapping references. This
                             // deliberately overcharges tiny capture reads.
-                            + 512 + read.snapshot.pages().count() * 256
+                            + 512
                             })
                             .sum::<usize>()
                 })
@@ -42,15 +42,16 @@ impl CapturedProgram {
     pub fn refresh(
         &self,
         requests: &[(Option<u8>, CaptureRequest)],
-        space: &MaxwellGpuAddressSpace,
+        space: &MaxwellGpuMemory,
         memory: &mut MemoryCache,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<Option<Self>> {
         if requests.len() != self.stages.len() {
             return Ok(None);
         }
         let mut stages = Vec::with_capacity(self.stages.len());
         for (stage, (_, request)) in self.stages.iter().zip(requests) {
-            let Some(stage) = stage.refresh(request, space, memory)? else {
+            let Some(stage) = stage.refresh(request, space, memory, access)? else {
                 return Ok(None);
             };
             stages.push(stage);
@@ -64,10 +65,11 @@ impl CapturedProgram {
 
 pub fn capture_program(
     compiler: &mut Compiler,
-    space: &MaxwellGpuAddressSpace,
+    space: &MaxwellGpuMemory,
     requests: impl IntoIterator<Item = (Option<u8>, CaptureRequest)>,
     configuration: &Configuration,
     memory: &mut MemoryCache,
+    access: &mut nixe_gpu::MemoryAccess<'_>,
 ) -> Result<CapturedProgram> {
     compiler.reset()?;
     let mut stages = Vec::new();
@@ -96,6 +98,7 @@ pub fn capture_program(
             &configuration.host,
             &configuration.settings,
             memory,
+            access,
         )?;
         let mut info = (*captured.info).clone();
         if stage == Stage::VertexA {
@@ -139,17 +142,13 @@ pub fn capture_program(
 
 impl CapturedStage {
     /// A changed location requires a fresh memory proof even for identical code.
-    pub fn request_is_current(
-        &self,
-        request: &CaptureRequest,
-        space: &MaxwellGpuAddressSpace,
-    ) -> bool {
+    pub fn request_is_current(&self, request: &CaptureRequest, space: &MaxwellGpuMemory) -> bool {
         self.address == request.address
             && self.request_metadata == request.metadata
             && self.is_current(space, &request.bindings)
     }
 
-    pub fn memory_is_current(&self, space: &MaxwellGpuAddressSpace) -> bool {
+    pub fn memory_is_current(&self, space: &MaxwellGpuMemory) -> bool {
         self.code_dependencies
             .iter()
             .chain(self.dependencies.iter())
@@ -165,9 +164,12 @@ mod tests {
     fn linked_capture_merges_vertex_metadata_and_replays_after_scratch_reset() {
         let (allocation, space, base) = crate::shader::test_support::mapped_memory();
         for offset in [0, 0x100, 0x200] {
-            allocation
-                .write(offset + 0x50, &0xe300_0000_0007_000fu64.to_le_bytes())
-                .unwrap();
+            crate::test_memory::write(
+                &allocation,
+                offset + 0x50,
+                &0xe300_0000_0007_000fu64.to_le_bytes(),
+            )
+            .unwrap();
         }
         let configuration = Configuration {
             profile: nixe_shader_recompiler::Profile {
@@ -192,7 +194,7 @@ mod tests {
 
         let capture = capture_program(
             &mut compiler,
-            &space,
+            space.memory(),
             [
                 (Some(0), request(0, Stage::VertexA)),
                 (Some(0), request(0x100, Stage::VertexB)),
@@ -200,11 +202,14 @@ mod tests {
             ],
             &configuration,
             &mut MemoryCache::default(),
+            &mut crate::test_memory::access(space.memory().machine()),
         )
         .unwrap();
         assert_eq!(capture.inputs.stages.len(), 3);
-        assert!(capture.stages[0].request_is_current(&request(0, Stage::VertexA), &space));
-        assert!(!capture.stages[0].request_is_current(&request(0x100, Stage::VertexA), &space));
+        assert!(capture.stages[0].request_is_current(&request(0, Stage::VertexA), space.memory()));
+        assert!(
+            !capture.stages[0].request_is_current(&request(0x100, Stage::VertexA), space.memory())
+        );
         compiler.reset().unwrap();
         let output = capture
             .inputs
@@ -217,8 +222,8 @@ mod tests {
             nixe_shader_recompiler::artifact::StageProvenance::MergedVertex
         );
         assert_eq!(output[1].stage, Stage::Fragment);
-        crate::shader::test_support::write_shader_words(&space, &[(base + 0x50, 0)]);
-        assert!(!capture.stages[0].memory_is_current(&space));
-        assert!(capture.stages[1].memory_is_current(&space));
+        crate::shader::test_support::write_shader_words(space.memory(), &[(base + 0x50, 0)]);
+        assert!(!capture.stages[0].is_current(space.memory(), &capture.stages[0].bindings));
+        super::super::tests::refresh_unchanged(&capture.stages[1], space.memory());
     }
 }

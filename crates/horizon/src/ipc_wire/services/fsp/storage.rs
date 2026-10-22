@@ -8,7 +8,7 @@ use crate::ipc_wire::message::{CmifRequest, HipcRequest};
 
 use super::commands::StorageCommand;
 
-pub(super) fn decode(
+pub(super) async fn decode(
     request: &CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
 ) -> Result<Option<IpcRequest>, IpcWireError> {
@@ -77,7 +77,7 @@ mod tests {
             domain: None,
         };
         assert_eq!(
-            decode(&request, &hipc).unwrap(),
+            crate::test_memory::run(decode(&request, &hipc)).unwrap(),
             Some(IpcRequest::ReadStorage {
                 offset: 0,
                 size: size as usize,
@@ -86,7 +86,7 @@ mod tests {
         wire[8..12].copy_from_slice(&16_u32.to_le_bytes());
         let hipc = HipcRequest::decode(&wire).unwrap();
         assert!(matches!(
-            decode(&request, &hipc),
+            crate::test_memory::run(decode(&request, &hipc)),
             Err(IpcWireError::Malformed(_))
         ));
     }

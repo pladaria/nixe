@@ -1343,8 +1343,6 @@ name = "nixe-cpu"
 version = "0.1.0"
 dependencies = [
  "nixe-memory",
- "rustc-hash",
- "smallvec",
 ]
 
 [[package]]
@@ -1352,7 +1350,6 @@ name = "nixe-cpu-direct-memory"
 version = "0.1.0"
 dependencies = [
  "libc",
- "nixe-cpu",
  "nixe-memory",
 ]
 
@@ -1361,7 +1358,6 @@ name = "nixe-cpu-interpreter"
 version = "0.1.0"
 dependencies = [
  "nixe-cpu",
- "nixe-cpu-direct-memory",
  "nixe-memory",
 ]
 
@@ -1507,7 +1503,6 @@ name = "nixe-memory"
 version = "0.1.0"
 dependencies = [
  "libc",
- "rustc-hash",
  "smallvec",
 ]
 
@@ -1519,7 +1514,6 @@ dependencies = [
  "log",
  "nixe-cpu",
  "nixe-cpu-direct-memory",
- "nixe-cpu-interpreter",
  "nixe-cpu-jit",
  "nixe-loader-content",
  "nixe-loader-executable",

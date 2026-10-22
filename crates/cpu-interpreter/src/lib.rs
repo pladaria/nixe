@@ -1,13 +1,8 @@
-//! Direct reference-interpreter backend.
-//!
-//! This crate owns instruction interpretation, the bounded execution loop,
-//! interpreter-local dispatch resources, and its semantic/differential tests.
-//! `nixe-cpu` supplies only reusable architectural frontend primitives.
-
+//! A64 instruction semantics used by native JIT instruction completion.
 mod interpreter;
-mod process;
-
 pub use interpreter::{
-    InstructionStep, InterpreterContext, InterpreterError, execute_one, execute_one_with_context,
+    InstructionStep, InterpreterContext, InterpreterError, execute_one_with_context,
 };
-pub use process::{InterpreterProcess, InterpreterRunRequest, InterpreterThread};
+#[cfg(test)]
+#[path = "../tests/support/memory.rs"]
+mod test_memory;

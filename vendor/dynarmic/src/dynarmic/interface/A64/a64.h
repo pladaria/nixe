@@ -112,6 +112,9 @@ public:
 
     /// Clears exclusive state for this core.
     void ClearExclusiveState();
+    /// Installs an exclusive load completed after Run returned to its owner.
+    /// Host physical metadata is never guest architectural register state.
+    void SetPhysicalExclusiveReservation(u64 address, u64 identity, u64 version, u64 device_version, u8 bytes, Vector expected);
 
     /**
      * Returns true if Jit::Run was called but hasn't returned yet.

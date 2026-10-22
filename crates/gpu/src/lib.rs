@@ -6,6 +6,8 @@
 mod access;
 mod address;
 mod allocation;
+pub mod authority;
+pub mod physical;
 mod working_set;
 pub use working_set::WorkingSet;
 mod color;
@@ -24,7 +26,7 @@ mod execution;
 mod presentation;
 mod resource;
 mod runtime;
-pub use execution::{ExecutionBatch, GpuExecution, PreparedStateId};
+pub use execution::{ExecutionBatch, GpuExecution, MemoryAccess, PreparedStateId};
 mod tessellation;
 pub use tessellation::{
     TessellationControl, TessellationDomain, TessellationMode, TessellationOutput,
@@ -38,10 +40,12 @@ pub use access::{
     AccessDescriptionError, AccessMode, AccessScope, AccessTarget, BufferRange, PipelineStages,
     QueryRange, ResourceAccess, ResourceDependency, ResourceTransition, ResourceUsage,
 };
-pub use address::{GpuVirtualAddress, GpuVirtualAddressError};
+pub use address::{
+    GpuVirtualAddress, GpuVirtualAddressError, MappingGeneration, MappingGenerationExhausted,
+};
 pub use allocation::{
-    AllocationDescriptionError, BackingView, BackingViewError, CanonicalBackingSpan,
-    GpuAllocationDescription, GpuAllocationId,
+    AllocationDescriptionError, BackingView, BackingViewError, GpuAllocationDescription,
+    GpuAllocationId,
 };
 
 pub use command::{
@@ -57,7 +61,6 @@ pub use diagnostics::{
     CpuVirtualAddress, GpfifoEntryIndex, GpuChannelId, GpuClassId, GpuMethodId,
     GraphicsAllocationId, GraphicsGapKind,
 };
-pub use nixe_memory::{CanonicalBackingSegment, MappingGeneration};
 pub use presentation::{
     PresentationImageFormat, PresentationImageId, PresentationImageRequest, PresentationLease,
     PresentationRelease, ResidentImage,
@@ -68,7 +71,7 @@ pub use resource::{
     QueryPoolId, RenderPassId, ResourceDescriptionError, SampleCount, SamplerDescription,
     SamplerId, ShaderId, ShaderStage,
 };
-pub use runtime::{BackendExecutionCompletion, BackendRuntimeError, BackendVisibilityRequester};
+pub use runtime::{BackendExecutionCompletion, BackendRuntimeError};
 pub use submission::{
     BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId, FrontendSubmissionSegment,
 };

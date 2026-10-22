@@ -1,180 +1,42 @@
-//! Runtime-owned concrete CPU backend selection and per-vCPU state.
-
-use std::collections::BTreeMap;
-use std::error::Error;
-use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-
-use crate::GuestCpuState;
-use nixe_cpu::execution::{
-    ArchitecturalTimer, ControlRequest, CpuControl, CpuFault, CpuFaultKind, CpuProcessId,
-    CpuThreadId, MemoryBinding, TimerSnapshot, VcpuEventState,
+//! Runtime ownership of native CPU processes and per-core register contexts.
+use crate::{ExceptionTerminationScope, GuestBreakPayload, GuestCpuState, VirtualClock};
+use nixe_cpu::{
+    execution::{
+        ArchitecturalTimer, ControlRequest, CpuControl, CpuFault, CpuFaultKind, CpuProcessId,
+        TimerSnapshot, VcpuEventState,
+    },
+    location::LocationDescriptor,
+    profile::ProcessCpuContext,
+    state::RegisterContext,
 };
-use nixe_cpu::location::LocationDescriptor;
-use nixe_cpu::memory::ExecutionMemory;
-use nixe_cpu::profile::ProcessCpuContext;
-use nixe_cpu::state::{RegisterContext, ThreadCpuState};
-use nixe_cpu_interpreter::{InterpreterProcess, InterpreterRunRequest, InterpreterThread};
 use nixe_cpu_jit::{JitProcess, JitRunRequest, JitThread};
-use nixe_memory::{GuestVirtualAddress, MemoryInvalidationSource};
-
-use crate::{ExceptionTerminationScope, GuestBreakPayload, VirtualClock};
+use nixe_memory::{AddressSpace, GuestVirtualAddress};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    fmt::{Display, Formatter},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 static NEXT_CPU_PROCESS_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 pub(super) fn allocate_cpu_process_id() -> Option<CpuProcessId> {
     NEXT_CPU_PROCESS_ID
-        .fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |id| id.checked_add(1),
-        )
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .ok()
         .map(CpuProcessId::new)
 }
-
 pub use nixe_cpu::execution::{CpuExit as ExecutionStop, ExecutionReport};
-
 #[derive(Clone, Debug, Default)]
 pub enum CpuBackendConfig {
+    /// The standalone interpreter is excluded from the machine-memory runtime.
     Interpreter,
     #[default]
     Jit,
 }
-
-enum CpuBackend {
-    Interpreter(InterpreterProcess),
-    Jit(Arc<JitProcess>),
-}
-
-impl CpuBackend {
-    fn new(
-        selection: &CpuBackendConfig,
-        cpu: ProcessCpuContext,
-        memory: Arc<ExecutionMemory>,
-        end_exclusive: GuestVirtualAddress,
-        timer_frequency: u64,
-    ) -> Result<Self, CpuFault> {
-        match selection {
-            CpuBackendConfig::Interpreter => {
-                let mut process = InterpreterProcess::new(cpu);
-                process.bind_memory(MemoryBinding {
-                    address_space: cpu.address_space_id(),
-                    end_exclusive,
-                    memory: memory.as_ref(),
-                    mapping_epoch: memory.mapping_epoch().get(),
-                    invalidation_cursor: memory.invalidation_cursor(),
-                })?;
-                Ok(Self::Interpreter(process))
-            }
-            CpuBackendConfig::Jit => JitProcess::new(cpu, memory, timer_frequency)
-                .map(Arc::new)
-                .map(Self::Jit)
-                .map_err(|error| runtime_fault(cpu, CpuFaultKind::Unavailable, error.to_string())),
-        }
-    }
-
-    fn create_thread(&mut self, id: CpuThreadId) -> Result<CpuThread, CpuFault> {
-        match self {
-            Self::Interpreter(process) => process.create_thread(id).map(CpuThread::Interpreter),
-            Self::Jit(process) => JitThread::new(Arc::clone(process))
-                .map(Box::new)
-                .map(CpuThread::Jit)
-                .map_err(|error| jit_boundary_fault(error, None)),
-        }
-    }
-
-    fn request_stop(&mut self) -> Result<(), CpuFault> {
-        match self {
-            Self::Interpreter(process) => process.request_stop(),
-            Self::Jit(process) => process
-                .request_stop()
-                .map_err(|error| jit_boundary_fault(error, None)),
-        }
-    }
-
-    fn shutdown(&mut self) -> Result<(), CpuFault> {
-        match self {
-            Self::Interpreter(process) => process.shutdown(),
-            Self::Jit(process) => match process.try_shutdown() {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(jit_boundary_fault(
-                    "JIT shutdown still has outstanding execution or compilation owners",
-                    None,
-                )),
-                Err(error) => Err(jit_boundary_fault(error, None)),
-            },
-        }
-    }
-
-    const fn name(&self) -> &'static str {
-        match self {
-            Self::Interpreter(_) => "interpreter",
-            Self::Jit(_) => "jit",
-        }
-    }
-}
-
-pub(crate) enum CpuThread {
-    Interpreter(InterpreterThread),
-    // Keep the native engine out of every scheduler command's inline size.
-    Jit(Box<JitThread>),
-}
-
-impl CpuThread {
-    pub(crate) fn synchronize_address_space(
-        &mut self,
-        binding: MemoryBinding<'_>,
-        state: &GuestCpuState,
-    ) -> Result<(), CpuFault> {
-        match self {
-            Self::Interpreter(thread) => thread.synchronize_address_space(binding),
-            Self::Jit(thread) => thread
-                .synchronize_address_space(binding)
-                .map_err(|error| jit_boundary_fault(error, Some(state))),
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn control(&self) -> CpuControl {
-        match self {
-            Self::Interpreter(thread) => thread.control(),
-            Self::Jit(thread) => thread.control(),
-        }
-    }
-
-    pub(crate) fn prepare_shutdown(
-        &mut self,
-        binding: MemoryBinding<'_>,
-        state: Option<&ThreadCpuState>,
-    ) -> Result<(), CpuFault> {
-        match self {
-            Self::Interpreter(thread) => thread.prepare_shutdown(binding),
-            Self::Jit(thread) => {
-                thread
-                    .synchronize_address_space(binding)
-                    .map_err(|error| CpuFault {
-                        backend: "dynarmic",
-                        kind: CpuFaultKind::Internal,
-                        progress: 0,
-                        message: error.to_string().into(),
-                        context: state.map(|state| Box::new(state.register_context())),
-                    })?;
-                thread.clear_local_exclusive_reservation();
-                Ok(())
-            }
-        }
-    }
-
-    pub(crate) fn clear_local_exclusive_reservation(&mut self) {
-        match self {
-            Self::Interpreter(thread) => thread.clear_local_exclusive_reservation(),
-            Self::Jit(thread) => thread.clear_local_exclusive_reservation(),
-        }
-    }
-}
-
+pub(crate) type CpuThread = Box<JitThread>;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ProcessExitCause {
     HostRequested,
@@ -287,267 +149,113 @@ impl Display for ProcessTeardownFailure {
 impl Error for ProcessTeardownFailure {}
 
 pub(crate) struct ProcessExecutionControl {
-    backend: CpuBackend,
+    process: Arc<JitProcess>,
     process_id: CpuProcessId,
     controls: BTreeMap<nixe_scheduler::VirtualCpuId, CpuControl>,
     pub(super) residents: BTreeMap<nixe_scheduler::VirtualCpuId, nixe_scheduler::GuestThreadId>,
-    cpu: ProcessCpuContext,
     virtual_clock: VirtualClock,
     architectural_timer_frequency: u64,
-    address_space_end: GuestVirtualAddress,
     shutdown_complete: bool,
     stopping: bool,
     pending_safepoint: AtomicBool,
-    transition_safepoints: Arc<TransitionSafepoints>,
 }
-
-#[derive(Default)]
-struct TransitionSafepoints {
-    controls: Mutex<BTreeMap<nixe_scheduler::VirtualCpuId, CpuControl>>,
-}
-
-impl TransitionSafepoints {
-    fn register(&self, vcpu: nixe_scheduler::VirtualCpuId, control: CpuControl) {
-        self.lock_controls().insert(vcpu, control);
-    }
-
-    fn clear(&self) {
-        self.lock_controls().clear();
-    }
-
-    fn request(&self) {
-        for control in self
-            .lock_controls()
-            .values()
-            .filter(|control| control.execution_active())
-        {
-            control.request(ControlRequest::Preempt);
-        }
-    }
-
-    fn lock_controls(
-        &self,
-    ) -> std::sync::MutexGuard<'_, BTreeMap<nixe_scheduler::VirtualCpuId, CpuControl>> {
-        self.controls.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-pub(crate) struct CpuThreadTeardownState {
-    memory: Arc<ExecutionMemory>,
-    cpu: ProcessCpuContext,
-    address_space_end: GuestVirtualAddress,
-    state: Option<Box<ThreadCpuState>>,
-}
-
-impl CpuThreadTeardownState {
-    pub(crate) fn prepare(&self, thread: &mut CpuThread) -> Result<(), CpuFault> {
-        thread.prepare_shutdown(self.binding(), self.state.as_deref())
-    }
-
-    fn binding(&self) -> MemoryBinding<'_> {
-        MemoryBinding {
-            address_space: self.cpu.address_space_id(),
-            end_exclusive: self.address_space_end,
-            memory: self.memory.as_ref(),
-            mapping_epoch: self.memory.mapping_epoch().get(),
-            invalidation_cursor: self.memory.invalidation_cursor(),
-        }
-    }
-}
-
 pub(crate) struct ProcessExecutionConfiguration {
     pub(crate) virtual_clock: VirtualClock,
     pub(crate) timer_frequency: u64,
     pub(crate) cpu: ProcessCpuContext,
-    pub(crate) address_space_end: GuestVirtualAddress,
 }
-
 impl ProcessExecutionControl {
     pub(crate) fn new(
         configuration: ProcessExecutionConfiguration,
-        memory: Arc<ExecutionMemory>,
+        space: Arc<AddressSpace>,
         process_id: CpuProcessId,
         selection: &CpuBackendConfig,
     ) -> Result<Self, CpuFault> {
-        let ProcessExecutionConfiguration {
-            virtual_clock,
-            timer_frequency,
-            cpu,
-            address_space_end,
-        } = configuration;
-        let backend = CpuBackend::new(
-            selection,
-            cpu,
-            Arc::clone(&memory),
-            address_space_end,
-            timer_frequency,
-        )?;
-        let transition_safepoints = Arc::new(TransitionSafepoints::default());
-        let weak_safepoints = Arc::downgrade(&transition_safepoints);
-        memory.set_transition_notifier(Some(Arc::new(move || {
-            if let Some(safepoints) = weak_safepoints.upgrade() {
-                safepoints.request();
-            }
-        })));
+        if matches!(selection, CpuBackendConfig::Interpreter) {
+            return Err(jit_boundary_fault(
+                "the legacy interpreter is excluded from this runtime",
+            ));
+        }
+        let process = JitProcess::new(configuration.cpu, space, configuration.timer_frequency)
+            .map_err(jit_boundary_fault)?;
         Ok(Self {
-            backend,
+            process,
             process_id,
             controls: BTreeMap::new(),
             residents: BTreeMap::new(),
-            cpu,
-            virtual_clock,
-            architectural_timer_frequency: timer_frequency,
-            address_space_end,
+            virtual_clock: configuration.virtual_clock,
+            architectural_timer_frequency: configuration.timer_frequency,
             shutdown_complete: false,
             stopping: false,
             pending_safepoint: AtomicBool::new(false),
-            transition_safepoints,
         })
     }
-
     pub(crate) const fn backend_name(&self) -> &'static str {
-        self.backend.name()
+        "jit"
     }
-
     pub(crate) const fn process_id(&self) -> CpuProcessId {
         self.process_id
     }
-
     pub(crate) fn request_vcpu_safepoint(&self, vcpu: nixe_scheduler::VirtualCpuId) {
         if let Some(control) = self.controls.get(&vcpu) {
             control.request(ControlRequest::Preempt);
         }
     }
-
     pub(crate) fn request_safepoint(&self) {
         if self.controls.is_empty() {
             self.pending_safepoint.store(true, Ordering::Release);
-        } else {
-            for control in self.controls.values() {
-                control.request(ControlRequest::Preempt);
-            }
+        }
+        for control in self.controls.values() {
+            control.request(ControlRequest::Preempt);
         }
     }
-
     pub(crate) fn request_stop(&mut self) -> Result<(), CpuFault> {
-        if !self.stopping {
-            self.request_safepoint();
-            self.backend.request_stop()?;
-            self.stopping = true;
-        }
+        self.process.request_stop();
+        self.stopping = true;
         Ok(())
     }
-
     pub(crate) fn shutdown(&mut self) -> Result<(), CpuFault> {
         if self.shutdown_complete {
             return Ok(());
         }
         self.request_stop()?;
-        let result = self.backend.shutdown();
-        if result.is_ok() {
-            self.shutdown_complete = true;
+        if !self.process.try_shutdown().map_err(jit_boundary_fault)? {
+            return Err(jit_boundary_fault("native execution has not stopped"));
         }
-        result
+        self.shutdown_complete = true;
+        Ok(())
     }
-
-    pub(crate) fn request_mapping_safepoint(&self) {
-        for control in self
-            .controls
-            .values()
-            .filter(|control| control.execution_active())
-        {
-            control.request(ControlRequest::Preempt);
-        }
-    }
-
-    pub(crate) fn publish_memory_invalidation(
-        &self,
-        cursor: nixe_memory::MemoryInvalidationCursor,
-    ) {
-        for control in self.controls.values() {
-            control.request_invalidation(cursor.get());
-        }
-    }
-
-    pub(crate) fn memory_invalidation_acknowledged(
-        &self,
-        cursor: nixe_memory::MemoryInvalidationCursor,
-    ) -> bool {
-        let mut controls = self.controls.values();
-        controls.next().is_some_and(|first| {
-            first.acknowledged_invalidation(cursor.get())
-                && controls.all(|control| control.acknowledged_invalidation(cursor.get()))
-        })
-    }
-
     pub(crate) fn create_worker_cpu_thread(
         &mut self,
         vcpu: nixe_scheduler::VirtualCpuId,
     ) -> Result<CpuThread, CpuFault> {
         if self.stopping {
-            return Err(runtime_fault(
-                self.cpu,
-                CpuFaultKind::Unavailable,
-                "CPU backend is stopping",
-            ));
+            return Err(CpuFault {
+                backend: "jit",
+                kind: CpuFaultKind::Unavailable,
+                progress: 0,
+                message: "CPU process is stopping".into(),
+                context: None,
+            });
         }
-        let thread = self
-            .backend
-            .create_thread(CpuThreadId::new(u64::from(vcpu.get()) + 1))?;
+        let thread = Box::new(self.process.create_thread().map_err(jit_boundary_fault)?);
         let control = thread.control();
         if self.pending_safepoint.swap(false, Ordering::AcqRel) {
             control.request(ControlRequest::Preempt);
         }
-        self.transition_safepoints.register(vcpu, control.clone());
         self.controls.insert(vcpu, control);
         Ok(thread)
     }
-
-    pub(crate) fn cpu_thread_teardown_state(
-        &self,
-        memory: Arc<ExecutionMemory>,
-        state: Option<Box<ThreadCpuState>>,
-    ) -> CpuThreadTeardownState {
-        CpuThreadTeardownState {
-            memory,
-            cpu: self.cpu,
-            address_space_end: self.address_space_end,
-            state,
-        }
-    }
-
-    pub(crate) fn complete_cpu_thread_retirement(
-        &mut self,
-        cursor: nixe_memory::MemoryInvalidationCursor,
-    ) -> Result<(), CpuFault> {
-        if self
-            .controls
-            .values()
-            .any(|control| !control.acknowledged_invalidation(cursor.get()))
-        {
-            return Err(runtime_fault(
-                self.cpu,
-                CpuFaultKind::Internal,
-                "CPU thread retirement did not acknowledge the final invalidation cursor",
-            ));
-        }
+    pub(crate) fn complete_cpu_thread_retirement(&mut self) {
         self.controls.clear();
-        self.transition_safepoints.clear();
-        Ok(())
     }
-
-    pub(crate) fn execution_environment(
-        &self,
-    ) -> (VirtualClock, u64, ProcessCpuContext, GuestVirtualAddress) {
+    pub(crate) fn execution_environment(&self) -> (VirtualClock, u64) {
         (
             self.virtual_clock.clone(),
             self.architectural_timer_frequency,
-            self.cpu,
-            self.address_space_end,
         )
     }
 }
-
 impl Drop for ProcessExecutionControl {
     fn drop(&mut self) {
         if !self.shutdown_complete {
@@ -555,121 +263,51 @@ impl Drop for ProcessExecutionControl {
         }
     }
 }
-
-impl crate::exception_dispatch::MemoryMutationControl for ProcessExecutionControl {
-    fn request_mapping_safepoint(&self) {
-        Self::request_mapping_safepoint(self);
-    }
-    fn publish_memory_invalidation(&self, cursor: nixe_memory::MemoryInvalidationCursor) {
-        Self::publish_memory_invalidation(self, cursor);
-    }
-}
-
-fn jit_boundary_fault(message: impl ToString, state: Option<&GuestCpuState>) -> CpuFault {
+fn jit_boundary_fault(message: impl ToString) -> CpuFault {
     CpuFault {
         backend: "jit",
         kind: CpuFaultKind::Internal,
         progress: 0,
         message: message.to_string().into_boxed_str(),
-        context: state.map(|state| Box::new(state.register_context())),
-    }
-}
-
-fn runtime_fault(
-    _cpu: ProcessCpuContext,
-    kind: CpuFaultKind,
-    message: impl Into<Box<str>>,
-) -> CpuFault {
-    CpuFault {
-        backend: "runtime",
-        kind,
-        progress: 0,
-        message: message.into(),
         context: None,
     }
 }
-
 struct RuntimeTimer<'a> {
     clock: &'a VirtualClock,
     frequency: u64,
 }
-
 pub(crate) struct VcpuExecutionState {
     pub(crate) thread: GuestCpuState,
-    pub(crate) cpu: ProcessCpuContext,
-    pub(crate) memory: Arc<ExecutionMemory>,
     pub(crate) virtual_clock: VirtualClock,
     pub(crate) architectural_timer_frequency: u64,
-    pub(crate) address_space_end: GuestVirtualAddress,
     pub(crate) instruction_budget: u64,
     pub(crate) capture_context: bool,
     pub(crate) events: VcpuEventState,
 }
-
 impl VcpuExecutionState {
     pub(crate) fn run(
         &mut self,
         worker: &mut nixe_cpu_direct_memory::NativeWorker,
         thread: &mut CpuThread,
     ) -> Result<ExecutionReport, ProcessExecutionError> {
-        let memory_lease = matches!(thread, CpuThread::Interpreter(_))
-            .then(|| self.memory.acquire_execution_lease());
-        if let Some(error) = self.memory.direct_backend_failure() {
-            return Err(ProcessExecutionError::Cpu {
-                fault: runtime_fault(self.cpu, CpuFaultKind::Internal, error),
-            });
-        }
-        thread
-            .synchronize_address_space(
-                MemoryBinding {
-                    address_space: self.cpu.address_space_id(),
-                    end_exclusive: self.address_space_end,
-                    memory: self.memory.as_ref(),
-                    mapping_epoch: memory_lease.as_ref().map_or_else(
-                        || self.memory.mapping_epoch().get(),
-                        |lease| lease.epoch().get(),
-                    ),
-                    invalidation_cursor: self.memory.invalidation_cursor(),
-                },
-                &self.thread,
-            )
-            .map_err(|fault| ProcessExecutionError::Cpu { fault })?;
         let timer = RuntimeTimer {
             clock: &self.virtual_clock,
             frequency: self.architectural_timer_frequency,
         };
-        let control = thread.control();
-        let _execution = control.enter_execution();
-        let result = match thread {
-            CpuThread::Interpreter(interpreter) => interpreter.run_slice(
+        thread
+            .run_slice(
                 worker,
-                InterpreterRunRequest {
-                    memory: self.memory.as_ref(),
-                    memory_lease,
-                    state: self.thread.saved_mut(),
+                JitRunRequest {
+                    state: &mut self.thread,
                     instruction_budget: self.instruction_budget,
                     timer: &timer,
-                    events: self.events.clone(),
+                    events: &self.events,
+                    capture_context: self.capture_context,
                 },
-            ),
-            CpuThread::Jit(jit) => {
-                drop(memory_lease);
-                jit.run_slice(
-                    worker,
-                    JitRunRequest {
-                        state: &mut self.thread,
-                        instruction_budget: self.instruction_budget,
-                        timer: &timer,
-                        events: &self.events,
-                        capture_context: self.capture_context,
-                    },
-                )
-            }
-        };
-        result.map_err(|fault| ProcessExecutionError::Cpu { fault })
+            )
+            .map_err(|fault| ProcessExecutionError::Cpu { fault })
     }
 }
-
 impl ArchitecturalTimer for RuntimeTimer<'_> {
     fn snapshot(&self) -> TimerSnapshot {
         let ticks = self
@@ -684,34 +322,9 @@ impl ArchitecturalTimer for RuntimeTimer<'_> {
         }
     }
 }
-
 pub(crate) fn current_location(
     cpu: ProcessCpuContext,
     state: &GuestCpuState,
 ) -> LocationDescriptor {
     LocationDescriptor::new(GuestVirtualAddress::new(state.pc()), cpu.profile_id())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn external_transition_requests_preemption_only_from_active_cpu_slices() {
-        let safepoints = TransitionSafepoints::default();
-        let control = CpuControl::default();
-        safepoints.register(nixe_scheduler::VirtualCpuId::new(0), control.clone());
-
-        safepoints.request();
-        assert!(control.take_pending().is_none());
-
-        let execution = control.enter_execution();
-        safepoints.request();
-        assert!(
-            control
-                .take_pending()
-                .is_some_and(|pending| pending.contains(ControlRequest::Preempt))
-        );
-        drop(execution);
-    }
 }

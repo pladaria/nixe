@@ -5,7 +5,6 @@ use crate::cache::*;
 use ash::vk;
 use nixe_gpu::{
     ShaderStage,
-    compilation::Pending,
     shader_module::{self as spirv, ResourceId},
 };
 use rustc_hash::FxHashMap as HashMap;
@@ -164,7 +163,7 @@ struct Texture {
     sampler: Arc<Sampler>,
 }
 pub(crate) struct ScreenRenderer {
-    pipelines: HashMap<(vk::Format, u8), Pending<NativePipeline>>,
+    pipelines: HashMap<(vk::Format, u8), Arc<NativePipeline>>,
     linear: Arc<Sampler>,
     nearest: Arc<Sampler>,
     textures: HashMap<egui::TextureId, Texture>,
@@ -200,7 +199,7 @@ impl ScreenRenderer {
         compiler: &PipelineCompiler,
         format: vk::Format,
         kind: u8,
-    ) -> Result<Option<Arc<NativePipeline>>, VulkanError> {
+    ) -> Result<Arc<NativePipeline>, VulkanError> {
         if let std::collections::hash_map::Entry::Vacant(entry) =
             self.pipelines.entry((format, kind))
         {
@@ -212,10 +211,7 @@ impl ScreenRenderer {
                 .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
             entry.insert(pending);
         }
-        self.pipelines[&(format, kind)]
-            .poll()
-            .map(|result| result.map_err(|e| VulkanError::Compilation(e.to_string().into())))
-            .transpose()
+        Ok(Arc::clone(&self.pipelines[&(format, kind)]))
     }
     pub fn update_textures(
         &mut self,

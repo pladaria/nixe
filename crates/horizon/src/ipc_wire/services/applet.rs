@@ -21,17 +21,17 @@ pub(in crate::ipc_wire) fn applet_requests_self_exit(
         )
 }
 
-pub(in crate::ipc_wire) fn dispatch_applet(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_applet(
+    process: &mut Request,
     session: &AppletSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
-    host_systems: &HostSystems<'_>,
+    host_systems: &HostSystems,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    let video_system = host_systems.video;
+    let video_system = &host_systems.video;
     let application_language = host_systems.application_language;
-    let save_data = host_systems.save_data;
-    let hid = host_systems.hid;
+    let save_data = host_systems.save_data.as_ref();
+    let hid = &host_systems.hid;
     // The startup order, command IDs, input PID/process handle, returned
     // objects, and scalar result layouts implemented below follow libnx:
     // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L112-L333
@@ -157,7 +157,7 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                     applet_data(request.token, &[])
                 }
                 CommonStateGetterCommand::GetEventHandle => {
-                    let handle = match process.handles_mut().insert(session.message_event()) {
+                    let handle = match process.return_handle(session.message_event()) {
                         Ok(handle) => handle,
                         Err(_) => {
                             return Err(IpcWireError::HostResourceExhausted(
@@ -262,7 +262,7 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                         }
                         _ => session.accumulated_suspended_tick_changed_event(),
                     };
-                    let handle = match process.handles_mut().insert(event) {
+                    let handle = match process.return_handle(event) {
                         Ok(handle) => handle,
                         Err(_) => {
                             return Err(IpcWireError::HostResourceExhausted(
@@ -623,13 +623,8 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                         );
                     }
                     let handle = process
-                        .handles_mut()
-                        .insert(session.gpu_error_detected_event())
-                        .map_err(|_| {
-                            IpcWireError::HostResourceExhausted(
-                                "installing the applet GPU-error event handle",
-                            )
-                        })?;
+                        .return_handle(session.gpu_error_detected_event())
+                        .map_err(IpcWireError::Handle)?;
                     Ok((
                         encode_domain_response(
                             request.token,
@@ -735,10 +730,7 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                         );
                     }
-                    let Some(memory) = process
-                        .handles()
-                        .get_as::<TransferMemoryObject>(hipc.copy_handles[0])
-                    else {
+                    let Some(memory) = process.copy_handle::<TransferMemoryObject>(0) else {
                         return applet_error(
                             request.token,
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
@@ -753,7 +745,7 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                     }
                     let id = session
                         .create_transfer_storage(
-                            std::sync::Arc::new(memory.clone()),
+                            memory.clone(),
                             size as usize,
                             request.data[0] != 0,
                         )
@@ -848,11 +840,7 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                             HorizonIpcResult::CMIF_TARGET_NOT_FOUND,
                         );
                     };
-                    let handle = process.handles_mut().insert(event).map_err(|_| {
-                        IpcWireError::HostResourceExhausted(
-                            "installing a library-applet event handle",
-                        )
-                    })?;
+                    let handle = process.return_handle(event).map_err(IpcWireError::Handle)?;
                     Ok((
                         encode_domain_response(
                             request.token,
@@ -934,26 +922,29 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                         );
                     }
-                    let launch =
-                        session
-                            .prepare_library_applet_launch(object_id)
-                            .map_err(|error| match error {
-                                PrepareLibraryAppletLaunchError::AppletNotFound => {
-                                    IpcWireError::Internal(
-                                        "live library-applet accessor lost its launch state",
-                                    )
-                                }
-                                PrepareLibraryAppletLaunchError::StorageBackingMissing => {
-                                    IpcWireError::Internal(
-                                        "library-applet input queue lost retained storage backing",
-                                    )
-                                }
-                                PrepareLibraryAppletLaunchError::AllocationFailed => {
-                                    IpcWireError::HostResourceExhausted(
-                                        "snapshotting library-applet launch inputs",
-                                    )
-                                }
-                            })?;
+                    let launch = session
+                        .prepare_library_applet_launch(object_id)
+                        .await
+                        .map_err(|error| match error {
+                            PrepareLibraryAppletLaunchError::Memory(error) => {
+                                IpcWireError::SystemMemory(error)
+                            }
+                            PrepareLibraryAppletLaunchError::AppletNotFound => {
+                                IpcWireError::Internal(
+                                    "live library-applet accessor lost its launch state",
+                                )
+                            }
+                            PrepareLibraryAppletLaunchError::StorageBackingMissing => {
+                                IpcWireError::Internal(
+                                    "library-applet input queue lost retained storage backing",
+                                )
+                            }
+                            PrepareLibraryAppletLaunchError::AllocationFailed => {
+                                IpcWireError::HostResourceExhausted(
+                                    "snapshotting library-applet launch inputs",
+                                )
+                            }
+                        })?;
                     if launch.applet_id == LibraryAppletId::SoftwareKeyboard {
                         if launch.mode != LibraryAppletMode::AllForeground {
                             return Err(IpcWireError::Malformed(
@@ -985,9 +976,13 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                             config.text_check,
                             config.utf8
                         );
-                        let host = host_systems.keyboard.ok_or(IpcWireError::Malformed(
-                            "software keyboard requires a host window",
-                        ))?;
+                        let host =
+                            host_systems
+                                .keyboard
+                                .as_ref()
+                                .ok_or(IpcWireError::Malformed(
+                                    "software keyboard requires a host window",
+                                ))?;
                         session
                             .start_keyboard(object_id, config, host)
                             .map_err(IpcWireError::Malformed)?;
@@ -1043,7 +1038,15 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                     }
                     session
                         .keyboard_validation(object_id, input_objects[0])
-                        .map_err(IpcWireError::Malformed)?;
+                        .await
+                        .map_err(|error| match error {
+                            crate::object::KeyboardValidationError::Invalid(message) => {
+                                IpcWireError::Malformed(message)
+                            }
+                            crate::object::KeyboardValidationError::Memory(error) => {
+                                IpcWireError::SystemMemory(error)
+                            }
+                        })?;
                     applet_data(request.token, &[])
                 }
                 LibraryAppletAccessorCommand::PushInData => {
@@ -1156,10 +1159,10 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                     }
                     let (address, size) = one_auto_select_input(hipc)?;
                     let mut bytes = vec![0; size];
-                    read_bytes(process, GuestVirtualAddress::new(address), &mut bytes)?;
+                    read_bytes(process, GuestVirtualAddress::new(address), &mut bytes).await?;
                     let offset = request_u64(request.data, 0)
                         .expect("validated IStorageAccessor::Write payload length");
-                    match session.write_storage(storage_id, offset, &bytes) {
+                    match session.write_storage(storage_id, offset, &bytes).await {
                         Ok(()) => applet_data(request.token, &[]),
                         Err(AppletStorageAccessError::NotFound) => {
                             applet_error(request.token, HorizonIpcResult::CMIF_TARGET_NOT_FOUND)
@@ -1169,9 +1172,9 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                             // https://github.com/eden-emulator/mirror/blob/67bada77f8a43a90da2e94e89b8e7da73c256989/src/core/hle/service/am/library_applet_storage.cpp
                             applet_error(request.token, HorizonIpcResult::from_raw(u32::MAX))
                         }
-                        Err(AppletStorageAccessError::BackingFailed) => Err(
-                            IpcWireError::Internal("applet transfer-memory backing access failed"),
-                        ),
+                        Err(AppletStorageAccessError::Memory(error)) => {
+                            Err(IpcWireError::SystemMemory(error))
+                        }
                         Err(AppletStorageAccessError::OutOfRange) => {
                             Err(IpcWireError::UnsupportedService(
                                 UnsupportedServiceOperation::CommandVariant {
@@ -1201,9 +1204,9 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                     let (address, size) = one_auto_select_output(hipc)?;
                     let offset = request_u64(request.data, 0)
                         .expect("validated IStorageAccessor::Read payload length");
-                    match session.read_storage(storage_id, offset, size) {
+                    match session.read_storage(storage_id, offset, size).await {
                         Ok(bytes) => {
-                            write_bytes(process, GuestVirtualAddress::new(address), &bytes)?;
+                            write_bytes(process, GuestVirtualAddress::new(address), &bytes).await?;
                             applet_data(request.token, &[])
                         }
                         Err(AppletStorageAccessError::NotFound) => {
@@ -1214,9 +1217,9 @@ pub(in crate::ipc_wire) fn dispatch_applet(
                             // https://github.com/eden-emulator/mirror/blob/67bada77f8a43a90da2e94e89b8e7da73c256989/src/core/hle/service/am/library_applet_storage.cpp
                             applet_error(request.token, HorizonIpcResult::from_raw(u32::MAX))
                         }
-                        Err(AppletStorageAccessError::BackingFailed) => Err(
-                            IpcWireError::Internal("applet transfer-memory backing access failed"),
-                        ),
+                        Err(AppletStorageAccessError::Memory(error)) => {
+                            Err(IpcWireError::SystemMemory(error))
+                        }
                         Err(AppletStorageAccessError::OutOfRange) => {
                             Err(IpcWireError::UnsupportedService(
                                 UnsupportedServiceOperation::CommandVariant {
@@ -1314,7 +1317,7 @@ mod tests {
 
     #[test]
     fn library_applet_interactive_command_ids_match_the_public_abi() {
-        assert_eq!(LibraryAppletAccessorCommand::decode(102), None);
+        assert!((LibraryAppletAccessorCommand::decode(102)).is_none());
         assert_eq!(
             LibraryAppletAccessorCommand::decode(103),
             Some(LibraryAppletAccessorCommand::PushInteractiveInData)
@@ -1338,7 +1341,7 @@ mod tests {
             RootCommand::decode(100).map(RootCommand::proxy_kind),
             Some(AppletProxyKind::SystemApplet)
         );
-        assert_eq!(RootCommand::decode(200), None);
+        assert!((RootCommand::decode(200)).is_none());
         assert_eq!(
             ProxyCommand::decode(AppletProxyKind::Application, 20)
                 .map(|command| command.child(AppletProxyKind::Application)),
@@ -1349,7 +1352,7 @@ mod tests {
                 .map(|command| command.child(AppletProxyKind::SystemApplet)),
             Some(AppletObject::HomeMenuFunctions)
         );
-        assert_eq!(ProxyCommand::decode(AppletProxyKind::Application, 23), None);
+        assert!((ProxyCommand::decode(AppletProxyKind::Application, 23)).is_none());
     }
 
     #[test]

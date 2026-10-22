@@ -2,14 +2,12 @@ use super::*;
 
 use std::fs;
 
-use nixe_cpu::memory::{
-    CpuMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue, SYNTHETIC_PAGE_SIZE,
-};
-
 use crate::{Launcher, LauncherInput};
 
-fn reference_process_builder() -> ProcessBuilder {
-    ProcessBuilder::default().with_cpu_backend(crate::CpuBackendConfig::Interpreter)
+pub(crate) fn reference_process_builder() -> ProcessBuilder {
+    let machine = nixe_memory::Machine::switch_ram().unwrap();
+    let system = machine.account(nixe_memory::DEFAULT_RAM_BYTES).unwrap();
+    ProcessBuilder::new(machine, system)
 }
 
 struct FixedSupervisorCallDispatcher<F> {
@@ -33,33 +31,29 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
 }
 
 fn replace_entry_instructions(process: &mut RunnableProcess, encodings: &[u32]) {
-    let address_space = process.cpu.address_space_id();
     let entry = GuestVirtualAddress::new(process.entry_module().entry_address());
-    let mapping = process.memory.mapping_info(address_space, entry).unwrap();
-    let alias_page = GuestVirtualAddress::new(0x6000_0000);
-    assert!(
-        std::sync::Arc::get_mut(&mut process.memory)
-            .unwrap()
-            .map_page(
-                address_space,
-                alias_page,
-                mapping.physical_page,
-                MemoryPermissions::READ_WRITE,
-            )
+    write_code(
+        process,
+        entry,
+        &encodings
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>(),
     );
-    let page_offset = entry.get() % SYNTHETIC_PAGE_SIZE as u64;
-    for (index, encoding) in encodings.iter().copied().enumerate() {
-        let instruction_offset = u64::try_from(index).unwrap() * 4;
-        process
-            .memory
-            .write(
-                address_space,
-                GuestVirtualAddress::new(alias_page.get() + page_offset + instruction_offset),
-                MemoryAccess::normal(MemoryAccessSize::Word),
-                MemoryValue::U32(encoding),
-            )
-            .unwrap();
-    }
+}
+
+fn write_code(process: &RunnableProcess, address: GuestVirtualAddress, bytes: &[u8]) {
+    let ranges = process
+        .memory
+        .space()
+        .capture(address, bytes.len() as u64, MemoryPermissions::EXECUTE)
+        .unwrap();
+    process
+        .memory
+        .account()
+        .machine()
+        .write_resolved(&ranges, bytes)
+        .unwrap();
 }
 
 fn replace_entry_instruction(process: &mut RunnableProcess, encoding: u32) {
@@ -118,10 +112,9 @@ fn unsynchronized_cpu_failure_discards_state_and_allows_retirement() {
         process.lifecycle(),
         nixe_scheduler::ProcessLifecycle::Faulted
     );
-    process
-        .cpu_thread_teardown_state()
-        .prepare(&mut cpu)
-        .unwrap();
+    cpu.clear_local_exclusive_reservation();
+    drop(cpu);
+    process.complete_cpu_thread_retirement();
 }
 
 #[test]
@@ -166,29 +159,6 @@ fn panicked_worker_does_not_restore_an_incoming_snapshot() {
     );
 }
 
-#[test]
-fn runtime_mapping_mutation_requires_backend_acknowledgement_before_reentry() {
-    let (_directory, plan) = plan();
-    let mut process = reference_process_builder().build(&plan).unwrap();
-    let heap = process.memory_layout().heap();
-    process
-        .resize_memory_mapping(
-            heap.base(),
-            0,
-            SYNTHETIC_PAGE_SIZE as u64,
-            MemoryPermissions::READ_WRITE,
-            MemoryMappingPurpose::Heap,
-        )
-        .unwrap();
-    let cursor = process.memory.invalidation_cursor();
-    assert!(!process.memory_invalidation_acknowledged(cursor));
-    assert_eq!(
-        process.run(0).unwrap().stop,
-        crate::ExecutionStop::BudgetExhausted
-    );
-    assert!(process.memory_invalidation_acknowledged(cursor));
-}
-
 fn synthetic_nro() -> Vec<u8> {
     let mut bytes = vec![0; 0x2800];
     bytes[..4].copy_from_slice(&0x1400_0020_u32.to_le_bytes()); // B entry + 0x80
@@ -219,7 +189,7 @@ pub(crate) fn synthetic_process_for_coordinator(process_id: u64) -> RunnableProc
     reference_process_builder()
         .with_config(ProcessBuildConfig {
             process_id,
-            address_space_id: AddressSpaceId::new(process_id),
+
             ..ProcessBuildConfig::default()
         })
         .build(&plan)
@@ -265,12 +235,11 @@ pub(crate) fn synthetic_backend_instruction_process(
     let path = directory.path().join("memory-loop.nro");
     fs::write(&path, bytes).unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    ProcessBuilder::default()
+    reference_process_builder()
         .with_cpu_backend(backend)
-        .with_memory_backend(nixe_memory::DirectBackendPolicy::Required)
         .with_config(ProcessBuildConfig {
             process_id,
-            address_space_id: AddressSpaceId::new(process_id),
+
             ..ProcessBuildConfig::default()
         })
         .build(&plan)
@@ -278,3 +247,27 @@ pub(crate) fn synthetic_backend_instruction_process(
 }
 
 mod run;
+
+#[test]
+fn dropping_a_process_closes_its_memory_and_handles_while_stopped_native_registers_survive() {
+    let mut process = synthetic_svc_process_for_coordinator(1);
+    let memory = std::sync::Arc::clone(process.memory());
+    let handles = std::sync::Arc::clone(process.handles());
+    let report = process.run(100).unwrap();
+    assert!(matches!(
+        report.stop,
+        crate::ExecutionStop::SupervisorCall { .. }
+    ));
+    let state = process.main_thread_mut().take_state().unwrap();
+    assert!(state.is_resident());
+    assert!(memory.account().used_bytes() != 0);
+    drop(process);
+    assert_eq!(memory.account().used_bytes(), 0);
+    assert_eq!(memory.account().machine().statistics().allocated_bytes, 0);
+    assert!(handles.is_empty());
+    assert_eq!(
+        handles.insert(crate::EventObject::new()),
+        Err(crate::HandleError::Closed)
+    );
+    assert_eq!(state.register_context(), report.context.unwrap());
+}

@@ -1,7 +1,7 @@
 //! `IFile` wire command decoding.
 
+use crate::ipc_wire::request::Request;
 use nixe_memory::GuestVirtualAddress;
-use nixe_runtime::ExceptionProcessContext;
 
 use crate::ipc_wire::buffer::{one_receive_buffer, one_send_buffer};
 use crate::ipc_wire::io::{read_bytes, request_u32, request_u64};
@@ -11,8 +11,8 @@ use crate::{IpcRequest, MAX_IPC_READ_BYTES, SemanticIpcObject};
 
 use super::commands::FileCommand;
 
-pub(super) fn decode(
-    process: &ExceptionProcessContext<'_>,
+pub(super) async fn decode(
+    process: &Request,
     object: &SemanticIpcObject,
     request: &CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -81,7 +81,8 @@ pub(super) fn decode(
                 process,
                 GuestVirtualAddress::new(descriptor.address),
                 &mut data,
-            )?;
+            )
+            .await?;
             Ok(Some(IpcRequest::WriteFile {
                 offset,
                 data,

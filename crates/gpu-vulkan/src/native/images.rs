@@ -119,12 +119,24 @@ impl NativeGpuExecution {
         } // Interpretation lookup only; prepared GPU leases stay valid.
         let format = format(guest.description.format());
         let extent = guest.description.extent();
-        let mut backings = Vec::new();
+        let mut geometry = Vec::new();
         let mut planes = Vec::new();
         let mut offset = 0;
         let [bw, bh] = guest.description.format().block_extent();
         for p in guest.planes.iter() {
-            backings.push(p.backing.clone());
+            let nixe_gpu::physical::WriteDomain::Image(mut physical) = p.footprint.domain() else {
+                return Err(VulkanError::InvalidResource(
+                    "native image plane requires physical image geometry",
+                ));
+            };
+            physical.native_base = offset;
+            geometry.push(
+                nixe_gpu::physical::Footprint::new(
+                    Arc::clone(p.footprint.mapping()),
+                    nixe_gpu::physical::WriteDomain::Image(physical),
+                )
+                .map_err(VulkanError::from)?,
+            );
             let mip = guest.description.mip_extent(p.mip_level as u8).unwrap();
             planes.push(ImagePlane {
                 offset,
@@ -147,10 +159,19 @@ impl NativeGpuExecution {
                 },
                 bytes_per_block: p.bytes_per_block,
             });
-            offset += p.backing.size();
+            offset = offset
+                .checked_add(
+                    physical
+                        .native_row_pitch
+                        .checked_mul(u64::from(physical.rows))
+                        .ok_or(VulkanError::InvalidResource(
+                            "native image plane size overflows",
+                        ))?,
+                )
+                .ok_or(VulkanError::InvalidResource(
+                    "native image plane offset overflows",
+                ))?;
         }
-        let backing = nixe_memory::CanonicalBackingRange::concatenate(backings)
-            .map_err(|e| VulkanError::CanonicalMemory(e.to_string().into()))?;
         let mut usage = vk::ImageUsageFlags::SAMPLED;
         if bw == 1 && bh == 1 {
             usage |= if guest.description.format().is_depth_stencil() {
@@ -183,20 +204,20 @@ impl NativeGpuExecution {
         };
         let image = if guest.description.samples() != SampleCount::One {
             self.residency.multisample_image_for(
-                backing,
+                geometry,
                 description,
                 planes.clone(),
                 guest.sample_grid,
             )?
         } else if guest.canonical_texels && bw == 1 && bh == 1 {
             self.residency
-                .image_for_deferred_import(backing, description, planes.clone())?
+                .image_for_deferred_import(geometry, description, planes.clone())?
         } else if guest.canonical_texels {
             self.residency
-                .sampled_image_for(backing, description, planes.clone())?
+                .sampled_image_for(geometry, description, planes.clone())?
         } else {
             self.residency
-                .image_for_device_write(backing, description, planes.clone())?
+                .image_for_device_write(geometry, description, planes.clone())?
         };
         let entry = self.residency.image(image)?;
         let result = Arc::new(GuestNativeImage {
@@ -306,7 +327,7 @@ impl NativeGpuExecution {
                         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER,
                     )?,
                     offset: 0,
-                    size: backing.size(),
+                    size: backing.bytes(),
                 },
                 GuestBinding::Image { image, arrayed } => {
                     Binding::Image(self.view(image, *arrayed)?)
@@ -526,10 +547,7 @@ impl NativeGpuExecution {
         if let Some((first, step)) = sampling {
             let view = self.view(source, false)?;
             let destination = self.image(destination)?;
-            let pipeline = self.affine_pipelines[&destination.format]
-                .poll()
-                .expect("prepared affine pipeline")
-                .map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
+            let pipeline = Arc::clone(&self.affine_pipelines[&destination.format]);
             self.residency.affine_blit(
                 pipeline,
                 view,
@@ -630,6 +648,7 @@ mod tests {
         };
         let validation = device.validation_monitor();
         let mut execution = NativeGpuExecution::new(
+            nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
             device,
             ShaderNamespace {
                 guest: *b"nixe-native-test",
@@ -639,7 +658,7 @@ mod tests {
             8 * 1024 * 1024,
         )
         .unwrap();
-        let (_, backing) = backing_allocation(4096, 4096, 0);
+        let (_allocation, backing) = backing_allocation(&execution.residency, 4096, 4096, 0);
         let guest = GuestImage {
             description: nixe_gpu::ImageDescription::new(
                 ImageDimension::Two,
@@ -658,7 +677,12 @@ mod tests {
                 mip_level: 0,
                 array_layer: 0,
                 aspect: nixe_gpu::native::GuestImageAspect::Color,
-                backing: backing.snapshot_subrange(0, 4).unwrap(),
+                footprint: crate::residency::tests::plane_geometry(
+                    backing.slice(0, 4).unwrap(),
+                    [1, 1],
+                    4,
+                    4,
+                ),
                 row_pitch: 4,
                 bytes_per_block: 4,
             }]),

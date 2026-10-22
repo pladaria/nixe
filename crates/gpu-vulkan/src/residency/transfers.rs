@@ -67,7 +67,7 @@ impl VulkanResidency {
                 "native fill requires a four-byte aligned interval; byte masks require a conversion helper",
             ));
         }
-        self.prepare_write(Resource::Buffer(id), offset, size)?;
+        let writer = self.prepare_write(Resource::Buffer(id), offset, size)?;
         let buffer = self.buffer_access_range(
             id,
             offset,
@@ -79,16 +79,16 @@ impl VulkanResidency {
         )?;
         let index = self.device.begin_recording()?;
         self.barriers.emit(&mut self.device);
-        unsafe {
-            self.device.dispatch.cmd_fill_buffer(
-                self.device.submission.slots[index].command,
+        self.publish_effect(&[writer], |device| unsafe {
+            device.dispatch.cmd_fill_buffer(
+                device.submission.slots[index].command,
                 buffer,
                 offset,
                 size,
                 value,
             );
-        }
-        self.record_authority(Resource::Buffer(id), offset, size)?;
+        })?;
+        self.finish_buffer_write(id, offset, size)?;
         self.device.work_ticket()
     }
     pub(super) fn checked_image_rect(
@@ -144,41 +144,12 @@ impl VulkanResidency {
         normalize(&mut intervals);
         intervals
     }
-    pub(super) fn canonical_image_rect_bytes(
-        &self,
-        id: ImageId,
-        p: ImagePlane,
-        rect: vk::Rect2D,
-    ) -> Result<Vec<(u64, u64)>, VulkanError> {
-        let p = self.image(id)?.storage_plane(p);
-        let rect = self.image(id)?.storage_rect(rect);
-        if p.aspect == vk::ImageAspectFlags::DEPTH
-            && matches!(
-                self.image(id)?.description.format,
-                vk::Format::D24_UNORM_S8_UINT | vk::Format::X8_D24_UNORM_PACK32
-            )
-        {
-            // Vulkan's D24 transfer element has an unused high byte. It is not
-            // a depth producer and must not overwrite a canonical padding or
-            // independently authored stencil byte with unspecified copy data.
-            // https://docs.vulkan.org/refpages/latest/refpages/source/VkFormat.html
-            let mut ranges = Vec::with_capacity((rect.extent.width * rect.extent.height) as usize);
-            for y in rect.offset.y as u32..rect.offset.y as u32 + rect.extent.height {
-                for x in rect.offset.x as u32..rect.offset.x as u32 + rect.extent.width {
-                    ranges.push((p.offset + u64::from(y) * p.row_pitch + u64::from(x) * 4, 3));
-                }
-            }
-            Ok(ranges)
-        } else {
-            Ok(Self::image_rect_bytes(p, rect))
-        }
-    }
     pub(super) fn prepare_image_rect(
         &mut self,
         id: ImageId,
         p: ImagePlane,
         rect: vk::Rect2D,
-    ) -> Result<(), VulkanError> {
+    ) -> Result<WriterId, VulkanError> {
         if self.image(id)?.decoded.is_some() {
             return Err(VulkanError::InvalidResource(
                 "decoded compressed textures are read-only; writes require the encoded canonical representation",
@@ -198,7 +169,48 @@ impl VulkanResidency {
         p: ImagePlane,
         rect: vk::Rect2D,
     ) -> Result<(), VulkanError> {
-        self.publish_image_write(id, p, rect)?;
+        for (offset, bytes) in Self::image_rect_bytes(
+            self.image(id)?.storage_plane(p),
+            self.image(id)?.storage_rect(rect),
+        ) {
+            self.contents_mut(Resource::Image(id))
+                .validate_interval(offset, bytes);
+        }
+        let full = self.image(id)?.planes.len() == 1 && rect == full_rect(p);
+        if full {
+            if self
+                .image(id)?
+                .contents
+                .geometry
+                .iter()
+                .all(|f| f.mapping().is_injective())
+                && self
+                    .image(id)?
+                    .contents
+                    .device
+                    .iter()
+                    .any(ResourceObservation::is_invalid)
+            {
+                let geometry = self.image(id)?.contents.geometry.clone();
+                let observed = geometry
+                    .into_iter()
+                    .map(|f| self.authority.observe_native(Resource::Image(id), f))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.images[id.slot]
+                    .entry
+                    .as_mut()
+                    .expect("image")
+                    .contents
+                    .device = observed;
+            }
+            self.images[id.slot]
+                .entry
+                .as_mut()
+                .expect("image")
+                .contents
+                .cpu
+                .clear();
+        }
         self.define_image_rect(id, p, rect);
         self.advance_image_producer(id)
     }
@@ -295,7 +307,7 @@ impl VulkanResidency {
             ));
         }
         let rect = full_rect(p);
-        self.prepare_image_rect(id, p, rect)?;
+        let writer = self.prepare_image_rect(id, p, rect)?;
         let (image, layout) = self.image_access_subresources(
             id,
             plane_range(p),
@@ -307,15 +319,15 @@ impl VulkanResidency {
         )?;
         self.barriers.emit(&mut self.device);
         let index = self.device.begin_recording()?;
-        unsafe {
-            self.device.dispatch.cmd_clear_color_image(
-                self.device.submission.slots[index].command,
+        self.publish_effect(&[writer], |device| unsafe {
+            device.dispatch.cmd_clear_color_image(
+                device.submission.slots[index].command,
                 image,
                 layout,
                 &value,
                 &[plane_range(p)],
             );
-        }
+        })?;
         self.finish_image_rect(id, p, rect)?;
         self.device.work_ticket()
     }
@@ -347,7 +359,7 @@ impl VulkanResidency {
             ));
         }
         let rect = full_rect(p);
-        self.prepare_image_rect(id, p, rect)?;
+        let writer = self.prepare_image_rect(id, p, rect)?;
         let (image, layout) = self.image_access_subresources(
             id,
             plane_range(p),
@@ -359,9 +371,9 @@ impl VulkanResidency {
         )?;
         self.barriers.emit(&mut self.device);
         let index = self.device.begin_recording()?;
-        unsafe {
-            self.device.dispatch.cmd_clear_depth_stencil_image(
-                self.device.submission.slots[index].command,
+        self.publish_effect(&[writer], |device| unsafe {
+            device.dispatch.cmd_clear_depth_stencil_image(
+                device.submission.slots[index].command,
                 image,
                 layout,
                 // Vulkan validates depth even when only stencil is selected.
@@ -376,7 +388,7 @@ impl VulkanResidency {
                 },
                 &[plane_range(p)],
             );
-        }
+        })?;
         self.finish_image_rect(id, p, rect)?;
         self.device.work_ticket()
     }
@@ -411,7 +423,7 @@ impl VulkanResidency {
             ));
         }
         self.ensure_image_initialized(source, src, source_rect)?;
-        self.prepare_image_rect(destination, dst, rect)?;
+        let writer = self.prepare_image_rect(destination, dst, rect)?;
         let (source, source_layout) = self.image_access_subresources(
             source,
             plane_range(src),
@@ -450,16 +462,16 @@ impl VulkanResidency {
             });
         self.barriers.emit(&mut self.device);
         let slot = self.device.begin_recording()?;
-        unsafe {
-            self.device.dispatch.cmd_resolve_image(
-                self.device.submission.slots[slot].command,
+        self.publish_effect(&[writer], |device| unsafe {
+            device.dispatch.cmd_resolve_image(
+                device.submission.slots[slot].command,
                 source,
                 source_layout,
                 destination_handle,
                 destination_layout,
                 &[region],
             );
-        }
+        })?;
         self.finish_image_rect(destination, dst, rect)?;
         self.device.work_ticket()
     }
@@ -492,7 +504,7 @@ impl VulkanResidency {
             && src.mip_level == dst.mip_level
             && src.array_layer == dst.array_layer
         {
-            self.prepare_image_rect(destination, dst, rect)?;
+            let writer = self.prepare_image_rect(destination, dst, rect)?;
             let row_bytes = u64::from(source_rect.extent.width.div_ceil(src.block_extent.width))
                 * u64::from(src.bytes_per_block);
             let size =
@@ -551,21 +563,21 @@ impl VulkanResidency {
                     z: 0,
                 })
                 .image_extent(extent);
-            unsafe {
-                self.device.dispatch.cmd_copy_buffer_to_image(
+            self.publish_effect(&[writer], |device| unsafe {
+                device.dispatch.cmd_copy_buffer_to_image(
                     command,
                     scratch.handle,
                     handle,
                     write_layout,
                     &[region],
                 );
-            }
+            })?;
             let work = self.device.work_ticket()?;
             self.device.retire_buffer(scratch, work)?;
             self.finish_image_rect(destination, dst, rect)?;
             return Ok(work);
         }
-        self.prepare_image_rect(destination, dst, rect)?;
+        let writer = self.prepare_image_rect(destination, dst, rect)?;
         let (source_handle, source_layout) = self.image_access_subresources(
             source,
             plane_range(src),
@@ -604,16 +616,16 @@ impl VulkanResidency {
             });
         self.barriers.emit(&mut self.device);
         let index = self.device.begin_recording()?;
-        unsafe {
-            self.device.dispatch.cmd_copy_image(
-                self.device.submission.slots[index].command,
+        self.publish_effect(&[writer], |device| unsafe {
+            device.dispatch.cmd_copy_image(
+                device.submission.slots[index].command,
                 source_handle,
                 source_layout,
                 destination_handle,
                 destination_layout,
                 &[region],
             );
-        }
+        })?;
         self.finish_image_rect(destination, dst, rect)?;
         self.device.work_ticket()
     }

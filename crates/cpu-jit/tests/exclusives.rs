@@ -3,21 +3,17 @@
 //! https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/STXR--Store-Exclusive-Register-
 
 use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState};
-use nixe_cpu::memory::{
-    CpuMemory, ExecutionMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue,
-    ProcessMemory,
-};
+use nixe_cpu::memory::MemoryAccessSize;
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
 use nixe_cpu_jit::{JitProcess, JitRunRequest, JitThread, ThreadState};
 use nixe_memory::{
-    AddressSpaceId, CanonicalCpuWriteDependency, CanonicalRangeTranslator, DirectBackendPolicy,
-    GuestPhysicalPageId, GuestVirtualAddress,
+    AddressSpace, AddressWidth, AllocationRange, GuestVirtualAddress, Machine, MemoryPermissions,
+    PAGE_SIZE,
 };
 use std::sync::Arc;
 
-const SPACE: AddressSpaceId = AddressSpaceId::new(4);
 const DATA: GuestVirtualAddress = GuestVirtualAddress::new(0x3000);
 const ALIAS: GuestVirtualAddress = GuestVirtualAddress::new(0x5000);
 struct Timer;
@@ -32,46 +28,45 @@ impl ArchitecturalTimer for Timer {
 fn x(i: u8) -> A64Register {
     A64Register::General(A64GeneralRegister::new(i).unwrap())
 }
-fn fixture(code: &[u32]) -> (Arc<ExecutionMemory>, Arc<JitProcess>) {
-    let mut memory = ExecutionMemory::new();
-    for id in [1, 2] {
-        assert!(memory.add_ram_page(GuestPhysicalPageId::new(id)));
-    }
+fn fixture(code: &[u32]) -> (Arc<AddressSpace>, Arc<JitProcess>) {
+    let machine = Machine::new(2 * PAGE_SIZE).unwrap();
+    let account = machine.account(2 * PAGE_SIZE).unwrap();
+    let executable = account.allocate(PAGE_SIZE).unwrap();
+    let data = account.allocate(PAGE_SIZE).unwrap();
+    let bytes: Vec<_> = code.iter().flat_map(|word| word.to_le_bytes()).collect();
+    machine
+        .write_resolved(
+            &[AllocationRange::new(executable.pin(), 0, bytes.len() as u64).unwrap()],
+            &bytes,
+        )
+        .unwrap();
+    let memory = AddressSpace::new(machine, AddressWidth::Bits32).unwrap();
     memory
-        .initialize_ram(
-            GuestPhysicalPageId::new(1),
+        .map(
+            GuestVirtualAddress::new(0x1000),
+            executable,
             0,
-            &code
-                .iter()
-                .copied()
-                .flat_map(u32::to_le_bytes)
-                .collect::<Vec<_>>(),
+            PAGE_SIZE,
+            MemoryPermissions::READ_EXECUTE,
         )
         .unwrap();
-    for (address, id, permissions) in [
-        (0x1000, 1, MemoryPermissions::READ_EXECUTE),
-        (DATA.get(), 2, MemoryPermissions::READ_WRITE),
-        (ALIAS.get(), 2, MemoryPermissions::READ_WRITE),
-    ] {
-        assert!(memory.map_page(
-            SPACE,
-            GuestVirtualAddress::new(address),
-            GuestPhysicalPageId::new(id),
-            permissions
-        ));
+    for address in [DATA, ALIAS] {
+        memory
+            .map(
+                address,
+                data.clone(),
+                0,
+                PAGE_SIZE,
+                MemoryPermissions::READ_WRITE,
+            )
+            .unwrap();
     }
-    memory
-        .bind_cpu_memory_backend(SPACE, 0x10000, DirectBackendPolicy::Required)
-        .unwrap();
-    let memory = Arc::new(memory);
-    let process = Arc::new(
-        JitProcess::new(
-            ProcessCpuContext::for_platform(TargetPlatform::Switch1, SPACE),
-            memory.clone(),
-            19_200_000,
-        )
-        .unwrap(),
-    );
+    let process = JitProcess::new(
+        ProcessCpuContext::for_platform(TargetPlatform::Switch1, memory.identity()),
+        memory.clone(),
+        19_200_000,
+    )
+    .unwrap();
     (memory, process)
 }
 fn state() -> ThreadState {
@@ -119,16 +114,16 @@ fn every_scalar_width_and_acquire_release_use_physical_alias_reservations() {
         let (memory, process) = fixture(&[load, store, 0xd4000001]);
         let mut state = state();
         assert!(matches!(
-            run(&mut JitThread::new(process).unwrap(), &mut state),
+            run(&mut process.create_thread().unwrap(), &mut state),
             CpuExit::SupervisorCall { .. }
         ));
         assert_eq!(state.read_x(x(3)), 0);
         assert_eq!(
             memory
-                .read(SPACE, DATA, MemoryAccess::normal(size))
+                .read_value(DATA, size.bytes())
                 .unwrap()
-                .value
-                .bits(),
+                .into_ready()
+                .unwrap(),
             7
         );
     }
@@ -153,16 +148,16 @@ fn paired_exclusives_preserve_both_lanes() {
         let (memory, process) = fixture(&[load, store, 0xd4000001]);
         let mut state = state();
         assert!(matches!(
-            run(&mut JitThread::new(process).unwrap(), &mut state),
+            run(&mut process.create_thread().unwrap(), &mut state),
             CpuExit::SupervisorCall { .. }
         ));
         assert_eq!(state.read_x(x(4)), 0);
         assert_eq!(
             memory
-                .read(SPACE, DATA, MemoryAccess::normal(size))
+                .read_value(DATA, size.bytes())
                 .unwrap()
-                .value
-                .bits(),
+                .into_ready()
+                .unwrap(),
             expected
         );
     }
@@ -172,51 +167,83 @@ fn paired_exclusives_preserve_both_lanes() {
 fn paired_exclusive_read_preserves_readonly_observation() {
     let (memory, process) = fixture(&[0xc87f0c22, 0xd4000001]);
     memory
-        .write(
-            SPACE,
-            DATA,
-            MemoryAccess::normal(MemoryAccessSize::Quadword),
-            MemoryValue::U128((9_u128 << 64) | 7),
-        )
+        .write_value(DATA, MemoryAccessSize::Quadword.bytes(), (9_u128 << 64) | 7)
+        .unwrap()
+        .into_ready()
         .unwrap();
     memory
-        .set_permissions(SPACE, DATA, 4096, MemoryPermissions::READ)
+        .protect(DATA, PAGE_SIZE, MemoryPermissions::READ)
         .unwrap();
-    let range = memory
-        .translate_canonical_range(SPACE, DATA, 16, MemoryPermissions::READ)
+    let range = memory.capture(DATA, 16, MemoryPermissions::READ).unwrap();
+    let dependency = nixe_memory::Observation::default();
+    memory
+        .machine()
+        .access_captured(
+            &range,
+            nixe_memory::AccessOperation::ReadObserved(dependency.clone()),
+        )
+        .unwrap()
+        .into_ready()
         .unwrap();
-    let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
     let mut state = state();
     assert!(matches!(
-        run(&mut JitThread::new(process).unwrap(), &mut state),
+        run(&mut process.create_thread().unwrap(), &mut state),
         CpuExit::SupervisorCall { .. }
     ));
     assert_eq!(state.read_x(x(2)), 7);
     assert_eq!(state.read_x(x(3)), 9);
-    assert!(dependency.remains_current());
+    assert!(!dependency.is_invalid());
 }
 
 #[test]
-fn generated_ordinary_alias_writes_invalidate_aba_and_same_value_reservations() {
-    for middle in [vec![0xf9000085, 0xf9000080], vec![0xf9000080]] {
+fn ordinary_alias_writes_use_expected_value_cas_without_store_instrumentation() {
+    // Eden's normal stores do not update the exclusive monitor. A changed
+    // observed value must fail, while same-value/ABA may commit by host CAS.
+    for (middle, status, final_value) in [
+        (vec![0xf9000085], 1, 9),
+        (vec![0xf9000085, 0xf9000080], 0, 11),
+        (vec![0xf9000080], 0, 11),
+    ] {
         let mut code = vec![0xc85f7c22];
         code.extend(middle);
-        code.extend([0xc8037c20, 0xd4000001]);
+        code.extend([0xc8037c26, 0xd4000001]); // STXR W3, X6, [X1]
         let (memory, process) = fixture(&code);
         memory
-            .write(
-                SPACE,
-                DATA,
-                MemoryAccess::normal(MemoryAccessSize::Doubleword),
-                MemoryValue::U64(7),
-            )
+            .write_value(DATA, 8, 7)
+            .unwrap()
+            .into_ready()
             .unwrap();
         let mut state = state();
+        state.write_x(x(6), 11);
         assert!(matches!(
-            run(&mut JitThread::new(process).unwrap(), &mut state),
+            run(&mut process.create_thread().unwrap(), &mut state),
             CpuExit::SupervisorCall { .. }
         ));
-        assert_eq!(state.read_x(x(3)), 1);
+        assert_eq!(state.read_x(x(3)), status);
+        assert_eq!(
+            memory.read_value(DATA, 8).unwrap().into_ready().unwrap(),
+            final_value
+        );
+    }
+}
+
+#[test]
+fn every_native_exclusive_width_rejects_a_changed_value_from_a_plain_alias_store() {
+    for (load, ordinary, store, status) in [
+        (0x085f7c22, 0x39000085, 0x08037c20, 3),
+        (0x485f7c22, 0x79000085, 0x48037c20, 3),
+        (0x885f7c22, 0xb9000085, 0x88037c20, 3),
+        (0xc85f7c22, 0xf9000085, 0xc8037c20, 3),
+        (0xc87f0c22, 0xf9000085, 0xc8241420, 4),
+    ] {
+        let (memory, process) = fixture(&[load, ordinary, store, 0xd4000001]);
+        let mut state = state();
+        assert!(matches!(
+            run(&mut process.create_thread().unwrap(), &mut state),
+            CpuExit::SupervisorCall { .. }
+        ));
+        assert_eq!(state.read_x(x(status)), 1);
+        assert_eq!(memory.read_value(DATA, 8).unwrap().into_ready().unwrap(), 9);
     }
 }
 
@@ -228,11 +255,18 @@ fn clrex_and_context_switch_clear_the_local_reservation() {
         (0xd503203f, true, false),
     ] {
         let (memory, process) = fixture(&[0xc85f7c22, middle, 0xc8037c20, 0xd4000001]);
-        let mut jit = JitThread::new(process).unwrap();
-        let range = memory
-            .translate_canonical_range(SPACE, DATA, 16, MemoryPermissions::READ)
+        let mut jit = process.create_thread().unwrap();
+        let range = memory.capture(DATA, 16, MemoryPermissions::READ).unwrap();
+        let dependency = nixe_memory::Observation::default();
+        memory
+            .machine()
+            .access_captured(
+                &range,
+                nixe_memory::AccessOperation::ReadObserved(dependency.clone()),
+            )
+            .unwrap()
+            .into_ready()
             .unwrap();
-        let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
         let mut state = state();
         let stop = run(&mut jit, &mut state);
         assert!(if scheduled {
@@ -252,20 +286,17 @@ fn clrex_and_context_switch_clear_the_local_reservation() {
         }
         assert_eq!(state.read_x(x(3)), u64::from(clear));
         assert_eq!(
-            dependency.remains_current(),
+            !dependency.is_invalid(),
             clear,
             "only committed STXR may invalidate observation"
         );
         assert_eq!(
             memory
-                .read(
-                    SPACE,
-                    DATA,
-                    MemoryAccess::normal(MemoryAccessSize::Doubleword)
-                )
+                .read_value(DATA, MemoryAccessSize::Doubleword.bytes())
                 .unwrap()
-                .value,
-            MemoryValue::U64(if clear { 0 } else { 7 })
+                .into_ready()
+                .unwrap(),
+            if clear { 0 } else { 7 }
         );
     }
 }
@@ -281,19 +312,16 @@ fn native_release_acquire_publishes_the_prior_payload() {
     for iteration in 1..=16 {
         for address in [DATA, DATA.checked_add(16).unwrap()] {
             memory
-                .write(
-                    SPACE,
-                    address,
-                    MemoryAccess::normal(MemoryAccessSize::Doubleword),
-                    MemoryValue::U64(0),
-                )
+                .write_value(address, MemoryAccessSize::Doubleword.bytes(), 0)
+                .unwrap()
+                .into_ready()
                 .unwrap();
         }
         let barrier = Arc::new(std::sync::Barrier::new(3));
         let mut workers = Vec::new();
         for consumer in [false, true] {
             let barrier = barrier.clone();
-            let mut jit = JitThread::new(process.clone()).unwrap();
+            let mut jit = process.create_thread().unwrap();
             workers.push(std::thread::spawn(move || {
                 let mut state = state();
                 state.write_x(x(0), 1);
@@ -322,50 +350,56 @@ fn misaligned_exclusive_faults_without_partial_effects() {
     let mut state = state();
     state.write_x(x(1), DATA.get() + 4092);
     state.write_x(x(2), 0x1234);
-    let stop = run(&mut JitThread::new(process).unwrap(), &mut state);
+    let stop = run(&mut process.create_thread().unwrap(), &mut state);
     assert!(matches!(stop, CpuExit::DataFault { .. }));
     assert_eq!(state.pc(), 0x1000);
     assert_eq!(state.read_x(x(2)), 0x1234);
     assert_eq!(
         memory
-            .read(
-                SPACE,
-                DATA,
-                MemoryAccess::normal(MemoryAccessSize::Doubleword)
-            )
+            .read_value(DATA, MemoryAccessSize::Doubleword.bytes())
             .unwrap()
-            .value,
-        MemoryValue::U64(0)
+            .into_ready()
+            .unwrap(),
+        0
     );
 }
 
 #[test]
 fn observed_first_write_retries_without_losing_the_observer() {
-    // LDXR; STXR; CBNZ status,LDXR; SVC.
-    let (memory, process) = fixture(&[0xc85f7c22, 0xc8037c20, 0x35ffffc3, 0xd4000001]);
-    let range = memory
-        .translate_canonical_range(SPACE, DATA, 16, MemoryPermissions::READ)
-        .unwrap();
-    let dependency = CanonicalCpuWriteDependency::capture(&range).unwrap();
-    assert!(dependency.remains_current());
-    let mut state = state();
-    assert!(matches!(
-        run(&mut JitThread::new(process).unwrap(), &mut state),
-        CpuExit::SupervisorCall { .. }
-    ));
-    assert_eq!(state.read_x(x(3)), 0);
-    assert!(!dependency.remains_current());
-    assert_eq!(
+    // LDXR/STXR or LDXP/STXP; retry the exclusive load after a watched write.
+    for (load, store, retry, width, status, expected) in [
+        (0xc85f7c22, 0xc8037c20, 0x35ffffc3, 8, 3, 7),
+        (0xc87f0c22, 0xc8241420, 0x35ffffc4, 16, 4, (9u128 << 64) | 7),
+    ] {
+        let (memory, process) = fixture(&[load, store, retry, 0xd4000001]);
+        let range = memory.capture(DATA, 16, MemoryPermissions::READ).unwrap();
+        let dependency = nixe_memory::Observation::default();
         memory
-            .read(
-                SPACE,
-                DATA,
-                MemoryAccess::normal(MemoryAccessSize::Doubleword)
+            .machine()
+            .access_captured(
+                &range,
+                nixe_memory::AccessOperation::ReadObserved(dependency.clone()),
             )
             .unwrap()
-            .value,
-        MemoryValue::U64(7)
-    );
+            .into_ready()
+            .unwrap();
+        assert!(!dependency.is_invalid());
+        let mut state = state();
+        assert!(matches!(
+            run(&mut process.create_thread().unwrap(), &mut state),
+            CpuExit::SupervisorCall { .. }
+        ));
+        assert_eq!(state.read_x(x(status)), 0);
+        assert!(dependency.is_invalid());
+        assert_eq!(
+            memory
+                .read_value(DATA, width)
+                .unwrap()
+                .into_ready()
+                .unwrap(),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -376,7 +410,7 @@ fn competing_native_cores_make_progress_without_lost_updates() {
     ]);
     let mut workers = Vec::new();
     for _ in 0..2 {
-        let mut jit = JitThread::new(process.clone()).unwrap();
+        let mut jit = process.create_thread().unwrap();
         workers.push(std::thread::spawn(move || {
             let mut state = state();
             state.write_x(x(0), 10_000);
@@ -391,13 +425,52 @@ fn competing_native_cores_make_progress_without_lost_updates() {
     }
     assert_eq!(
         memory
-            .read(
-                SPACE,
-                DATA,
-                MemoryAccess::normal(MemoryAccessSize::Doubleword)
-            )
+            .read_value(DATA, MemoryAccessSize::Doubleword.bytes())
             .unwrap()
-            .value,
-        MemoryValue::U64(20_000)
+            .into_ready()
+            .unwrap(),
+        20_000
     );
+}
+
+#[test]
+fn exclusive_memory_abort_preserves_live_floating_point_registers_and_flags() {
+    // FADD D2,D0,D1; CMP X0,X0; LDXR X8,[X1]; ADD X8,X8,#1;
+    // STXR W9,X8,[X1]; CSET W10,EQ; FADD D3,D2,D1; SVC.
+    let (memory, process) = fixture(&[
+        0x1e612802, 0xeb00001f, 0xc85f7c28, 0x91000508, 0xc8097c28, 0x1a9f17ea, 0x1e612843,
+        0xd4000001,
+    ]);
+    for iteration in 0..4u64 {
+        let mut state = state();
+        for index in 0..32 {
+            state.set_vector(
+                index,
+                0x1234_5678_9abc_def0_1122_3344_5566_7700 + u128::from(index),
+            );
+        }
+        state.set_vector(0, u128::from(1.25f64.to_bits()));
+        state.set_vector(1, u128::from(2.5f64.to_bits()));
+        assert!(matches!(
+            run(&mut process.create_thread().unwrap(), &mut state),
+            CpuExit::SupervisorCall { .. }
+        ));
+        assert_eq!(state.read_x(x(9)), 0);
+        assert_eq!(state.read_x(x(10)), 1);
+        assert_eq!(state.nzcv().bits(), 0x6000_0000);
+        assert_eq!(state.vector(0), Some(u128::from(1.25f64.to_bits())));
+        assert_eq!(state.vector(1), Some(u128::from(2.5f64.to_bits())));
+        assert_eq!(state.vector(2), Some(u128::from(3.75f64.to_bits())));
+        assert_eq!(state.vector(3), Some(u128::from(6.25f64.to_bits())));
+        for index in 4..32 {
+            assert_eq!(
+                state.vector(index),
+                Some(0x1234_5678_9abc_def0_1122_3344_5566_7700 + u128::from(index))
+            );
+        }
+        assert_eq!(
+            memory.read_value(DATA, 8).unwrap().into_ready().unwrap(),
+            u128::from(iteration + 1)
+        );
+    }
 }

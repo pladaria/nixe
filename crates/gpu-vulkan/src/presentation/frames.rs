@@ -6,7 +6,9 @@ use nixe_gpu::{
     ResidentImage, SampleCount, native::NativePresentationImage,
 };
 struct Import {
-    source: NativePresentationImage,
+    planes: Arc<[nixe_gpu::native::GuestImagePlane]>,
+    extent: [u32; 2],
+    format: F,
     image: ImageId,
 }
 pub(crate) struct Snapshot {
@@ -88,9 +90,9 @@ impl Frames {
             F::Rgba4444 => vk::Format::R16_UINT,
         };
         let image = if let Some(import) = self.imports.iter().find(|i| {
-            Arc::ptr_eq(&i.source.planes, &source.planes)
-                && i.source.extent == source.extent
-                && i.source.format == source.format
+            Arc::ptr_eq(&i.planes, &source.planes)
+                && i.extent == source.extent
+                && i.format == source.format
                 && cache
                     .require_frame_source(i.image, source.extent, source.allow_canonical_import)
                     .is_ok()
@@ -136,14 +138,14 @@ impl Frames {
                 "native framebuffer import: extent={:?} format={:?} segments={}",
                 source.extent,
                 source.format,
-                plane.backing.segments().len()
+                plane.footprint.mapping().spans().len()
             );
             let image = if let Some(image) =
-                cache.resident_frame_source(&plane.backing, description, &planes)
+                cache.resident_frame_source(&plane.footprint, description, &planes)
             {
                 image
             } else if source.allow_canonical_import {
-                cache.image_for(plane.backing.clone(), description, planes)?
+                cache.image_for(vec![Arc::clone(&plane.footprint)], description, planes)?
             } else {
                 return Err(VulkanError::InvalidResource(
                     "opaque framebuffer requires a matching native resident representation",
@@ -151,12 +153,14 @@ impl Frames {
             };
             log::trace!("native framebuffer resident source: {image:?}");
             self.imports
-                .retain(|i| !Arc::ptr_eq(&i.source.planes, &source.planes));
+                .retain(|i| !Arc::ptr_eq(&i.planes, &source.planes));
             if self.imports.len() == 16 {
                 self.imports.remove(0);
             }
             self.imports.push(Import {
-                source: source.clone(),
+                planes: Arc::clone(&source.planes),
+                extent: source.extent,
+                format: source.format,
                 image,
             });
             image

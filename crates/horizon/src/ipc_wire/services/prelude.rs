@@ -3,10 +3,11 @@
 //! This prelude is private to the service family. Transport, control, and
 //! message-decoding modules do not depend on it.
 
+pub(super) use crate::ipc_wire::request::Request;
 pub(super) use chrono::{Datelike, Offset, Timelike};
 pub(super) use chrono_tz::OffsetComponents;
 pub(super) use nixe_memory::GuestVirtualAddress;
-pub(super) use nixe_runtime::{ExceptionProcessContext, TransferMemoryObject};
+pub(super) use nixe_runtime::TransferMemoryObject;
 
 pub(super) use crate::ipc_wire::HostSystems;
 pub(super) use crate::ipc_wire::buffer::{

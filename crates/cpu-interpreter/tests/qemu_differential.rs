@@ -16,7 +16,33 @@ use nixe_cpu::{
     platform::TargetPlatform,
     state::a64::{A64GeneralRegister, A64Register, A64State, Nzcv},
 };
-use nixe_cpu_interpreter::{InstructionStep, execute_one};
+use nixe_cpu_interpreter::{
+    InstructionStep, InterpreterContext, InterpreterError, execute_one_with_context,
+};
+#[allow(dead_code)]
+#[path = "support/memory.rs"]
+mod memory;
+fn execute_one(
+    platform: &TargetPlatform,
+    state: &mut A64State,
+    word: u32,
+) -> Result<InstructionStep, InterpreterError> {
+    let memory = memory::Memory::new();
+    let monitor = std::cell::RefCell::new(Default::default());
+    let timer = memory::Timer;
+    let events = nixe_cpu::execution::VcpuEventState::default();
+    execute_one_with_context(
+        InterpreterContext::new(
+            nixe_cpu::profile::ProcessCpuContext::new(*platform, memory.space.identity()),
+            &memory,
+            &monitor,
+            &timer,
+            &events,
+        ),
+        state,
+        word,
+    )
+}
 
 const RUNNER_SOURCE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

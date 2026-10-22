@@ -15,6 +15,7 @@ pub(crate) fn device_uuid(_: &VulkanDevice) -> Option<[u8; 16]> {
 }
 #[cfg(not(target_os = "linux"))]
 impl VideoTransfers {
+    pub(crate) fn retire_sources(&mut self, _: u64) {}
     pub(crate) fn import(
         &mut self,
         _: &mut VulkanResidency,
@@ -50,7 +51,7 @@ impl VulkanResidency {
                 "invalid decoded video plane pitch/format",
             ));
         }
-        self.prepare_image_rect(image, plane, rectangle)?;
+        let writer = self.prepare_image_rect(image, plane, rectangle)?;
         let (target, layout) = self.image_access_subresources(
             image,
             plane_range(plane),
@@ -76,15 +77,15 @@ impl VulkanResidency {
                 height: rectangle.extent.height,
                 depth: 1,
             });
-        unsafe {
-            self.device.dispatch.cmd_copy_buffer_to_image(
-                self.device.submission.slots[slot].command,
+        self.publish_effect(&[writer], |device| unsafe {
+            device.dispatch.cmd_copy_buffer_to_image(
+                device.submission.slots[slot].command,
                 source,
                 target,
                 layout,
                 &[region],
             );
-        }
+        })?;
         self.finish_image_rect(image, plane, rectangle)?;
         self.statistics.gpu_copied_bytes += u64::from(rectangle.extent.width)
             * u64::from(rectangle.extent.height)
@@ -169,7 +170,7 @@ mod tests {
             (vk::Format::R8_UNORM, 1, 67, 37),
             (vk::Format::R8G8_UNORM, 2, 34, 19),
         ] {
-            let (_, backing) = backing_allocation(8192, 4096, 0xa5);
+            let (_allocation, backing) = backing_allocation(&cache, 8192, 4096, 0xa5);
             let extent = vk::Extent3D {
                 width: 128 / bpp,
                 height,
@@ -190,7 +191,20 @@ mod tests {
             };
             let image = cache
                 .image_for_deferred_import(
-                    backing.clone(),
+                    crate::residency::tests::image_geometry(
+                        backing.clone(),
+                        NativeImageDescription {
+                            image_type: vk::ImageType::TYPE_2D,
+                            format,
+                            extent,
+                            mip_levels: 1,
+                            array_layers: 1,
+                            samples: vk::SampleCountFlags::TYPE_1,
+                            usage: vk::ImageUsageFlags::SAMPLED,
+                            flags: vk::ImageCreateFlags::empty(),
+                        },
+                        &[plane],
+                    ),
                     NativeImageDescription {
                         image_type: vk::ImageType::TYPE_2D,
                         format,

@@ -13,27 +13,31 @@ pub trait MaxwellFrontend: Send + 'static {
         &mut self,
         state: &MaxwellThreeDState,
         trigger: MaxwellThreeDOperationTrigger,
-        address_space: &MaxwellGpuAddressSpace,
+        address_space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
         instances: Option<(u32, u32)>,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<Self::Work, MaxwellSubmissionExecutionError>;
     fn lower_launch(
         &mut self,
         launch: &MaxwellResolvedComputeLaunch,
-        address_space: &MaxwellGpuAddressSpace,
+        address_space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<Self::Work, MaxwellSubmissionExecutionError>;
     fn lower_solid(
         &mut self,
         request: &MaxwellTwoDSolidOperation,
-        address_space: &MaxwellGpuAddressSpace,
+        address_space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<Self::Work, MaxwellSubmissionExecutionError>;
     fn lower_blit(
         &mut self,
         request: &MaxwellTwoDBlitOperation,
-        address_space: &MaxwellGpuAddressSpace,
+        address_space: &MaxwellGpuMemory,
         frontend: FrontendSubmissionId,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<Self::Work, MaxwellSubmissionExecutionError>;
     fn take_mme_scratch(&mut self) -> (Vec<crate::MaxwellMethodDispatch>, Vec<u32>);
     fn recycle_mme_scratch(

@@ -57,27 +57,12 @@ fn main() -> ExitCode {
         log::error!("cannot start execution trace: {error}");
         return ExitCode::FAILURE;
     }
-    #[cfg(feature = "performance-counters")]
-    let capture = match performance::Capture::start() {
-        Ok(capture) => capture,
-        Err(error) => {
-            log::error!("cannot start performance capture: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
     let result = match invocation.command {
         Command::Input => commands::input::run(),
         Command::List(arguments) => commands::list::run(arguments),
         Command::Run(arguments) => commands::run::run(arguments),
         Command::VulkanCheck(arguments) => commands::vulkan_check::run(arguments),
     };
-    #[cfg(feature = "performance-counters")]
-    if let Some(capture) = capture
-        && let Err(error) = capture.finish()
-    {
-        log::error!("cannot finish performance capture: {error}");
-        return ExitCode::FAILURE;
-    }
     #[cfg(feature = "execution-trace")]
     if let Err(error) = nixe_memory::trace::finish() {
         log::error!("cannot finish execution trace: {error}");

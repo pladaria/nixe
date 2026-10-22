@@ -180,3 +180,35 @@ mod tests {
         assert_eq!(address.to_string(), "gpu-va=0x0000000000abcdef");
     }
 }
+/// Version of a GPU virtual mapping and its interpretation.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct MappingGeneration(u64);
+impl MappingGeneration {
+    pub const INITIAL: Self = Self(0);
+    pub const MAX: Self = Self(u64::MAX);
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+    pub const fn next(self) -> Result<Self, MappingGenerationExhausted> {
+        match self.0.checked_add(1) {
+            Some(value) => Ok(Self(value)),
+            None => Err(MappingGenerationExhausted),
+        }
+    }
+}
+impl std::fmt::Display for MappingGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mapping-generation={}", self.0)
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MappingGenerationExhausted;
+impl std::fmt::Display for MappingGenerationExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GPU mapping generation exhausted")
+    }
+}
+impl std::error::Error for MappingGenerationExhausted {}

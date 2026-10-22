@@ -18,7 +18,7 @@ impl VulkanResidency {
                 self.clear_depth_stencil(id, plane, value.depth, value.stencil)
             };
         }
-        self.ensure_image(id)?;
+        self.observe_image_cpu_writes(id)?;
         let description = self.image(id)?.description;
         let usage = if p.aspect == vk::ImageAspectFlags::COLOR {
             vk::ImageUsageFlags::COLOR_ATTACHMENT
@@ -38,7 +38,7 @@ impl VulkanResidency {
                 ));
             }
         }
-        self.prepare_image_rect(id, p, rect)?;
+        let writer = self.prepare_image_rect(id, p, rect)?;
         let depth = p.aspect != vk::ImageAspectFlags::COLOR;
         let mut aspects = p.aspect;
         if depth
@@ -103,9 +103,9 @@ impl VulkanResidency {
             .aspect_mask(p.aspect)
             .color_attachment(0)
             .clear_value(value);
-        unsafe {
-            self.device.dispatch.begin_rendering(command, &info);
-            self.device.dispatch.cmd_clear_attachments(
+        self.publish_effect(&[writer], |device| unsafe {
+            device.dispatch.begin_rendering(command, &info);
+            device.dispatch.cmd_clear_attachments(
                 command,
                 &[clear],
                 &[vk::ClearRect::default()
@@ -113,8 +113,8 @@ impl VulkanResidency {
                     .base_array_layer(0)
                     .layer_count(1)],
             );
-            self.device.dispatch.end_rendering(command);
-        }
+            device.dispatch.end_rendering(command);
+        })?;
         self.device.submission.slots[slot]
             .retained_views
             .push(leased);
@@ -195,7 +195,7 @@ impl VulkanResidency {
             }
         }
         self.ensure_image_initialized(source, src, source_rect)?;
-        self.prepare_image_rect(destination, dst, destination_rect)?;
+        let writer = self.prepare_image_rect(destination, dst, destination_rect)?;
         let (source, src_layout) = self.image_access_subresources(
             source,
             commands::plane_range(src),
@@ -235,9 +235,9 @@ impl VulkanResidency {
             .dst_offsets(corners(destination_rect));
         self.barriers.emit(&mut self.device);
         let slot = self.device.begin_recording()?;
-        unsafe {
-            self.device.dispatch.cmd_blit_image(
-                self.device.submission.slots[slot].command,
+        self.publish_effect(&[writer], |device| unsafe {
+            device.dispatch.cmd_blit_image(
+                device.submission.slots[slot].command,
                 source,
                 src_layout,
                 target,
@@ -245,7 +245,7 @@ impl VulkanResidency {
                 &[region],
                 filter,
             );
-        }
+        })?;
         self.finish_image_rect(destination, dst, destination_rect)?;
         self.device.work_ticket()
     }

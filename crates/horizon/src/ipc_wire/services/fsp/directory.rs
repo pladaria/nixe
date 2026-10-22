@@ -8,7 +8,7 @@ use crate::{IpcRequest, MAX_IPC_LIST_ENTRIES};
 use super::abi::FS_DIRECTORY_ENTRY_SIZE;
 use super::commands::DirectoryCommand;
 
-pub(super) fn decode(
+pub(super) async fn decode(
     request: &CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
 ) -> Result<Option<IpcRequest>, IpcWireError> {

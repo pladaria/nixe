@@ -4,13 +4,11 @@ use core::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use nixe_memory::{AddressSpaceId, CanonicalRangeTranslator, GuestVirtualAddress};
-
 use crate::coverage::CoverageId;
 use crate::error::{InstructionFetchFault, UnallocatedEncoding};
 use crate::exception::ExceptionKind;
 use crate::location::{InstructionEncoding, LocationDescriptor};
-use crate::memory::{CpuMemory, DataAccessFault};
+use crate::memory::DataAccessFault;
 use crate::state::RegisterContext;
 
 macro_rules! identity {
@@ -310,18 +308,6 @@ impl Display for CpuFault {
 }
 
 impl std::error::Error for CpuFault {}
-
-pub trait BoundMemory: CpuMemory + CanonicalRangeTranslator {}
-impl<T> BoundMemory for T where T: CpuMemory + CanonicalRangeTranslator {}
-
-#[derive(Clone, Copy)]
-pub struct MemoryBinding<'a> {
-    pub address_space: AddressSpaceId,
-    pub end_exclusive: GuestVirtualAddress,
-    pub memory: &'a dyn BoundMemory,
-    pub mapping_epoch: u64,
-    pub invalidation_cursor: nixe_memory::MemoryInvalidationCursor,
-}
 
 const CONTROL_PREEMPT: u32 = 1 << 0;
 const CONTROL_CODE_INVALIDATION: u32 = 1 << 1;

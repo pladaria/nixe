@@ -8,8 +8,10 @@ license.workspace = true
 performance-counters = ["nixe-gpu/performance-counters", "nixe-memory/performance-counters"]
 
 [dependencies]
+nixe-memory.workspace = true
 log.workspace = true
 rustc-hash.workspace = true
 nixe-gpu.workspace = true
 nixe-shader-recompiler.workspace = true
-nixe-memory.workspace = true
+
+[dev-dependencies]

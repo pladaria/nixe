@@ -1,4 +1,5 @@
-use nixe_memory::{AddressSpaceId, CanonicalRangeTranslator};
+use nixe_memory::AddressSpaceId;
+use nixe_runtime::memory::ProcessMemory;
 
 use super::NvDrvFileDescriptor;
 use super::nvhost_ctrl::PendingNvHostCtrlWait;
@@ -11,7 +12,7 @@ pub(crate) struct NvDrvIoctlRequest<'a> {
     pub inline: NvDrvInlineBuffer<'a>,
     pub process_id: u64,
     pub address_space: AddressSpaceId,
-    pub translator: &'a dyn CanonicalRangeTranslator,
+    pub memory: &'a ProcessMemory,
     pub caller: NvDrvIoctlCaller<'a>,
 }
 
@@ -52,9 +53,10 @@ pub(crate) struct NvDrvIoctlResponse {
 }
 
 /// Semantic disposition of an ioctl before scheduler or wire adaptation.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum NvDrvIoctlOutcome {
     Complete(NvDrvIoctlResponse),
+    PendingHost1x(super::host1x::CaptureSubmission),
     PendingSyncpointWait(PendingNvHostCtrlWait),
     PendingSubmission(super::PendingGpuSubmission),
 }

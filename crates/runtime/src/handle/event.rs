@@ -45,12 +45,13 @@ impl Drop for EventWatchRegistration {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        state
+        let removed = state
             .generation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .watchers
             .remove(&self.id);
+        drop(removed);
     }
 }
 
@@ -210,6 +211,9 @@ impl EventObject {
 pub struct WritableEventObject(pub(super) EventObject);
 
 impl WritableEventObject {
+    pub(crate) fn same_event(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0.state, &other.0.state)
+    }
     #[must_use]
     pub fn is_signalled(&self) -> bool {
         self.0.is_signalled()
@@ -229,6 +233,9 @@ impl WritableEventObject {
 pub struct ReadableEventObject(pub(super) EventObject);
 
 impl ReadableEventObject {
+    pub(crate) fn same_event(&self, writer: &WritableEventObject) -> bool {
+        Arc::ptr_eq(&self.0.state, &writer.0.state)
+    }
     #[must_use]
     pub fn source(&self) -> Option<crate::ExternalEventSource> {
         self.0.state.source
@@ -246,11 +253,115 @@ impl ReadableEventObject {
         self.0.watch(watcher)
     }
 
+    /// Waits without occupying a host worker. The future retains the event,
+    /// and dropping it removes its observer.
+    pub fn wait_async(&self) -> EventFuture {
+        EventFuture {
+            event: self.clone(),
+            registration: None,
+        }
+    }
+
     /// Sleeps until this event is signalled or the relative timeout expires.
     /// `None` represents an infinite wait.
     #[must_use]
     pub fn wait(&self, timeout: Option<Duration>) -> EventWaitOutcome {
         let deadline = timeout.and_then(|duration| Instant::now().checked_add(duration));
         self.0.wait_until(deadline)
+    }
+}
+
+/// An owned level-triggered event wait, safe to retain across guest suspension.
+pub struct EventFuture {
+    event: ReadableEventObject,
+    registration: Option<EventWatchRegistration>,
+}
+impl std::future::Future for EventFuture {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let this = self.get_mut();
+        if this.event.is_signalled() {
+            this.registration = None;
+            return std::task::Poll::Ready(());
+        }
+        // signal() consumes observers. Replace the registration on every poll
+        // so a cleared level followed by another signal cannot lose a wake.
+        this.registration = None;
+        let waker = context.waker().clone();
+        this.registration = Some(this.event.watch(Arc::new(move || waker.wake_by_ref())));
+        if this.event.is_signalled() {
+            this.registration = None;
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use super::*;
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll, Wake, Waker},
+    };
+    #[derive(Default)]
+    struct Wakes(AtomicUsize);
+    impl Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[test]
+    fn async_wait_rearms_after_a_signal_is_cleared_and_releases_on_cancel() {
+        let (writer, reader) = EventObject::create_pair();
+        let wakes = Arc::new(Wakes::default());
+        let waker = Waker::from(wakes.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut wait = reader.wait_async();
+        assert_eq!(Pin::new(&mut wait).poll(&mut context), Poll::Pending);
+        writer.signal();
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        reader.clear();
+        assert_eq!(Pin::new(&mut wait).poll(&mut context), Poll::Pending);
+        writer.signal();
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 2);
+        assert_eq!(Pin::new(&mut wait).poll(&mut context), Poll::Ready(()));
+        reader.clear();
+        let mut cancelled = reader.wait_async();
+        assert_eq!(Pin::new(&mut cancelled).poll(&mut context), Poll::Pending);
+        drop(cancelled);
+        writer.signal();
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 2);
+        let mut already_ready = reader.wait_async();
+        assert_eq!(
+            Pin::new(&mut already_ready).poll(&mut context),
+            Poll::Ready(())
+        );
+    }
+    #[test]
+    fn async_wait_replaces_its_waker_without_retaining_the_old_executor() {
+        let (writer, reader) = EventObject::create_pair();
+        let first = Arc::new(Wakes::default());
+        let second = Arc::new(Wakes::default());
+        let mut wait = reader.wait_async();
+        assert!(
+            Pin::new(&mut wait)
+                .poll(&mut Context::from_waker(&Waker::from(first.clone())))
+                .is_pending()
+        );
+        assert!(
+            Pin::new(&mut wait)
+                .poll(&mut Context::from_waker(&Waker::from(second.clone())))
+                .is_pending()
+        );
+        writer.signal();
+        assert_eq!(first.0.load(Ordering::Relaxed), 0);
+        assert_eq!(second.0.load(Ordering::Relaxed), 1);
     }
 }

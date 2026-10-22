@@ -1,183 +1,138 @@
 use super::*;
 
 #[test]
-fn loader_stub_executes_before_runtime_termination_on_both_backends() {
-    for backend in [
-        crate::CpuBackendConfig::Interpreter,
-        crate::CpuBackendConfig::Jit,
-    ] {
-        for split in [false, true] {
-            let (_directory, plan) = plan();
-            let mut process = ProcessBuilder::default()
-                .with_cpu_backend(backend.clone())
-                .with_memory_backend(nixe_memory::DirectBackendPolicy::Required)
-                .build(&plan)
-                .unwrap();
-            let entry = GuestVirtualAddress::new(process.entry_module().entry_address());
-            let stub = process.main_thread().loader_return.unwrap();
-            process
-                .memory
-                .overwrite_mapped_ram(
-                    process.cpu.address_space_id(),
-                    entry,
-                    &0xd65f03c0_u32.to_le_bytes(),
-                )
-                .unwrap(); // RET X30 to the real mapped loader stub.
-            let result = 0x8123_4567_89ab_cdef;
-            process
-                .main_thread_mut()
-                .state_mut()
-                .write_x(A64Register::General(a64_register(0)), result);
-            let mut cpu_thread = process
-                .execution
-                .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
-                .unwrap();
+fn loader_stub_executes_before_runtime_termination() {
+    for split in [false, true] {
+        let (_directory, plan) = plan();
+        let mut process = reference_process_builder().build(&plan).unwrap();
+        let entry = GuestVirtualAddress::new(process.entry_module().entry_address());
+        let stub = process.main_thread().loader_return.unwrap();
+        write_code(&process, entry, &0xd65f03c0_u32.to_le_bytes()); // RET X30 to the real mapped loader stub.
+        let result = 0x8123_4567_89ab_cdef;
+        process
+            .main_thread_mut()
+            .state_mut()
+            .write_x(A64Register::General(a64_register(0)), result);
+        let mut cpu_thread = process
+            .execution
+            .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
+            .unwrap();
 
-            if split {
-                let returned = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
-                assert_eq!(returned.stop, crate::ExecutionStop::BudgetExhausted);
-                assert_eq!(returned.progress, 1);
-                assert_eq!(process.main_thread().state().pc(), stub.get());
-                assert!(process.exit().is_none());
-                let zero = process.run_with_cpu_thread(&mut cpu_thread, 0).unwrap();
-                assert_eq!(zero.stop, crate::ExecutionStop::BudgetExhausted);
-                assert_eq!(zero.progress, 0);
-                cpu_thread
-                    .control()
-                    .request(nixe_cpu::execution::ControlRequest::Preempt);
-                let paused = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
-                assert_eq!(paused.stop, crate::ExecutionStop::Safepoint);
-                assert_eq!(paused.progress, 0);
-                assert_eq!(process.main_thread().state().pc(), stub.get());
-                assert!(process.exit().is_none());
-            }
-            let report = process.run_with_cpu_thread(&mut cpu_thread, 16).unwrap();
-            assert!(matches!(report.stop,
+        if split {
+            let returned = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
+            assert_eq!(returned.stop, crate::ExecutionStop::BudgetExhausted);
+            assert_eq!(returned.progress, 1);
+            assert_eq!(process.main_thread().state().pc(), stub.get());
+            assert!(process.exit().is_none());
+            let zero = process.run_with_cpu_thread(&mut cpu_thread, 0).unwrap();
+            assert_eq!(zero.stop, crate::ExecutionStop::BudgetExhausted);
+            assert_eq!(zero.progress, 0);
+            cpu_thread
+                .control()
+                .request(nixe_cpu::execution::ControlRequest::Preempt);
+            let paused = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
+            assert_eq!(paused.stop, crate::ExecutionStop::Safepoint);
+            assert_eq!(paused.progress, 0);
+            assert_eq!(process.main_thread().state().pc(), stub.get());
+            assert!(process.exit().is_none());
+        }
+        let report = process.run_with_cpu_thread(&mut cpu_thread, 16).unwrap();
+        assert!(matches!(report.stop,
                 crate::ExecutionStop::LoaderReturn { source, result_code }
                     if source.pc == stub && result_code == result));
-            assert_eq!(report.progress, if split { 1 } else { 2 }); // RET, then SVC.
-            assert_eq!(process.main_thread().state().pc(), stub.get());
-            assert_eq!(
-                report.context,
-                Some(process.main_thread().state().register_context())
-            );
-            assert_eq!(
-                process.lifecycle(),
-                nixe_scheduler::ProcessLifecycle::Exited
-            );
-            let exit = process.exit().unwrap();
-            assert_eq!(exit.cause, ProcessExitCause::LoaderReturned);
-            assert_eq!(exit.exit_code, result);
-            assert_eq!(exit.source.unwrap().pc, stub);
-            assert_eq!(exit.context.as_deref(), report.context.as_ref());
-            assert_eq!(
-                process.main_thread().exit.as_ref().unwrap().exit_code,
-                result
-            );
+        assert_eq!(report.progress, if split { 1 } else { 2 }); // RET, then SVC.
+        assert_eq!(process.main_thread().state().pc(), stub.get());
+        assert_eq!(
+            report.context,
+            Some(process.main_thread().state().register_context())
+        );
+        assert_eq!(
+            process.lifecycle(),
+            nixe_scheduler::ProcessLifecycle::Exited
+        );
+        let exit = process.exit().unwrap();
+        assert_eq!(exit.cause, ProcessExitCause::LoaderReturned);
+        assert_eq!(exit.exit_code, result);
+        assert_eq!(exit.source.unwrap().pc, stub);
+        assert_eq!(exit.context.as_deref(), report.context.as_ref());
+        assert_eq!(
+            process.main_thread().exit.as_ref().unwrap().exit_code,
+            result
+        );
 
-            process.request_execution_stop().unwrap();
-            process
-                .cpu_thread_teardown_state()
-                .prepare(&mut cpu_thread)
-                .unwrap();
-            drop(cpu_thread);
-            process.complete_cpu_thread_retirement().unwrap();
-            process.try_teardown().unwrap();
-        }
+        process.request_execution_stop().unwrap();
+        cpu_thread.clear_local_exclusive_reservation();
+        drop(cpu_thread);
+        process.complete_cpu_thread_retirement();
+        process.try_teardown().unwrap();
     }
 }
 
 #[test]
 fn loader_stub_recognition_requires_the_thread_address_and_exit_svc() {
-    for backend in [
-        crate::CpuBackendConfig::Interpreter,
-        crate::CpuBackendConfig::Jit,
-    ] {
-        // Same SVC elsewhere, same stub without this thread's registration,
-        // and another SVC at the registered address must remain ordinary calls.
-        for case in 0..3 {
-            let (_directory, plan) = plan();
-            let mut process = ProcessBuilder::default()
-                .with_cpu_backend(backend.clone())
-                .with_memory_backend(nixe_memory::DirectBackendPolicy::Required)
-                .build(&plan)
-                .unwrap();
-            let stub = process.main_thread().loader_return.unwrap();
-            let pc = if case == 0 {
-                GuestVirtualAddress::new(process.entry_module().entry_address())
-            } else {
-                stub
-            };
-            let (instruction, immediate) = if case == 2 {
-                (0xd4000841_u32, 0x42)
-            } else {
-                (HOME_BREW_EXIT_PROCESS_INSTRUCTION, 7)
-            };
-            process
-                .memory
-                .overwrite_mapped_ram(
-                    process.cpu.address_space_id(),
-                    pc,
-                    &instruction.to_le_bytes(),
-                )
-                .unwrap();
-            if case == 1 {
-                process.main_thread_mut().loader_return = None;
-            }
-            process.main_thread_mut().state_mut().set_pc(pc.get());
-            let mut cpu_thread = process
-                .execution
-                .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
-                .unwrap();
-            let report = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
-            assert!(matches!(report.stop,
+    // Same SVC elsewhere, same stub without this thread's registration,
+    // and another SVC at the registered address must remain ordinary calls.
+    for case in 0..3 {
+        let (_directory, plan) = plan();
+        let mut process = reference_process_builder().build(&plan).unwrap();
+        let stub = process.main_thread().loader_return.unwrap();
+        let pc = if case == 0 {
+            GuestVirtualAddress::new(process.entry_module().entry_address())
+        } else {
+            stub
+        };
+        let (instruction, immediate) = if case == 2 {
+            (0xd4000841_u32, 0x42)
+        } else {
+            (HOME_BREW_EXIT_PROCESS_INSTRUCTION, 7)
+        };
+        write_code(&process, pc, &instruction.to_le_bytes());
+        if case == 1 {
+            process.main_thread_mut().loader_return = None;
+        }
+        process.main_thread_mut().state_mut().set_pc(pc.get());
+        let mut cpu_thread = process
+            .execution
+            .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
+            .unwrap();
+        let report = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
+        assert!(matches!(report.stop,
                 crate::ExecutionStop::SupervisorCall { source, immediate: observed }
                     if source.pc == pc && observed == immediate));
-            assert_eq!(report.progress, 1);
-            assert_eq!(process.main_thread().state().pc(), pc.get());
-            assert_eq!(
-                report.context,
-                Some(process.main_thread().state().register_context())
-            );
-            assert!(process.exit().is_none());
-            assert_eq!(
-                process.lifecycle(),
-                nixe_scheduler::ProcessLifecycle::Running
-            );
-            process.request_execution_stop().unwrap();
-            process
-                .cpu_thread_teardown_state()
-                .prepare(&mut cpu_thread)
-                .unwrap();
-            drop(cpu_thread);
-            process.complete_cpu_thread_retirement().unwrap();
-            process.try_teardown().unwrap();
-        }
+        assert_eq!(report.progress, 1);
+        assert_eq!(process.main_thread().state().pc(), pc.get());
+        assert_eq!(
+            report.context,
+            Some(process.main_thread().state().register_context())
+        );
+        assert!(process.exit().is_none());
+        assert_eq!(
+            process.lifecycle(),
+            nixe_scheduler::ProcessLifecycle::Running
+        );
+        process.request_execution_stop().unwrap();
+        cpu_thread.clear_local_exclusive_reservation();
+        drop(cpu_thread);
+        process.complete_cpu_thread_retirement();
+        process.try_teardown().unwrap();
     }
 }
 
 #[test]
 fn production_jit_uses_block_budgets_recompiles_mutated_code_and_retires() {
     let (_directory, plan) = plan();
-    let mut process = ProcessBuilder::default()
-        .with_memory_backend(nixe_memory::DirectBackendPolicy::Required)
-        .build(&plan)
-        .unwrap();
+    let mut process = reference_process_builder().build(&plan).unwrap();
     let entry = GuestVirtualAddress::new(process.entry_module().entry_address());
-    let space = process.cpu.address_space_id();
     let mut words = vec![0x91000400_u32; 17]; // ADD X0,X0,#1.
     words.push(0x17ffffef); // B entry: -17 instructions.
-    process
-        .memory
-        .overwrite_mapped_ram(
-            space,
-            entry,
-            &words
-                .iter()
-                .flat_map(|word| word.to_le_bytes())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    write_code(
+        &process,
+        entry,
+        &words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
     process
         .main_thread_mut()
         .state_mut()
@@ -201,10 +156,7 @@ fn production_jit_uses_block_budgets_recompiles_mutated_code_and_retires() {
         17
     );
 
-    process
-        .memory
-        .overwrite_mapped_ram(space, entry, &0x91002400_u32.to_le_bytes())
-        .unwrap(); // ADD #9.
+    write_code(&process, entry, &0x91002400_u32.to_le_bytes()); // ADD #9.
     let second = process.run_with_cpu_thread(&mut thread, 1).unwrap();
     assert_eq!(second.progress, 18);
     assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
@@ -216,12 +168,9 @@ fn production_jit_uses_block_budgets_recompiles_mutated_code_and_retires() {
         42
     );
     process.request_execution_stop().unwrap();
-    process
-        .cpu_thread_teardown_state()
-        .prepare(&mut thread)
-        .unwrap();
+    thread.clear_local_exclusive_reservation();
     drop(thread);
-    process.complete_cpu_thread_retirement().unwrap();
+    process.complete_cpu_thread_retirement();
     process.try_teardown().unwrap();
 }
 
@@ -243,49 +192,39 @@ fn reference_execution_honors_budget_and_preserves_dispatch_pc() {
 }
 
 #[test]
-fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
+fn native_slices_preserve_supervisor_call_boundaries_and_apply_the_continuation_once() {
     let (_directory, plan) = plan();
     let mut process = reference_process_builder().build(&plan).unwrap();
     replace_entry_instructions(
         &mut process,
         &[
-            0x9100_0400, // ADD X0,X0,#1
-            0x9100_0800, // ADD X0,X0,#2
-            0xd400_0841, // SVC #0x42
-            0x9100_1000, // ADD X0,X0,#4
+            0x91000400, // ADD X0,#1.
+            0x91000800, // ADD X0,#2.
+            0xd4000841, // SVC #0x42.
+            0x91001000, // ADD X0,#4.
+            0xd4000861, // SVC #0x43.
         ],
     );
     let entry = process.entry_module().entry_address();
-    let state = process.main_thread_mut().state_mut();
-    state.write_x(A64Register::General(a64_register(0)), 0);
-    let mut cpu_thread = process
-        .execution
+    process
+        .main_thread_mut()
+        .state_mut()
+        .write_x(A64Register::General(a64_register(0)), 0);
+    let mut cpu = process
         .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
         .unwrap();
-
-    let first = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
-    assert_eq!(first.progress, 1);
-    assert_eq!(first.stop, crate::ExecutionStop::BudgetExhausted);
-    let state = process.main_thread().state();
-    assert_eq!(state.read_x(A64Register::General(a64_register(0))), 1);
-    assert_eq!(state.pc(), entry + 4);
-
-    let second = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
-    assert_eq!(second.progress, 1);
-    assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
-    let state = process.main_thread().state();
-    assert_eq!(state.read_x(A64Register::General(a64_register(0))), 3);
-    assert_eq!(state.pc(), entry + 8);
-
-    let svc = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
-    assert_eq!(svc.progress, 1);
-    assert!(matches!(
-        svc.stop,
-        crate::ExecutionStop::SupervisorCall {
-            source,
-            immediate: 0x42,
-        } if source.pc.get() == entry + 8
-    ));
+    let first = process.run_with_cpu_thread(&mut cpu, 100).unwrap();
+    assert!(
+        matches!(first.stop, crate::ExecutionStop::SupervisorCall { source, immediate: 0x42 }
+        if source.pc.get() == entry + 8)
+    );
+    assert_eq!(
+        process
+            .main_thread()
+            .state()
+            .read_x(A64Register::General(a64_register(0))),
+        3
+    );
     let mut dispatcher = FixedSupervisorCallDispatcher {
         outcome: Some(crate::ExceptionDispatchOutcome::<&'static str>::Resume(
             crate::ExceptionResume::Next,
@@ -293,19 +232,25 @@ fn reference_slices_preserve_instruction_and_supervisor_call_boundaries() {
     };
     assert_eq!(
         process
-            .route_supervisor_call(&svc.stop, &mut dispatcher)
+            .route_supervisor_call(&first.stop, &mut dispatcher)
             .unwrap(),
         crate::ExceptionHandlingResult::Resumed
     );
-    let resumed = process.run_with_cpu_thread(&mut cpu_thread, 1).unwrap();
-    assert_eq!(resumed.progress, 1);
-    assert_eq!(resumed.stop, crate::ExecutionStop::BudgetExhausted);
-    let state = process.main_thread().state();
-    assert_eq!(state.read_x(A64Register::General(a64_register(0))), 7);
-    assert_eq!(state.pc(), entry + 16);
+    let second = process.run_with_cpu_thread(&mut cpu, 100).unwrap();
+    assert!(
+        matches!(second.stop, crate::ExecutionStop::SupervisorCall { source, immediate: 0x43 }
+        if source.pc.get() == entry + 16)
+    );
+    assert_eq!(
+        process
+            .main_thread()
+            .state()
+            .read_x(A64Register::General(a64_register(0))),
+        7
+    );
 }
 #[test]
-fn fixed_virtual_timer_is_stable_across_reference_slices() {
+fn fixed_virtual_timer_is_stable_across_native_slices() {
     let (_directory, plan) = plan();
     let frequency = 24_000_000;
     let mut process = reference_process_builder()
@@ -324,14 +269,15 @@ fn fixed_virtual_timer_is_stable_across_reference_slices() {
             0xd53b_e001, // MRS X1,CNTFRQ_EL0
             0xd53b_e022, // MRS X2,CNTVCT_EL0
             0xd53b_e023, // MRS X3,CNTVCT_EL0
+            0x17fffffd,  // B to the first timer read.
         ],
     );
 
-    let first = process.run(2).unwrap();
-    assert_eq!(first.progress, 2);
+    let first = process.run(4).unwrap();
+    assert_eq!(first.progress, 4);
     assert_eq!(first.stop, crate::ExecutionStop::BudgetExhausted);
-    let second = process.run(1).unwrap();
-    assert_eq!(second.progress, 1);
+    let second = process.run(4).unwrap();
+    assert_eq!(second.progress, 4);
     assert_eq!(second.stop, crate::ExecutionStop::BudgetExhausted);
 
     let state = process.main_thread().state();
@@ -351,7 +297,9 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
         &mut process,
         &[
             0x885f_fc60, // LDAXR W0,[X3]
+            0x14000001,  // End the load block without clearing the monitor.
             0x8801_fc60, // STLXR W1,W0,[X3]
+            0x17fffffd,  // End the store block and return to the load.
         ],
     );
     let entry = process.entry_module().entry_address();
@@ -366,16 +314,10 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
         state.write_x(A64Register::General(a64_register(3)), address.get());
         address
     };
-    let address_space = process.cpu_context().address_space_id();
-    process
-        .memory()
-        .write(
-            address_space,
-            data,
-            MemoryAccess::normal(MemoryAccessSize::Word),
-            MemoryValue::U32(7),
-        )
-        .unwrap();
+    assert!(matches!(
+        process.memory().space().write_value(data, 4, 7).unwrap(),
+        nixe_memory::Access::Ready(())
+    ));
     let mut cpu_thread = process
         .execution
         .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
@@ -383,7 +325,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
 
     assert_eq!(
         process
-            .run_with_cpu_thread(&mut cpu_thread, 1)
+            .run_with_cpu_thread(&mut cpu_thread, 2)
             .unwrap()
             .stop,
         crate::ExecutionStop::BudgetExhausted
@@ -393,7 +335,7 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
     state.write_x(A64Register::General(a64_register(0)), 9);
     assert_eq!(
         process
-            .run_with_cpu_thread(&mut cpu_thread, 1)
+            .run_with_cpu_thread(&mut cpu_thread, 2)
             .unwrap()
             .stop,
         crate::ExecutionStop::BudgetExhausted
@@ -403,39 +345,32 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
     assert_eq!(
         process
             .memory()
-            .read(
-                address_space,
-                data,
-                MemoryAccess::normal(MemoryAccessSize::Word),
-            )
+            .space()
+            .read_value(data, 4)
             .unwrap()
-            .value,
-        MemoryValue::U32(9)
+            .into_ready()
+            .unwrap(),
+        9
     );
 
     let state = process.main_thread_mut().state_mut();
     state.set_pc(entry);
     assert_eq!(
         process
-            .run_with_cpu_thread(&mut cpu_thread, 1)
+            .run_with_cpu_thread(&mut cpu_thread, 2)
             .unwrap()
             .stop,
         crate::ExecutionStop::BudgetExhausted
     );
-    process
-        .memory()
-        .write(
-            address_space,
-            data,
-            MemoryAccess::normal(MemoryAccessSize::Word),
-            MemoryValue::U32(11),
-        )
-        .unwrap();
+    assert!(matches!(
+        process.memory().space().write_value(data, 4, 11).unwrap(),
+        nixe_memory::Access::Ready(())
+    ));
     let state = process.main_thread_mut().state_mut();
     state.write_x(A64Register::General(a64_register(0)), 13);
     assert_eq!(
         process
-            .run_with_cpu_thread(&mut cpu_thread, 1)
+            .run_with_cpu_thread(&mut cpu_thread, 2)
             .unwrap()
             .stop,
         crate::ExecutionStop::BudgetExhausted
@@ -445,14 +380,12 @@ fn exclusive_monitor_persists_and_observes_generation_changes_across_slices() {
     assert_eq!(
         process
             .memory()
-            .read(
-                address_space,
-                data,
-                MemoryAccess::normal(MemoryAccessSize::Word),
-            )
+            .space()
+            .read_value(data, 4)
             .unwrap()
-            .value,
-        MemoryValue::U32(11)
+            .into_ready()
+            .unwrap(),
+        11
     );
 }
 
@@ -489,29 +422,18 @@ fn reference_execution_reports_instruction_fetch_faults_as_a_distinct_stop() {
 }
 
 #[test]
-fn reference_execution_rejects_unsupported_and_invalid_code() {
+fn native_execution_reports_an_unallocated_instruction_with_its_original_source() {
     let (_directory, plan) = plan();
-
-    let mut unsupported = reference_process_builder().build(&plan).unwrap();
-    replace_entry_instruction(&mut unsupported, 0xd503_20df); // unimplemented reserved HINT #6
-    let crate::ProcessExecutionError::Cpu { fault } = unsupported.run(1).unwrap_err() else {
-        panic!("unsupported instruction must be a CPU fault");
+    let mut process = reference_process_builder().build(&plan).unwrap();
+    replace_entry_instruction(&mut process, 0);
+    let entry = process.entry_module().entry_address();
+    let report = process.run(100).unwrap();
+    let crate::ExecutionStop::UnallocatedEncoding { error } = report.stop else {
+        panic!("unallocated encoding must stop execution")
     };
-    assert_eq!(fault.kind, nixe_cpu::execution::CpuFaultKind::Unavailable);
-    assert_eq!(fault.progress, 0);
-    assert!(fault.message.contains("unsupported instruction"));
-
-    let mut unallocated = reference_process_builder().build(&plan).unwrap();
-    replace_entry_instruction(&mut unallocated, 0);
-    let crate::ProcessExecutionError::Cpu { fault } = unallocated.run(1).unwrap_err() else {
-        panic!("invalid instruction must be a CPU fault");
-    };
-    assert_eq!(
-        fault.kind,
-        nixe_cpu::execution::CpuFaultKind::InvalidRequest
-    );
-    assert_eq!(fault.progress, 0);
-    assert!(fault.message.contains("invalid instruction stream"));
+    assert_eq!(error.instruction.location.pc.get(), entry);
+    assert_eq!(error.instruction.encoding.bits(), 0);
+    assert_eq!(process.main_thread().state().pc(), entry);
 }
 
 #[test]

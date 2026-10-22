@@ -238,6 +238,39 @@ impl MaxwellMemoryCopyOperation {
         Ok(())
     }
 
+    /// Exact destination coverage, excluding disabled remap components.
+    pub(crate) fn written_spans(
+        self,
+    ) -> Result<Vec<std::ops::Range<usize>>, MaxwellMemoryCopyError> {
+        let remap = self.remap.expect("remapped copy");
+        let (_, element_bytes) = self.element_sizes();
+        let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let base = layout_offset(self.destination_layout, x, y, element_bytes)?;
+                for component in 0..usize::from(remap.destination_components) {
+                    if remap.components[component] == MaxwellMemoryCopyComponentSource::NoWrite {
+                        continue;
+                    }
+                    let start = base + component * usize::from(remap.component_bytes);
+                    spans.push(start..start + usize::from(remap.component_bytes));
+                }
+            }
+        }
+        spans.sort_unstable_by_key(|span| span.start);
+        let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+        for span in spans {
+            if let Some(last) = merged.last_mut()
+                && last.end >= span.start
+            {
+                last.end = last.end.max(span.end);
+            } else {
+                merged.push(span);
+            }
+        }
+        Ok(merged)
+    }
+
     const fn element_sizes(self) -> (u32, u32) {
         match self.remap {
             Some(remap) => (

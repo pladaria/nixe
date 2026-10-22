@@ -37,7 +37,7 @@ impl PerformanceSessionCommand {
 // Command IDs, payloads, and the returned child object follow libnx:
 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/apm.c
 pub(in crate::ipc_wire) fn dispatch_performance_manager(
-    process: &mut ExceptionProcessContext<'_>,
+    process: &mut Request,
     manager: &PerformanceManagerSession,
     request: CmifRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
@@ -46,8 +46,7 @@ pub(in crate::ipc_wire) fn dispatch_performance_manager(
     };
     match command {
         PerformanceManagerCommand::OpenSession => match process
-            .handles_mut()
-            .insert(HorizonIpcObject::Performance(manager.open_session()))
+            .return_handle(HorizonIpcObject::Performance(manager.open_session()))
         {
             Ok(handle) => {
                 log::debug!("apm opened performance session handle {handle:#x}");

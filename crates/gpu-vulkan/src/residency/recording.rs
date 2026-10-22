@@ -90,6 +90,73 @@ impl VulkanResidency {
         }
         Ok(())
     }
+    pub(super) fn copy_buffer_effect(
+        &mut self,
+        writer: WriterId,
+        source: BufferId,
+        offset: u64,
+        destination: BufferId,
+        destination_offset: u64,
+        bytes: u64,
+    ) -> Result<(), VulkanError> {
+        let scratch = if source == destination {
+            Some(self.temporary_buffer(bytes, &[Resource::Buffer(source)])?)
+        } else {
+            None
+        };
+        let src = self.buffer_access_range(
+            source,
+            offset,
+            bytes,
+            AccessScope::new(
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_READ,
+            ),
+        )?;
+        let dst = self.buffer_access_range(
+            destination,
+            destination_offset,
+            bytes,
+            AccessScope::new(
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            ),
+        )?;
+        let slot = self.device.begin_recording()?;
+        let command = self.device.submission.slots[slot].command;
+        self.barriers.emit(&mut self.device);
+        let (source, source_offset) = if let Some(scratch) = &scratch {
+            unsafe {
+                self.device.dispatch.cmd_copy_buffer(
+                    command,
+                    src,
+                    scratch.handle,
+                    &[vk::BufferCopy::default().src_offset(offset).size(bytes)],
+                );
+                scratch_read_barrier(&self.device, command, scratch.handle, bytes);
+            }
+            (scratch.handle, 0)
+        } else {
+            (src, offset)
+        };
+        self.publish_effect(&[writer], |device| unsafe {
+            device.dispatch.cmd_copy_buffer(
+                command,
+                source,
+                dst,
+                &[vk::BufferCopy::default()
+                    .src_offset(source_offset)
+                    .dst_offset(destination_offset)
+                    .size(bytes)],
+            );
+        })?;
+        if let Some(scratch) = scratch {
+            let work = self.device.work_ticket()?;
+            self.device.retire_buffer(scratch, work)?;
+        }
+        self.statistics.gpu_copied_bytes += bytes;
+        Ok(())
+    }
     pub(super) fn copy_source(
         &mut self,
         source: Resource,
@@ -332,16 +399,7 @@ impl VulkanResidency {
         let mut copied = 0;
         while copied < size {
             let length = (size - copied).min(limit);
-            let src = self.buffer_access_range(
-                id,
-                offset + copied,
-                length,
-                AccessScope::new(
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_READ,
-                ),
-            )?;
-            let ticket = self.download_buffer(src, offset + copied, length)?;
+            let ticket = self.download_buffer(id, offset + copied, length)?;
             self.flush()?;
             result.extend(self.device.readback(ticket)?);
             self.statistics.native_readback_bytes += length;
@@ -349,75 +407,77 @@ impl VulkanResidency {
         }
         Ok(result)
     }
-    /// Record one demanded page's compatible transfers without consuming them.
-    pub(super) fn record_cpu_authorities(
+    /// Native transfer batches name exact owned requests. Source fragments are
+    /// gathered into one request buffer; publication keeps the original tokens.
+    pub(super) fn record_access_readbacks(
         &mut self,
-        request: CpuVisibilityRequest,
-        writes: &[Authority],
+        request: nixe_memory::AccessRequestId,
+        writes: &[nixe_gpu::authority::ResolvedBytes<Resource>],
     ) -> Result<(), VulkanError> {
         use super::cpu_readback::{Scatter, Transfer};
-        let mut images = rustc_hash::FxHashMap::<ImageId, Vec<Authority>>::default();
+        let mut images = rustc_hash::FxHashMap::<ImageId, Vec<_>>::default();
         let mut buffers = Vec::new();
         let limit = self.device.submission.configuration.arena_bytes;
         for &write in writes {
-            match write.source {
+            let producer = write.producer.ok_or(VulkanError::InvalidResource(
+                "native readback has no device producer",
+            ))?;
+            match producer.resource {
                 Resource::Buffer(id) => {
                     if let Some(known) = &self.buffer(id)?.known {
-                        nixe_gpu::trace::detail_event("readback_kind", 0, write.start, write.end);
-                        let bytes = Arc::clone(&known.bytes);
-                        self.cpu_readbacks.get_mut(&request).unwrap().bytes
-                            [write.start as usize..write.end as usize]
-                            .copy_from_slice(
-                                &bytes[write.offset as usize
-                                    ..(write.offset + write.end - write.start) as usize],
-                            );
+                        let literal = Arc::clone(&known.bytes);
+                        let start = producer.native as usize;
+                        let end = start.checked_add(write.bytes as usize).ok_or(
+                            VulkanError::InvalidResource("literal readback interval overflows"),
+                        )?;
+                        let bytes = literal.get(start..end).ok_or(VulkanError::InvalidResource(
+                            "literal readback exceeds its producer",
+                        ))?;
+                        self.cpu_readbacks
+                            .get_mut(&request)
+                            .expect("registered access")
+                            .bytes
+                            [write.logical as usize..(write.logical + write.bytes) as usize]
+                            .copy_from_slice(bytes);
                     } else {
-                        nixe_gpu::trace::detail_event("readback_kind", 1, write.start, write.end);
                         let mut copied = 0;
-                        while copied < write.end - write.start {
-                            let length = (write.end - write.start - copied).min(limit);
-                            buffers.push(Authority {
-                                start: write.start + copied,
-                                end: write.start + copied + length,
-                                offset: write.offset + copied,
-                                ..write
-                            });
+                        while copied < write.bytes {
+                            let length = (write.bytes - copied).min(limit);
+                            buffers.push((
+                                id,
+                                producer.native + copied,
+                                write.logical + copied,
+                                length,
+                            ));
                             copied += length;
                         }
                     }
                 }
-                Resource::Image(id) => {
-                    nixe_gpu::trace::detail_event("readback_kind", 2, write.start, write.end);
-                    images.entry(id).or_default().push(write);
-                }
+                Resource::Image(id) => images.entry(id).or_default().push(write),
             }
         }
         let mut next = 0;
         while next < buffers.len() {
             let first = next;
             let mut bytes = 0;
-            while let Some(w) = buffers.get(next) {
-                if bytes + w.end - w.start > limit {
+            while let Some(&(_, _, _, length)) = buffers.get(next) {
+                if bytes + length > limit {
                     break;
                 }
-                bytes += w.end - w.start;
+                bytes += length;
                 next += 1;
             }
-            let (index, slice, ticket) = self.reserve_cpu_readback(bytes, 4)?;
+            let (index, slice, ticket) = self.reserve_readback(bytes, 4)?;
             let command = self.device.submission.slots[index].command;
             let target = self.device.submission.slots[index]
                 .readback_buffer(slice)
                 .handle;
             let mut copies = Vec::new();
             let mut packed = 0;
-            for w in &buffers[first..next] {
-                let Resource::Buffer(id) = w.source else {
-                    unreachable!()
-                };
-                let length = w.end - w.start;
+            for &(id, offset, destination, length) in &buffers[first..next] {
                 let source = self.buffer_access_range(
                     id,
-                    w.offset,
+                    offset,
                     length,
                     AccessScope::new(
                         vk::PipelineStageFlags2::COPY,
@@ -431,14 +491,14 @@ impl VulkanResidency {
                         source,
                         target,
                         &[vk::BufferCopy::default()
-                            .src_offset(w.offset)
+                            .src_offset(offset)
                             .dst_offset(slice.offset + packed)
                             .size(length)],
                     );
                 }
                 copies.push(Scatter {
                     source: packed as usize,
-                    destination: w.start as usize,
+                    destination: destination as usize,
                     length: length as usize,
                 });
                 packed += length;
@@ -459,16 +519,35 @@ impl VulkanResidency {
                 continue;
             }
             let pieces = self.image_read_pieces(id, &writes, limit)?;
+            let mut ordered: Vec<_> = writes.iter().collect();
+            ordered.sort_unstable_by_key(|w| w.producer.expect("device source").native);
+            let mut next = 0;
+            let mut active = Vec::new();
             let mut reads = Vec::new();
             for piece in pieces {
+                let finish = piece.logical + piece.length;
+                // The native pieces are ordered and disjoint. Each source
+                // enters once and is visited only while it intersects a piece.
+                // Repeated physical aliases can still have separate targets.
+                while let Some(&write) = ordered.get(next) {
+                    if write.producer.expect("device source").native >= finish {
+                        break;
+                    }
+                    active.push(write);
+                    next += 1;
+                }
+                active.retain(|w| {
+                    w.producer.expect("device source").native + w.bytes > piece.logical
+                });
                 let mut copies = Vec::new();
-                for w in &writes {
-                    let start = w.offset.max(piece.logical);
-                    let end = (w.offset + w.end - w.start).min(piece.logical + piece.length);
+                for w in &active {
+                    let offset = w.producer.expect("device readback source").native;
+                    let start = offset.max(piece.logical);
+                    let end = (offset + w.bytes).min(piece.logical + piece.length);
                     if start < end {
                         copies.push(Scatter {
                             source: (start - piece.logical) as usize,
-                            destination: (w.start + start - w.offset) as usize,
+                            destination: (w.logical + start - offset) as usize,
                             length: (end - start) as usize,
                         });
                     }
@@ -482,7 +561,7 @@ impl VulkanResidency {
 
     pub(super) fn record_image_reads(
         &mut self,
-        request: CpuVisibilityRequest,
+        request: nixe_memory::AccessRequestId,
         id: ImageId,
         reads: Vec<(
             Option<super::readback::WindowKey>,
@@ -510,13 +589,18 @@ impl VulkanResidency {
                 alignment = alignment.max(align);
                 batch.push((offset, reads.next().unwrap()));
             }
+            if batch.is_empty() {
+                return Err(VulkanError::InvalidResource(
+                    "image readback block exceeds the staging arena",
+                ));
+            }
             let mut converted = Vec::new();
             if multisample {
                 for (_, (_, piece, _)) in &batch {
                     converted.push(self.sample_readback_window(id, *piece)?);
                 }
             }
-            let (index, slice, ticket) = self.reserve_cpu_readback(bytes, alignment)?;
+            let (index, slice, ticket) = self.reserve_readback(bytes, alignment)?;
             let command = self.device.submission.slots[index].command;
             let buffer = self.device.submission.slots[index]
                 .readback_buffer(slice)
@@ -594,13 +678,22 @@ impl VulkanResidency {
         }
         Ok(())
     }
-    fn download_buffer(
+    pub(super) fn download_buffer(
         &mut self,
-        source: vk::Buffer,
+        id: BufferId,
         offset: u64,
         size: u64,
     ) -> Result<ReadbackTicket, VulkanError> {
-        let (index, slice, ticket) = self.device.submission.reserve_readback(size)?;
+        let (index, slice, ticket) = self.reserve_readback(size, 4)?;
+        let source = self.buffer_access_range(
+            id,
+            offset,
+            size,
+            AccessScope::new(
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_READ,
+            ),
+        )?;
         let command = self.device.submission.slots[index].command;
         let target = self.device.submission.slots[index]
             .readback_buffer(slice)
@@ -638,30 +731,7 @@ impl VulkanResidency {
     }
 }
 
-pub(super) fn host_read_barrier(
-    device: &VulkanDevice,
-    command: vk::CommandBuffer,
-    buffer: vk::Buffer,
-    offset: u64,
-    size: u64,
-) {
-    let barriers = [vk::BufferMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::COPY)
-        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-        .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-        .dst_access_mask(vk::AccessFlags2::HOST_READ)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .buffer(buffer)
-        .offset(offset)
-        .size(size)];
-    unsafe {
-        device.dispatch.barrier(
-            command,
-            &vk::DependencyInfo::default().buffer_memory_barriers(&barriers),
-        );
-    }
-}
+pub(super) use crate::transfer::host_read_barrier;
 pub(super) fn scratch_read_barrier(
     device: &VulkanDevice,
     command: vk::CommandBuffer,

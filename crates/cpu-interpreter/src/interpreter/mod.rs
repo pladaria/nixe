@@ -9,16 +9,16 @@ mod a64;
 use core::{cell::RefCell, fmt};
 
 use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState};
+#[cfg(test)]
+use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::{
     coverage::CoverageId,
     decode::{self, DecodeResult, DecodedOpcode},
     location::{DecodedInstruction, InstructionEncoding, LocationDescriptor},
-    memory::{CpuMemory, SyntheticMemory},
-    platform::TargetPlatform,
+    memory::InstructionMemoryAccess,
     profile::ProcessCpuContext,
     state::a64::A64State,
 };
-use nixe_memory::AddressSpaceId;
 
 /// Result of one decoded instruction in the direct interpreter loop.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,22 +60,27 @@ impl InstructionStep {
 }
 
 /// Concrete services available to every production interpreter instruction.
-#[derive(Clone, Copy)]
-pub struct InterpreterContext<'a, 'worker> {
+pub struct InterpreterContext<'a, M: InstructionMemoryAccess + ?Sized> {
     process: ProcessCpuContext,
-    memory: &'a dyn CpuMemory,
-    exclusive_monitor: &'a RefCell<nixe_cpu::exclusive::ExclusiveMonitorState>,
+    memory: &'a M,
+    exclusive_monitor: &'a RefCell<nixe_cpu::exclusive::ExclusiveMonitorState<M::Reservation>>,
     architectural_timer: &'a dyn ArchitecturalTimer,
     events: &'a VcpuEventState,
-    direct_memory: Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemorySlice<'worker>>>,
 }
 
-impl<'a, 'worker> InterpreterContext<'a, 'worker> {
+impl<M: InstructionMemoryAccess + ?Sized> Copy for InterpreterContext<'_, M> {}
+impl<M: InstructionMemoryAccess + ?Sized> Clone for InterpreterContext<'_, M> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, M: InstructionMemoryAccess + ?Sized> InterpreterContext<'a, M> {
     #[must_use]
     pub const fn new(
         process: ProcessCpuContext,
-        memory: &'a dyn CpuMemory,
-        exclusive_monitor: &'a RefCell<nixe_cpu::exclusive::ExclusiveMonitorState>,
+        memory: &'a M,
+        exclusive_monitor: &'a RefCell<nixe_cpu::exclusive::ExclusiveMonitorState<M::Reservation>>,
         architectural_timer: &'a dyn ArchitecturalTimer,
         events: &'a VcpuEventState,
     ) -> Self {
@@ -85,16 +90,7 @@ impl<'a, 'worker> InterpreterContext<'a, 'worker> {
             exclusive_monitor,
             architectural_timer,
             events,
-            direct_memory: None,
         }
-    }
-
-    pub(crate) const fn with_direct_memory(
-        mut self,
-        direct_memory: Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemorySlice<'worker>>>,
-    ) -> Self {
-        self.direct_memory = direct_memory;
-        self
     }
 
     #[must_use]
@@ -110,7 +106,7 @@ impl<'a, 'worker> InterpreterContext<'a, 'worker> {
     #[must_use]
     pub const fn exclusive_monitor(
         self,
-    ) -> &'a RefCell<nixe_cpu::exclusive::ExclusiveMonitorState> {
+    ) -> &'a RefCell<nixe_cpu::exclusive::ExclusiveMonitorState<M::Reservation>> {
         self.exclusive_monitor
     }
 
@@ -120,26 +116,8 @@ impl<'a, 'worker> InterpreterContext<'a, 'worker> {
     }
 
     #[must_use]
-    pub const fn memory(self) -> &'a dyn CpuMemory {
+    pub const fn memory(self) -> &'a M {
         self.memory
-    }
-
-    #[must_use]
-    pub(crate) const fn direct_memory(
-        self,
-    ) -> Option<&'a RefCell<nixe_cpu_direct_memory::DirectMemorySlice<'worker>>> {
-        self.direct_memory
-    }
-}
-
-struct ZeroTimer;
-
-impl ArchitecturalTimer for ZeroTimer {
-    fn snapshot(&self) -> TimerSnapshot {
-        TimerSnapshot {
-            counter: 0,
-            frequency: 0,
-        }
     }
 }
 
@@ -157,10 +135,6 @@ pub enum InterpreterError {
         source: LocationDescriptor,
         encoding: InstructionEncoding,
         reason: Box<str>,
-    },
-    DirectMemory {
-        source: LocationDescriptor,
-        detail: Box<str>,
     },
 }
 
@@ -184,12 +158,6 @@ impl fmt::Display for InterpreterError {
                 formatter,
                 "invalid instruction stream: {source} encoding={encoding} reason={reason}"
             ),
-            Self::DirectMemory { source, detail } => {
-                write!(
-                    formatter,
-                    "direct interpreter memory failed at {source}: {detail}"
-                )
-            }
         }
     }
 }
@@ -197,28 +165,30 @@ impl fmt::Display for InterpreterError {
 impl std::error::Error for InterpreterError {}
 
 /// Executes one already-fetched instruction as a reference-engine step.
-pub fn execute_one(
+#[cfg(test)]
+fn execute_one(
     platform: &TargetPlatform,
     state: &mut A64State,
     encoding: u32,
 ) -> Result<InstructionStep, InterpreterError> {
-    let memory = SyntheticMemory::new();
-    let monitor = RefCell::new(Default::default());
-    let timer = ZeroTimer;
-    let events = VcpuEventState::default();
-    let context = InterpreterContext::new(
-        ProcessCpuContext::new(*platform, AddressSpaceId::new(0)),
-        &memory,
-        &monitor,
-        &timer,
-        &events,
-    );
-    execute_one_with_context(context, state, encoding)
+    crate::test_memory::UNMAPPED.with(|memory| {
+        let monitor = RefCell::new(Default::default());
+        let timer = crate::test_memory::Timer;
+        let events = VcpuEventState::default();
+        let context = InterpreterContext::new(
+            ProcessCpuContext::new(*platform, memory.space.identity()),
+            memory,
+            &monitor,
+            &timer,
+            &events,
+        );
+        execute_one_with_context(context, state, encoding)
+    })
 }
 
 /// Executes one instruction with process address-space and memory services.
 pub fn execute_one_with_context(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     state: &mut A64State,
     encoding: u32,
 ) -> Result<InstructionStep, InterpreterError> {
@@ -252,7 +222,7 @@ pub fn execute_one_with_context(
 }
 
 pub(crate) fn execute_decoded(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
 ) -> Result<InstructionStep, InterpreterError> {

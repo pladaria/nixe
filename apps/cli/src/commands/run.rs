@@ -1,6 +1,4 @@
 use std::collections::BTreeSet;
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,9 +11,8 @@ use nixe_config::{
     TimeMode, WindowState,
 };
 use nixe_horizon::{
-    GuestLogLevel, HorizonDiagnostics, HorizonSvcDispatcher, HorizonSvcFault, OperationMode,
-    SaveDataSystem, SettingsEnvironment, SystemLanguage, TimeEnvironment,
-    UnsupportedNvDrvOperation, VideoSystem, switch_1_machine_profile,
+    GuestLogLevel, HorizonDiagnostics, HorizonSvcDispatcher, OperationMode, SaveDataSystem,
+    SettingsEnvironment, SystemLanguage, TimeEnvironment, VideoSystem, switch_1_machine_profile,
 };
 use nixe_input::{
     ControllerId, EmulatedButtonState, GamepadProfiles, InputReader, InputWorker,
@@ -36,8 +33,6 @@ use super::load_config;
 
 const EXECUTION_RATE_COMPLETIONS: u64 = 1024;
 const EXECUTION_RATE_LOG_INTERVAL: Duration = Duration::from_secs(5);
-const MAXWELL_PUSHBUFFER_DUMP_DIRECTORY: &str = "dump";
-const MAXWELL_PUSHBUFFER_DUMP_FILENAME: &str = "pushbuffer.bin";
 
 pub struct Arguments {
     pub config_path: Option<PathBuf>,
@@ -51,6 +46,18 @@ pub struct Arguments {
 }
 
 pub fn run(arguments: Arguments) -> Result<(), String> {
+    let memory = nixe_memory::Machine::switch_ram().map_err(|error| error.to_string())?;
+    #[cfg(feature = "performance-counters")]
+    let capture = crate::performance::Capture::start(memory.clone()).map_err(|e| e.to_string())?;
+    let result = run_with_memory(arguments, memory);
+    #[cfg(feature = "performance-counters")]
+    if let Some(capture) = capture {
+        capture.finish().map_err(|e| e.to_string())?;
+    }
+    result
+}
+
+fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result<(), String> {
     let Arguments {
         config_path,
         log_level_override,
@@ -187,7 +194,10 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
     let cpu_backend = select_cpu_backend(cpu_configuration)?;
     let trace_interpreter = matches!(cpu_backend, CpuBackendConfig::Interpreter)
         && log::log_enabled!(log::Level::Trace);
-    let process_builder = ProcessBuilder::new()
+    let system_memory = memory
+        .account(nixe_memory::DEFAULT_RAM_BYTES)
+        .map_err(|error| error.to_string())?;
+    let process_builder = ProcessBuilder::new(memory, system_memory)
         .with_virtual_clock(virtual_clock.clone())
         .with_sd_card_root(sd_card_root)
         .with_config(machine_profile.process_build_config())
@@ -208,8 +218,12 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         InitialOperationMode::Docked => OperationMode::Console,
     };
     log::debug!("initial operation mode: {initial_operation_mode:?}");
-    let time_environment = TimeEnvironment::new(virtual_clock, &config.system.time.timezone)
-        .map_err(|error| format!("cannot create Horizon time environment: {error}"))?;
+    let time_environment = TimeEnvironment::new(
+        process.memory().system_account(),
+        virtual_clock,
+        &config.system.time.timezone,
+    )
+    .map_err(|error| format!("cannot create Horizon time environment: {error}"))?;
     let settings_environment = SettingsEnvironment::for_language(
         config
             .system
@@ -223,7 +237,12 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         operation_mode: initial_operation_mode,
         time: time_environment,
         settings: settings_environment,
-        shared_fonts: nixe_horizon::SharedFontSession::new(config.system.font.clone()),
+        hid: nixe_horizon::HidSystem::new(process.memory().system_account())
+            .map_err(|e| e.to_string())?,
+        shared_fonts: nixe_horizon::SharedFontSession::new(
+            process.memory().system_account(),
+            config.system.font.clone(),
+        )?,
         system_archives: nixe_horizon::SystemArchives::new(config.system.dictionary.clone()),
         application_language: plan.control_metadata().and_then(|control| {
             desired_application_language(
@@ -293,6 +312,7 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
             device.profile().name
         );
         let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
+            process.memory().space().machine().clone(),
             device,
             nixe_gpu_maxwell::MAXWELL_SHADER_NAMESPACE,
             nixe_gpu_vulkan::cache::CacheConfiguration {
@@ -313,7 +333,12 @@ pub fn run(arguments: Arguments) -> Result<(), String> {
         let maxwell = nixe_gpu_maxwell::MaxwellNativeFrontend::new(
             renderer.device_profile().shader_compiler.clone(),
         );
-        VideoSystem::with_gpu_frontend(presenter, renderer, maxwell)
+        VideoSystem::with_gpu_frontend(
+            process.memory().space().machine().clone(),
+            presenter,
+            renderer,
+            maxwell,
+        )
     };
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
     // SDL initialization and final subsystem shutdown remain on the main thread.
@@ -569,6 +594,7 @@ struct HorizonEnvironment {
     operation_mode: OperationMode,
     time: TimeEnvironment,
     settings: SettingsEnvironment,
+    hid: nixe_horizon::HidSystem,
     shared_fonts: nixe_horizon::SharedFontSession,
     system_archives: nixe_horizon::SystemArchives,
     application_language: Option<SystemLanguage>,
@@ -727,10 +753,12 @@ fn execute(
     let mut dispatcher = HorizonSvcDispatcher::new_with_video_and_settings(
         horizon_environment.operation_mode,
         horizon_environment.time,
+        horizon_environment.hid,
+        horizon_environment.shared_fonts,
         horizon_environment.settings,
         video_system,
     )
-    .with_shared_fonts(horizon_environment.shared_fonts)
+    .with_memory_completions(coordinator.event_sender())
     .with_system_archives(horizon_environment.system_archives)
     .with_diagnostics(horizon_environment.diagnostics)
     .with_audio_backend(audio_backend.clone())
@@ -764,6 +792,9 @@ fn execute(
         coordinator
             .drain_external_events()
             .map_err(|error| error.to_string())?;
+        dispatcher
+            .poll_memory_completions(coordinator)
+            .map_err(|error| error.to_string())?;
         if coordinator.host_stop_requested() {
             log::info!("host stop received; stopping the guest process cleanly");
             if !coordinator
@@ -796,6 +827,9 @@ fn execute(
         let elapsed = coordinator
             .emulation_elapsed()
             .saturating_sub(execution_started);
+        dispatcher
+            .poll_input_publication()
+            .map_err(|error| error.to_string())?;
         dispatcher
             .advance_video(elapsed)
             .map_err(|error| error.to_string())?;
@@ -868,6 +902,9 @@ fn execute(
                     .saturating_sub(execution_started),
                 dispatcher.next_video_deadline(),
             );
+            let host_wait = dispatcher
+                .next_service_deadline()
+                .map_or(host_wait, |deadline| deadline.min(host_wait));
             coordinator
                 .wait_for_external_event_for(host_wait)
                 .map_err(|error| error.to_string())?;
@@ -958,7 +995,6 @@ fn execute(
                         }
                         ExceptionHandlingResult::Suspended => {}
                         ExceptionHandlingResult::Fault(error) => {
-                            dump_maxwell_pushbuffer_on_fault(&error);
                             return Err(format!("Horizon SVC dispatch failed: {error}; {report}"));
                         }
                     }
@@ -970,65 +1006,6 @@ fn execute(
             }
         }
     }
-}
-
-fn dump_maxwell_pushbuffer_on_fault(fault: &HorizonSvcFault) {
-    let HorizonSvcFault::Ipc { fault, .. } = fault else {
-        return;
-    };
-    let Some(UnsupportedNvDrvOperation::ScheduledGpfifoSubmission { boundary, .. }) =
-        fault.unsupported_nvdrv()
-    else {
-        return;
-    };
-    if boundary.frontend_failure().is_none() {
-        return;
-    }
-    let diagnostic = match boundary.frontend_diagnostic() {
-        Ok(Some(diagnostic)) => diagnostic,
-        Ok(None) => return,
-        Err(error) => {
-            log::warn!("cannot reconstruct failed Maxwell pushbuffer: {error}");
-            return;
-        }
-    };
-    let directory = PathBuf::from(MAXWELL_PUSHBUFFER_DUMP_DIRECTORY);
-    let path = directory.join(MAXWELL_PUSHBUFFER_DUMP_FILENAME);
-
-    let result = (|| -> io::Result<()> {
-        std::fs::create_dir_all(&directory)?;
-        let file = File::create(&path)?;
-        let mut writer = BufWriter::new(file);
-        write_nv_push_dump_words(&mut writer, diagnostic.words().iter().copied())?;
-        writer.flush()
-    })();
-
-    match result {
-        Ok(()) => log::info!(
-            "Maxwell pushbuffer dumped for nv_push_dump: path={} words={} total={} complete={}",
-            path.display(),
-            diagnostic.words().len(),
-            diagnostic.total_words(),
-            diagnostic.is_complete(),
-        ),
-        Err(error) => log::warn!(
-            "cannot dump Maxwell pushbuffer to {}: {error}",
-            path.display()
-        ),
-    }
-}
-
-fn write_nv_push_dump_words(
-    writer: &mut impl Write,
-    words: impl IntoIterator<Item = u32>,
-) -> io::Result<()> {
-    // Mesa's nv_push_dump consumes a headerless array of native uint32_t
-    // command words. Nixe emits the Switch/Maxwell little-endian form.
-    // https://android.googlesource.com/platform/external/mesa3d/+/refs/tags/upstream-mesa-26.0.6/src/nouveau/headers/nv_push_dump.c
-    for word in words {
-        writer.write_all(&word.to_le_bytes())?;
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1346,14 +1323,6 @@ mod tests {
             button_transitions(all_pressed, EmulatedButtonState::default()).collect::<Vec<_>>();
         assert_eq!(released.len(), 18);
         assert!(released.iter().all(|(_, state)| !state));
-    }
-
-    #[test]
-    fn nv_push_dump_words_are_headerless_little_endian_u32_values() {
-        let mut bytes = Vec::new();
-        write_nv_push_dump_words(&mut bytes, [0x2001_4000, 0x0002_0002]).unwrap();
-
-        assert_eq!(bytes, [0x00, 0x40, 0x01, 0x20, 0x02, 0x00, 0x02, 0x00]);
     }
 
     fn process_exit(cause: ProcessExitCause, exit_code: u64) -> ProcessExit {

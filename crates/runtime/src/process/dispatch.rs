@@ -28,28 +28,14 @@ impl RunnableProcess {
         self.execution.request_stop()
     }
 
-    pub(crate) fn cpu_thread_teardown_state(&self) -> super::execution::CpuThreadTeardownState {
-        self.execution.cpu_thread_teardown_state(
-            std::sync::Arc::clone(&self.memory),
-            self.main_thread()
-                .state
-                .as_ref()
-                .filter(|state| state.is_available())
-                .map(|state| Box::new(state.snapshot())),
-        )
-    }
-
-    pub(crate) fn complete_cpu_thread_retirement(
-        &mut self,
-    ) -> Result<(), nixe_cpu::execution::CpuFault> {
+    pub(crate) fn complete_cpu_thread_retirement(&mut self) {
         for (_, thread) in self.threads.iter_mut() {
             if let Some(state) = &mut thread.state {
                 state.materialize();
             }
         }
         self.execution.residents.clear();
-        self.execution
-            .complete_cpu_thread_retirement(self.memory.invalidation_cursor())
+        self.execution.complete_cpu_thread_retirement();
     }
 
     pub(crate) fn request_safepoint(&mut self) {
@@ -160,8 +146,7 @@ impl RunnableProcess {
         self.execution
             .residents
             .retain(|core, guest| *core == vcpu || *guest != thread_id);
-        let (virtual_clock, architectural_timer_frequency, cpu, address_space_end) =
-            self.execution.execution_environment();
+        let (virtual_clock, architectural_timer_frequency) = self.execution.execution_environment();
         let thread = self
             .threads
             .get_mut(thread_id)
@@ -171,11 +156,8 @@ impl RunnableProcess {
             .expect("a ready scheduler thread owns resident CPU state");
         Ok(execution::VcpuExecutionState {
             thread: state,
-            cpu,
-            memory: std::sync::Arc::clone(&self.memory),
             virtual_clock,
             architectural_timer_frequency,
-            address_space_end,
             instruction_budget,
             capture_context,
             events,

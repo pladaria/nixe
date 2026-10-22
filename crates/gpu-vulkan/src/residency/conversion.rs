@@ -39,7 +39,7 @@ pub struct PreparedNv12 {
 pub fn nv12_pipeline(
     compiler: &PipelineCompiler,
     format: vk::Format,
-) -> Result<Pending<NativePipeline>, CompileError> {
+) -> Result<Arc<NativePipeline>, CompileError> {
     if !matches!(
         format,
         vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM

@@ -5,14 +5,14 @@
 //! semantic result translation therefore live here, while each service owns
 //! its wire command decoder.
 
-use nixe_runtime::ExceptionProcessContext;
+use crate::ipc_wire::request::Request;
 
 use crate::ipc_wire::io::encode_domain_response;
 use crate::ipc_wire::message::{CmifRequest, DomainRequest, HipcRequest};
 use crate::ipc_wire::{IpcWireError, unsupported_service_command};
 use crate::{
-    FileSystemAccessLogMode, HorizonIpcResult, IpcDispatcher, IpcRequest, IpcResultCode,
-    IpcService, IpcSession, SemanticIpcObject,
+    FileSystemAccessLogMode, HorizonIpcResult, IpcRequest, IpcResultCode, IpcService, IpcSession,
+    SemanticIpcObject,
 };
 
 use super::fsp;
@@ -24,8 +24,8 @@ enum Target {
     Object(SemanticIpcObject),
 }
 
-pub(in crate::ipc_wire) fn dispatch_service(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_service(
+    process: &mut Request,
     session: &IpcSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -80,14 +80,14 @@ pub(in crate::ipc_wire) fn dispatch_service(
         && session.service() == IpcService::FileSystem
         && request.command_id == 51
     {
-        return fsp::open_save_data(process, session, request, hipc, save_data);
+        return fsp::open_save_data(process, session, request, hipc, save_data).await;
     }
 
     if matches!(target, Target::Root)
         && session.service() == IpcService::FileSystem
         && request.command_id == 202
     {
-        return fsp::open_system_data(process, session, request, hipc, system_archives);
+        return fsp::open_system_data(process, session, request, hipc, system_archives).await;
     }
 
     dispatch_command(
@@ -99,10 +99,11 @@ pub(in crate::ipc_wire) fn dispatch_service(
         hipc,
         file_system_access_log_mode,
     )
+    .await
 }
 
-pub(in crate::ipc_wire) fn dispatch_plain_object(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_plain_object(
+    process: &mut Request,
     object: &SemanticIpcObject,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -116,10 +117,11 @@ pub(in crate::ipc_wire) fn dispatch_plain_object(
         hipc,
         FileSystemAccessLogMode::None,
     )
+    .await
 }
 
-fn dispatch_command(
-    process: &mut ExceptionProcessContext<'_>,
+async fn dispatch_command(
+    process: &mut Request,
     service: IpcService,
     session: Option<&IpcSession>,
     target: Target,
@@ -133,7 +135,7 @@ fn dispatch_command(
             semantic_service_name(service),
         ),
         Target::Object(object) => (
-            fsp::decode_object_request(process, object, &request, hipc)?,
+            fsp::decode_object_request(process, object, &request, hipc).await?,
             fsp::object_name(object),
         ),
     };
@@ -142,33 +144,33 @@ fn dispatch_command(
     };
 
     let result = {
-        let (mounts, handles) = process.mounts_and_handles_mut();
+        let mounts = process.mounts();
         match &target {
-            Target::Root => IpcDispatcher::dispatch_session(
+            Target::Root => crate::ipc::dispatch_session(
                 mounts,
-                handles,
                 session.expect("a content-service root belongs to a session"),
                 decoded,
                 file_system_access_log_mode,
             ),
-            Target::Object(object) => {
-                IpcDispatcher::dispatch_semantic_object(mounts, handles, object, decoded)
-            }
+            Target::Object(object) => crate::ipc::dispatch_semantic_object(mounts, object, decoded),
         }
     };
 
     match result {
-        Ok(response) => encode_semantic_response(
-            process,
-            session,
-            match &target {
-                Target::Root => None,
-                Target::Object(object) => Some(object),
-            },
-            request,
-            hipc,
-            response,
-        ),
+        Ok(response) => {
+            encode_semantic_response(
+                process,
+                session,
+                match &target {
+                    Target::Root => None,
+                    Target::Object(object) => Some(object),
+                },
+                request,
+                hipc,
+                response,
+            )
+            .await
+        }
         Err(IpcResultCode::INVALID_COMMAND) => {
             unsupported_service_command(name, request.command_id)
         }

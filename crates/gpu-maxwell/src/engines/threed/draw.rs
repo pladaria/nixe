@@ -128,8 +128,8 @@ pub(in crate::engines) fn flush<E>(
 mod tests {
     use super::*;
     use crate::*;
+    use nixe_gpu::MappingGeneration;
     use nixe_gpu::{FrontendSubmissionId, GpuVirtualAddress};
-    use nixe_memory::MappingGeneration;
     use std::convert::Infallible;
 
     fn source() -> MaxwellMethodSource {

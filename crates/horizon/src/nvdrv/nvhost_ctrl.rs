@@ -46,16 +46,6 @@ pub(crate) enum NvHostCtrlWaitKind {
     RegisteredEvent,
 }
 
-impl NvHostCtrlWaitKind {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Direct => "direct",
-            Self::AllocateEvent => "allocate-event",
-            Self::RegisteredEvent => "registered-event",
-        }
-    }
-}
-
 /// Runtime identity of one guest thread blocked in a direct nvdrv wait.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct NvHostCtrlWaiterId {
@@ -85,26 +75,6 @@ pub(crate) struct PendingNvHostCtrlWait {
 }
 
 impl PendingNvHostCtrlWait {
-    pub(crate) const fn request(&self) -> u32 {
-        self.request
-    }
-
-    pub(crate) const fn target(&self) -> GuestTimelinePoint {
-        self.target
-    }
-
-    pub(crate) const fn timeout_microseconds(&self) -> i32 {
-        self.timeout_microseconds
-    }
-
-    pub(crate) const fn kind(&self) -> NvHostCtrlWaitKind {
-        self.kind
-    }
-
-    pub(crate) const fn event_slot(&self) -> Option<GpuSyncpointEventSlot> {
-        self.event_slot
-    }
-
     pub(crate) fn wake_event(&self) -> ReadableEventObject {
         self.wake_event.clone()
     }
@@ -946,7 +916,7 @@ mod tests {
         else {
             panic!("syncpoint read unexpectedly blocked")
         };
-        assert_eq!(input_u32(&read, 4), Ok(1));
+        assert_eq!((input_u32(&read, 4)).unwrap(), 1);
         assert!(matches!(
             control.ioctl(descriptor(), IOCTL_SYNCPT_WAIT, &words(&[5, 1, 0])),
             Ok(NvHostCtrlIoctlOutcome::Complete(_))
@@ -985,7 +955,7 @@ mod tests {
         else {
             panic!("completed fence regressed after channel release")
         };
-        assert_eq!(input_u32(&wait, 12), Ok(80));
+        assert_eq!((input_u32(&wait, 12)).unwrap(), 80);
 
         let reused = control
             .allocate_channel_syncpoint(descriptor(), IOCTL_SYNCPT_INCREMENT)
@@ -1008,10 +978,10 @@ mod tests {
         else {
             panic!("unresolved wait completed early")
         };
-        assert_eq!(wait.target().syncpoint(), GuestSyncpointId::new(2));
-        assert_eq!(wait.target().value(), GuestSyncpointValue::new(9));
-        assert_eq!(wait.timeout_microseconds(), -1);
-        assert_eq!(wait.kind(), NvHostCtrlWaitKind::Direct);
+        assert_eq!(wait.target.syncpoint(), GuestSyncpointId::new(2));
+        assert_eq!(wait.target.value(), GuestSyncpointValue::new(9));
+        assert_eq!(wait.timeout_microseconds, -1);
+        assert_eq!(wait.kind, NvHostCtrlWaitKind::Direct);
 
         let NvHostCtrlIoctlOutcome::Complete(read) = control
             .ioctl(descriptor(), IOCTL_SYNCPT_READ, &words(&[2, 99]))
@@ -1019,7 +989,7 @@ mod tests {
         else {
             panic!("syncpoint read unexpectedly blocked")
         };
-        assert_eq!(input_u32(&read, 4), Ok(NV_SUCCESS));
+        assert_eq!((input_u32(&read, 4)).unwrap(), NV_SUCCESS);
     }
 
     #[test]
@@ -1284,33 +1254,33 @@ mod tests {
         else {
             panic!("recreated syncpoint read unexpectedly blocked")
         };
-        assert_eq!(input_u32(&read, 4), Ok(0));
+        assert_eq!((input_u32(&read, 4)).unwrap(), 0);
     }
 
     #[test]
     fn invalid_syncpoints_slots_and_sizes_return_guest_argument_errors() {
         let mut control = NvHostControl::default();
         control.open(FD);
-        assert_eq!(
+        assert!(matches!(
             control.ioctl(
                 descriptor(),
                 IOCTL_SYNCPT_READ,
                 &words(&[SYNCPOINT_COUNT, 0])
             ),
             Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER))
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             control.ioctl(
                 descriptor(),
                 IOCTL_SYNCPT_ALLOC_EVENT,
                 &words(&[EVENT_SLOT_COUNT])
             ),
             Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER))
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             control.ioctl(descriptor(), IOCTL_SYNCPT_READ, &[0; 7]),
             Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER))
-        );
+        ));
     }
 
     #[test]

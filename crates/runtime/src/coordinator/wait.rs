@@ -52,6 +52,11 @@ impl RuntimeCoordinator {
         }
     }
 
+    /// Completes only the current generation after its owned result is installed.
+    pub fn complete_wait(&mut self, token: WakeToken) -> Result<bool, CoordinatorError> {
+        self.apply_wake(token, false)
+    }
+
     /// Cancels exactly one current wait generation and releases its observers
     /// and deadline. A readiness wake which already won cannot be cancelled.
     pub fn cancel_wait(&mut self, token: WakeToken) -> Result<bool, CoordinatorError> {
@@ -64,14 +69,23 @@ impl RuntimeCoordinator {
     }
 
     /// Suspends a caller until a monotonic scheduler deadline. Non-positive
-    /// Horizon sleep values are scheduler yields and become ready immediately.
+    /// Horizon values 0, -1 and -2 select the three explicit yield modes.
     pub fn sleep_thread(
         &mut self,
         thread: GuestThreadId,
         nanoseconds: i64,
     ) -> Result<Option<WakeToken>, CoordinatorError> {
         if nanoseconds <= 0 {
-            self.make_thread_ready(thread)?;
+            let migration = match nanoseconds {
+                0 => Some(nixe_scheduler::YieldMigration::None),
+                -1 => Some(nixe_scheduler::YieldMigration::Suggested),
+                -2 => Some(nixe_scheduler::YieldMigration::Any),
+                _ => None,
+            };
+            self.scheduler.apply(match migration {
+                Some(migration) => SchedulerCommand::Yield { thread, migration },
+                None => SchedulerCommand::MakeReady(thread),
+            })?;
             return Ok(None);
         }
         let token = self.register_timed_wait(thread, Some(nanoseconds as u64))?;
@@ -147,7 +161,25 @@ impl RuntimeCoordinator {
         Ok(true)
     }
 
+    pub(super) fn service_preemption(&mut self) {
+        let Some(deadline) = self.next_preemption_ns else {
+            return;
+        };
+        let now = self.virtual_time_ns();
+        if now < deadline {
+            return;
+        }
+        let interval = self.scheduler.profile().preemption_interval_ns().unwrap();
+        // Missed host callbacks do not mean guest threads actually ran intervening
+        // turns. Rotate once and preserve the periodic phase, as CoreTiming does.
+        self.next_preemption_ns = Some(now.saturating_add(interval - (now - deadline) % interval));
+        self.scheduler
+            .apply(SchedulerCommand::Rotate)
+            .expect("rotation is infallible");
+    }
+
     pub(super) fn wake_due_deadlines(&mut self) -> Result<usize, CoordinatorError> {
+        self.service_preemption();
         if self.deadlines.is_empty() {
             return Ok(0);
         }
@@ -158,6 +190,15 @@ impl RuntimeCoordinator {
                 break;
             }
             self.deadlines.remove(&key);
+            let handoff = self.scheduler.thread(token.thread).is_some_and(|thread| {
+                thread.active_wait == Some(token)
+                    && self.processes.get(&thread.process).is_some_and(|process| {
+                        process.address_waits().lock().defer_timeout(token.thread)
+                    })
+            });
+            if handoff {
+                continue;
+            }
             if self.apply_wake(token, false)? {
                 // Address waits complete at timer expiry, before a later mutex
                 // unlock or condition signal can transfer ownership to them.
@@ -166,7 +207,8 @@ impl RuntimeCoordinator {
                     .processes
                     .get_mut(&process_id)
                     .unwrap()
-                    .address_waits_mut()
+                    .address_waits()
+                    .lock()
                     .expire_thread_wait(token.thread)
                 {
                     self.priority_donations

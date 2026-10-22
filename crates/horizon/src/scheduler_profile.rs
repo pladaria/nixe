@@ -67,12 +67,18 @@ pub fn switch_1_machine_profile() -> HorizonMachineProfile {
 pub fn switch_1_scheduler_profile() -> MachineSchedulerProfile {
     MachineSchedulerProfile::new(
         (0..4)
-            .map(|id| VirtualCpuDescriptor::new(VirtualCpuId::new(id), 0))
+            .map(|id| {
+                VirtualCpuDescriptor::new(VirtualCpuId::new(id), 0)
+                    .with_rotation_priority(if id == 3 { 63 } else { 59 })
+            })
             .collect(),
         PriorityRange::new(0, 63).expect("the verified Switch 1 priority range is valid"),
         10_000,
     )
     .expect("the verified Switch 1 scheduler topology is valid")
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/global_scheduler_context.cpp#L41-L55
+    .with_preemption(10_000_000, 2)
+    .expect("the verified Switch 1 preemption policy is valid")
 }
 
 #[cfg(test)]

@@ -76,7 +76,7 @@ impl VulkanResidency {
     /// the host really lacks a format, rather than inheriting WebGPU size rules.
     pub fn sampled_image_for(
         &mut self,
-        backing: CanonicalBackingRange,
+        geometry: Vec<Arc<Footprint>>,
         description: NativeImageDescription,
         planes: Vec<ImagePlane>,
     ) -> Result<ImageId, VulkanError> {
@@ -102,7 +102,7 @@ impl VulkanResidency {
             true
         };
         match support {
-            Ok(_) if enabled => return self.image_for(backing, description, planes),
+            Ok(_) if enabled => return self.image_for(geometry, description, planes),
             Err(e) if e != vk::Result::ERROR_FORMAT_NOT_SUPPORTED => {
                 return Err(VulkanError::vk("sampled image format query", e));
             }
@@ -140,7 +140,7 @@ impl VulkanResidency {
             })
             .collect();
         let id = self.create_image_representation(
-            backing,
+            geometry,
             target,
             native_planes,
             true,
@@ -155,28 +155,57 @@ impl VulkanResidency {
     }
     pub(super) fn refresh_decoded_image(&mut self, id: ImageId) -> Result<(), VulkanError> {
         let image = self.image(id)?;
-        let backing = image.contents.backing.clone();
-        let dependency = image.contents.cpu.clone();
-        let mut dirty = image.contents.invalid.clone();
+        let geometry = image.contents.geometry.clone();
         let encoded = image.decoded.as_ref().unwrap().clone();
         let native = image.planes.clone();
-        let imports = self.cpu_imports(&backing, &dependency, &[])?;
-        dirty.extend(imports.gpu_invalidated);
-        for (offset, bytes) in imports.snapshots {
-            dirty.push((offset, bytes.len() as u64));
+        let bytes = encoded
+            .planes
+            .iter()
+            .map(|p| p.end().expect("encoded plane"))
+            .max()
+            .expect("encoded planes");
+        let mut parts = Vec::new();
+        for footprint in &geometry {
+            parts.extend(self.authority.resolve_footprint(footprint)?);
         }
-        normalize(&mut dirty);
-        // Encoded blocks produced by GPU storage writes must become visible to
-        // the exact CPU decoder. This is a host-format limitation, not a segment
-        // switch or a CPU shader execution fallback. Unchanged imports do no work.
-        if backing.pages().any(|page| {
-            self.index
-                .pages
-                .get(&page.identity())
-                .is_some_and(|p| p.has_writes())
-        }) {
-            self.accept_recording()?;
-        }
+        let device = geometry
+            .iter()
+            .map(|f| {
+                self.authority
+                    .observe_native(Resource::Image(id), Arc::clone(f))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (captured, cpu) = if parts.iter().all(|p| p.producer.is_none()) {
+            let mut inputs = Vec::new();
+            for footprint in &geometry {
+                footprint.mapping().observed_pages(footprint, &mut inputs)?;
+            }
+            let inputs = nixe_gpu::physical::pin_selected_pages(inputs)?;
+            let copies: Vec<_> = parts
+                .iter()
+                .map(|p| nixe_memory::PhysicalCapture {
+                    source: nixe_memory::Extent {
+                        start: p.start,
+                        bytes: p.bytes,
+                    },
+                    destination: p.logical as usize,
+                })
+                .collect();
+            let mut bytes = vec![0; bytes as usize];
+            let observation = self
+                .memory
+                .capture_clean_scattered(&inputs, &copies, &mut bytes)?;
+            (bytes, vec![observation])
+        } else {
+            let buffer = self.buffer_for_geometry(
+                geometry,
+                bytes,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                true,
+            )?;
+            let cpu = self.buffer(buffer)?.contents.cpu.clone();
+            (self.read_buffer_native(buffer, 0, bytes)?, cpu)
+        };
         let mut decoder = std::mem::take(&mut self.decoder);
         let result = (|| {
             let format = codec(encoded.format).unwrap();
@@ -187,24 +216,12 @@ impl VulkanResidency {
                         let offset = source.offset
                             + u64::from(row) * source.row_pitch
                             + u64::from(column) * u64::from(source.bytes_per_block);
-                        if !dirty.iter().any(|&(start, size)| {
-                            start < offset + u64::from(source.bytes_per_block)
-                                && offset < start + size
-                        }) {
-                            continue;
-                        }
-                        let mut block = vec![0; source.bytes_per_block as usize];
-                        backing
-                            .read_with_resolver(offset, &mut block, &mut |_, request| {
-                                self.materialize_cpu_page(request).map_err(|e| {
-                                    nixe_memory::VisibilityCoordinatorError::new(e.to_string())
-                                })
-                            })
-                            .map_err(memory_error)?;
+                        let block = &captured
+                            [offset as usize..offset as usize + source.bytes_per_block as usize];
                         let width = bw.min(source.extent.width - column * bw);
                         let height = bh.min(source.extent.height - row * bh);
                         let pixels = decoder
-                            .decode(format, width, height, &block)
+                            .decode(format, width, height, block)
                             .map_err(|e| VulkanError::TextureDecode(e.to_string().into()))?;
                         let rect = vk::Rect2D {
                             offset: vk::Offset2D {
@@ -219,6 +236,8 @@ impl VulkanResidency {
             }
             let work = self.device.work_ticket()?;
             let image = self.images[id.slot].entry.as_mut().unwrap();
+            image.contents.cpu = cpu;
+            image.contents.device = device;
             image.contents.invalid.clear();
             image.producer = Some(work);
             image.version = image

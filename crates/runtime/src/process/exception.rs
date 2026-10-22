@@ -52,10 +52,36 @@ impl RunnableProcess {
                 current,
             });
         }
+        let outcome =
+            self.with_exception_context(thread_id, vcpu, request.source(), |context| {
+                dispatcher.dispatch(context, request)
+            })?;
+        self.apply_supervisor_call_outcome(thread_id, request.source(), other_live, outcome)
+    }
+
+    pub(crate) fn resume_supervisor_call_for<F>(
+        &mut self,
+        thread_id: nixe_scheduler::GuestThreadId,
+        vcpu: nixe_scheduler::VirtualCpuId,
+        source: LocationDescriptor,
+        other_live: bool,
+        continuation: impl FnOnce(&mut ExceptionDispatchContext<'_>) -> ExceptionDispatchOutcome<F>,
+    ) -> Result<ExceptionHandlingResult<F>, ExceptionRouteError> {
+        let outcome = self.with_exception_context(thread_id, vcpu, source, continuation)?;
+        self.apply_supervisor_call_outcome(thread_id, source, other_live, outcome)
+    }
+
+    fn with_exception_context<T>(
+        &mut self,
+        thread_id: nixe_scheduler::GuestThreadId,
+        vcpu: nixe_scheduler::VirtualCpuId,
+        source: LocationDescriptor,
+        operation: impl FnOnce(&mut ExceptionDispatchContext<'_>) -> T,
+    ) -> Result<T, ExceptionRouteError> {
         let thread = self
             .threads
             .get_mut(thread_id)
-            .expect("the selected thread was validated");
+            .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
         let handle = thread.handle;
         let object = thread.object.clone();
         let process = ExceptionProcessContext::new(
@@ -67,21 +93,17 @@ impl RunnableProcess {
                 random_entropy: self.random_entropy,
                 thread_policy: self.thread_policy,
             },
-            &mut self.memory_accounting,
             ExceptionProcessResources {
                 memory: &self.memory,
-                mapping_control: &self.execution,
-                canonical_memory: self.memory.as_ref(),
                 mounts: &self.mounts,
-                handles: &mut self.handles,
-                address_waits: &mut self.address_waits,
+                handles: &self.handles,
+                address_waits: &self.address_waits,
             },
         );
         let thread =
             ExceptionThreadContext::new(thread_id, vcpu, object, handle, thread.state_mut());
-        let mut context = ExceptionDispatchContext::new(process, thread);
-        let outcome = dispatcher.dispatch(&mut context, request);
-        self.apply_supervisor_call_outcome(thread_id, request.source(), other_live, outcome)
+        let mut context = ExceptionDispatchContext::new(source, process, thread);
+        Ok(operation(&mut context))
     }
 
     fn apply_supervisor_call_outcome<F>(
@@ -253,15 +275,12 @@ impl RunnableProcess {
                 .is_some_and(|end| end <= stack_top)
         {
             let mut record = [0_u8; 16];
-            if self
-                .memory
-                .read_bytes(
-                    self.cpu.address_space_id(),
-                    GuestVirtualAddress::new(frame_pointer),
-                    &mut record,
-                )
-                .is_err()
-            {
+            if !matches!(
+                self.memory
+                    .space()
+                    .read_into(GuestVirtualAddress::new(frame_pointer), &mut record),
+                Ok(nixe_memory::Access::Ready(()))
+            ) {
                 break;
             }
             let previous = u64::from_le_bytes(record[..8].try_into().unwrap());

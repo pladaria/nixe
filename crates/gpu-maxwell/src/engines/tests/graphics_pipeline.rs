@@ -189,8 +189,12 @@ fn z_compression_selector_is_typed_depth_state_without_an_operation() {
         assert_eq!(channel.two_d(), &two_d_before);
     }
 
-    let resources =
-        resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
+    let resources = resolve_maxwell_three_d_resources(
+        channel.three_d(),
+        resource_address_space().memory(),
+        &mut crate::test_memory::apply,
+    )
+    .unwrap();
     assert!(resources.resources().is_empty());
 }
 
@@ -292,9 +296,12 @@ fn color_compression_selectors_are_typed_and_isolated_per_target() {
             assert_eq!(channel.two_d(), &two_d_before);
         }
 
-        let resources =
-            resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space())
-                .unwrap();
+        let resources = resolve_maxwell_three_d_resources(
+            channel.three_d(),
+            resource_address_space().memory(),
+            &mut crate::test_memory::apply,
+        )
+        .unwrap();
         assert!(resources.resources().is_empty());
     }
 }
@@ -430,8 +437,12 @@ fn compression_threshold_is_typed_source_preserving_nonsemantic_policy() {
         assert_eq!(channel.two_d(), &two_d_before);
     }
 
-    let resources =
-        resolve_maxwell_three_d_resources(channel.three_d(), &resource_address_space()).unwrap();
+    let resources = resolve_maxwell_three_d_resources(
+        channel.three_d(),
+        resource_address_space().memory(),
+        &mut crate::test_memory::apply,
+    )
+    .unwrap();
     assert!(resources.resources().is_empty());
 }
 
@@ -1892,10 +1903,14 @@ fn depth_layer_reset_is_shared_by_live_state_and_mme_shadow_replay() {
         MaxwellThreeDRegisterOrigin::Unset
     );
     assert!(
-        resolve_maxwell_three_d_resources(&reset_state, &resource_address_space())
-            .unwrap()
-            .resources()
-            .is_empty()
+        resolve_maxwell_three_d_resources(
+            &reset_state,
+            resource_address_space().memory(),
+            &mut crate::test_memory::apply
+        )
+        .unwrap()
+        .resources()
+        .is_empty()
     );
 
     program_three_d(&mut channel, 0x0124, 2);
@@ -3318,25 +3333,23 @@ fn viewport_firmware_defaults_are_shared_by_live_state_and_shadow_replay() {
     );
 }
 
-#[test]
-fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
-    use crate::execution::MaxwellFrontend;
-    use nixe_gpu::native::NativeCommand;
-    let vertices = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-    let color = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
-    let shaders = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+struct NativeDrawFixture {
+    space: MaxwellGpuAddressSpace,
+    channel: MaxwellGpuChannel,
+    shaders: Allocation,
+    vertex: u64,
+    fragment_header: [u32; 20],
+}
+
+fn native_draw_fixture() -> NativeDrawFixture {
     let mut space = resource_address_space();
-    let mut map = |allocation: &CanonicalAllocation, id, kind| {
-        map_resource(
-            &mut space,
-            allocation
-                .backing_range(MemoryPermissions::READ_WRITE)
-                .unwrap(),
-            id,
-            kind,
-        )
-        .offset()
-        .get()
+    let vertices = crate::test_memory::allocate(space.memory().machine(), 0x1000);
+    let color = crate::test_memory::allocate(space.memory().machine(), 0x10000);
+    let shaders = crate::test_memory::allocate(space.memory().machine(), 0x1000);
+    let mut map = |allocation: &Allocation, id, kind| {
+        map_resource(&mut space, crate::test_memory::ranges(allocation), id, kind)
+            .offset()
+            .get()
     };
     let vertex = map(&vertices, 1, 0);
     let target = map(&color, 2, 0xfe);
@@ -3344,36 +3357,36 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
     let exit = 0xe300_0000_0007_000f_u64;
     let mut header = [0_u32; 20];
     header[0] = 0x0002_0461;
-    shaders
-        .write(
-            0,
-            &header
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .chain([exit, 0, 0, 0].into_iter().flat_map(u64::to_le_bytes))
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    crate::test_memory::write(
+        &shaders,
+        0,
+        &header
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .chain([exit, 0, 0, 0].into_iter().flat_map(u64::to_le_bytes))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     header = [0; 20];
     header[0] = 0x0002_5462;
     header[4] = 0x000f_f000;
     header[6] = 0xaa;
     header[13] = 0;
     header[18] = 1;
-    shaders
-        .write(
-            0x100,
-            &header
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .chain(
-                    [0xe0c3_ff88_0077_ff00, exit, 0, 0]
-                        .into_iter()
-                        .flat_map(u64::to_le_bytes),
-                )
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    crate::test_memory::write(
+        &shaders,
+        0x100,
+        &header
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .chain(
+                [0xe0c3_ff88_0077_ff00, exit, 0, 0]
+                    .into_iter()
+                    .flat_map(u64::to_le_bytes),
+            )
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let mut channel = three_d_channel();
     program_basic_draw_state(&mut channel, vertex);
     program_color_target(&mut channel, 0, target, 0xd5);
@@ -3388,6 +3401,63 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
     ] {
         program_three_d(&mut channel, method, value);
     }
+    NativeDrawFixture {
+        space,
+        channel,
+        shaders,
+        vertex,
+        fragment_header: header,
+    }
+}
+
+#[test]
+#[ignore = "Explicit command/resource CPU-stage saturation diagnostic; not game FPS"]
+fn profile_native_frontend_draw_consumption() {
+    use crate::execution::MaxwellFrontend;
+    let NativeDrawFixture {
+        space, mut channel, ..
+    } = native_draw_fixture();
+    let mut frontend = crate::MaxwellNativeFrontend::new(Default::default());
+    for (phase, iterations) in [("warmup", 1000), ("sample", 100_000)] {
+        let begin = std::time::Instant::now();
+        for index in 0..iterations {
+            program_three_d(&mut channel, 0x0d74, index % 32);
+            let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+            let draw = &dispatch.operations()[0];
+            std::hint::black_box(
+                frontend
+                    .lower_three_d(
+                        draw.state(),
+                        draw.trigger(),
+                        space.memory(),
+                        FrontendSubmissionId::new(u64::from(index) + 1),
+                        None,
+                        &mut crate::test_memory::access(space.memory().machine()),
+                    )
+                    .unwrap(),
+            );
+        }
+        eprintln!(
+            "command-resource-stage phase={phase} draws={iterations} seconds={}",
+            begin.elapsed().as_secs_f64(),
+        );
+    }
+    assert_eq!(frontend.statistics.draws, 101_000);
+    assert_eq!(frontend.statistics.shader_captures, 1);
+}
+
+#[test]
+fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
+    use crate::execution::MaxwellFrontend;
+    use nixe_gpu::native::NativeCommand;
+    let NativeDrawFixture {
+        mut space,
+        mut channel,
+        shaders,
+        vertex,
+        fragment_header: mut header,
+    } = native_draw_fixture();
+    let exit = 0xe300_0000_0007_000f_u64;
     let mut frontend = crate::MaxwellNativeFrontend::new(Default::default());
     let mut previous = None;
     for first in 0..32 {
@@ -3398,9 +3468,10 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
             .lower_three_d(
                 draw.state(),
                 draw.trigger(),
-                &space,
+                space.memory(),
                 FrontendSubmissionId::new(u64::from(first) + 1),
                 (first == 31).then_some((2, 5)),
+                &mut crate::test_memory::access(space.memory().machine()),
             )
             .unwrap();
         let NativeCommand::Draw { state, arguments } = work.command else {
@@ -3431,9 +3502,10 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
             .lower_three_d(
                 draw.state(),
                 draw.trigger(),
-                &space,
+                space.memory(),
                 FrontendSubmissionId::new(200 + u64::from(offset)),
                 None,
+                &mut crate::test_memory::access(space.memory().machine()),
             )
             .unwrap();
         let NativeCommand::Draw { state, .. } = work.command else {
@@ -3443,8 +3515,8 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
         assert!(Arc::ptr_eq(&original.parameters, &state.parameters));
         assert!(Arc::ptr_eq(&original.program, &state.program));
         assert_ne!(
-            original.vertices[0].backing.byte_mapping_key(),
-            state.vertices[0].backing.byte_mapping_key()
+            original.vertices[0].backing.as_ref(),
+            state.vertices[0].backing.as_ref()
         );
     }
     assert_eq!(frontend.statistics.prepared_parameters, 1);
@@ -3460,9 +3532,10 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
         .lower_three_d(
             draw.state(),
             draw.trigger(),
-            &space,
+            space.memory(),
             FrontendSubmissionId::new(500),
             None,
+            &mut crate::test_memory::access(space.memory().machine()),
         )
         .unwrap();
     let NativeCommand::Draw { state, .. } = work.command else {
@@ -3476,7 +3549,7 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
         if phase == 1 {
             // An identical CPU write refreshes the memory proof while keeping
             // the immutable capture and compiled code reusable.
-            shaders.write(0x50, &exit.to_le_bytes()).unwrap();
+            crate::test_memory::write(&shaders, 0x50, &exit.to_le_bytes()).unwrap();
         }
         let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
         let draw = &dispatch.operations()[0];
@@ -3484,9 +3557,10 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
             .lower_three_d(
                 draw.state(),
                 draw.trigger(),
-                &space,
+                space.memory(),
                 FrontendSubmissionId::new(100 + u64::from(phase)),
                 None,
+                &mut crate::test_memory::access(space.memory().machine()),
             )
             .unwrap();
         let NativeCommand::Draw { state, .. } = work.command else {
@@ -3500,32 +3574,25 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
 
     // Two live uniform bindings exercise both complete reuse and a changed
     // suffix after an equal prefix. Data epochs cannot change binding identity.
-    let uniforms = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-    let uniform_address = map_resource(
-        &mut space,
-        uniforms
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap(),
-        4,
-        0,
-    )
-    .offset()
-    .get();
+    let uniforms = crate::test_memory::allocate(space.memory().machine(), 0x1000);
+    let uniform_address = map_resource(&mut space, crate::test_memory::ranges(&uniforms), 4, 0)
+        .offset()
+        .get();
     header[18] = 3;
-    shaders
-        .write(
-            0x100,
-            &header
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .chain(
-                    [0x4c98_0784_0047_0000, 0x4c98_0788_0047_0001, 0, exit]
-                        .into_iter()
-                        .flat_map(u64::to_le_bytes),
-                )
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    crate::test_memory::write(
+        &shaders,
+        0x100,
+        &header
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .chain(
+                [0x4c98_0784_0047_0000, 0x4c98_0788_0047_0001, 0, exit]
+                    .into_iter()
+                    .flat_map(u64::to_le_bytes),
+            )
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     for (method, value) in [
         (0x2380, 0x100),
         (0x2384, (uniform_address >> 32) as u32),
@@ -3542,9 +3609,10 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
             .lower_three_d(
                 trigger.state(),
                 trigger.trigger(),
-                &space,
+                space.memory(),
                 FrontendSubmissionId::new(600),
                 None,
+                &mut crate::test_memory::access(space.memory().machine()),
             )
             .unwrap();
         let NativeCommand::Draw { state, .. } = work.command else {
@@ -3554,7 +3622,7 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
     };
     let before = draw(&mut channel, &mut frontend);
     assert_eq!(before.program.bindings.len(), 2);
-    uniforms.write(16, &1.0_f32.to_le_bytes()).unwrap();
+    crate::test_memory::write(&uniforms, 16, &1.0_f32.to_le_bytes()).unwrap();
     let rewritten = draw(&mut channel, &mut frontend);
     assert!(Arc::ptr_eq(&before.program, &rewritten.program));
     program_three_d(&mut channel, 0x2388, (uniform_address + 0x100) as u32);
@@ -3565,7 +3633,7 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
         let nixe_gpu::native::GuestBinding::Buffer(range) = binding else {
             panic!("expected buffer")
         };
-        range.byte_mapping_key()
+        range.clone()
     };
     assert_eq!(
         mapping(&before.program.bindings[0].1),

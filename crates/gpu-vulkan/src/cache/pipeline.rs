@@ -10,7 +10,7 @@ use ash::vk;
 use nixe_gpu::{ShaderStage, shader_identity::ContentId};
 use rustc_hash::FxHashMap as HashMap;
 use std::{
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, OnceLock},
     time::Instant,
 };
 
@@ -48,23 +48,55 @@ pub struct PipelineMetrics {
     pub library_driver_ns: Option<u64>,
 }
 
+// Resource metadata is available before the driver executable. Only the native
+// recording worker waits for construction, as in Eden GraphicsPipeline::ConfigureImpl.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 pub struct NativePipeline {
     pub(crate) owner: Arc<DeviceOwner>,
-    pub(crate) handle: vk::Pipeline,
+    build: OnceLock<Result<Executable, Arc<CompileError>>>,
+    build_lock: Mutex<()>,
+    build_ready: Condvar,
     pub layout: Arc<PipelineLayout>,
     pub bind_point: vk::PipelineBindPoint,
     pub dynamic_states: Box<[vk::DynamicState]>,
-    pub metrics: PipelineMetrics,
     pub(crate) graphics: Option<GraphicsState>,
     pub(crate) resources: Box<[crate::residency::execution::ShaderAccess]>,
     pub(crate) host_uniforms: Box<[nixe_shader_recompiler::artifact::HostUniformLayout]>,
     pub(crate) binding_origins: Box<[super::layout::BindingOrigin]>,
+}
+impl NativePipeline {
+    fn executable(&self) -> Result<&Executable, Arc<CompileError>> {
+        let build = if let Some(build) = self.build.get() {
+            build
+        } else {
+            let lock = self.build_lock.lock().unwrap();
+            drop(
+                self.build_ready
+                    .wait_while(lock, |_| self.build.get().is_none())
+                    .unwrap(),
+            );
+            self.build.get().unwrap()
+        };
+        build.as_ref().map_err(Arc::clone)
+    }
+    pub(crate) fn handle(&self) -> Result<vk::Pipeline, Arc<CompileError>> {
+        self.executable().map(|build| build.handle)
+    }
+    pub fn metrics(&self) -> Result<PipelineMetrics, Arc<CompileError>> {
+        self.executable().map(|build| build.metrics)
+    }
+}
+struct Executable {
+    handle: vk::Pipeline,
+    metrics: PipelineMetrics,
     _libraries: Box<[Arc<Library>]>,
 }
 impl Drop for NativePipeline {
     fn drop(&mut self) {
-        unsafe {
-            self.owner.device.destroy_pipeline(self.handle, None);
+        if let Some(Ok(build)) = self.build.get() {
+            unsafe {
+                self.owner.device.destroy_pipeline(build.handle, None);
+            }
         }
     }
 }
@@ -197,10 +229,13 @@ struct Compiler {
 }
 pub struct PipelineCompiler {
     pool: Arc<CompilePool>,
-    cache: CompilationCache<PipelineKey, NativePipeline>,
+    cache: Mutex<nixe_gpu::WorkingSet<PipelineKey, Arc<NativePipeline>>>,
     compiler: Arc<Compiler>,
 }
 impl PipelineCompiler {
+    pub(crate) fn bind_wakeup(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.pool.bind_wakeup(wake);
+    }
     pub fn new(
         device: &VulkanDevice,
         pool: Arc<CompilePool>,
@@ -262,10 +297,10 @@ impl PipelineCompiler {
         }
         Ok(Self {
             pool,
-            cache: CompilationCache::new(
+            cache: Mutex::new(nixe_gpu::WorkingSet::new(
                 config.pipeline_entries,
                 config.pipeline_entries * std::mem::size_of::<NativePipeline>(),
-            ),
+            )),
             compiler: Arc::new(Compiler {
                 owner: Arc::clone(&device.owner),
                 driver: DriverCaches::new(device, config)?,
@@ -302,87 +337,134 @@ impl PipelineCompiler {
     pub fn strategy(&self) -> PipelineStrategy {
         self.compiler.strategy
     }
-    pub fn request(&self, recipe: PipelineRecipe) -> Result<Pending<NativePipeline>, CompileError> {
+    pub fn request(&self, recipe: PipelineRecipe) -> Result<Arc<NativePipeline>, CompileError> {
         let (shader, state) = match recipe {
             PipelineRecipe::Compute(shader) => (shader, None),
             PipelineRecipe::Graphics { shader, state } => (shader, Some(state)),
         };
+        self.compiler.check_stages(&shader, state.as_ref())?;
         if let Some(state) = &state {
             self.compiler.check_graphics(state)?;
         }
-        let state = state.map(|s| self.compiler.normalize(s));
+        let state = state.map(|state| self.compiler.normalize(state));
         let key = PipelineKey {
             shader: shader.identity,
             state: state.clone(),
         };
-        let compiler = Arc::clone(&self.compiler);
         #[cfg(feature = "performance-counters")]
-        let captured = key.clone();
-        self.cache.request(
-            &self.pool,
-            key,
-            std::mem::size_of::<NativePipeline>(),
-            move |worker| {
-                #[cfg(feature = "performance-counters")]
+        let capture_key = nixe_gpu::compilation_capture::Key::new(&key);
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(pipeline) = cache.get(&key) {
+            #[cfg(feature = "performance-counters")]
+            capture_key.event("hit", usize::MAX, 0);
+            return Ok(Arc::clone(pipeline));
+        }
+        let layout = self.compiler.layouts.get(LayoutKey::reflect(&shader)?)?;
+        let binding_origins = super::layout::binding_origins(&shader, &layout.key)?;
+        let resources = crate::residency::execution::shader_accesses(&shader, &layout.key);
+        let host_uniforms = shader
+            .stages
+            .iter()
+            .filter_map(|stage| stage.guest.as_ref())
+            .flat_map(|stage| stage.host_uniforms.iter().cloned())
+            .collect();
+        let bind_point = if state.is_some() {
+            vk::PipelineBindPoint::GRAPHICS
+        } else {
+            vk::PipelineBindPoint::COMPUTE
+        };
+        let dynamic_states = if state.is_some() {
+            self.compiler.dynamic.clone()
+        } else {
+            Box::new([])
+        };
+        let pipeline = Arc::new(NativePipeline {
+            owner: Arc::clone(&self.compiler.owner),
+            build: OnceLock::new(),
+            build_lock: Mutex::new(()),
+            build_ready: Condvar::new(),
+            layout,
+            bind_point,
+            dynamic_states,
+            resources,
+            binding_origins,
+            host_uniforms,
+            graphics: state,
+        });
+        let compiler = Arc::clone(&self.compiler);
+        let build_pipeline = Arc::clone(&pipeline);
+        self.pool.submit(move |worker| {
+            let _trace = nixe_gpu::trace::span("pipeline_compile", worker as u64, 0, 0);
+            #[cfg(feature = "performance-counters")]
+            capture_key.event("begin", worker, 0);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                compiler.build(
+                    worker,
+                    &shader,
+                    build_pipeline.graphics.as_ref(),
+                    &build_pipeline.layout,
+                )
+            }))
+            .unwrap_or_else(|_| {
+                Err(CompileError::Failed(
+                    "pipeline construction panicked".into(),
+                ))
+            })
+            .map_err(Arc::new);
+            #[cfg(feature = "performance-counters")]
+            if let Ok(build) = &result {
+                capture_key.event("end", worker, build.metrics.wall_ns);
                 if nixe_gpu::compilation_capture::enabled() {
-                    nixe_gpu::compilation_capture::Key::new(&captured).detail(
-                        "identity",
-                        worker,
-                        0,
-                        &format!(
-                            "{captured:?} stages={:?} strategy={:?}",
-                            shader
-                                .stages
-                                .iter()
-                                .map(|s| (s.stage, s.identity.hex(), s.module.words.len()))
-                                .collect::<Vec<_>>(),
-                            compiler.strategy
-                        ),
-                    );
-                }
-                let result = compiler.create(worker, shader, state);
-                #[cfg(feature = "performance-counters")]
-                if let Ok(pipeline) = &result {
-                    nixe_gpu::compilation_capture::Key::new(&captured).detail(
+                    capture_key.detail(
                         "metrics",
                         worker,
-                        pipeline.metrics.wall_ns,
-                        &format!("{:?}", pipeline.metrics),
+                        build.metrics.wall_ns,
+                        &format!("{:?}", build.metrics),
                     );
                 }
-                result
-            },
-        )
+            }
+            let _lock = build_pipeline.build_lock.lock().unwrap();
+            assert!(
+                build_pipeline.build.set(result).is_ok(),
+                "pipeline completed twice"
+            );
+            build_pipeline.build_ready.notify_all();
+        })?;
+        cache.insert(
+            key,
+            Arc::clone(&pipeline),
+            std::mem::size_of::<NativePipeline>(),
+        );
+        Ok(pipeline)
     }
     pub fn checkpoint(&self) -> Result<(), CompileError> {
         self.compiler.driver.checkpoint()
     }
     pub fn usage(&self) -> (usize, usize) {
-        self.cache.usage()
+        self.cache.lock().unwrap().usage()
     }
     pub fn library_entries(&self) -> usize {
         self.compiler.libraries.map.lock().unwrap().entries.len()
     }
 }
+
 impl Compiler {
     fn normalize(&self, s: GraphicsState) -> GraphicsState {
         s.normalized(&self.dynamic)
     }
-    fn create(
+    fn build(
         &self,
         worker: usize,
-        shader: Arc<ShaderArtifact>,
-        state: Option<GraphicsState>,
-    ) -> Result<NativePipeline, CompileError> {
-        self.check_stages(&shader, state.as_ref())?;
-        let layout = self.layouts.get(LayoutKey::reflect(&shader)?)?;
-        let binding_origins = super::layout::binding_origins(&shader, &layout.key)?;
+        shader: &ShaderArtifact,
+        state: Option<&GraphicsState>,
+        layout: &Arc<PipelineLayout>,
+    ) -> Result<Executable, CompileError> {
         let start = Instant::now();
         let mut metrics = PipelineMetrics::default();
         let mut linked_libraries = Vec::new();
-        let (handle, bind_point, dynamic) = if let Some(state) = &state {
+        let handle = if let Some(state) = state {
             self.check_graphics(state)?;
-            let handle = if self.strategy == PipelineStrategy::Libraries {
+            if self.strategy == PipelineStrategy::Libraries {
                 let mut libraries = Vec::new();
                 for part in [
                     vk::GraphicsPipelineLibraryFlagsEXT::VERTEX_INPUT_INTERFACE,
@@ -399,14 +481,14 @@ impl Compiler {
                     {
                         continue;
                     }
-                    let key = self.library_key(&shader, &layout, state, part);
+                    let key = self.library_key(shader, layout, state, part);
                     let (library, created) = self.libraries.get(key, || {
                         let mut library_metrics = PipelineMetrics::default();
                         let library_start = Instant::now();
                         let handle = self.graphics(
                             worker,
-                            &shader,
-                            &layout,
+                            shader,
+                            layout,
                             state,
                             GraphicsCompilation::Library(part),
                             &mut library_metrics,
@@ -414,7 +496,7 @@ impl Compiler {
                         Ok(Library {
                             owner: Arc::clone(&self.owner),
                             handle,
-                            _layout: Arc::clone(&layout),
+                            _layout: Arc::clone(layout),
                             metrics: {
                                 library_metrics.wall_ns = library_start.elapsed().as_nanos() as u64;
                                 library_metrics
@@ -435,8 +517,8 @@ impl Compiler {
                 let link_start = Instant::now();
                 let handle = self.graphics(
                     worker,
-                    &shader,
-                    &layout,
+                    shader,
+                    layout,
                     state,
                     GraphicsCompilation::Link(&handles),
                     &mut metrics,
@@ -450,24 +532,15 @@ impl Compiler {
             } else {
                 self.graphics(
                     worker,
-                    &shader,
-                    &layout,
+                    shader,
+                    layout,
                     state,
                     GraphicsCompilation::Monolithic,
                     &mut metrics,
                 )?
-            };
-            (
-                handle,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.dynamic.clone(),
-            )
+            }
         } else {
-            (
-                self.compute(worker, &shader, &layout, &mut metrics)?,
-                vk::PipelineBindPoint::COMPUTE,
-                Box::new([]) as Box<[vk::DynamicState]>,
-            )
+            self.compute(worker, shader, layout, &mut metrics)?
         };
         metrics.wall_ns = start.elapsed().as_nanos() as u64;
         nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::HostPipelineCompilations, 1);
@@ -475,23 +548,9 @@ impl Compiler {
             nixe_gpu::metrics::Counter::HostPipelineCompilationNanoseconds,
             metrics.wall_ns,
         );
-        let resources = crate::residency::execution::shader_accesses(&shader, &layout.key);
-        Ok(NativePipeline {
-            owner: Arc::clone(&self.owner),
+        Ok(Executable {
             handle,
-            layout,
-            bind_point,
-            dynamic_states: dynamic,
             metrics,
-            resources,
-            binding_origins,
-            host_uniforms: shader
-                .stages
-                .iter()
-                .filter_map(|stage| stage.guest.as_ref())
-                .flat_map(|stage| stage.host_uniforms.iter().cloned())
-                .collect(),
-            graphics: state,
             _libraries: linked_libraries.into_boxed_slice(),
         })
     }
@@ -818,5 +877,103 @@ impl Compiler {
             },
             state,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ApiPreference, test_device};
+    use std::{sync::mpsc, time::Duration};
+
+    struct Release(Option<mpsc::Sender<()>>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[test]
+    fn driver_build_does_not_block_metadata_binding_or_submission_on_the_owner() {
+        let Some(mut device) = test_device::device_for_test(ApiPreference::Auto) else {
+            return;
+        };
+        let validation = device.validation_monitor();
+        let config = CacheConfiguration {
+            workers: 1,
+            ..Default::default()
+        };
+        let pool = Arc::new(CompilePool::new(1, 8).unwrap());
+        let (started, entered) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let mut release = Release(Some(release));
+        pool.submit(move |_| {
+            started.send(()).unwrap();
+            released.recv().unwrap();
+        })
+        .unwrap();
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        let compiler = PipelineCompiler::new(&device, Arc::clone(&pool), &config).unwrap();
+        let shader = crate::test_shaders::compile(
+            &device.profile().shader_compiler.profile,
+            [crate::test_shaders::increment(7, 4)],
+        );
+        let pipeline = compiler.request(PipelineRecipe::Compute(shader)).unwrap();
+        assert!(!pipeline.layout.key.bindings.is_empty());
+        device.bind_native_pipeline(&pipeline).unwrap();
+        let work = device.flush().unwrap().unwrap();
+        assert!(device.queue_usage().submitted_tick < work.tick());
+        release.0.take().unwrap().send(()).unwrap();
+        assert!(device.wait_for_work(work, Duration::from_secs(10)).unwrap());
+        device.shutdown().unwrap();
+        validation.check().unwrap();
+    }
+
+    #[test]
+    fn recorder_pipeline_failure_retains_its_cause_and_never_submits_the_failed_tick() {
+        let Some(mut device) = test_device::device_for_test(ApiPreference::Auto) else {
+            return;
+        };
+        let validation = device.validation_monitor();
+        let config = CacheConfiguration {
+            workers: 1,
+            ..Default::default()
+        };
+        let pool = Arc::new(CompilePool::new(1, 8).unwrap());
+        let compiler = PipelineCompiler::new(&device, Arc::clone(&pool), &config).unwrap();
+        let shader = crate::test_shaders::compile(
+            &device.profile().shader_compiler.profile,
+            [crate::test_shaders::increment(7, 4)],
+        );
+        let source = compiler.request(PipelineRecipe::Compute(shader)).unwrap();
+        let pipeline = Arc::new(NativePipeline {
+            owner: Arc::clone(&source.owner),
+            build: OnceLock::from(Err(Arc::new(CompileError::Failed(
+                "pipeline build regression".into(),
+            )))),
+            build_lock: Mutex::new(()),
+            build_ready: Condvar::new(),
+            layout: Arc::clone(&source.layout),
+            bind_point: source.bind_point,
+            dynamic_states: source.dynamic_states.clone(),
+            graphics: source.graphics.clone(),
+            resources: source.resources.clone(),
+            host_uniforms: source.host_uniforms.clone(),
+            binding_origins: source.binding_origins.clone(),
+        });
+        device.bind_native_pipeline(&pipeline).unwrap();
+        let work = device.flush().unwrap().unwrap();
+        let error = device
+            .wait_for_work(work, Duration::from_secs(10))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("pipeline build regression"),
+            "{error}"
+        );
+        assert!(device.queue_usage().submitted_tick < work.tick());
+        assert!(device.shutdown().is_err());
+        validation.check().unwrap();
     }
 }

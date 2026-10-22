@@ -2,12 +2,14 @@
 use super::super::response::{encode_semantic_response, semantic_error};
 use crate::ipc_wire::io::has_ipc_descriptors;
 use crate::ipc_wire::message::{CmifRequest, HipcRequest};
+use crate::ipc_wire::request::Request;
 use crate::ipc_wire::{IpcWireError, UnsupportedServiceOperation};
-use crate::{HorizonIpcResult, IpcDispatcher, IpcSession, SystemArchives};
-use nixe_runtime::ExceptionProcessContext;
+use crate::{
+    HorizonIpcResult, IpcResponse, IpcSession, ReadOnlyStorage, SemanticIpcObject, SystemArchives,
+};
 
-pub(in crate::ipc_wire::services) fn open_system_data(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire::services) async fn open_system_data(
+    process: &mut Request,
     session: &IpcSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -39,15 +41,8 @@ pub(in crate::ipc_wire::services) fn open_system_data(
         .open(data_id)
         .map_err(|e| IpcWireError::SystemArchive(e.into_boxed_str()))?
         .ok_or_else(unsupported)?;
-    let (_, handles) = process.mounts_and_handles_mut();
-    match IpcDispatcher::open_storage(handles, storage) {
-        Ok(response) => {
-            encode_semantic_response(process, Some(session), None, request, hipc, response)
-        }
-        Err(error) => semantic_error(
-            request.token,
-            Some(session),
-            HorizonIpcResult::from_semantic(crate::IpcService::FileSystem, error),
-        ),
-    }
+    let response = IpcResponse::Object(SemanticIpcObject::ReadOnlyStorage(ReadOnlyStorage::new(
+        storage,
+    )));
+    encode_semantic_response(process, Some(session), None, request, hipc, response).await
 }

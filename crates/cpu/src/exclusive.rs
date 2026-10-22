@@ -4,55 +4,28 @@
 //! local-monitor storage belong to concrete engine executors. This module keeps
 //! only values referenced by the common CPU memory contract.
 
-use nixe_memory::GuestPhysicalPageId;
-
-/// Physical reservation recorded by a local exclusive monitor.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ExclusiveReservation {
-    pub page: GuestPhysicalPageId,
-    pub byte_offset: u16,
-    pub access_size: u8,
-    /// Completed physical write version captured atomically with the load.
-    pub version: u64,
-}
-
 /// Portable local-monitor state used by CPU execution engines.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub struct ExclusiveMonitorState {
-    reservation: Option<ExclusiveReservation>,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ExclusiveMonitorState<R = nixe_memory::Reservation> {
+    reservation: Option<R>,
+}
+impl<R> Default for ExclusiveMonitorState<R> {
+    fn default() -> Self {
+        Self { reservation: None }
+    }
 }
 
-impl ExclusiveMonitorState {
+impl<R: Copy> ExclusiveMonitorState<R> {
     #[must_use]
-    pub const fn reservation(self) -> Option<ExclusiveReservation> {
+    pub const fn reservation(self) -> Option<R> {
         self.reservation
     }
 
-    pub const fn reserve(&mut self, reservation: ExclusiveReservation) {
+    pub const fn reserve(&mut self, reservation: R) {
         self.reservation = Some(reservation);
     }
 
     pub const fn clear(&mut self) {
         self.reservation = None;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exclusive_monitor_value_retains_a_typed_reservation() {
-        let reservation = ExclusiveReservation {
-            page: GuestPhysicalPageId::new(3),
-            byte_offset: 64,
-            access_size: 8,
-            version: 2,
-        };
-        let mut monitor = ExclusiveMonitorState::default();
-        monitor.reserve(reservation);
-        assert_eq!(monitor.reservation(), Some(reservation));
-        monitor.clear();
-        assert_eq!(monitor.reservation(), None);
     }
 }

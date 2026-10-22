@@ -219,11 +219,11 @@ fn two_d_affine_sampling_accepts_bounded_partial_destination_rectangles() {
 #[test]
 fn four_sample_targets_reject_single_sample_kinds_and_short_storage() {
     for kind in [0xdb, 0xfe, 0xe0] {
-        let source = CanonicalAllocation::zeroed(0x10000, 0x1000).unwrap();
         let mut address_space = resource_address_space();
+        let source = crate::test_memory::allocate(address_space.memory().machine(), 0x10000);
         let src = map_resource(
             &mut address_space,
-            source.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
+            crate::test_memory::ranges(&source),
             73,
             kind,
         );
@@ -233,7 +233,11 @@ fn four_sample_targets_reject_single_sample_kinds_and_short_storage() {
             src.offset().get(),
             Some(u32::from(kind != 0xfe)),
         );
-        let result = resolve_maxwell_three_d_resources(channel.three_d(), &address_space);
+        let result = resolve_maxwell_three_d_resources(
+            channel.three_d(),
+            address_space.memory(),
+            &mut crate::test_memory::access(address_space.memory().machine()),
+        );
         if kind == 0xe0 {
             assert!(result.is_ok());
         } else {
@@ -244,7 +248,11 @@ fn four_sample_targets_reject_single_sample_kinds_and_short_storage() {
         }
         program_three_d(&mut channel, 0x081c, 512);
         assert!(matches!(
-            resolve_maxwell_three_d_resources(channel.three_d(), &address_space),
+            resolve_maxwell_three_d_resources(
+                channel.three_d(),
+                address_space.memory(),
+                &mut crate::test_memory::access(address_space.memory().machine())
+            ),
             Err(MaxwellThreeDResourceError::ContradictoryState { .. })
         ));
     }

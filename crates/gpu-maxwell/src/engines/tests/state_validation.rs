@@ -837,6 +837,26 @@ fn three_d_report_semaphore_trigger_is_an_explicit_observable_boundary() {
         if report.payload() == 0xcafe_babe
             && report.structure_size() == MaxwellThreeDReportSemaphoreStructureSize::FourWords
             && report.prior_work_pending()));
+    // Short RELEASE is the completion boundary. Timestamped releases and
+    // REPORT_ONLY do not commit preceding asynchronous reports.
+    for (raw, fence) in [
+        (0x1000_f000, true),
+        (0x0000_f000, false),
+        (0x1000_f002, false),
+        (0x0000_f002, false),
+    ] {
+        let dispatch = dispatch_method(&mut channel, 0x1b0c / 4, raw).unwrap();
+        let Ok(MaxwellThreeDSynchronizationPlan::ReportSemaphoreWrite(report)) =
+            lower_maxwell_three_d_synchronization(
+                dispatch.synchronization_operations()[0],
+                None,
+                true,
+            )
+        else {
+            panic!("expected payload report");
+        };
+        assert_eq!(report.is_fence(), fence, "control={raw:#x}");
+    }
     for raw in [0xf001, 0xf003, 0x0080_f002, 0x0010_f002, 0x0002_f002] {
         let dispatch = dispatch_method(&mut channel, 0x1b0c / 4, raw).unwrap();
         assert!(matches!(

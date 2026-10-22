@@ -7,7 +7,6 @@ use core::fmt::{self, Write};
 pub(super) enum Reason {
     RetryWithoutProgress,
     MissingDispatcher,
-    RetryLimit,
     DispatcherRejected,
     UnattributedPc,
     DispatcherPanicked,
@@ -25,7 +24,6 @@ impl Reason {
         match self {
             Self::RetryWithoutProgress => "retry-without-progress",
             Self::MissingDispatcher => "missing-dispatcher",
-            Self::RetryLimit => "retry-limit",
             Self::DispatcherRejected => "dispatcher-rejected",
             Self::UnattributedPc => "unattributed-native-pc",
             Self::DispatcherPanicked => "dispatcher-panicked",
@@ -108,7 +106,6 @@ mod tests {
         for reason in [
             Reason::RetryWithoutProgress,
             Reason::MissingDispatcher,
-            Reason::RetryLimit,
             Reason::DispatcherRejected,
             Reason::UnattributedPc,
             Reason::DispatcherPanicked,

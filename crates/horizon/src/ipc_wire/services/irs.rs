@@ -1,11 +1,12 @@
 use super::prelude::*;
 use crate::object::IrsSession;
 
-pub(in crate::ipc_wire) fn dispatch_irs(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_irs(
+    process: &mut Request,
     session: &IrsSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
+    scheduling: &std::sync::Arc<crate::ipc_wire::operation::ServiceScheduling>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     if request.command_id == 311 {
         // This identifies a camera slot; it does not require a connected camera.
@@ -51,16 +52,14 @@ pub(in crate::ipc_wire) fn dispatch_irs(
     }
     if request.command_id == 304 {
         let handle = process
-            .handles_mut()
-            .insert(session.shared_memory())
-            .map_err(|_| {
-                IpcWireError::HostResourceExhausted("installing IRS shared-memory handle")
-            })?;
+            .return_handle(session.shared_memory())
+            .map_err(IpcWireError::Handle)?;
         return semantic_success(request.token, false, &[], &[handle], &[], None);
     }
     let registered = session
-        .set_active(aruid, request.command_id != 303)
-        .map_err(|_| IpcWireError::Internal("updating IRS applet registration"))?;
+        .set_active(aruid, request.command_id != 303, scheduling)
+        .await
+        .map_err(IpcWireError::SystemMemory)?;
     if !registered {
         return Err(IpcWireError::HostResourceExhausted(
             "registering IRS applet",

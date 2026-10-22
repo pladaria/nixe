@@ -115,9 +115,12 @@ mod tests {
     #[test]
     fn graphics_state_captures_header_and_tracks_passthrough_register_changes() {
         let (allocation, space, base) = crate::shader::test_support::mapped_memory();
-        allocation
-            .write(0x10 + 0x58, &0xe300_0000_0007_000fu64.to_le_bytes())
-            .unwrap();
+        crate::test_memory::write(
+            &allocation,
+            0x10 + 0x58,
+            &0xe300_0000_0007_000fu64.to_le_bytes(),
+        )
+        .unwrap();
         let mut channel = crate::engines::tests::three_d_channel();
         for (method, value) in [
             (0x1608, (base >> 32) as u32),
@@ -140,11 +143,12 @@ mod tests {
         let mut compiler = Compiler::new().unwrap();
         let (captured, _) = capture(
             &mut compiler,
-            &space,
+            space.memory(),
             request,
             &HostTranslateInfo::default(),
             &CompilerSettings::default(),
             &mut MemoryCache::default(),
+            &mut crate::test_memory::access(space.memory().machine()),
         )
         .unwrap();
         assert_eq!(

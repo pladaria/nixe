@@ -64,8 +64,8 @@ impl HidAppletResourceCommand {
     }
 }
 
-pub(in crate::ipc_wire) fn dispatch_hid(
-    process: &mut ExceptionProcessContext<'_>,
+pub(in crate::ipc_wire) async fn dispatch_hid(
+    process: &mut Request,
     session: &HidSession,
     hid_system: &HidSystem,
     request: CmifRequest<'_>,
@@ -127,12 +127,14 @@ pub(in crate::ipc_wire) fn dispatch_hid(
                     process,
                     GuestVirtualAddress::new(handles.address),
                     &mut encoded_handles,
-                )?;
+                )
+                .await?;
                 read_bytes(
                     process,
                     GuestVirtualAddress::new(values.address),
                     &mut encoded_values,
-                )?;
+                )
+                .await?;
             }
             let mut updates = Vec::with_capacity(handles_size / 4);
             for (handle, value) in encoded_handles
@@ -183,15 +185,10 @@ pub(in crate::ipc_wire) fn dispatch_hid(
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let handle = process
-                .handles_mut()
-                .insert(HorizonIpcObject::HidActiveVibrationDeviceList(
+                .return_handle(HorizonIpcObject::HidActiveVibrationDeviceList(
                     HidActiveVibrationDeviceList::default(),
                 ))
-                .map_err(|_| {
-                    IpcWireError::HostResourceExhausted(
-                        "installing a HID active vibration device list",
-                    )
-                })?;
+                .map_err(IpcWireError::Handle)?;
             semantic_success(request.token, false, &[], &[], &[], Some(handle))
         }
         // libnx sends the process ID and the applet-resource user ID:
@@ -201,13 +198,10 @@ pub(in crate::ipc_wire) fn dispatch_hid(
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let handle = process
-                .handles_mut()
-                .insert(HorizonIpcObject::HidAppletResource(
+                .return_handle(HorizonIpcObject::HidAppletResource(
                     session.create_applet_resource(),
                 ))
-                .map_err(|_| {
-                    IpcWireError::HostResourceExhausted("installing a HID applet-resource handle")
-                })?;
+                .map_err(IpcWireError::Handle)?;
             log::debug!("hid created IAppletResource handle {handle:#x}");
             semantic_success(request.token, false, &[], &[], &[], Some(handle))
         }
@@ -293,7 +287,7 @@ pub(in crate::ipc_wire) fn dispatch_hid(
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let mut encoded_ids = vec![0; size];
-            read_bytes(process, GuestVirtualAddress::new(address), &mut encoded_ids)?;
+            read_bytes(process, GuestVirtualAddress::new(address), &mut encoded_ids).await?;
             let ids = encoded_ids
                 .chunks_exact(4)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
@@ -344,7 +338,8 @@ pub(in crate::ipc_wire) fn dispatch_hid(
             let id = request_u32(request.data, 0).unwrap();
             if !hid_system
                 .set_npad_joy_assignment_mode_dual(id)
-                .map_err(|_| IpcWireError::Internal("updating Npad assignment metadata"))?
+                .await
+                .map_err(IpcWireError::SystemMemory)?
             {
                 return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
             }
@@ -371,9 +366,7 @@ pub(in crate::ipc_wire) fn dispatch_hid(
             let Some(event) = hid_system.acquire_style_event(id) else {
                 return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
             };
-            let handle = process.handles_mut().insert(event).map_err(|_| {
-                IpcWireError::HostResourceExhausted("copying a HID style update event")
-            })?;
+            let handle = process.return_handle(event).map_err(IpcWireError::Handle)?;
             semantic_success(request.token, false, &[], &[handle], &[], None)
         }
         HidCommand::ActivateNpadWithRevision => {
@@ -409,7 +402,7 @@ pub(in crate::ipc_wire) fn dispatch_hid(
 }
 
 pub(in crate::ipc_wire) fn dispatch_hid_applet_resource(
-    process: &mut ExceptionProcessContext<'_>,
+    process: &mut Request,
     resource: &HidAppletResource,
     request: CmifRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
@@ -421,11 +414,8 @@ pub(in crate::ipc_wire) fn dispatch_hid_applet_resource(
     // libnx maps the returned 0x40000-byte shared-memory object read-only:
     // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/hid.c#L47-L65
     let handle = process
-        .handles_mut()
-        .insert(resource.shared_memory())
-        .map_err(|_| {
-            IpcWireError::HostResourceExhausted("installing a HID shared-memory handle")
-        })?;
+        .return_handle(resource.shared_memory())
+        .map_err(IpcWireError::Handle)?;
     log::debug!("hid returned shared-memory handle {handle:#x}");
     semantic_success(request.token, false, &[], &[handle], &[], None)
 }

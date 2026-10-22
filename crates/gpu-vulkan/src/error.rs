@@ -32,8 +32,12 @@ pub enum VulkanError {
         maximum: u64,
     },
     QueueStopped,
+    SubmissionFailed {
+        tick: u64,
+        cause: Box<VulkanError>,
+    },
     DescriptorPressure,
-    CanonicalMemory(Box<str>),
+    Memory(std::sync::Arc<nixe_memory::MemoryError>),
     ResidencyPressure {
         requested: u64,
         allocated: u64,
@@ -69,16 +73,36 @@ impl Display for VulkanError {
             Self::Validation(e) => write!(f, "Vulkan validation reported errors: {}", e.join("; ")),
             Self::QueuePressure { pending, retained_readbacks } => write!(f, "Vulkan staging/command budget is full; pending work: {pending:?}, unread readbacks: {retained_readbacks}"),
             Self::StagingRequestTooLarge { requested, maximum } => write!(f, "Vulkan staging request of {requested} bytes exceeds the bounded allocation size {maximum}; split the transfer into chunks"),
-            Self::CanonicalMemory(error) => write!(f, "Vulkan canonical memory: {error}"),
+            Self::Memory(error) => write!(f, "Vulkan physical memory: {error}"),
             Self::ResidencyPressure { requested, allocated, budget } => write!(f, "Vulkan residency budget exhausted: requested {requested}, live/in-flight allocations {allocated}, budget {budget}; authoritative or leased contents cannot be discarded"),
             Self::DescriptorPressure => f.write_str("Vulkan descriptor slot budget is full; flush and continue in a recycled command slot"),
             Self::QueueStopped => f.write_str("Vulkan queue is stopped after shutdown or a terminal device error"),
+            Self::SubmissionFailed { tick, cause } => write!(f, "Vulkan submission tick {tick} failed: {cause}"),
         }
     }
 }
-impl std::error::Error for VulkanError {}
+impl std::error::Error for VulkanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SubmissionFailed { cause, .. } => Some(cause.as_ref()),
+            Self::Memory(cause) => Some(cause.as_ref()),
+            _ => None,
+        }
+    }
+}
 impl From<gpu_allocator::AllocationError> for VulkanError {
     fn from(e: gpu_allocator::AllocationError) -> Self {
         Self::Allocation(e)
+    }
+}
+
+impl From<nixe_memory::MemoryError> for VulkanError {
+    fn from(error: nixe_memory::MemoryError) -> Self {
+        Self::Memory(std::sync::Arc::new(error))
+    }
+}
+impl From<std::sync::Arc<nixe_memory::MemoryError>> for VulkanError {
+    fn from(error: std::sync::Arc<nixe_memory::MemoryError>) -> Self {
+        Self::Memory(error)
     }
 }

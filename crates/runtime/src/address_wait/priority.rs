@@ -25,8 +25,16 @@ mod tests {
         let low_event = queue.enqueue(0x1000, low, 40, None).unwrap();
         let first_event = queue.enqueue(0x1000, first, 20, None).unwrap();
         let second_event = queue.enqueue(0x1000, second, 20, None).unwrap();
-        queue.signal(0x1000, 1);
-        queue.signal(0x1000, 1);
+        let (selected, _) = queue.signal_targets(0x1000, 1);
+        queue.complete_signal(&selected);
+        for wake in queue.take_wakes() {
+            wake.signal();
+        }
+        let (selected, _) = queue.signal_targets(0x1000, 1);
+        queue.complete_signal(&selected);
+        for wake in queue.take_wakes() {
+            wake.signal();
+        }
         assert!(first_event.is_signalled());
         assert!(second_event.is_signalled());
         assert!(!low_event.is_signalled());
@@ -36,7 +44,11 @@ mod tests {
             queue.take_result(second),
             Some(AddressWaitResult::Signalled)
         );
-        queue.signal(0x1000, usize::MAX);
+        let (selected, _) = queue.signal_targets(0x1000, usize::MAX);
+        queue.complete_signal(&selected);
+        for wake in queue.take_wakes() {
+            wake.signal();
+        }
         assert_eq!(queue.take_result(low), Some(AddressWaitResult::Signalled));
         assert!(queue.is_empty());
     }
@@ -49,11 +61,18 @@ mod tests {
         let first_event = queue.enqueue(0x1000, first, 20, Some(100)).unwrap();
         let second_event = queue.enqueue(0x1000, second, 40, Some(100)).unwrap();
         queue.change_priority(second, 10);
-        queue.signal(0x1000, 1);
+        let (selected, _) = queue.signal_targets(0x1000, 1);
+        queue.complete_signal(&selected);
+        for wake in queue.take_wakes() {
+            wake.signal();
+        }
         assert!(second_event.is_signalled());
         assert!(!first_event.is_signalled());
         queue.change_priority(second, 50); // Completion is no longer queued.
-        queue.expire(100);
+        queue.expire(100, |_| false);
+        for wake in queue.take_wakes() {
+            wake.signal();
+        }
         assert_eq!(queue.take_result(first), Some(AddressWaitResult::TimedOut));
         assert_eq!(
             queue.take_result(second),
@@ -69,11 +88,21 @@ mod tests {
         let active = GuestThreadId::new(2);
         let expired_event = queue.enqueue(0x1000, expired, 10, Some(10)).unwrap();
         let active_event = queue.enqueue(0x1000, active, 20, Some(20)).unwrap();
-        queue.expire(10);
+        queue.expire(10, |_| false);
+        for wake in queue.take_wakes() {
+            wake.signal();
+        }
         assert!(expired_event.is_signalled());
         assert_eq!(queue.waiting_count(0x1000), 1);
-        queue.signal(0x1000, 1);
-        queue.expire(20);
+        let (selected, _) = queue.signal_targets(0x1000, 1);
+        queue.complete_signal(&selected);
+        for wake in queue.take_wakes() {
+            wake.signal();
+        }
+        queue.expire(20, |_| false);
+        for wake in queue.take_wakes() {
+            wake.signal();
+        }
         assert!(active_event.is_signalled());
         assert_eq!(
             queue.take_result(expired),
@@ -94,21 +123,45 @@ mod tests {
         assert!(queue.enqueue(0x1000, thread, 20, None).is_none());
         queue.remove(thread);
         let new_event = queue.enqueue(0x2000, thread, 20, None).unwrap();
-        queue.expire(10);
-        queue.signal(0x1000, usize::MAX);
+        queue.expire(10, |_| false);
+        for wake in queue.take_wakes() {
+            wake.signal();
+        }
+        let (selected, _) = queue.signal_targets(0x1000, usize::MAX);
+        queue.complete_signal(&selected);
+        for wake in queue.take_wakes() {
+            wake.signal();
+        }
         assert!(!old_event.is_signalled());
         assert!(!new_event.is_signalled());
-        queue.signal(0x2000, 1);
+        let (selected, _) = queue.signal_targets(0x2000, 1);
+        queue.complete_signal(&selected);
+        for wake in queue.take_wakes() {
+            wake.signal();
+        }
         queue.remove(thread);
         assert!(queue.is_empty());
     }
 }
 
 #[derive(Debug)]
-struct Waiter {
+pub(super) struct Waiter {
     thread: GuestThreadId,
     deadline: Option<u64>,
     event: WritableEventObject,
+    checking: bool,
+    timeout_deferred: bool,
+}
+
+#[derive(Debug)]
+pub struct AddressSignalTargets(Vec<(GuestThreadId, WritableEventObject)>);
+impl AddressSignalTargets {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// Lower numeric priorities wake first; equal priorities retain queue order.
@@ -120,9 +173,18 @@ pub struct PriorityAddressWaitQueue {
     positions: BTreeMap<GuestThreadId, (u64, i32)>,
     deadlines: BTreeSet<(u64, GuestThreadId)>,
     completed: BTreeMap<GuestThreadId, AddressWaitResult>,
+    wakes: Vec<WritableEventObject>,
+    retired: Vec<Waiter>,
 }
 
 impl PriorityAddressWaitQueue {
+    pub(super) fn take_wakes(&mut self) -> Vec<WritableEventObject> {
+        std::mem::take(&mut self.wakes)
+    }
+    pub(super) fn take_retired(&mut self) -> Vec<Waiter> {
+        std::mem::take(&mut self.retired)
+    }
+
     /// Returns `None` if this thread already owns a pending continuation.
     pub fn enqueue(
         &mut self,
@@ -144,6 +206,8 @@ impl PriorityAddressWaitQueue {
                 thread,
                 deadline,
                 event,
+                checking: false,
+                timeout_deferred: false,
             });
         self.positions.insert(thread, (address, priority));
         if let Some(deadline) = deadline {
@@ -166,40 +230,108 @@ impl PriorityAddressWaitQueue {
             .map_or(0, |priorities| priorities.values().map(VecDeque::len).sum())
     }
 
-    /// Selects each active waiter once and removes it before publishing wakeup.
-    pub fn signal(&mut self, address: u64, count: usize) {
-        for _ in 0..count {
-            let Some(priorities) = self.queues.get_mut(&address) else {
-                break;
-            };
-            let mut entry = priorities.first_entry().expect("address queue is nonempty");
-            let waiter = entry
-                .get_mut()
-                .pop_front()
-                .expect("priority queue is nonempty");
-            if entry.get().is_empty() {
-                entry.remove();
-            }
-            if priorities.is_empty() {
-                self.queues.remove(&address);
-            }
-            self.positions.remove(&waiter.thread);
-            self.complete(waiter, AddressWaitResult::Signalled);
+    pub fn begin_check(&mut self, thread: GuestThreadId) {
+        if let Some(waiter) = self.waiter_mut(thread) {
+            waiter.checking = true;
         }
     }
-
-    /// Expire before signalling so an overdue thread cannot consume a signal
-    /// while it is ready but has not yet executed its timeout continuation.
-    pub fn expire(&mut self, now: u64) {
+    pub fn finish_check(&mut self, thread: GuestThreadId, now: u64, zero_timeout: bool) {
+        let Some(waiter) = self.waiter_mut(thread) else {
+            return;
+        };
+        waiter.checking = false;
+        if zero_timeout
+            || waiter.timeout_deferred
+            || waiter.deadline.is_some_and(|deadline| deadline <= now)
+        {
+            let waiter = self.remove_active(thread).unwrap();
+            self.complete(waiter, AddressWaitResult::TimedOut);
+        }
+    }
+    /// Capture current priority/FIFO selection before its conditional word
+    /// operation. Late priority changes cannot select a different generation.
+    pub fn signal_targets(&self, address: u64, count: usize) -> (AddressSignalTargets, bool) {
+        let mut eligible = self
+            .queues
+            .get(&address)
+            .into_iter()
+            .flat_map(|priorities| priorities.values())
+            .flatten()
+            .filter(|waiter| !waiter.checking);
+        let selected = eligible
+            .by_ref()
+            .take(count)
+            .map(|waiter| (waiter.thread, waiter.event.clone()))
+            .collect();
+        (AddressSignalTargets(selected), eligible.next().is_some())
+    }
+    pub fn complete_signal(&mut self, targets: &AddressSignalTargets) {
+        for (thread, event) in &targets.0 {
+            if self
+                .waiter_mut(*thread)
+                .is_some_and(|waiter| !waiter.checking && waiter.event.same_event(event))
+            {
+                let waiter = self.remove_active(*thread).unwrap();
+                self.complete(waiter, AddressWaitResult::Signalled);
+            }
+        }
+    }
+    /// Timer delivery during an ordered word operation records expiry without
+    /// allowing guest code to run ahead of that operation's result.
+    pub(super) fn defer_timeout(
+        &mut self,
+        thread: GuestThreadId,
+        locked: impl FnOnce(u64) -> bool,
+    ) -> Option<u64> {
+        let &(address, _) = self.positions.get(&thread)?;
+        let locked = locked(address);
+        let waiter = self.waiter_mut(thread).unwrap();
+        if waiter.checking || locked {
+            waiter.timeout_deferred = true;
+            if let Some(deadline) = waiter.deadline {
+                self.deadlines.remove(&(deadline, thread));
+            }
+            Some(address)
+        } else {
+            None
+        }
+    }
+    pub fn expire(&mut self, now: u64, mut locked: impl FnMut(u64) -> bool) {
         while let Some(&(deadline, thread)) = self.deadlines.first() {
             if deadline > now {
                 break;
             }
-            let waiter = self
-                .remove_active(thread)
-                .expect("deadline owns an active wait");
+            self.deadlines.remove(&(deadline, thread));
+            if self.defer_timeout(thread, &mut locked).is_none() {
+                let waiter = self
+                    .remove_active(thread)
+                    .expect("deadline owns an active wait");
+                self.complete(waiter, AddressWaitResult::TimedOut);
+            }
+        }
+    }
+    pub(super) fn publish_deferred_timeouts(&mut self, address: u64) {
+        let expired: Vec<_> = self
+            .queues
+            .get(&address)
+            .into_iter()
+            .flat_map(|priorities| priorities.values())
+            .flatten()
+            .filter(|waiter| !waiter.checking && waiter.timeout_deferred)
+            .map(|waiter| waiter.thread)
+            .collect();
+        for thread in expired {
+            let waiter = self.remove_active(thread).unwrap();
             self.complete(waiter, AddressWaitResult::TimedOut);
         }
+    }
+    fn waiter_mut(&mut self, thread: GuestThreadId) -> Option<&mut Waiter> {
+        let &(address, priority) = self.positions.get(&thread)?;
+        self.queues
+            .get_mut(&address)?
+            .get_mut(&priority)?
+            .iter_mut()
+            .find(|waiter| waiter.thread == thread)
     }
 
     pub fn change_priority(&mut self, thread: GuestThreadId, priority: i32) {
@@ -212,7 +344,9 @@ impl PriorityAddressWaitQueue {
         let waiter = self
             .remove_active(thread)
             .expect("position owns an active wait");
-        if let Some(deadline) = waiter.deadline {
+        if let Some(deadline) = waiter.deadline
+            && !waiter.timeout_deferred
+        {
             self.deadlines.insert((deadline, thread));
         }
         self.queues
@@ -225,7 +359,9 @@ impl PriorityAddressWaitQueue {
     }
 
     pub fn remove(&mut self, thread: GuestThreadId) {
-        self.remove_active(thread);
+        if let Some(waiter) = self.remove_active(thread) {
+            self.retired.push(waiter);
+        }
         self.completed.remove(&thread);
     }
 
@@ -241,7 +377,7 @@ impl PriorityAddressWaitQueue {
             self.deadlines.remove(&(deadline, waiter.thread));
         }
         self.completed.insert(waiter.thread, result);
-        waiter.event.signal();
+        self.wakes.push(waiter.event);
     }
 
     fn remove_active(&mut self, thread: GuestThreadId) -> Option<Waiter> {

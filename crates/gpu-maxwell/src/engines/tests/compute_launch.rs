@@ -99,17 +99,19 @@ fn pcas_rejects_missing_address_reserved_flags_and_unscheduled_operations() {
 
 #[test]
 fn qmd_resolution_checks_memory_version_and_program_address_on_consumption() {
-    let mut address_space =
-        MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+    let machine = crate::test_memory::machine();
+    let mut address_space = MaxwellGpuAddressSpace::new(
+        machine.clone(),
+        MaxwellAddressSpaceId::new(1),
+        SWITCH_1_GM20B_PROFILE,
+    );
     address_space
         .initialize(MaxwellAddressSpaceInitialization::default())
         .unwrap();
-    let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+    let allocation = crate::test_memory::allocate(&machine, 0x1000);
     let request = MaxwellMapRequest {
         allocation: MaxwellAllocationId::new(1),
-        backing: allocation
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap(),
+        backing: crate::test_memory::ranges(&allocation),
         backing_offset: 0,
         size: 0x1000,
         allocation_alignment: 0x1000,
@@ -145,7 +147,7 @@ fn qmd_resolution_checks_memory_version_and_program_address_on_consumption() {
             panic!()
         };
         assert!(
-            matches!(resolve_compute_launch(launch, state, &address_space),
+            matches!(resolve_compute_launch(launch, state, address_space.memory(), &mut crate::test_memory::access(address_space.memory().machine())),
             Err(MaxwellComputeLaunchError::Address { address, .. }) if address == qmd_address)
         );
     }
@@ -161,7 +163,12 @@ fn qmd_resolution_checks_memory_version_and_program_address_on_consumption() {
         panic!()
     };
     assert!(matches!(
-        resolve_compute_launch(launch, state, &address_space),
+        resolve_compute_launch(
+            launch,
+            state,
+            address_space.memory(),
+            &mut crate::test_memory::access(address_space.memory().machine())
+        ),
         Err(MaxwellComputeLaunchError::QmdVersion {
             major: 0,
             minor: 0,
@@ -169,11 +176,14 @@ fn qmd_resolution_checks_memory_version_and_program_address_on_consumption() {
         })
     ));
 
-    allocation
-        .write(0x48, &0x0020_0017_u32.to_le_bytes())
-        .unwrap();
+    crate::test_memory::write(&allocation, 0x48, &0x0020_0017_u32.to_le_bytes()).unwrap();
     assert!(matches!(
-        resolve_compute_launch(launch, state, &address_space),
+        resolve_compute_launch(
+            launch,
+            state,
+            address_space.memory(),
+            &mut crate::test_memory::access(address_space.memory().machine())
+        ),
         Err(MaxwellComputeLaunchError::MissingProgramRegion { .. })
     ));
 
@@ -182,14 +192,19 @@ fn qmd_resolution_checks_memory_version_and_program_address_on_consumption() {
         &incrementing_packet_on_subchannel(1, 0x1608 / 4, &[0xff, 0xffff_ff00]),
     )
     .unwrap();
-    allocation.write(0x20, &0x100_u32.to_le_bytes()).unwrap();
+    crate::test_memory::write(&allocation, 0x20, &0x100_u32.to_le_bytes()).unwrap();
     let dispatch = dispatch_first(&mut channel, &packet_on_subchannel(1, 0x02bc / 4, 2)).unwrap();
     let [MaxwellEngineOperation::ComputeLaunch { launch, state }] = dispatch.ordered_operations()
     else {
         panic!()
     };
     assert!(matches!(
-        resolve_compute_launch(launch, state, &address_space),
+        resolve_compute_launch(
+            launch,
+            state,
+            address_space.memory(),
+            &mut crate::test_memory::access(address_space.memory().machine())
+        ),
         Err(MaxwellComputeLaunchError::ProgramAddressOverflow {
             base: 0xffff_ffff00,
             offset: 0x100,
@@ -199,6 +214,12 @@ fn qmd_resolution_checks_memory_version_and_program_address_on_consumption() {
 
     // No descriptor cache: even without INVALIDATE, subsequent reads observe
     // modified memory. The last byte address is representable; wrapping is not.
-    allocation.write(0x20, &0xff_u32.to_le_bytes()).unwrap();
-    let _resolved = resolve_compute_launch(launch, state, &address_space).unwrap();
+    crate::test_memory::write(&allocation, 0x20, &0xff_u32.to_le_bytes()).unwrap();
+    let _resolved = resolve_compute_launch(
+        launch,
+        state,
+        address_space.memory(),
+        &mut crate::test_memory::access(address_space.memory().machine()),
+    )
+    .unwrap();
 }

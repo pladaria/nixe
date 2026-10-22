@@ -117,10 +117,8 @@ impl RuntimeCoordinator {
                 return Ok(None);
             }
         }
-        let result = self
-            .workers
-            .receive_any()
-            .map_err(CoordinatorError::Worker)?;
+        self.interrupt_rescheduled_cores();
+        let result = self.receive_any_with_deadlines()?;
         let lease = self
             .scheduler
             .active_leases()
@@ -174,6 +172,45 @@ impl RuntimeCoordinator {
             unreachable!("select commands always produce a selected decision")
         };
         Ok(lease)
+    }
+
+    fn interrupt_rescheduled_cores(&mut self) {
+        self.scheduler.rebalance();
+        for lease in self.scheduler.preemptions() {
+            self.processes[&lease.process].request_vcpu_safepoint(lease.vcpu);
+        }
+    }
+
+    fn worker_wait_timeout(&self) -> Option<std::time::Duration> {
+        if self.virtual_clock.mode() != crate::VirtualClockMode::Realtime {
+            return None;
+        }
+        let deadline = self
+            .next_preemption_ns
+            .into_iter()
+            .chain(
+                self.deadlines
+                    .first_key_value()
+                    .map(|((deadline, _), _)| *deadline),
+            )
+            .min()?;
+        Some(std::time::Duration::from_nanos(
+            deadline.saturating_sub(self.virtual_time_ns()),
+        ))
+    }
+
+    fn receive_any_with_deadlines(&mut self) -> Result<worker::WorkerResult, CoordinatorError> {
+        loop {
+            if let Some(result) = self
+                .workers
+                .receive_any(self.worker_wait_timeout())
+                .map_err(CoordinatorError::Worker)?
+            {
+                return Ok(result);
+            }
+            self.wake_due_deadlines()?;
+            self.interrupt_rescheduled_cores();
+        }
     }
 
     fn dispatch_worker(
@@ -245,8 +282,21 @@ impl RuntimeCoordinator {
         &mut self,
         expected: Lease,
     ) -> Result<CoordinatorExecution, CoordinatorError> {
-        let worker_result = match self.workers.receive(expected.vcpu) {
-            Ok(result) => result,
+        let received = loop {
+            match self
+                .workers
+                .receive_for(expected.vcpu, self.worker_wait_timeout())
+            {
+                Ok(None) => {
+                    self.wake_due_deadlines()?;
+                    self.interrupt_rescheduled_cores();
+                }
+                result => break result,
+            }
+        };
+        let worker_result = match received {
+            Ok(Some(result)) => result,
+            Ok(None) => unreachable!("timeouts are serviced above"),
             Err(failure) => {
                 self.processes
                     .get_mut(&expected.process)
@@ -264,6 +314,12 @@ impl RuntimeCoordinator {
         expected: Lease,
         worker_result: worker::WorkerResult,
     ) -> Result<CoordinatorExecution, CoordinatorError> {
+        nixe_memory::trace::detail_event(
+            "cpu_result_received",
+            worker_result.lease.generation.get(),
+            worker_result.lease.thread.get(),
+            u64::from(worker_result.lease.vcpu.get()),
+        );
         if worker_result.lease != expected {
             self.processes
                 .get_mut(&expected.process)
@@ -388,6 +444,7 @@ impl RuntimeCoordinator {
                     Completion::Ready
                 }
             },
+            ExecutionStop::SupervisorCall { .. } => Completion::KernelCall,
             _ => Completion::Waiting,
         };
         Ok(completion)

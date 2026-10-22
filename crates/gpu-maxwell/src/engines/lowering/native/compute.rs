@@ -4,7 +4,8 @@ impl MaxwellNativeFrontend {
     pub(super) fn capture_compute(
         &mut self,
         launch: &super::super::super::compute::MaxwellResolvedComputeLaunch,
-        space: &MaxwellGpuAddressSpace,
+        space: &MaxwellGpuMemory,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<Arc<crate::recompiler::CapturedProgram>, Error> {
         let request = launch.capture_request();
         let current = |capture: &crate::recompiler::CapturedProgram| {
@@ -30,6 +31,7 @@ impl MaxwellNativeFrontend {
                     &[(None, launch.capture_request())],
                     space,
                     &mut self.capture_memory,
+                    access,
                 )
                 .map_err(compilation)?,
             _ => None,
@@ -54,6 +56,7 @@ impl MaxwellNativeFrontend {
                     [(None, request)],
                     &self.configuration,
                     &mut self.capture_memory,
+                    access,
                 )
                 .map_err(compilation)?,
             );

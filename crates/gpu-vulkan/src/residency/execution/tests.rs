@@ -27,7 +27,7 @@ fn null_storage_buffers_read_zero_and_discard_writes_and_atomics() {
     }
     let validation = cache.device.validation_monitor();
     let compilers = Compilers::new(&cache);
-    let (_, backing) = backing_allocation(4096, 4096, 0x19);
+    let (_allocation_1, backing) = backing_allocation(&cache, 4096, 4096, 0x19);
     let destination = cache
         .buffer_for(backing.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
         .unwrap();
@@ -49,12 +49,10 @@ fn null_storage_buffers_read_zero_and_discard_writes_and_atomics() {
     s.op(O::WriteStorage32, &[V::U32(1), V::U32(0), loaded]);
     s.op(O::WriteStorage32, &[V::U32(1), V::U32(4), atomic]);
     let shader = compilers.shader(&cache, [s]);
-    let pipeline = ready(
-        compilers
-            .pipelines
-            .request(PipelineRecipe::Compute(shader))
-            .unwrap(),
-    );
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Compute(shader))
+        .unwrap();
     let program = cache
         .prepare_program(
             pipeline,
@@ -87,16 +85,16 @@ fn dispatch_alias_import_keeps_prepared_physical_page_baseline() {
     };
     let validation = cache.device.validation_monitor();
     let compilers = Compilers::new(&cache);
-    let (allocation, whole) = backing_allocation(4096, 4096, 0x19);
+    let (allocation, whole) = backing_allocation(&cache, 4096, 4096, 0x19);
     let destination = cache
         .buffer_for(
-            whole.snapshot_subrange(0, 16).unwrap(),
+            whole.slice(0, 16).unwrap(),
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )
         .unwrap();
     let source = cache
         .buffer_for(
-            whole.snapshot_subrange(128, 16).unwrap(),
+            whole.slice(128, 16).unwrap(),
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )
         .unwrap();
@@ -124,12 +122,10 @@ fn dispatch_alias_import_keeps_prepared_physical_page_baseline() {
         }
     }
     let shader = compilers.shader(&cache, [shader]);
-    let pipeline = ready(
-        compilers
-            .pipelines
-            .request(PipelineRecipe::Compute(shader))
-            .unwrap(),
-    );
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Compute(shader))
+        .unwrap();
     let program = cache
         .prepare_program(
             pipeline,
@@ -149,8 +145,7 @@ fn dispatch_alias_import_keeps_prepared_physical_page_baseline() {
         .unwrap();
     // The first write view and the later read view share a physical CPU page.
     // Importing the read view must not destroy this dispatch's preserved bytes.
-    allocation
-        .write(128, &0x11223344_u32.to_le_bytes())
+    crate::residency::tests::cpu_write(&mut cache, &allocation, 128, &0x11223344_u32.to_le_bytes())
         .unwrap();
     cache
         .dispatch(&program, Dispatch::Direct([1, 1, 1]), &[])
@@ -186,19 +181,13 @@ impl Compilers {
         test_shaders::compile(&cache.device.profile().shader_compiler.profile, shaders)
     }
 }
-fn ready<T>(pending: Pending<T>) -> Arc<T> {
-    pending
-        .wait_timeout(Duration::from_secs(30))
-        .unwrap()
-        .unwrap()
-}
 fn image(
     cache: &mut VulkanResidency,
     format: vk::Format,
     aspect: vk::ImageAspectFlags,
     bytes: u32,
-) -> (ImageId, CanonicalBackingRange) {
-    let (_, backing) = backing_allocation(4096, 4096, 0x7b);
+) -> (ImageId, Arc<PhysicalMapping>, nixe_memory::Allocation) {
+    let (_allocation_2, backing) = backing_allocation(cache, 4096, 4096, 0x7b);
     let extent = vk::Extent3D {
         width: 8,
         height: 8,
@@ -219,7 +208,26 @@ fn image(
     };
     let id = cache
         .image_for(
-            backing.clone(),
+            crate::residency::tests::image_geometry(
+                backing.clone(),
+                NativeImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format,
+                    extent,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    usage: vk::ImageUsageFlags::TRANSFER_SRC
+                        | vk::ImageUsageFlags::TRANSFER_DST
+                        | if aspect == vk::ImageAspectFlags::COLOR {
+                            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        } else {
+                            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                        },
+                    flags: vk::ImageCreateFlags::empty(),
+                },
+                &[plane],
+            ),
             NativeImageDescription {
                 image_type: vk::ImageType::TYPE_2D,
                 format,
@@ -239,7 +247,7 @@ fn image(
             vec![plane],
         )
         .unwrap();
-    (id, backing)
+    (id, backing, _allocation_2)
 }
 fn area() -> vk::Rect2D {
     vk::Rect2D {
@@ -275,36 +283,33 @@ fn graphics_state() -> GraphicsState {
 }
 fn streams(
     cache: &mut VulkanResidency,
-) -> (
-    Box<[VertexBuffer]>,
-    IndexBuffer,
-    nixe_memory::CanonicalAllocation,
-) {
+) -> (Box<[VertexBuffer]>, IndexBuffer, nixe_memory::Allocation) {
     let values = [
         [-1f32, -1., 0.25, 1., 0., 0.],
         [3., -1., 0.25, 0., 1., 0.],
         [-1., 3., 0.25, 0., 0., 1.],
     ];
-    let (allocation, backing) = backing_allocation(4096, 4096, 0);
+    let (allocation, backing) = backing_allocation(cache, 4096, 4096, 0);
     let bytes: Vec<_> = values
         .iter()
         .flatten()
         .flat_map(|f| f.to_le_bytes())
         .collect();
-    allocation.write(24, &bytes).unwrap();
+    crate::residency::tests::cpu_write(cache, &allocation, 24, &bytes).unwrap();
     let vertex = cache
         .buffer_for(backing.clone(), vk::BufferUsageFlags::VERTEX_BUFFER)
         .unwrap();
     // Skip one index and use a signed base vertex. Ordered vertices stay 0,1,2.
-    allocation
-        .write(
-            128,
-            &[999u16, 1, 2, 3]
-                .into_iter()
-                .flat_map(u16::to_le_bytes)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    crate::residency::tests::cpu_write(
+        cache,
+        &allocation,
+        128,
+        &[999u16, 1, 2, 3]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let index = cache
         .buffer_for(
             backing,
@@ -336,20 +341,18 @@ fn gathered_draw_inputs_reuse_versions_and_observe_intervening_gpu_writes() {
     let compilers = Compilers::new(&cache);
     let shader = compilers.shader(&cache, vertex_fragment());
     let state = graphics_state();
-    let pipeline = ready(
-        compilers
-            .pipelines
-            .request(PipelineRecipe::Graphics {
-                shader,
-                state: state.clone(),
-            })
-            .unwrap(),
-    );
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Graphics {
+            shader,
+            state: state.clone(),
+        })
+        .unwrap();
     let program = cache.prepare_program(pipeline, &[]).unwrap();
     let graphics = cache
         .prepare_graphics(program, GraphicsParameters::new(state, area().extent))
         .unwrap();
-    let (target, pixels) = image(
+    let (target, pixels, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -380,44 +383,20 @@ fn gathered_draw_inputs_reuse_versions_and_observe_intervening_gpu_writes() {
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>()
     };
-    let page = cache
-        .buffer(vertex.buffer)
-        .unwrap()
-        .contents
-        .backing
-        .pages()
-        .next()
-        .unwrap()
-        .clone();
-    let cpu_write = |bytes: &[u8]| {
-        let mut access = page.try_cpu_access().unwrap().unwrap();
-        access.prepare_write().unwrap();
-        access
-            .write_prepared(vertex.offset as usize, bytes)
-            .unwrap();
-    };
-    cpu_write(&vertex_bytes([0., 0., 1.]));
-    let before = cache.statistics.cpu_streamed_bytes;
-    let inputs = cache
-        .capture_draw_inputs([&draw, &draw].into_iter())
-        .unwrap();
-    assert_eq!(
-        cache.statistics.cpu_streamed_bytes - before,
-        vertex.size,
-        "repeated draws gather one physical input version"
-    );
-    let _second = cache.capture_draw_inputs([&draw].into_iter()).unwrap();
-    assert_eq!(cache.statistics.cpu_streamed_bytes - before, vertex.size);
-    cpu_write(&vertex_bytes([0., 1., 0.]));
+    crate::residency::tests::cpu_write(
+        &mut cache,
+        &_allocation,
+        vertex.offset,
+        &vertex_bytes([0., 0., 1.]),
+    )
+    .unwrap();
     let arguments = [Draw::Direct {
         vertices: 3,
         instances: 1,
         first_vertex: 0,
         first_instance: 0,
     }];
-    cache
-        .draws_streamed(&draw, &arguments, &[], Some(&inputs))
-        .unwrap();
+    cache.draws_streamed(&draw, &arguments, &[]).unwrap();
     cache.flush().unwrap();
     let old_output = cpu_read(&mut cache, &pixels);
     for row in 0..8 {
@@ -425,11 +404,10 @@ fn gathered_draw_inputs_reuse_versions_and_observe_intervening_gpu_writes() {
             assert_eq!(
                 pixel,
                 [0, 0, 255, 255],
-                "CPU inputs were consumed at the batch read boundary"
+                "CPU inputs were consumed by the draw owner"
             );
         }
     }
-    let inputs = cache.capture_draw_inputs([&draw].into_iter()).unwrap();
     let replacement = vertex_bytes([1., 1., 0.]);
     let upload = cache
         .write_buffer(vertex.buffer, vertex.offset, &replacement)
@@ -445,7 +423,6 @@ fn gathered_draw_inputs_reuse_versions_and_observe_intervening_gpu_writes() {
                 first_instance: 0,
             }],
             &[],
-            Some(&inputs),
         )
         .unwrap();
     cache.flush().unwrap();
@@ -486,7 +463,7 @@ fn raster(api: ApiPreference, inline: bool, large: bool) {
     }
     let compilers = Compilers::new(&cache);
     let shader = compilers.shader(&cache, vertex_fragment());
-    let (color, backing) = image(
+    let (color, backing, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -497,7 +474,7 @@ fn raster(api: ApiPreference, inline: bool, large: bool) {
         // Dirty unconsumed padding forces a full vertex-page import after the
         // inline indices have entered staging. Its repeated flushes must never
         // recycle the index producer before the draw's real consumer retires.
-        vertex_allocation.write(0, &[0x33]).unwrap();
+        crate::residency::tests::cpu_write(&mut cache, &vertex_allocation, 0, &[0x33]).unwrap();
     }
     let mut state = graphics_state();
     state.provoking = vk::ProvokingVertexModeEXT::LAST_VERTEX;
@@ -510,15 +487,13 @@ fn raster(api: ApiPreference, inline: bool, large: bool) {
         );
         return;
     }
-    let pipeline = ready(
-        compilers
-            .pipelines
-            .request(PipelineRecipe::Graphics {
-                shader: Arc::clone(&shader),
-                state: state.clone(),
-            })
-            .unwrap(),
-    );
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Graphics {
+            shader: Arc::clone(&shader),
+            state: state.clone(),
+        })
+        .unwrap();
     let program = cache.prepare_program(pipeline, &[]).unwrap();
     let mut params = GraphicsParameters::new(state, area().extent);
     params.scissors[0] = vk::Rect2D {
@@ -638,26 +613,25 @@ fn compute(api: ApiPreference) {
     let validation = cache.device.validation_monitor();
     let compilers = Compilers::new(&cache);
     let shader = compilers.shader(&cache, [increment()]);
-    let pipeline = ready(
-        compilers
-            .pipelines
-            .request(PipelineRecipe::Compute(shader))
-            .unwrap(),
-    );
-    let (_, backing) = backing_allocation(4096, 4096, 0);
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Compute(shader))
+        .unwrap();
+    let (_allocation_3, backing) = backing_allocation(&cache, 4096, 4096, 0);
     let buffer = cache
         .buffer_for(backing.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
         .unwrap();
-    let (allocation, args) = backing_allocation(4096, 4096, 0);
-    allocation
-        .write(
-            4,
-            &[1u32; 3]
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    let (allocation, args) = backing_allocation(&cache, 4096, 4096, 0);
+    crate::residency::tests::cpu_write(
+        &mut cache,
+        &allocation,
+        4,
+        &[1u32; 3]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let indirect = cache
         .buffer_for(args, vk::BufferUsageFlags::INDIRECT_BUFFER)
         .unwrap();
@@ -697,13 +671,14 @@ fn compute(api: ApiPreference) {
     let result = cpu_read(&mut cache, &backing);
     assert_eq!(&result[..4], &8u32.to_le_bytes());
     assert!(result[4..].iter().all(|v| *v == 0));
-    assert_eq!(
-        cache
-            .device()
-            .recording_statistics()
-            .stream_descriptor_allocations,
-        1
-    );
+    // Descriptors belong to recording slots, including the fence publication
+    // slot. Repeated dispatches must reuse those bounded arenas.
+    let allocations = cache
+        .device()
+        .recording_statistics()
+        .stream_descriptor_allocations;
+    assert!(allocations <= cache.device().queue_usage().command_pools as u64);
+    assert!(allocations < 8);
     drop(program);
     drop(compilers);
     drop(cache);
@@ -806,14 +781,12 @@ fn solid_prepared(
 ) -> Result<PreparedDraw, VulkanError> {
     let mut state = GraphicsState::color(format);
     state.samples = samples;
-    let pipeline = ready(
-        compiler(cache)
-            .request(PipelineRecipe::Graphics {
-                shader: solid_artifact(),
-                state: state.clone(),
-            })
-            .unwrap(),
-    );
+    let pipeline = compiler(cache)
+        .request(PipelineRecipe::Graphics {
+            shader: solid_artifact(),
+            state: state.clone(),
+        })
+        .unwrap();
     let program = cache.prepare_program(pipeline, &[])?;
     let mut parameters = GraphicsParameters::new(state, extent);
     parameters.scissors[0] = scissor;
@@ -888,11 +861,9 @@ impl Utilities for VulkanResidency {
         offset: u64,
         count: u32,
     ) -> Result<WorkTicket, VulkanError> {
-        let backing = self
-            .buffer(id)?
-            .contents
-            .backing
-            .snapshot_subrange(offset, u64::from(count) * 4)
+        let backing = self.buffer(id)?.contents.geometry[0]
+            .mapping()
+            .slice(offset, u64::from(count) * 4)
             .map_err(memory_error)?;
         let interval = self.buffer_for(backing, vk::BufferUsageFlags::STORAGE_BUFFER)?;
         let shader = Arc::new(ShaderArtifact::new(Box::new([host_stage(
@@ -909,11 +880,9 @@ impl Utilities for VulkanResidency {
             }]),
             8,
         )])));
-        let pipeline = ready(
-            compiler(self)
-                .request(PipelineRecipe::Compute(shader))
-                .unwrap(),
-        );
+        let pipeline = compiler(self)
+            .request(PipelineRecipe::Compute(shader))
+            .unwrap();
         let program = self.prepare_program(
             pipeline,
             &[Binding::Buffer {
@@ -987,13 +956,13 @@ fn blend_masks_depth_stencil_and_dynamic_pipeline_reuse() {
     };
     let validation = cache.device.validation_monitor();
     let compilers = Compilers::new(&cache);
-    let (color, bytes) = image(
+    let (color, bytes, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
         4,
     );
-    let (_, dsbytes) = backing_allocation(4096, 4096, 0x61);
+    let (_allocation_4, dsbytes) = backing_allocation(&cache, 4096, 4096, 0x61);
     let extent = vk::Extent3D {
         width: 8,
         height: 8,
@@ -1021,7 +990,20 @@ fn blend_masks_depth_stencil_and_dynamic_pipeline_reuse() {
     };
     let ds = cache
         .image_for(
-            dsbytes.clone(),
+            crate::residency::tests::image_geometry(
+                dsbytes.clone(),
+                NativeImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format: vk::Format::D32_SFLOAT_S8_UINT,
+                    extent,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                    flags: vk::ImageCreateFlags::empty(),
+                },
+                &[depth, stencil],
+            ),
             NativeImageDescription {
                 image_type: vk::ImageType::TYPE_2D,
                 format: vk::Format::D32_SFLOAT_S8_UINT,
@@ -1060,15 +1042,13 @@ fn blend_masks_depth_stencil_and_dynamic_pipeline_reuse() {
     state.colors[0].1.enabled = true;
     state.colors[0].1.dst_color = vk::BlendFactor::ONE;
     state.colors[0].1.write_mask = vk::ColorComponentFlags::R | vk::ColorComponentFlags::B;
-    let pipeline = ready(
-        compilers
-            .pipelines
-            .request(PipelineRecipe::Graphics {
-                shader: Arc::clone(&shader),
-                state: state.clone(),
-            })
-            .unwrap(),
-    );
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Graphics {
+            shader: Arc::clone(&shader),
+            state: state.clone(),
+        })
+        .unwrap();
     let make_targets = |cache: &mut VulkanResidency| {
         let load = |plane| RenderAttachment {
             source: AttachmentSource::Canonical { image: ds, plane },
@@ -1119,15 +1099,13 @@ fn blend_masks_depth_stencil_and_dynamic_pipeline_reuse() {
     state.depth_compare = vk::CompareOp::GREATER;
     state.front.depth_fail = vk::StencilOp::INCREMENT_AND_CLAMP;
     state.back = state.front;
-    let other = ready(
-        compilers
-            .pipelines
-            .request(PipelineRecipe::Graphics {
-                shader,
-                state: state.clone(),
-            })
-            .unwrap(),
-    );
+    let other = compilers
+        .pipelines
+        .request(PipelineRecipe::Graphics {
+            shader,
+            state: state.clone(),
+        })
+        .unwrap();
     if cache.device.profile().dynamic_state.base {
         assert!(Arc::ptr_eq(&pipeline, &other));
     }
@@ -1176,7 +1154,7 @@ fn exercise_sample_mask_and_resolve(canonical: bool) {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (target, bytes) = image(
+    let (target, bytes, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -1197,12 +1175,30 @@ fn exercise_sample_mask_and_resolve(canonical: bool) {
         flags: vk::ImageCreateFlags::empty(),
     };
     let mut source_storage = None;
+    let mut _source_allocation = None;
     let source = if canonical {
-        let (_, backing) = backing_allocation(1280, 64, 0x39);
+        let (_allocation_5, backing) = backing_allocation(&cache, 1280, 64, 0x39);
         source_storage = Some(backing.clone());
+        _source_allocation = Some(_allocation_5);
         let image = cache
             .multisample_image_for(
-                backing,
+                crate::residency::tests::image_geometry(
+                    backing,
+                    description,
+                    &[ImagePlane {
+                        offset: 0,
+                        row_pitch: 80,
+                        mip_level: 0,
+                        array_layer: 0,
+                        aspect: vk::ImageAspectFlags::COLOR,
+                        extent: description.extent,
+                        block_extent: vk::Extent2D {
+                            width: 1,
+                            height: 1,
+                        },
+                        bytes_per_block: 4,
+                    }],
+                ),
                 description,
                 vec![ImagePlane {
                     offset: 0,
@@ -1229,14 +1225,12 @@ fn exercise_sample_mask_and_resolve(canonical: bool) {
     state.sample_mask = 5;
     let compiler = Arc::new(compiler(&cache));
     cache.enable_sample_conversion(Arc::clone(&compiler));
-    let pipeline = ready(
-        compiler
-            .request(PipelineRecipe::Graphics {
-                shader: solid_artifact(),
-                state: state.clone(),
-            })
-            .unwrap(),
-    );
+    let pipeline = compiler
+        .request(PipelineRecipe::Graphics {
+            shader: solid_artifact(),
+            state: state.clone(),
+        })
+        .unwrap();
     let program = cache.prepare_program(pipeline, &[]).unwrap();
     let graphics = cache
         .prepare_graphics(program, GraphicsParameters::new(state, area().extent))
@@ -1279,19 +1273,6 @@ fn exercise_sample_mask_and_resolve(canonical: bool) {
         .unwrap();
     match source {
         AttachmentSource::Canonical { image, plane } => {
-            let owned: u64 = cache
-                .index
-                .pages
-                .values()
-                .flat_map(|p| p.resolved_writes())
-                .filter(|w| w.source == crate::residency::index::Resource::Image(image))
-                .map(|w| w.end - w.start)
-                .sum();
-            assert_eq!(
-                owned,
-                8 * 8 * 4 * 4,
-                "authority covers all four stored samples and excludes row padding"
-            );
             cache
                 .resolve_image(image, plane, area(), target, 0, Default::default())
                 .unwrap();
@@ -1351,9 +1332,14 @@ fn exercise_sample_mask_and_resolve(canonical: bool) {
         };
         let planes = entry.planes.clone();
         let alias = cache
-            .multisample_image_for(storage.clone(), srgb_description, planes, [2, 2])
+            .multisample_image_for(
+                crate::residency::tests::image_geometry(storage.clone(), srgb_description, &planes),
+                srgb_description,
+                planes,
+                [2, 2],
+            )
             .unwrap();
-        let (resolved, resolved_bytes) = image(
+        let (resolved, resolved_bytes, _image_allocation) = image(
             &mut cache,
             vk::Format::R8G8B8A8_SRGB,
             vk::ImageAspectFlags::COLOR,
@@ -1410,18 +1396,168 @@ fn sampled_shader(cache: &VulkanResidency, coords: [f32; 2]) -> Arc<ShaderArtifa
     ])))
 }
 #[test]
+fn sampled_image_preserves_undefined_padding_without_requiring_the_whole_view() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (target, pixels, _target_allocation) = image(
+        &mut cache,
+        vk::Format::R8G8B8A8_UNORM,
+        vk::ImageAspectFlags::COLOR,
+        4,
+    );
+    let (_source_allocation, backing) = backing_allocation(&cache, 4096, 4096, 0x73);
+    let entry = cache.image(target).unwrap();
+    let description = NativeImageDescription {
+        usage: entry.description.usage | vk::ImageUsageFlags::SAMPLED,
+        ..entry.description
+    };
+    let planes = entry.planes.clone();
+    let source = cache
+        .image_for_device_write(
+            crate::residency::tests::image_geometry(backing, description, &planes),
+            description,
+            planes.clone(),
+        )
+        .unwrap();
+    let written = vk::Rect2D {
+        offset: Default::default(),
+        extent: vk::Extent2D {
+            width: 4,
+            height: 4,
+        },
+    };
+    cache
+        .clear_image_rect(
+            source,
+            0,
+            written,
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [1., 0., 0., 1.],
+                },
+            },
+        )
+        .unwrap();
+    let view = cache
+        .image_view(
+            source,
+            ImageViewDescription {
+                format: description.format,
+                view_type: vk::ImageViewType::TYPE_2D,
+                aspects: vk::ImageAspectFlags::COLOR,
+                base_mip: 0,
+                mip_count: 1,
+                base_layer: 0,
+                layer_count: 1,
+                swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
+            },
+        )
+        .unwrap();
+    let mut samplers = SamplerCache::new(cache.device(), 4);
+    let sampler = samplers.get(&vk::SamplerCreateInfo::default()).unwrap();
+    let compiler = compiler(&cache);
+    let state = GraphicsState::color(vk::Format::R8G8B8A8_UNORM);
+    let pipeline = compiler
+        .request(PipelineRecipe::Graphics {
+            shader: sampled_shader(&cache, [0.25; 2]),
+            state: state.clone(),
+        })
+        .unwrap();
+    let program = cache
+        .prepare_program(
+            pipeline,
+            &[Binding::CombinedImageSampler {
+                image: view,
+                sampler,
+            }],
+        )
+        .unwrap();
+    let graphics = cache
+        .prepare_graphics(program, GraphicsParameters::new(state, area().extent))
+        .unwrap();
+    let targets = cache
+        .prepare_targets(RenderingTargets {
+            area: area(),
+            colors: Box::new([Some(RenderAttachment::color(
+                target,
+                0,
+                AttachmentLoad::Clear([0., 0., 1., 1.]),
+                AttachmentStore::Store,
+            ))]),
+            depth: None,
+            stencil: None,
+        })
+        .unwrap();
+    let draw = cache
+        .prepare_draw(graphics, targets, Box::new([]), None)
+        .unwrap();
+    let before = cache.statistics().cpu_uploaded_bytes;
+    let buffers_before = cache
+        .buffers
+        .iter()
+        .filter(|slot| slot.entry.is_some())
+        .count();
+    cache
+        .draw(
+            &draw,
+            Draw::Direct {
+                vertices: 3,
+                instances: 1,
+                first_vertex: 0,
+                first_instance: 0,
+            },
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        cache
+            .buffers
+            .iter()
+            .filter(|slot| slot.entry.is_some())
+            .count(),
+        buffers_before,
+        "sampling existing native writes must not create a reconstruction buffer"
+    );
+    let result = cpu_read(&mut cache, &pixels);
+    for row in result[32..32 + 8 * 48].chunks_exact(48) {
+        for pixel in row[..32].chunks_exact(4) {
+            assert_eq!(pixel, [255, 0, 0, 255]);
+        }
+        assert_eq!(&row[32..], &[0x7b; 16]);
+    }
+    assert_eq!(cache.statistics().cpu_uploaded_bytes, before);
+    assert!(!cache.image(source).unwrap().discarded.is_empty());
+    assert!(
+        cache
+            .require_image_initialized(
+                source,
+                planes[0],
+                super::super::transfers::full_rect(planes[0])
+            )
+            .is_err()
+    );
+    drop(draw);
+    drop(compiler);
+    drop(samplers);
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
 fn native_bc_extent_astc_decode_dirty_blocks_and_custom_sampler_border() {
     let Some(mut cache) = cache(ApiPreference::Auto, 32 * 1024 * 1024) else {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (allocation, backing) = backing_allocation(4096, 4096, 0);
+    let (allocation, backing) = backing_allocation(&cache, 4096, 4096, 0);
     let mut block = [255u8; 16];
     block[..2].copy_from_slice(&[0xfc, 0xfd]);
     for (c, v) in [65535u16, 0, 0, 65535].into_iter().enumerate() {
         block[8 + c * 2..10 + c * 2].copy_from_slice(&v.to_le_bytes());
     }
-    allocation.write(32, &block).unwrap();
+    crate::residency::tests::cpu_write(&mut cache, &allocation, 32, &block).unwrap();
     let extent = vk::Extent3D {
         width: 3,
         height: 2,
@@ -1442,7 +1578,20 @@ fn native_bc_extent_astc_decode_dirty_blocks_and_custom_sampler_border() {
     };
     let image = cache
         .sampled_image_for(
-            backing.clone(),
+            crate::residency::tests::image_geometry(
+                backing.clone(),
+                NativeImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format: vk::Format::ASTC_4X4_UNORM_BLOCK,
+                    extent,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    usage: vk::ImageUsageFlags::SAMPLED,
+                    flags: vk::ImageCreateFlags::empty(),
+                },
+                &[source],
+            ),
             NativeImageDescription {
                 image_type: vk::ImageType::TYPE_2D,
                 format: vk::Format::ASTC_4X4_UNORM_BLOCK,
@@ -1475,7 +1624,7 @@ fn native_bc_extent_astc_decode_dirty_blocks_and_custom_sampler_border() {
             },
         )
         .unwrap();
-    let (target, pixels) = self::image(
+    let (target, pixels, _image_allocation) = self::image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -1505,14 +1654,12 @@ fn native_bc_extent_astc_decode_dirty_blocks_and_custom_sampler_border() {
         }
         let sampler = samplers.get_extended(&info, extensions).unwrap();
         let state = GraphicsState::color(vk::Format::R8G8B8A8_UNORM);
-        let pipeline = ready(
-            compiler
-                .request(PipelineRecipe::Graphics {
-                    shader: sampled_shader(&cache, if custom { [-1.; 2] } else { [0.5; 2] }),
-                    state: state.clone(),
-                })
-                .unwrap(),
-        );
+        let pipeline = compiler
+            .request(PipelineRecipe::Graphics {
+                shader: sampled_shader(&cache, if custom { [-1.; 2] } else { [0.5; 2] }),
+                state: state.clone(),
+            })
+            .unwrap();
         let program = cache
             .prepare_program(
                 pipeline,
@@ -1567,7 +1714,7 @@ fn native_bc_extent_astc_decode_dirty_blocks_and_custom_sampler_border() {
     let before_dirty = cache.statistics().cpu_uploaded_bytes;
     block[8..10].copy_from_slice(&0u16.to_le_bytes());
     block[12..14].copy_from_slice(&65535u16.to_le_bytes());
-    allocation.write(32, &block).unwrap();
+    crate::residency::tests::cpu_write(&mut cache, &allocation, 32, &block).unwrap();
     cache.ensure_image(image).unwrap();
     if cache.device.profile().core.texture_compression_astc_ldr == 0 {
         assert_eq!(
@@ -1576,7 +1723,7 @@ fn native_bc_extent_astc_decode_dirty_blocks_and_custom_sampler_border() {
         );
     }
     // BC is retained compressed even for a 5x3 extent; no WebGPU padding decode.
-    let (_, bcbytes) = backing_allocation(4096, 4096, 0);
+    let (_allocation_6, bcbytes) = backing_allocation(&cache, 4096, 4096, 0);
     let mut d = cache.image(target).unwrap().description;
     d.format = vk::Format::BC1_RGBA_UNORM_BLOCK;
     d.extent = vk::Extent3D {
@@ -1587,7 +1734,21 @@ fn native_bc_extent_astc_decode_dirty_blocks_and_custom_sampler_border() {
     d.usage = vk::ImageUsageFlags::SAMPLED;
     let bc = cache
         .sampled_image_for(
-            bcbytes,
+            crate::residency::tests::image_geometry(
+                bcbytes,
+                d,
+                &[ImagePlane {
+                    offset: 0,
+                    row_pitch: 16,
+                    extent: d.extent,
+                    block_extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                    bytes_per_block: 8,
+                    ..source
+                }],
+            ),
             d,
             vec![ImagePlane {
                 offset: 0,
@@ -1631,20 +1792,18 @@ fn compute_produced_indexed_indirect_draw_scaled32_and_first_instance() {
     state.vertex_attributes[1].binding = 1;
     state.vertex_attributes[1].offset = 0;
     state.vertex_attributes[1].format = vk::Format::R32G32B32_UINT;
-    let pipeline = ready(
-        compilers
-            .pipelines
-            .request(PipelineRecipe::Graphics {
-                shader,
-                state: state.clone(),
-            })
-            .unwrap(),
-    );
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Graphics {
+            shader,
+            state: state.clone(),
+        })
+        .unwrap();
     let program = cache.prepare_program(pipeline, &[]).unwrap();
     let graphics = cache
         .prepare_graphics(program, GraphicsParameters::new(state, area().extent))
         .unwrap();
-    let (target, pixels) = image(
+    let (target, pixels, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -1664,16 +1823,17 @@ fn compute_produced_indexed_indirect_draw_scaled32_and_first_instance() {
         })
         .unwrap();
     let (vertices, index, _vertex_allocation) = streams(&mut cache);
-    let (allocation, colors) = backing_allocation(4096, 4096, 0);
-    allocation
-        .write(
-            0,
-            &[1u32, 0, 0, 0, 1, 0]
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    let (allocation, colors) = backing_allocation(&cache, 4096, 4096, 0);
+    crate::residency::tests::cpu_write(
+        &mut cache,
+        &allocation,
+        0,
+        &[1u32, 0, 0, 0, 1, 0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let instance = cache
         .buffer_for(colors, vk::BufferUsageFlags::VERTEX_BUFFER)
         .unwrap();
@@ -1689,7 +1849,7 @@ fn compute_produced_indexed_indirect_draw_scaled32_and_first_instance() {
     let draw = cache
         .prepare_draw(graphics, targets, vertices, Some(index))
         .unwrap();
-    let (_, commands) = backing_allocation(4096, 4096, 0);
+    let (_allocation_7, commands) = backing_allocation(&cache, 4096, 4096, 0);
     let indirect = cache
         .buffer_for(
             commands,
@@ -1705,12 +1865,10 @@ fn compute_produced_indexed_indirect_draw_scaled32_and_first_instance() {
         );
     }
     let shader = compilers.shader(&cache, [f]);
-    let pipeline = ready(
-        compilers
-            .pipelines
-            .request(PipelineRecipe::Compute(shader))
-            .unwrap(),
-    );
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Compute(shader))
+        .unwrap();
     let compute = cache
         .prepare_program(
             pipeline,
@@ -1754,14 +1912,14 @@ fn native_nv12_fixed_point_bgra_crop_and_alpha_match_integer_reference() {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (yalloc, ybytes) = backing_allocation(4096, 4096, 0);
-    let (uvalloc, uvbytes) = backing_allocation(4096, 4096, 0);
+    let (yalloc, ybytes) = backing_allocation(&cache, 4096, 4096, 0);
+    let (uvalloc, uvbytes) = backing_allocation(&cache, 4096, 4096, 0);
     let ys: Vec<_> = (0..100).map(|i| (i * 3 + 7) as u8).collect();
-    yalloc.write(0, &ys).unwrap();
+    crate::residency::tests::cpu_write(&mut cache, &yalloc, 0, &ys).unwrap();
     let uvs: Vec<_> = (0..50).map(|i| (i * 5 + 13) as u8).collect();
-    uvalloc.write(0, &uvs).unwrap();
+    crate::residency::tests::cpu_write(&mut cache, &uvalloc, 0, &uvs).unwrap();
     let make = |cache: &mut VulkanResidency,
-                bytes: CanonicalBackingRange,
+                bytes: Arc<PhysicalMapping>,
                 format: vk::Format,
                 width: u32,
                 height: u32,
@@ -1773,7 +1931,32 @@ fn native_nv12_fixed_point_bgra_crop_and_alpha_match_integer_reference() {
         };
         let image = cache
             .image_for(
-                bytes,
+                crate::residency::tests::image_geometry(
+                    bytes,
+                    NativeImageDescription {
+                        image_type: vk::ImageType::TYPE_2D,
+                        format,
+                        extent,
+                        mip_levels: 1,
+                        array_layers: 1,
+                        samples: vk::SampleCountFlags::TYPE_1,
+                        usage: vk::ImageUsageFlags::SAMPLED,
+                        flags: vk::ImageCreateFlags::empty(),
+                    },
+                    &[ImagePlane {
+                        offset: 0,
+                        row_pitch: u64::from(width * bpp),
+                        mip_level: 0,
+                        array_layer: 0,
+                        aspect: vk::ImageAspectFlags::COLOR,
+                        extent,
+                        block_extent: vk::Extent2D {
+                            width: 1,
+                            height: 1,
+                        },
+                        bytes_per_block: bpp,
+                    }],
+                ),
                 NativeImageDescription {
                     image_type: vk::ImageType::TYPE_2D,
                     format,
@@ -1817,14 +2000,14 @@ fn native_nv12_fixed_point_bgra_crop_and_alpha_match_integer_reference() {
     };
     let y = make(&mut cache, ybytes, vk::Format::R8_UNORM, 10, 10, 1);
     let uv = make(&mut cache, uvbytes, vk::Format::R8G8_UNORM, 5, 5, 2);
-    let (target, bytes) = image(
+    let (target, bytes, _image_allocation) = image(
         &mut cache,
         vk::Format::B8G8R8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
         4,
     );
     let compiler = compiler(&cache);
-    let pipeline = ready(crate::nv12_pipeline(&compiler, vk::Format::B8G8R8A8_UNORM).unwrap());
+    let pipeline = crate::nv12_pipeline(&compiler, vk::Format::B8G8R8A8_UNORM).unwrap();
     let t = nixe_gpu::Nv12ColorTransform {
         coefficients: [
             [256, 0, 128, -4096],
@@ -1922,7 +2105,7 @@ fn native_tessellation_default_control_levels_are_dynamic_and_zero_culls_patch()
     let shader = Arc::new(ShaderArtifact::new(Box::new([
         vertex, control, evaluation, fragment,
     ])));
-    let (target, pixels) = image(
+    let (target, pixels, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -1961,19 +2144,17 @@ fn native_tessellation_default_control_levels_are_dynamic_and_zero_culls_patch()
                         state.topology = vk::PrimitiveTopology::PATCH_LIST;
                         state.patch_points = 3;
                     }
-                    let pipeline = ready(
-                        compilers
-                            .pipelines
-                            .request(PipelineRecipe::Graphics {
-                                shader: if tessellated {
-                                    shader.clone()
-                                } else {
-                                    reference_shader.clone()
-                                },
-                                state: state.clone(),
-                            })
-                            .unwrap(),
-                    );
+                    let pipeline = compilers
+                        .pipelines
+                        .request(PipelineRecipe::Graphics {
+                            shader: if tessellated {
+                                shader.clone()
+                            } else {
+                                reference_shader.clone()
+                            },
+                            state: state.clone(),
+                        })
+                        .unwrap();
                     let program = cache.prepare_program(pipeline, &[]).unwrap();
                     let mut parameters = GraphicsParameters::new(state, area().extent);
                     if negative_viewport {
@@ -2082,39 +2263,37 @@ fn quad_geometry(provoking_first: bool) {
         vk::ProvokingVertexModeEXT::LAST_VERTEX
     };
     let compiler = compiler(&cache);
-    let pending = compiler
-        .request(PipelineRecipe::Graphics {
-            shader,
-            state: state.clone(),
-        })
-        .unwrap();
-    let result = pending.wait_timeout(Duration::from_secs(30)).unwrap();
+    let result = compiler.request(PipelineRecipe::Graphics {
+        shader,
+        state: state.clone(),
+    });
     if cache.device.profile().core.geometry_shader == 0 {
         assert!(result.is_err());
         return;
     }
     let pipeline = result.unwrap();
-    let (allocation, vertices) = backing_allocation(4096, 4096, 0);
+    let (allocation, vertices) = backing_allocation(&cache, 4096, 4096, 0);
     let values = [
         [-1f32, -1., 0.25, 1., 0., 0.],
         [1., -1., 0.25, 0., 1., 0.],
         [1., 1., 0.25, 0., 0., 1.],
         [-1., 1., 0.25, 1., 1., 0.],
     ];
-    allocation
-        .write(
-            0,
-            &values
-                .iter()
-                .flatten()
-                .flat_map(|f| f.to_le_bytes())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    crate::residency::tests::cpu_write(
+        &mut cache,
+        &allocation,
+        0,
+        &values
+            .iter()
+            .flatten()
+            .flat_map(|f| f.to_le_bytes())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let vertex = cache
         .buffer_for(vertices, vk::BufferUsageFlags::VERTEX_BUFFER)
         .unwrap();
-    let (_, counters) = backing_allocation(4096, 4096, 0);
+    let (_allocation_8, counters) = backing_allocation(&cache, 4096, 4096, 0);
     let buffer = cache
         .buffer_for(counters.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
         .unwrap();
@@ -2131,7 +2310,7 @@ fn quad_geometry(provoking_first: bool) {
     let graphics = cache
         .prepare_graphics(program, GraphicsParameters::new(state, area().extent))
         .unwrap();
-    let (target, pixels) = image(
+    let (target, pixels, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -2214,27 +2393,28 @@ fn native_fill_rectangle_and_front_and_back_culling() {
         assert!(requested.is_err());
         return;
     }
-    let pipeline = ready(requested.unwrap());
-    let (allocation, vertices) = backing_allocation(4096, 4096, 0);
+    let pipeline = requested.unwrap();
+    let (allocation, vertices) = backing_allocation(&cache, 4096, 4096, 0);
     let values = [
         [-0.5f32, -0.5, 0.25, 1., 0., 0.],
         [0.5, -0.5, 0.25, 0., 1., 0.],
         [-0.5, 0.5, 0.25, 0., 0., 1.],
     ];
-    allocation
-        .write(
-            0,
-            &values
-                .iter()
-                .flatten()
-                .flat_map(|f| f.to_le_bytes())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    crate::residency::tests::cpu_write(
+        &mut cache,
+        &allocation,
+        0,
+        &values
+            .iter()
+            .flatten()
+            .flat_map(|f| f.to_le_bytes())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let vertex = cache
         .buffer_for(vertices, vk::BufferUsageFlags::VERTEX_BUFFER)
         .unwrap();
-    let (target, pixels) = image(
+    let (target, pixels, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -2317,7 +2497,7 @@ fn partial_image_write_does_not_take_ownership_of_untouched_pages() {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (_, storage) = backing_allocation(16384, 4096, 0x73);
+    let (_allocation_9, storage) = backing_allocation(&cache, 16384, 4096, 0x73);
     let extent = vk::Extent3D {
         width: 64,
         height: 64,
@@ -2325,7 +2505,32 @@ fn partial_image_write_does_not_take_ownership_of_untouched_pages() {
     };
     let target = cache
         .image_for(
-            storage.clone(),
+            crate::residency::tests::image_geometry(
+                storage.clone(),
+                NativeImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format: vk::Format::R8G8B8A8_UNORM,
+                    extent,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    flags: vk::ImageCreateFlags::empty(),
+                },
+                &[ImagePlane {
+                    offset: 0,
+                    row_pitch: 256,
+                    mip_level: 0,
+                    array_layer: 0,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    extent,
+                    block_extent: vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                    bytes_per_block: 4,
+                }],
+            ),
             NativeImageDescription {
                 image_type: vk::ImageType::TYPE_2D,
                 format: vk::Format::R8G8B8A8_UNORM,
@@ -2371,7 +2576,17 @@ fn partial_image_write_does_not_take_ownership_of_untouched_pages() {
         .unwrap();
     // Access outside the touched physical page needs no GPU visibility resolver.
     let mut untouched = vec![0; 12288];
-    storage.read(4096, &mut untouched).unwrap();
+    let input = storage.pin(4096, untouched.len() as u64).unwrap();
+    cache
+        .memory()
+        .read_captured_into(
+            &nixe_memory::CapturedMemory::new(input).unwrap(),
+            0,
+            &mut untouched,
+        )
+        .unwrap()
+        .into_ready()
+        .expect("untouched RAM needs no device access");
     assert_eq!(untouched, vec![0x73; 12288]);
     cache.flush().unwrap();
     let actual = cpu_read(&mut cache, &storage);
@@ -2427,7 +2642,7 @@ fn opaque_image_shape_alias_imports_only_proven_device_bytes() {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (_, storage) = backing_allocation(16384, 4096, 0x73);
+    let (_allocation_10, storage) = backing_allocation(&cache, 16384, 4096, 0x73);
     let make = |cache: &mut VulkanResidency, backing, width, height| {
         let extent = vk::Extent3D {
             width,
@@ -2436,7 +2651,12 @@ fn opaque_image_shape_alias_imports_only_proven_device_bytes() {
         };
         cache
             .image_for_device_write(
-                backing,
+                vec![crate::residency::tests::plane_geometry(
+                    backing,
+                    [width, height],
+                    u64::from(width) * 4,
+                    4,
+                )],
                 NativeImageDescription {
                     image_type: vk::ImageType::TYPE_2D,
                     format: vk::Format::R8G8B8A8_UNORM,
@@ -2504,7 +2724,7 @@ fn opaque_image_shape_alias_imports_only_proven_device_bytes() {
         .ensure_image_initialized(alias, p, transfers::full_rect(p))
         .unwrap();
     assert_eq!(cache.statistics.native_readback_bytes, 0);
-    let (_, result) = backing_allocation(16384, 4096, 0x91);
+    let (_allocation_11, result) = backing_allocation(&cache, 16384, 4096, 0x91);
     let destination = make(&mut cache, result.clone(), 32, 128);
     cache
         .copy_image_region(
@@ -2535,7 +2755,7 @@ fn gpu_image_buffer_reconstruction_coalesces_page_boundaries() {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (_, storage) = backing_allocation(16384, 64, 0x73);
+    let (_allocation_12, storage) = backing_allocation(&cache, 16384, 64, 0x73);
     let extent = vk::Extent3D {
         width: 64,
         height: 64,
@@ -2543,7 +2763,32 @@ fn gpu_image_buffer_reconstruction_coalesces_page_boundaries() {
     };
     let target = cache
         .image_for_device_write(
-            storage.clone(),
+            crate::residency::tests::image_geometry(
+                storage.clone(),
+                NativeImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format: vk::Format::R8G8B8A8_UNORM,
+                    extent,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    flags: vk::ImageCreateFlags::empty(),
+                },
+                &[ImagePlane {
+                    offset: 0,
+                    row_pitch: 256,
+                    mip_level: 0,
+                    array_layer: 0,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    extent,
+                    block_extent: vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                    bytes_per_block: 4,
+                }],
+            ),
             NativeImageDescription {
                 image_type: vk::ImageType::TYPE_2D,
                 format: vk::Format::R8G8B8A8_UNORM,
@@ -2599,7 +2844,7 @@ fn deferred_canonical_import_skips_overwritten_bytes_and_preserves_partial_loads
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (template, _) = image(
+    let (template, _, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -2609,10 +2854,18 @@ fn deferred_canonical_import_skips_overwritten_bytes_and_preserves_partial_loads
     let description = entry.description;
     let planes = entry.planes.clone();
     for full in [false, true] {
-        let (_, bytes) = backing_allocation(4096, 4096, 0x7b);
+        let (_allocation_13, bytes) = backing_allocation(&cache, 4096, 4096, 0x7b);
         let uploaded = cache.statistics.cpu_uploaded_bytes;
         let target = cache
-            .image_for_deferred_import(bytes.clone(), description, planes.clone())
+            .image_for_deferred_import(
+                crate::residency::tests::image_geometry(
+                    bytes.clone(),
+                    description,
+                    &planes.clone(),
+                ),
+                description,
+                planes.clone(),
+            )
             .unwrap();
         assert_eq!(cache.statistics.cpu_uploaded_bytes, uploaded);
         let rect = if full {
@@ -2642,7 +2895,7 @@ fn deferred_canonical_import_skips_overwritten_bytes_and_preserves_partial_loads
         if full {
             assert_eq!(cache.statistics.cpu_uploaded_bytes, uploaded);
         }
-        let (result, download) = image(
+        let (result, download, _image_allocation) = image(
             &mut cache,
             description.format,
             vk::ImageAspectFlags::COLOR,
@@ -2683,7 +2936,7 @@ fn multisample_readback_keeps_other_gpu_pages_after_cpu_reuses_a_page() {
     let validation = cache.device.validation_monitor();
     let compiler = Arc::new(compiler(&cache));
     cache.enable_sample_conversion(Arc::clone(&compiler));
-    let (allocation, storage) = backing_allocation(65536, 64, 0);
+    let (allocation, storage) = backing_allocation(&cache, 65536, 64, 0);
     let extent = vk::Extent3D {
         width: 64,
         height: 64,
@@ -2691,7 +2944,32 @@ fn multisample_readback_keeps_other_gpu_pages_after_cpu_reuses_a_page() {
     };
     let target = cache
         .multisample_image_for(
-            storage.clone(),
+            crate::residency::tests::image_geometry(
+                storage.clone(),
+                NativeImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format: vk::Format::R8G8B8A8_UNORM,
+                    extent,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: vk::SampleCountFlags::TYPE_4,
+                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                    flags: vk::ImageCreateFlags::empty(),
+                },
+                &[ImagePlane {
+                    offset: 0,
+                    row_pitch: 512,
+                    mip_level: 0,
+                    array_layer: 0,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    extent,
+                    block_extent: vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                    bytes_per_block: 4,
+                }],
+            ),
             NativeImageDescription {
                 image_type: vk::ImageType::TYPE_2D,
                 format: vk::Format::R8G8B8A8_UNORM,
@@ -2728,11 +3006,19 @@ fn multisample_readback_keeps_other_gpu_pages_after_cpu_reuses_a_page() {
         )
         .unwrap();
     cache.flush().unwrap();
-    let first = storage.snapshot_subrange(0, 64).unwrap();
+    let first = storage.slice(0, 64).unwrap();
     assert_eq!(cpu_read(&mut cache, &first), [0, 0, 255, 255].repeat(16));
-    allocation.write(0, &[0x55]).unwrap();
-    assert!(!cache.image(target).unwrap().contents.cpu.remains_current());
-    let last = storage.snapshot_subrange(65536 - 64, 64).unwrap();
+    crate::residency::tests::cpu_write(&mut cache, &allocation, 0, &[0x55]).unwrap();
+    assert!(
+        cache
+            .image(target)
+            .unwrap()
+            .contents
+            .device
+            .iter()
+            .any(nixe_gpu::authority::ResourceObservation::is_invalid)
+    );
+    let last = storage.slice(65536 - 64, 64).unwrap();
     assert_eq!(cpu_read(&mut cache, &last), [0, 0, 255, 255].repeat(16));
     assert_eq!(cpu_read(&mut cache, &first)[0], 0x55);
     drop(cache);
@@ -2747,7 +3033,7 @@ fn multisample_srgb_readback_preserves_encoded_bits() {
     let validation = cache.device.validation_monitor();
     let compiler = Arc::new(compiler(&cache));
     cache.enable_sample_conversion(Arc::clone(&compiler));
-    let (_, storage) = backing_allocation(1024, 64, 0);
+    let (_allocation_14, storage) = backing_allocation(&cache, 1024, 64, 0);
     let extent = vk::Extent3D {
         width: 8,
         height: 8,
@@ -2768,7 +3054,20 @@ fn multisample_srgb_readback_preserves_encoded_bits() {
     };
     let target = cache
         .multisample_image_for(
-            storage.clone(),
+            crate::residency::tests::image_geometry(
+                storage.clone(),
+                NativeImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format: vk::Format::R8G8B8A8_SRGB,
+                    extent,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: vk::SampleCountFlags::TYPE_4,
+                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                    flags: vk::ImageCreateFlags::empty(),
+                },
+                &[plane],
+            ),
             NativeImageDescription {
                 image_type: vk::ImageType::TYPE_2D,
                 format: vk::Format::R8G8B8A8_SRGB,
@@ -2843,7 +3142,7 @@ fn multisample_depth_stencil_readback_preserves_exact_samples_and_padding() {
     let validation = cache.device.validation_monitor();
     let compiler = Arc::new(compiler(&cache));
     cache.enable_sample_conversion(Arc::clone(&compiler));
-    let (_, storage) = backing_allocation(4096, 64, 0x73);
+    let (_allocation_15, storage) = backing_allocation(&cache, 4096, 64, 0x73);
     let extent = vk::Extent3D {
         width: 8,
         height: 8,
@@ -2880,12 +3179,21 @@ fn multisample_depth_stencil_readback_preserves_exact_samples_and_padding() {
         flags: vk::ImageCreateFlags::empty(),
     };
     let target = cache
-        .multisample_image_for(storage.clone(), description, vec![depth, stencil], [2, 2])
+        .multisample_image_for(
+            crate::residency::tests::image_geometry(
+                storage.clone(),
+                description,
+                &[depth, stencil],
+            ),
+            description,
+            vec![depth, stencil],
+            [2, 2],
+        )
         .unwrap();
     // Values near quantization boundaries and the endpoints exercise the exact
     // integer inverse of native normalized depth sampling.
     for depth_value in [0., 1., 0.1, 0.25, 0.5, 0.75, 0.9999] {
-        let (reference, reference_bytes) = image(
+        let (reference, reference_bytes, _image_allocation) = image(
             &mut cache,
             description.format,
             vk::ImageAspectFlags::DEPTH,
@@ -2926,7 +3234,7 @@ fn depth24_transfer_never_authors_the_unused_high_byte() {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (image, bytes) = image(
+    let (image, bytes, _image_allocation) = image(
         &mut cache,
         vk::Format::D24_UNORM_S8_UINT,
         vk::ImageAspectFlags::DEPTH,
@@ -2953,7 +3261,7 @@ fn unaligned_fill_and_native_565_to_bgra_blit_preserve_unselected_bytes() {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (_, bytes) = backing_allocation(4096, 4096, 0x5a);
+    let (_allocation_16, bytes) = backing_allocation(&cache, 4096, 4096, 0x5a);
     let buffer = cache
         .buffer_for(bytes.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
         .unwrap();
@@ -2963,13 +3271,13 @@ fn unaligned_fill_and_native_565_to_bgra_blit_preserve_unselected_bytes() {
     assert_eq!(&result[..7], &[0x5a; 7]);
     assert_eq!(&result[7..20], &[0x11, 0x22, 0x33, 0x44].repeat(4)[..13]);
     assert_eq!(&result[20..], &[0x5a; 4096 - 20]);
-    let (source, _) = image(
+    let (source, _, _image_allocation) = image(
         &mut cache,
         vk::Format::R5G6B5_UNORM_PACK16,
         vk::ImageAspectFlags::COLOR,
         2,
     );
-    let (destination, target) = image(
+    let (destination, target, _image_allocation) = image(
         &mut cache,
         vk::Format::B8G8R8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -3018,7 +3326,7 @@ fn empty_draw_still_executes_attachment_clear_without_shader_writes() {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (image, bytes) = image(
+    let (image, bytes, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -3081,27 +3389,28 @@ fn native_rectangular_wireframe_width_changes_coverage() {
         assert!(requested.is_err());
         return;
     }
-    let pipeline = ready(requested.unwrap());
-    let (allocation, vertices) = backing_allocation(4096, 4096, 0);
+    let pipeline = requested.unwrap();
+    let (allocation, vertices) = backing_allocation(&cache, 4096, 4096, 0);
     let values = [
         [-0.5f32, -0.5, 0.25, 1., 0., 0.],
         [0.5, -0.5, 0.25, 1., 0., 0.],
         [0., 0.5, 0.25, 1., 0., 0.],
     ];
-    allocation
-        .write(
-            0,
-            &values
-                .iter()
-                .flatten()
-                .flat_map(|f| f.to_le_bytes())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+    crate::residency::tests::cpu_write(
+        &mut cache,
+        &allocation,
+        0,
+        &values
+            .iter()
+            .flatten()
+            .flat_map(|f| f.to_le_bytes())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let vertex = cache
         .buffer_for(vertices, vk::BufferUsageFlags::VERTEX_BUFFER)
         .unwrap();
-    let (target, pixels) = image(
+    let (target, pixels, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -3186,7 +3495,7 @@ fn shader_storage_alias_becomes_sampled_texture_without_cpu_readback() {
     };
     let validation = cache.device.validation_monitor();
     let compilers = Compilers::new(&cache);
-    let (source, source_bytes) = image(
+    let (source, source_bytes, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -3197,7 +3506,13 @@ fn shader_storage_alias_becomes_sampled_texture_without_cpu_readback() {
     let mut d = cache.image(source).unwrap().description;
     d.usage |= vk::ImageUsageFlags::SAMPLED;
     let planes = cache.image(source).unwrap().planes.clone();
-    let source = cache.image_for(source_bytes.clone(), d, planes).unwrap();
+    let source = cache
+        .image_for(
+            crate::residency::tests::image_geometry(source_bytes.clone(), d, &planes),
+            d,
+            planes,
+        )
+        .unwrap();
     let view = cache
         .image_view(
             source,
@@ -3215,7 +3530,7 @@ fn shader_storage_alias_becomes_sampled_texture_without_cpu_readback() {
         .unwrap();
     let buffer = cache
         .buffer_for(
-            source_bytes.snapshot_subrange(32, 4).unwrap(),
+            source_bytes.slice(32, 4).unwrap(),
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )
         .unwrap();
@@ -3226,12 +3541,10 @@ fn shader_storage_alias_becomes_sampled_texture_without_cpu_readback() {
         &[V::U32(0), V::U32(0), V::U32(0xff0000ff)],
     );
     let shader = compilers.shader(&cache, [f]);
-    let pipeline = ready(
-        compilers
-            .pipelines
-            .request(PipelineRecipe::Compute(shader))
-            .unwrap(),
-    );
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Compute(shader))
+        .unwrap();
     let compute = cache
         .prepare_program(
             pipeline,
@@ -3245,22 +3558,20 @@ fn shader_storage_alias_becomes_sampled_texture_without_cpu_readback() {
     cache
         .dispatch(&compute, Dispatch::Direct([1, 1, 1]), &[])
         .unwrap();
-    let (target, pixels) = image(
+    let (target, pixels, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
         4,
     );
     let state = GraphicsState::color(vk::Format::R8G8B8A8_UNORM);
-    let pipeline = ready(
-        compilers
-            .pipelines
-            .request(PipelineRecipe::Graphics {
-                shader: sampled_shader(&cache, [0.0625; 2]),
-                state: state.clone(),
-            })
-            .unwrap(),
-    );
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Graphics {
+            shader: sampled_shader(&cache, [0.0625; 2]),
+            state: state.clone(),
+        })
+        .unwrap();
     let sampler = SamplerCache::new(cache.device(), 16)
         .get(&vk::SamplerCreateInfo::default())
         .unwrap();
@@ -3357,7 +3668,7 @@ fn affine_fixed_point_sampling_reverses_crops_and_preserves_destination_padding(
         return;
     }
     let mut target = |byte| {
-        let (_, backing) = backing_allocation(256, 256, byte);
+        let (_allocation_17, backing) = backing_allocation(&cache, 256, 256, byte);
         let description = NativeImageDescription {
             image_type: vk::ImageType::TYPE_2D,
             format: vk::Format::R8G8B8A8_UNORM,
@@ -3386,12 +3697,16 @@ fn affine_fixed_point_sampling_reverses_crops_and_preserves_destination_padding(
             bytes_per_block: 4,
         };
         let id = cache
-            .image_for(backing.clone(), description, vec![plane])
+            .image_for(
+                crate::residency::tests::image_geometry(backing.clone(), description, &[plane]),
+                description,
+                vec![plane],
+            )
             .unwrap();
-        (id, backing)
+        (id, backing, _allocation_17)
     };
-    let (source, source_bytes) = target(0x7a);
-    let (destination, destination_bytes) = target(0x3b);
+    let (source, source_bytes, _source_allocation) = target(0x7a);
+    let (destination, destination_bytes, _destination_allocation) = target(0x3b);
     // The helper uses texel coordinates, without introducing a normalized
     // texture-coordinate conversion or rounding the 32.32 accumulator on CPU.
     let pixels: Vec<_> = (0..8_u8).flat_map(|i| [i * 16, 0, 0, 255]).collect();
@@ -3416,9 +3731,8 @@ fn affine_fixed_point_sampling_reverses_crops_and_preserves_destination_padding(
             },
         )
         .unwrap();
-    let pipeline = ready(
-        super::super::affine_pipeline(&compiler(&cache), vk::Format::R8G8B8A8_UNORM).unwrap(),
-    );
+    let pipeline =
+        super::super::affine_pipeline(&compiler(&cache), vk::Format::R8G8B8A8_UNORM).unwrap();
     cache
         .affine_blit(
             pipeline,
@@ -3472,7 +3786,7 @@ fn exercise_read_only_depth(api: ApiPreference) {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (_, depth_bytes) = backing_allocation(4096, 4096, 0x7b);
+    let (_allocation_18, depth_bytes) = backing_allocation(&cache, 4096, 4096, 0x7b);
     let extent = vk::Extent3D {
         width: 8,
         height: 8,
@@ -3480,7 +3794,33 @@ fn exercise_read_only_depth(api: ApiPreference) {
     };
     let depth = cache
         .image_for_deferred_import(
-            depth_bytes.clone(),
+            crate::residency::tests::image_geometry(
+                depth_bytes.clone(),
+                NativeImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format: vk::Format::D32_SFLOAT,
+                    extent,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                        | vk::ImageUsageFlags::SAMPLED,
+                    flags: vk::ImageCreateFlags::empty(),
+                },
+                &[ImagePlane {
+                    offset: 32,
+                    row_pitch: 48,
+                    mip_level: 0,
+                    array_layer: 0,
+                    aspect: vk::ImageAspectFlags::DEPTH,
+                    extent,
+                    block_extent: vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                    bytes_per_block: 4,
+                }],
+            ),
             NativeImageDescription {
                 image_type: vk::ImageType::TYPE_2D,
                 format: vk::Format::D32_SFLOAT,
@@ -3522,7 +3862,7 @@ fn exercise_read_only_depth(api: ApiPreference) {
             },
         )
         .unwrap();
-    let (color, bytes) = image(
+    let (color, bytes, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageAspectFlags::COLOR,
@@ -3533,14 +3873,12 @@ fn exercise_read_only_depth(api: ApiPreference) {
     state.depth_format = vk::Format::D32_SFLOAT;
     state.depth_test = true;
     state.depth_compare = vk::CompareOp::ALWAYS;
-    let pipeline = ready(
-        compiler
-            .request(PipelineRecipe::Graphics {
-                shader: sampled_shader(&cache, [0.5, 0.5]),
-                state: state.clone(),
-            })
-            .unwrap(),
-    );
+    let pipeline = compiler
+        .request(PipelineRecipe::Graphics {
+            shader: sampled_shader(&cache, [0.5, 0.5]),
+            state: state.clone(),
+        })
+        .unwrap();
     let mut samplers = SamplerCache::new(cache.device(), 16);
     let sampler = samplers.get(&vk::SamplerCreateInfo::default()).unwrap();
     let program = cache
@@ -3612,7 +3950,7 @@ fn replacement_draw_into_undefined_color_needs_no_load_and_preserves_unwritten_b
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (_, bytes) = backing_allocation(4096, 4096, 0xa5);
+    let (_allocation_19, bytes) = backing_allocation(&cache, 4096, 4096, 0xa5);
     let extent = vk::Extent3D {
         width: 8,
         height: 8,
@@ -3633,7 +3971,20 @@ fn replacement_draw_into_undefined_color_needs_no_load_and_preserves_unwritten_b
     };
     let image = cache
         .image_for_device_write(
-            bytes.clone(),
+            crate::residency::tests::image_geometry(
+                bytes.clone(),
+                NativeImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    format: vk::Format::R8G8B8A8_UNORM,
+                    extent,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    flags: vk::ImageCreateFlags::empty(),
+                },
+                &[plane],
+            ),
             NativeImageDescription {
                 image_type: vk::ImageType::TYPE_2D,
                 format: vk::Format::R8G8B8A8_UNORM,
@@ -3741,7 +4092,7 @@ fn transfer_writes_skip_old_destination_import_and_preserve_exterior_producers()
                 return;
             };
             let validation = cache.device.validation_monitor();
-            let (old, backing) = image(
+            let (old, backing, _image_allocation) = image(
                 &mut cache,
                 vk::Format::D32_SFLOAT,
                 vk::ImageAspectFlags::DEPTH,
@@ -3758,9 +4109,13 @@ fn transfer_writes_skip_old_destination_import_and_preserve_exterior_producers()
                 ..cache.image(old).unwrap().description
             };
             let destination = cache
-                .image_for_deferred_import(backing.clone(), description, vec![plane])
+                .image_for_deferred_import(
+                    crate::residency::tests::image_geometry(backing.clone(), description, &[plane]),
+                    description,
+                    vec![plane],
+                )
                 .unwrap();
-            let (source, _) = image(
+            let (source, _, _image_allocation) = image(
                 &mut cache,
                 vk::Format::R8G8B8A8_UNORM,
                 vk::ImageAspectFlags::COLOR,
@@ -3852,8 +4207,8 @@ fn uniform_word_addressing_dynamic_offsets_and_cpu_gpu_producers_keep_visibility
         .min_uniform_buffer_offset_alignment
         .max(16);
     let (input_allocation, input_backing) =
-        backing_allocation((alignment * 2 + 80) as usize, 4096, 0x19);
-    let (_, output_backing) = backing_allocation(4096, 4096, 0x71);
+        backing_allocation(&cache, (alignment * 2 + 80) as usize, 4096, 0x19);
+    let (_allocation_20, output_backing) = backing_allocation(&cache, 4096, 4096, 0x71);
     let input = cache
         .buffer_for(input_backing.clone(), vk::BufferUsageFlags::UNIFORM_BUFFER)
         .unwrap();
@@ -3875,12 +4230,10 @@ fn uniform_word_addressing_dynamic_offsets_and_cpu_gpu_producers_keep_visibility
     let value = f.op(O::GetCbufU32, &[V::U32(0), address]);
     f.op(O::WriteStorage32, &[V::U32(0), V::U32(0), value]);
     let shader = compilers.shader(&cache, [f]);
-    let pipeline = ready(
-        compilers
-            .pipelines
-            .request(PipelineRecipe::Compute(shader))
-            .unwrap(),
-    );
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Compute(shader))
+        .unwrap();
     assert!(matches!(
         pipeline.layout.key.bindings[0].kind,
         vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
@@ -3905,15 +4258,20 @@ fn uniform_word_addressing_dynamic_offsets_and_cpu_gpu_producers_keep_visibility
     assert!(program.uses.iter().any(|u|matches!(u,Use::Buffer {scope,..} if scope.access.contains(vk::AccessFlags2::UNIFORM_READ))));
     for address in [0u32, 4, 12, 16, 60] {
         let expected = 0x12340000 + address;
-        input_allocation
-            .write(
-                (alignment + u64::from(address)) as usize,
-                &expected.to_le_bytes(),
-            )
-            .unwrap();
-        input_allocation
-            .write((alignment + 64) as usize, &address.to_le_bytes())
-            .unwrap();
+        crate::residency::tests::cpu_write(
+            &mut cache,
+            &input_allocation,
+            (alignment + u64::from(address)) as usize,
+            &expected.to_le_bytes(),
+        )
+        .unwrap();
+        crate::residency::tests::cpu_write(
+            &mut cache,
+            &input_allocation,
+            (alignment + 64) as usize,
+            &address.to_le_bytes(),
+        )
+        .unwrap();
         cache
             .dispatch(&program, Dispatch::Direct([1, 1, 1]), &[])
             .unwrap();
@@ -3925,9 +4283,13 @@ fn uniform_word_addressing_dynamic_offsets_and_cpu_gpu_producers_keep_visibility
     }
     // A native producer must become visible to the uniform access class.
     let expected = 0xabcdef12u32;
-    input_allocation
-        .write((alignment + 64) as usize, &16u32.to_le_bytes())
-        .unwrap();
+    crate::residency::tests::cpu_write(
+        &mut cache,
+        &input_allocation,
+        (alignment + 64) as usize,
+        &16u32.to_le_bytes(),
+    )
+    .unwrap();
     let upload = cache
         .write_buffer(input, alignment + 16, &expected.to_le_bytes())
         .unwrap();

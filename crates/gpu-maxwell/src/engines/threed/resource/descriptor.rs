@@ -1,19 +1,14 @@
-//! Immutable descriptor bytes and their exact ordered validity proof.
-//!
-//! Descriptor identity is independent of draw-state revisions. Reuse the
-//! observation instead of rebuilding page tracking for each resource set.
-//! Independent reference mechanisms:
-//! https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/texture_cache/texture_cache.h
-//! https://github.com/yangjieshao/Ryujinx/blob/2505a1abcd5f31e4364bfb7f9313546f1840e5e1/src/Ryujinx.Graphics.Gpu/Image/TexturePool.cs
+//! Immutable descriptor bytes with one monotonic invalidation observation.
 use super::*;
+use nixe_gpu::physical::PhysicalMapping;
+use nixe_memory::{AccessOperation, AccessResult, Observation};
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct Key {
-    parent: nixe_memory::CanonicalByteMappingKey,
+    parent: Arc<PhysicalMapping>,
     offset: u64,
     size: u8,
 }
-
 pub(super) struct Cache {
     entries: nixe_gpu::WorkingSet<Key, Arc<Snapshot>>,
 }
@@ -34,92 +29,56 @@ impl std::fmt::Debug for Cache {
 impl Cache {
     pub(super) fn read(
         &mut self,
-        parent: &CanonicalBackingRange,
+        parent: &Arc<PhysicalMapping>,
         offset: u64,
         size: u8,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<Arc<Snapshot>, MaxwellThreeDResourceError> {
         let key = Key {
-            parent: parent.byte_mapping_key(),
+            parent: Arc::clone(parent),
             offset,
             size,
         };
-        let range = if let Some(snapshot) = self.entries.get(&key) {
-            if snapshot.remains_current()? {
-                return Ok(Arc::clone(snapshot));
-            }
-            // New bytes need an independent observation, not a new physical
-            // topology. Old snapshots keep their own unchanged byte versions.
-            snapshot.range.clone()
-        } else {
-            parent
-                .snapshot_subrange(offset, u64::from(size))
-                .map_err(MaxwellThreeDResourceError::Canonical)?
-        };
-        let snapshot = Arc::new(Snapshot::capture(range, size)?);
-        // Both parent identity and the narrow observed range retain metadata.
-        // Charge them conservatively even when other consumers share it.
-        let bytes = std::mem::size_of::<Snapshot>()
-            + parent.metadata_bytes()
-            + snapshot.range.metadata_bytes()
-            + 512 * (1 + snapshot.range.pages().count());
-        self.entries.insert(key, Arc::clone(&snapshot), bytes);
+        if let Some(snapshot) = self.entries.get(&key)
+            && snapshot.remains_current()
+        {
+            return Ok(Arc::clone(snapshot));
+        }
+        let snapshot = Arc::new(Snapshot::read(parent, offset, size, access)?);
+        let weight = std::mem::size_of::<Snapshot>() + parent.metadata_bytes() + 512;
+        self.entries.insert(key, Arc::clone(&snapshot), weight);
         Ok(snapshot)
     }
 }
-
 #[derive(Debug)]
 pub(super) struct Snapshot {
-    range: CanonicalBackingRange,
     pub(super) bytes: [u8; 32],
-    size: u8,
-    cpu_writes: CanonicalCpuWriteDependency,
+    observation: Observation,
 }
 impl Snapshot {
     pub(super) fn read(
-        parent: &CanonicalBackingRange,
+        parent: &PhysicalMapping,
         offset: u64,
         size: u8,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<Self, MaxwellThreeDResourceError> {
-        let range = parent
-            .snapshot_subrange(offset, u64::from(size))
-            .map_err(MaxwellThreeDResourceError::Canonical)?;
-        Self::capture(range, size)
-    }
-
-    fn capture(range: CanonicalBackingRange, size: u8) -> Result<Self, MaxwellThreeDResourceError> {
-        debug_assert!((1..=32).contains(&size));
-        // Arm before reading. A concurrent write must not establish a clean
-        // baseline for bytes already captured from an older version.
-        let cpu_writes = CanonicalCpuWriteDependency::capture(&range)
-            .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
+        assert!((1..=32).contains(&size));
+        let ranges = parent
+            .pin(offset, u64::from(size))
+            .map_err(|e| MaxwellThreeDResourceError::Memory(Arc::new(e)))?;
+        let observation = Observation::default();
+        let AccessResult::Read(captured) =
+            access(ranges, AccessOperation::ReadObserved(observation.clone()))
+                .map_err(MaxwellThreeDResourceError::Memory)?
+        else {
+            unreachable!("read returns bytes")
+        };
         let mut bytes = [0; 32];
-        range
-            .read(0, &mut bytes[..usize::from(size)])
-            .map_err(MaxwellThreeDResourceError::CanonicalAccess)?;
-        Ok(Self {
-            range,
-            bytes,
-            size,
-            cpu_writes,
-        })
+        bytes[..usize::from(size)].copy_from_slice(&captured);
+        Ok(Self { bytes, observation })
     }
-
-    pub(super) fn remains_current(&self) -> Result<bool, MaxwellThreeDResourceError> {
-        // CPU-write epochs alone do not prove that an outstanding GPU producer
-        // has left descriptor bytes unchanged. Reject without waiting; an actual
-        // read on a miss resolves that producer through normal memory admission.
-        if !self
-            .range
-            .subrange_is_cpu_visible(0, u64::from(self.size))
-            .map_err(MaxwellThreeDResourceError::Canonical)?
-        {
-            return Ok(false);
-        }
-        Ok(self.cpu_writes.remains_current()
-            || self
-                .cpu_writes
-                .confirm_unchanged(&self.bytes[..usize::from(self.size)])
-                .map_err(MaxwellThreeDResourceError::CanonicalAccess)?)
+    pub(super) fn remains_current(&self) -> bool {
+        !self.observation.is_invalid()
     }
 }
 

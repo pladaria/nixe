@@ -13,12 +13,12 @@ use std::sync::Arc;
 
 use nixe_loader_title::TitleId;
 
-use nixe_runtime::{EventObject, HandleTable, ProcessMountNamespace, RunnableProcess};
+use nixe_runtime::{EventObject, ProcessMountNamespace, ReadableEventObject};
 
 use crate::{
-    DirectoryEntry, DirectoryEntryKind, FileSystemAccessLogMode, HorizonIpcObject,
-    HostDirectoryFileSystem, HostFile, IpcSession, ReadOnlyDirectory, ReadOnlyFile,
-    ReadOnlyFileSystem, ReadOnlyStorage, SemanticIpcObject,
+    DirectoryEntry, DirectoryEntryKind, FileSystemAccessLogMode, HostDirectoryFileSystem, HostFile,
+    IpcSession, ReadOnlyDirectory, ReadOnlyFile, ReadOnlyFileSystem, ReadOnlyStorage,
+    SemanticIpcObject,
 };
 
 /// Largest path accepted by the semantic filesystem boundary.
@@ -105,7 +105,7 @@ pub struct AddOnContentEntry {
     pub mount_count: u32,
 }
 
-/// Bounded semantic requests accepted by [`IpcDispatcher`].
+/// Bounded semantic requests accepted by the filesystem services.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum IpcRequest {
@@ -184,12 +184,12 @@ pub enum IpcRequest {
 }
 
 /// Typed response returned on a successful semantic dispatch.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum IpcResponse {
     None,
-    Handle(u32),
-    Event(u32),
+    Object(SemanticIpcObject),
+    Event(ReadableEventObject),
     Size(u64),
     EntryType(DirectoryEntryKind),
     FileSystemAttribute {
@@ -210,100 +210,19 @@ pub enum IpcResponse {
     AddOnContentEntries(Vec<AddOnContentEntry>),
 }
 
-/// Stateless service dispatcher. All guest-owned state remains in handles.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct IpcDispatcher;
-
-impl IpcDispatcher {
-    pub(crate) fn open_storage(
-        handles: &mut HandleTable,
-        storage: nixe_loader_storage::StorageRef,
-    ) -> Result<IpcResponse, IpcResultCode> {
-        insert_handle(
-            handles,
-            SemanticIpcObject::ReadOnlyStorage(ReadOnlyStorage::new(storage)),
-        )
-    }
-
-    /// Connects to one built-in service after applying the effective NPDM SAC.
-    pub fn connect(
-        mounts: &ProcessMountNamespace,
-        handles: &mut HandleTable,
-        service: IpcService,
-    ) -> Result<u32, IpcResultCode> {
-        if !mounts.allows_service(service.name()) {
-            return Err(IpcResultCode::ACCESS_DENIED);
-        }
-        handles
-            .insert(HorizonIpcObject::SemanticService(IpcSession::new(service)))
-            .map_err(|_| IpcResultCode::RESOURCE_LIMIT)
-    }
-
-    /// Dispatches a validated request against the type of its target handle.
-    pub fn dispatch(
-        mounts: &ProcessMountNamespace,
-        handles: &mut HandleTable,
-        target: u32,
-        request: IpcRequest,
-    ) -> Result<IpcResponse, IpcResultCode> {
-        let object = handles
-            .get_as::<HorizonIpcObject>(target)
-            .cloned()
-            .ok_or(IpcResultCode::INVALID_HANDLE)?;
-        match object {
-            HorizonIpcObject::SemanticService(session) => dispatch_session(
-                mounts,
-                handles,
-                &session,
-                request,
-                FileSystemAccessLogMode::None,
-            ),
-            HorizonIpcObject::SemanticObject(object) => {
-                dispatch_semantic_object(mounts, handles, &object, request)
-            }
-            _ => Err(IpcResultCode::INVALID_COMMAND),
-        }
-    }
-
-    pub(crate) fn dispatch_session(
-        mounts: &ProcessMountNamespace,
-        handles: &mut HandleTable,
-        session: &IpcSession,
-        request: IpcRequest,
-        file_system_access_log_mode: FileSystemAccessLogMode,
-    ) -> Result<IpcResponse, IpcResultCode> {
-        dispatch_session(
-            mounts,
-            handles,
-            session,
-            request,
-            file_system_access_log_mode,
-        )
-    }
-
-    pub(crate) fn dispatch_semantic_object(
-        mounts: &ProcessMountNamespace,
-        handles: &mut HandleTable,
-        object: &SemanticIpcObject,
-        request: IpcRequest,
-    ) -> Result<IpcResponse, IpcResultCode> {
-        dispatch_semantic_object(mounts, handles, object, request)
-    }
-}
-
-fn dispatch_semantic_object(
+pub(crate) fn dispatch_semantic_object(
     mounts: &ProcessMountNamespace,
-    handles: &mut HandleTable,
+
     object: &SemanticIpcObject,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcResultCode> {
     match object {
         SemanticIpcObject::ReadOnlyFileSystem(filesystem) => {
-            dispatch_filesystem(handles, filesystem, request)
+            dispatch_filesystem(filesystem, request)
         }
         SemanticIpcObject::ReadOnlyStorage(storage) => dispatch_storage(storage, request),
         SemanticIpcObject::HostDirectoryFileSystem(filesystem) => {
-            dispatch_host_filesystem(mounts, handles, filesystem, request)
+            dispatch_host_filesystem(mounts, filesystem, request)
         }
         SemanticIpcObject::ReadOnlyFile(file) => dispatch_file(file, request),
         SemanticIpcObject::HostFile(file) => dispatch_host_file(mounts, file, request),
@@ -311,9 +230,9 @@ fn dispatch_semantic_object(
     }
 }
 
-fn dispatch_session(
+pub(crate) fn dispatch_session(
     mounts: &ProcessMountNamespace,
-    handles: &mut HandleTable,
+
     session: &IpcSession,
     request: IpcRequest,
     file_system_access_log_mode: FileSystemAccessLogMode,
@@ -348,17 +267,18 @@ fn dispatch_session(
                 .primary()
                 .cloned()
                 .ok_or(IpcResultCode::PATH_NOT_FOUND)?;
-            insert_handle(
-                handles,
-                SemanticIpcObject::ReadOnlyFileSystem(ReadOnlyFileSystem::new(mount)),
-            )
+            Ok(IpcResponse::Object(SemanticIpcObject::ReadOnlyFileSystem(
+                ReadOnlyFileSystem::new(mount),
+            )))
         }
         (IpcService::FileSystem, IpcRequest::OpenPrimaryStorage) => {
             let storage = mounts
                 .primary()
                 .map(|mount| mount.romfs().storage())
                 .ok_or(IpcResultCode::PATH_NOT_FOUND)?;
-            IpcDispatcher::open_storage(handles, storage)
+            Ok(IpcResponse::Object(SemanticIpcObject::ReadOnlyStorage(
+                ReadOnlyStorage::new(storage),
+            )))
         }
         (IpcService::FileSystem, IpcRequest::OpenSdCardFileSystem) => {
             require_sd_card_access(mounts)?;
@@ -366,10 +286,9 @@ fn dispatch_session(
             if root.is_none() && mounts.homebrew_executable().is_none() {
                 return Err(IpcResultCode::PATH_NOT_FOUND);
             }
-            insert_handle(
-                handles,
+            Ok(IpcResponse::Object(
                 SemanticIpcObject::HostDirectoryFileSystem(HostDirectoryFileSystem::new(root)),
-            )
+            ))
         }
         (IpcService::AddOnContent, IpcRequest::GetAddOnContentCount) => Ok(IpcResponse::Size(
             u64::try_from(mounts.add_ons().len()).map_err(|_| IpcResultCode::OUT_OF_RANGE)?,
@@ -449,10 +368,7 @@ fn dispatch_session(
         }
         (IpcService::AddOnContent, IpcRequest::GetAddOnContentListChangedEvent) => {
             let (_writable, readable) = EventObject::create_pair();
-            handles
-                .insert(readable)
-                .map(IpcResponse::Event)
-                .map_err(|_| IpcResultCode::RESOURCE_LIMIT)
+            Ok(IpcResponse::Event(readable))
         }
         (
             IpcService::AddOnContent,
@@ -469,10 +385,9 @@ fn dispatch_session(
                 .get(mount_index)
                 .cloned()
                 .ok_or(IpcResultCode::OUT_OF_RANGE)?;
-            insert_handle(
-                handles,
-                SemanticIpcObject::ReadOnlyFileSystem(ReadOnlyFileSystem::new(mount)),
-            )
+            Ok(IpcResponse::Object(SemanticIpcObject::ReadOnlyFileSystem(
+                ReadOnlyFileSystem::new(mount),
+            )))
         }
         _ => Err(IpcResultCode::INVALID_COMMAND),
     }
@@ -489,7 +404,6 @@ fn add_on_entry(add_on: &nixe_runtime::AddOnContent) -> Result<AddOnContentEntry
 }
 
 fn dispatch_filesystem(
-    handles: &mut HandleTable,
     filesystem: &ReadOnlyFileSystem,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcResultCode> {
@@ -509,25 +423,16 @@ fn dispatch_filesystem(
                 .romfs()
                 .open_file(file)
                 .map_err(|_| IpcResultCode::STORAGE_FAILURE)?;
-            insert_handle(
-                handles,
-                SemanticIpcObject::ReadOnlyFile(ReadOnlyFile::new(
-                    Arc::from(path),
-                    file.size(),
-                    storage,
-                )),
-            )
+            Ok(IpcResponse::Object(SemanticIpcObject::ReadOnlyFile(
+                ReadOnlyFile::new(Arc::from(path), file.size(), storage),
+            )))
         }
         IpcRequest::OpenDirectory { path, .. } => {
             let path = normalize_path(&path)?;
             let entries = directory_entries(filesystem, &path)?;
-            insert_handle(
-                handles,
-                SemanticIpcObject::ReadOnlyDirectory(ReadOnlyDirectory::new(
-                    Arc::from(path),
-                    entries.into(),
-                )),
-            )
+            Ok(IpcResponse::Object(SemanticIpcObject::ReadOnlyDirectory(
+                ReadOnlyDirectory::new(Arc::from(path), entries.into()),
+            )))
         }
         _ => Err(IpcResultCode::INVALID_COMMAND),
     }
@@ -597,7 +502,7 @@ fn dispatch_storage(
 
 fn dispatch_host_filesystem(
     mounts: &ProcessMountNamespace,
-    handles: &mut HandleTable,
+
     filesystem: &HostDirectoryFileSystem,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcResultCode> {
@@ -717,14 +622,13 @@ fn dispatch_host_filesystem(
                     if mode & (FILE_OPEN_WRITE | FILE_OPEN_APPEND) != 0 {
                         return Err(IpcResultCode::ACCESS_DENIED);
                     }
-                    return insert_handle(
-                        handles,
-                        SemanticIpcObject::ReadOnlyFile(ReadOnlyFile::new(
+                    return Ok(IpcResponse::Object(SemanticIpcObject::ReadOnlyFile(
+                        ReadOnlyFile::new(
                             Arc::from(path),
                             identity.size(),
                             identity.source().clone(),
-                        )),
-                    );
+                        ),
+                    )));
                 }
                 if is_homebrew_virtual_directory(identity.guest_path(), &path) {
                     return Err(IpcResultCode::NOT_A_FILE);
@@ -749,20 +653,16 @@ fn dispatch_host_filesystem(
                 .open(host_path)
                 .map_err(map_host_io_error)?;
             file.try_lock_shared().map_err(map_host_file_lock_error)?;
-            insert_handle(
-                handles,
-                SemanticIpcObject::HostFile(
-                    HostFile::new(Arc::from(path), file, readable, writable, allow_append)
-                        .with_save(
-                            filesystem.save_volume().cloned(),
-                            if writable {
-                                save.as_ref().map(|volume| volume.open_writer())
-                            } else {
-                                None
-                            },
-                        ),
+            Ok(IpcResponse::Object(SemanticIpcObject::HostFile(
+                HostFile::new(Arc::from(path), file, readable, writable, allow_append).with_save(
+                    filesystem.save_volume().cloned(),
+                    if writable {
+                        save.as_ref().map(|volume| volume.open_writer())
+                    } else {
+                        None
+                    },
                 ),
-            )
+            )))
         }
         IpcRequest::OpenDirectory { path, mode } => {
             if mode & (DIRECTORY_OPEN_DIRECTORIES | DIRECTORY_OPEN_FILES) == 0
@@ -776,13 +676,9 @@ fn dispatch_host_filesystem(
             }
             let path = normalize_host_path(&path)?;
             let entries = host_directory_entries(mounts, filesystem, &path, mode)?;
-            insert_handle(
-                handles,
-                SemanticIpcObject::ReadOnlyDirectory(ReadOnlyDirectory::new(
-                    Arc::from(path),
-                    entries.into(),
-                )),
-            )
+            Ok(IpcResponse::Object(SemanticIpcObject::ReadOnlyDirectory(
+                ReadOnlyDirectory::new(Arc::from(path), entries.into()),
+            )))
         }
         IpcRequest::CommitFileSystem => {
             if let Some(volume) = save.as_mut() {
@@ -959,44 +855,6 @@ fn require_sd_card_access(mounts: &ProcessMountNamespace) -> Result<(), IpcResul
         Ok(())
     } else {
         Err(IpcResultCode::ACCESS_DENIED)
-    }
-}
-
-fn insert_handle(
-    handles: &mut HandleTable,
-    object: SemanticIpcObject,
-) -> Result<IpcResponse, IpcResultCode> {
-    handles
-        .insert(HorizonIpcObject::SemanticObject(object))
-        .map(IpcResponse::Handle)
-        .map_err(|_| IpcResultCode::RESOURCE_LIMIT)
-}
-
-/// Horizon service access implemented for a runnable process without making
-/// the generic runtime crate depend on Horizon.
-pub trait HorizonProcess {
-    fn connect_ipc_service(&mut self, service: IpcService) -> Result<u32, IpcResultCode>;
-
-    fn dispatch_ipc(
-        &mut self,
-        target: u32,
-        request: IpcRequest,
-    ) -> Result<IpcResponse, IpcResultCode>;
-}
-
-impl HorizonProcess for RunnableProcess {
-    fn connect_ipc_service(&mut self, service: IpcService) -> Result<u32, IpcResultCode> {
-        let (mounts, handles) = self.mounts_and_handles_mut();
-        IpcDispatcher::connect(mounts, handles, service)
-    }
-
-    fn dispatch_ipc(
-        &mut self,
-        target: u32,
-        request: IpcRequest,
-    ) -> Result<IpcResponse, IpcResultCode> {
-        let (mounts, handles) = self.mounts_and_handles_mut();
-        IpcDispatcher::dispatch(mounts, handles, target, request)
     }
 }
 
@@ -1227,6 +1085,7 @@ fn validate_list_limit(limit: usize) -> Result<(), IpcResultCode> {
 #[cfg(test)]
 mod tests {
     use nixe_loader_storage::{Storage, StorageError};
+    use nixe_runtime::RunnableProcess;
 
     use super::*;
 
@@ -1249,35 +1108,41 @@ mod tests {
         let path = directory.path().join("test.nro");
         std::fs::write(&path, nro).unwrap();
         let plan = Launcher::build(LauncherInput::new(path)).unwrap();
-        let process = ProcessBuilder::new().build(&plan).unwrap();
+        let machine = crate::test_memory::machine();
+        let process =
+            ProcessBuilder::new(machine.clone(), machine.account(16 * 1024 * 1024).unwrap())
+                .with_config(nixe_runtime::ProcessBuildConfig {
+                    physical_memory_limit: 16 * 1024 * 1024,
+                    ..Default::default()
+                })
+                .build(&plan)
+                .unwrap();
         (directory, process)
     }
 
     #[test]
     fn save_files_enforce_quota_and_publish_only_after_writers_close() {
         use nixe_runtime::TransactionalDirectory;
-        let (directory, mut process) = save_test_process();
+        let (directory, process) = save_test_process();
         let base = directory.path().join("volume");
         std::fs::create_dir_all(base.join("data")).unwrap();
         let volume = Arc::new(std::sync::Mutex::new(
             TransactionalDirectory::open(base.clone(), 4).unwrap(),
         ));
         let filesystem = HostDirectoryFileSystem::from_save(volume.clone());
-        let (mounts, handles) = process.mounts_and_handles_mut();
-        assert_eq!(
+        let (mounts, _) = process.mounts_and_handles();
+        assert!(matches!(
             dispatch_host_filesystem(
                 mounts,
-                handles,
                 &filesystem,
                 IpcRequest::GetEntryType {
                     path: "/progress".into()
                 }
             ),
             Err(IpcResultCode::PATH_NOT_FOUND)
-        );
+        ));
         dispatch_host_filesystem(
             mounts,
-            handles,
             &filesystem,
             IpcRequest::CreateFile {
                 path: "/progress".into(),
@@ -1286,10 +1151,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
+        assert!(matches!(
             dispatch_host_filesystem(
                 mounts,
-                handles,
                 &filesystem,
                 IpcRequest::CreateFile {
                     path: "/extra".into(),
@@ -1298,10 +1162,9 @@ mod tests {
                 }
             ),
             Err(IpcResultCode::NO_SPACE)
-        );
-        let IpcResponse::Handle(handle) = dispatch_host_filesystem(
+        ));
+        let IpcResponse::Object(SemanticIpcObject::HostFile(file)) = dispatch_host_filesystem(
             mounts,
-            handles,
             &filesystem,
             IpcRequest::OpenFile {
                 path: "/progress".into(),
@@ -1311,14 +1174,10 @@ mod tests {
         .unwrap() else {
             panic!()
         };
-        let object = handles.get_as::<HorizonIpcObject>(handle).unwrap().clone();
-        let HorizonIpcObject::SemanticObject(SemanticIpcObject::HostFile(file)) = object else {
-            panic!()
-        };
-        assert_eq!(
+        assert!(matches!(
             dispatch_host_file(mounts, &file, IpcRequest::SetFileSize { size: 5 }),
             Err(IpcResultCode::NO_SPACE)
-        );
+        ));
         dispatch_host_file(
             mounts,
             &file,
@@ -1329,25 +1188,22 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            dispatch_host_filesystem(mounts, handles, &filesystem, IpcRequest::CommitFileSystem),
+        assert!(matches!(
+            dispatch_host_filesystem(mounts, &filesystem, IpcRequest::CommitFileSystem),
             Err(IpcResultCode::WRITE_FILE_NOT_CLOSED)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             dispatch_host_filesystem(
                 mounts,
-                handles,
                 &filesystem,
                 IpcRequest::DeleteFile {
                     path: "/progress".into()
                 },
             ),
             Err(IpcResultCode::TARGET_LOCKED)
-        );
-        handles.close(handle).unwrap();
+        ));
         drop(file);
-        dispatch_host_filesystem(mounts, handles, &filesystem, IpcRequest::CommitFileSystem)
-            .unwrap();
+        dispatch_host_filesystem(mounts, &filesystem, IpcRequest::CommitFileSystem).unwrap();
         drop(filesystem);
         drop(volume);
         let reopened = TransactionalDirectory::open(base, 4).unwrap();
@@ -1360,78 +1216,71 @@ mod tests {
     #[test]
     fn save_deletion_releases_quota_and_is_durable_only_after_commit() {
         use nixe_runtime::TransactionalDirectory;
-        let (directory, mut process) = save_test_process();
+        let (directory, process) = save_test_process();
         let base = directory.path().join("volume");
         std::fs::create_dir_all(base.join("data/slot")).unwrap();
         std::fs::write(base.join("data/slot/progress"), b"save").unwrap();
         std::fs::write(base.join("data/settings"), b"keep").unwrap();
-        let (mounts, handles) = process.mounts_and_handles_mut();
+        let (mounts, _) = process.mounts_and_handles();
         for commit in [false, true] {
             let volume = Arc::new(std::sync::Mutex::new(
                 TransactionalDirectory::open(base.clone(), 8).unwrap(),
             ));
             let filesystem = HostDirectoryFileSystem::from_save(volume.clone());
-            assert_eq!(
-                dispatch_host_filesystem(
-                    mounts,
-                    handles,
-                    &filesystem,
-                    IpcRequest::GetFileSystemAttribute
-                ),
+            assert!(matches!(
+                dispatch_host_filesystem(mounts, &filesystem, IpcRequest::GetFileSystemAttribute),
                 Ok(IpcResponse::FileSystemAttribute {
                     name_length_max: 255,
                     path_length_max: 768
                 })
-            );
+            ));
             for (path, result) in [
                 ("/missing", IpcResultCode::PATH_NOT_FOUND),
                 ("/slot", IpcResultCode::NOT_A_FILE),
                 ("/", IpcResultCode::NOT_A_FILE),
                 ("/../settings", IpcResultCode::INVALID_ARGUMENT),
             ] {
-                assert_eq!(
+                assert!(matches!(
                     dispatch_host_filesystem(
                         mounts,
-                        handles,
                         &filesystem,
                         IpcRequest::DeleteFile { path: path.into() }
                     ),
-                    Err(result)
-                );
+                    Err(actual) if actual == result
+                ));
             }
             let path = "/slot/progress";
             let mut opened = Vec::new();
             for _ in 0..2 {
-                let IpcResponse::Handle(handle) = dispatch_host_filesystem(
-                    mounts,
-                    handles,
-                    &filesystem,
-                    IpcRequest::OpenFile {
-                        path: path.into(),
-                        mode: FILE_OPEN_READ,
-                    },
-                )
-                .unwrap() else {
-                    panic!()
-                };
-                opened.push(handle);
-            }
-            for handle in opened {
-                assert_eq!(
+                let IpcResponse::Object(SemanticIpcObject::HostFile(file)) =
                     dispatch_host_filesystem(
                         mounts,
-                        handles,
+                        &filesystem,
+                        IpcRequest::OpenFile {
+                            path: path.into(),
+                            mode: FILE_OPEN_READ,
+                        },
+                    )
+                    .unwrap()
+                else {
+                    panic!()
+                };
+                opened.push(file);
+            }
+            for file in opened {
+                assert!(matches!(
+                    dispatch_host_filesystem(
+                        mounts,
                         &filesystem,
                         IpcRequest::DeleteFile { path: path.into() }
                     ),
                     Err(IpcResultCode::TARGET_LOCKED)
-                );
+                ));
                 assert!(!volume.lock().unwrap().can_resize(0, 1));
-                handles.close(handle).unwrap();
+                drop(file);
             }
             dispatch_host_filesystem(
                 mounts,
-                handles,
                 &filesystem,
                 IpcRequest::DeleteFile { path: path.into() },
             )
@@ -1444,13 +1293,8 @@ mod tests {
                     .is_file()
             );
             if commit {
-                dispatch_host_filesystem(
-                    mounts,
-                    handles,
-                    &filesystem,
-                    IpcRequest::CommitFileSystem,
-                )
-                .unwrap();
+                dispatch_host_filesystem(mounts, &filesystem, IpcRequest::CommitFileSystem)
+                    .unwrap();
             }
         }
         let volume = TransactionalDirectory::open(base, 8).unwrap();
@@ -1465,7 +1309,7 @@ mod tests {
     #[test]
     fn deleting_and_recreating_a_save_file_does_not_reuse_committed_contents() {
         use nixe_runtime::TransactionalDirectory;
-        let (directory, mut process) = save_test_process();
+        let (directory, process) = save_test_process();
         let base = directory.path().join("volume");
         std::fs::create_dir_all(base.join("data")).unwrap();
         std::fs::write(base.join("data/progress"), b"old!").unwrap();
@@ -1473,10 +1317,9 @@ mod tests {
             TransactionalDirectory::open(base.clone(), 4).unwrap(),
         ));
         let filesystem = HostDirectoryFileSystem::from_save(volume.clone());
-        let (mounts, handles) = process.mounts_and_handles_mut();
+        let (mounts, _) = process.mounts_and_handles();
         dispatch_host_filesystem(
             mounts,
-            handles,
             &filesystem,
             IpcRequest::DeleteFile {
                 path: "/progress".into(),
@@ -1485,7 +1328,6 @@ mod tests {
         .unwrap();
         dispatch_host_filesystem(
             mounts,
-            handles,
             &filesystem,
             IpcRequest::CreateFile {
                 path: "/progress".into(),
@@ -1495,8 +1337,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(filesystem.resolve_existing("/progress").unwrap(), b"new!").unwrap();
-        dispatch_host_filesystem(mounts, handles, &filesystem, IpcRequest::CommitFileSystem)
-            .unwrap();
+        dispatch_host_filesystem(mounts, &filesystem, IpcRequest::CommitFileSystem).unwrap();
         drop(filesystem);
         drop(volume);
         let reopened = TransactionalDirectory::open(base, 4).unwrap();
@@ -1510,7 +1351,7 @@ mod tests {
     #[test]
     fn save_deletion_rejects_symbolic_links_without_touching_their_targets() {
         use nixe_runtime::TransactionalDirectory;
-        let (directory, mut process) = save_test_process();
+        let (directory, process) = save_test_process();
         let base = directory.path().join("volume");
         std::fs::create_dir_all(base.join("data")).unwrap();
         let outside = directory.path().join("outside");
@@ -1520,18 +1361,17 @@ mod tests {
         ));
         let filesystem = HostDirectoryFileSystem::from_save(volume);
         std::os::unix::fs::symlink(&outside, filesystem.resolve_new("/link").unwrap()).unwrap();
-        let (mounts, handles) = process.mounts_and_handles_mut();
-        assert_eq!(
+        let (mounts, _) = process.mounts_and_handles();
+        assert!(matches!(
             dispatch_host_filesystem(
                 mounts,
-                handles,
                 &filesystem,
                 IpcRequest::DeleteFile {
                     path: "/link".into()
                 }
             ),
             Err(IpcResultCode::ACCESS_DENIED)
-        );
+        ));
         assert_eq!(std::fs::read(outside).unwrap(), b"keep");
     }
 
@@ -1552,20 +1392,20 @@ mod tests {
         const SIZE: usize = 512 * 1024 * 1024;
         let storage = ReadOnlyStorage::new(Arc::new(SizedStorage(SIZE as u64)));
 
-        assert_eq!(
+        assert!(matches!(
             dispatch_storage(
                 &storage,
                 IpcRequest::ReadStorage {
                     offset: 0,
-                    size: SIZE,
-                },
+                    size: SIZE
+                }
             ),
             Ok(IpcResponse::StorageRead {
                 offset: 0,
-                size: SIZE,
+                size: SIZE
             })
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             dispatch_storage(
                 &storage,
                 IpcRequest::ReadStorage {
@@ -1574,8 +1414,8 @@ mod tests {
                 },
             ),
             Err(IpcResultCode::OUT_OF_RANGE)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             dispatch_storage(
                 &storage,
                 IpcRequest::ReadStorage {
@@ -1584,6 +1424,6 @@ mod tests {
                 }
             ),
             Err(IpcResultCode::OUT_OF_RANGE)
-        );
+        ));
     }
 }

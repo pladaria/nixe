@@ -5,8 +5,8 @@ use nixe_cpu::{
     },
     location::DecodedInstruction,
     memory::{
-        CpuMemory, DataAccessFault, MemoryAccess, MemoryAccessClass, MemoryAccessSize,
-        MemoryAlignment, MemoryOrdering, MemoryValue,
+        DataAccessFault, InstructionMemoryAccess, MemoryAccess, MemoryAccessClass,
+        MemoryAccessSize, MemoryAlignment, MemoryOrdering, MemoryValue,
     },
     semantics::a64::{
         LoadSpec, ScalarTransfer, atomic_ordering, atomic_rmw_kind, compare_exchange_pair_sizes,
@@ -19,30 +19,12 @@ use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 use super::{advance, read, register_offset_address, sign_extend, write};
 use crate::interpreter::{InstructionStep, InterpreterContext, InterpreterError};
 
-pub(super) enum MemoryStepError {
-    Data(DataAccessFault),
-    Direct(Box<str>),
-}
-
-impl From<DataAccessFault> for MemoryStepError {
-    fn from(fault: DataAccessFault) -> Self {
-        Self::Data(fault)
-    }
-}
-
-impl From<nixe_cpu_direct_memory::DirectMemoryAccessError> for MemoryStepError {
-    fn from(error: nixe_cpu_direct_memory::DirectMemoryAccessError) -> Self {
-        match error {
-            nixe_cpu_direct_memory::DirectMemoryAccessError::DataFault(fault) => Self::Data(fault),
-            error => Self::Direct(error.to_string().into_boxed_str()),
-        }
-    }
-}
+pub(super) type MemoryStepError = DataAccessFault;
 
 type MemoryStep = Result<Option<()>, MemoryStepError>;
 
 pub(super) fn execute(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
     instruction: Instruction,
@@ -85,18 +67,12 @@ pub(super) fn execute(
             Ok(InstructionStep::Continue)
         }
         Ok(None) => Err(super::super::unsupported(decoded)),
-        Err(MemoryStepError::Data(fault)) => {
-            Ok(InstructionStep::data_fault(decoded.location, fault))
-        }
-        Err(MemoryStepError::Direct(detail)) => Err(InterpreterError::DirectMemory {
-            source: decoded.location,
-            detail,
-        }),
+        Err(fault) => Ok(InstructionStep::data_fault(decoded.location, fault)),
     }
 }
 
 fn atomic(
-    memory: &dyn CpuMemory,
+    memory: &(impl InstructionMemoryAccess + ?Sized),
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -201,9 +177,9 @@ fn atomic(
     Ok(Some(()))
 }
 
-fn exclusive(
-    context: InterpreterContext<'_, '_>,
-    memory: &dyn CpuMemory,
+fn exclusive<M: InstructionMemoryAccess + ?Sized>(
+    context: InterpreterContext<'_, M>,
+    memory: &M,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -297,7 +273,7 @@ fn access(size: MemoryAccessSize, ordering: MemoryOrdering, aligned: bool) -> Me
 }
 
 fn literal(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     _address_space: AddressSpaceId,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
@@ -320,7 +296,7 @@ fn literal(
 }
 
 fn unsigned(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -342,7 +318,7 @@ fn unsigned(
 }
 
 fn indexed(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -383,7 +359,7 @@ fn indexed(
 }
 
 fn register_offset(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -410,7 +386,11 @@ fn register_offset(
     )
 }
 
-fn pair(context: InterpreterContext<'_, '_>, state: &mut A64State, fields: Operands) -> MemoryStep {
+fn pair(
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    state: &mut A64State,
+    fields: Operands,
+) -> MemoryStep {
     let Some((size, load_spec)) = pair_transfer(fields.size, fields.load) else {
         return Ok(None);
     };
@@ -461,7 +441,7 @@ fn pair(context: InterpreterContext<'_, '_>, state: &mut A64State, fields: Opera
 }
 
 fn acquire_release(
-    memory: &dyn CpuMemory,
+    memory: &(impl InstructionMemoryAccess + ?Sized),
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -491,7 +471,7 @@ fn acquire_release(
 }
 
 fn transfer(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     _address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -518,19 +498,10 @@ fn transfer(
 }
 
 pub(super) fn ordinary_read(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     address: GuestVirtualAddress,
     descriptor: MemoryAccess,
 ) -> Result<MemoryValue, MemoryStepError> {
-    if descriptor.ordering == MemoryOrdering::Relaxed
-        && descriptor.class == MemoryAccessClass::Normal
-        && let Some(direct) = context.direct_memory()
-    {
-        return direct
-            .borrow_mut()
-            .read(context.memory(), address, descriptor)
-            .map_err(Into::into);
-    }
     Ok(context
         .memory()
         .read(context.process().address_space_id(), address, descriptor)?
@@ -538,20 +509,11 @@ pub(super) fn ordinary_read(
 }
 
 pub(super) fn ordinary_write(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     address: GuestVirtualAddress,
     value: MemoryValue,
     descriptor: MemoryAccess,
 ) -> Result<(), MemoryStepError> {
-    if descriptor.ordering == MemoryOrdering::Relaxed
-        && descriptor.class == MemoryAccessClass::Normal
-        && let Some(direct) = context.direct_memory()
-    {
-        return direct
-            .borrow_mut()
-            .write(context.memory(), address, descriptor, value)
-            .map_err(Into::into);
-    }
     context.memory().write(
         context.process().address_space_id(),
         address,

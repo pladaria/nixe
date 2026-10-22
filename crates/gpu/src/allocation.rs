@@ -1,11 +1,9 @@
-//! Neutral allocation identities and retained canonical backing views.
+//! Neutral allocation identities and weak physical resource views.
 
 use std::{
     fmt::{Display, Formatter},
     sync::Arc,
 };
-
-use nixe_memory::{CanonicalBackingRange, CanonicalBackingSegment, CanonicalPageId};
 
 /// Backend-independent identity of one logical GPU backing allocation.
 ///
@@ -39,7 +37,7 @@ impl Display for GpuAllocationId {
 /// Immutable size and alignment requirements of a logical GPU allocation.
 ///
 /// Canonical guest bytes are deliberately absent. A resource view attaches a
-/// checked [`CanonicalBackingRange`] to an allocation only through
+/// checked physical mapping to an allocation only through
 /// [`BackingView`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GpuAllocationDescription {
@@ -95,184 +93,85 @@ impl Display for AllocationDescriptionError {
 
 impl std::error::Error for AllocationDescriptionError {}
 
-/// A retained canonical byte range within one logical GPU allocation.
-///
-/// The range owns canonical page references and remains pointer-free. It does
-/// not give the resource a guest CPU or GPU virtual address. Repeated canonical
-/// bytes retain their virtual ordering for reads, while the coverage index stores
-/// their union. Host writes to such internal aliases require coherent execution.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Immutable physical interpretation of one logical allocation subrange.
+/// Cached views keep weak allocation metadata. In-flight native inputs retain
+/// their own exact pins until actual device retirement.
+#[derive(Clone)]
 pub struct BackingView {
     allocation: GpuAllocationId,
     allocation_offset: u64,
-    range: CanonicalBackingRange,
-    canonical_spans: Arc<[CanonicalBackingSpan]>,
-    internal_aliases: bool,
+    mapping: Arc<crate::physical::PhysicalMapping>,
+    footprint: Arc<crate::physical::Footprint>,
 }
-
-/// One maximal run of canonical bytes retained by a backing view.
-///
-/// Consecutive fully covered pages share one span. Boundary offsets preserve
-/// exact byte identity for partial first and last pages.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CanonicalBackingSpan {
-    first_page: CanonicalPageId,
-    last_page: CanonicalPageId,
-    first_offset: u64,
-    last_end: u64,
-    ends_at_page_boundary: bool,
-}
-
-impl CanonicalBackingSpan {
-    /// Returns the first page covered by this span.
-    #[must_use]
-    pub const fn first_page(self) -> CanonicalPageId {
-        self.first_page
-    }
-
-    /// Returns the last page covered by this span.
-    #[must_use]
-    pub const fn last_page(self) -> CanonicalPageId {
-        self.last_page
-    }
-
-    /// Returns the first covered byte within [`Self::first_page`].
-    #[must_use]
-    pub const fn first_offset(self) -> u64 {
-        self.first_offset
-    }
-
-    /// Returns the exclusive final covered byte within [`Self::last_page`].
-    #[must_use]
-    pub const fn last_end(self) -> u64 {
-        self.last_end
-    }
-
-    /// Returns whether this span can no longer overlap a later sorted span.
-    #[must_use]
-    pub fn ends_before(self, page: CanonicalPageId, offset: u64) -> bool {
-        self.last_page < page || (self.last_page == page && self.last_end <= offset)
-    }
-
-    /// Returns whether both spans contain any of the same canonical bytes.
-    #[must_use]
-    pub fn overlaps(self, other: Self) -> bool {
-        if self.first_page.store() != other.first_page.store()
-            || self.last_page < other.first_page
-            || other.last_page < self.first_page
-        {
-            return false;
-        }
-
-        let page = self.first_page.max(other.first_page);
-        let last_page = self.last_page.min(other.last_page);
-        if page < last_page {
-            return true;
-        }
-
-        let self_start = if page == self.first_page {
-            self.first_offset
-        } else {
-            0
-        };
-        let self_end = if page == self.last_page {
-            self.last_end
-        } else {
-            u64::MAX
-        };
-        let other_start = if page == other.first_page {
-            other.first_offset
-        } else {
-            0
-        };
-        let other_end = if page == other.last_page {
-            other.last_end
-        } else {
-            u64::MAX
-        };
-        self_start < other_end && other_start < self_end
+impl std::fmt::Debug for BackingView {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackingView")
+            .field("allocation", &self.allocation)
+            .field("allocation_offset", &self.allocation_offset)
+            .field("mapping", &self.mapping)
+            .finish()
     }
 }
-
+impl PartialEq for BackingView {
+    fn eq(&self, other: &Self) -> bool {
+        self.allocation == other.allocation
+            && self.allocation_offset == other.allocation_offset
+            && self.mapping == other.mapping
+    }
+}
+impl Eq for BackingView {}
 impl BackingView {
-    /// Attaches a complete checked canonical range to an allocation subrange.
     pub fn new(
         allocation: GpuAllocationId,
         description: GpuAllocationDescription,
         allocation_offset: u64,
-        range: CanonicalBackingRange,
+        mapping: Arc<crate::physical::PhysicalMapping>,
     ) -> Result<Self, BackingViewError> {
+        let bytes = mapping.bytes();
         let end = allocation_offset
-            .checked_add(range.size())
+            .checked_add(bytes)
             .ok_or(BackingViewError::RangeOverflow)?;
         if end > description.size {
             return Err(BackingViewError::OutOfBounds {
                 offset: allocation_offset,
-                size: range.size(),
+                size: bytes,
                 allocation_size: description.size,
             });
         }
-        let (canonical_spans, internal_aliases) = canonical_spans(&range);
+        let footprint = crate::physical::Footprint::new(
+            mapping.clone(),
+            crate::physical::WriteDomain::Buffer { start: 0, bytes },
+        )
+        .expect("complete nonempty physical mapping is a valid byte footprint");
         Ok(Self {
             allocation,
             allocation_offset,
-            range,
-            canonical_spans: canonical_spans.into(),
-            internal_aliases,
+            mapping,
+            footprint,
         })
     }
-
-    /// Whether distinct virtual offsets name overlapping canonical bytes.
-    #[must_use]
-    pub const fn has_internal_aliases(&self) -> bool {
-        self.internal_aliases
+    pub fn has_internal_aliases(&self) -> bool {
+        !self.mapping.is_injective()
     }
-
-    /// Returns the logical allocation retaining this range.
-    #[must_use]
     pub const fn allocation(&self) -> GpuAllocationId {
         self.allocation
     }
-
-    /// Returns the first byte within the logical allocation.
-    #[must_use]
     pub const fn allocation_offset(&self) -> u64 {
         self.allocation_offset
     }
-
-    /// Returns the exact retained canonical range.
-    #[must_use]
-    pub const fn range(&self) -> &CanonicalBackingRange {
-        &self.range
+    pub fn mapping(&self) -> &Arc<crate::physical::PhysicalMapping> {
+        &self.mapping
     }
-
-    /// Returns the retained byte count.
-    #[must_use]
-    pub const fn size(&self) -> u64 {
-        self.range.size()
+    pub fn size(&self) -> u64 {
+        self.mapping.bytes()
     }
-
-    /// Returns the page-ordered, maximally compressed canonical coverage.
-    ///
-    /// Canonical identity is exposed without revealing host pointers so
-    /// callers can index aliases without enumerating every retained page.
-    #[must_use]
-    pub fn canonical_spans(&self) -> &[CanonicalBackingSpan] {
-        &self.canonical_spans
-    }
-
-    /// Returns whether both views retain any of the same canonical bytes.
-    ///
-    /// Each constructor creates a compressed page-ordered index once, so this
-    /// comparison depends on discontiguous runs rather than retained pages.
-    #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
         crate::metrics::record(crate::metrics::Counter::AliasComparisons, 1);
         crate::metrics::record(
             crate::metrics::Counter::AliasInputSpans,
-            (self.canonical_spans.len() + other.canonical_spans.len()) as u64,
+            (self.mapping.spans().len() + other.mapping.spans().len()) as u64,
         );
-        sorted_spans_overlap(&self.canonical_spans, &other.canonical_spans)
+        self.footprint.intersects(&other.footprint)
     }
 }
 
@@ -307,258 +206,125 @@ impl Display for BackingViewError {
 
 impl std::error::Error for BackingViewError {}
 
-fn canonical_spans(range: &CanonicalBackingRange) -> (Vec<CanonicalBackingSpan>, bool) {
-    let segments = range.segments();
-    let ordered = segments
-        .windows(2)
-        .all(|pair| canonical_segment_key(&pair[0]) <= canonical_segment_key(&pair[1]));
-    let mut spans = Vec::new();
-    let mut internal_aliases = false;
-    if ordered {
-        for segment in segments {
-            append_canonical_span(&mut spans, segment, &mut internal_aliases);
-        }
-    } else {
-        let mut sorted = segments.iter().collect::<Vec<_>>();
-        sorted.sort_unstable_by_key(|segment| canonical_segment_key(segment));
-        for segment in sorted {
-            append_canonical_span(&mut spans, segment, &mut internal_aliases);
-        }
-    }
-    (spans, internal_aliases)
-}
-
-fn canonical_segment_key(segment: &CanonicalBackingSegment) -> (CanonicalPageId, u64, u64) {
-    (
-        segment.page(),
-        segment.offset(),
-        segment.offset() + segment.size(),
-    )
-}
-
-fn append_canonical_span(
-    spans: &mut Vec<CanonicalBackingSpan>,
-    segment: &CanonicalBackingSegment,
-    internal_aliases: &mut bool,
-) {
-    let span = CanonicalBackingSpan {
-        first_page: segment.page(),
-        last_page: segment.page(),
-        first_offset: segment.offset(),
-        last_end: segment.offset() + segment.size(),
-        ends_at_page_boundary: segment.ends_at_page_boundary(),
-    };
-    if let Some(previous) = spans.last_mut() {
-        if previous.last_page == span.first_page {
-            if span.first_offset <= previous.last_end {
-                *internal_aliases |= span.first_offset < previous.last_end;
-                if span.last_end > previous.last_end {
-                    previous.last_end = span.last_end;
-                    previous.ends_at_page_boundary = span.ends_at_page_boundary;
-                }
-                return;
-            }
-        } else if previous.last_page.store() == span.first_page.store()
-            && previous.last_page.page().get().checked_add(1) == Some(span.first_page.page().get())
-            && previous.ends_at_page_boundary
-            && span.first_offset == 0
-        {
-            previous.last_page = span.last_page;
-            previous.last_end = span.last_end;
-            previous.ends_at_page_boundary = span.ends_at_page_boundary;
-            return;
-        }
-    }
-    spans.push(span);
-}
-
-fn sorted_spans_overlap(left: &[CanonicalBackingSpan], right: &[CanonicalBackingSpan]) -> bool {
-    let mut left_index = 0;
-    let mut right_index = 0;
-    while let (Some(left), Some(right)) = (left.get(left_index), right.get(right_index)) {
-        if left.ends_before(right.first_page, right.first_offset) {
-            left_index += 1;
-        } else if right.ends_before(left.first_page, left.first_offset) {
-            right_index += 1;
-        } else {
-            return left.overlaps(*right);
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
-    use nixe_memory::{
-        CanonicalBackingPage, CanonicalBackingSegment, CanonicalBackingStore, ContentGeneration,
-        GuestPhysicalPageId, MappingGeneration, MemoryPermissions,
-    };
-
     use super::*;
-
-    fn page() -> CanonicalBackingPage {
-        let store = CanonicalBackingStore::allocate().unwrap();
-        CanonicalBackingPage::zeroed(
-            &store,
-            GuestPhysicalPageId::new(1),
-            0x1000,
-            ContentGeneration::INITIAL,
-        )
-        .unwrap()
-    }
-
-    fn segment(page: &CanonicalBackingPage, offset: u64, size: u64) -> CanonicalBackingSegment {
-        CanonicalBackingSegment::new(
-            page.clone(),
+    use crate::physical::PhysicalMapping;
+    use nixe_memory::{AllocationRange, Machine, PAGE_SIZE};
+    fn view(allocation: &nixe_memory::Allocation, offset: u64, bytes: u64) -> BackingView {
+        let range =
+            AllocationRange::new(allocation.pin_range(offset, bytes).unwrap(), offset, bytes)
+                .unwrap();
+        BackingView::new(
+            GpuAllocationId::new(7),
+            GpuAllocationDescription::new(allocation.bytes(), PAGE_SIZE).unwrap(),
             offset,
-            size,
-            MemoryPermissions::READ_WRITE,
-            MappingGeneration::INITIAL,
+            PhysicalMapping::new(&[range]).unwrap(),
         )
         .unwrap()
     }
-
     #[test]
-    fn descriptions_reject_empty_or_unaligned_allocations() {
+    fn allocation_descriptions_and_view_bounds_reject_invalid_ranges() {
         assert_eq!(
-            GpuAllocationDescription::new(0, 0x1000),
+            GpuAllocationDescription::new(0, PAGE_SIZE),
             Err(AllocationDescriptionError::Empty)
         );
         assert_eq!(
-            GpuAllocationDescription::new(0x1000, 24),
+            GpuAllocationDescription::new(PAGE_SIZE, 24),
             Err(AllocationDescriptionError::InvalidAlignment { alignment: 24 })
         );
-    }
-
-    #[test]
-    fn backing_views_are_bounded_and_pointer_free() {
-        let page = page();
-        let range = CanonicalBackingRange::new(vec![segment(&page, 0, 0x800)]).unwrap();
-        let description = GpuAllocationDescription::new(0x1000, 0x100).unwrap();
-        let view = BackingView::new(GpuAllocationId::new(7), description, 0x800, range).unwrap();
-
-        assert_eq!(view.allocation(), GpuAllocationId::new(7));
-        assert_eq!(view.allocation_offset(), 0x800);
-        assert_eq!(view.size(), 0x800);
-        assert_eq!(
-            view.allocation().to_string(),
-            "gpu-allocation=0x0000000000000007"
-        );
-    }
-
-    #[test]
-    fn backing_view_checks_bounds_and_indexes_repeated_canonical_bytes() {
-        let page = page();
-        let description = GpuAllocationDescription::new(0x1000, 1).unwrap();
-        let range = CanonicalBackingRange::new(vec![segment(&page, 0, 0x800)]).unwrap();
+        let machine = Machine::new(PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(PAGE_SIZE)
+            .unwrap()
+            .allocate(PAGE_SIZE)
+            .unwrap();
+        let first = view(&allocation, 0x800, 0x800);
+        assert_eq!(first.allocation(), GpuAllocationId::new(7));
+        assert_eq!(first.allocation_offset(), 0x800);
+        assert_eq!(first.size(), 0x800);
+        let description = GpuAllocationDescription::new(PAGE_SIZE, 1).unwrap();
         assert!(matches!(
-            BackingView::new(GpuAllocationId::new(1), description, 0x900, range),
+            BackingView::new(
+                GpuAllocationId::new(7),
+                description,
+                0x801,
+                first.mapping().clone()
+            ),
             Err(BackingViewError::OutOfBounds { .. })
         ));
-
-        let range = CanonicalBackingRange::new(vec![
-            segment(&page, 0, 0x800),
-            segment(&page, 0x400, 0x800),
-        ])
-        .unwrap();
-        let view = BackingView::new(GpuAllocationId::new(1), description, 0, range).unwrap();
-        assert!(view.has_internal_aliases());
-        assert_eq!(view.size(), 0x1000);
-        assert_eq!(view.canonical_spans().len(), 1);
-        assert_eq!(view.canonical_spans()[0].last_end(), 0xc00);
+        assert_eq!(
+            BackingView::new(
+                GpuAllocationId::new(7),
+                description,
+                u64::MAX,
+                first.mapping().clone()
+            ),
+            Err(BackingViewError::RangeOverflow)
+        );
     }
-
     #[test]
-    fn backing_view_overlap_index_preserves_exact_interval_semantics() {
-        let page = page();
-        let description = GpuAllocationDescription::new(0x2000, 1).unwrap();
-        let first = BackingView::new(
-            GpuAllocationId::new(1),
-            description,
-            0,
-            CanonicalBackingRange::new(vec![
-                segment(&page, 0x800, 0x100),
-                segment(&page, 0, 0x100),
-            ])
-            .unwrap(),
-        )
-        .unwrap();
-        let overlapping = BackingView::new(
-            GpuAllocationId::new(2),
-            description,
-            0,
-            CanonicalBackingRange::new(vec![segment(&page, 0x80, 0x40)]).unwrap(),
-        )
-        .unwrap();
-        let adjacent = BackingView::new(
-            GpuAllocationId::new(3),
-            description,
-            0,
-            CanonicalBackingRange::new(vec![segment(&page, 0x100, 0x100)]).unwrap(),
-        )
-        .unwrap();
-
-        assert!(first.overlaps(&overlapping));
-        assert!(overlapping.overlaps(&first));
+    fn physical_aliases_overlap_by_exact_bytes_across_logical_allocation_ids() {
+        let machine = Machine::new(PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(PAGE_SIZE)
+            .unwrap()
+            .allocate(PAGE_SIZE)
+            .unwrap();
+        let first = view(&allocation, 128, 512);
+        let overlap = view(&allocation, 512, 64);
+        let adjacent = view(&allocation, 640, 64);
+        assert!(first.overlaps(&overlap));
         assert!(!first.overlaps(&adjacent));
-        assert!(!adjacent.overlaps(&first));
+        let alias = BackingView::new(
+            GpuAllocationId::new(99),
+            GpuAllocationDescription::new(PAGE_SIZE, 1).unwrap(),
+            0,
+            first.mapping().clone(),
+        )
+        .unwrap();
+        assert!(first.overlaps(&alias));
+        let other_machine = Machine::new(PAGE_SIZE).unwrap();
+        let other = other_machine
+            .account(PAGE_SIZE)
+            .unwrap()
+            .allocate(PAGE_SIZE)
+            .unwrap();
+        assert!(!first.overlaps(&view(&other, 128, 512)));
     }
-
     #[test]
-    fn backing_view_compresses_consecutive_pages_without_losing_boundaries() {
-        let store = CanonicalBackingStore::allocate().unwrap();
-        let pages = [10, 11, 12, 14]
-            .into_iter()
-            .map(|id| {
-                CanonicalBackingPage::zeroed(
-                    &store,
-                    GuestPhysicalPageId::new(id),
-                    0x1000,
-                    ContentGeneration::INITIAL,
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let description = GpuAllocationDescription::new(0x5000, 1).unwrap();
-        let view = BackingView::new(
-            GpuAllocationId::new(1),
-            description,
+    fn cached_views_keep_metadata_without_pinning_guest_ram() {
+        let machine = Machine::new(PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(PAGE_SIZE)
+            .unwrap()
+            .allocate(PAGE_SIZE)
+            .unwrap();
+        let cached = view(&allocation, 0, PAGE_SIZE);
+        assert!(!cached.has_internal_aliases());
+        drop(allocation);
+        assert_eq!(machine.statistics().allocated_bytes, 0);
+        assert!(cached.mapping().pin(0, 1).is_err());
+    }
+    #[test]
+    fn repeated_physical_bytes_are_preserved_as_internal_aliases() {
+        let machine = Machine::new(PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(PAGE_SIZE)
+            .unwrap()
+            .allocate(PAGE_SIZE)
+            .unwrap();
+        let range = AllocationRange::new(allocation.pin(), 0, PAGE_SIZE / 2).unwrap();
+        let mapping = PhysicalMapping::new(&[range.clone(), range]).unwrap();
+        let repeated = BackingView::new(
+            GpuAllocationId::new(7),
+            GpuAllocationDescription::new(PAGE_SIZE, 1).unwrap(),
             0,
-            CanonicalBackingRange::new(vec![
-                segment(&pages[0], 0x800, 0x800),
-                segment(&pages[1], 0, 0x1000),
-                segment(&pages[2], 0, 0x400),
-                segment(&pages[3], 0, 0x1000),
-            ])
-            .unwrap(),
+            mapping,
         )
         .unwrap();
-
-        let [span, separate] = view.canonical_spans() else {
-            panic!("only consecutive canonical pages may share a span");
-        };
-        assert_eq!(span.first_page(), pages[0].identity());
-        assert_eq!(span.last_page(), pages[2].identity());
-        assert_eq!(span.first_offset(), 0x800);
-        assert_eq!(span.last_end(), 0x400);
-        assert_eq!(separate.first_page(), pages[3].identity());
-        assert_eq!(separate.last_page(), pages[3].identity());
-
-        let middle = BackingView::new(
-            GpuAllocationId::new(2),
-            description,
-            0,
-            CanonicalBackingRange::new(vec![segment(&pages[1], 0x400, 0x100)]).unwrap(),
-        )
-        .unwrap();
-        let adjacent = BackingView::new(
-            GpuAllocationId::new(3),
-            description,
-            0,
-            CanonicalBackingRange::new(vec![segment(&pages[2], 0x400, 0x100)]).unwrap(),
-        )
-        .unwrap();
-        assert!(view.overlaps(&middle));
-        assert!(!view.overlaps(&adjacent));
+        assert!(repeated.has_internal_aliases());
+        assert!(repeated.overlaps(&view(&allocation, 0, 1)));
+        assert!(!repeated.overlaps(&view(&allocation, PAGE_SIZE / 2, 1)));
     }
 }

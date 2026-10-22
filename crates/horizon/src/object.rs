@@ -15,6 +15,7 @@ use nixe_runtime::{
 };
 
 mod keyboard;
+pub(crate) use keyboard::KeyboardValidationError;
 
 use crate::graphics::ViSession;
 use crate::ipc::IpcService;
@@ -344,7 +345,7 @@ mod account_tests {
             Some(AccountObject::BaasManagerForApplication(manager))
         );
         assert!(clone.close_object(object_id));
-        assert_eq!(session.object(object_id), None);
+        assert!((session.object(object_id)).is_none());
     }
 }
 
@@ -990,27 +991,19 @@ impl HidSession {
 #[derive(Clone, Debug)]
 pub struct IrsSession {
     shared_memory: SharedMemoryObject,
-    activation_lock: Arc<Mutex<()>>,
 }
 
 impl IrsSession {
     pub(crate) fn new(
-        memory: &nixe_cpu::memory::ExecutionMemory,
-    ) -> Result<Self, nixe_runtime::HandleError> {
-        // Nine 0xe30-byte device entries, followed by five ARUID entries.
-        // Camera status 2 means unconnected; mode and processor state stay stopped.
+        account: &nixe_memory::MemoryAccount,
+    ) -> Result<Self, Arc<nixe_memory::MemoryError>> {
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/services/irs.h#L350-L379
-        let shared_memory = SharedMemoryObject::for_process(
-            memory,
-            0x8000,
-            nixe_cpu::memory::MemoryPermissions::READ,
-        )?;
+        let mut initial = [0; 0x8000];
         for camera in 0..9 {
-            shared_memory.write(camera * 0xe30, &2_u32.to_le_bytes())?;
+            initial[camera * 0xe30..camera * 0xe30 + 4].copy_from_slice(&2_u32.to_le_bytes());
         }
         Ok(Self {
-            shared_memory,
-            activation_lock: Arc::new(Mutex::new(())),
+            shared_memory: crate::system_memory::create(account, initial.len(), &initial)?,
         })
     }
 
@@ -1018,24 +1011,32 @@ impl IrsSession {
         self.shared_memory.clone()
     }
 
-    pub(crate) fn set_active(
+    pub(crate) async fn set_active(
         &self,
         aruid: u64,
         active: bool,
-    ) -> Result<bool, nixe_runtime::HandleError> {
-        let _lock = self
-            .activation_lock
-            .lock()
-            .expect("IRS activation lock poisoned");
+        scheduling: &Arc<crate::ipc_wire::operation::ServiceScheduling>,
+    ) -> Result<bool, Arc<nixe_memory::MemoryError>> {
+        let allocation = self.shared_memory.allocation();
+        let turn = scheduling
+            .enter(crate::ipc_wire::operation::ServiceKey::Shared(
+                allocation.machine().identity(),
+                allocation.identity(),
+            ))
+            .map_err(|_| {
+                Arc::new(nixe_memory::MemoryError::Execution(
+                    "IRS update identity exhausted".into(),
+                ))
+            })?;
+        (&turn).await;
         let mut empty = None;
         for index in 0..5 {
             let offset = 9 * 0xe30 + index * 16;
-            let mut entry = [0; 16];
-            self.shared_memory.read(offset, &mut entry)?;
+            let entry = crate::system_memory::read(&self.shared_memory, offset, 16).await?;
             let id = u64::from_le_bytes(entry[..8].try_into().expect("ARUID field"));
             if id == aruid {
                 if !active {
-                    self.shared_memory.write(offset, &[0; 16])?;
+                    crate::system_memory::write(&self.shared_memory, offset, &[0; 16]).await?;
                 }
                 return Ok(true);
             }
@@ -1052,7 +1053,7 @@ impl IrsSession {
         let mut entry = [0; 16];
         entry[..8].copy_from_slice(&aruid.to_le_bytes());
         entry[8..12].copy_from_slice(&1_u32.to_le_bytes()); // Foreground applet.
-        self.shared_memory.write(offset, &entry)?;
+        crate::system_memory::write(&self.shared_memory, offset, &entry).await?;
         Ok(true)
     }
 }
@@ -1063,7 +1064,8 @@ mod infrared_tests {
 
     #[test]
     fn disconnected_cameras_and_registrations_share_read_only_backing() {
-        let session = IrsSession::new(&nixe_cpu::memory::ExecutionMemory::new()).unwrap();
+        let session =
+            IrsSession::new(&crate::test_memory::machine().account(0x10000).unwrap()).unwrap();
         let clone = session.clone();
         let shared = session.shared_memory();
         assert_eq!(shared.size(), 0x8000);
@@ -1071,21 +1073,27 @@ mod infrared_tests {
             shared.remote_permissions(),
             nixe_cpu::memory::MemoryPermissions::READ
         );
+        let scheduling = Arc::new(crate::ipc_wire::operation::ServiceScheduling::default());
         for camera in 0..9 {
-            let mut entry = [0; 16];
-            shared.read(camera * 0xe30, &mut entry).unwrap();
+            let entry =
+                crate::test_memory::run(crate::system_memory::read(&shared, camera * 0xe30, 16))
+                    .unwrap();
             assert_eq!(entry[0], 2);
             assert!(entry[1..].iter().all(|byte| *byte == 0));
         }
         for aruid in 1..=5 {
-            assert!(session.set_active(aruid, true).unwrap());
+            assert!(crate::test_memory::run(session.set_active(aruid, true, &scheduling)).unwrap());
         }
-        assert!(clone.set_active(3, true).unwrap());
-        assert!(!session.set_active(6, true).unwrap());
-        assert!(clone.set_active(3, false).unwrap());
-        assert!(session.set_active(6, true).unwrap());
-        let mut entries = [0; 80];
-        clone.shared_memory().read(9 * 0xe30, &mut entries).unwrap();
+        assert!(crate::test_memory::run(clone.set_active(3, true, &scheduling)).unwrap());
+        assert!(!crate::test_memory::run(session.set_active(6, true, &scheduling)).unwrap());
+        assert!(crate::test_memory::run(clone.set_active(3, false, &scheduling)).unwrap());
+        assert!(crate::test_memory::run(session.set_active(6, true, &scheduling)).unwrap());
+        let entries = crate::test_memory::run(crate::system_memory::read(
+            &clone.shared_memory(),
+            9 * 0xe30,
+            80,
+        ))
+        .unwrap();
         let ids: BTreeSet<_> = entries
             .chunks_exact(16)
             .map(|entry| {
@@ -1178,52 +1186,58 @@ const TIME_SOURCE_ID: [u8; 16] = *b"NixeTimeSource01";
 /// Initial virtual-time environment injected by the application runtime.
 #[derive(Clone, Debug)]
 pub struct TimeEnvironment {
-    clock: VirtualClock,
-    location_name: [u8; TIME_LOCATION_NAME_SIZE],
-    timezone: Tz,
+    state: Arc<TimeState>,
 }
 
 impl TimeEnvironment {
-    /// Creates an environment with one validated Horizon location name.
-    pub fn new(clock: VirtualClock, timezone: &str) -> Result<Self, &'static str> {
+    pub fn new(
+        account: &nixe_memory::MemoryAccount,
+        clock: VirtualClock,
+        timezone: &str,
+    ) -> Result<Self, String> {
         if timezone.is_empty() || timezone.len() >= TIME_LOCATION_NAME_SIZE || !timezone.is_ascii()
         {
-            return Err("timezone is not representable as a Horizon location name");
+            return Err("timezone is not representable as a Horizon location name".to_owned());
         }
-        // Versioned IANA rule parser used by the calendar-conversion commands:
-        // https://docs.rs/chrono-tz/0.10.4/chrono_tz/enum.Tz.html
         let timezone = timezone
             .parse::<Tz>()
-            .map_err(|_| "timezone is not present in the IANA database")?;
+            .map_err(|_| "timezone is not present in the IANA database".to_owned())?;
         let mut location_name = [0; TIME_LOCATION_NAME_SIZE];
         let name = timezone.name();
         location_name[..name.len()].copy_from_slice(name.as_bytes());
+        let elapsed_seconds = i64::try_from(clock.elapsed().as_secs()).unwrap_or(i64::MAX);
+        let context = SystemClockContext {
+            offset: clock.unix_seconds().saturating_sub(elapsed_seconds),
+            steady_time_point: 0,
+            source_id: TIME_SOURCE_ID,
+        };
+        let mut initial = [0; TIME_SHARED_MEMORY_SIZE];
+        let mut steady = [0; 0x18];
+        steady[8..].copy_from_slice(&TIME_SOURCE_ID);
+        initialise_time_shared_object(&mut initial, 0x00, &steady);
+        initialise_time_shared_object(&mut initial, 0x38, &context.encode());
+        initialise_time_shared_object(&mut initial, 0x80, &context.encode());
+        let shared_memory = crate::system_memory::create(account, initial.len(), &initial)
+            .map_err(|e| e.to_string())?;
         Ok(Self {
-            clock,
-            location_name,
-            timezone,
+            state: Arc::new(TimeState {
+                clock,
+                location_name,
+                timezone,
+                shared_memory,
+                clock_contexts: Mutex::new([context; 3]),
+                counters: Mutex::new([0; 2]),
+            }),
         })
     }
-
-    pub(crate) fn create_service(
-        &self,
-        memory: &nixe_cpu::memory::ExecutionMemory,
-    ) -> Result<TimeServiceSession, nixe_runtime::HandleError> {
-        TimeServiceSession::new(self.clone(), memory)
+    pub(crate) fn create_service(&self) -> TimeServiceSession {
+        TimeServiceSession {
+            state: Arc::clone(&self.state),
+            domain: DomainSession::new(),
+        }
     }
-
     pub(crate) fn clock(&self) -> &VirtualClock {
-        &self.clock
-    }
-}
-
-impl Default for TimeEnvironment {
-    fn default() -> Self {
-        Self::new(
-            VirtualClock::new(nixe_runtime::VirtualClockMode::Realtime),
-            "UTC",
-        )
-        .expect("UTC is a representable Horizon location name")
+        &self.state.clock
     }
 }
 
@@ -1234,6 +1248,7 @@ struct TimeState {
     timezone: Tz,
     shared_memory: SharedMemoryObject,
     clock_contexts: Mutex<[SystemClockContext; 3]>,
+    counters: Mutex<[u32; 2]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1303,11 +1318,25 @@ impl TimeState {
         (monotonic_elapsed, monotonic_elapsed)
     }
 
-    fn set_current_time(
+    async fn set_current_time(
         &self,
         kind: SystemClockKind,
         unix_seconds: i64,
-    ) -> Result<(), nixe_runtime::HandleError> {
+        scheduling: &Arc<crate::ipc_wire::operation::ServiceScheduling>,
+    ) -> Result<(), Arc<nixe_memory::MemoryError>> {
+        let allocation = self.shared_memory.allocation();
+        let turn = scheduling
+            .enter(crate::ipc_wire::operation::ServiceKey::Clock(
+                allocation.machine().identity(),
+                allocation.identity(),
+                kind.index() as u8,
+            ))
+            .map_err(|_| {
+                Arc::new(nixe_memory::MemoryError::Execution(
+                    "clock update identity exhausted".into(),
+                ))
+            })?;
+        (&turn).await;
         let steady_time_point = self.steady_seconds();
         let context = SystemClockContext {
             offset: unix_seconds.saturating_sub(steady_time_point),
@@ -1315,12 +1344,26 @@ impl TimeState {
             source_id: TIME_SOURCE_ID,
         };
         let shared_offset = match kind {
-            SystemClockKind::User => Some(0x38),
-            SystemClockKind::Network => Some(0x80),
+            SystemClockKind::User => Some((0x38, 0)),
+            SystemClockKind::Network => Some((0x80, 1)),
             SystemClockKind::Local => None,
         };
-        if let Some(shared_offset) = shared_offset {
-            write_system_clock_context(&self.shared_memory, shared_offset, context)?;
+        if let Some((offset, index)) = shared_offset {
+            let counter = self.counters.lock().unwrap()[index].wrapping_add(1);
+            // Publish the inactive value before the counter, matching Eden's
+            // lock-free shared-clock protocol. Only this clock's updates wait
+            // for the publication turn; independent service calls keep running.
+            // https://git.eden-emu.dev/eden-emu/eden/src/branch/master/src/core/hle/service/psc/time/shared_memory.cpp
+            crate::system_memory::write(
+                &self.shared_memory,
+                offset + 8 + (counter as usize % 2) * 0x20,
+                &context.encode(),
+            )
+            .await?;
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            crate::system_memory::write(&self.shared_memory, offset, &counter.to_le_bytes())
+                .await?;
+            self.counters.lock().unwrap()[index] = counter;
         }
         self.clock_contexts
             .lock()
@@ -1345,39 +1388,6 @@ pub(crate) enum TimeObject {
 }
 
 impl TimeServiceSession {
-    fn new(
-        environment: TimeEnvironment,
-        memory: &nixe_cpu::memory::ExecutionMemory,
-    ) -> Result<Self, nixe_runtime::HandleError> {
-        let shared_memory = SharedMemoryObject::for_process(
-            memory,
-            TIME_SHARED_MEMORY_SIZE,
-            nixe_cpu::memory::MemoryPermissions::READ,
-        )?;
-        let elapsed_seconds =
-            i64::try_from(environment.clock.elapsed().as_secs()).unwrap_or(i64::MAX);
-        let wall_anchor = environment
-            .clock
-            .unix_seconds()
-            .saturating_sub(elapsed_seconds);
-        let initial_context = SystemClockContext {
-            offset: wall_anchor,
-            steady_time_point: 0,
-            source_id: TIME_SOURCE_ID,
-        };
-        initialise_time_shared_memory(&shared_memory, initial_context)?;
-        Ok(Self {
-            state: Arc::new(TimeState {
-                clock: environment.clock,
-                location_name: environment.location_name,
-                timezone: environment.timezone,
-                shared_memory,
-                clock_contexts: Mutex::new([initial_context; 3]),
-            }),
-            domain: DomainSession::new(),
-        })
-    }
-
     pub(crate) fn is_domain(&self) -> bool {
         self.domain.is_domain()
     }
@@ -1464,11 +1474,14 @@ impl SystemClockSession {
         self.state.current_time(self.kind)
     }
 
-    pub(crate) fn set_current_time(
+    pub(crate) async fn set_current_time(
         &self,
         unix_seconds: i64,
-    ) -> Result<(), nixe_runtime::HandleError> {
-        self.state.set_current_time(self.kind, unix_seconds)
+        scheduling: &Arc<crate::ipc_wire::operation::ServiceScheduling>,
+    ) -> Result<(), Arc<nixe_memory::MemoryError>> {
+        self.state
+            .set_current_time(self.kind, unix_seconds, scheduling)
+            .await
     }
 
     pub(crate) fn context(&self) -> [u8; 0x20] {
@@ -1505,36 +1518,9 @@ impl TimeZoneServiceSession {
     }
 }
 
-fn initialise_time_shared_memory(
-    memory: &SharedMemoryObject,
-    initial_context: SystemClockContext,
-) -> Result<(), nixe_runtime::HandleError> {
-    // libnx's lock-free reader and the three object offsets define this 4 KiB
-    // layout. Both copies begin identical and use an even counter:
-    // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/time.c#L96-L158
-    let mut steady = [0_u8; 0x18];
-    steady[8..].copy_from_slice(&initial_context.source_id);
-    write_shared_object(memory, 0x00, &steady)?;
-
-    write_system_clock_context(memory, 0x38, initial_context)?;
-    write_system_clock_context(memory, 0x80, initial_context)
-}
-
-fn write_shared_object(
-    memory: &SharedMemoryObject,
-    offset: usize,
-    value: &[u8],
-) -> Result<(), nixe_runtime::HandleError> {
-    memory.write(offset + 8, value)?;
-    memory.write(offset + 8 + value.len(), value)
-}
-
-fn write_system_clock_context(
-    memory: &SharedMemoryObject,
-    offset: usize,
-    context: SystemClockContext,
-) -> Result<(), nixe_runtime::HandleError> {
-    write_shared_object(memory, offset, &context.encode())
+fn initialise_time_shared_object(memory: &mut [u8], offset: usize, value: &[u8]) {
+    memory[offset + 8..offset + 8 + value.len()].copy_from_slice(value);
+    memory[offset + 8 + value.len()..offset + 8 + 2 * value.len()].copy_from_slice(value);
 }
 
 const APPLET_ROOT_OBJECT_ID: u32 = 1;
@@ -1830,12 +1816,12 @@ pub(crate) enum OpenAppletStorageAccessorError {
     ObjectIdExhausted,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum AppletStorageAccessError {
     NotFound,
     OutOfRange,
     ReadOnly,
-    BackingFailed,
+    Memory(Arc<nixe_memory::MemoryError>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1852,8 +1838,9 @@ pub(crate) struct LibraryAppletLaunchRequest {
     pub(crate) input_storages: Vec<Vec<u8>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum PrepareLibraryAppletLaunchError {
+    Memory(Arc<nixe_memory::MemoryError>),
     AppletNotFound,
     StorageBackingMissing,
     AllocationFailed,
@@ -1875,22 +1862,42 @@ impl AppletStorage {
             Self::Transfer { size, .. } => *size,
         }
     }
-    fn read(&self, offset: u64, size: usize) -> Result<Vec<u8>, AppletStorageAccessError> {
+    fn read(&self, offset: u64, size: usize) -> Result<StorageRead, AppletStorageAccessError> {
         let start = usize::try_from(offset).map_err(|_| AppletStorageAccessError::OutOfRange)?;
         let end = start
             .checked_add(size)
             .filter(|end| *end <= self.len())
             .ok_or(AppletStorageAccessError::OutOfRange)?;
+        Ok(match self {
+            Self::Owned(bytes) => StorageRead::Owned(bytes[start..end].to_vec()),
+            Self::Transfer { memory, .. } => StorageRead::Transfer {
+                memory: memory.clone(),
+                offset,
+                bytes: size,
+            },
+        })
+    }
+}
+
+enum StorageRead {
+    Owned(Vec<u8>),
+    Transfer {
+        memory: Arc<nixe_runtime::TransferMemoryObject>,
+        offset: u64,
+        bytes: usize,
+    },
+}
+impl StorageRead {
+    async fn resolve(self) -> Result<Vec<u8>, AppletStorageAccessError> {
         match self {
-            Self::Owned(bytes) => Ok(bytes[start..end].to_vec()),
-            Self::Transfer { memory, .. } => {
-                let mut bytes = vec![0; size];
-                memory
-                    .backing()
-                    .read(offset, &mut bytes)
-                    .map_err(|_| AppletStorageAccessError::BackingFailed)?;
-                Ok(bytes)
-            }
+            Self::Owned(bytes) => Ok(bytes),
+            Self::Transfer {
+                memory,
+                offset,
+                bytes,
+            } => crate::system_memory::read_transfer(&memory, offset, bytes)
+                .await
+                .map_err(AppletStorageAccessError::Memory),
         }
     }
 }
@@ -2260,73 +2267,65 @@ impl AppletSession {
         u64::try_from(domain.storages.get(&storage_id)?.len()).ok()
     }
 
-    pub(crate) fn write_storage(
+    pub(crate) async fn write_storage(
         &self,
         storage_id: u64,
         offset: u64,
         bytes: &[u8],
     ) -> Result<(), AppletStorageAccessError> {
-        let mut domain = self
-            .domain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let storage = domain
-            .storages
-            .get_mut(&storage_id)
-            .ok_or(AppletStorageAccessError::NotFound)?;
-        if let AppletStorage::Transfer {
-            memory,
-            size,
-            writable,
-        } = storage
-        {
-            if !*writable {
-                return Err(AppletStorageAccessError::ReadOnly);
+        let transfer = {
+            let mut domain = self
+                .domain
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let storage = domain
+                .storages
+                .get_mut(&storage_id)
+                .ok_or(AppletStorageAccessError::NotFound)?;
+            let start =
+                usize::try_from(offset).map_err(|_| AppletStorageAccessError::OutOfRange)?;
+            let end = start
+                .checked_add(bytes.len())
+                .filter(|end| *end <= storage.len())
+                .ok_or(AppletStorageAccessError::OutOfRange)?;
+            match storage {
+                AppletStorage::Owned(storage) => {
+                    storage[start..end].copy_from_slice(bytes);
+                    return Ok(());
+                }
+                AppletStorage::Transfer {
+                    memory, writable, ..
+                } => {
+                    if !*writable {
+                        return Err(AppletStorageAccessError::ReadOnly);
+                    }
+                    memory.clone()
+                }
             }
-            if offset
-                .checked_add(bytes.len() as u64)
-                .is_none_or(|end| end > *size as u64)
-            {
-                return Err(AppletStorageAccessError::OutOfRange);
-            }
-            let mut batch = nixe_memory::CanonicalWriteBatch::new();
-            batch
-                .stage(memory.backing(), offset, bytes)
-                .map_err(|_| AppletStorageAccessError::BackingFailed)?;
-            batch
-                .commit()
-                .map_err(|_| AppletStorageAccessError::BackingFailed)?;
-            return Ok(());
-        }
-        let AppletStorage::Owned(storage) = storage else {
-            unreachable!()
         };
-        let start = usize::try_from(offset).map_err(|_| AppletStorageAccessError::OutOfRange)?;
-        let end = start
-            .checked_add(bytes.len())
-            .ok_or(AppletStorageAccessError::OutOfRange)?;
-        storage
-            .get_mut(start..end)
-            .ok_or(AppletStorageAccessError::OutOfRange)?
-            .copy_from_slice(bytes);
-        Ok(())
+        crate::system_memory::write_transfer(&transfer, offset, bytes)
+            .await
+            .map_err(AppletStorageAccessError::Memory)
     }
 
-    pub(crate) fn read_storage(
+    pub(crate) async fn read_storage(
         &self,
         storage_id: u64,
         offset: u64,
         size: usize,
     ) -> Result<Vec<u8>, AppletStorageAccessError> {
-        let domain = self
-            .domain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let storage = domain
-            .storages
-            .get(&storage_id)
-            .ok_or(AppletStorageAccessError::NotFound)?;
-        storage.read(offset, size)
+        let read = {
+            let domain = self
+                .domain
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            domain
+                .storages
+                .get(&storage_id)
+                .ok_or(AppletStorageAccessError::NotFound)?
+                .read(offset, size)?
+        };
+        read.resolve().await
     }
 
     pub(crate) fn create_library_applet(
@@ -2510,37 +2509,49 @@ impl AppletSession {
         Ok(())
     }
 
-    pub(crate) fn prepare_library_applet_launch(
+    pub(crate) async fn prepare_library_applet_launch(
         &self,
         applet_object_id: u32,
     ) -> Result<LibraryAppletLaunchRequest, PrepareLibraryAppletLaunchError> {
-        let domain = self
-            .domain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(active) = domain.active_library_applet.as_ref() else {
-            return Err(PrepareLibraryAppletLaunchError::AppletNotFound);
-        };
-        if active.object_id != applet_object_id {
-            return Err(PrepareLibraryAppletLaunchError::AppletNotFound);
-        }
-        let Some(AppletObject::LibraryAppletAccessor { applet_id, mode }) =
-            domain.objects.get(&applet_object_id).copied()
-        else {
-            return Err(PrepareLibraryAppletLaunchError::AppletNotFound);
-        };
-        let mut input_storages = Vec::new();
-        input_storages
-            .try_reserve_exact(active.input_storage_ids.len())
-            .map_err(|_| PrepareLibraryAppletLaunchError::AllocationFailed)?;
-        for storage_id in &active.input_storage_ids {
-            let Some(source) = domain.storages.get(storage_id) else {
-                return Err(PrepareLibraryAppletLaunchError::StorageBackingMissing);
+        let (applet_id, mode, reads) = {
+            let domain = self
+                .domain
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(active) = domain.active_library_applet.as_ref() else {
+                return Err(PrepareLibraryAppletLaunchError::AppletNotFound);
             };
-            let storage = source
-                .read(0, source.len())
-                .map_err(|_| PrepareLibraryAppletLaunchError::StorageBackingMissing)?;
-            input_storages.push(storage);
+            if active.object_id != applet_object_id {
+                return Err(PrepareLibraryAppletLaunchError::AppletNotFound);
+            }
+            let Some(AppletObject::LibraryAppletAccessor { applet_id, mode }) =
+                domain.objects.get(&applet_object_id).copied()
+            else {
+                return Err(PrepareLibraryAppletLaunchError::AppletNotFound);
+            };
+            let mut input_storages = Vec::new();
+            input_storages
+                .try_reserve_exact(active.input_storage_ids.len())
+                .map_err(|_| PrepareLibraryAppletLaunchError::AllocationFailed)?;
+            for storage_id in &active.input_storage_ids {
+                let Some(source) = domain.storages.get(storage_id) else {
+                    return Err(PrepareLibraryAppletLaunchError::StorageBackingMissing);
+                };
+                let storage = source
+                    .read(0, source.len())
+                    .map_err(|_| PrepareLibraryAppletLaunchError::StorageBackingMissing)?;
+                input_storages.push(storage);
+            }
+            (applet_id, mode, input_storages)
+        };
+        let mut input_storages = Vec::with_capacity(reads.len());
+        for read in reads {
+            input_storages.push(read.resolve().await.map_err(|error| match error {
+                AppletStorageAccessError::Memory(error) => {
+                    PrepareLibraryAppletLaunchError::Memory(error)
+                }
+                _ => PrepareLibraryAppletLaunchError::StorageBackingMissing,
+            })?);
         }
         Ok(LibraryAppletLaunchRequest {
             applet_id,
@@ -2751,30 +2762,30 @@ mod applet_tests {
             .unwrap();
         let event = session.library_applet_state_changed_event(applet).unwrap();
         assert!(!event.is_signalled());
-        assert_eq!(session.library_applet_result(applet), None);
-        assert_eq!(
+        assert!((session.library_applet_result(applet)).is_none());
+        assert!(matches!(
             session.pop_library_applet_output(applet),
             Err(PopAppletLaunchParameterError::NotAvailable)
-        );
+        ));
         assert!(session.complete_library_applet(applet, vec![1, 2, 3, 4]));
         assert!(event.is_signalled());
         assert!(!session.complete_library_applet(applet, vec![9]));
         assert_eq!(session.library_applet_result(applet), Some(0));
         let storage = session.pop_library_applet_output(applet).unwrap();
-        assert_eq!(
+        assert!(matches!(
             session.pop_library_applet_output(applet),
             Err(PopAppletLaunchParameterError::NotAvailable)
-        );
+        ));
         let Some(AppletObject::Storage { storage_id }) = session.object(storage) else {
             panic!("output storage missing")
         };
         assert!(session.close_object(applet));
         assert_eq!(
-            session.read_storage(storage_id, 0, 4).unwrap(),
+            crate::test_memory::run(session.read_storage(storage_id, 0, 4)).unwrap(),
             [1, 2, 3, 4]
         );
         assert!(session.close_object(storage));
-        assert_eq!(session.storage_size(storage_id), None);
+        assert!((session.storage_size(storage_id)).is_none());
     }
 
     #[test]
@@ -2809,7 +2820,7 @@ mod applet_tests {
                     .unwrap()
                     .request_exit_to_library_applet_at_execute_next_program_enabled
             );
-            assert_eq!(session.receive_message(), None);
+            assert!((session.receive_message()).is_none());
             assert!(!session.message_event().is_signalled());
         }
     }
@@ -2847,7 +2858,7 @@ mod applet_tests {
                 session.domain.lock().unwrap().restart_message_enabled,
                 enabled
             );
-            assert_eq!(session.receive_message(), None);
+            assert!((session.receive_message()).is_none());
             assert!(!event.is_signalled());
         }
     }
@@ -2871,7 +2882,7 @@ mod applet_tests {
             Some(AppletObject::Proxy(AppletProxyKind::Application))
         );
         assert!(session.close_object(child));
-        assert_eq!(session.object(child), None);
+        assert!((session.object(child)).is_none());
         assert!(!session.close_object(APPLET_ROOT_OBJECT_ID));
 
         for _ in 0..MAX_APPLET_DOMAIN_OBJECTS - 1 {
@@ -2928,7 +2939,7 @@ mod applet_tests {
         assert!(event.is_signalled());
         assert_eq!(session.receive_message(), Some(15));
         assert!(!event.is_signalled());
-        assert_eq!(session.receive_message(), None);
+        assert!((session.receive_message()).is_none());
         assert!(!event.is_signalled());
     }
 
@@ -2951,7 +2962,7 @@ mod applet_tests {
     fn applet_termination_result_is_shared_and_last_writer_wins() {
         let session = AppletSession::new(OperationMode::Console);
         let cloned = session.clone();
-        assert_eq!(session.termination_result(), None);
+        assert!((session.termination_result()).is_none());
 
         cloned.set_termination_result(0x2a2);
         assert_eq!(session.termination_result(), Some(0x2a2));
@@ -3002,11 +3013,11 @@ mod applet_tests {
                 .library_applet_state_changed_event(accessor)
                 .is_some_and(|event| !event.is_signalled())
         );
-        assert_eq!(
+        assert!(matches!(
             session
                 .create_library_applet(LibraryAppletId::Error, LibraryAppletMode::AllForeground,),
             Err(CreateLibraryAppletError::Busy)
-        );
+        ));
 
         assert!(session.close_object(accessor));
         assert!(launchable.is_signalled());
@@ -3036,17 +3047,17 @@ mod applet_tests {
         assert!(session.close_object(storage));
         assert_eq!(session.storage_size(storage_id), Some(0x20));
         assert!(session.close_object(accessor));
-        assert_eq!(session.storage_size(storage_id), None);
+        assert!((session.storage_size(storage_id)).is_none());
     }
 
     #[test]
     fn preselected_user_launch_parameter_is_stable_and_consumed_once() {
         let session = AppletSession::new(OperationMode::Console);
         assert_eq!(session.user(), DEFAULT_USER);
-        assert_eq!(
+        assert!(matches!(
             session.pop_launch_parameter(AppletLaunchParameterKind::PreselectedUser),
             Err(PopAppletLaunchParameterError::NotDomain)
-        );
+        ));
 
         session.convert_to_domain();
         let storage_object = session
@@ -3055,9 +3066,12 @@ mod applet_tests {
         let AppletObject::Storage { storage_id } = session.object(storage_object).unwrap() else {
             panic!("PopLaunchParameter returned the wrong object kind");
         };
-        let bytes = session
-            .read_storage(storage_id, 0, PRESELECTED_USER_LAUNCH_PARAMETER_SIZE)
-            .unwrap();
+        let bytes = crate::test_memory::run(session.read_storage(
+            storage_id,
+            0,
+            PRESELECTED_USER_LAUNCH_PARAMETER_SIZE,
+        ))
+        .unwrap();
         assert_eq!(bytes.len(), PRESELECTED_USER_LAUNCH_PARAMETER_SIZE);
         assert_eq!(
             u32::from_le_bytes(bytes[..4].try_into().unwrap()),
@@ -3068,14 +3082,14 @@ mod applet_tests {
         assert_eq!(&bytes[8..24], &1_u128.to_le_bytes());
         assert!(bytes[24..].iter().all(|byte| *byte == 0));
 
-        assert_eq!(
+        assert!(matches!(
             session.pop_launch_parameter(AppletLaunchParameterKind::PreselectedUser),
             Err(PopAppletLaunchParameterError::NotAvailable)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             session.pop_launch_parameter(AppletLaunchParameterKind::UserChannel),
             Err(PopAppletLaunchParameterError::NotAvailable)
-        );
+        ));
     }
 
     #[test]
@@ -3089,7 +3103,7 @@ mod applet_tests {
         let AppletObject::Storage { storage_id } = session.object(storage).unwrap() else {
             panic!("CreateStorage returned the wrong object kind");
         };
-        session.write_storage(storage_id, 0, b"evidence").unwrap();
+        crate::test_memory::run(session.write_storage(storage_id, 0, b"evidence")).unwrap();
 
         session
             .push_library_applet_input_storage(applet, storage)
@@ -3097,7 +3111,7 @@ mod applet_tests {
         assert!(session.close_object(storage));
         assert_eq!(session.storage_size(storage_id), Some(8));
         assert_eq!(
-            session.prepare_library_applet_launch(applet).unwrap(),
+            crate::test_memory::run(session.prepare_library_applet_launch(applet)).unwrap(),
             LibraryAppletLaunchRequest {
                 applet_id: LibraryAppletId::Error,
                 mode: LibraryAppletMode::AllForeground,
@@ -3106,7 +3120,7 @@ mod applet_tests {
         );
 
         assert!(session.close_object(applet));
-        assert_eq!(session.storage_size(storage_id), None);
+        assert!((session.storage_size(storage_id)).is_none());
     }
 
     #[test]
@@ -3120,10 +3134,10 @@ mod applet_tests {
             .insert_object(AppletObject::CommonStateGetter)
             .unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             session.push_library_applet_input_storage(applet, not_storage),
             Err(PushLibraryAppletStorageError::StorageNotFound)
-        );
+        ));
         assert!(session.close_object(not_storage));
         assert!(session.close_object(applet));
     }
@@ -3137,23 +3151,23 @@ mod applet_tests {
             panic!("CreateStorage returned the wrong object kind");
         };
 
-        session.write_storage(storage_id, 2, &[1, 2, 3]).unwrap();
+        crate::test_memory::run(session.write_storage(storage_id, 2, &[1, 2, 3])).unwrap();
         assert_eq!(
-            session.read_storage(storage_id, 0, 8).unwrap(),
+            crate::test_memory::run(session.read_storage(storage_id, 0, 8)).unwrap(),
             [0, 0, 1, 2, 3, 0, 0, 0]
         );
-        assert_eq!(
-            session.write_storage(storage_id, 7, &[9, 9]),
+        assert!(matches!(
+            crate::test_memory::run(session.write_storage(storage_id, 7, &[9, 9])),
             Err(AppletStorageAccessError::OutOfRange)
-        );
+        ));
         assert_eq!(
-            session.read_storage(storage_id, 0, 8).unwrap(),
+            crate::test_memory::run(session.read_storage(storage_id, 0, 8)).unwrap(),
             [0, 0, 1, 2, 3, 0, 0, 0]
         );
-        assert_eq!(
-            session.read_storage(storage_id, u64::MAX, 1),
+        assert!(matches!(
+            crate::test_memory::run(session.read_storage(storage_id, u64::MAX, 1)),
             Err(AppletStorageAccessError::OutOfRange)
-        );
+        ));
     }
 }
 
@@ -3218,7 +3232,7 @@ mod performance_tests {
         assert_eq!(first.configuration(0), Some(0));
         assert!(first.set_configuration(0, 0x1234));
         assert_eq!(second.configuration(0), Some(0x1234));
-        assert_eq!(second.configuration(2), None);
+        assert!((second.configuration(2)).is_none());
         assert!(!second.set_configuration(2, 1));
     }
 }
@@ -3231,15 +3245,14 @@ mod time_tests {
     #[test]
     fn fixed_time_is_shared_by_every_clock_and_encoded_for_libnx() {
         let environment = TimeEnvironment::new(
+            &crate::test_memory::machine().account(0x10000).unwrap(),
             VirtualClock::new(VirtualClockMode::Fixed {
                 unix_seconds: 1_704_067_200,
             }),
             "Europe/Madrid",
         )
         .unwrap();
-        let service = environment
-            .create_service(&nixe_cpu::memory::ExecutionMemory::new())
-            .unwrap();
+        let service = environment.create_service();
         let user_clock = service.system_clock(SystemClockKind::User);
 
         assert_eq!(user_clock.current_time(), 1_704_067_200);
@@ -3256,24 +3269,33 @@ mod time_tests {
         );
 
         let memory = service.shared_memory();
-        let mut user_context = [0_u8; 0x20];
-        memory.read(0x40, &mut user_context).unwrap();
+        let user_context =
+            crate::test_memory::run(crate::system_memory::read(&memory, 0x40, 0x20)).unwrap();
         assert_eq!(
             i64::from_le_bytes(user_context[..8].try_into().unwrap()),
             1_704_067_200
         );
         assert_eq!(&user_context[16..], &TIME_SOURCE_ID);
 
-        user_clock.set_current_time(1_704_067_260).unwrap();
+        let scheduling = Arc::new(crate::ipc_wire::operation::ServiceScheduling::default());
+        crate::test_memory::run(user_clock.set_current_time(1_704_067_260, &scheduling)).unwrap();
         assert_eq!(user_clock.current_time(), 1_704_067_260);
         let context = user_clock.context();
         assert_eq!(
             i64::from_le_bytes(context[..8].try_into().unwrap()),
             1_704_067_260
         );
-        let mut shared_context = [0; 0x20];
-        memory.read(0x40, &mut shared_context).unwrap();
-        assert_eq!(shared_context, context);
+        let counter =
+            crate::test_memory::run(crate::system_memory::read(&memory, 0x38, 4)).unwrap();
+        let counter = u32::from_le_bytes(counter.as_ref().try_into().unwrap());
+        assert_eq!(counter, 1);
+        let shared_context = crate::test_memory::run(crate::system_memory::read(
+            &memory,
+            0x40 + (counter as usize % 2) * 0x20,
+            0x20,
+        ))
+        .unwrap();
+        assert_eq!(&*shared_context, &context);
 
         assert_eq!(
             service
@@ -3284,11 +3306,11 @@ mod time_tests {
 
         let mut foreign_context = context;
         foreign_context[16] ^= 1;
-        assert_eq!(
+        assert!(matches!(
             service.calculate_monotonic_system_clock_base_time_point(foreign_context),
             Err(MonotonicClockError::NotComparable)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             SystemClockContext {
                 offset: i64::MAX,
                 steady_time_point: 0,
@@ -3296,14 +3318,18 @@ mod time_tests {
             }
             .monotonic_base_time_point(1, 0),
             Err(MonotonicClockError::Overflowed)
-        );
+        ));
     }
 
     #[test]
     fn time_domain_retains_every_child_interface_until_close() {
-        let service = TimeEnvironment::default()
-            .create_service(&nixe_cpu::memory::ExecutionMemory::new())
-            .unwrap();
+        let service = TimeEnvironment::new(
+            &crate::test_memory::machine().account(0x10000).unwrap(),
+            VirtualClock::default(),
+            "UTC",
+        )
+        .unwrap()
+        .create_service();
 
         assert!(!service.is_domain());
         assert_eq!(service.convert_to_domain(), IPC_ROOT_OBJECT_ID);

@@ -111,7 +111,7 @@ mod tests {
                 Some(HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw())
             );
             assert_eq!(request_u32(&response, 28), Some(0x1234));
-            assert_eq!(handle, None);
+            assert!((handle).is_none());
             assert_eq!(session.interface_version(), 1);
         }
         for with_pid in [false, true] {

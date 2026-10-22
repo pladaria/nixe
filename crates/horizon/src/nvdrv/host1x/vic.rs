@@ -3,8 +3,8 @@
 //! https://github.com/averne/FFmpeg/blob/caeec83b791be08ed43468a2ef426d6901d51c78/libavutil/vic_drv.h
 //! https://github.com/averne/FFmpeg/blob/caeec83b791be08ed43468a2ef426d6901d51c78/libavutil/hwcontext_nvtegra.c
 use super::surface::Surface;
+use super::video::write_spans;
 use super::video::{Mappings, read, region, word};
-use nixe_memory::CanonicalWriteBatch;
 
 fn wide(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
@@ -284,9 +284,7 @@ fn write_opaque_nv12(
     let simd = std::is_x86_feature_detected!("sse4.1");
     let (backing, offset) = region(mappings, address, output.length())?;
     let mut bytes = vec![0; output.length()];
-    backing
-        .read(offset, &mut bytes)
-        .map_err(|e| e.to_string())?;
+
     #[cfg(target_arch = "x86_64")]
     if simd {
         // SAFETY: the runtime feature check covers the complete raster loop.
@@ -329,11 +327,14 @@ fn write_opaque_nv12(
             }
         }
     }
-    let mut writes = CanonicalWriteBatch::new();
-    writes
-        .stage(&backing, offset, &bytes)
-        .map_err(|e| e.to_string())?;
-    writes.commit_ordered().map_err(|e| e.to_string())?;
+    let mut spans = Vec::with_capacity(output.height * (output.width * 4).div_ceil(16));
+    for y in 0..output.height {
+        for x in (0..output.width * 4).step_by(16) {
+            let target = output.offset(x, y);
+            spans.push(target..target + (output.width * 4 - x).min(16));
+        }
+    }
+    write_spans(backing, offset, &bytes, spans)?;
     Ok(())
 }
 
@@ -638,9 +639,7 @@ pub(super) fn execute_with_gpu(
     let length = output.length();
     let (backing, offset) = region(mappings, address, length)?;
     let mut bytes = vec![0; length];
-    backing
-        .read(offset, &mut bytes)
-        .map_err(|e| e.to_string())?;
+
     for y in 0..output.height {
         for x0 in (0..output.width).step_by(4) {
             let count = (output.width - x0).min(4);
@@ -670,11 +669,14 @@ pub(super) fn execute_with_gpu(
             bytes[target..target + count * 4].copy_from_slice(&packed[..count * 4]);
         }
     }
-    let mut writes = CanonicalWriteBatch::new();
-    writes
-        .stage(&backing, offset, &bytes)
-        .map_err(|e| e.to_string())?;
-    writes.commit_ordered().map_err(|e| e.to_string())?;
+    let mut spans = Vec::with_capacity(output.height * (output.width * 4).div_ceil(16));
+    for y in 0..output.height {
+        for x in (0..output.width * 4).step_by(16) {
+            let target = output.offset(x, y);
+            spans.push(target..target + (output.width * 4 - x).min(16));
+        }
+    }
+    write_spans(backing, offset, &bytes, spans)?;
     log::trace!(
         "VIC output: dimensions={}x{} format={} layout={} block-height={}",
         output.width,

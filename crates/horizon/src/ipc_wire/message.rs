@@ -798,10 +798,10 @@ mod tests {
             put_word(&mut bytes, 0, word0);
             put_word(&mut bytes, 4, word1);
             let hipc = HipcRequest::decode(&bytes).unwrap();
-            assert_eq!(
+            assert!(matches!(
                 TipcRequest::decode(&hipc),
                 Err(MessageError("TIPC request contains pointer descriptors"))
-            );
+            ));
         }
     }
 

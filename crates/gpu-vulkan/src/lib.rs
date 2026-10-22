@@ -24,8 +24,7 @@ pub use memory::NativeImageDescription;
 pub use residency::{
     AccessScope, AttachmentId, AttachmentLoad, AttachmentStore, BarrierPolicy, BarrierStatistics,
     BufferId, BufferUpload, ImageId, ImagePlane, ImageViewDescription, ImageViewId, LayoutPolicy,
-    PreparedNv12, RecordingPolicy, ResidencyStatistics, VulkanResidency, VulkanVisibility,
-    nv12_pipeline,
+    PreparedNv12, RecordingPolicy, ResidencyStatistics, VulkanResidency, nv12_pipeline,
 };
 mod validation;
 pub use gpu_allocator::MemoryLocation;
@@ -38,7 +37,9 @@ pub use profile::{
     ApiPath, ApiPreference, DeviceProfile, DynamicStateSupport, FloatControls, PortabilitySupport,
     SubgroupSupport, SwapchainMaintenance,
 };
-pub use queue::{QueueConfiguration, QueueUsage, ReadbackTicket, RecordingStatistics, WorkTicket};
+pub use queue::{
+    QueueConfiguration, QueueUsage, ReadbackTicket, RecordingStatistics, WorkStatus, WorkTicket,
+};
 pub use validation::{ValidationMode, ValidationMonitor};
 
 pub use residency::execution::{
@@ -55,3 +56,12 @@ pub use native::{NativeExecutionStatistics, NativeGpuExecution};
 
 #[cfg(test)]
 mod test_shaders;
+
+#[cfg(test)]
+mod test_device {
+    use crate as nixe_gpu_vulkan;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/device.rs"
+    ));
+}

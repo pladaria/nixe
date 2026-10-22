@@ -32,7 +32,7 @@ pub(crate) enum Command {
     BindPipeline {
         command: vk::CommandBuffer,
         point: vk::PipelineBindPoint,
-        pipeline: vk::Pipeline,
+        pipeline: std::sync::Arc<crate::cache::NativePipeline>,
     },
     BindDescriptorSets {
         command: vk::CommandBuffer,
@@ -223,7 +223,7 @@ pub(crate) enum Command {
         first: u32,
         count: u32,
     },
-    #[cfg(any(test, feature = "performance-counters", feature = "binding-probe"))]
+    #[cfg(any(test, feature = "performance-counters"))]
     WriteTimestamp {
         command: vk::CommandBuffer,
         stage: vk::PipelineStageFlags,
@@ -266,13 +266,25 @@ pub(crate) enum Command {
 // All array arguments are copied into their owning command before delegation.
 unsafe impl Send for Command {}
 impl Command {
-    pub(super) unsafe fn execute(self, device: &Device, functions: &Functions) {
+    pub(super) unsafe fn execute(
+        self,
+        device: &Device,
+        functions: &Functions,
+    ) -> Result<(), crate::queue::progress::NativeFailure> {
         match self {
             Command::BindPipeline {
                 command,
                 point,
                 pipeline,
-            } => unsafe { device.cmd_bind_pipeline(command, point, pipeline) },
+            } => unsafe {
+                device.cmd_bind_pipeline(
+                    command,
+                    point,
+                    pipeline
+                        .handle()
+                        .map_err(crate::queue::progress::NativeFailure::Compilation)?,
+                )
+            },
             Command::BindDescriptorSets {
                 command,
                 point,
@@ -506,7 +518,7 @@ impl Command {
                 first,
                 count,
             } => unsafe { device.cmd_reset_query_pool(command, pool, first, count) },
-            #[cfg(any(test, feature = "performance-counters", feature = "binding-probe"))]
+            #[cfg(any(test, feature = "performance-counters"))]
             Command::WriteTimestamp {
                 command,
                 stage,
@@ -591,5 +603,6 @@ impl Command {
                 unsafe { (functions.timestamp)(command, stage, pool, index) };
             }
         }
+        Ok(())
     }
 }

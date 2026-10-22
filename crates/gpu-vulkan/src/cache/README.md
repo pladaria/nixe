@@ -35,19 +35,21 @@ access; descriptor reuse is not permission to omit those effects.
 
 ## Bounded asynchronous work
 
-One shared `CompilePool` runs cold frontend/artifact/driver jobs. A key has one
-pending publication, so concurrent duplicate misses compile once. Entry and byte
-budgets include pending reservations and are updated to actual artifact payload
-sizes. LRU eviction drops only derived cache ownership; prepared/in-flight
-references retain their values. Queue/budget pressure is explicit and retryable.
+Separate bounded `CompilePool` instances run source/artifact and driver jobs.
+Concurrent duplicate requests share one artifact or pipeline. Artifact entry and
+byte budgets include pending reservations and account for actual published payloads.
+Pipeline metadata has its own bounded LRU; prepared/in-flight references retain
+the executable and its linked libraries. Queue/budget pressure is explicit and retryable.
 Failed or panicking compilation publishes an error, never a successful substitute.
 Structured shader diagnostics retain stage and guest PC.
 
-Pending results expose polling and bounded waits. The GPU owner can service
-visibility/control while waiting, retaining the required draw/dispatch in order.
-No worker owns a Vulkan queue. Each worker has a separate `VkPipelineCache`; its
-mutex excludes explicit checkpoint merge/serialization as well as creation, without
-serializing every worker on a global driver cache lock. Required misses remain ordered while the owner services control and visibility.
+Pipeline requests publish immutable resource/layout metadata before driver
+construction. The command owner consumes resources and records native parameters
+immediately; the Vulkan recording worker waits for the executable at its ordered
+bind. Published results use a lock-free read, and build errors fail the native
+submission with their original cause. Driver compiler workers do not own a Vulkan
+queue. Each has a separate `VkPipelineCache`; its mutex excludes explicit
+checkpoint merge/serialization and creation without serializing all workers.
 
 ## Vulkan pipeline construction
 

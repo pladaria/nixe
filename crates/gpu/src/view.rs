@@ -58,7 +58,7 @@ impl BufferView {
         &self.backing
     }
     #[must_use]
-    pub const fn size(&self) -> u64 {
+    pub fn size(&self) -> u64 {
         self.backing.size()
     }
 }
@@ -449,7 +449,8 @@ impl std::error::Error for ImageViewError {}
 
 #[cfg(test)]
 mod tests {
-    use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+    use crate::physical::PhysicalMapping;
+    use nixe_memory::{AllocationRange, Machine, PAGE_SIZE};
 
     use super::*;
     use crate::{
@@ -471,14 +472,15 @@ mod tests {
     }
 
     fn backing(id: u64, size: usize) -> BackingView {
-        let allocation = CanonicalAllocation::zeroed(size, 0x1000).unwrap();
+        let bytes = (size as u64).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let machine = Machine::new(bytes).unwrap();
+        let allocation = machine.account(bytes).unwrap().allocate(bytes).unwrap();
+        let range = AllocationRange::new(allocation.pin(), 0, size as u64).unwrap();
         BackingView::new(
             GpuAllocationId::new(id),
             GpuAllocationDescription::new(size as u64, 1).unwrap(),
             0,
-            allocation
-                .backing_range(MemoryPermissions::READ_WRITE)
-                .unwrap(),
+            PhysicalMapping::new(&[range]).unwrap(),
         )
         .unwrap()
     }
@@ -513,12 +515,11 @@ mod tests {
         assert_eq!(changed.image(), ImageId::new(2));
         assert!(view.can_initialize_from_canonical_texels());
         assert!(!changed.can_initialize_from_canonical_texels());
-        let range = changed.bindings()[0].backing().range().clone();
+        let mapping = changed.bindings()[0].backing().mapping().clone();
         drop(view);
         drop(changed);
-        let mut bytes = [9; 4];
-        range.read(0, &mut bytes).unwrap();
-        assert_eq!(bytes, [0; 4]);
+        assert_eq!(mapping.bytes(), 512);
+        assert!(mapping.pin(0, 4).is_err());
     }
 
     #[test]
@@ -594,17 +595,7 @@ mod tests {
 
     #[test]
     fn malformed_or_overlapping_bindings_are_rejected_atomically() {
-        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
-        let allocation_description = GpuAllocationDescription::new(0x2000, 1).unwrap();
-        let first = BackingView::new(
-            GpuAllocationId::new(1),
-            allocation_description,
-            0,
-            allocation
-                .backing_range(MemoryPermissions::READ_WRITE)
-                .unwrap(),
-        )
-        .unwrap();
+        let first = backing(1, 0x2000);
         let second = first.clone();
         let range = ImageSubresourceRange {
             plane: 0,

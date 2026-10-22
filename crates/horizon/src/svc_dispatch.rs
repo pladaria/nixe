@@ -1,24 +1,13 @@
-//! Minimal verified Horizon SVC semantics for interpreter bring-up.
-//!
-//! ABI layouts and result values follow the public Switchbrew SVC revision
-//! linked from [`crate::svc`]. Operations needing a scheduler or HIPC wire
-//! transport remain explicit unsupported semantics rather than approximations.
+//! Horizon SVC dispatch and owned kernel continuations.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
 use nixe_cpu::exception::ExceptionKind;
-use nixe_cpu::memory::{
-    CpuMemory, DataAccessFault, DataAccessFaultReason, MemoryAccess, MemoryAccessSize,
-    MemoryAliasError, MemoryAliasErrorReason, MemoryAttributes, MemoryMappingError,
-    MemoryMappingErrorReason, MemoryMappingProperties, MemoryMappingPurpose, MemoryPermissions,
-    MemoryProtectionError, MemoryProtectionErrorReason, MemoryQueryResult, MemoryRegionKind,
-    MemoryValue, ProcessMemory,
-};
+use nixe_cpu::memory::MemoryPermissions;
 use nixe_cpu::state::ThreadCpuState;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
-use nixe_memory::CanonicalRangeTranslationError;
 use nixe_memory::GuestVirtualAddress;
 use nixe_runtime::GuestCpuState;
 use nixe_runtime::{
@@ -38,9 +27,11 @@ use crate::{
 };
 
 mod address_arbitration;
+mod address_word;
 mod debug_string;
 mod ipc;
 mod memory;
+mod memory_wait;
 mod scheduled;
 mod synchronization;
 mod thread;
@@ -124,46 +115,8 @@ impl HorizonKernelResult {
     }
 }
 
-fn set_heap_size(
-    context: &mut ExceptionDispatchContext<'_>,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let new_size = read_register(context.thread().state(), 1);
-    let layout = context.process().memory_layout();
-    if !new_size.is_multiple_of(HORIZON_HEAP_ALIGNMENT)
-        || new_size > HORIZON_MAX_HEAP_SIZE
-        || new_size > layout.heap().size()
-    {
-        result(context, HorizonKernelResult::INVALID_SIZE);
-        return resume();
-    }
-    if !context.process().can_resize_heap(new_size) {
-        result(context, HorizonKernelResult::RESOURCE_LIMIT);
-        return resume();
-    }
-    let old_size = context.process().heap_size();
-    match context.process().resize_memory_mapping(
-        layout.heap().base(),
-        old_size,
-        new_size,
-        MemoryPermissions::READ_WRITE,
-        MemoryMappingPurpose::Heap,
-    ) {
-        Ok(()) => {
-            context.process_mut().set_heap_size(new_size);
-            result(context, HorizonKernelResult::SUCCESS);
-            write_register(
-                context.thread_mut().state_mut(),
-                1,
-                layout.heap().base().get(),
-            );
-            resume()
-        }
-        Err(fault) => reject(context, HorizonSvcFault::MemoryMapping { fault }),
-    }
-}
-
 /// Host-side reason an SVC could not be given faithful guest semantics.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum HorizonSvcFault {
     NotSupervisorCall,
     MissingImmediate,
@@ -172,10 +125,6 @@ pub enum HorizonSvcFault {
         immediate: u32,
         documented_name: &'static str,
     },
-    GuestMemory {
-        immediate: u32,
-        fault: DataAccessFault,
-    },
     InvalidMemoryPermission {
         raw: u32,
     },
@@ -183,23 +132,12 @@ pub enum HorizonSvcFault {
         mask: u32,
         value: u32,
     },
-    InvalidMemoryState {
-        immediate: u32,
-        address: GuestVirtualAddress,
-        purpose: MemoryMappingPurpose,
-    },
-    MemoryProtection {
-        fault: MemoryProtectionError,
-    },
     MemoryMapping {
-        fault: MemoryMappingError,
+        fault: std::sync::Arc<nixe_runtime::memory::MappingError>,
     },
-    MemoryAlias {
-        fault: MemoryAliasError,
-    },
-    CanonicalMemory {
+    MemoryAccess {
         immediate: u32,
-        fault: CanonicalRangeTranslationError,
+        fault: std::sync::Arc<nixe_memory::MemoryError>,
     },
     Ipc {
         immediate: u32,
@@ -214,58 +152,41 @@ impl HorizonSvcFault {
     /// Returns the stable Horizon result exposed for a recoverable runtime
     /// rejection, or `None` when dispatch must stop on a host-side fault.
     #[must_use]
-    pub const fn guest_result(&self) -> Option<HorizonKernelResult> {
+    pub fn guest_result(&self) -> Option<HorizonKernelResult> {
         match self {
             Self::Unknown(_) | Self::UnsupportedSemantics { .. } => None,
-            Self::GuestMemory { fault, .. } => match fault.reason {
-                DataAccessFaultReason::ContentGenerationExhausted
-                | DataAccessFaultReason::HostBacking(_) => None,
-                _ => Some(HorizonKernelResult::INVALID_POINTER),
-            },
-            Self::InvalidMemoryPermission { .. }
-            | Self::InvalidMemoryAttribute { .. }
-            | Self::InvalidMemoryState { .. } => Some(HorizonKernelResult::INVALID_STATE),
-            Self::MemoryProtection { fault } => match fault.reason {
-                MemoryProtectionErrorReason::InvalidRange
-                | MemoryProtectionErrorReason::Unmapped => {
+            Self::InvalidMemoryPermission { .. } | Self::InvalidMemoryAttribute { .. } => {
+                Some(HorizonKernelResult::INVALID_STATE)
+            }
+            Self::MemoryMapping { fault } => match fault.as_ref() {
+                nixe_runtime::memory::MappingError::InvalidRange
+                | nixe_runtime::memory::MappingError::AlreadyMapped
+                | nixe_runtime::memory::MappingError::Unmapped => {
                     Some(HorizonKernelResult::INVALID_ADDRESS)
                 }
-                MemoryProtectionErrorReason::WritableExecutable
-                | MemoryProtectionErrorReason::UnsupportedPermissions
-                | MemoryProtectionErrorReason::PermissionLocked => {
-                    Some(HorizonKernelResult::INVALID_STATE)
-                }
-                MemoryProtectionErrorReason::GenerationExhausted => None,
-            },
-            Self::MemoryMapping { fault } => match fault.reason {
-                MemoryMappingErrorReason::InvalidRange
-                | MemoryMappingErrorReason::AlreadyMapped
-                | MemoryMappingErrorReason::MappingStateMismatch => {
-                    Some(HorizonKernelResult::INVALID_ADDRESS)
-                }
-                MemoryMappingErrorReason::WritableExecutable => {
-                    Some(HorizonKernelResult::INVALID_STATE)
-                }
-                MemoryMappingErrorReason::ResourceExhausted => {
-                    Some(HorizonKernelResult::RESOURCE_LIMIT)
-                }
-                MemoryMappingErrorReason::GenerationExhausted => None,
-            },
-            Self::MemoryAlias { fault } => match fault.reason {
-                MemoryAliasErrorReason::InvalidRange
-                | MemoryAliasErrorReason::SourceStateMismatch
-                | MemoryAliasErrorReason::DestinationStateMismatch => {
+                nixe_runtime::memory::MappingError::StateMismatch => {
                     Some(HorizonKernelResult::INVALID_CURRENT_MEMORY)
                 }
-                MemoryAliasErrorReason::PhysicalIdentityMismatch => {
+                nixe_runtime::memory::MappingError::PhysicalIdentityMismatch => {
                     Some(HorizonKernelResult::INVALID_MEMORY_REGION)
                 }
-                MemoryAliasErrorReason::ResourceExhausted => {
-                    Some(HorizonKernelResult::OUT_OF_RESOURCE)
+                nixe_runtime::memory::MappingError::PermissionLocked
+                | nixe_runtime::memory::MappingError::InvalidPermission => {
+                    Some(HorizonKernelResult::INVALID_STATE)
                 }
-                MemoryAliasErrorReason::GenerationExhausted => None,
+                nixe_runtime::memory::MappingError::Memory(error) => match error.as_ref() {
+                    nixe_memory::MemoryError::ProcessLimit { .. }
+                    | nixe_memory::MemoryError::PhysicalExhaustion { .. } => {
+                        Some(HorizonKernelResult::RESOURCE_LIMIT)
+                    }
+                    _ => None,
+                },
             },
-            Self::CanonicalMemory { .. } | Self::Ipc { .. } | Self::InternalRuntime { .. } => None,
+            Self::MemoryAccess { fault, .. } => fault
+                .is_access_fault()
+                .then_some(HorizonKernelResult::INVALID_POINTER),
+            Self::Ipc { fault, .. } => fault.guest_result(),
+            Self::InternalRuntime { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
         }
     }
@@ -284,12 +205,6 @@ impl Display for HorizonSvcFault {
                 formatter,
                 "Horizon SVC {immediate:#x} ({documented_name}) has no runtime semantics"
             ),
-            Self::GuestMemory { immediate, fault } => {
-                write!(
-                    formatter,
-                    "Horizon SVC {immediate:#x} guest-memory fault: {fault:?}"
-                )
-            }
             Self::InvalidMemoryPermission { raw } => {
                 write!(formatter, "invalid Horizon memory permission {raw:#x}")
             }
@@ -297,29 +212,10 @@ impl Display for HorizonSvcFault {
                 formatter,
                 "invalid Horizon memory attribute mask={mask:#x} value={value:#x}"
             ),
-            Self::InvalidMemoryState {
-                immediate,
-                address,
-                purpose,
-            } => write!(
+            Self::MemoryMapping { fault } => write!(formatter, "Horizon mapping failed: {fault}"),
+            Self::MemoryAccess { immediate, fault } => write!(
                 formatter,
-                "Horizon SVC {immediate:#x} rejects mapping at {address} with purpose {purpose:?}"
-            ),
-            Self::MemoryProtection { fault } => {
-                write!(formatter, "Horizon memory protection failed: {fault:?}")
-            }
-            Self::MemoryMapping { fault } => {
-                write!(formatter, "Horizon memory mapping failed: {fault:?}")
-            }
-            Self::MemoryAlias { fault } => {
-                write!(
-                    formatter,
-                    "Horizon memory alias transition failed: {fault:?}"
-                )
-            }
-            Self::CanonicalMemory { immediate, fault } => write!(
-                formatter,
-                "Horizon SVC {immediate:#x} cannot retain canonical memory: {fault}"
+                "Horizon SVC {immediate:#x} memory access failed: {fault}"
             ),
             Self::Ipc { immediate, fault } => {
                 write!(formatter, "Horizon SVC {immediate:#x} {fault}")
@@ -370,7 +266,7 @@ pub struct HorizonSvcDispatcher {
     user_account_switch_locked: Option<bool>,
     save_data: Option<crate::SaveDataSystem>,
     shared_fonts: crate::SharedFontSession,
-    system_archives: crate::SystemArchives,
+    system_archives: std::sync::Arc<crate::SystemArchives>,
     keyboard_host: Option<nixe_applets::keyboard::KeyboardHost>,
     diagnostics: crate::HorizonDiagnostics,
     video_system: crate::VideoSystem,
@@ -382,13 +278,21 @@ pub struct HorizonSvcDispatcher {
     wait_deadlines: BTreeMap<(u64, u32), u64>,
     virtual_clock: nixe_runtime::VirtualClock,
     pending_wakes: BTreeMap<u64, PendingThreadWake>,
+    synchronization_waits: BTreeMap<u64, synchronization::SynchronizationWait>,
+    session_requests: BTreeMap<u64, ipc::KernelSessionRequest>,
+    reply_waits: BTreeMap<u64, synchronization::ReplyReceiveWait>,
     pending_runtime_requests: BTreeMap<GuestThreadId, PendingRuntimeRequest>,
+    memory_waits: BTreeMap<GuestThreadId, memory_wait::PendingMemory>,
+    service_scheduling: std::sync::Arc<crate::ipc_wire::operation::ServiceScheduling>,
+    memory_completions: std::sync::Arc<memory_wait::MemoryCompletions>,
+    memory_events: Option<nixe_runtime::ExternalEventSender>,
+    next_memory_generation: u64,
     cancellable_waits: BTreeSet<u64>,
     cancelled_waits: BTreeSet<u64>,
     pending_wait_cancellations: BTreeSet<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum PendingRuntimeRequest {
     CreateThread {
         entry: GuestVirtualAddress,
@@ -427,7 +331,7 @@ enum PendingRuntimeRequest {
     },
     GetThreadContext {
         object_id: u64,
-        address: GuestVirtualAddress,
+        ranges: Vec<nixe_memory::AllocationRange>,
     },
     SynchronizeMutexWaits {
         addresses: Vec<u64>,
@@ -438,6 +342,9 @@ enum PendingRuntimeRequest {
     RegisterAddressWait {
         address: u64,
         deadline: Option<u64>,
+        check: address_arbitration::AddressWaitCheck,
+        source: nixe_cpu::location::LocationDescriptor,
+        vcpu: VirtualCpuId,
     },
 }
 
@@ -481,13 +388,18 @@ impl HorizonSvcDispatcher {
     /// Creates a dispatcher whose applet service reports the selected initial mode.
     #[must_use]
     pub fn new(
+        machine: nixe_memory::Machine,
         initial_operation_mode: crate::OperationMode,
         time_environment: crate::TimeEnvironment,
+        hid_system: crate::HidSystem,
+        shared_fonts: crate::SharedFontSession,
     ) -> Self {
         Self::new_with_video(
             initial_operation_mode,
             time_environment,
-            crate::VideoSystem::default(),
+            hid_system,
+            shared_fonts,
+            crate::VideoSystem::new(machine),
         )
     }
 
@@ -496,11 +408,15 @@ impl HorizonSvcDispatcher {
     pub fn new_with_video(
         initial_operation_mode: crate::OperationMode,
         time_environment: crate::TimeEnvironment,
+        hid_system: crate::HidSystem,
+        shared_fonts: crate::SharedFontSession,
         video_system: crate::VideoSystem,
     ) -> Self {
         Self::new_with_video_and_settings(
             initial_operation_mode,
             time_environment,
+            hid_system,
+            shared_fonts,
             crate::SettingsEnvironment::default(),
             video_system,
         )
@@ -511,6 +427,8 @@ impl HorizonSvcDispatcher {
     pub fn new_with_video_and_settings(
         initial_operation_mode: crate::OperationMode,
         time_environment: crate::TimeEnvironment,
+        hid_system: crate::HidSystem,
+        shared_fonts: crate::SharedFontSession,
         settings_environment: crate::SettingsEnvironment,
         video_system: crate::VideoSystem,
     ) -> Self {
@@ -524,12 +442,12 @@ impl HorizonSvcDispatcher {
             application_language: None,
             user_account_switch_locked: None,
             save_data: None,
-            shared_fonts: crate::SharedFontSession::default(),
-            system_archives: crate::SystemArchives::default(),
+            shared_fonts,
+            system_archives: std::sync::Arc::new(crate::SystemArchives::default()),
             keyboard_host: None,
             diagnostics: crate::HorizonDiagnostics::default(),
             video_system,
-            hid_system: crate::HidSystem::new(),
+            hid_system,
             audio_backend: None,
             audio_renderers: crate::AudioRendererManagerSession::default(),
             named_ports: BTreeMap::new(),
@@ -537,7 +455,15 @@ impl HorizonSvcDispatcher {
             wait_deadlines: BTreeMap::new(),
             virtual_clock,
             pending_wakes: BTreeMap::new(),
+            synchronization_waits: BTreeMap::new(),
+            session_requests: BTreeMap::new(),
+            reply_waits: BTreeMap::new(),
             pending_runtime_requests: BTreeMap::new(),
+            memory_waits: BTreeMap::new(),
+            service_scheduling: std::sync::Arc::default(),
+            memory_completions: std::sync::Arc::new(memory_wait::MemoryCompletions::default()),
+            memory_events: None,
+            next_memory_generation: 0,
             cancellable_waits: BTreeSet::new(),
             cancelled_waits: BTreeSet::new(),
             pending_wait_cancellations: BTreeSet::new(),
@@ -568,14 +494,7 @@ impl HorizonSvcDispatcher {
     /// Supplies host-generated resources for filesystem system-data requests.
     #[must_use]
     pub fn with_system_archives(mut self, archives: crate::SystemArchives) -> Self {
-        self.system_archives = archives;
-        self
-    }
-
-    /// Supplies caller-owned system font resources to pl:u.
-    #[must_use]
-    pub fn with_shared_fonts(mut self, shared_fonts: crate::SharedFontSession) -> Self {
-        self.shared_fonts = shared_fonts;
+        self.system_archives = std::sync::Arc::new(archives);
         self
     }
 
@@ -603,7 +522,7 @@ impl HorizonSvcDispatcher {
     }
 
     /// Supplies real controller actuator output owned by the host input worker.
-    pub fn with_vibration_output(mut self, output: nixe_input::VibrationOutput) -> Self {
+    pub fn with_vibration_output(self, output: nixe_input::VibrationOutput) -> Self {
         self.hid_system.set_vibration_output(output);
         self
     }
@@ -641,8 +560,12 @@ impl HorizonSvcDispatcher {
         &mut self,
         state: &nixe_input::EmulatedTouchScreenState,
         delta: Duration,
-    ) -> Result<(), nixe_runtime::HandleError> {
+    ) -> Result<(), crate::HidInputError> {
         self.hid_system.publish_touch_screen(state, delta)
+    }
+
+    pub fn poll_input_publication(&self) -> Result<(), crate::HidInputError> {
+        self.hid_system.poll_publication()
     }
 
     #[must_use]
@@ -706,14 +629,12 @@ impl HorizonSvcDispatcher {
         request: PendingRuntimeRequest,
         operation: &'static str,
     ) -> Result<(), HorizonSvcFault> {
-        if self
-            .pending_runtime_requests
-            .insert(thread, request)
-            .is_some()
-        {
-            Err(runtime_fault(operation))
-        } else {
-            Ok(())
+        match self.pending_runtime_requests.entry(thread) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(request);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(runtime_fault(operation)),
         }
     }
 
@@ -736,25 +657,38 @@ impl HorizonSvcDispatcher {
         coordinator: &mut nixe_runtime::RuntimeCoordinator,
         process_id: ProcessId,
         thread_id: GuestThreadId,
-    ) -> Result<bool, HorizonSvcFault> {
+    ) -> Result<Option<nixe_runtime::ExceptionHandlingResult<HorizonSvcFault>>, HorizonSvcFault>
+    {
         let Some(request) = self.pending_runtime_requests.remove(&thread_id) else {
-            return Ok(false);
+            return Ok(None);
         };
         let mut fully_handled = true;
         match request {
-            PendingRuntimeRequest::RegisterAddressWait { address, deadline } => {
+            PendingRuntimeRequest::RegisterAddressWait {
+                address,
+                deadline,
+                check,
+                source,
+                vcpu,
+            } => {
                 let priority = coordinator
                     .scheduler()
                     .thread(thread_id)
                     .ok_or_else(|| runtime_fault("WaitForAddress thread priority"))?
                     .effective_priority;
-                let event = coordinator
-                    .process_mut(process_id)
-                    .ok_or_else(|| runtime_fault("WaitForAddress process"))?
-                    .address_waits_mut()
-                    .priority_waits_mut()
-                    .enqueue(address, thread_id, priority, deadline)
-                    .ok_or_else(|| runtime_fault("WaitForAddress duplicate registration"))?;
+                let event = {
+                    let mut state = coordinator
+                        .process(process_id)
+                        .ok_or_else(|| runtime_fault("WaitForAddress process"))?
+                        .address_waits()
+                        .lock();
+                    let queue = state.priority_waits_mut();
+                    let event = queue
+                        .enqueue(address, thread_id, priority, deadline)
+                        .ok_or_else(|| runtime_fault("WaitForAddress duplicate registration"))?;
+                    queue.begin_check(thread_id);
+                    event
+                };
                 self.pending_wakes.insert(
                     thread_id.get(),
                     PendingThreadWake {
@@ -762,7 +696,20 @@ impl HorizonSvcDispatcher {
                         deadline,
                     },
                 );
-                fully_handled = false;
+                let token = coordinator
+                    .register_wait(thread_id, nixe_scheduler::Readiness::Pending)
+                    .map_err(|_| runtime_fault("address comparison registration"))?
+                    .ok_or_else(|| runtime_fault("address comparison generation"))?;
+                let handling = coordinator
+                    .resume_supervisor_call(token, vcpu, source, |context| {
+                        self.start_address_wait_check(context, address, check)
+                    })
+                    .map_err(|_| runtime_fault("address comparison continuation"))?
+                    .ok_or_else(|| runtime_fault("address comparison lost generation"))?;
+                return self
+                    .finish_scheduled_call(coordinator, process_id, thread_id, handling)
+                    .map(Some)
+                    .map_err(|_| runtime_fault("address comparison scheduling"));
             }
             PendingRuntimeRequest::CreateThread {
                 entry,
@@ -790,7 +737,7 @@ impl HorizonSvcDispatcher {
                             u32::MAX,
                         ))),
                     )?;
-                    return Ok(true);
+                    return Ok(Some(nixe_runtime::ExceptionHandlingResult::Resumed));
                 };
                 let affinity = match coordinator.scheduler().profile().core_set([ideal]) {
                     Ok(affinity) => affinity,
@@ -801,7 +748,7 @@ impl HorizonSvcDispatcher {
                             thread_id,
                             Err(ThreadCreateError::InvalidVirtualCpu(ideal)),
                         )?;
-                        return Ok(true);
+                        return Ok(Some(nixe_runtime::ExceptionHandlingResult::Resumed));
                     }
                 };
                 let result = coordinator.create_thread(
@@ -980,7 +927,7 @@ impl HorizonSvcDispatcher {
                             HorizonKernelResult::OUT_OF_RANGE,
                             |_| {},
                         )?;
-                        return Ok(true);
+                        return Ok(Some(nixe_runtime::ExceptionHandlingResult::Resumed));
                     };
                     map_thread_operation(
                         coordinator.set_thread_affinity(object_id, ideal, affinity),
@@ -1027,37 +974,33 @@ impl HorizonSvcDispatcher {
                     |_| {},
                 )?;
             }
-            PendingRuntimeRequest::GetThreadContext { object_id, address } => {
+            PendingRuntimeRequest::GetThreadContext { object_id, ranges } => {
                 let info = coordinator
                     .thread_scheduling_info(object_id)
                     .map_err(|_| runtime_fault("GetThreadContext3"))?;
-                let code = if info.thread == thread_id || !info.paused {
-                    HorizonKernelResult::INVALID_STATE
+                if info.thread == thread_id || !info.paused {
+                    finish_pending_caller(
+                        coordinator,
+                        process_id,
+                        thread_id,
+                        "GetThreadContext3",
+                        HorizonKernelResult::INVALID_STATE,
+                        |_| {},
+                    )?;
                 } else {
                     let state = coordinator
                         .thread_cpu_state(object_id)
                         .map_err(|_| runtime_fault("GetThreadContext3"))?;
                     let bytes = encode_thread_context(&state);
-                    let process = coordinator
-                        .process(process_id)
-                        .ok_or_else(|| runtime_fault("GetThreadContext3"))?;
-                    if process
-                        .memory()
-                        .write_bytes(process.cpu_context().address_space_id(), address, &bytes)
-                        .is_err()
-                    {
-                        return Err(runtime_fault("GetThreadContext3 atomic context write"));
-                    }
-                    HorizonKernelResult::SUCCESS
-                };
-                finish_pending_caller(
-                    coordinator,
-                    process_id,
-                    thread_id,
-                    "GetThreadContext3",
-                    code,
-                    |_| {},
-                )?;
+                    self.write_runtime_output(
+                        coordinator,
+                        process_id,
+                        thread_id,
+                        0x33,
+                        ranges,
+                        &bytes,
+                    )?;
+                }
             }
             PendingRuntimeRequest::SynchronizeMutexWaits { addresses } => {
                 coordinator
@@ -1082,7 +1025,7 @@ impl HorizonSvcDispatcher {
                 )?;
             }
         }
-        Ok(fully_handled)
+        Ok(fully_handled.then_some(nixe_runtime::ExceptionHandlingResult::Resumed))
     }
 
     fn finish_create_thread(
@@ -1175,12 +1118,12 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
         };
 
         let outcome = match immediate {
-            0x01 => set_heap_size(context),
+            0x01 => self.set_heap_size(context),
             0x02 => set_memory_permission(context),
             0x03 => set_memory_attribute(context),
             0x04 => map_memory(context),
             0x05 => unmap_memory(context),
-            0x06 => query_memory(context, immediate),
+            0x06 => self.query_memory(context, immediate),
             0x07 => terminate(ExceptionTerminationScope::Process),
             0x08 => self.create_thread(context),
             0x09 => self.start_thread(context),
@@ -1214,8 +1157,8 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x22 => self.send_sync_request_with_user_buffer(context),
             0x24 => get_process_id(context),
             0x25 => get_thread_id(context),
-            0x26 => break_process(context),
-            0x27 => debug_string::output_debug_string(context, self.diagnostics.guest_logs_level),
+            0x26 => self.break_process(context),
+            0x27 => self.output_debug_string(context),
             0x29 => get_info(context),
             0x32 => self.set_thread_activity(context),
             0x33 => self.get_thread_context(context),
@@ -1243,15 +1186,6 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
     }
 }
 
-impl Default for HorizonSvcDispatcher {
-    fn default() -> Self {
-        Self::new(
-            crate::OperationMode::default(),
-            crate::TimeEnvironment::default(),
-        )
-    }
-}
-
 const fn svc_support(immediate: u32) -> HorizonSvcSupport {
     match immediate {
         0x04 | 0x05 | 0x07 | 0x08 | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x0e | 0x0f | 0x10
@@ -1274,9 +1208,9 @@ fn reject(
     context: &mut ExceptionDispatchContext<'_>,
     diagnostic: HorizonSvcFault,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let guest_result = diagnostic
-        .guest_result()
-        .expect("only recoverable Horizon failures may reject a guest operation");
+    let Some(guest_result) = diagnostic.guest_result() else {
+        return ExceptionDispatchOutcome::Fault(diagnostic);
+    };
     result(context, guest_result);
     ExceptionDispatchOutcome::Reject { diagnostic }
 }
@@ -1356,95 +1290,6 @@ fn session_request_owner(context: &ExceptionDispatchContext<'_>) -> SessionReque
         process_id: context.process().process_id(),
         thread_id: context.thread().object().thread_id(),
     }
-}
-
-fn read_guest_message(
-    context: &mut ExceptionDispatchContext<'_>,
-    address: GuestVirtualAddress,
-    size: usize,
-    immediate: u32,
-) -> Result<Vec<u8>, ExceptionDispatchOutcome<HorizonSvcFault>> {
-    let mut message = Vec::new();
-    if message.try_reserve_exact(size).is_err() {
-        result(context, HorizonKernelResult::OUT_OF_RESOURCE);
-        return Err(resume());
-    }
-    message.resize(size, 0);
-    if let Err(error) = crate::ipc_wire::read_bytes(context.process(), address, &mut message) {
-        return Err(reject_ipc(context, immediate, error));
-    }
-    Ok(message)
-}
-
-fn read_handle_array(
-    context: &mut ExceptionDispatchContext<'_>,
-    pointer: u64,
-    count: u32,
-    immediate: u32,
-) -> Result<Vec<u32>, ExceptionDispatchOutcome<HorizonSvcFault>> {
-    let mut handles = Vec::with_capacity(count as usize);
-    for index in 0..count {
-        let Some(address) = pointer.checked_add(u64::from(index) * 4) else {
-            result(context, HorizonKernelResult::INVALID_ADDRESS);
-            return Err(resume());
-        };
-        let read = context.process().memory().read(
-            context.process().cpu().address_space_id(),
-            GuestVirtualAddress::new(address),
-            MemoryAccess::normal(MemoryAccessSize::Word),
-        );
-        let value = match read {
-            Ok(read) => read.value,
-            Err(fault) => {
-                return Err(reject(
-                    context,
-                    HorizonSvcFault::GuestMemory { immediate, fault },
-                ));
-            }
-        };
-        let MemoryValue::U32(handle) = value else {
-            unreachable!("word access returns a word value")
-        };
-        handles.push(handle);
-    }
-    Ok(handles)
-}
-
-fn read_c_name(
-    context: &mut ExceptionDispatchContext<'_>,
-    start: GuestVirtualAddress,
-    capacity: usize,
-    immediate: u32,
-) -> Result<Option<Vec<u8>>, ExceptionDispatchOutcome<HorizonSvcFault>> {
-    let mut name = Vec::with_capacity(capacity);
-    for index in 0..capacity {
-        let Some(address) = start.checked_add(index as u64) else {
-            result(context, HorizonKernelResult::INVALID_ADDRESS);
-            return Err(resume());
-        };
-        let read = context.process().memory().read(
-            context.process().cpu().address_space_id(),
-            address,
-            MemoryAccess::normal(MemoryAccessSize::Byte),
-        );
-        let byte = match read {
-            Ok(read) => match read.value {
-                MemoryValue::U8(byte) => byte,
-                _ => unreachable!("byte access returns a byte value"),
-            },
-            Err(fault) => {
-                return Err(reject(
-                    context,
-                    HorizonSvcFault::GuestMemory { immediate, fault },
-                ));
-            }
-        };
-        if byte == 0 {
-            return Ok(Some(name));
-        }
-        name.push(byte);
-    }
-    Ok(None)
 }
 
 fn read_register(state: &GuestCpuState, index: u8) -> u64 {
@@ -1578,7 +1423,7 @@ fn close_handle(
         result(context, HorizonKernelResult::INVALID_HANDLE);
         return resume();
     }
-    let closed = context.process_mut().handles_mut().close(handle);
+    let closed = context.process_mut().handles().close(handle);
     let Ok(object) = closed else {
         result(context, HorizonKernelResult::INVALID_HANDLE);
         return resume();
@@ -1587,7 +1432,7 @@ fn close_handle(
         .then(|| object.downcast_ref::<ThreadObject>())
         .flatten()
         .filter(|thread| thread.is_signalled())
-        .map(ThreadObject::thread_id);
+        .map(|thread| thread.thread_id());
     let caller = context.thread().id();
     let Some(object_id) = reap else {
         result(context, HorizonKernelResult::SUCCESS);
@@ -1611,8 +1456,8 @@ fn event_signal(
     let event = context
         .process()
         .handles()
-        .get_as::<WritableEventObject>(handle)
-        .cloned();
+        .lookup_as::<WritableEventObject>(handle)
+        .map(std::sync::Arc::unwrap_or_clone);
     let code = if let Some(event) = event {
         event.signal();
         HorizonKernelResult::SUCCESS
@@ -1630,13 +1475,13 @@ fn event_clear(
     let writable = context
         .process()
         .handles()
-        .get_as::<WritableEventObject>(handle)
-        .cloned();
+        .lookup_as::<WritableEventObject>(handle)
+        .map(std::sync::Arc::unwrap_or_clone);
     let readable = context
         .process()
         .handles()
-        .get_as::<ReadableEventObject>(handle)
-        .cloned();
+        .lookup_as::<ReadableEventObject>(handle)
+        .map(std::sync::Arc::unwrap_or_clone);
     let code = if let Some(event) = writable {
         event.clear();
         HorizonKernelResult::SUCCESS
@@ -1657,8 +1502,8 @@ fn reset_signal(
     let readable = context
         .process()
         .handles()
-        .get_as::<ReadableEventObject>(handle)
-        .cloned();
+        .lookup_as::<ReadableEventObject>(handle)
+        .map(std::sync::Arc::unwrap_or_clone);
     let code = match readable {
         Some(event) if event.is_signalled() => {
             event.clear();
@@ -1675,7 +1520,7 @@ fn create_event(
     context: &mut ExceptionDispatchContext<'_>,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let (writable, readable) = nixe_runtime::EventObject::create_pair();
-    match insert_pair(context.process_mut().handles_mut(), writable, readable) {
+    match insert_pair(context.process_mut().handles(), writable, readable) {
         Ok((write_handle, read_handle)) => {
             result(context, HorizonKernelResult::SUCCESS);
             write_register(context.thread_mut().state_mut(), 1, u64::from(write_handle));
@@ -1697,7 +1542,7 @@ fn create_session(
     } else {
         SessionObject::create_light_pair()
     };
-    match insert_pair(context.process_mut().handles_mut(), server, client) {
+    match insert_pair(context.process_mut().handles(), server, client) {
         Ok((server_handle, client_handle)) => {
             result(context, HorizonKernelResult::SUCCESS);
             write_register(
@@ -1728,7 +1573,7 @@ fn create_port(
         return resume();
     }
     let (server, client) = PortObject::create_pair(max_sessions as usize, is_light);
-    match insert_pair(context.process_mut().handles_mut(), server, client) {
+    match insert_pair(context.process_mut().handles(), server, client) {
         Ok((server_handle, client_handle)) => {
             result(context, HorizonKernelResult::SUCCESS);
             write_register(
@@ -1754,8 +1599,8 @@ fn connect_to_port(
     let Some(port) = context
         .process()
         .handles()
-        .get_as::<PortObject>(handle)
-        .cloned()
+        .lookup_as::<PortObject>(handle)
+        .map(std::sync::Arc::unwrap_or_clone)
     else {
         result(context, HorizonKernelResult::INVALID_HANDLE);
         return resume();
@@ -1779,7 +1624,7 @@ fn connect_to_port(
             return resume();
         }
     };
-    match context.process_mut().handles_mut().insert(session) {
+    match context.process_mut().handles().insert(session) {
         Ok(session_handle) => {
             result(context, HorizonKernelResult::SUCCESS);
             write_register(
@@ -1800,8 +1645,8 @@ fn accept_session(
     let Some(port) = context
         .process()
         .handles()
-        .get_as::<PortObject>(handle)
-        .cloned()
+        .lookup_as::<PortObject>(handle)
+        .map(std::sync::Arc::unwrap_or_clone)
     else {
         result(context, HorizonKernelResult::INVALID_HANDLE);
         return resume();
@@ -1811,7 +1656,7 @@ fn accept_session(
         return resume();
     }
     match port.accept() {
-        Ok(session) => match context.process_mut().handles_mut().insert(session) {
+        Ok(session) => match context.process_mut().handles().insert(session) {
             Ok(session_handle) => {
                 result(context, HorizonKernelResult::SUCCESS);
                 write_register(
@@ -1831,86 +1676,9 @@ fn accept_session(
     resume()
 }
 
-fn query_memory(
-    context: &mut ExceptionDispatchContext<'_>,
-    immediate: u32,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let output = GuestVirtualAddress::new(read_register(context.thread().state(), 0));
-    let address = GuestVirtualAddress::new(read_register(context.thread().state(), 2));
-    let limit = context.process().address_space_limit();
-    let query = if address.get() >= limit {
-        // Horizon reports one synthetic inaccessible region from the process address-space
-        // limit through the end of the 64-bit range. Nintendo's rtld walks mappings with
-        // `base + size` and relies on this terminal region wrapping the cursor back to zero;
-        // returning InvalidAddress here makes rtld enter its fatal self-loop instead.
-        MemoryQueryResult {
-            base: GuestVirtualAddress::new(limit),
-            size: 0_u64.wrapping_sub(limit),
-            region: None,
-            permissions: MemoryPermissions::NONE,
-            attributes: MemoryAttributes::NONE,
-            purpose: MemoryMappingPurpose::Normal,
-        }
-    } else {
-        let Some(query) = context.process().memory().query_memory(
-            context.process().cpu().address_space_id(),
-            address,
-            GuestVirtualAddress::new(limit),
-        ) else {
-            result(context, HorizonKernelResult::INVALID_ADDRESS);
-            return resume();
-        };
-        query
-    };
-    let memory_type = match query.region {
-        None => 0_u32,
-        Some(MemoryRegionKind::Device) => 1,
-        Some(MemoryRegionKind::Ram) => match query.purpose {
-            MemoryMappingPurpose::Normal => 2,
-            MemoryMappingPurpose::CodeStatic => 3,
-            MemoryMappingPurpose::CodeMutable => 4,
-            MemoryMappingPurpose::ModuleCodeStatic => 8,
-            MemoryMappingPurpose::ModuleCodeMutable => 9,
-            MemoryMappingPurpose::ThreadLocal => 0x0c,
-            MemoryMappingPurpose::Stack => 0x0b,
-            MemoryMappingPurpose::Heap => 5,
-            MemoryMappingPurpose::SharedMemory => 6,
-        },
-    };
-    let fields = [
-        (0_u64, MemoryValue::U64(query.base.get())),
-        (8, MemoryValue::U64(query.size)),
-        (0x10, MemoryValue::U32(memory_type)),
-        (0x14, MemoryValue::U32(query.attributes.bits())),
-        (0x18, MemoryValue::U32(u32::from(query.permissions.bits()))),
-        (0x1c, MemoryValue::U32(0)),
-        (0x20, MemoryValue::U32(0)),
-        (0x24, MemoryValue::U32(0)),
-    ];
-    for (offset, value) in fields {
-        let Some(address) = output.checked_add(offset) else {
-            result(context, HorizonKernelResult::INVALID_ADDRESS);
-            return resume();
-        };
-        let access = MemoryAccess::normal(value.size());
-        if let Err(fault) = context.process().memory().write(
-            context.process().cpu().address_space_id(),
-            address,
-            access,
-            value,
-        ) {
-            return reject(context, HorizonSvcFault::GuestMemory { immediate, fault });
-        }
-    }
-    result(context, HorizonKernelResult::SUCCESS);
-    write_register(context.thread_mut().state_mut(), 1, 0);
-    resume()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nixe_memory::AddressSpaceId;
     use nixe_runtime::EventObject;
 
     #[test]
@@ -1934,35 +1702,35 @@ mod tests {
             completed_svc_guest_error(*decode_horizon_svc(0x01).unwrap(), &state, &completed),
             Some(HorizonKernelResult::RESOURCE_LIMIT)
         );
-        assert_eq!(
-            completed_svc_guest_error(*decode_horizon_svc(0x10).unwrap(), &state, &completed),
-            None
+        assert!(
+            (completed_svc_guest_error(*decode_horizon_svc(0x10).unwrap(), &state, &completed))
+                .is_none()
         );
-        assert_eq!(
-            completed_svc_guest_error(*decode_horizon_svc(0x01).unwrap(), &state, &retrying),
-            None
+        assert!(
+            (completed_svc_guest_error(*decode_horizon_svc(0x01).unwrap(), &state, &retrying))
+                .is_none()
         );
 
         write_register(&mut state, 0, u64::from(HorizonKernelResult::SUCCESS.raw()));
-        assert_eq!(
-            completed_svc_guest_error(*decode_horizon_svc(0x01).unwrap(), &state, &completed),
-            None
+        assert!(
+            (completed_svc_guest_error(*decode_horizon_svc(0x01).unwrap(), &state, &completed))
+                .is_none()
         );
     }
 
     #[test]
     fn failed_handle_materialization_rolls_back_partial_allocations() {
         let retained = HandleObject::new(EventObject::new());
-        let mut handles = HandleTable::with_capacity_limit(2);
+        let handles = std::sync::Arc::new(HandleTable::with_capacity_limit(2));
         let existing = handles.insert(ThreadObject::new(1)).unwrap();
         let mut bytes = vec![0_u8; 20];
         bytes[0..4].copy_from_slice(&4_u32.to_le_bytes());
         bytes[4..8].copy_from_slice(&(1_u32 << 31).to_le_bytes());
         bytes[8..12].copy_from_slice(&(2_u32 << 1).to_le_bytes());
 
-        assert_eq!(
+        assert!(matches!(
             materialize_message_handles_in_table(
-                &mut handles,
+                &handles,
                 SessionMessage::TransportedBuffer {
                     bytes,
                     copy_handles: vec![Some(retained.clone()), Some(retained)],
@@ -1970,9 +1738,9 @@ mod tests {
                 },
             ),
             Err(HorizonKernelResult::OUT_OF_HANDLES)
-        );
+        ));
         assert_eq!(handles.len(), 1);
-        assert!(handles.get(existing).unwrap().is::<ThreadObject>());
+        assert!(handles.lookup_as::<ThreadObject>(existing).is_some());
     }
 
     #[test]
@@ -1982,7 +1750,7 @@ mod tests {
             documented_name: "WaitForAddress",
         };
 
-        assert_eq!(fault.guest_result(), None);
+        assert!((fault.guest_result()).is_none());
     }
 
     #[test]
@@ -1994,7 +1762,7 @@ mod tests {
             ))),
         };
 
-        assert_eq!(fault.guest_result(), None);
+        assert!((fault.guest_result()).is_none());
     }
 
     #[test]
@@ -2004,7 +1772,7 @@ mod tests {
             fault: Box::new(HorizonIpcFault::malformed("synthetic malformed request")),
         };
 
-        assert_eq!(fault.guest_result(), None);
+        assert!((fault.guest_result()).is_none());
     }
 
     #[test]
@@ -2017,7 +1785,7 @@ mod tests {
             ))),
         };
 
-        assert_eq!(fault.guest_result(), None);
+        assert!((fault.guest_result()).is_none());
         let rendered = fault.to_string();
         assert!(rendered.contains("unimplemented Error library applet"));
         assert!(rendered.contains("mode=AllForeground"));
@@ -2034,7 +1802,7 @@ mod tests {
             )),
         };
 
-        assert_eq!(fault.guest_result(), None);
+        assert!((fault.guest_result()).is_none());
     }
 
     #[test]
@@ -2054,7 +1822,7 @@ mod tests {
             ))),
         };
 
-        assert_eq!(fault.guest_result(), None);
+        assert!((fault.guest_result()).is_none());
         assert_eq!(
             fault.to_string(),
             "Horizon SVC 0x21 reached unsupported emulator semantics: graphics-gap=ioctl nvdrv \
@@ -2065,65 +1833,38 @@ mod tests {
 
     #[test]
     fn emulator_generation_exhaustion_is_never_fabricated_as_a_guest_result() {
-        let address_space = AddressSpaceId::new(1);
-        let address = GuestVirtualAddress::new(0x1000);
         let faults = [
-            HorizonSvcFault::GuestMemory {
+            HorizonSvcFault::MemoryAccess {
                 immediate: 0x21,
-                fault: DataAccessFault::new(
-                    address_space,
-                    address,
-                    nixe_cpu::memory::DataAccessKind::Write,
-                    DataAccessFaultReason::ContentGenerationExhausted,
-                ),
-            },
-            HorizonSvcFault::MemoryProtection {
-                fault: MemoryProtectionError {
-                    address_space,
-                    address,
-                    reason: MemoryProtectionErrorReason::GenerationExhausted,
-                },
+                fault: std::sync::Arc::new(nixe_memory::MemoryError::Invalid(
+                    "mapping identity exhausted",
+                )),
             },
             HorizonSvcFault::MemoryMapping {
-                fault: MemoryMappingError {
-                    address_space,
-                    address,
-                    reason: MemoryMappingErrorReason::GenerationExhausted,
-                },
+                fault: std::sync::Arc::new(nixe_runtime::memory::MappingError::Memory(
+                    std::sync::Arc::new(nixe_memory::MemoryError::Invalid(
+                        "mapping identity exhausted",
+                    )),
+                )),
             },
         ];
 
         for fault in faults {
-            assert_eq!(fault.guest_result(), None);
+            assert!((fault.guest_result()).is_none());
         }
     }
 
     #[test]
     fn canonical_backing_failures_are_never_fabricated_as_guest_results() {
-        let address_space = AddressSpaceId::new(1);
-        let address = GuestVirtualAddress::new(0x1000);
-        let faults = [
-            HorizonSvcFault::GuestMemory {
-                immediate: 0x21,
-                fault: DataAccessFault::new(
-                    address_space,
-                    address,
-                    nixe_cpu::memory::DataAccessKind::Write,
-                    DataAccessFaultReason::HostBacking("allocation failed".into()),
-                ),
-            },
-            HorizonSvcFault::CanonicalMemory {
-                immediate: 0x15,
-                fault: CanonicalRangeTranslationError {
-                    address_space,
-                    address,
-                    reason: nixe_memory::CanonicalRangeTranslationErrorReason::ResourceExhausted,
-                },
-            },
-        ];
+        let faults = [HorizonSvcFault::MemoryAccess {
+            immediate: 0x15,
+            fault: std::sync::Arc::new(nixe_memory::MemoryError::Execution(
+                "device access failed".into(),
+            )),
+        }];
 
         for fault in faults {
-            assert_eq!(fault.guest_result(), None);
+            assert!((fault.guest_result()).is_none());
         }
     }
 }

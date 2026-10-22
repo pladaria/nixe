@@ -1,19 +1,18 @@
 use core::cell::{Cell, RefCell};
+use nixe_cpu::memory::InstructionMemoryAccess;
 use std::collections::BTreeSet;
 
+use crate::test_memory::Memory;
 use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState};
 use nixe_cpu::{
     decode::table::DecodeSupport,
     location::LocationDescriptor,
-    memory::{
-        CpuMemory, MemoryAccess, MemoryAccessSize, MemoryPermissions, MemoryValue, ProcessMemory,
-        SyntheticMemory,
-    },
+    memory::{MemoryAccess, MemoryAccessSize, MemoryValue},
     platform::TargetPlatform,
     profile::ProcessCpuContext,
     state::a64::{A64GeneralRegister, A64Register, A64State, Nzcv},
 };
-use nixe_memory::{AddressSpaceId, GuestPhysicalPageId, GuestVirtualAddress};
+use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
 use super::{
     InstructionStep, InterpreterContext, InterpreterError, execute_one, execute_one_with_context,
@@ -65,9 +64,15 @@ impl TestServices {
     fn context<'a>(
         &'a self,
         process: ProcessCpuContext,
-        memory: &'a dyn CpuMemory,
-    ) -> InterpreterContext<'a, 'a> {
-        InterpreterContext::new(process, memory, &self.monitor, &self.timer, &self.events)
+        memory: &'a Memory,
+    ) -> InterpreterContext<'a, Memory> {
+        InterpreterContext::new(
+            ProcessCpuContext::new(process.platform(), memory.space.identity()),
+            memory,
+            &self.monitor,
+            &self.timer,
+            &self.events,
+        )
     }
 }
 
@@ -314,7 +319,7 @@ fn a64_system_register_reference_semantics_preserve_thread_state() {
 #[test]
 fn a64_architectural_timer_registers_use_the_runtime_snapshot() {
     let profile = TargetPlatform::Switch1;
-    let memory = SyntheticMemory::new();
+    let memory = Memory::new();
     let services = TestServices::default();
     let timer = SnapshotTimer(TimerSnapshot {
         counter: 0x1234_5678_9abc_def0,
@@ -357,7 +362,7 @@ fn a64_architectural_timer_provider_is_only_sampled_by_timer_reads() {
     let timer = CountingTimer {
         samples: Cell::new(0),
     };
-    let memory = SyntheticMemory::new();
+    let memory = Memory::new();
     let services = TestServices::default();
     let context = InterpreterContext::new(
         ProcessCpuContext::new(profile, AddressSpaceId::new(0)),
@@ -376,7 +381,7 @@ fn a64_architectural_timer_provider_is_only_sampled_by_timer_reads() {
 
 #[test]
 fn a64_prefetch_does_not_access_unmapped_memory_or_modify_registers() {
-    let memory = SyntheticMemory::new();
+    let memory = Memory::new();
     let services = TestServices::default();
     let context = services.context(
         ProcessCpuContext::new(TargetPlatform::Switch1, AddressSpaceId::new(0)),
@@ -410,15 +415,7 @@ fn a64_prefetch_does_not_access_unmapped_memory_or_modify_registers() {
 fn a64_cache_maintenance_uses_the_canonical_memory_contract() {
     let profile = TargetPlatform::Switch1;
     let space = AddressSpaceId::new(0);
-    let mut memory = SyntheticMemory::new();
-    let page = GuestPhysicalPageId::new(1);
-    assert!(memory.add_ram_page(page));
-    assert!(memory.map_page(
-        space,
-        GuestVirtualAddress::new(0x1234_5000),
-        page,
-        MemoryPermissions::READ_WRITE,
-    ));
+    let memory = Memory::mapped(0x1234_5000, &[]);
     let mut state = A64State::default();
     let a64 = &mut state;
     a64.write_x(x(8), 0x1234_5000);
@@ -3012,16 +3009,9 @@ fn a64_scalar_fcsel_selects_exact_single_and_double_bits() {
 #[test]
 fn a64_simd_quadword_single_and_pair_memory_transfers_round_trip() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(49);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(96);
+
     let profile = TargetPlatform::Switch1;
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE,
-    ));
+    let memory = Memory::mapped(0x1000, &[]);
     let services = TestServices::default();
     let context = services.context(ProcessCpuContext::new(profile, SPACE), &memory);
     let mut state = A64State::default();
@@ -3047,16 +3037,8 @@ fn a64_simd_quadword_single_and_pair_memory_transfers_round_trip() {
 #[test]
 fn a64_interleaved_load_fault_retains_completed_lanes_and_clears_upper_bits() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(55);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(102);
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.initialize_ram(PAGE, 0, &[0x12; 4096]));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE
-    ));
+
+    let memory = Memory::mapped(0x1000, &[0x12; 4096]);
     let services = TestServices::default();
     let context = services.context(
         ProcessCpuContext::new(TargetPlatform::Switch1, SPACE),
@@ -3108,16 +3090,9 @@ fn a64_interleaved_load_fault_retains_completed_lanes_and_clears_upper_bits() {
 #[test]
 fn a64_simd_ld1_st1_single_structure_transfers_selected_lanes() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(55);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(102);
+
     let profile = TargetPlatform::Switch1;
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE,
-    ));
+    let memory = Memory::mapped(0x1000, &[]);
     let services = TestServices::default();
     let context = services.context(ProcessCpuContext::new(profile, SPACE), &memory);
     let mut state = A64State::default();
@@ -3195,16 +3170,9 @@ fn a64_simd_ld1_st1_single_structure_transfers_selected_lanes() {
 #[test]
 fn a64_simd_single_structure_post_index_uses_immediate_or_register_offset() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(56);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(103);
+
     let profile = TargetPlatform::Switch1;
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE,
-    ));
+    let memory = Memory::mapped(0x1000, &[]);
     memory
         .write(
             SPACE,
@@ -3246,16 +3214,9 @@ fn a64_simd_single_structure_post_index_uses_immediate_or_register_offset() {
 #[test]
 fn a64_simd_ld1_st1_multiple_structures_transfer_consecutive_registers() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(52);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(99);
+
     let profile = TargetPlatform::Switch1;
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE,
-    ));
+    let memory = Memory::mapped(0x1000, &[]);
     let services = TestServices::default();
     let context = services.context(ProcessCpuContext::new(profile, SPACE), &memory);
     let mut state = A64State::default();
@@ -3389,7 +3350,10 @@ fn a64_simd_ld1_st1_multiple_structures_transfer_consecutive_registers() {
 
     let interleaved: Vec<u8> = (0..32).collect();
     memory
-        .write_bytes(SPACE, GuestVirtualAddress::new(0x1180), &interleaved)
+        .space
+        .write(GuestVirtualAddress::new(0x1180), &interleaved)
+        .unwrap()
+        .into_ready()
         .unwrap();
     let a64 = &mut state;
     a64.write_x(x(1), 0x1180);
@@ -3412,7 +3376,7 @@ fn a64_simd_ld1_st1_multiple_structures_transfer_consecutive_registers() {
 #[test]
 fn a64_simd_contiguous_structures_commit_each_element_before_abort() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(53);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(100);
+
     // Independent expected byte layout, not the shared structure-index helper.
     for (opcode, registers) in [(7, 1), (10, 2), (6, 3), (2, 4)] {
         for full in [false, true] {
@@ -3422,15 +3386,7 @@ fn a64_simd_contiguous_structures_commit_each_element_before_abort() {
                 let elements = registers * vector_bytes / element_bytes;
                 for load in [false, true] {
                     for completed in 0..elements {
-                        let mut memory = SyntheticMemory::new();
-                        assert!(memory.add_ram_page(PAGE));
-                        assert!(memory.initialize_ram(PAGE, 0, &[0x92; 4096]));
-                        assert!(memory.map_page(
-                            SPACE,
-                            GuestVirtualAddress::new(0x1000),
-                            PAGE,
-                            MemoryPermissions::READ_WRITE
-                        ));
+                        let memory = Memory::mapped(0x1000, &[0x92; 4096]);
                         let services = TestServices::default();
                         let context = services.context(
                             ProcessCpuContext::new(TargetPlatform::Switch1, SPACE),
@@ -3478,7 +3434,10 @@ fn a64_simd_contiguous_structures_commit_each_element_before_abort() {
                         assert_eq!(state, expected, "word={word:08x} completed={completed}");
                         let mut observed = vec![0; prefix];
                         memory
-                            .read_bytes(SPACE, GuestVirtualAddress::new(base), &mut observed)
+                            .space
+                            .read_into(GuestVirtualAddress::new(base), &mut observed)
+                            .unwrap()
+                            .into_ready()
                             .unwrap();
                         assert_eq!(observed, expected_bytes);
                     }
@@ -3491,16 +3450,9 @@ fn a64_simd_contiguous_structures_commit_each_element_before_abort() {
 #[test]
 fn a64_simd_ld1_post_index_suppresses_writeback_on_data_abort() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(53);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(100);
+
     let profile = TargetPlatform::Switch1;
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE,
-    ));
+    let memory = Memory::mapped(0x1000, &[]);
     let services = TestServices::default();
     let context = services.context(ProcessCpuContext::new(profile, SPACE), &memory);
     let mut state = A64State::default();
@@ -3521,16 +3473,9 @@ fn a64_simd_ld1_post_index_suppresses_writeback_on_data_abort() {
 #[test]
 fn a64_simd_pre_and_post_index_transfers_cover_sizes_writeback_and_faults() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(51);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(98);
+
     let profile = TargetPlatform::Switch1;
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE,
-    ));
+    let memory = Memory::mapped(0x1000, &[]);
     let services = TestServices::default();
     let context = services.context(ProcessCpuContext::new(profile, SPACE), &memory);
     let mut state = A64State::default();
@@ -3643,16 +3588,9 @@ fn a64_simd_pre_and_post_index_transfers_cover_sizes_writeback_and_faults() {
 #[test]
 fn a64_simd_register_offset_transfers_cover_extensions_scaling_and_sizes() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(50);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(97);
+
     let profile = TargetPlatform::Switch1;
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE,
-    ));
+    let memory = Memory::mapped(0x1000, &[]);
     let services = TestServices::default();
     let context = services.context(ProcessCpuContext::new(profile, SPACE), &memory);
     let mut state = A64State::default();
@@ -3725,17 +3663,10 @@ fn a64_simd_register_offset_transfers_cover_extensions_scaling_and_sizes() {
 #[test]
 fn a64_memory_reference_semantics_use_process_address_space_and_report_faults() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(44);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(91);
+
     let profile = TargetPlatform::Switch1;
     let process = ProcessCpuContext::new(profile, SPACE);
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE,
-    ));
+    let memory = Memory::mapped(0x1000, &[]);
     let services = TestServices::default();
     let context = services.context(process, &memory);
     let mut state = A64State::default();
@@ -3772,18 +3703,27 @@ fn a64_memory_reference_semantics_use_process_address_space_and_report_faults() 
 #[test]
 fn a64_non_temporal_pairs_apply_offsets_for_scalar_and_vector_transfers() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(45);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(92);
+
     let process = ProcessCpuContext::new(TargetPlatform::Switch1, SPACE);
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE
-    ));
-    assert!(memory.initialize_ram(PAGE, 8, &0x1122_3344_u32.to_le_bytes()));
-    assert!(memory.initialize_ram(PAGE, 12, &0xaabb_ccdd_u32.to_le_bytes()));
+    let memory = Memory::mapped(0x1000, &[]);
+    memory
+        .space
+        .write(
+            GuestVirtualAddress::new(0x1000 + 8),
+            &0x1122_3344_u32.to_le_bytes(),
+        )
+        .unwrap()
+        .into_ready()
+        .unwrap();
+    memory
+        .space
+        .write(
+            GuestVirtualAddress::new(0x1000 + 12),
+            &0xaabb_ccdd_u32.to_le_bytes(),
+        )
+        .unwrap()
+        .into_ready()
+        .unwrap();
     let services = TestServices::default();
     for vector in [false, true] {
         let mut state = A64State::default();
@@ -3831,19 +3771,28 @@ fn a64_non_temporal_pairs_apply_offsets_for_scalar_and_vector_transfers() {
 #[test]
 fn a64_pair_offset_mode_applies_its_scaled_immediate_without_writeback() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(45);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(92);
+
     let profile = TargetPlatform::Switch1;
     let process = ProcessCpuContext::new(profile, SPACE);
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE,
-    ));
-    assert!(memory.initialize_ram(PAGE, 8, &0x1122_3344_u32.to_le_bytes()));
-    assert!(memory.initialize_ram(PAGE, 12, &0xffff_fffe_u32.to_le_bytes()));
+    let memory = Memory::mapped(0x1000, &[]);
+    memory
+        .space
+        .write(
+            GuestVirtualAddress::new(0x1000 + 8),
+            &0x1122_3344_u32.to_le_bytes(),
+        )
+        .unwrap()
+        .into_ready()
+        .unwrap();
+    memory
+        .space
+        .write(
+            GuestVirtualAddress::new(0x1000 + 12),
+            &0xffff_fffe_u32.to_le_bytes(),
+        )
+        .unwrap()
+        .into_ready()
+        .unwrap();
     let services = TestServices::default();
     let context = services.context(process, &memory);
     let mut state = A64State::default();
@@ -3862,18 +3811,16 @@ fn a64_pair_offset_mode_applies_its_scaled_immediate_without_writeback() {
 #[test]
 fn a64_exclusive_monitor_uses_physical_identity_and_write_version() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(46);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(93);
+
     let profile = TargetPlatform::Switch1;
     let process = ProcessCpuContext::new(profile, SPACE);
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE,
-    ));
-    assert!(memory.initialize_ram(PAGE, 0, &7_u32.to_le_bytes()));
+    let memory = Memory::mapped(0x1000, &[]);
+    memory
+        .space
+        .write(GuestVirtualAddress::new(0x1000), &7_u32.to_le_bytes())
+        .unwrap()
+        .into_ready()
+        .unwrap();
     let monitor = std::cell::RefCell::new(nixe_cpu::exclusive::ExclusiveMonitorState::default());
     let services = TestServices::default();
     let context = InterpreterContext::new(
@@ -3936,16 +3883,9 @@ fn a64_exclusive_monitor_uses_physical_identity_and_write_version() {
 #[test]
 fn every_a64_ordinary_scalar_memory_family_has_a_reference_handler() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(45);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(92);
+
     let profile = TargetPlatform::Switch1;
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE,
-    ));
+    let memory = Memory::mapped(0x1000, &[]);
     let services = TestServices::default();
     let context = services.context(ProcessCpuContext::new(profile, SPACE), &memory);
     let encodings: [u32; 9] = [
@@ -3982,16 +3922,9 @@ fn every_a64_ordinary_scalar_memory_family_has_a_reference_handler() {
 #[test]
 fn a64_unscaled_load_applies_a_negative_signed_offset_without_writeback() {
     const SPACE: AddressSpaceId = AddressSpaceId::new(49);
-    const PAGE: GuestPhysicalPageId = GuestPhysicalPageId::new(96);
+
     let profile = TargetPlatform::Switch1;
-    let mut memory = SyntheticMemory::new();
-    assert!(memory.add_ram_page(PAGE));
-    assert!(memory.map_page(
-        SPACE,
-        GuestVirtualAddress::new(0x1000),
-        PAGE,
-        MemoryPermissions::READ_WRITE,
-    ));
+    let memory = Memory::mapped(0x1000, &[]);
     memory
         .write(
             SPACE,

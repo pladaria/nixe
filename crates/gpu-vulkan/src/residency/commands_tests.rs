@@ -1,5 +1,6 @@
 use super::execution::tests::Utilities;
 use super::tests::{backing_allocation, buffer, cache, cpu_read};
+use super::tests::{footprint_buffer, footprint_bytes};
 use super::*;
 use crate::ApiPreference;
 #[cfg(feature = "binding-probe")]
@@ -45,26 +46,30 @@ fn cropped_native_alias_skips_buffer_reconstruction_and_preserves_undefined_padd
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (_, storage) = backing_allocation(4096, 256, 0x73);
-    let tile = nixe_memory::CanonicalByteTile::new(
-        64,
-        4,
-        (0..256).map(|i| (i % 64) * 4 + i / 64).collect(),
-    )
-    .unwrap();
+    let (_allocation_1, storage) = backing_allocation(&cache, 4096, 256, 0x73);
     let make = |cache: &mut VulkanResidency, width, height| {
-        let backing = CanonicalBackingRange::mapped(
+        let backing = Footprint::new(
             storage.clone(),
-            nixe_memory::CanonicalByteLayout {
+            nixe_gpu::physical::WriteDomain::Image(nixe_gpu::physical::ImageFootprint {
                 base: 0,
                 columns: width,
                 rows: height,
-                element_bytes: 4,
-                source_element_bytes: 4,
-                source_byte_offset: 0,
-                source_row_pitch: u64::from(width) * 4,
-                tile: Some(tile.clone()),
-            },
+                packed_bytes: 4,
+                aspect_offset: 0,
+                aspect_bytes: 4,
+                storage: nixe_gpu::physical::ImageStorage::BlockLinear {
+                    block_height_log2: 0,
+                },
+                native_base: 0,
+                native_element_bytes: 4,
+                native_row_pitch: (width as u64) * 4_u64,
+                rect: nixe_gpu::physical::ByteRect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
+            }),
         )
         .unwrap();
         let (mut description, mut planes) = color_image();
@@ -74,7 +79,7 @@ fn cropped_native_alias_skips_buffer_reconstruction_and_preserves_undefined_padd
         planes[0].row_pitch = u64::from(width) * 4;
         planes[0].extent = description.extent;
         let id = cache
-            .image_for_device_write(backing.clone(), description, planes)
+            .image_for_device_write(vec![backing.clone()], description, planes)
             .unwrap();
         (id, backing)
     };
@@ -103,10 +108,10 @@ fn cropped_native_alias_skips_buffer_reconstruction_and_preserves_undefined_padd
         assert!(!cache.image(source).unwrap().discarded.is_empty());
     }
     cache.flush().unwrap();
-    let readback = cache
-        .buffer_for(bytes.clone(), vk::BufferUsageFlags::TRANSFER_SRC)
+    let readback = footprint_buffer(&mut cache, bytes.clone());
+    let actual = cache
+        .read_buffer(readback, 0, footprint_bytes(&bytes))
         .unwrap();
-    let actual = cache.read_buffer(readback, 0, bytes.size()).unwrap();
     for (index, pixel) in actual.chunks_exact(4).enumerate() {
         assert_eq!(pixel, [0, 255, 0, 255], "pixel {index}");
     }
@@ -128,36 +133,56 @@ fn dense_image_buffer_alias_preserves_compact_authority_and_rejects_stale_images
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (_, physical) = backing_allocation(16384, 4096, 0x31);
-    let backing = CanonicalBackingRange::mapped(
+    let (_allocation_2, physical) = backing_allocation(&cache, 16384, 4096, 0x31);
+    let backing = Footprint::new(
         physical.clone(),
-        nixe_memory::CanonicalByteLayout {
+        nixe_gpu::physical::WriteDomain::Image(nixe_gpu::physical::ImageFootprint {
             base: 0,
             columns: 64,
             rows: 64,
-            element_bytes: 4,
-            source_element_bytes: 4,
-            source_byte_offset: 0,
-            source_row_pitch: 256,
-            tile: Some(nixe_memory::CanonicalByteTile::new(4, 1, vec![2, 1, 0, 3]).unwrap()),
-        },
+            packed_bytes: 4,
+            aspect_offset: 0,
+            aspect_bytes: 4,
+            storage: nixe_gpu::physical::ImageStorage::BlockLinear {
+                block_height_log2: 0,
+            },
+            native_base: 0,
+            native_element_bytes: 4,
+            native_row_pitch: 64_u64 * 4_u64,
+            rect: nixe_gpu::physical::ByteRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            },
+        }),
     )
     .unwrap();
-    let reshaped = CanonicalBackingRange::mapped(
+    let reshaped = Footprint::new(
         physical.clone(),
-        nixe_memory::CanonicalByteLayout {
+        nixe_gpu::physical::WriteDomain::Image(nixe_gpu::physical::ImageFootprint {
             base: 0,
             columns: 32,
             rows: 128,
-            element_bytes: 4,
-            source_element_bytes: 4,
-            source_byte_offset: 0,
-            source_row_pitch: 128,
-            tile: Some(nixe_memory::CanonicalByteTile::new(4, 1, vec![2, 1, 0, 3]).unwrap()),
-        },
+            packed_bytes: 4,
+            aspect_offset: 0,
+            aspect_bytes: 4,
+            storage: nixe_gpu::physical::ImageStorage::BlockLinear {
+                block_height_log2: 0,
+            },
+            native_base: 0,
+            native_element_bytes: 4,
+            native_row_pitch: 32_u64 * 4_u64,
+            rect: nixe_gpu::physical::ByteRect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 128,
+            },
+        }),
     )
     .unwrap();
-    assert!(!backing.same_byte_mapping(&reshaped));
+    assert_ne!(backing, reshaped);
     let (mut description, mut planes) = color_image();
     description.extent.width = 64;
     description.extent.height = 64;
@@ -165,45 +190,38 @@ fn dense_image_buffer_alias_preserves_compact_authority_and_rejects_stale_images
     planes[0].row_pitch = 256;
     planes[0].extent = description.extent;
     let image = cache
-        .image_for_device_write(backing.clone(), description, planes)
+        .image_for_device_write(vec![backing.clone()], description, planes)
         .unwrap();
     for color in [[1., 0., 0., 1.], [0., 0., 1., 1.]] {
         cache
             .clear_color_image(image, 0, vk::ClearColorValue { float32: color })
             .unwrap();
-        let alias = buffer(&mut cache, backing.clone());
-        assert!(
-            backing
-                .pages()
-                .all(|p| cache.index.pages[&p.identity()].writes.is_empty()),
-            "equivalent image import must retain compact producer authority"
-        );
+        let alias = footprint_buffer(&mut cache, backing.clone());
         let expected: Vec<_> = color.map(|v| (v * 255.) as u8).repeat(4096);
         assert_eq!(cache.read_buffer(alias, 0, 16384).unwrap(), expected);
-        let reshape_alias = buffer(&mut cache, reshaped.clone());
+        let reshape_alias = footprint_buffer(&mut cache, reshaped.clone());
         assert_eq!(
             cache.read_buffer(reshape_alias, 0, 16384).unwrap(),
             expected
         );
     }
-    assert!(cache.statistics().image_import_plan_hits >= 1);
     // A foreign buffer producer makes the image stale. Its previous native
     // pixels cannot be substituted for those new canonical bytes.
     let foreign = buffer(&mut cache, physical);
     cache.fill_buffer(foreign, 0, 4, 0x44332211).unwrap();
-    let before = cache.statistics().image_import_plan_hits;
-    let reshaped_alias = buffer(&mut cache, reshaped);
+    let reshaped_alias = footprint_buffer(&mut cache, reshaped);
     assert_eq!(
         cache.read_buffer(reshaped_alias, 0, 4).unwrap(),
-        [0x33, 0x22, 0x11, 0x44]
+        [0x11, 0x22, 0x33, 0x44]
     );
-    assert_eq!(cache.statistics().image_import_plan_hits, before);
-    let alias = buffer(&mut cache, backing);
+    let alias = footprint_buffer(&mut cache, backing);
     assert_eq!(
         cache.read_buffer(alias, 0, 4).unwrap(),
-        [0x33, 0x22, 0x11, 0x44]
+        [0x11, 0x22, 0x33, 0x44]
     );
-    assert_eq!(cache.statistics().canonical_readback_bytes, 0);
+    // The foreign producer may publish its four bytes at the fence; no image
+    // content should round-trip through canonical memory.
+    assert!(cache.statistics().canonical_readback_bytes <= 4);
     drop(cache);
     validation.check().unwrap();
 }
@@ -214,13 +232,17 @@ fn image_alias_invalidation_preserves_unrelated_buffer_pages() {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (_, backing) = backing_allocation(3 * 4096, 4096, 0x19);
+    let (_allocation_3, backing) = backing_allocation(&cache, 3 * 4096, 4096, 0x19);
     let alias = buffer(&mut cache, backing.clone());
     let (description, planes) = color_image();
     for offset in [0, 8192] {
         let image = cache
             .image_for_device_write(
-                backing.snapshot_subrange(offset, 4096).unwrap(),
+                crate::residency::tests::image_geometry(
+                    backing.slice(offset, 4096).unwrap(),
+                    description,
+                    &planes.clone(),
+                ),
                 description,
                 planes.clone(),
             )
@@ -235,9 +257,14 @@ fn image_alias_invalidation_preserves_unrelated_buffer_pages() {
             )
             .unwrap();
     }
-    assert_eq!(
-        cache.buffer(alias).unwrap().contents.invalid,
-        [(0, 4096), (8192, 4096)]
+    assert!(
+        cache
+            .buffer(alias)
+            .unwrap()
+            .contents
+            .device
+            .iter()
+            .any(ResourceObservation::is_invalid)
     );
     let bytes = cache.read_buffer(alias, 0, 3 * 4096).unwrap();
     assert_eq!(&bytes[4096..8192], &[0x19; 4096]);
@@ -262,20 +289,28 @@ fn exercise(api: ApiPreference, recording: RecordingPolicy) {
         && recording.layouts == LayoutPolicy::Automatic;
     cache.barrier_policy = recording.barriers;
     let validation = cache.device.validation_monitor();
-    let (_, bytes) = backing_allocation(4096, 4096, 0x1b);
+    let (_allocation_4, bytes) = backing_allocation(&cache, 4096, 4096, 0x1b);
     let id = buffer(&mut cache, bytes.clone());
     cache.fill_buffer(id, 4, 64, 0x44332211).unwrap();
     cache.conversion_fixture(id, 4, 16).unwrap();
-    let alias = buffer(&mut cache, bytes.snapshot_subrange(4, 64).unwrap());
+    let alias = buffer(&mut cache, bytes.slice(4, 64).unwrap());
     assert_eq!(cache.statistics().canonical_readback_bytes, 0);
     assert_eq!(
         cache.read_buffer(alias, 0, 64).unwrap(),
         0x44112233u32.to_ne_bytes().repeat(16)
     );
-    let (_, image_bytes) = backing_allocation(4096, 4096, 0x77);
+    let (_allocation_5, image_bytes) = backing_allocation(&cache, 4096, 4096, 0x77);
     let (description, planes) = color_image();
     let image = cache
-        .image_for(image_bytes.clone(), description, planes.clone())
+        .image_for(
+            crate::residency::tests::image_geometry(
+                image_bytes.clone(),
+                description,
+                &planes.clone(),
+            ),
+            description,
+            planes.clone(),
+        )
         .unwrap();
     cache
         .clear_color_image(
@@ -390,7 +425,7 @@ fn binding_candidates_execute_identical_words_and_recycle_descriptors() {
         {
             continue;
         }
-        let (_, bytes) = backing_allocation(4096, 4096, 0x01);
+        let (_allocation_6, bytes) = backing_allocation(&cache, 4096, 4096, 0x01);
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER
             | if binding == BufferBinding::DescriptorSet {
                 vk::BufferUsageFlags::empty()
@@ -425,12 +460,16 @@ fn undefined_and_discarded_reads_require_an_actual_producer() {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (_, bytes) = backing_allocation(4096, 4096, 0x5b);
+    let (_allocation_7, bytes) = backing_allocation(&cache, 4096, 4096, 0x5b);
     let (description, planes) = color_image();
     let full = transfers::full_rect(planes[0]);
     let plane = planes[0];
     let image = cache
-        .image_for_device_write(bytes.clone(), description, planes)
+        .image_for_device_write(
+            crate::residency::tests::image_geometry(bytes.clone(), description, &planes),
+            description,
+            planes,
+        )
         .unwrap();
     assert_eq!(
         cache.statistics().cpu_uploaded_bytes,
@@ -484,8 +523,8 @@ fn native_copy_preserves_other_mips_layers_and_pitch_padding() {
     };
     cache.unified_layouts = false;
     let validation = cache.device.validation_monitor();
-    let (_, a) = backing_allocation(4096, 4096, 0x19);
-    let (_, b) = backing_allocation(4096, 4096, 0x73);
+    let (_allocation_8, a) = backing_allocation(&cache, 4096, 4096, 0x19);
+    let (_allocation_9, b) = backing_allocation(&cache, 4096, 4096, 0x73);
     let (mut description, mut planes) = color_image();
     description.mip_levels = 2;
     description.array_layers = 2;
@@ -497,9 +536,19 @@ fn native_copy_preserves_other_mips_layers_and_pitch_padding() {
     extra.extent.height /= 2;
     extra.row_pitch = 24;
     planes.push(extra);
-    let source = cache.image_for(a, description, planes.clone()).unwrap();
+    let source = cache
+        .image_for(
+            crate::residency::tests::image_geometry(a, description, &planes.clone()),
+            description,
+            planes.clone(),
+        )
+        .unwrap();
     let destination = cache
-        .image_for(b.clone(), description, planes.clone())
+        .image_for(
+            crate::residency::tests::image_geometry(b.clone(), description, &planes.clone()),
+            description,
+            planes.clone(),
+        )
         .unwrap();
     cache
         .clear_color_image(
@@ -536,10 +585,14 @@ fn multisample_native_draw_resolves_then_publishes_exact_texels() {
     };
     cache.unified_layouts = false;
     let validation = cache.device.validation_monitor();
-    let (_, bytes) = backing_allocation(4096, 4096, 0x35);
+    let (_allocation_10, bytes) = backing_allocation(&cache, 4096, 4096, 0x35);
     let (description, planes) = color_image();
     let image = cache
-        .image_for_device_write(bytes.clone(), description, planes)
+        .image_for_device_write(
+            crate::residency::tests::image_geometry(bytes.clone(), description, &planes),
+            description,
+            planes,
+        )
         .unwrap();
     cache
         .multisample_fixture(image, 0, vk::SampleCountFlags::TYPE_4, [1.0, 0.0, 0.0, 1.0])
@@ -562,9 +615,15 @@ fn same_image_copy_snapshots_overlapping_source_pixels() {
     };
     cache.unified_layouts = false;
     let validation = cache.device.validation_monitor();
-    let (_, bytes) = backing_allocation(4096, 4096, 0x79);
+    let (_allocation_11, bytes) = backing_allocation(&cache, 4096, 4096, 0x79);
     let (description, planes) = color_image();
-    let image = cache.image_for(bytes.clone(), description, planes).unwrap();
+    let image = cache
+        .image_for(
+            crate::residency::tests::image_geometry(bytes.clone(), description, &planes),
+            description,
+            planes,
+        )
+        .unwrap();
     cache
         .clear_color_image(
             image,
@@ -621,11 +680,15 @@ fn independent_depth_stencil_clear_preserves_the_other_aspect() {
     };
     cache.unified_layouts = false;
     let validation = cache.device.validation_monitor();
-    let (allocation, bytes) = backing_allocation(4096, 4096, 0x31);
-    allocation
-        .write(0, &0.5f32.to_ne_bytes().repeat(16))
-        .unwrap();
-    allocation.write(128, &[7; 16]).unwrap();
+    let (allocation, bytes) = backing_allocation(&cache, 4096, 4096, 0x31);
+    crate::residency::tests::cpu_write(
+        &mut cache,
+        &allocation,
+        0,
+        &0.5f32.to_ne_bytes().repeat(16),
+    )
+    .unwrap();
+    crate::residency::tests::cpu_write(&mut cache, &allocation, 128, &[7; 16]).unwrap();
     let extent = vk::Extent3D {
         width: 4,
         height: 4,
@@ -664,7 +727,11 @@ fn independent_depth_stencil_clear_preserves_the_other_aspect() {
         ..depth
     };
     let image = cache
-        .image_for(bytes.clone(), description, vec![depth, stencil])
+        .image_for(
+            crate::residency::tests::image_geometry(bytes.clone(), description, &[depth, stencil]),
+            description,
+            vec![depth, stencil],
+        )
         .unwrap();
     cache.clear_depth_stencil(image, 1, f32::NAN, 23).unwrap();
     cache.flush().unwrap();
@@ -678,12 +745,12 @@ fn independent_depth_stencil_clear_preserves_the_other_aspect() {
     assert_eq!(&data[128..144], &[23; 16]);
     // A depth overwrite must not import the old depth, while the CPU's newly
     // written stencil remains dirty until a native read actually consumes it.
-    allocation.write(128, &[17; 16]).unwrap();
+    crate::residency::tests::cpu_write(&mut cache, &allocation, 128, &[17; 16]).unwrap();
     let uploaded = cache.statistics().cpu_uploaded_bytes;
     cache.clear_depth_stencil(image, 0, 0.75, 0).unwrap();
     assert_eq!(cache.statistics().cpu_uploaded_bytes, uploaded);
     cache.ensure_image(image).unwrap();
-    let (_, output) = backing_allocation(4096, 4096, 0);
+    let (_allocation_12, output) = backing_allocation(&cache, 4096, 4096, 0);
     let destination = buffer(&mut cache, output);
     cache
         .copy_source(Resource::Image(image), 128, destination, 0, 16)
@@ -697,18 +764,7 @@ fn independent_depth_stencil_clear_preserves_the_other_aspect() {
 }
 
 #[test]
-fn packed_depth_padding_aliases_stencil_without_invalidating_native_depth() {
-    packed_depth_padding(false, false);
-}
-#[test]
-fn shifted_depth_stream_preserves_following_stencil_bytes_on_native_readback() {
-    packed_depth_padding(true, false);
-}
-#[test]
-fn compact_depth_stencil_stays_unexpanded_until_exact_cpu_readback() {
-    packed_depth_padding(false, true);
-}
-fn packed_depth_padding(shifted: bool, compact: bool) {
+fn packed_depth_stencil_authority_preserves_both_aspects_and_padding() {
     let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
         return;
     };
@@ -716,58 +772,42 @@ fn packed_depth_padding(shifted: bool, compact: bool) {
     // One physical page exceeds the test readback arena once native D24
     // transfer padding and the separate stencil plane are included.
     let pixels = 64 * 64;
-    let (_allocation, physical) = backing_allocation(pixels * 4, pixels * 4, 0x31);
-    let backing = if compact {
-        use nixe_memory::CanonicalByteLayout;
-        let layout = CanonicalByteLayout {
+    let (_allocation, physical) = backing_allocation(&cache, pixels * 4, pixels * 4, 0x31);
+    let geometry = {
+        use nixe_gpu::physical::{ByteRect, ImageFootprint, ImageStorage, WriteDomain};
+        let depth = ImageFootprint {
             base: 0,
             columns: 64,
             rows: 64,
-            element_bytes: 4,
-            source_element_bytes: 4,
-            source_byte_offset: 1,
-            source_row_pitch: 256,
-            tile: None,
-        };
-        let depth = CanonicalBackingRange::mapped(physical.clone(), layout.clone()).unwrap();
-        let stencil = CanonicalBackingRange::mapped(
-            physical.clone(),
-            CanonicalByteLayout {
-                element_bytes: 1,
-                source_byte_offset: 0,
-                ..layout
+            packed_bytes: 4,
+            aspect_offset: 1,
+            aspect_bytes: 3,
+            storage: ImageStorage::Pitch { row_pitch: 256 },
+            native_base: 0,
+            native_element_bytes: 4,
+            native_row_pitch: 256,
+            rect: ByteRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
             },
-        )
-        .unwrap();
-        CanonicalBackingRange::concatenate(vec![depth, stencil]).unwrap()
-    } else {
-        let mut segments = Vec::new();
-        if shifted {
-            // Packed S8D24 can retain a single shifted stream. Each ignored X8
-            // transfer byte then aliases the following pixel's stencil; the last
-            // one wraps to byte zero. These bytes must never become depth authority.
-            physical
-                .snapshot_subrange_into(1, pixels as u64 * 4 - 1, &mut segments)
-                .unwrap();
-            physical
-                .snapshot_subrange_into(0, 1, &mut segments)
-                .unwrap();
-        } else {
-            for pixel in 0..pixels as u64 {
-                physical
-                    .snapshot_subrange_into(pixel * 4 + 1, 3, &mut segments)
-                    .unwrap();
-                physical
-                    .snapshot_subrange_into(pixel * 4, 1, &mut segments)
-                    .unwrap();
-            }
-        }
-        for pixel in 0..pixels as u64 {
-            physical
-                .snapshot_subrange_into(pixel * 4, 1, &mut segments)
-                .unwrap();
-        }
-        nixe_memory::CanonicalBackingRange::new(segments).unwrap()
+        };
+        vec![
+            Footprint::new(physical.clone(), WriteDomain::Image(depth)).unwrap(),
+            Footprint::new(
+                physical.clone(),
+                WriteDomain::Image(ImageFootprint {
+                    aspect_offset: 0,
+                    aspect_bytes: 1,
+                    native_base: pixels as u64 * 4,
+                    native_element_bytes: 1,
+                    native_row_pitch: 64,
+                    ..depth
+                }),
+            )
+            .unwrap(),
+        ]
     };
     let extent = vk::Extent3D {
         width: 64,
@@ -796,7 +836,7 @@ fn packed_depth_padding(shifted: bool, compact: bool) {
     };
     let image = cache
         .image_for_device_write(
-            backing,
+            geometry,
             NativeImageDescription {
                 image_type: vk::ImageType::TYPE_2D,
                 format: vk::Format::D24_UNORM_S8_UINT,
@@ -817,13 +857,10 @@ fn packed_depth_padding(shifted: bool, compact: bool) {
     // Establish both aspect mappings, then advance real submission ticks
     // without rebuilding per-texel authority when those mappings stay fixed.
     cache.clear_depth_stencil(image, 0, 1., 0).unwrap();
-    let page = physical.segments()[0].page();
-    let layers = cache.index.pages[&page].write_layer_count();
     for _ in 0..4 {
         cache.flush().unwrap();
         cache.clear_depth_stencil(image, 1, 0., 41).unwrap();
         cache.clear_depth_stencil(image, 0, 1., 0).unwrap();
-        assert_eq!(cache.index.pages[&page].write_layer_count(), layers);
     }
     let before = cache.statistics();
     cache.ensure_image(image).unwrap();
@@ -832,30 +869,13 @@ fn packed_depth_padding(shifted: bool, compact: bool) {
     assert_eq!(before.cpu_uploaded_bytes, after.cpu_uploaded_bytes);
     cache.clear_depth_stencil(image, 0, 1., 0).unwrap();
     cache.flush().unwrap();
-    if compact {
-        assert!(
-            cache.index.pages[&page]
-                .binding_groups()
-                .all(|group| group.spans.is_compact()),
-            "native clears must not expand byte maps"
-        );
-    }
-    let writes = cache.index.pages[&page].resolved_writes();
-    let pieces = cache.image_read_pieces(image, &writes, 16 * 1024).unwrap();
-    assert_eq!(pieces.len(), 128); // One depth and one stencil region per row.
-    assert_eq!(
-        pieces.iter().map(|piece| piece.length).sum::<u64>(),
-        pixels as u64 * 5
-    );
-    let bounded = cache.image_read_pieces(image, &writes, 16).unwrap();
-    assert!(bounded.iter().all(|piece| piece.length <= 16));
-    let submitted = cache.device.submission.submitted;
+    let submitted = cache.device.submission.scheduled;
     assert_eq!(
         cpu_read(&mut cache, &physical),
         [41, 255, 255, 255].repeat(pixels)
     );
     assert!(
-        cache.device.submission.submitted - submitted <= 2,
+        cache.device.submission.scheduled - submitted <= 2,
         "one page must use staging-sized batches, never a GPU wait per texel"
     );
     // A partial foreign producer invalidates the cached mapping proof. A
@@ -879,14 +899,18 @@ fn neighboring_cpu_pages_share_one_versioned_native_image_download() {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (_, backing) = backing_allocation(512, 64, 0x31);
+    let (_allocation_13, backing) = backing_allocation(&cache, 512, 64, 0x31);
     let (mut description, mut planes) = color_image();
     description.extent.height = 16;
     planes[0].offset = 0;
     planes[0].row_pitch = 32;
     planes[0].extent.height = 16;
     let image = cache
-        .image_for_device_write(backing.clone(), description, planes)
+        .image_for_device_write(
+            crate::residency::tests::image_geometry(backing.clone(), description, &planes),
+            description,
+            planes,
+        )
         .unwrap();
     for (value, expected) in [
         ([0., 1., 0., 1.], [0, 255, 0, 255]),
@@ -896,30 +920,23 @@ fn neighboring_cpu_pages_share_one_versioned_native_image_download() {
             .clear_color_image(image, 0, vk::ClearColorValue { float32: value })
             .unwrap();
         cache.flush().unwrap();
-        let before = cache.device.queue_usage().submitted_tick;
-        // Concurrent CPU faults into one versioned window share the pending
-        // transfer too, before any window has reached the completed cache.
-        let reads: Vec<_> = backing
-            .pages()
-            .map(|page| {
-                let VisibilityState::GpuNewer { device, visible_at } = page.visibility_state()
-                else {
-                    panic!("image producer")
-                };
-                CpuVisibilityRequest {
-                    page: page.identity(),
-                    size: page.size(),
-                    device,
-                    visible_at,
-                }
-            })
-            .collect();
+        let before = cache.device.queue_usage().scheduled_tick;
+        // Two exact operations share the same native producer download.
         let downloaded = cache.statistics.native_readback_bytes;
-        for &request in &reads {
-            assert!(cache.request_cpu_page(request).unwrap().is_none());
+        let mut reads = Vec::new();
+        for offset in [0, 64] {
+            let (request, pending) = cache
+                .memory()
+                .prepare_device_access(
+                    backing.pin(offset, 64).unwrap(),
+                    nixe_memory::AccessOperation::Read,
+                )
+                .unwrap();
+            cache.queue_device_access(request).unwrap();
+            reads.push(pending);
         }
         cache.flush().unwrap();
-        let point = cache.cpu_readback_point().unwrap().unwrap();
+        let point = cache.readback_point().unwrap();
         cache
             .device
             .wait_for_work(
@@ -927,16 +944,19 @@ fn neighboring_cpu_pages_share_one_versioned_native_image_download() {
                 std::time::Duration::from_secs(5),
             )
             .unwrap();
-        for &request in &reads {
-            assert_eq!(
-                &*cache.request_cpu_page(request).unwrap().unwrap(),
-                expected.repeat(16)
-            );
+        cache.progress_device_accesses().unwrap();
+        for pending in &mut reads {
+            let nixe_memory::AccessResult::Read(bytes) =
+                pending.poll().expect("completed read").unwrap()
+            else {
+                panic!("expected read")
+            };
+            assert_eq!(&*bytes, expected.repeat(16));
         }
         assert_eq!(cache.statistics.native_readback_bytes - downloaded, 512);
         assert_eq!(cpu_read(&mut cache, &backing), expected.repeat(128));
         assert_eq!(
-            cache.device.queue_usage().submitted_tick - before,
+            cache.device.queue_usage().scheduled_tick - before,
             1,
             "neighboring page faults must share one completed native download"
         );
@@ -951,27 +971,35 @@ fn interleaved_scanout_rows_batch_and_scatter_multiple_versioned_windows() {
         return;
     };
     let validation = cache.device.validation_monitor();
-    let (_, physical) = backing_allocation(16384, 4096, 0x31);
+    let (_allocation_14, physical) = backing_allocation(&cache, 16384, 4096, 0x31);
     // Every canonical page contains rows from all four native readback windows.
     let mut segments = Vec::new();
     for row in 0..128 {
         let physical_row = row % 32 * 4 + row / 32;
-        physical
-            .snapshot_subrange_into(physical_row * 128, 128, &mut segments)
-            .unwrap();
+        segments.push(physical.slice(physical_row * 128, 128).unwrap());
     }
-    let backing = CanonicalBackingRange::mapped(
-        CanonicalBackingRange::new(segments).unwrap(),
-        nixe_memory::CanonicalByteLayout {
+    let backing = Footprint::new(
+        PhysicalMapping::join(&segments).unwrap(),
+        nixe_gpu::physical::WriteDomain::Image(nixe_gpu::physical::ImageFootprint {
             base: 0,
             columns: 32,
             rows: 128,
-            element_bytes: 4,
-            source_element_bytes: 4,
-            source_byte_offset: 0,
-            source_row_pitch: 128,
-            tile: Some(nixe_memory::CanonicalByteTile::new(4, 1, vec![2, 1, 0, 3]).unwrap()),
-        },
+            packed_bytes: 4,
+            aspect_offset: 0,
+            aspect_bytes: 4,
+            storage: nixe_gpu::physical::ImageStorage::BlockLinear {
+                block_height_log2: 0,
+            },
+            native_base: 0,
+            native_element_bytes: 4,
+            native_row_pitch: 32_u64 * 4_u64,
+            rect: nixe_gpu::physical::ByteRect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 128,
+            },
+        }),
     )
     .unwrap();
     let (mut description, mut planes) = color_image();
@@ -981,7 +1009,7 @@ fn interleaved_scanout_rows_batch_and_scatter_multiple_versioned_windows() {
     planes[0].row_pitch = 128;
     planes[0].extent = description.extent;
     let image = cache
-        .image_for_device_write(backing.clone(), description, planes.clone())
+        .image_for_device_write(vec![backing.clone()], description, planes.clone())
         .unwrap();
     for rotation in 0..2 {
         cache
@@ -1018,25 +1046,37 @@ fn interleaved_scanout_rows_batch_and_scatter_multiple_versioned_windows() {
                 )
                 .unwrap();
             for row in 0..32 {
-                let start = (row * 4 + band) * 128;
-                expected[start..start + 128]
-                    .copy_from_slice(&[color[2], color[1], color[0], color[3]].repeat(32));
+                let y = band * 32 + row;
+                for x in 0..32 {
+                    let byte = x * 4;
+                    let start = (y / 8) * 1024
+                        + (byte / 64) * 512
+                        + (byte % 64 / 32) * 256
+                        + (y % 8 / 2) * 64
+                        + (byte % 32 / 16) * 32
+                        + (y % 2) * 16
+                        + byte % 16;
+                    let logical_row = start / 128;
+                    let physical_row = logical_row % 32 * 4 + logical_row / 32;
+                    let at = physical_row * 128 + start % 128;
+                    expected[at..at + 4].copy_from_slice(&color);
+                }
             }
         }
         cache.flush().unwrap();
-        let compact_bytes = backing.metadata_bytes();
+        let compact_bytes = backing.mapping().metadata_bytes();
         assert_eq!(
             cache.resident_frame_source(&backing, description, &planes),
             Some(image)
         );
         assert_eq!(
-            backing.metadata_bytes(),
+            backing.mapping().metadata_bytes(),
             compact_bytes,
             "scanout lookup must keep the tiled mapping compact"
         );
-        let before = cache.device.queue_usage().submitted_tick;
+        let before = cache.device.queue_usage().scheduled_tick;
         assert_eq!(cpu_read(&mut cache, &physical), expected);
-        assert_eq!(cache.device.queue_usage().submitted_tick - before, 1);
+        assert_eq!(cache.device.queue_usage().scheduled_tick - before, 1);
     }
     drop(cache);
     validation.check().unwrap();

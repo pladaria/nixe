@@ -8,6 +8,7 @@ license.workspace = true
 performance-counters = ["nixe-gpu-maxwell/performance-counters"]
 
 [dependencies]
+nixe-memory.workspace = true
 nixe-audio.workspace = true
 nixe-applets.workspace = true
 flate2.workspace = true
@@ -22,7 +23,6 @@ nixe-gpu-maxwell.workspace = true
 nixe-input.workspace = true
 nixe-loader-storage.workspace = true
 nixe-loader-title.workspace = true
-nixe-memory.workspace = true
 nixe-runtime.workspace = true
 nixe-scheduler.workspace = true
 nixe-video.workspace = true

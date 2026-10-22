@@ -15,7 +15,7 @@ pub const MAXWELL_SHADER_NAMESPACE: nixe_gpu::shader_identity::ShaderNamespace =
     };
 
 use super::memory::{MaxwellShaderMemoryView, MaxwellShaderRead};
-use crate::{MaxwellGpuAddressSpace, MaxwellShaderStage};
+use crate::{MaxwellGpuMemory, MaxwellShaderStage};
 use nixe_shader_recompiler::{
     CompileError, Compiler, Result,
     artifact::ShaderInfo,
@@ -70,7 +70,7 @@ pub struct CapturedStage {
 }
 
 impl CapturedStage {
-    pub fn is_current(&self, space: &MaxwellGpuAddressSpace, bindings: &CaptureBindings) -> bool {
+    pub fn is_current(&self, space: &MaxwellGpuMemory, bindings: &CaptureBindings) -> bool {
         let observed = self.environment.observations();
         if self.environment.metadata().stage == Stage::Geometry
             && self.environment.metadata().sph.geometry_passthrough() != 0
@@ -111,8 +111,9 @@ impl CapturedStage {
     fn refresh(
         &self,
         request: &CaptureRequest,
-        space: &MaxwellGpuAddressSpace,
+        space: &MaxwellGpuMemory,
         memory: &mut MemoryCache,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<Option<Self>> {
         if self.request_is_current(request, space) {
             return Ok(Some(self.clone()));
@@ -120,12 +121,18 @@ impl CapturedStage {
         if self.address != request.address || self.request_metadata != request.metadata {
             return Ok(None);
         }
-        if !self
-            .code_dependencies
-            .iter()
-            .all(|read| read.is_current(space))
+        let mut code_dependencies = Vec::with_capacity(self.code_dependencies.len());
         {
-            return Ok(None);
+            let mut view = MaxwellShaderMemoryView::new(space, memory, access);
+            for previous in self.code_dependencies.iter() {
+                let current = view
+                    .read(previous.stage, previous.address, previous.bytes.len())
+                    .map_err(|error| invalid(error.to_string()))?;
+                if current.bytes != previous.bytes {
+                    return Ok(None);
+                }
+                code_dependencies.push(current);
+            }
         }
         let metadata = self.environment.metadata();
         if metadata.stage == Stage::Geometry
@@ -135,7 +142,7 @@ impl CapturedStage {
             return Ok(None);
         }
         let mut source = CaptureEnvironment {
-            memory: MaxwellShaderMemoryView::new(space, memory),
+            memory: MaxwellShaderMemoryView::new(space, memory, access),
             address: request.address,
             metadata: metadata.clone(),
             bindings: request.bindings.clone(),
@@ -144,26 +151,27 @@ impl CapturedStage {
             textures: BTreeMap::new(),
         };
         let observed = self.environment.observations();
+        let mut recording = RecordingEnvironment::new(&mut source);
         for (key, &expected) in &observed.cbuf_words {
-            let actual = source.read_cbuf_value(key.index, key.offset)?;
+            let actual = recording.read_cbuf_value(key.index, key.offset)?;
             if actual != expected {
                 return Ok(None);
             }
         }
         for (&expression, &previous) in &observed.texture_handles {
-            let current = source.read_texture_handle(expression)?;
+            let current = recording.read_texture_handle(expression)?;
             if let Some(&expected) = observed.texture_types.get(&previous)
-                && source.read_texture_type(current)? != expected
+                && recording.read_texture_type(current)? != expected
             {
                 return Ok(None);
             }
             if let Some(&expected) = observed.texture_pixel_formats.get(&previous)
-                && source.read_texture_pixel_format(current)? != expected
+                && recording.read_texture_pixel_format(current)? != expected
             {
                 return Ok(None);
             }
             if let Some(&expected) = observed.texture_integer_formats.get(&previous)
-                && source.is_texture_pixel_format_integer(current)? != expected
+                && recording.is_texture_pixel_format_integer(current)? != expected
             {
                 return Ok(None);
             }
@@ -175,41 +183,37 @@ impl CapturedStage {
                 .any(|&value| value == handle)
         };
         for (&handle, &expected) in &observed.texture_types {
-            if !via_expression(handle) && source.read_texture_type(handle)? != expected {
+            if !via_expression(handle) && recording.read_texture_type(handle)? != expected {
                 return Ok(None);
             }
         }
         for (&handle, &expected) in &observed.texture_pixel_formats {
-            if !via_expression(handle) && source.read_texture_pixel_format(handle)? != expected {
+            if !via_expression(handle) && recording.read_texture_pixel_format(handle)? != expected {
                 return Ok(None);
             }
         }
         for (&handle, &expected) in &observed.texture_integer_formats {
             if !via_expression(handle)
-                && source.is_texture_pixel_format_integer(handle)? != expected
+                && recording.is_texture_pixel_format_integer(handle)? != expected
             {
                 return Ok(None);
             }
         }
         if let Some(expected) = observed.viewport_transform_state
-            && source.read_viewport_transform_state()? != expected
+            && recording.read_viewport_transform_state()? != expected
         {
             return Ok(None);
         }
-        if !self
-            .code_dependencies
-            .iter()
-            .chain(&source.dependencies)
-            .all(|read| read.is_current(space))
-        {
-            return Err(invalid("Shader observations changed during revalidation"));
-        }
+        // The values just compared are owned inputs to this consumption. A
+        // later CPU store invalidates their next reuse, not these captured bytes.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/shader_environment.cpp
+        drop(recording);
         Ok(Some(Self {
             address: self.address,
             request_metadata: self.request_metadata.clone(),
             environment: self.environment.clone(),
             info: self.info.clone(),
-            code_dependencies: self.code_dependencies.clone(),
+            code_dependencies: code_dependencies.into(),
             dependencies: source.dependencies.into(),
             bindings: source.bindings,
         }))
@@ -218,15 +222,16 @@ impl CapturedStage {
 
 pub fn capture(
     compiler: &mut Compiler,
-    space: &MaxwellGpuAddressSpace,
+    space: &MaxwellGpuMemory,
     request: CaptureRequest,
     host: &HostTranslateInfo,
     settings: &CompilerSettings,
     memory: &mut MemoryCache,
+    access: &mut nixe_gpu::MemoryAccess<'_>,
 ) -> Result<(CapturedStage, nixe_shader_recompiler::session::ProgramId)> {
     let request_metadata = request.metadata.clone();
     let mut source = CaptureEnvironment {
-        memory: MaxwellShaderMemoryView::new(space, memory),
+        memory: MaxwellShaderMemoryView::new(space, memory, access),
         address: request.address,
         metadata: request.metadata,
         bindings: request.bindings,
@@ -264,13 +269,6 @@ pub fn capture(
         dependencies: source.dependencies.into(),
         bindings: source.bindings,
     };
-    if !captured.memory_is_current(space) {
-        return Err(invalid(format!(
-            "{:?} shader source changed during capture at {:#x}",
-            captured.environment.metadata().stage,
-            captured.address,
-        )));
-    }
     Ok((captured, program))
 }
 
@@ -278,8 +276,8 @@ fn invalid(message: impl Into<String>) -> CompileError {
     CompileError::new(FailureCategory::InvalidArgument, message)
 }
 
-struct CaptureEnvironment<'a> {
-    memory: MaxwellShaderMemoryView<'a>,
+struct CaptureEnvironment<'a, 'm> {
+    memory: MaxwellShaderMemoryView<'a, 'm>,
     address: u64,
     metadata: EnvironmentMetadata,
     bindings: CaptureBindings,
@@ -288,7 +286,7 @@ struct CaptureEnvironment<'a> {
     textures: BTreeMap<TextureHandle, [u32; 8]>,
 }
 
-impl CaptureEnvironment<'_> {
+impl CaptureEnvironment<'_, '_> {
     fn consolidate_code(&mut self) {
         let Some(begin) = self.code_dependencies.iter().map(|read| read.address).min() else {
             return;
@@ -381,7 +379,7 @@ impl CaptureEnvironment<'_> {
     }
 }
 
-impl Environment for CaptureEnvironment<'_> {
+impl Environment for CaptureEnvironment<'_, '_> {
     fn metadata(&self) -> &EnvironmentMetadata {
         &self.metadata
     }
@@ -471,21 +469,42 @@ mod tests {
     use crate::shader::test_support::{mapped_memory, write_shader_words};
     use nixe_gpu::shader_encoding;
 
+    pub(super) fn refresh_unchanged(
+        captured: &CapturedStage,
+        space: &MaxwellGpuMemory,
+    ) -> CapturedStage {
+        let request = CaptureRequest {
+            address: captured.address,
+            metadata: captured.request_metadata.clone(),
+            bindings: captured.bindings.clone(),
+        };
+        let refreshed = captured
+            .refresh(
+                &request,
+                space,
+                &mut MemoryCache::default(),
+                &mut crate::test_memory::apply,
+            )
+            .unwrap()
+            .expect("unchanged consumed shader inputs");
+        assert_eq!(captured.environment, refreshed.environment);
+        assert!(refreshed.is_current(space, &request.bindings));
+        refreshed
+    }
+
     #[test]
     fn instruction_reads_share_one_code_proof_and_detect_real_rewrites() {
         use nixe_shader_recompiler::maxwell::decode::Opcode;
         let (allocation, space, base) = mapped_memory();
         let mov = Opcode::MOV32I.encoding().value | 7 << 16 | 15 << 12;
         for (offset, instruction) in [(8, mov), (16, mov | 1), (24, 0xe300_0000_0007_000f)] {
-            allocation
-                .write(offset, &instruction.to_le_bytes())
-                .unwrap();
+            crate::test_memory::write(&allocation, offset, &instruction.to_le_bytes()).unwrap();
         }
 
         let mut compiler = Compiler::new().unwrap();
         let (captured, _) = capture(
             &mut compiler,
-            &space,
+            space.memory(),
             CaptureRequest {
                 address: base,
                 metadata: EnvironmentMetadata {
@@ -498,28 +517,28 @@ mod tests {
             &HostTranslateInfo::default(),
             &CompilerSettings::default(),
             &mut MemoryCache::default(),
+            &mut crate::test_memory::apply,
         )
         .unwrap();
         assert_eq!(captured.environment.observations().instructions.len(), 3);
         assert_eq!(captured.code_dependencies.len(), 1);
         assert_eq!(captured.code_dependencies[0].bytes.len(), 24);
-        allocation.write(0x800, &[1]).unwrap();
-        assert!(captured.memory_is_current(&space));
-        allocation.write(16, &(mov | 2).to_le_bytes()).unwrap();
-        assert!(!captured.memory_is_current(&space));
+        crate::test_memory::write(&allocation, 0x800, &[1]).unwrap();
+        assert!(!captured.is_current(space.memory(), &captured.bindings));
+        let captured = refresh_unchanged(&captured, space.memory());
+        crate::test_memory::write(&allocation, 16, &(mov | 2).to_le_bytes()).unwrap();
+        assert!(!captured.is_current(space.memory(), &captured.bindings));
     }
 
     #[test]
     fn equivalent_texture_handles_refresh_properties_without_changing_shader_inputs() {
         use nixe_shader_recompiler::environment::HandleKey;
         let (allocation, space, base) = mapped_memory();
-        allocation.write(0x100, &0u32.to_le_bytes()).unwrap();
+        crate::test_memory::write(&allocation, 0x100, &0u32.to_le_bytes()).unwrap();
         for offset in [0x200, 0x220] {
-            allocation
-                .write(offset + 16, &(1u32 << 23).to_le_bytes())
+            crate::test_memory::write(&allocation, offset + 16, &(1u32 << 23).to_le_bytes())
                 .unwrap();
-            allocation
-                .write(offset + 20, &(1u32 << 31).to_le_bytes())
+            crate::test_memory::write(&allocation, offset + 20, &(1u32 << 31).to_le_bytes())
                 .unwrap();
         }
 
@@ -534,8 +553,9 @@ mod tests {
             via_header_index: false,
         });
         let mut memory = MemoryCache::default();
+        let mut memory_access = crate::test_memory::access(space.memory().machine());
         let mut source = CaptureEnvironment {
-            memory: MaxwellShaderMemoryView::new(&space, &mut memory),
+            memory: MaxwellShaderMemoryView::new(space.memory(), &mut memory, &mut memory_access),
             address: base,
             metadata: EnvironmentMetadata::default(),
             bindings: bindings.clone(),
@@ -570,22 +590,30 @@ mod tests {
             metadata: captured.request_metadata.clone(),
             bindings,
         };
-        allocation.write(0x100, &1u32.to_le_bytes()).unwrap();
-        assert!(!captured.request_is_current(&request, &space));
+        crate::test_memory::write(&allocation, 0x100, &1u32.to_le_bytes()).unwrap();
+        assert!(!captured.request_is_current(&request, space.memory()));
         let refreshed = captured
-            .refresh(&request, &space, &mut MemoryCache::default())
+            .refresh(
+                &request,
+                space.memory(),
+                &mut MemoryCache::default(),
+                &mut crate::test_memory::apply,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(refreshed.environment, captured.environment);
         assert!(Arc::ptr_eq(&refreshed.environment, &captured.environment));
         assert!(Arc::ptr_eq(&refreshed.info, &captured.info));
-        assert!(refreshed.request_is_current(&request, &space));
-        allocation
-            .write(0x220 + 16, &(2u32 << 23).to_le_bytes())
-            .unwrap();
+        assert!(refreshed.request_is_current(&request, space.memory()));
+        crate::test_memory::write(&allocation, 0x220 + 16, &(2u32 << 23).to_le_bytes()).unwrap();
         assert!(
             refreshed
-                .refresh(&request, &space, &mut MemoryCache::default())
+                .refresh(
+                    &request,
+                    space.memory(),
+                    &mut MemoryCache::default(),
+                    &mut crate::test_memory::access(space.memory().machine())
+                )
                 .unwrap()
                 .is_none()
         );
@@ -595,7 +623,7 @@ mod tests {
     fn compute_capture_replays_owned_code_and_tracks_instruction_changes() {
         let (allocation, space, base) = mapped_memory();
         let exit = 0xe300_0000_0007_000fu64;
-        allocation.write(8, &exit.to_le_bytes()).unwrap();
+        crate::test_memory::write(&allocation, 8, &exit.to_le_bytes()).unwrap();
 
         let mut compiler = Compiler::new().unwrap();
         let request = |address| CaptureRequest {
@@ -609,27 +637,29 @@ mod tests {
         };
         let (captured, _) = capture(
             &mut compiler,
-            &space,
+            space.memory(),
             request(base),
             &HostTranslateInfo::default(),
             &CompilerSettings::default(),
             &mut MemoryCache::default(),
+            &mut crate::test_memory::apply,
         )
         .unwrap();
         assert_eq!(captured.environment.observations().instructions.len(), 1);
-        assert!(captured.is_current(&space, &CaptureBindings::default()));
-        allocation.write(0x800, &[1, 2, 3, 4]).unwrap();
-        assert!(captured.is_current(&space, &CaptureBindings::default()));
-        write_shader_words(&space, &[(base + 8, 0)]);
-        assert!(!captured.is_current(&space, &CaptureBindings::default()));
-        allocation.write(0x108, &exit.to_le_bytes()).unwrap();
+        assert!(captured.is_current(space.memory(), &CaptureBindings::default()));
+        crate::test_memory::write(&allocation, 0x800, &[1, 2, 3, 4]).unwrap();
+        let captured = refresh_unchanged(&captured, space.memory());
+        write_shader_words(space.memory(), &[(base + 8, 0)]);
+        assert!(!captured.is_current(space.memory(), &CaptureBindings::default()));
+        crate::test_memory::write(&allocation, 0x108, &exit.to_le_bytes()).unwrap();
         let (relocated, _) = capture(
             &mut compiler,
-            &space,
+            space.memory(),
             request(base + 0x100),
             &HostTranslateInfo::default(),
             &CompilerSettings::default(),
             &mut MemoryCache::default(),
+            &mut crate::test_memory::apply,
         )
         .unwrap();
         assert_eq!(
@@ -650,13 +680,9 @@ mod tests {
     #[test]
     fn consumed_cbuf_and_texture_dependencies_exclude_image_contents() {
         let (allocation, space, base) = mapped_memory();
-        allocation.write(0x100, &7u32.to_le_bytes()).unwrap();
-        allocation
-            .write(0x200 + 16, &(1u32 << 23).to_le_bytes())
-            .unwrap();
-        allocation
-            .write(0x200 + 20, &(1u32 << 31).to_le_bytes())
-            .unwrap();
+        crate::test_memory::write(&allocation, 0x100, &7u32.to_le_bytes()).unwrap();
+        crate::test_memory::write(&allocation, 0x200 + 16, &(1u32 << 23).to_le_bytes()).unwrap();
+        crate::test_memory::write(&allocation, 0x200 + 20, &(1u32 << 31).to_le_bytes()).unwrap();
 
         let mut bindings = CaptureBindings::default();
         bindings.constant_buffers[2] = Some(BufferBinding {
@@ -669,8 +695,9 @@ mod tests {
             via_header_index: false,
         });
         let mut memory = MemoryCache::default();
+        let mut memory_access = crate::test_memory::access(space.memory().machine());
         let mut source = CaptureEnvironment {
-            memory: MaxwellShaderMemoryView::new(&space, &mut memory),
+            memory: MaxwellShaderMemoryView::new(space.memory(), &mut memory, &mut memory_access),
             address: base,
             metadata: EnvironmentMetadata::default(),
             bindings: bindings.clone(),
@@ -699,38 +726,48 @@ mod tests {
             dependencies: source.dependencies.into(),
             bindings: source.bindings,
         };
-        allocation.write(0x800, &[99]).unwrap();
-        assert!(captured.is_current(&space, &bindings));
+        crate::test_memory::write(&allocation, 0x800, &[99]).unwrap();
+        let captured = refresh_unchanged(&captured, space.memory());
         let mut unrelated = bindings.clone();
         unrelated.constant_buffers[3] = Some(BufferBinding {
             address: base + 0x300,
             size: 4,
         });
-        assert!(captured.is_current(&space, &unrelated));
+        assert!(captured.is_current(space.memory(), &unrelated));
         unrelated.constant_buffers[2] = unrelated.constant_buffers[3];
-        assert!(!captured.is_current(&space, &unrelated));
-        allocation.write(0x300, &7u32.to_le_bytes()).unwrap();
+        assert!(!captured.is_current(space.memory(), &unrelated));
+        crate::test_memory::write(&allocation, 0x300, &7u32.to_le_bytes()).unwrap();
         let request = CaptureRequest {
             address: base,
             metadata: captured.request_metadata.clone(),
             bindings: unrelated.clone(),
         };
         let refreshed = captured
-            .refresh(&request, &space, &mut MemoryCache::default())
+            .refresh(
+                &request,
+                space.memory(),
+                &mut MemoryCache::default(),
+                &mut crate::test_memory::apply,
+            )
             .unwrap()
             .unwrap();
-        assert!(refreshed.request_is_current(&request, &space));
+        assert!(refreshed.request_is_current(&request, space.memory()));
         assert_eq!(refreshed.environment, captured.environment);
-        allocation.write(0x300, &8u32.to_le_bytes()).unwrap();
+        crate::test_memory::write(&allocation, 0x300, &8u32.to_le_bytes()).unwrap();
         assert!(
             refreshed
-                .refresh(&request, &space, &mut MemoryCache::default())
+                .refresh(
+                    &request,
+                    space.memory(),
+                    &mut MemoryCache::default(),
+                    &mut crate::test_memory::access(space.memory().machine())
+                )
                 .unwrap()
                 .is_none()
         );
-        write_shader_words(&space, &[(base + 0x100, 8)]);
-        assert!(!captured.is_current(&space, &bindings));
-        write_shader_words(&space, &[(base + 0x200 + 16, 2 << 23)]);
-        assert!(!captured.is_current(&space, &bindings));
+        write_shader_words(space.memory(), &[(base + 0x100, 8)]);
+        assert!(!captured.is_current(space.memory(), &bindings));
+        write_shader_words(space.memory(), &[(base + 0x200 + 16, 2 << 23)]);
+        assert!(!captured.is_current(space.memory(), &bindings));
     }
 }

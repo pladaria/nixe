@@ -16,7 +16,6 @@ struct StateMeasurement {
 #include <cstring>
 #include <dynarmic/backend/exception_handler.h>
 #include <dynarmic/interface/A64/a64.h>
-#include <dynarmic/interface/exclusive_monitor.h>
 #include <exception>
 #include <memory>
 #include <string>
@@ -52,17 +51,13 @@ struct Core final : Dynarmic::A64::UserCallbacks {
   std::uint64_t tpidr = 0, tpidrro = 0;
   NixeExit exit{};
   std::uint64_t ticks_left = 0, ticks_executed = 0;
-  bool persistent_fastmem_fault = false;
   std::unique_ptr<Dynarmic::A64::Jit> jit;
 
-  Core(NixeCallbacks cb, Dynarmic::ExclusiveMonitor *monitor, size_t id,
-       std::uintptr_t arena, std::uintptr_t exclusive_table, size_t address_bits, std::uint32_t frequency,
-       std::uint32_t ctr, std::uint32_t dczid)
+  Core(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t exclusive_table,
+       size_t address_bits, std::uint32_t frequency, std::uint32_t ctr, std::uint32_t dczid)
       : callbacks(cb) {
     Dynarmic::A64::UserConfig conf{};
     conf.callbacks = this;
-    conf.processor_id = id;
-    conf.global_monitor = monitor;
     conf.tpidr_el0 = &tpidr;
     conf.tpidrro_el0 = &tpidrro;
     conf.cntfrq_el0 = frequency;
@@ -79,11 +74,10 @@ struct Core final : Dynarmic::A64::UserCallbacks {
 #endif
     conf.fastmem_address_space_bits = address_bits;
     conf.silently_mirror_fastmem = false;
-    // Tracking/ownership faults are transient. Keep the direct access after
-    // repair.
-    conf.recompile_on_fastmem_failure = false;
-    conf.recompile_on_exclusive_fastmem_failure = false;
-    conf.persistent_fastmem_fault = &persistent_fastmem_fault;
+    // Fault attribution selects the canonical PTE fallback after a fault.
+    // Untouched sites retain plain fastmem; a reopened page is direct again.
+    conf.recompile_on_fastmem_failure = true;
+    conf.recompile_on_exclusive_fastmem_failure = true;
     jit = std::make_unique<Dynarmic::A64::Jit>(conf);
   }
   void stop(std::uint32_t kind, std::uint32_t detail, std::uint64_t pc,
@@ -93,9 +87,9 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     jit->HaltExecution();
   }
   bool access(std::uint64_t addr, unsigned size, unsigned op, Vector &value,
-              const Vector *expected = nullptr) {
+              const std::uint64_t *expected = nullptr) {
     if (callbacks.memory(context, addr, size, op, value.data(),
-                         expected ? expected->data() : nullptr))
+                         expected))
       return true;
     jit->HaltExecution(HaltReason::MemoryAbort);
     return false;
@@ -137,19 +131,19 @@ struct Core final : Dynarmic::A64::UserCallbacks {
                                   std::uint##bits##_t value,                   \
                                   std::uint##bits##_t expected) override {     \
     Vector v{value, 0}, e{expected, 0};                                        \
-    return access(addr, bits / 8, 2, v, &e) && v[0] != 0;                      \
+    return access(addr, bits / 8, 2, v, e.data()) && v[0] != 0;                 \
   }
   EXCLUSIVE(8)
   EXCLUSIVE(16) EXCLUSIVE(32) EXCLUSIVE(64)
 #undef EXCLUSIVE
       bool MemoryWriteExclusive128(std::uint64_t addr, Vector v,
                                    Vector e) override {
-    return access(addr, 16, 2, v, &e) && v[0] != 0;
+    return access(addr, 16, 2, v, e.data()) && v[0] != 0;
   }
   void PreparePhysicalExclusive(std::uint64_t address, size_t bytes, bool write,
                                 std::uint64_t *data) override {
-    Vector value{data[0], data[1]}, expected{data[2], data[3]};
-    access(address, bytes, write ? 5 : 3, value, &expected);
+    Vector value{data[0], data[1]};
+    access(address, bytes, write ? 5 : 3, value, data + 2);
     data[0] = value[0];
   }
   void InterpreterFallback(std::uint64_t pc, size_t) override {
@@ -194,9 +188,8 @@ struct Core final : Dynarmic::A64::UserCallbacks {
 };
 } // namespace
 extern "C" {
-bool nixe_dynarmic_resolve_fault(Core *core, std::uint64_t pc, bool persistent, std::uint64_t *call,
+bool nixe_dynarmic_resolve_fault(std::uint64_t pc, std::uint64_t *call,
                                  std::uint64_t *ret) noexcept {
-  core->persistent_fastmem_fault = persistent;
   const auto result =
       Dynarmic::Backend::ExceptionHandler::HandleExternalFault(pc);
   if (!result)
@@ -211,24 +204,12 @@ bool nixe_dynarmic_resolve_fault(Core *core, std::uint64_t pc, bool persistent, 
   return true;
 }
 const char *nixe_dynarmic_error() noexcept { return last_error.c_str(); }
-void *nixe_dynarmic_monitor_create(size_t count) noexcept {
-  try {
-    return new Dynarmic::ExclusiveMonitor(count);
-  } catch (const std::exception &e) {
-    last_error = e.what();
-    return nullptr;
-  }
-}
-void nixe_dynarmic_monitor_destroy(void *p) noexcept {
-  delete static_cast<Dynarmic::ExclusiveMonitor *>(p);
-}
-void *nixe_dynarmic_create(NixeCallbacks cb, void *monitor, size_t id,
+void *nixe_dynarmic_create(NixeCallbacks cb,
                            std::uintptr_t arena, std::uintptr_t exclusive_table, size_t bits,
                            std::uint32_t frequency, std::uint32_t ctr,
                            std::uint32_t dczid) noexcept {
   try {
-    return new Core(cb, static_cast<Dynarmic::ExclusiveMonitor *>(monitor), id,
-                    arena, exclusive_table, bits, frequency, ctr, dczid);
+    return new Core(cb, arena, exclusive_table, bits, frequency, ctr, dczid);
   } catch (const std::exception &e) {
     last_error = e.what();
     return nullptr;
@@ -241,6 +222,13 @@ void nixe_dynarmic_clear_halt(Core *core) noexcept {
 }
 void nixe_dynarmic_clear_exclusive(Core *core) noexcept {
   core->jit->ClearExclusiveState();
+}
+void nixe_dynarmic_reserve_exclusive(Core *core, const std::uint64_t *proof) noexcept {
+#if defined(__x86_64__)
+  core->jit->SetPhysicalExclusiveReservation(proof[3], proof[0], proof[1], proof[2], static_cast<std::uint8_t>(proof[4]), Vector{proof[5], proof[6]});
+#else
+  std::terminate();
+#endif
 }
 bool nixe_dynarmic_invalidate(Core *core, std::uint64_t addr,
                               size_t size) noexcept {

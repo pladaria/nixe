@@ -2,26 +2,28 @@
 use super::*;
 use crate::engines::tests::register_benchmark::ALLOCATIONS;
 use crate::{
-    MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellMapRequest,
-    SWITCH_1_GM20B_PROFILE,
+    MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellGpuAddressSpace,
+    MaxwellMapRequest, SWITCH_1_GM20B_PROFILE,
 };
 
 #[test]
 #[cfg(target_os = "linux")]
 #[ignore = "opt-in matched descriptor CPU/allocation measurement"]
 fn descriptor_lookup_throughput() {
-    let allocation = nixe_memory::CanonicalAllocation::zeroed(8192, 4096).unwrap();
-    let mut space =
-        MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(1), SWITCH_1_GM20B_PROFILE);
+    let machine = crate::test_memory::machine();
+    let allocation = crate::test_memory::allocate(&machine, 8192);
+    let mut space = MaxwellGpuAddressSpace::new(
+        machine.clone(),
+        MaxwellAddressSpaceId::new(1),
+        SWITCH_1_GM20B_PROFILE,
+    );
     space
         .initialize(MaxwellAddressSpaceInitialization::default())
         .unwrap();
     let mapping = space
         .map(MaxwellMapRequest {
             allocation: MaxwellAllocationId::new(1),
-            backing: allocation
-                .backing_range(MemoryPermissions::READ_WRITE)
-                .unwrap(),
+            backing: crate::test_memory::ranges(&allocation),
             backing_offset: 0,
             size: 8192,
             allocation_alignment: 4096,
@@ -34,7 +36,9 @@ fn descriptor_lookup_throughput() {
         .unwrap();
     let mut cache = MaxwellThreeDRetainedBackingCache::default();
     cache.set_view_limit(4096);
-    let mut builder = ResourceBuilder::new(&space, None, Some(&mut cache));
+    let mut memory_access = crate::test_memory::access(space.memory().machine());
+    let mut builder =
+        ResourceBuilder::new(space.memory(), None, Some(&mut cache), &mut memory_access);
     let address = mapping.offset().get();
     builder
         .buffer(

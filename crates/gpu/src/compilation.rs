@@ -3,7 +3,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::{
     hash::Hash,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -53,7 +53,8 @@ impl std::error::Error for CompileError {}
 
 type Result<T> = std::result::Result<Arc<T>, Arc<CompileError>>;
 struct Cell<T> {
-    result: Mutex<Option<Result<T>>>,
+    result: OnceLock<Result<T>>,
+    notification: Mutex<()>,
     ready: Condvar,
 }
 pub struct Pending<T>(Arc<Cell<T>>);
@@ -64,26 +65,40 @@ impl<T> Clone for Pending<T> {
 }
 impl<T> Pending<T> {
     pub fn poll(&self) -> Option<Result<T>> {
-        self.0.result.lock().unwrap().clone()
+        self.0.result.get().cloned()
     }
-    /// Bounded wait leaves servicing of unrelated control/visibility to the owner.
     pub fn wait_timeout(&self, timeout: Duration) -> Option<Result<T>> {
-        let result = self.0.result.lock().unwrap();
-        self.0
-            .ready
-            .wait_timeout_while(result, timeout, |r| r.is_none())
-            .unwrap()
+        if let Some(result) = self.poll() {
+            return Some(result);
+        }
+        let lock = self.0.notification.lock().unwrap();
+        let _wait = self
             .0
-            .clone()
+            .ready
+            .wait_timeout_while(lock, timeout, |_| self.0.result.get().is_none())
+            .unwrap();
+        self.poll()
+    }
+}
+impl<T> Cell<T> {
+    fn publish(&self, result: Result<T>) {
+        let _lock = self.notification.lock().unwrap();
+        assert!(
+            self.result.set(result).is_ok(),
+            "compilation completed twice"
+        );
+        self.ready.notify_all();
     }
 }
 
 type Job = Box<dyn FnOnce(usize) + Send + 'static>;
+type Wakeup = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 pub struct CompilePool {
     sender: Option<mpsc::SyncSender<Job>>,
     threads: Vec<thread::JoinHandle<()>>,
     queued: Arc<AtomicUsize>,
     capacity: usize,
+    wakeup: Wakeup,
 }
 impl CompilePool {
     pub fn new(workers: usize, queue: usize) -> std::io::Result<Self> {
@@ -104,10 +119,12 @@ impl CompilePool {
             threads: Vec::new(),
             queued: Arc::clone(&queued),
             capacity: queue,
+            wakeup: Arc::new(Mutex::new(None)),
         };
         for index in 0..workers {
             let rx = Arc::clone(&rx);
             let queued = Arc::clone(&queued);
+            let wakeup = Arc::clone(&pool.wakeup);
             pool.threads.push(
                 thread::Builder::new()
                     .name(format!("{name}-{index}"))
@@ -119,19 +136,31 @@ impl CompilePool {
                             };
                             queued.fetch_sub(1, Ordering::Relaxed);
                             job(index);
+                            let wake = wakeup.lock().unwrap().clone();
+                            if let Some(wake) = wake {
+                                wake();
+                            }
                         }
                     })?,
             );
         }
         Ok(pool)
     }
+    pub fn bind_wakeup(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        // Install before the consumer checks readiness and starts parking.
+        // Every later job publishes its result before reading this callback.
+        *self.wakeup.lock().unwrap() = Some(wake);
+    }
     pub fn workers(&self) -> usize {
         self.threads.len()
     }
-    fn submit(&self, job: Job) -> std::result::Result<(), CompileError> {
+    pub fn submit(
+        &self,
+        job: impl FnOnce(usize) + Send + 'static,
+    ) -> std::result::Result<(), CompileError> {
         let sender = self.sender.as_ref().ok_or(CompileError::Stopped)?;
         self.queued.fetch_add(1, Ordering::Relaxed);
-        let result = sender.try_send(job).map_err(|e| match e {
+        let result = sender.try_send(Box::new(job)).map_err(|e| match e {
             mpsc::TrySendError::Full(_) => CompileError::Backpressure,
             mpsc::TrySendError::Disconnected(_) => CompileError::Stopped,
         });
@@ -246,7 +275,8 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
             state.weight -= old.weight;
         }
         let pending = Pending(Arc::new(Cell {
-            result: Mutex::new(None),
+            result: OnceLock::new(),
+            notification: Mutex::new(()),
             ready: Condvar::new(),
         }));
         let publish = pending.clone();
@@ -257,7 +287,7 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
         let queued = std::time::Instant::now();
         #[cfg(feature = "performance-counters")]
         capture_key.event("miss", usize::MAX, weight as u64);
-        pool.submit(Box::new(move |worker| {
+        pool.submit(move |worker| {
             #[cfg(feature = "performance-counters")]
             capture_key.event("begin", worker, queued.elapsed().as_nanos() as u64);
             #[cfg(feature = "performance-counters")]
@@ -308,9 +338,8 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
                     .map(ToString::to_string)
                     .unwrap_or_default(),
             );
-            *publish.0.result.lock().unwrap() = Some(result);
-            publish.0.ready.notify_all();
-        }))?;
+            publish.0.publish(result);
+        })?;
         state.weight += weight;
         state.entries.insert(
             key,

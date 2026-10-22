@@ -21,7 +21,7 @@ use std::fmt::{Display, Formatter};
 use nixe_gpu::GpuMethodId;
 
 use crate::{
-    MaxwellGpfifoSourceError, MaxwellGpfifoSourceLocation, MaxwellGpuAddressSpace,
+    MaxwellGpfifoSourceError, MaxwellGpfifoSourceLocation, MaxwellGpuMemory,
     MaxwellValidatedGpfifoSubmission,
 };
 
@@ -269,7 +269,7 @@ impl MaxwellDecodedPushbuffer {
 }
 
 /// Failure while reading or validating packet syntax.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum MaxwellPushbufferDecodeError {
     Source(MaxwellGpfifoSourceError),
     UnknownEncoding {
@@ -470,14 +470,15 @@ where
 /// No channel, scheduler, fence, class, or backend state is mutated.
 pub fn decode_maxwell_submission(
     submission: &MaxwellValidatedGpfifoSubmission,
-    address_space: &MaxwellGpuAddressSpace,
+    address_space: &MaxwellGpuMemory,
+    access: &mut nixe_gpu::MemoryAccess<'_>,
 ) -> Result<MaxwellDecodedPushbuffer, MaxwellPushbufferDecodeError> {
-    submission.validate_sources(address_space)?;
     decode_maxwell_pushbuffer(SubmissionWords::new(
         submission,
         address_space,
         &mut MaxwellCommandSourceScratch::default(),
         &mut || Ok(()),
+        access,
     ))
 }
 
@@ -722,8 +723,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::MaxwellGpuAddressSpace;
     use nixe_gpu::{FrontendSubmissionId, GpuVirtualAddress, MappingGeneration};
-    use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+    use nixe_memory::MemoryPermissions;
 
     use super::*;
     use crate::{
@@ -978,14 +980,16 @@ mod tests {
     #[test]
     fn rejects_truncation_and_incrementing_method_overflow_at_the_header() {
         let truncated = sourced(method_header(3, 0x100, 0, 3), 0, 4);
-        assert_eq!(
-            decode(&[truncated, sourced(1, 0, 5)]),
-            Err(MaxwellPushbufferDecodeError::TruncatedPacket {
-                source: location(0, 4),
-                expected_arguments: 3,
-                available_arguments: 1,
-            })
-        );
+        let Err(MaxwellPushbufferDecodeError::TruncatedPacket {
+            source,
+            expected_arguments,
+            available_arguments,
+        }) = decode(&[truncated, sourced(1, 0, 5)])
+        else {
+            panic!("expected truncated packet")
+        };
+        assert_eq!(source, location(0, 4));
+        assert_eq!((expected_arguments, available_arguments), (3, 1));
 
         assert!(matches!(
             decode(&[
@@ -1033,35 +1037,37 @@ mod tests {
             Ok(sourced(method_header(4, 0x100, 0, 1), 0, 0)),
             Err(MaxwellGpfifoSourceError::ResourceExhausted),
         ];
-        assert_eq!(
+        assert!(matches!(
             decode_maxwell_pushbuffer(input),
             Err(MaxwellPushbufferDecodeError::Source(
                 MaxwellGpfifoSourceError::ResourceExhausted
             ))
-        );
+        ));
     }
 
     #[test]
     fn retained_submission_decoding_reads_canonical_bytes_and_preserves_mapping_source() {
+        let machine = crate::test_memory::machine();
         let command_words = [method_header(1, 0x100, 2, 2), 0x1122_3344, 0x5566_7788];
-        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
+        let allocation = crate::test_memory::allocate(&machine, 0x1000);
         let command_bytes = command_words
             .iter()
             .flat_map(|word| word.to_le_bytes())
             .collect::<Vec<_>>();
-        allocation.write(0, &command_bytes).unwrap();
+        crate::test_memory::write(&allocation, 0, &command_bytes).unwrap();
 
-        let mut address_space =
-            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(2), SWITCH_1_GM20B_PROFILE);
+        let mut address_space = MaxwellGpuAddressSpace::new(
+            machine.clone(),
+            MaxwellAddressSpaceId::new(2),
+            SWITCH_1_GM20B_PROFILE,
+        );
         address_space
             .initialize(MaxwellAddressSpaceInitialization::default())
             .unwrap();
         let mapping = address_space
             .map(MaxwellMapRequest {
                 allocation: MaxwellAllocationId::new(4),
-                backing: allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
+                backing: crate::test_memory::ranges(&allocation),
                 backing_offset: 0,
                 size: 0x1000,
                 allocation_alignment: 0x1000,
@@ -1100,11 +1106,16 @@ mod tests {
             &channel,
             FrontendSubmissionId::new(12),
             decoded_gpfifo,
-            &address_space,
+            address_space.memory(),
         )
         .unwrap();
 
-        let decoded = decode_maxwell_submission(&retained, &address_space).unwrap();
+        let decoded = decode_maxwell_submission(
+            &retained,
+            address_space.memory(),
+            &mut crate::test_memory::access(address_space.memory().machine()),
+        )
+        .unwrap();
         let MaxwellDecodedPacket::Methods(packet) = &decoded.packets()[0] else {
             panic!("expected method packet");
         };
@@ -1124,9 +1135,16 @@ mod tests {
 
         address_space.unmap(mapping.offset()).unwrap();
         assert!(matches!(
-            decode_maxwell_submission(&retained, &address_space),
+            decode_maxwell_submission(
+                &retained,
+                address_space.memory(),
+                &mut crate::test_memory::access(address_space.memory().machine())
+            ),
             Err(MaxwellPushbufferDecodeError::Source(
-                MaxwellGpfifoSourceError::StaleMapping { .. }
+                MaxwellGpfifoSourceError::Access {
+                    error: crate::MaxwellGpuAccessError::StaleMapping { .. },
+                    ..
+                }
             ))
         ));
     }

@@ -294,6 +294,7 @@ pub struct MaxwellThreeDReportSemaphoreWrite {
     address: MaxwellThreeDUnresolvedAddress,
     payload: u32,
     structure_size: MaxwellThreeDReportSemaphoreStructureSize,
+    fence: bool,
     source: MaxwellMethodSource,
     prior_work_pending: bool,
 }
@@ -312,6 +313,13 @@ impl MaxwellThreeDReportSemaphoreWrite {
     #[must_use]
     pub const fn structure_size(self) -> MaxwellThreeDReportSemaphoreStructureSize {
         self.structure_size
+    }
+
+    /// Only a short RELEASE commits pending reports as a fence.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
+    #[must_use]
+    pub const fn is_fence(self) -> bool {
+        self.fence
     }
 
     #[must_use]
@@ -868,6 +876,9 @@ pub fn lower_maxwell_three_d_synchronization(
                     address,
                     payload,
                     structure_size: control.structure_size(),
+                    fence: control.operation() == MaxwellThreeDReportSemaphoreOperation::Release
+                        && control.structure_size()
+                            == MaxwellThreeDReportSemaphoreStructureSize::OneWord,
                     source,
                     prior_work_pending,
                 },

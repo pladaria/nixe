@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use nixe_gpu_maxwell::{MaxwellChannelConfiguration, MaxwellGpuAddressSpace};
+use nixe_gpu_maxwell::{MaxwellChannelConfiguration, MaxwellGpuMemory};
 
 use super::{NvDrvDeviceDescriptor, NvDrvFileDescriptor, NvDrvSession, NvDrvSessionId};
 
@@ -44,7 +44,7 @@ impl NvDrvSession {
 
     /// Returns the profile-bound address space owned by an as-gpu descriptor.
     #[must_use]
-    pub fn gpu_address_space(&self, fd: NvDrvFileDescriptor) -> Option<MaxwellGpuAddressSpace> {
+    pub fn gpu_address_space(&self, fd: NvDrvFileDescriptor) -> Option<MaxwellGpuMemory> {
         let address_spaces = Arc::clone(
             &self
                 .state
@@ -56,7 +56,7 @@ impl NvDrvSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&fd)
-            .cloned()
+            .map(|space| space.memory().clone())
     }
 
     /// Returns pointer-free Maxwell channel state for diagnostics and tests.

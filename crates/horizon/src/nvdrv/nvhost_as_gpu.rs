@@ -152,8 +152,8 @@ pub(super) fn ioctl_nvhost_as_gpu(
                 .allocation_metadata()
                 .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
             let backing = object
-                .backing()
-                .cloned()
+                .ranges()
+                .map(<[nixe_memory::AllocationRange]>::to_vec)
                 .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
             let mapping_size = if mapping_size == 0 {
                 u64::from(object.size())
@@ -263,8 +263,8 @@ fn remap(
                 .allocation_metadata()
                 .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
             let backing = object
-                .backing()
-                .cloned()
+                .ranges()
+                .map(<[nixe_memory::AllocationRange]>::to_vec)
                 .ok_or(NvDrvCallError::GuestResult(NV_BAD_VALUE))?;
             let backing_offset = u64::from(input_u32(entry, 8)?)
                 .checked_mul(big_page_size)

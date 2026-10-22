@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-nixe-cpu.workspace = true
 nixe-memory.workspace = true
+nixe-cpu.workspace = true
 nixe-cpu-direct-memory.workspace = true
 nixe-cpu-interpreter.workspace = true
 
@@ -15,7 +15,3 @@ performance-counters = ["nixe-memory/performance-counters"]
 
 [build-dependencies]
 cmake = "0.1"
-
-[[example]]
-name = "memory_access"
-required-features = ["performance-counters"]

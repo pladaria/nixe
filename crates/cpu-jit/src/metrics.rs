@@ -4,11 +4,7 @@
 pub enum Counter {
     NativeEntries,
     GuestTicks,
-    // Kept for baseline comparisons; direct lending performs no Rust copying.
-    RustStateBytes,
     NativeStateBytes,
-    // No Rust marshalling timer remains after T03; this category stays zero.
-    RustStateNanoseconds,
     NativeStateNanoseconds,
     NativeRunNanoseconds,
     FaultDispatches,
@@ -18,16 +14,31 @@ pub enum Counter {
     AtomicCallbacks,
     InvalidationCalls,
     InvalidationBytes,
-    FullInvalidations,
     InvalidationNanoseconds,
     ContextLoads,
     ContextSaves,
+    InternalHaltResumes,
+    AdmissionNanoseconds,
 }
 #[cfg(feature = "performance-counters")]
-static COUNTERS: [std::sync::atomic::AtomicU64; 18] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+static COUNTERS: [std::sync::atomic::AtomicU64; 17] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 17];
+#[cfg(test)]
+std::thread_local! {
+    static TEST_COUNTERS: std::cell::Cell<[u64; 17]> = const { std::cell::Cell::new([0; 17]) };
+}
+#[cfg(test)]
+pub(crate) fn test_snapshot() -> [u64; 17] {
+    TEST_COUNTERS.get()
+}
 #[inline]
 pub fn record(counter: Counter, amount: u64) {
+    #[cfg(test)]
+    TEST_COUNTERS.with(|values| {
+        let mut current = values.get();
+        current[counter as usize] += amount;
+        values.set(current);
+    });
     #[cfg(feature = "performance-counters")]
     COUNTERS[counter as usize].fetch_add(amount, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(feature = "performance-counters"))]
@@ -38,9 +49,7 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
     const NAMES: &[&str] = &[
         "JitNativeEntries",
         "JitGuestTicks",
-        "JitRustStateBytes",
         "JitNativeStateBytes",
-        "JitRustStateNanoseconds",
         "JitNativeStateNanoseconds",
         "JitNativeRunNanoseconds",
         "JitFaultDispatches",
@@ -50,12 +59,13 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         "JitAtomicCallbacks",
         "JitInvalidationCalls",
         "JitInvalidationBytes",
-        "JitFullInvalidations",
         "JitInvalidationNanoseconds",
         "JitContextLoads",
         "JitContextSaves",
+        "JitInternalHaltResumes",
+        "JitAdmissionNanoseconds",
     ];
-    let values: [u64; 18] =
+    let values: [u64; 17] =
         std::array::from_fn(|index| COUNTERS[index].load(std::sync::atomic::Ordering::Relaxed));
     let total = values[Counter::ReadCallbacks as usize]
         + values[Counter::WriteCallbacks as usize]

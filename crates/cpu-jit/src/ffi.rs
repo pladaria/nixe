@@ -18,24 +18,12 @@ pub struct Exit {
     pub ticks: u64,
 }
 unsafe extern "C" {
-    pub fn nixe_dynarmic_resolve_fault(
-        core: *mut c_void,
-        pc: u64,
-        persistent: bool,
-        call: *mut u64,
-        ret: *mut u64,
-    ) -> bool;
+    pub fn nixe_dynarmic_resolve_fault(pc: u64, call: *mut u64, ret: *mut u64) -> bool;
     fn nixe_dynarmic_error() -> *const c_char;
-    #[cfg(not(target_arch = "x86_64"))]
-    pub fn nixe_dynarmic_monitor_create(count: usize) -> *mut c_void;
-    #[cfg(not(target_arch = "x86_64"))]
-    pub fn nixe_dynarmic_monitor_destroy(monitor: *mut c_void);
     pub fn nixe_dynarmic_create(
         cb: Callbacks,
-        monitor: *mut c_void,
-        id: usize,
         arena: usize,
-        exclusive_table: usize,
+        page_table: usize,
         bits: usize,
         frequency: u32,
         ctr: u32,
@@ -45,6 +33,10 @@ unsafe extern "C" {
     pub fn nixe_dynarmic_halt(core: *mut c_void);
     pub fn nixe_dynarmic_clear_halt(core: *mut c_void);
     pub fn nixe_dynarmic_clear_exclusive(core: *mut c_void);
+    pub fn nixe_dynarmic_reserve_exclusive(
+        core: *mut c_void,
+        reservation: *const nixe_memory::NativeReservation,
+    );
     pub fn nixe_dynarmic_invalidate(core: *mut c_void, addr: u64, size: usize) -> bool;
     pub fn nixe_dynarmic_load(core: *mut c_void, state: *const A64State);
     pub fn nixe_dynarmic_save(core: *mut c_void, state: *mut A64State);

@@ -8,7 +8,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     })?;
     let monitor = device.validation_monitor();
+    let memory = nixe_memory::Machine::new(4 * 1024 * 1024 * 1024)?;
     let mut renderer = nixe_gpu_vulkan::NativeGpuExecution::new(
+        memory.clone(),
         device,
         nixe_gpu_maxwell::MAXWELL_SHADER_NAMESPACE,
         nixe_gpu_vulkan::cache::CacheConfiguration::default(),
@@ -18,8 +20,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frontend = nixe_gpu_maxwell::MaxwellNativeFrontend::new(
         renderer.device_profile().shader_compiler.clone(),
     );
-    let video =
-        nixe_horizon::VideoSystem::with_gpu_frontend(Some(window.mailbox()), renderer, frontend);
+    let video = nixe_horizon::VideoSystem::with_gpu_frontend(
+        memory,
+        Some(window.mailbox()),
+        renderer,
+        frontend,
+    );
     let control = window.control();
     let host = window.keyboard_host();
     let session = host.open(

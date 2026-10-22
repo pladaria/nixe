@@ -3,13 +3,12 @@
 //! https://github.com/torvalds/linux/blob/master/arch/arm64/include/uapi/asm/sigcontext.h
 //! https://github.com/torvalds/linux/blob/master/arch/x86/include/uapi/asm/sigcontext.h
 
-use super::{FaultDisposition, FaultSlot, NativeFaultSite};
+use super::{FaultDisposition, FaultSlot};
 use std::{marker::PhantomData, ptr::NonNull, sync::atomic::Ordering};
 
 /// Borrowed during dispatch or after escape, never across worker-slot reuse.
 pub struct CapturedFault<'a> {
     pub(super) slot: NonNull<FaultSlot>,
-    pub(super) site: Option<&'a NativeFaultSite>,
     pub(super) lifetime: PhantomData<&'a FaultSlot>,
 }
 
@@ -58,12 +57,20 @@ impl CapturedFault<'_> {
             .fault_address
             .load(Ordering::Relaxed)
     }
-
-    /// Fixed-stub/legacy dispatch only. After escape the registry may have been
-    /// dropped; the execution owner must attribute native_pc against its live code cache.
-    pub fn site(&self) -> &NativeFaultSite {
-        self.site
-            .expect("site is only available during attributed dispatch")
+    /// x86 page-fault error code W/R bit from the captured kernel context.
+    /// https://github.com/torvalds/linux/blob/master/arch/x86/include/asm/trap_pf.h
+    pub fn writes_memory(&self) -> Option<bool> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.context().gregs[libc::REG_TRAPNO as usize] != 14 {
+                return None;
+            }
+            Some(self.context().gregs[libc::REG_ERR as usize] & 2 != 0)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            None
+        }
     }
 
     fn context(&self) -> &libc::mcontext_t {

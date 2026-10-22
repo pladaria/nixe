@@ -75,6 +75,7 @@ impl ShaderInputs {
         configuration: &Configuration,
         graphics: Option<&GraphicsRuntimeState>,
     ) -> Result<Vec<StageArtifact>> {
+        crate::trace::event("shader_compile", self.stages.len() as u64, 0, 0);
         let stages = self.prepare(compiler, configuration, graphics)?;
         let mut bindings = Bindings::default();
         stages

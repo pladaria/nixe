@@ -9,13 +9,16 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use nixe_cpu::memory::MemoryPermissions;
-use nixe_memory::{CanonicalAllocation, CanonicalBackingRange, GuestVirtualAddress};
+use nixe_memory::GuestVirtualAddress;
+use nixe_memory::{Access, Allocation, MemoryError};
 
 mod event;
 mod port;
 mod session;
 pub(crate) use event::EventWatchRegistration;
-pub use event::{EventObject, EventWaitOutcome, ReadableEventObject, WritableEventObject};
+pub use event::{
+    EventFuture, EventObject, EventWaitOutcome, ReadableEventObject, WritableEventObject,
+};
 use port::PortState;
 pub use port::{PortEndpoint, PortError, PortObject};
 pub use session::{
@@ -25,9 +28,6 @@ pub use session::{
 
 const FIRST_HANDLE: u32 = 1;
 const LAST_HANDLE: u32 = 0x7fff_ffff;
-/// Safety limit for the temporary host-backed shared-memory object.
-pub const MAX_SHARED_MEMORY_BYTES: usize = 256 * 1024 * 1024;
-
 /// Type-erased value retained by a process handle.
 ///
 /// The blanket implementation lets platform layers add object types without
@@ -62,6 +62,14 @@ impl HandleObject {
         }
     }
 
+    pub fn from_arc<T: HandleValue>(value: Arc<T>) -> Self {
+        Self { value }
+    }
+    pub fn downcast<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        let value: Arc<dyn Any + Send + Sync> = self.value.clone();
+        value.downcast::<T>().ok()
+    }
+
     #[must_use]
     pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
         self.value.as_ref().as_any().downcast_ref()
@@ -90,6 +98,11 @@ impl PartialEq for HandleObject {
 }
 
 impl Eq for HandleObject {}
+impl std::hash::Hash for HandleObject {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(Arc::as_ptr(&self.value).cast::<()>(), state);
+    }
+}
 
 impl Debug for HandleObject {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
@@ -173,112 +186,142 @@ impl PartialEq for ThreadObject {
 }
 
 impl Eq for ThreadObject {}
-/// Guest-owned memory range exported through a Horizon transfer-memory handle.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransferMemoryObject {
+/// Original owner and physical pins survive duplicated/exported transfer handles.
+#[derive(Clone)]
+pub struct TransferMemoryObject(Arc<TransferMemory>);
+struct TransferMemory {
+    owner: Arc<crate::memory::ProcessMemory>,
     address: GuestVirtualAddress,
     size: u64,
     permissions: MemoryPermissions,
-    backing: CanonicalBackingRange,
+    before: crate::memory::Mapping,
+    ranges: nixe_memory::CapturedMemory,
 }
-
+impl Debug for TransferMemoryObject {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransferMemoryObject")
+            .field("address", &self.0.address)
+            .field("size", &self.0.size)
+            .field("permissions", &self.0.permissions)
+            .finish_non_exhaustive()
+    }
+}
+impl PartialEq for TransferMemoryObject {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for TransferMemoryObject {}
 impl TransferMemoryObject {
-    #[must_use]
-    pub const fn new(
+    pub fn new(
+        owner: Arc<crate::memory::ProcessMemory>,
         address: GuestVirtualAddress,
         size: u64,
         permissions: MemoryPermissions,
-        backing: CanonicalBackingRange,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, crate::memory::MappingError> {
+        let (before, ranges) = owner.lock_transfer(address, size, permissions)?;
+        Ok(Self(Arc::new(TransferMemory {
+            owner,
             address,
             size,
             permissions,
-            backing,
+            before,
+            ranges,
+        })))
+    }
+    pub fn address(&self) -> GuestVirtualAddress {
+        self.0.address
+    }
+    pub fn size(&self) -> u64 {
+        self.0.size
+    }
+    pub fn permissions(&self) -> MemoryPermissions {
+        self.0.permissions
+    }
+    pub fn ranges(&self) -> &nixe_memory::CapturedMemory {
+        &self.0.ranges
+    }
+}
+impl Drop for TransferMemory {
+    fn drop(&mut self) {
+        if let Err(error) = self.owner.unlock_transfer(
+            self.address,
+            self.size,
+            self.permissions,
+            self.before,
+            &self.ranges,
+        ) {
+            self.owner.space().fail(MemoryError::Execution(
+                format!("releasing transfer memory: {error}").into(),
+            ));
         }
-    }
-
-    #[must_use]
-    pub const fn address(&self) -> GuestVirtualAddress {
-        self.address
-    }
-
-    #[must_use]
-    pub const fn size(&self) -> u64 {
-        self.size
-    }
-
-    #[must_use]
-    pub const fn permissions(&self) -> MemoryPermissions {
-        self.permissions
-    }
-
-    /// Returns the retained canonical bytes denoted by the handle.
-    #[must_use]
-    pub const fn backing(&self) -> &CanonicalBackingRange {
-        &self.backing
     }
 }
 
-/// Shared-memory identity backed by device-neutral canonical storage.
-#[derive(Clone, Debug)]
+/// Shared machine allocation. Duplicate handles retain the same physical bytes.
+#[derive(Clone)]
 pub struct SharedMemoryObject {
-    backing: CanonicalAllocation,
+    allocation: Allocation,
     size: usize,
     remote_permissions: MemoryPermissions,
 }
-
+impl Debug for SharedMemoryObject {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedMemoryObject")
+            .field("allocation", &self.allocation.identity())
+            .field("size", &self.size)
+            .field("remote_permissions", &self.remote_permissions)
+            .finish()
+    }
+}
 impl SharedMemoryObject {
-    pub fn for_process(
-        memory: &nixe_cpu::memory::ExecutionMemory,
+    pub fn new(
+        allocation: Allocation,
         size: usize,
         remote_permissions: MemoryPermissions,
     ) -> Result<Self, HandleError> {
-        if size > MAX_SHARED_MEMORY_BYTES {
-            return Err(HandleError::ObjectTooLarge(size));
+        if size == 0
+            || allocation.bytes()
+                != (size as u64).div_ceil(nixe_memory::PAGE_SIZE) * nixe_memory::PAGE_SIZE
+        {
+            return Err(HandleError::InvalidRange);
         }
-        let backing = memory
-            .allocate_shared_backing(size)
-            .map_err(|_| HandleError::AllocationFailed)?;
         Ok(Self {
-            backing,
+            allocation,
             size,
             remote_permissions,
         })
     }
-
-    #[must_use]
-    pub fn backing(&self) -> &CanonicalAllocation {
-        &self.backing
+    pub fn allocation(&self) -> &Allocation {
+        &self.allocation
     }
-    #[must_use]
     pub const fn size(&self) -> usize {
         self.size
     }
-
-    #[must_use]
     pub const fn remote_permissions(&self) -> MemoryPermissions {
         self.remote_permissions
     }
-
-    /// Copies bytes into canonical backing shared by every duplicate handle.
-    pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), HandleError> {
-        self.backing
-            .write(offset, bytes)
-            .map_err(|error| match error {
-                nixe_memory::CanonicalAllocationError::InvalidRange => HandleError::InvalidRange,
-                error => HandleError::MemoryWrite(error.to_string().into()),
-            })
+    fn validate_range(&self, offset: usize, bytes: usize) -> Result<(), MemoryError> {
+        if bytes == 0 || offset.checked_add(bytes).is_none_or(|end| end > self.size) {
+            return Err(MemoryError::Invalid(
+                "shared-memory access is outside its object",
+            ));
+        }
+        Ok(())
     }
-
-    /// Copies bytes out of canonical shared backing.
-    pub fn read(&self, offset: usize, output: &mut [u8]) -> Result<(), HandleError> {
-        self.backing
-            .read(offset, output)
-            .map_err(|error| match error {
-                nixe_memory::CanonicalAllocationError::InvalidRange => HandleError::InvalidRange,
-                _ => HandleError::BackingAccess,
-            })
+    pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<Access<()>, MemoryError> {
+        if bytes.is_empty() {
+            return Ok(Access::Ready(()));
+        }
+        self.validate_range(offset, bytes.len())?;
+        self.allocation.write(offset as u64, bytes)
+    }
+    pub fn read(&self, offset: usize, bytes: usize) -> Result<Access<Box<[u8]>>, MemoryError> {
+        if bytes == 0 {
+            return Ok(Access::Ready(Box::new([])));
+        }
+        self.validate_range(offset, bytes)?;
+        self.allocation.read(offset as u64, bytes)
     }
 }
 
@@ -287,8 +330,9 @@ impl SharedMemoryObject {
 pub enum HandleError {
     Exhausted,
     AllocationFailed,
+    Closed,
+    IdentityExhausted,
     InvalidHandle(u32),
-    ObjectTooLarge(usize),
     InvalidRange,
     BackingAccess,
     MemoryWrite(Box<str>),
@@ -297,13 +341,11 @@ pub enum HandleError {
 impl Display for HandleError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Closed => formatter.write_str("process handle table is closed"),
+            Self::IdentityExhausted => formatter.write_str("handle reservation identity exhausted"),
             Self::Exhausted => formatter.write_str("process handle table is exhausted"),
             Self::AllocationFailed => formatter.write_str("runtime object allocation failed"),
             Self::InvalidHandle(handle) => write!(formatter, "invalid process handle {handle:#x}"),
-            Self::ObjectTooLarge(size) => write!(
-                formatter,
-                "runtime object size {size:#x} exceeds its safety limit"
-            ),
             Self::InvalidRange => formatter.write_str("object byte range is outside its backing"),
             Self::BackingAccess => {
                 formatter.write_str("canonical object backing could not complete the access")
@@ -315,142 +357,8 @@ impl Display for HandleError {
 
 impl Error for HandleError {}
 
-/// Process-owned handle table with deterministic lowest-free allocation.
-#[derive(Debug)]
-pub struct HandleTable {
-    objects: BTreeMap<u32, HandleObject>,
-    recycled: BTreeSet<u32>,
-    next_handle: u32,
-    capacity_limit: usize,
-    changed: EventObject,
-}
-
-impl Default for HandleTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl HandleTable {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            objects: BTreeMap::new(),
-            recycled: BTreeSet::new(),
-            next_handle: FIRST_HANDLE,
-            capacity_limit: (LAST_HANDLE - FIRST_HANDLE + 1) as usize,
-            changed: EventObject::new(),
-        }
-    }
-
-    /// Creates a table with a bounded number of simultaneously live handles.
-    ///
-    /// This models the per-process handle-table capacity carried by Horizon
-    /// process metadata while retaining the ordinary numeric handle range.
-    #[must_use]
-    pub fn with_capacity_limit(capacity_limit: usize) -> Self {
-        Self {
-            objects: BTreeMap::new(),
-            recycled: BTreeSet::new(),
-            next_handle: FIRST_HANDLE,
-            capacity_limit,
-            changed: EventObject::new(),
-        }
-    }
-
-    pub fn insert<T>(&mut self, value: T) -> Result<u32, HandleError>
-    where
-        T: HandleValue,
-    {
-        self.insert_object(HandleObject::new(value))
-    }
-
-    pub fn insert_object(&mut self, object: HandleObject) -> Result<u32, HandleError> {
-        if self.objects.len() >= self.capacity_limit {
-            return Err(HandleError::Exhausted);
-        }
-        let handle = if let Some(handle) = self.recycled.pop_first() {
-            handle
-        } else {
-            let handle = self.next_handle;
-            if handle > LAST_HANDLE {
-                return Err(HandleError::Exhausted);
-            }
-            self.next_handle = handle.saturating_add(1);
-            handle
-        };
-        self.objects.insert(handle, object);
-        self.changed.signal();
-        Ok(handle)
-    }
-
-    #[must_use]
-    pub fn get(&self, handle: u32) -> Option<&HandleObject> {
-        self.objects.get(&handle)
-    }
-
-    #[must_use]
-    pub fn get_as<T: Any>(&self, handle: u32) -> Option<&T> {
-        self.get(handle)?.downcast_ref()
-    }
-
-    pub fn duplicate(&mut self, handle: u32) -> Result<u32, HandleError> {
-        let object = self
-            .objects
-            .get(&handle)
-            .cloned()
-            .ok_or(HandleError::InvalidHandle(handle))?;
-        self.insert_object(object)
-    }
-
-    pub fn close(&mut self, handle: u32) -> Result<HandleObject, HandleError> {
-        let object = self
-            .objects
-            .remove(&handle)
-            .ok_or(HandleError::InvalidHandle(handle))?;
-        self.recycled.insert(handle);
-        self.changed.signal();
-        Ok(object)
-    }
-
-    #[must_use]
-    pub fn changed_event(&self) -> ReadableEventObject {
-        ReadableEventObject(self.changed.clone())
-    }
-
-    /// Moves one object to another process table without cloning its runtime state.
-    pub fn transfer_to(&mut self, destination: &mut Self, handle: u32) -> Result<u32, HandleError> {
-        if !self.objects.contains_key(&handle) {
-            return Err(HandleError::InvalidHandle(handle));
-        }
-        if destination.objects.len() >= destination.capacity_limit
-            || (destination.next_handle > LAST_HANDLE && destination.recycled.is_empty())
-        {
-            return Err(HandleError::Exhausted);
-        }
-        let object = self.close(handle)?;
-        let inserted = destination
-            .insert_object(object)
-            .expect("destination capacity and numeric handle were reserved before source removal");
-        Ok(inserted)
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.objects.len()
-    }
-
-    /// Returns the maximum number of simultaneously live handles.
-    #[must_use]
-    pub const fn capacity_limit(&self) -> usize {
-        self.capacity_limit
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.objects.is_empty()
-    }
-}
+mod table;
+pub use table::{HandleReservation, HandleTable};
 
 #[cfg(test)]
 mod tests {
@@ -465,22 +373,22 @@ mod tests {
 
     #[test]
     fn allocation_duplicate_transfer_and_close_preserve_object_lifetime() {
-        let mut source = HandleTable::new();
+        let source = HandleTable::new();
         let event = EventObject::new();
         let first = source.insert(event.clone()).unwrap();
         let duplicate = source.duplicate(first).unwrap();
         event.signal();
         assert!(
             source
-                .get_as::<EventObject>(duplicate)
+                .lookup_as::<EventObject>(duplicate)
                 .unwrap()
                 .is_signalled()
         );
 
-        let mut destination = HandleTable::new();
-        let transferred = source.transfer_to(&mut destination, duplicate).unwrap();
-        assert!(source.get(duplicate).is_none());
-        assert!(destination.get_as::<EventObject>(transferred).is_some());
+        let destination = HandleTable::new();
+        let transferred = source.transfer_to(&destination, duplicate).unwrap();
+        assert!(source.lookup(duplicate).is_none());
+        assert!(destination.lookup_as::<EventObject>(transferred).is_some());
         let closed = source.close(first).unwrap();
         assert!(closed.is::<EventObject>());
         assert!(matches!(
@@ -505,7 +413,7 @@ mod tests {
 
     #[test]
     fn allocation_reuses_the_lowest_closed_handle() {
-        let mut handles = HandleTable::new();
+        let handles = HandleTable::new();
         let first = handles.insert(ThreadObject::new(1)).unwrap();
         let second = handles.insert(ThreadObject::new(2)).unwrap();
         assert_eq!((first, second), (1, 2));
@@ -515,7 +423,7 @@ mod tests {
 
     #[test]
     fn capacity_limit_counts_live_handles_and_allows_reuse_after_close() {
-        let mut handles = HandleTable::with_capacity_limit(1);
+        let handles = HandleTable::with_capacity_limit(1);
         let first = handles.insert(ThreadObject::new(1)).unwrap();
         assert_eq!(
             handles.insert(ThreadObject::new(2)),
@@ -527,32 +435,103 @@ mod tests {
 
     #[test]
     fn shared_memory_is_bounded_and_has_shared_identity() {
-        let process = nixe_cpu::memory::ExecutionMemory::new();
-        let memory =
-            SharedMemoryObject::for_process(&process, 0x1000, MemoryPermissions::READ_WRITE)
-                .unwrap();
+        let machine = nixe_memory::Machine::new(2 * nixe_memory::PAGE_SIZE).unwrap();
+        let account = machine.account(2 * nixe_memory::PAGE_SIZE).unwrap();
+        let memory = SharedMemoryObject::new(
+            account.allocate(nixe_memory::PAGE_SIZE).unwrap(),
+            0x1000,
+            MemoryPermissions::READ_WRITE,
+        )
+        .unwrap();
         let duplicate = memory.clone();
         assert_eq!(memory.size(), 0x1000);
-        assert_eq!(memory.backing().store(), duplicate.backing().store());
-        let range = memory
-            .backing()
-            .backing_range(memory.remote_permissions())
-            .unwrap();
-        let cpu_writes = nixe_memory::CanonicalCpuWriteDependency::capture(&range).unwrap();
-        assert_eq!(range.size(), 0x1000);
-        memory.write(3, &[0x5a]).unwrap();
-        let mut byte = [0];
-        duplicate.read(3, &mut byte).unwrap();
-        assert_eq!(byte, [0x5a]);
-        assert!(!cpu_writes.remains_current());
+        assert_eq!(
+            memory.allocation().identity(),
+            duplicate.allocation().identity()
+        );
         assert!(matches!(
-            SharedMemoryObject::for_process(
-                &process,
-                MAX_SHARED_MEMORY_BYTES + 1,
+            memory.write(3, &[0x5a]).unwrap(),
+            Access::Ready(())
+        ));
+        let Access::Ready(byte) = duplicate.read(3, 1).unwrap() else {
+            panic!("plain RAM is ready")
+        };
+        assert_eq!(&*byte, &[0x5a]);
+        assert!(duplicate.read(0xfff, 2).is_err());
+        assert!(matches!(
+            SharedMemoryObject::new(
+                account.allocate(nixe_memory::PAGE_SIZE).unwrap(),
+                0x2000,
                 MemoryPermissions::READ_WRITE
             ),
-            Err(HandleError::ObjectTooLarge(_))
+            Err(HandleError::InvalidRange)
         ));
+        drop(memory);
+        assert_eq!(account.used_bytes(), nixe_memory::PAGE_SIZE);
+        drop(duplicate);
+        assert_eq!(machine.statistics().allocated_bytes, 0);
+    }
+
+    #[test]
+    fn shared_memory_owned_access_preserves_aliases_and_excludes_page_padding() {
+        use nixe_memory::{AccessOperation, AddressSpace, AddressWidth, Observation, PAGE_SIZE};
+        let machine = nixe_memory::Machine::new(PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(PAGE_SIZE)
+            .unwrap()
+            .allocate(PAGE_SIZE)
+            .unwrap();
+        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
+        let base = GuestVirtualAddress::new(PAGE_SIZE);
+        space
+            .map(
+                base,
+                allocation.clone(),
+                0,
+                PAGE_SIZE,
+                MemoryPermissions::READ,
+            )
+            .unwrap();
+        let memory =
+            SharedMemoryObject::new(allocation, PAGE_SIZE as usize - 7, MemoryPermissions::READ)
+                .unwrap();
+        let captured = space.capture(base, 4, MemoryPermissions::READ).unwrap();
+        let observation = Observation::default();
+        machine
+            .access_captured(
+                &captured,
+                AccessOperation::ReadObserved(observation.clone()),
+            )
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        memory
+            .write(0, &[1, 2, 3, 4])
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        assert!(observation.is_invalid());
+        assert_eq!(
+            space.read_value(base, 4).unwrap().into_ready().unwrap(),
+            0x04030201
+        );
+        assert!(memory.write(memory.size() - 1, &[9, 9]).is_err());
+        assert!(memory.read(memory.size(), 1).is_err());
+        assert!(memory.write(usize::MAX, &[9]).is_err());
+        assert_eq!(
+            &*memory
+                .read(memory.size() - 1, 1)
+                .unwrap()
+                .into_ready()
+                .unwrap(),
+            &[0]
+        );
+        space.unmap(base, PAGE_SIZE).unwrap();
+        drop(captured);
+        memory.write(0, &[5]).unwrap().into_ready().unwrap();
+        assert_eq!(&*memory.read(0, 1).unwrap().into_ready().unwrap(), &[5]);
+        drop(memory);
+        assert_eq!(machine.statistics().allocated_bytes, 0);
     }
 
     #[test]

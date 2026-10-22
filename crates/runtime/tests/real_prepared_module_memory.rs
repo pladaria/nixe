@@ -5,22 +5,21 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use nixe_cpu::memory::{
-    CpuMemory, DataAccessFaultReason, InstructionMemory, MemoryAccess, MemoryAccessSize,
-    MemoryPermissions as CpuPermissions, MemoryValue, SYNTHETIC_PAGE_SIZE, SyntheticMemory,
-};
 use nixe_loader_content::{
-    ExeFsLoader, NcaContentType, NcaKeySet, NcaLoader, NcaSectionType, NspLoader, XciLoader,
+    ExeFsLoader, NcaContentType, NcaKeySet, NcaLoader, NcaSectionType, NspLoader, NszLoader,
+    XciLoader,
 };
 use nixe_loader_executable::{
     ExternalSymbol, MemoryPermissions as LoaderPermissions, NsoLoader, PreparationConfig,
     PreparedModule, SymbolResolution,
 };
 use nixe_loader_storage::{FileStorage, FormatLoader, StorageRef};
-use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
+use nixe_memory::{
+    Access, AccessOperation, AccessResult, AddressWidth, GuestVirtualAddress, Machine,
+    MemoryPermissions as CpuPermissions, PAGE_SIZE,
+};
 use nixe_runtime::install_prepared_module;
-
-const SPACE: AddressSpaceId = AddressSpaceId::new(0x100);
+use nixe_runtime::memory::ProcessMemory;
 
 fn deterministic_runtime_export(symbol: ExternalSymbol<'_>) -> SymbolResolution {
     let hash = symbol
@@ -52,6 +51,17 @@ fn package_entries(path: &Path) -> Vec<(String, StorageRef)> {
                         .open(entry.name())
                         .expect("open XCI entry")
                         .expect("listed XCI entry"),
+                )
+            })
+            .collect()
+    } else if extension.eq_ignore_ascii_case("nsz") {
+        let nsz = NszLoader::load(source).expect("parse NSZ");
+        nsz.entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.logical_name().to_owned(),
+                    nsz.open_entry(entry).expect("open logical NCA"),
                 )
             })
             .collect()
@@ -149,7 +159,7 @@ fn prepare_modules(
                 .last()
                 .expect("prepared main has mappings")
                 .guest_end()
-                .checked_add(SYNTHETIC_PAGE_SIZE as u64)
+                .checked_add(PAGE_SIZE)
                 .expect("dependency placement overflows");
             let dependency = NsoLoader::load(
                 exefs
@@ -185,47 +195,34 @@ fn cpu_permissions(permissions: LoaderPermissions) -> CpuPermissions {
     }
 }
 
-fn verify_module(memory: &SyntheticMemory, module: &PreparedModule, pages: &mut BTreeSet<u64>) {
+fn verify_module(memory: &ProcessMemory, module: &PreparedModule, pages: &mut BTreeSet<u64>) {
     for mapping in module.mappings() {
         let expected_permissions = cpu_permissions(mapping.permissions());
-        for (index, bytes) in mapping
-            .bytes()
-            .chunks_exact(SYNTHETIC_PAGE_SIZE)
-            .enumerate()
-        {
-            let address = GuestVirtualAddress::new(
-                mapping.guest_address() + (index * SYNTHETIC_PAGE_SIZE) as u64,
-            );
-            let info = memory.mapping_info(SPACE, address).expect("installed page");
+        for (index, bytes) in mapping.bytes().chunks_exact(PAGE_SIZE as usize).enumerate() {
+            let address =
+                GuestVirtualAddress::new(mapping.guest_address() + index as u64 * PAGE_SIZE);
+            let info = memory
+                .space()
+                .translate(address, expected_permissions)
+                .expect("installed page");
             assert_eq!(info.permissions, expected_permissions);
-            assert!(pages.insert(info.physical_page.get()));
-            assert_ne!(info.permissions, CpuPermissions::READ_WRITE_EXECUTE);
-            if mapping.permissions().is_readable() {
-                assert_eq!(
-                    memory
-                        .read(SPACE, address, MemoryAccess::normal(MemoryAccessSize::Byte),)
-                        .expect("read installed byte")
-                        .value,
-                    MemoryValue::U8(bytes[0])
-                );
-            }
-            if mapping.permissions().is_executable() {
-                assert_eq!(
-                    memory
-                        .fetch32(SPACE, address)
-                        .expect("fetch installed code")
-                        .bits,
-                    u32::from_le_bytes(bytes[..4].try_into().expect("instruction bytes"))
-                );
-                if !mapping.permissions().is_readable() {
-                    assert_eq!(
-                        memory
-                            .read(SPACE, address, MemoryAccess::normal(MemoryAccessSize::Byte),)
-                            .expect_err("execute-only page must reject data reads")
-                            .reason,
-                        DataAccessFaultReason::ReadPermissionDenied
-                    );
-                }
+            assert!(pages.insert(info.physical.get()));
+            assert_ne!(info.permissions, CpuPermissions::ALL);
+            let ranges = memory
+                .space()
+                .capture(address, PAGE_SIZE, expected_permissions)
+                .unwrap();
+            let Access::Ready(AccessResult::Read(actual)) = memory
+                .account()
+                .machine()
+                .access_captured(&ranges, AccessOperation::Read)
+                .unwrap()
+            else {
+                panic!("private image is ready")
+            };
+            assert_eq!(&*actual, bytes);
+            if !mapping.permissions().is_readable() {
+                assert!(memory.space().read_value(address, 1).is_err());
             }
         }
     }
@@ -248,21 +245,17 @@ fn installs_real_main_and_dependency_into_runtime_memory() {
         })
     }));
 
-    let mut memory = SyntheticMemory::new();
-    install_prepared_module(&mut memory, SPACE, &dependency).expect("install dependency");
-    install_prepared_module(&mut memory, SPACE, &main).expect("install main");
-    let fetched = memory
-        .fetch32(SPACE, GuestVirtualAddress::new(main.entry_address()))
-        .expect("fetch installed main entry");
-    assert_eq!(
-        fetched.bits,
-        u32::from_le_bytes(
-            main.read_guest(main.entry_address(), 4)
-                .expect("prepared entry bytes")
-                .try_into()
-                .expect("instruction bytes")
-        )
-    );
+    let machine = Machine::switch_ram().unwrap();
+    let memory = ProcessMemory::new(
+        machine.account(nixe_memory::DEFAULT_RAM_BYTES).unwrap(),
+        machine.account(machine.arena().capacity()).unwrap(),
+        AddressWidth::Bits39,
+        nixe_runtime::ProcessVirtualRegion::new(GuestVirtualAddress::new(0x1000000), 0x400000),
+        0,
+    )
+    .unwrap();
+    install_prepared_module(&memory, &dependency, false).expect("install dependency");
+    install_prepared_module(&memory, &main, false).expect("install main");
 
     let mut physical_pages = BTreeSet::new();
     verify_module(&memory, &dependency, &mut physical_pages);

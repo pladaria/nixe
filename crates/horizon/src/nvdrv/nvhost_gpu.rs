@@ -413,6 +413,11 @@ impl NvHostGpu {
     pub(super) fn pending_submission_count(&self) -> usize {
         self.scheduler.pending_count()
     }
+
+    #[cfg(test)]
+    pub(super) fn accepted_submission_count(&self) -> u64 {
+        self.next_frontend_submission - 1
+    }
 }
 
 fn is_legacy_submit_gpfifo(request: u32) -> bool {
@@ -520,8 +525,8 @@ fn submit_gpfifo(
     let following_frontend_submission = next_frontend_submission
         .checked_add(1)
         .ok_or_else(|| unsupported_state(descriptor, request))?;
-    let validated =
-        resolve_gpfifo_submission(&channel, frontend, decoded, address_space).map_err(|error| {
+    let validated = resolve_gpfifo_submission(&channel, frontend, decoded, address_space.memory())
+        .map_err(|error| {
             NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::GpfifoMemory {
                 context: NvDrvErrorContext::new(
                     descriptor.kind(),
@@ -584,7 +589,7 @@ fn submit_gpfifo(
         .filter(|address_space| address_space.id() == next_address_space)
         .ok_or_else(|| unsupported_state(descriptor, request))?;
     let dispatch = scheduler
-        .dispatch_next(dependency_reached, dispatch_address_space)
+        .dispatch_next(dependency_reached, dispatch_address_space.memory())
         .map_err(|error| scheduling_error(descriptor, request, error))?
         .ok_or_else(|| unsupported_state(descriptor, request))?;
     let expected_completion = dispatch
@@ -597,7 +602,7 @@ fn submit_gpfifo(
         request,
         dispatch,
         channel,
-        dispatch_address_space.clone(),
+        dispatch_address_space.memory().clone(),
         reservation.clone(),
         Arc::clone(resources.control),
         permit,

@@ -5,6 +5,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-libc = "0.2"
-nixe-cpu.workspace = true
 nixe-memory.workspace = true
+libc = "0.2"

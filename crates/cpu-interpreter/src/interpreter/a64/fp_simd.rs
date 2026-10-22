@@ -23,7 +23,7 @@ use crate::interpreter::{InstructionStep, InterpreterContext, InterpreterError};
 type MemoryStep = Result<(), MemoryStepError>;
 
 pub(super) fn execute(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
     instruction: Instruction,
@@ -132,15 +132,7 @@ pub(super) fn execute(
         _ => return Err(super::super::unsupported(decoded)),
     };
     if let Some(Err(error)) = result {
-        return match error {
-            MemoryStepError::Data(fault) => {
-                Ok(InstructionStep::data_fault(decoded.location, fault))
-            }
-            MemoryStepError::Direct(detail) => Err(InterpreterError::DirectMemory {
-                source: decoded.location,
-                detail,
-            }),
-        };
+        return Ok(InstructionStep::data_fault(decoded.location, error));
     }
     advance(state);
     Ok(InstructionStep::Continue)
@@ -152,7 +144,7 @@ pub(super) fn execute(
 // ARM DDI 0602 (2025-12):
 // https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMOV--register---Floating-point-Move-register--
 fn vector_pair(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
 ) -> MemoryStep {
@@ -185,7 +177,7 @@ fn vector_pair(
 }
 
 fn vector_multiple_structures(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
     shape: SimdMemoryShape,
@@ -232,7 +224,7 @@ fn vector_multiple_structures(
 }
 
 fn vector_single_structure(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
     shape: SimdMemoryShape,
@@ -296,7 +288,7 @@ fn insert_lane(state: &mut A64State, register: u8, lane: u8, lane_bits: u32, val
 }
 
 fn write_lane(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
     value: u128,
@@ -312,7 +304,7 @@ fn write_lane(
 }
 
 fn vector_transfer(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
     address: GuestVirtualAddress,
@@ -328,7 +320,7 @@ fn vector_transfer(
 }
 
 fn read_vector(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
 ) -> Result<u128, MemoryStepError> {
@@ -343,7 +335,7 @@ fn read_vector(
 }
 
 fn write_vector(
-    context: InterpreterContext<'_, '_>,
+    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
     state: &A64State,

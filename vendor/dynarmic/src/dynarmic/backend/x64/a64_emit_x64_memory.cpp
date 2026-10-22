@@ -286,47 +286,52 @@ void A64EmitX64::GenFastmemFallbacks() {
 #include "dynarmic/backend/x64/physical_exclusive.cpp.inc"
 
 void A64EmitX64::EmitA64ReadMemory8(A64EmitContext& ctx, IR::Inst* inst) {
+    if (conf.physical_exclusive_page_table && !ShouldFastmem(ctx, inst)) { EmitPhysicalMemoryAccess<8, false>(ctx, inst); return; }
     EmitMemoryRead<8, &A64::UserCallbacks::MemoryRead8>(ctx, inst);
 }
 
 void A64EmitX64::EmitA64ReadMemory16(A64EmitContext& ctx, IR::Inst* inst) {
+    if (conf.physical_exclusive_page_table && !ShouldFastmem(ctx, inst)) { EmitPhysicalMemoryAccess<16, false>(ctx, inst); return; }
     EmitMemoryRead<16, &A64::UserCallbacks::MemoryRead16>(ctx, inst);
 }
 
 void A64EmitX64::EmitA64ReadMemory32(A64EmitContext& ctx, IR::Inst* inst) {
+    if (conf.physical_exclusive_page_table && !ShouldFastmem(ctx, inst)) { EmitPhysicalMemoryAccess<32, false>(ctx, inst); return; }
     EmitMemoryRead<32, &A64::UserCallbacks::MemoryRead32>(ctx, inst);
 }
 
 void A64EmitX64::EmitA64ReadMemory64(A64EmitContext& ctx, IR::Inst* inst) {
+    if (conf.physical_exclusive_page_table && !ShouldFastmem(ctx, inst)) { EmitPhysicalMemoryAccess<64, false>(ctx, inst); return; }
     EmitMemoryRead<64, &A64::UserCallbacks::MemoryRead64>(ctx, inst);
 }
 
 void A64EmitX64::EmitA64ReadMemory128(A64EmitContext& ctx, IR::Inst* inst) {
+    if (conf.physical_exclusive_page_table && !ShouldFastmem(ctx, inst)) { EmitPhysicalMemoryAccess<128, false>(ctx, inst); return; }
     EmitMemoryRead<128, &A64::UserCallbacks::MemoryRead128>(ctx, inst);
 }
 
 void A64EmitX64::EmitA64WriteMemory8(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.physical_exclusive_page_table) { EmitPhysicalMemoryWrite<8>(ctx, inst); return; }
+    if (conf.physical_exclusive_page_table && !ShouldFastmem(ctx, inst)) { EmitPhysicalMemoryAccess<8, true>(ctx, inst); return; }
     EmitMemoryWrite<8, &A64::UserCallbacks::MemoryWrite8>(ctx, inst);
 }
 
 void A64EmitX64::EmitA64WriteMemory16(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.physical_exclusive_page_table) { EmitPhysicalMemoryWrite<16>(ctx, inst); return; }
+    if (conf.physical_exclusive_page_table && !ShouldFastmem(ctx, inst)) { EmitPhysicalMemoryAccess<16, true>(ctx, inst); return; }
     EmitMemoryWrite<16, &A64::UserCallbacks::MemoryWrite16>(ctx, inst);
 }
 
 void A64EmitX64::EmitA64WriteMemory32(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.physical_exclusive_page_table) { EmitPhysicalMemoryWrite<32>(ctx, inst); return; }
+    if (conf.physical_exclusive_page_table && !ShouldFastmem(ctx, inst)) { EmitPhysicalMemoryAccess<32, true>(ctx, inst); return; }
     EmitMemoryWrite<32, &A64::UserCallbacks::MemoryWrite32>(ctx, inst);
 }
 
 void A64EmitX64::EmitA64WriteMemory64(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.physical_exclusive_page_table) { EmitPhysicalMemoryWrite<64>(ctx, inst); return; }
+    if (conf.physical_exclusive_page_table && !ShouldFastmem(ctx, inst)) { EmitPhysicalMemoryAccess<64, true>(ctx, inst); return; }
     EmitMemoryWrite<64, &A64::UserCallbacks::MemoryWrite64>(ctx, inst);
 }
 
 void A64EmitX64::EmitA64WriteMemory128(A64EmitContext& ctx, IR::Inst* inst) {
-    if (conf.physical_exclusive_page_table) { EmitPhysicalMemoryWrite<128>(ctx, inst); return; }
+    if (conf.physical_exclusive_page_table && !ShouldFastmem(ctx, inst)) { EmitPhysicalMemoryAccess<128, true>(ctx, inst); return; }
     EmitMemoryWrite<128, &A64::UserCallbacks::MemoryWrite64>(ctx, inst);
 }
 

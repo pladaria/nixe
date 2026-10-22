@@ -216,6 +216,21 @@ pub(crate) struct VideoTransfers {
     pub statistics: VideoStatistics,
 }
 impl VideoTransfers {
+    pub(crate) fn retire_sources(&mut self, completed: u64) {
+        for transfer in &mut self.slots {
+            if transfer
+                .pending
+                .is_some_and(|work| work.tick() <= completed)
+            {
+                // The import retains the device context independently. Only
+                // the pending copy needs the decoder's mapped output surface.
+                // Eden releases its hardware frame after transferring pixels:
+                // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/host1x/ffmpeg.cpp
+                transfer.source = None;
+                transfer.pending = None;
+            }
+        }
+    }
     pub(crate) fn import(
         &mut self,
         cache: &mut VulkanResidency,
@@ -357,5 +372,83 @@ impl VideoTransfers {
         self.statistics.transferred_bytes += u64::from(frame.width) * u64::from(frame.height)
             + u64::from(frame.width.div_ceil(2) * 2) * u64::from(frame.height.div_ceil(2));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Source;
+    #[derive(Debug)]
+    struct Import;
+    impl DeviceImageTransfer for Import {
+        fn wait(&mut self) -> Result<(), Box<str>> {
+            Ok(())
+        }
+    }
+    impl DeviceImageSource for Source {
+        fn import_nv12(
+            &self,
+            _: ExternalImageBuffer,
+        ) -> Result<Box<dyn DeviceImageTransfer>, Box<str>> {
+            Ok(Box::new(Import))
+        }
+    }
+
+    #[test]
+    fn completed_video_copies_release_decoder_surfaces_and_keep_reusable_imports() {
+        let Some(mut cache) =
+            crate::residency::tests::cache(crate::ApiPreference::Auto, 8 * 1024 * 1024)
+        else {
+            return;
+        };
+        if device_uuid(&cache.device).is_none() {
+            return;
+        }
+        let validation = cache.device.validation_monitor();
+        let mut transfers = VideoTransfers::default();
+        let mut sources = Vec::new();
+        let mut tickets = Vec::new();
+        for _ in 0..2 {
+            let source: Arc<dyn DeviceImageSource> = Arc::new(Source);
+            sources.push(Arc::downgrade(&source));
+            let frame = DeviceImageFrame {
+                width: 2,
+                height: 2,
+                source,
+            };
+            let mut transfer = Transfer::new(&mut cache, &frame).unwrap();
+            let work = cache.device.work_ticket().unwrap();
+            transfer.pending = Some(work);
+            transfer.source = Some(Arc::clone(&frame.source));
+            transfers.slots.push(transfer);
+            cache.flush().unwrap();
+            tickets.push(work);
+        }
+        transfers.retire_sources(tickets[0].tick() - 1);
+        assert!(sources.iter().all(|source| source.upgrade().is_some()));
+        for (index, work) in tickets.into_iter().enumerate() {
+            assert!(
+                cache
+                    .device
+                    .wait_for_work(work, std::time::Duration::from_secs(5))
+                    .unwrap()
+            );
+            transfers.retire_sources(work.tick());
+            assert!(sources[index].upgrade().is_none());
+            if index == 0 {
+                assert!(sources[1].upgrade().is_some());
+            }
+            assert_eq!(
+                transfers.slots.len(),
+                2,
+                "external allocations stay reusable"
+            );
+        }
+        drop(transfers);
+        drop(cache);
+        validation.check().unwrap();
     }
 }

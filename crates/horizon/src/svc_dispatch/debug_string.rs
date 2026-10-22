@@ -1,69 +1,94 @@
 use super::*;
-use crate::GuestLogLevel;
 use crate::diagnostics::GuestLogSeverity;
 
 /// OutputDebugString takes a pointer and byte count, not a C string. Empty
 /// ranges succeed before pointer validation; copy failures are InvalidPointer.
 /// https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/svc/kern_svc_debug_string.cpp
 /// https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/kern_debug_log.cpp
-pub(super) fn output_debug_string(
-    context: &mut ExceptionDispatchContext<'_>,
-    policy: GuestLogLevel,
-) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-    let mut address = read_register(context.thread().state(), 0);
-    let mut remaining = read_register(context.thread().state(), 1);
-    if remaining == 0 {
-        result(context, HorizonKernelResult::SUCCESS);
-        return resume();
-    }
-    if address
-        .checked_add(remaining)
-        .is_none_or(|end| end > context.process().address_space_limit())
-    {
-        result(context, HorizonKernelResult::INVALID_POINTER);
-        return resume();
-    }
-
-    // Host filtering does not change guest memory validation. No allocation is
-    // proportional to a guest-provided length; long output uses several records.
-    let level = policy
-        .resolve(GuestLogSeverity::Info)
-        .filter(|level| log::log_enabled!(target: "nixe_horizon::guest", *level));
-    let mut bytes = [0_u8; 0x1000];
-    let mut pending = 0;
-    while remaining != 0 {
-        let count = remaining.min((bytes.len() - pending) as u64) as usize;
-        if let Err(fault) = context.process().memory().read_bytes(
-            context.process().cpu().address_space_id(),
-            GuestVirtualAddress::new(address),
-            &mut bytes[pending..pending + count],
+impl HorizonSvcDispatcher {
+    pub(super) fn output_debug_string(
+        &mut self,
+        context: &mut ExceptionDispatchContext<'_>,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        let address = GuestVirtualAddress::new(read_register(context.thread().state(), 0));
+        let count = read_register(context.thread().state(), 1);
+        if count == 0 {
+            result(context, HorizonKernelResult::SUCCESS);
+            return resume();
+        }
+        if address
+            .get()
+            .checked_add(count)
+            .is_none_or(|end| end > context.process().address_space_limit())
+        {
+            result(context, HorizonKernelResult::INVALID_POINTER);
+            return resume();
+        }
+        let ranges = match context.process().memory().space().capture(
+            address,
+            count,
+            nixe_memory::MemoryPermissions::READ,
         ) {
-            let diagnostic = HorizonSvcFault::GuestMemory {
+            Ok(ranges) => ranges,
+            Err(error) => {
+                return reject(
+                    context,
+                    HorizonSvcFault::MemoryAccess {
+                        immediate: 0x27,
+                        fault: std::sync::Arc::new(error),
+                    },
+                );
+            }
+        };
+        let machine = context.process().memory().account().machine().clone();
+        let level = self
+            .diagnostics
+            .guest_logs_level
+            .resolve(GuestLogSeverity::Info)
+            .filter(|level| log::log_enabled!(target: "nixe_horizon::guest", *level));
+        self.start_owned_svc(context, std::sync::Arc::default(), None, async move {
+            let fault = |fault| HorizonSvcFault::MemoryAccess {
                 immediate: 0x27,
                 fault,
             };
-            return if diagnostic.guest_result().is_some() {
-                reject(context, diagnostic)
-            } else {
-                ExceptionDispatchOutcome::Fault(diagnostic)
-            };
-        }
-        address += count as u64;
-        remaining -= count as u64;
-        let filled = pending + count;
-        let emitted = if remaining == 0 {
-            filled
-        } else {
-            complete_utf8_prefix(&bytes[..filled])
-        };
-        if let Some(level) = level {
-            emit(&bytes[..emitted], level);
-        }
-        bytes.copy_within(emitted..filled, 0);
-        pending = filled - emitted;
+            let ranges = nixe_memory::CapturedMemory::new(ranges)
+                .map_err(|e| fault(std::sync::Arc::new(e)))?;
+            let mut remaining = count;
+            let mut offset = 0;
+            let mut bytes = [0; 0x1000];
+            let mut pending_utf8 = 0;
+            while remaining != 0 {
+                let count = remaining.min((bytes.len() - pending_utf8) as u64) as usize;
+                let output = &mut bytes[pending_utf8..pending_utf8 + count];
+                match machine
+                    .read_captured_into(&ranges, offset, output)
+                    .map_err(|e| fault(std::sync::Arc::new(e)))?
+                {
+                    nixe_memory::Access::Ready(()) => {}
+                    nixe_memory::Access::Pending(pending) => match pending.await.map_err(fault)? {
+                        nixe_memory::AccessResult::Read(data) if data.len() == output.len() => {
+                            output.copy_from_slice(&data)
+                        }
+                        _ => return Err(runtime_fault("debug string read completion")),
+                    },
+                }
+                offset += count as u64;
+                remaining -= count as u64;
+                let filled = pending_utf8 + count;
+                let emitted = if remaining == 0 {
+                    filled
+                } else {
+                    complete_utf8_prefix(&bytes[..filled])
+                };
+                if let Some(level) = level {
+                    emit(&bytes[..emitted], level);
+                }
+                bytes.copy_within(emitted..filled, 0);
+                pending_utf8 = filled - emitted;
+            }
+            Ok(super::memory_wait::SvcCompletion::success(None))
+        })
     }
-    result(context, HorizonKernelResult::SUCCESS);
-    resume()
 }
 
 // Preserve a trailing partial UTF-8 character across host log chunks, while

@@ -1,16 +1,20 @@
 //! Typed failures produced while validating or dispatching Horizon IPC.
 
-use nixe_cpu::memory::DataAccessFault;
-
 use super::message::MessageError;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum IpcWireError {
-    GuestMemory(DataAccessFault),
+    Cancelled,
+    SystemMemory(std::sync::Arc<nixe_memory::MemoryError>),
+    Handle(nixe_runtime::HandleError),
+    GuestAccess {
+        address: nixe_memory::GuestVirtualAddress,
+        bytes: u64,
+        fault: std::sync::Arc<nixe_memory::MemoryError>,
+    },
     Malformed(&'static str),
     Internal(&'static str),
     HostResourceExhausted(&'static str),
-    ResponseCommit(DataAccessFault),
     GraphicsBackend(Box<str>),
     AudioBackend(Box<str>),
     AudioRenderer(Box<str>),
@@ -20,13 +24,10 @@ pub(crate) enum IpcWireError {
     ErrorApplet(Box<crate::ErrorAppletDiagnostic>),
     UnsupportedService(UnsupportedServiceOperation),
     UnsupportedNvDrv(crate::nvdrv::UnsupportedNvDrvOperation),
-    /// A decoded direct nvdrv wait which must suspend at the SVC boundary.
-    PendingNvDrv(crate::nvdrv::PendingNvHostCtrlWait),
-    PendingGpuSubmission(crate::nvdrv::PendingGpuSubmission),
 }
 
 /// Fatal diagnostic retained when a checked HIPC/CMIF operation cannot finish.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct HorizonIpcFault(IpcWireError);
 
 impl HorizonIpcFault {
@@ -50,6 +51,20 @@ impl HorizonIpcFault {
         }
     }
 
+    pub(crate) fn guest_result(&self) -> Option<crate::HorizonKernelResult> {
+        use crate::HorizonKernelResult as Result;
+        use nixe_runtime::HandleError;
+        match &self.0 {
+            IpcWireError::Cancelled => Some(Result::THREAD_TERMINATING),
+            IpcWireError::Handle(HandleError::InvalidHandle(_)) => Some(Result::INVALID_HANDLE),
+            IpcWireError::Handle(HandleError::Exhausted) => Some(Result::OUT_OF_HANDLES),
+            IpcWireError::Handle(HandleError::Closed) => Some(Result::THREAD_TERMINATING),
+            IpcWireError::GuestAccess { fault, .. } if fault.is_access_fault() => {
+                Some(Result::INVALID_POINTER)
+            }
+            _ => None,
+        }
+    }
     pub(crate) const fn from_wire(error: IpcWireError) -> Self {
         Self(error)
     }
@@ -58,19 +73,25 @@ impl HorizonIpcFault {
 impl std::fmt::Display for HorizonIpcFault {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
-            IpcWireError::GuestMemory(fault) => write!(formatter, "guest-memory fault: {fault:?}"),
+            IpcWireError::Cancelled => formatter.write_str("IPC caller terminated"),
+            IpcWireError::SystemMemory(error) => {
+                write!(formatter, "system shared-memory access failed: {error}")
+            }
+            IpcWireError::GuestAccess {
+                address,
+                bytes,
+                fault,
+            } => write!(
+                formatter,
+                "guest access at {address} ({bytes} bytes): {fault}"
+            ),
+            IpcWireError::Handle(error) => write!(formatter, "IPC handle transfer failed: {error}"),
             IpcWireError::Malformed(reason) => write!(formatter, "malformed IPC: {reason}"),
             IpcWireError::Internal(reason) => {
                 write!(formatter, "invalid emulator IPC state: {reason}")
             }
             IpcWireError::HostResourceExhausted(operation) => {
                 write!(formatter, "exhausted host resources while {operation}")
-            }
-            IpcWireError::ResponseCommit(fault) => {
-                write!(
-                    formatter,
-                    "could not commit a prevalidated response: {fault:?}"
-                )
             }
             IpcWireError::GraphicsBackend(reason) => {
                 write!(formatter, "GPU presentation export failed: {reason}")
@@ -107,9 +128,6 @@ impl std::fmt::Display for HorizonIpcFault {
                     formatter,
                     "reached unsupported emulator semantics: {operation}"
                 )
-            }
-            IpcWireError::PendingNvDrv(_) | IpcWireError::PendingGpuSubmission(_) => {
-                formatter.write_str("pending nvdrv wait escaped the scheduler boundary")
             }
         }
     }
@@ -211,7 +229,7 @@ mod tests {
 
     #[test]
     fn unimplemented_service_command_is_a_typed_host_fault() {
-        assert_eq!(
+        assert!(matches!(
             unsupported_service_command::<()>("IExample", 77),
             Err(IpcWireError::UnsupportedService(
                 UnsupportedServiceOperation::Command {
@@ -219,7 +237,7 @@ mod tests {
                     command_id: 77,
                 }
             ))
-        );
+        ));
     }
 
     #[test]

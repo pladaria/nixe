@@ -4,16 +4,16 @@ use crate::{
     device::DeviceOwner, memory::allocate_buffer,
 };
 use ash::vk;
+pub(crate) mod progress;
 #[cfg(feature = "performance-counters")]
 mod timing;
-mod visibility;
 use nixe_gpu::{BackendInstanceId, BackendSubmissionToken};
 use std::{
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -69,6 +69,12 @@ impl WorkTicket {
         BackendSubmissionToken::new(self.instance, self.tick, 1)
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkStatus {
+    Pending,
+    Complete,
+}
 #[must_use = "consume or explicitly discard the reserved readback"]
 #[derive(Debug)]
 pub struct ReadbackTicket {
@@ -84,6 +90,7 @@ impl ReadbackTicket {
 
 #[derive(Debug)]
 pub struct QueueUsage {
+    pub scheduled_tick: u64,
     pub submitted_tick: u64,
     pub completed_tick: u64,
     pub command_pools: usize,
@@ -146,7 +153,7 @@ pub(crate) struct Slot {
     pub retained_views: Vec<Arc<crate::AllocatedImageView>>,
     pub native_pipelines: Vec<Arc<crate::cache::NativePipeline>>,
     pub native_bindings: Vec<Arc<crate::cache::BindingRecord>>,
-    pub pipeline_handles: std::collections::HashSet<vk::Pipeline>,
+    pub pipeline_handles: std::collections::HashSet<usize>,
     pub binding_handles: std::collections::HashSet<vk::DescriptorSet>,
     pub bound_graphics_set: vk::DescriptorSet,
     pub bound_compute_offsets: Vec<u32>,
@@ -157,8 +164,8 @@ pub(crate) struct Slot {
     pub probe_queries: Vec<Arc<crate::probe::ProbeQueries>>,
     #[cfg(feature = "binding-probe")]
     pub descriptors: crate::residency::probe_commands::Descriptors,
-    pub bound_compute: vk::Pipeline,
-    pub bound_graphics: vk::Pipeline,
+    pub bound_compute: usize,
+    pub bound_graphics: usize,
     pub vertex_bindings: rustc_hash::FxHashMap<u32, (vk::Buffer, u64)>,
     pub index_binding: Option<(vk::Buffer, u64, vk::IndexType)>,
     pub push_layout: vk::PipelineLayout,
@@ -222,8 +229,8 @@ impl Slot {
             probe_queries: Vec::new(),
             #[cfg(feature = "binding-probe")]
             descriptors: crate::residency::probe_commands::Descriptors::new(),
-            bound_compute: vk::Pipeline::null(),
-            bound_graphics: vk::Pipeline::null(),
+            bound_compute: 0,
+            bound_graphics: 0,
             vertex_bindings: rustc_hash::FxHashMap::default(),
             index_binding: None,
             push_layout: vk::PipelineLayout::null(),
@@ -305,7 +312,7 @@ pub struct RecordingStatistics {
 }
 pub(crate) struct QueueState {
     recording_handle: crate::dispatch::RecordingHandle,
-    native_submitted: Arc<AtomicU64>,
+    pub(crate) progress: Arc<progress::SubmissionProgress>,
     pub statistics: RecordingStatistics,
     owner: Arc<DeviceOwner>,
     pub timeline: vk::Semaphore,
@@ -314,10 +321,8 @@ pub(crate) struct QueueState {
     pub(crate) configuration: QueueConfiguration,
     pub slots: Vec<Slot>,
     pub recording: Option<usize>,
-    pub submitted: u64,
+    pub scheduled: u64,
     pub completed: u64,
-    visibility: visibility::VisibilityTimeline,
-    visibility_scope: Option<(u64, nixe_memory::DeviceVisibilityPoint)>,
     overflow_capacity: u64,
     pending_stream_reads: Vec<usize>,
     stopped: bool,
@@ -349,7 +354,7 @@ impl QueueState {
             .map_err(|e| VulkanError::vk("vkCreateSemaphore(owner timeline)", e))?;
         let state = Self {
             recording_handle: _dispatch.recording_handle(),
-            native_submitted: Arc::new(AtomicU64::new(0)),
+            progress: Arc::new(progress::SubmissionProgress::default()),
             owner,
             timeline,
             instance: BackendInstanceId::new(instance),
@@ -358,10 +363,8 @@ impl QueueState {
             slots: Vec::new(),
             recording: None,
             statistics: Default::default(),
-            submitted: 0,
+            scheduled: 0,
             completed: 0,
-            visibility: Default::default(),
-            visibility_scope: None,
             overflow_capacity: 0,
             pending_stream_reads: Vec::new(),
             stopped: false,
@@ -371,7 +374,12 @@ impl QueueState {
         Ok(state)
     }
     pub(crate) fn is_device_lost(&self) -> bool {
-        self.lost || self.recording_handle.is_device_lost()
+        self.lost
+            || self.recording_handle.is_device_lost()
+            || self
+                .progress
+                .failure()
+                .is_some_and(|f| f.cause.device_lost())
     }
     pub(crate) fn ticket(&self, tick: u64) -> WorkTicket {
         WorkTicket {
@@ -380,20 +388,25 @@ impl QueueState {
         }
     }
     fn check_running(&self) -> Result<(), VulkanError> {
-        self.recording_handle.check_failure()?;
         if self.stopped {
-            Err(VulkanError::QueueStopped)
-        } else {
-            Ok(())
+            return Err(VulkanError::QueueStopped);
         }
+        if let Some(failure) = self.progress.failure() {
+            return Err(failure.error());
+        }
+        self.recording_handle.check_failure()
     }
     fn error(&mut self, operation: &'static str, result: vk::Result) -> VulkanError {
         self.stopped = true;
         self.lost |= result == vk::Result::ERROR_DEVICE_LOST;
-        VulkanError::vk(operation, result)
+        self.progress.fail(
+            self.completed + 1,
+            progress::NativeFailure::Vulkan { operation, result },
+        );
+        self.progress.failure().unwrap().error()
     }
     fn check_ticket(&self, ticket: WorkTicket) -> Result<(), VulkanError> {
-        let last = self.submitted + u64::from(self.recording.is_some());
+        let last = self.scheduled + u64::from(self.recording.is_some());
         if ticket.instance != self.instance || ticket.tick == 0 || ticket.tick > last {
             return Err(VulkanError::InvalidResource(
                 "foreign or unissued queue ticket",
@@ -402,18 +415,43 @@ impl QueueState {
         Ok(())
     }
     pub fn poll(&mut self) -> Result<u64, VulkanError> {
+        self.refresh_completed()?;
         self.check_running()?;
-        if self.completed == self.submitted {
+        Ok(self.completed)
+    }
+    fn refresh_completed(&mut self) -> Result<u64, VulkanError> {
+        let submitted = self.progress.submitted();
+        if self.completed >= submitted {
             return Ok(self.completed);
         }
         let completed = unsafe { self.owner.device.get_semaphore_counter_value(self.timeline) }
             .map_err(|e| self.error("vkGetSemaphoreCounterValue", e))?;
-        if completed.min(self.submitted) > self.completed {
+        if completed.min(submitted) > self.completed {
             #[cfg(feature = "performance-counters")]
-            self.retire_timings(completed.min(self.submitted))?;
-            self.reclaim(completed.min(self.submitted));
+            self.retire_timings(completed.min(submitted))?;
+            self.progress.observe_completed(completed.min(submitted));
+            self.reclaim(completed.min(submitted));
         }
         Ok(self.completed)
+    }
+    fn poll_work(&mut self, ticket: WorkTicket) -> Result<WorkStatus, VulkanError> {
+        self.check_ticket(ticket)?;
+        if ticket.tick <= self.completed {
+            return Ok(WorkStatus::Complete);
+        }
+        self.progress.check(ticket.tick)?;
+        if self.stopped {
+            return Err(VulkanError::QueueStopped);
+        }
+        if ticket.tick > self.progress.submitted() {
+            return Ok(WorkStatus::Pending);
+        }
+        self.refresh_completed()?;
+        Ok(if ticket.tick <= self.completed {
+            WorkStatus::Complete
+        } else {
+            WorkStatus::Pending
+        })
     }
     #[cfg(feature = "performance-counters")]
     fn retire_timings(&mut self, completed: u64) -> Result<(), VulkanError> {
@@ -431,7 +469,6 @@ impl QueueState {
             nixe_gpu::trace::detail_event("queue_complete", completed, self.completed, 0);
         }
         self.completed = self.completed.max(completed);
-        self.visibility.complete(self.completed);
         for slot in &mut self.slots {
             if !slot.pending_stream_read && slot.tick.max(slot.stream_read_until) <= self.completed
             {
@@ -474,7 +511,7 @@ impl QueueState {
         }
     }
     pub(crate) fn release_stream_uploads(&mut self) {
-        let consumer = self.submitted + u64::from(self.recording.is_some());
+        let consumer = self.scheduled + u64::from(self.recording.is_some());
         let mut reclaim = false;
         for index in self.pending_stream_reads.drain(..) {
             let slot = &mut self.slots[index];
@@ -492,7 +529,7 @@ impl QueueState {
                 .slots
                 .iter()
                 .map(|slot| slot.tick.max(slot.stream_read_until))
-                .filter(|&tick| tick > self.completed && tick <= self.submitted)
+                .filter(|&tick| tick > self.completed && tick <= self.scheduled)
                 .min()
                 .map(|tick| self.ticket(tick)),
             retained_readbacks: self.slots.iter().map(Slot::unread).sum(),
@@ -525,7 +562,7 @@ impl QueueState {
             None => return Err(self.pressure()),
         };
         let tick = self
-            .submitted
+            .scheduled
             .checked_add(1)
             .ok_or(VulkanError::InvalidResource(
                 "submission timeline exhausted",
@@ -533,7 +570,8 @@ impl QueueState {
         let slot = &mut self.slots[index];
         // The slot's previous GPU tick is complete. Reset/begin remain ordered
         // native jobs; no owner/worker round trip is needed to acquire a slot.
-        self.recording_handle.begin(slot.pool, slot.command)?;
+        self.recording_handle
+            .begin(slot.pool, slot.command, tick, Arc::clone(&self.progress))?;
         let slot = &mut self.slots[index];
         #[cfg(feature = "performance-counters")]
         if let Some(timing) = &mut slot.timing {
@@ -548,8 +586,8 @@ impl QueueState {
         }
         #[cfg(feature = "binding-probe")]
         slot.descriptors.reset(&self.owner)?;
-        slot.bound_compute = vk::Pipeline::null();
-        slot.bound_graphics = vk::Pipeline::null();
+        slot.bound_compute = 0;
+        slot.bound_graphics = 0;
         slot.vertex_bindings.clear();
         slot.index_binding = None;
         slot.push_layout = vk::PipelineLayout::null();
@@ -726,7 +764,7 @@ impl QueueState {
         let entry = slot.readbacks.len();
         slot.readbacks.push(Some(destination));
         slot.unread_count += 1;
-        let work = self.ticket(self.submitted + 1);
+        let work = self.ticket(self.scheduled + 1);
         Ok((
             index,
             source,
@@ -781,7 +819,7 @@ impl QueueState {
             index,
             slice,
             ReadbackTicket {
-                work: self.ticket(self.submitted + 1),
+                work: self.ticket(self.scheduled + 1),
                 slot: index,
                 entry,
             },
@@ -959,7 +997,9 @@ impl QueueState {
         // Capture native parameters now. The worker closes and submits this
         // command buffer in FIFO order while the owner prepares following work.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_scheduler.cpp
-        self.recording_handle
+        nixe_gpu::trace::detail_event("queue_schedule", tick, 0, 0);
+        let result = self
+            .recording_handle
             .submit(crate::dispatch::QueueSubmission {
                 queue,
                 command: self.slots[index].command,
@@ -984,37 +1024,48 @@ impl QueueState {
                     })
                     .collect(),
                 tick,
-                submitted: Arc::clone(&self.native_submitted),
-            })?;
-        nixe_gpu::trace::detail_event("queue_schedule", tick, 0, 0);
-        self.submitted = tick;
+                progress: Arc::clone(&self.progress),
+            });
+        if result.is_err() {
+            self.progress.fail(
+                tick,
+                self.recording_handle
+                    .native_failure()
+                    .unwrap_or(progress::NativeFailure::Stopped),
+            );
+            return Err(self.progress.failure().unwrap().error());
+        }
+        self.scheduled = tick;
         self.recording = None;
-        self.visibility_scope = None;
         Ok(Some(self.ticket(tick)))
     }
-    fn wait_submitted(
+    fn wait_for_completion(
         &mut self,
         ticket: WorkTicket,
         timeout: Duration,
     ) -> Result<bool, VulkanError> {
+        let deadline = Instant::now().checked_add(timeout);
         let _trace = nixe_gpu::trace::span(
             "timeline_wait",
             ticket.tick,
             timeout.as_nanos().min(u128::from(u64::MAX)) as u64,
             self.completed,
         );
-        self.check_running()?;
         self.check_ticket(ticket)?;
-        if ticket.tick > self.submitted {
+        if timeout.is_zero() {
+            return Ok(self.poll_work(ticket)? == WorkStatus::Complete);
+        }
+        if ticket.tick > self.scheduled {
             return Err(VulkanError::InvalidResource(
-                "wait target has not been submitted",
+                "wait target is still recording; flush it before waiting",
             ));
         }
         if ticket.tick <= self.completed {
             return Ok(true);
         }
-        if self.native_submitted.load(Ordering::Acquire) < ticket.tick {
-            self.recording_handle.finish()?;
+        self.progress.check(ticket.tick)?;
+        if !self.progress.wait_submitted(ticket.tick, deadline)? {
+            return Ok(false);
         }
         let semaphores = [self.timeline];
         let values = [ticket.tick];
@@ -1025,10 +1076,20 @@ impl QueueState {
         // https://docs.vulkan.org/refpages/latest/refpages/source/vkWaitSemaphores.html
         #[cfg(feature = "performance-counters")]
         let waited_at = std::time::Instant::now();
-        let result = unsafe {
-            self.owner
-                .device
-                .wait_semaphores(&info, timeout.as_nanos().min(u128::from(u64::MAX)) as u64)
+        let result = loop {
+            self.progress.check(ticket.tick)?;
+            let remaining = deadline.map_or(Duration::MAX, |d| {
+                d.saturating_duration_since(Instant::now())
+            });
+            let slice = remaining.min(Duration::from_millis(50));
+            let result = unsafe {
+                self.owner
+                    .device
+                    .wait_semaphores(&info, slice.as_nanos() as u64)
+            };
+            if result != Err(vk::Result::TIMEOUT) || remaining <= slice {
+                break result;
+            }
         };
         #[cfg(feature = "performance-counters")]
         {
@@ -1042,6 +1103,7 @@ impl QueueState {
             Ok(()) => {
                 #[cfg(feature = "performance-counters")]
                 self.retire_timings(ticket.tick)?;
+                self.progress.observe_completed(ticket.tick);
                 self.reclaim(ticket.tick);
                 Ok(true)
             }
@@ -1051,7 +1113,8 @@ impl QueueState {
     }
     pub fn usage(&self) -> QueueUsage {
         QueueUsage {
-            submitted_tick: self.submitted,
+            scheduled_tick: self.scheduled,
+            submitted_tick: self.progress.submitted(),
             completed_tick: self.completed,
             command_pools: self.slots.len(),
             arena_capacity: self
@@ -1076,15 +1139,17 @@ impl QueueState {
         }
     }
 }
-impl Drop for QueueState {
-    fn drop(&mut self) {
-        let _ = self.recording_handle.finish();
-        self.lost |= self.recording_handle.is_device_lost();
-        // A failed native job never signals its queued tick. Drain only host
-        // submissions actually accepted before the failure, retaining all slots.
-        let submitted = self.native_submitted.load(Ordering::Acquire);
-        // Cancel recording without submission; accepted work drains only to the
-        // last real tick. No queue/device-wide idle wait is needed, even at shutdown.
+impl QueueState {
+    fn stop(&mut self) -> Result<(), VulkanError> {
+        let prior_failure = self.progress.failure();
+        self.stopped = true;
+        self.progress.cancel_pending();
+        self.recording_handle.discard_pending();
+        // Shutdown is the explicit worker-drain boundary. Canceled jobs release
+        // their parameters; a native call already in progress may still succeed.
+        let drain = self.recording_handle.finish();
+        self.lost |= self.is_device_lost();
+        let submitted = self.progress.submitted();
         if !self.lost && self.completed < submitted {
             let semaphores = [self.timeline];
             let values = [submitted];
@@ -1092,16 +1157,50 @@ impl Drop for QueueState {
                 .semaphores(&semaphores)
                 .values(&values);
             match unsafe { self.owner.device.wait_semaphores(&info, u64::MAX) } {
-                Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {}
-                Err(error) => {
-                    // Terminate instead of freeing unproven in-flight resources
-                    // or retaining a hidden recovery/leak path after a driver failure.
-                    log::error!("cannot drain Vulkan queue during destruction: {error:?}");
-                    std::process::abort();
+                Ok(()) => {
+                    self.progress.observe_completed(submitted);
+                    self.reclaim(submitted);
                 }
+                Err(vk::Result::ERROR_DEVICE_LOST) => self.lost = true,
+                Err(error) => return Err(self.error("shutdown timeline wait", error)),
             }
         }
+        self.recording = None;
         self.slots.clear();
+        self.pending_stream_reads.clear();
+        self.overflow_capacity = 0;
+        if let Some(failure) = prior_failure.or_else(|| self.progress.failure())
+            && !matches!(failure.cause, progress::NativeFailure::Stopped)
+        {
+            return Err(failure.error());
+        }
+        match drain {
+            Err(_)
+                if self.progress.cancelled()
+                    && self
+                        .recording_handle
+                        .native_failure()
+                        .is_some_and(|failure| {
+                            matches!(failure, progress::NativeFailure::Stopped)
+                        }) =>
+            {
+                Ok(())
+            }
+            other => other,
+        }
+    }
+}
+impl Drop for QueueState {
+    fn drop(&mut self) {
+        let result = self.stop();
+        if !self.slots.is_empty() {
+            // Never destroy handles whose actual native use remains unproven.
+            log::error!(
+                "cannot drain Vulkan queue during destruction: {:?}",
+                result.err()
+            );
+            std::process::abort();
+        }
         unsafe { self.owner.device.destroy_semaphore(self.timeline, None) };
     }
 }
@@ -1110,7 +1209,11 @@ impl VulkanDevice {
     /// Ordering queries must not assemble diagnostic resource-usage totals.
     #[inline]
     pub(crate) fn submitted_tick(&self) -> u64 {
-        self.submission.submitted
+        self.submission.progress.submitted()
+    }
+    #[inline]
+    pub(crate) fn scheduled_tick(&self) -> u64 {
+        self.submission.scheduled
     }
     #[inline]
     pub(crate) fn completed_tick(&self) -> u64 {
@@ -1120,49 +1223,13 @@ impl VulkanDevice {
         let tick = self
             .submission
             .recording
-            .map_or(self.submission.submitted, |slot| {
+            .map_or(self.submission.scheduled, |slot| {
                 self.submission.slots[slot].tick
             });
         (tick != 0).then(|| self.submission.ticket(tick))
     }
     pub(crate) fn submission_instance(&self) -> BackendInstanceId {
         self.submission.instance
-    }
-    pub(crate) fn visibility_point(
-        &mut self,
-    ) -> Result<nixe_memory::DeviceVisibilityPoint, VulkanError> {
-        let required = self.preceding_work().map_or(0, WorkTicket::tick);
-        if let Some((work, point)) = self.submission.visibility_scope
-            && work == required
-        {
-            return Ok(point);
-        }
-        let point = self
-            .submission
-            .visibility
-            .issue(required, self.submission.completed)?;
-        self.submission.visibility_scope = Some((required, point));
-        Ok(point)
-    }
-    pub(crate) fn end_visibility_scope(&mut self) {
-        self.submission.visibility_scope = None;
-    }
-    pub(crate) fn visibility_work(
-        &self,
-        point: nixe_memory::DeviceVisibilityPoint,
-    ) -> Result<Option<WorkTicket>, VulkanError> {
-        self.submission
-            .visibility
-            .required(point)
-            .map(|work| work.map(|tick| self.submission.ticket(tick)))
-    }
-    pub(crate) fn completed_visibility(&self) -> u64 {
-        self.submission.visibility.completed()
-    }
-    pub(crate) fn submitted_visibility(&self) -> u64 {
-        self.submission
-            .visibility
-            .through(self.submission.submitted)
     }
     pub(crate) fn end_rendering(&mut self) {
         self.submission.end_rendering(&self.dispatch);
@@ -1190,7 +1257,7 @@ impl VulkanDevice {
     /// with no commands. A flush accepts it; host polling alone is not guest success.
     pub fn work_ticket(&mut self) -> Result<WorkTicket, VulkanError> {
         self.begin_recording()?;
-        Ok(self.submission.ticket(self.submission.submitted + 1))
+        Ok(self.submission.ticket(self.submission.scheduled + 1))
     }
     /// Submit recorded commands and signal the single timeline, without waiting.
     pub fn flush(&mut self) -> Result<Option<WorkTicket>, VulkanError> {
@@ -1199,18 +1266,18 @@ impl VulkanDevice {
     pub fn poll_progress(&mut self) -> Result<u64, VulkanError> {
         self.submission.poll()
     }
-    /// Flush a recording ticket before a targeted wait; never wait on a future,
-    /// unsignalled value that depends on an unrelated subsequent submission.
+    /// Inspect one ticket without flushing or waiting for recording/submission.
+    pub fn poll_work(&mut self, ticket: WorkTicket) -> Result<WorkStatus, VulkanError> {
+        self.submission.poll_work(ticket)
+    }
+    /// Wait only for sealed work. Call flush explicitly before waiting on a
+    /// recording ticket; the timeout covers acknowledgement and GPU completion.
     pub fn wait_for_work(
         &mut self,
         ticket: WorkTicket,
         timeout: Duration,
     ) -> Result<bool, VulkanError> {
-        self.submission.check_ticket(ticket)?;
-        if ticket.tick > self.submission.submitted {
-            self.flush()?;
-        }
-        self.submission.wait_submitted(ticket, timeout)
+        self.submission.wait_for_completion(ticket, timeout)
     }
     pub fn recording_statistics(&self) -> RecordingStatistics {
         self.submission.statistics
@@ -1222,6 +1289,9 @@ impl VulkanDevice {
     /// pin their arena even when the GPU has finished. No stale range can recycle.
     pub fn readback(&mut self, ticket: ReadbackTicket) -> Result<Vec<u8>, VulkanError> {
         self.validate_readback(&ticket)?;
+        if ticket.work.tick > self.submission.scheduled {
+            self.flush()?;
+        }
         self.wait_for_work(ticket.work, Duration::MAX)?;
         let slot = &mut self.submission.slots[ticket.slot];
         let slice = slot.readbacks[ticket.entry]
@@ -1316,20 +1386,7 @@ impl VulkanDevice {
     /// Cancel unsubmitted recording and drain accepted work, without publishing
     /// canceled guest reservations. Dropping the device uses the same last tick.
     pub fn shutdown(&mut self) -> Result<(), VulkanError> {
-        self.dispatch.finish_recording()?;
-        if self.submission.lost {
-            self.submission.stopped = true;
-            return Err(VulkanError::QueueStopped);
-        }
-        if self.submission.submitted > self.submission.completed {
-            let ticket = self.submission.ticket(self.submission.submitted);
-            self.submission.wait_submitted(ticket, Duration::MAX)?;
-        }
-        self.submission.stopped = true;
-        self.submission.recording = None;
-        self.submission.slots.clear();
-        self.submission.overflow_capacity = 0;
-        Ok(())
+        self.submission.stop()
     }
 }
 

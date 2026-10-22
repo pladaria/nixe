@@ -8,6 +8,7 @@
 use super::{
     RendererParameters,
     update::{RendererUpdateState, word},
+    worker::{RenderError, RenderMemory},
 };
 
 #[derive(Debug)]
@@ -60,11 +61,12 @@ impl RenderBuffers {
 
     pub(super) fn render(
         &mut self,
+        memory: &RenderMemory,
         state: &mut RendererUpdateState,
         params: &RendererParameters,
         pcm: &mut [i16],
         volume: f32,
-    ) -> Result<bool, Box<str>> {
+    ) -> Result<bool, RenderError> {
         self.samples.fill(0);
         self.prepare_mixes(state, params)?;
         let samples = params.samples as usize;
@@ -75,6 +77,7 @@ impl RenderBuffers {
             };
             let buffers = word(mix.as_slice(), 8) as usize;
             voice.render(
+                memory,
                 params.revision_number().unwrap(),
                 &mut self.voice_scratch,
                 samples,
@@ -91,6 +94,7 @@ impl RenderBuffers {
             }
         }
         self.mix_and_output(state, params, pcm, volume)
+            .map_err(Into::into)
     }
 
     fn prepare_mixes(
@@ -340,12 +344,16 @@ mod tests {
         );
         assert_eq!(pcm, [5, 32767, -5, -32768, 32767, 1]);
         // A new block clears stale samples instead of repeating the last block.
-        assert!(buffers.render(&mut state, &params, &mut pcm, 1.0).unwrap());
+        assert!(
+            buffers
+                .render(&RenderMemory::testing(), &mut state, &params, &mut pcm, 1.0)
+                .unwrap()
+        );
         assert_eq!(pcm, [0; 6]);
     }
     #[test]
     fn effect_runs_before_submix_routing_and_volume() {
-        use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+        use crate::test_memory::physical;
         let mut raw_params = [0; super::super::PARAMETER_SIZE];
         for (offset, value) in [
             (0, 48000_u32),
@@ -377,7 +385,7 @@ mod tests {
         sink[0x120..0x124].copy_from_slice(&2_u32.to_le_bytes());
         sink[0x125] = 1;
         state.sinks = vec![sink];
-        let memory = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        let ranges = physical(&vec![0; 4096]);
         let mut raw = [0; 0xc0];
         raw[0] = 4;
         raw[1] = 1;
@@ -398,7 +406,7 @@ mod tests {
                 48000,
                 &[],
                 true,
-                &|_, _| Ok(memory.backing_range(MemoryPermissions::READ_WRITE).unwrap()),
+                &|_, _| Ok(ranges.clone()),
                 true,
             )
             .unwrap();

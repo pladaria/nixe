@@ -32,34 +32,30 @@ use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
 use crate::GuestCpuState;
+use crate::memory::{Mapping, MemoryKind, ProcessMemory};
 use nixe_cpu::location::LocationDescriptor;
-use nixe_cpu::memory::{
-    CpuMemory, ExecutionMemory, MappingEpoch, MemoryAttributes, MemoryMappingError,
-    MemoryMappingPurpose, MemoryPermissions, MemoryProtectionError, ProcessMemory,
-    SYNTHETIC_PAGE_SIZE, SyntheticRamPage,
-};
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::a64::A64Register;
 use nixe_loader_executable::{
     AddressSpaceType, ExternalSymbol, PreparationConfig, PreparedModule, SymbolResolution,
 };
-use nixe_memory::MemoryInvalidationSource;
-use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
+use nixe_memory::GuestVirtualAddress;
+use nixe_memory::{MemoryPermissions, PAGE_SIZE};
 
 use crate::exception_dispatch::{ExceptionProcessMetadata, ExceptionProcessResources};
 use crate::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatcher,
     ExceptionHandlingResult, ExceptionProcessContext, ExceptionResume, ExceptionRouteError,
     ExceptionTerminationReason, ExceptionTerminationScope, ExceptionThreadContext, LaunchKind,
-    LaunchModuleImage, LaunchPlan, install_prepared_module,
+    LaunchModuleImage, LaunchPlan,
 };
 
 const DEFAULT_IMAGE_BASE: u64 = 0x7100_0000;
 const DEFAULT_HOME_BREW_STACK_SIZE: u64 = 0x10_0000;
 const MODULE_GUARD_SIZE: u64 = 0x1_0000;
 const RESOURCE_GUARD_SIZE: u64 = 0x1_0000;
-const TLS_SIZE: u64 = SYNTHETIC_PAGE_SIZE as u64;
+const TLS_SIZE: u64 = PAGE_SIZE;
 const HOME_BREW_CONFIG_ENTRY_SIZE: usize = 24;
 const HOME_BREW_MAIN_THREAD_HANDLE_KEY: u32 = 1;
 const HOME_BREW_ARGV_KEY: u32 = 5;
@@ -78,8 +74,7 @@ pub struct RunnableProcess {
     address_space: ProcessAddressSpace,
     memory_layout: ProcessMemoryLayout,
     random_entropy: [u64; 4],
-    memory_accounting: ProcessMemoryAccounting,
-    memory: std::sync::Arc<ExecutionMemory>,
+    memory: std::sync::Arc<ProcessMemory>,
     modules: Box<[PreparedModule]>,
     entry_module: usize,
     main_thread_id: nixe_scheduler::GuestThreadId,
@@ -89,9 +84,9 @@ pub struct RunnableProcess {
     next_thread_tls: GuestVirtualAddress,
     free_thread_tls: std::collections::BTreeSet<GuestVirtualAddress>,
     threads: crate::ThreadTable,
-    mounts: crate::ProcessMountNamespace,
-    handles: crate::HandleTable,
-    address_waits: crate::AddressWaitRegistry,
+    mounts: std::sync::Arc<crate::ProcessMountNamespace>,
+    handles: std::sync::Arc<crate::HandleTable>,
+    address_waits: std::sync::Arc<crate::AddressWaitRegistry>,
     execution: execution::ProcessExecutionControl,
 }
 
@@ -127,85 +122,19 @@ impl RunnableProcess {
 
     /// Returns the currently committed process heap size.
     #[must_use]
-    pub const fn heap_size(&self) -> u64 {
-        self.memory_accounting.heap_size()
+    pub fn heap_size(&self) -> u64 {
+        self.memory.heap_size()
     }
 
     /// Returns the coherent physical-memory counters used by Horizon queries.
     #[must_use]
-    pub const fn memory_accounting(&self) -> ProcessMemoryAccounting {
-        self.memory_accounting
+    pub fn memory_accounting(&self) -> ProcessMemoryAccounting {
+        self.memory.accounting()
     }
 
     #[must_use]
-    pub fn memory(&self) -> &ExecutionMemory {
-        self.memory.as_ref()
-    }
-
-    /// Applies one runtime mapping resize after closing new execution leases,
-    /// then publishes the committed epoch to every CPU-thread control path.
-    pub fn resize_memory_mapping(
-        &self,
-        start: GuestVirtualAddress,
-        old_size: u64,
-        new_size: u64,
-        permissions: MemoryPermissions,
-        purpose: MemoryMappingPurpose,
-    ) -> Result<(), MemoryMappingError> {
-        self.execution.request_mapping_safepoint();
-        self.memory.resize_zeroed_mapping(
-            self.cpu.address_space_id(),
-            start,
-            old_size,
-            new_size,
-            permissions,
-            purpose,
-        )?;
-        self.execution
-            .publish_memory_invalidation(self.memory.invalidation_cursor());
-        Ok(())
-    }
-
-    pub fn set_memory_permissions(
-        &self,
-        start: GuestVirtualAddress,
-        size: u64,
-        permissions: MemoryPermissions,
-    ) -> Result<(), MemoryProtectionError> {
-        self.execution.request_mapping_safepoint();
-        self.memory
-            .set_permissions(self.cpu.address_space_id(), start, size, permissions)?;
-        self.execution
-            .publish_memory_invalidation(self.memory.invalidation_cursor());
-        Ok(())
-    }
-
-    pub fn set_memory_attributes(
-        &self,
-        start: GuestVirtualAddress,
-        size: u64,
-        mask: MemoryAttributes,
-        value: MemoryAttributes,
-    ) -> Result<(), MemoryProtectionError> {
-        self.execution.request_mapping_safepoint();
-        self.memory
-            .set_attributes(self.cpu.address_space_id(), start, size, mask, value)?;
-        self.execution
-            .publish_memory_invalidation(self.memory.invalidation_cursor());
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn mapping_epoch(&self) -> MappingEpoch {
-        self.memory.mapping_epoch()
-    }
-
-    #[must_use]
-    pub fn memory_invalidation_acknowledged(
-        &self,
-        cursor: nixe_memory::MemoryInvalidationCursor,
-    ) -> bool {
-        self.execution.memory_invalidation_acknowledged(cursor)
+    pub fn memory(&self) -> &std::sync::Arc<ProcessMemory> {
+        &self.memory
     }
 
     #[must_use]
@@ -256,13 +185,12 @@ impl RunnableProcess {
         {
             return Err(ThreadCreateError::InvalidEntry);
         }
-        let limit = GuestVirtualAddress::new(self.address_space.exclusive_limit());
-        let entry_mapping =
-            self.memory
-                .query_memory(self.cpu.address_space_id(), request.entry, limit);
-        if entry_mapping.is_none_or(|mapping| {
-            mapping.region.is_none() || !mapping.permissions.contains(MemoryPermissions::EXECUTE)
-        }) {
+        if self
+            .memory
+            .space()
+            .translate(request.entry, MemoryPermissions::EXECUTE)
+            .is_err()
+        {
             return Err(ThreadCreateError::InvalidEntry);
         }
         let Some(stack_byte) = request.stack_top.get().checked_sub(1) else {
@@ -273,14 +201,15 @@ impl RunnableProcess {
         {
             return Err(ThreadCreateError::InvalidStack);
         }
-        let stack_mapping = self.memory.query_memory(
-            self.cpu.address_space_id(),
-            GuestVirtualAddress::new(stack_byte),
-            limit,
-        );
-        if stack_mapping.is_none_or(|mapping| {
-            mapping.region.is_none() || !mapping.permissions.contains(MemoryPermissions::WRITE)
-        }) {
+        if self
+            .memory
+            .space()
+            .translate(
+                GuestVirtualAddress::new(stack_byte),
+                MemoryPermissions::WRITE,
+            )
+            .is_err()
+        {
             return Err(ThreadCreateError::InvalidStack);
         }
         if let Some(policy) = self.thread_policy
@@ -318,10 +247,6 @@ impl RunnableProcess {
         id: nixe_scheduler::GuestThreadId,
         request: &ThreadCreateRequest,
     ) -> Result<ThreadCreation, ThreadCreateError> {
-        if !self.memory_accounting.can_commit_normal_memory(TLS_SIZE) {
-            log::debug!("thread TLS allocation exceeds process physical memory limit");
-            return Err(ThreadCreateError::ResourceLimit);
-        }
         let recycled_tls = self.free_thread_tls.pop_first();
         let tls_base = match recycled_tls {
             Some(tls_base) => tls_base,
@@ -337,17 +262,22 @@ impl RunnableProcess {
             );
             return Err(ThreadCreateError::ResourceLimit);
         }
-        self.resize_memory_mapping(
-            tls_base,
-            0,
-            TLS_SIZE,
-            MemoryPermissions::READ_WRITE,
-            MemoryMappingPurpose::ThreadLocal,
-        )
-        .map_err(|error| {
-            log::debug!("thread TLS mapping failed: tls={tls_base:?} error={error:?}");
-            ThreadCreateError::ResourceLimit
-        })?;
+        self.memory
+            .map_zeroed(
+                tls_base,
+                TLS_SIZE,
+                Mapping {
+                    kind: MemoryKind::ThreadLocal,
+                    permissions: MemoryPermissions::READ_WRITE,
+                    uncached: false,
+                    locked: false,
+                    permission_locked: false,
+                },
+            )
+            .map_err(|error| {
+                log::debug!("thread TLS mapping failed: tls={tls_base:?} error={error:?}");
+                ThreadCreateError::ResourceLimit
+            })?;
         let object = crate::ThreadObject::new(id.get());
         let handle = match self.handles.insert(object.clone()) {
             Ok(handle) => handle,
@@ -392,7 +322,6 @@ impl RunnableProcess {
         if recycled_tls.is_none() {
             self.next_thread_tls = tls_base;
         }
-        self.memory_accounting.commit_normal_memory(TLS_SIZE);
         Ok(ThreadCreation { id, handle })
     }
 
@@ -417,7 +346,6 @@ impl RunnableProcess {
 
     fn release_thread_tls(&mut self, tls_base: GuestVirtualAddress) {
         self.rollback_thread_tls(tls_base);
-        self.memory_accounting.release_normal_memory(TLS_SIZE);
         if tls_base == self.next_thread_tls {
             self.next_thread_tls = self
                 .next_thread_tls
@@ -435,12 +363,16 @@ impl RunnableProcess {
     }
 
     fn rollback_thread_tls(&self, tls_base: GuestVirtualAddress) {
-        let _ = self.resize_memory_mapping(
+        let _ = self.memory.unmap(
             tls_base,
             TLS_SIZE,
-            0,
-            MemoryPermissions::READ_WRITE,
-            MemoryMappingPurpose::ThreadLocal,
+            Mapping {
+                kind: MemoryKind::ThreadLocal,
+                permissions: MemoryPermissions::READ_WRITE,
+                uncached: false,
+                locked: false,
+                permission_locked: false,
+            },
         );
     }
 
@@ -499,35 +431,23 @@ impl RunnableProcess {
 
     /// Returns the immutable process-local filesystem namespace.
     #[must_use]
-    pub const fn mounts(&self) -> &crate::ProcessMountNamespace {
+    pub const fn mounts(&self) -> &std::sync::Arc<crate::ProcessMountNamespace> {
         &self.mounts
     }
 
     /// Returns the process-local kernel-object handle table.
     #[must_use]
-    pub const fn handles(&self) -> &crate::HandleTable {
+    pub const fn handles(&self) -> &std::sync::Arc<crate::HandleTable> {
         &self.handles
     }
 
-    /// Returns mutable handle access for future syscall/IPC dispatch.
-    pub const fn handles_mut(&mut self) -> &mut crate::HandleTable {
-        &mut self.handles
-    }
-
     #[must_use]
-    pub const fn address_waits(&self) -> &crate::AddressWaitRegistry {
+    pub const fn address_waits(&self) -> &std::sync::Arc<crate::AddressWaitRegistry> {
         &self.address_waits
     }
 
-    pub const fn address_waits_mut(&mut self) -> &mut crate::AddressWaitRegistry {
-        &mut self.address_waits
-    }
-
-    /// Borrows the console-neutral resources needed by a platform service layer.
-    pub fn mounts_and_handles_mut(
-        &mut self,
-    ) -> (&crate::ProcessMountNamespace, &mut crate::HandleTable) {
-        (&self.mounts, &mut self.handles)
+    pub fn mounts_and_handles(&self) -> (&crate::ProcessMountNamespace, &crate::HandleTable) {
+        (&self.mounts, &self.handles)
     }
 
     /// Consumes the process and deterministically releases all process-owned resources.
@@ -535,7 +455,7 @@ impl RunnableProcess {
         let previous_lifecycle = self.lifecycle;
         let report = ProcessTeardownReport {
             previous_lifecycle,
-            exit: self.process_exit,
+            exit: self.process_exit.take(),
             threads_released: self.threads.len(),
             modules_released: self.modules.len(),
             mappings_released: self
@@ -543,17 +463,30 @@ impl RunnableProcess {
                 .iter()
                 .map(|module| module.mappings().len())
                 .sum(),
-            physical_pages_released: self.memory.physical_page_count(),
+            physical_pages_released: (self.memory.account().used_bytes() / PAGE_SIZE) as usize,
             mounts_released: self.mounts.mount_count(),
             handles_released: self.handles.len(),
-            address_waiters_released: self.address_waits.waiter_count(),
+            address_waiters_released: self.address_waits.lock().waiter_count(),
         };
-        if let Err(fault) = self.execution.shutdown() {
+        let execution = self.execution.shutdown();
+        let memory = self.memory.close();
+        self.handles.close_all();
+        if let Err(fault) = execution {
             return Err(ProcessTeardownFailure {
                 report: Box::new(report),
                 fault: Box::new(fault),
             });
         }
+        memory.map_err(|error| ProcessTeardownFailure {
+            report: Box::new(report.clone()),
+            fault: Box::new(nixe_cpu::execution::CpuFault {
+                backend: "memory",
+                kind: nixe_cpu::execution::CpuFaultKind::Internal,
+                progress: 0,
+                message: error.to_string().into(),
+                context: None,
+            }),
+        })?;
         Ok(report)
     }
 
@@ -563,6 +496,14 @@ impl RunnableProcess {
 
     pub(crate) fn request_execution_safepoint(&self) {
         self.execution.request_safepoint();
+    }
+}
+
+impl Drop for RunnableProcess {
+    fn drop(&mut self) {
+        let _ = self.execution.request_stop();
+        let _ = self.memory.close();
+        self.handles.close_all();
     }
 }
 

@@ -185,16 +185,4 @@ void nixe_video_transfer_free(void* target) noexcept {
     delete static_cast<VideoTransfer*>(target);
 #endif
 }
-// Temporary synchronous consumer for the old renderer, sharing the same import
-// implementation. The native renderer retains imports and never calls this.
-int nixe_video_frame_copy(AVFrame* frame, int fd, int semaphore_fd, uint64_t allocation_size, const uint8_t* uuid,
-                          uint64_t row_pitch, uint64_t chroma_offset, int initialize) noexcept {
-    void* transfer = nixe_video_transfer_create(frame, fd, semaphore_fd, allocation_size, uuid,
-                                               row_pitch, chroma_offset, initialize);
-    if (!transfer) return -1;
-    const auto copied = nixe_video_transfer_enqueue(transfer, frame);
-    const auto waited = nixe_video_transfer_wait(transfer);
-    nixe_video_transfer_free(transfer);
-    return copied < 0 || waited < 0 ? -1 : 1;
-}
 }

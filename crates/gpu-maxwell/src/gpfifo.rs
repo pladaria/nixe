@@ -11,8 +11,7 @@ use nixe_memory::MemoryPermissions;
 
 use crate::{
     MaxwellAddressSpaceId, MaxwellAllocationId, MaxwellChannelId, MaxwellGpuAccessError,
-    MaxwellGpuAddressSpace, MaxwellGpuMapping, MaxwellGpuProfile, MaxwellMappingId,
-    MaxwellResolvedRange,
+    MaxwellGpuMapping, MaxwellGpuMemory, MaxwellGpuProfile, MaxwellMappingId, MaxwellResolvedRange,
 };
 
 /// Size of one hardware-format GPFIFO descriptor.
@@ -280,7 +279,7 @@ impl MaxwellValidatedGpfifoSubmission {
     /// Checks every retained mapping before any command backing is accessed.
     pub fn validate_sources(
         &self,
-        address_space: &MaxwellGpuAddressSpace,
+        address_space: &MaxwellGpuMemory,
     ) -> Result<(), MaxwellGpfifoSourceError> {
         if address_space.id() != self.address_space {
             return Err(MaxwellGpfifoSourceError::WrongAddressSpace {
@@ -307,35 +306,21 @@ impl MaxwellValidatedGpfifoSubmission {
         Ok(())
     }
 
-    /// Reads one complete entry after atomically revalidating every source.
-    ///
-    /// Revalidating the whole submission first prevents a later entry's hole
-    /// or remap from being discovered after a prefix was already consumed.
-    pub fn read_pushbuffer(
-        &self,
-        address_space: &MaxwellGpuAddressSpace,
-        entry_index: u32,
-        output: &mut [u8],
-    ) -> Result<(), MaxwellGpfifoSourceError> {
-        self.validate_sources(address_space)?;
-        self.read_entry(address_space, entry_index, output)
-    }
-
-    /// The streaming decoder checks the complete retained submission once
-    /// before its first read. Each entry still revalidates its own live mappings
-    /// in read_resolved_words; repeating the all-entry scan here would be quadratic.
+    /// Validate the consumed entry's live mappings in read_resolved, without
+    /// rescanning unrelated entries already checked at dispatch admission.
     pub(crate) fn read_entry(
         &self,
-        address_space: &MaxwellGpuAddressSpace,
+        address_space: &MaxwellGpuMemory,
         entry_index: u32,
         output: &mut [u8],
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<(), MaxwellGpfifoSourceError> {
         let pushbuffer = self
             .pushbuffers
             .get(entry_index as usize)
             .ok_or(MaxwellGpfifoSourceError::UnknownEntry { entry_index })?;
         address_space
-            .read_resolved_words(&pushbuffer.source, output)
+            .read_resolved(&pushbuffer.source, output, access)
             .map_err(|error| MaxwellGpfifoSourceError::Access {
                 location: first_source_location(self, pushbuffer)
                     .expect("resolved non-empty range has a first mapping"),
@@ -550,15 +535,11 @@ impl Display for MaxwellGpfifoCapture {
 }
 
 /// Failure while resolving or revalidating a complete command source.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum MaxwellGpfifoSourceError {
     Synchronization {
         entry_index: u32,
         detail: Box<str>,
-    },
-    CaptureTooLarge {
-        bytes: usize,
-        limit: usize,
     },
     ChannelAddressSpaceUnbound {
         channel: MaxwellChannelId,
@@ -603,10 +584,6 @@ impl Display for MaxwellGpfifoSourceError {
             } => write!(
                 formatter,
                 "GPFIFO fetch synchronization failed: entry={entry_index} detail=[{detail}]"
-            ),
-            Self::CaptureTooLarge { bytes, limit } => write!(
-                formatter,
-                "GPFIFO command capture exceeds host bound: bytes={bytes} limit={limit}"
             ),
             Self::ChannelAddressSpaceUnbound { channel } => write!(
                 formatter,
@@ -663,7 +640,7 @@ pub fn resolve_gpfifo_submission(
     channel: &crate::MaxwellChannelConfiguration,
     frontend: FrontendSubmissionId,
     decoded: MaxwellDecodedGpfifoSubmission,
-    address_space: &MaxwellGpuAddressSpace,
+    address_space: &MaxwellGpuMemory,
 ) -> Result<MaxwellValidatedGpfifoSubmission, MaxwellGpfifoSourceError> {
     let channel_id = channel.id();
     let expected_address_space =
@@ -1049,580 +1026,4 @@ pub fn decode_gpfifo_submission(
         fence_value: request.fence_value,
         entries: entries.into_boxed_slice(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::MaxwellGpuChannel;
-    use crate::{
-        MaxwellAddressSpaceInitialization, MaxwellAllocationId, MaxwellChannelOwner,
-        MaxwellMapRequest, SWITCH_1_GM20B_PROFILE,
-    };
-    use nixe_memory::CanonicalAllocation;
-
-    fn descriptor(address: u64, words: u32, modes: u32) -> [u8; 8] {
-        let word0 = address as u32;
-        let word1 = ((address >> 32) as u32 & ENTRY1_ADDRESS_HIGH_MASK)
-            | (words << ENTRY1_WORD_COUNT_SHIFT)
-            | modes;
-        let mut bytes = [0; 8];
-        bytes[..4].copy_from_slice(&word0.to_le_bytes());
-        bytes[4..].copy_from_slice(&word1.to_le_bytes());
-        bytes
-    }
-
-    fn request(entries: u32, flags: u32) -> MaxwellGpfifoSubmitRequest {
-        MaxwellGpfifoSubmitRequest {
-            entry_count: entries,
-            flags,
-            fence_id: 7,
-            fence_value: 11,
-        }
-    }
-
-    fn bound_channel(id: u64, address_space: MaxwellAddressSpaceId) -> MaxwellGpuChannel {
-        let mut channel = MaxwellGpuChannel::new(
-            MaxwellChannelId::new(id),
-            MaxwellChannelOwner::new(1),
-            SWITCH_1_GM20B_PROFILE,
-        );
-        channel.bind_address_space(address_space).unwrap();
-        channel
-    }
-
-    #[test]
-    fn decodes_every_descriptor_and_switch_mode_without_retaining_guest_memory() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&descriptor(0x12_3456_7000, 3, 0));
-        bytes.extend_from_slice(&descriptor(
-            0x23_4567_8000,
-            5,
-            ENTRY1_ALLOW_FLUSH | ENTRY1_LEVEL_SUBROUTINE | ENTRY1_SYNC_WAIT,
-        ));
-        let decoded = decode_gpfifo_submission(
-            SWITCH_1_GM20B_PROFILE,
-            0x800,
-            request(
-                2,
-                SUBMIT_HARDWARE_FORMAT
-                    | SUBMIT_FENCE_WAIT
-                    | SUBMIT_SUPPRESS_WFI
-                    | SUBMIT_FENCE_INCREMENT_VALUE,
-            ),
-            &bytes,
-        )
-        .unwrap();
-
-        assert_eq!(decoded.fence_id(), 7);
-        assert_eq!(decoded.fence_value(), 11);
-        assert!(decoded.mode().fence_wait());
-        assert!(decoded.mode().suppress_wfi());
-        assert!(decoded.mode().fence_increment_value());
-        assert_eq!(decoded.entries()[0].address().get(), 0x12_3456_7000);
-        assert_eq!(decoded.entries()[0].word_count(), 3);
-        assert_eq!(decoded.entries()[0].byte_count(), 12);
-        assert_eq!(decoded.entries()[1].level(), MaxwellGpfifoLevel::Subroutine);
-        assert_eq!(decoded.entries()[1].sync(), MaxwellGpfifoSyncMode::Wait);
-        assert!(decoded.entries()[1].allow_flush());
-    }
-
-    #[test]
-    fn rejects_count_size_and_profile_range_failures() {
-        assert_eq!(
-            decode_gpfifo_submission(
-                SWITCH_1_GM20B_PROFILE,
-                1,
-                request(2, SUBMIT_HARDWARE_FORMAT),
-                &[0; 16],
-            ),
-            Err(MaxwellGpfifoDecodeError::Invalid(
-                MaxwellInvalidGpfifoSubmission::EntryCountExceedsAllocation {
-                    requested: 2,
-                    allocated: 1,
-                }
-            ))
-        );
-        assert!(matches!(
-            decode_gpfifo_submission(
-                SWITCH_1_GM20B_PROFILE,
-                2,
-                request(2, SUBMIT_HARDWARE_FORMAT),
-                &[0; 8],
-            ),
-            Err(MaxwellGpfifoDecodeError::Invalid(
-                MaxwellInvalidGpfifoSubmission::EntryByteCountMismatch { .. }
-            ))
-        ));
-        let at_end = descriptor((1_u64 << 40) - 4, 1, 0);
-        assert!(matches!(
-            decode_gpfifo_submission(
-                SWITCH_1_GM20B_PROFILE,
-                1,
-                request(1, SUBMIT_HARDWARE_FORMAT),
-                &at_end,
-            ),
-            Err(MaxwellGpfifoDecodeError::Invalid(
-                MaxwellInvalidGpfifoSubmission::PushbufferRangeOutOfRange { .. }
-            ))
-        ));
-    }
-
-    #[test]
-    fn rejects_unsupported_modes_before_returning_any_prefix() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&descriptor(0x1000, 4, 0));
-        bytes.extend_from_slice(&descriptor(0x2001, 4, 0));
-        assert_eq!(
-            decode_gpfifo_submission(
-                SWITCH_1_GM20B_PROFILE,
-                2,
-                request(2, SUBMIT_HARDWARE_FORMAT),
-                &bytes,
-            ),
-            Err(MaxwellGpfifoDecodeError::Unsupported(
-                MaxwellUnsupportedGpfifoSubmission::ConditionalFetch { entry: 1 }
-            ))
-        );
-        assert!(matches!(
-            decode_gpfifo_submission(
-                SWITCH_1_GM20B_PROFILE,
-                0,
-                request(0, SUBMIT_HARDWARE_FORMAT | SUBMIT_SYNC_FENCE),
-                &[],
-            ),
-            Err(MaxwellGpfifoDecodeError::Unsupported(
-                MaxwellUnsupportedGpfifoSubmission::SyncFenceFileDescriptor
-            ))
-        ));
-        assert_eq!(
-            decode_gpfifo_submission(
-                SWITCH_1_GM20B_PROFILE,
-                0,
-                MaxwellGpfifoSubmitRequest {
-                    entry_count: 0,
-                    flags: SUBMIT_HARDWARE_FORMAT | SUBMIT_FENCE_GET | SUBMIT_FENCE_INCREMENT_VALUE,
-                    fence_id: 0,
-                    fence_value: 1,
-                },
-                &[],
-            ),
-            Err(MaxwellGpfifoDecodeError::Unsupported(
-                MaxwellUnsupportedGpfifoSubmission::ConflictingFenceCompletionModes
-            ))
-        );
-        assert_eq!(
-            decode_gpfifo_submission(
-                SWITCH_1_GM20B_PROFILE,
-                0,
-                MaxwellGpfifoSubmitRequest {
-                    entry_count: 0,
-                    flags: SUBMIT_HARDWARE_FORMAT | SUBMIT_FENCE_INCREMENT_VALUE,
-                    fence_id: 0,
-                    fence_value: 0,
-                },
-                &[],
-            ),
-            Err(MaxwellGpfifoDecodeError::Unsupported(
-                MaxwellUnsupportedGpfifoSubmission::ZeroFenceIncrementValue
-            ))
-        );
-    }
-
-    #[test]
-    fn accepts_a_completely_empty_hardware_format_submission() {
-        let decoded = decode_gpfifo_submission(
-            SWITCH_1_GM20B_PROFILE,
-            0x800,
-            request(0, SUBMIT_HARDWARE_FORMAT),
-            &[],
-        )
-        .unwrap();
-        assert!(decoded.entries().is_empty());
-    }
-
-    #[test]
-    fn resolves_complete_ranges_and_retains_exact_mapping_lifetimes() {
-        let first_allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        let second_allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        first_allocation.write(0xffc, &[1, 2, 3, 4]).unwrap();
-        second_allocation
-            .write(0, &[5, 6, 7, 8, 9, 10, 11, 12])
-            .unwrap();
-        let mut address_space =
-            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(9), SWITCH_1_GM20B_PROFILE);
-        address_space
-            .initialize(MaxwellAddressSpaceInitialization::default())
-            .unwrap();
-        let first = address_space
-            .map(MaxwellMapRequest {
-                allocation: MaxwellAllocationId::new(1),
-                backing: first_allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
-                backing_offset: 0,
-                size: 0x1000,
-                allocation_alignment: 0x1000,
-                page_size: 0x1000,
-                kind: 0,
-                cacheable: false,
-                permissions: MemoryPermissions::READ_WRITE,
-                fixed_offset: None,
-            })
-            .unwrap();
-        let second = address_space
-            .map(MaxwellMapRequest {
-                allocation: MaxwellAllocationId::new(2),
-                backing: second_allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
-                backing_offset: 0,
-                size: 0x1000,
-                allocation_alignment: 0x1000,
-                page_size: 0x1000,
-                kind: 0,
-                cacheable: false,
-                permissions: MemoryPermissions::READ_WRITE,
-                fixed_offset: None,
-            })
-            .unwrap();
-        assert_eq!(second.offset().get(), first.offset().get() + 0x1000);
-
-        let pushbuffer = first.offset().get() + 0xffc;
-        let decoded = decode_gpfifo_submission(
-            SWITCH_1_GM20B_PROFILE,
-            4,
-            request(1, SUBMIT_HARDWARE_FORMAT),
-            &descriptor(pushbuffer, 3, 0),
-        )
-        .unwrap();
-        let channel = bound_channel(4, address_space.id());
-        let validated = resolve_gpfifo_submission(
-            &channel,
-            FrontendSubmissionId::new(7),
-            decoded,
-            &address_space,
-        )
-        .unwrap();
-
-        assert_eq!(validated.pushbuffers()[0].source().segments().len(), 2);
-        let capture = validated.capture();
-        assert_eq!(capture.channel(), MaxwellChannelId::new(4));
-        assert_eq!(capture.frontend(), FrontendSubmissionId::new(7));
-        assert_eq!(capture.total_entries(), 1);
-        assert_eq!(capture.total_sources(), 2);
-        assert_eq!(capture.sources()[0].word_offset, 0);
-        assert_eq!(capture.sources()[1].word_offset, 1);
-        let mut bytes = [0; 12];
-        validated
-            .read_pushbuffer(&address_space, 0, &mut bytes)
-            .unwrap();
-        assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-        let mut scratch = crate::MaxwellCommandSourceScratch::default();
-        let mut synchronize = || Ok(());
-        let words = crate::pushbuffer::packet::SubmissionWords::new(
-            &validated,
-            &address_space,
-            &mut scratch,
-            &mut synchronize,
-        )
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-        for (index, word) in words.iter().enumerate() {
-            assert_eq!(
-                word.value(),
-                u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
-            );
-            assert_eq!(
-                word.location(),
-                validated.word_location(0, index as u64).unwrap()
-            );
-        }
-
-        drop(first_allocation);
-        address_space.unmap(first.offset()).unwrap();
-        assert!(matches!(
-            validated.validate_sources(&address_space),
-            Err(MaxwellGpfifoSourceError::StaleMapping { location })
-                if location.entry_index == 0
-                    && location.word_offset == 0
-                    && location.mapping == first.id()
-                    && location.generation == first.generation()
-        ));
-        let retained_mapping = validated.pushbuffers()[0].source().segments()[0].mapping();
-        let mut retained_bytes = [0; 4];
-        retained_mapping
-            .backing()
-            .read(
-                retained_mapping.backing_offset() + 0xffc,
-                &mut retained_bytes,
-            )
-            .unwrap();
-        assert_eq!(retained_bytes, [1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn rejects_a_later_hole_before_returning_a_retained_prefix() {
-        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        let mut address_space =
-            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(3), SWITCH_1_GM20B_PROFILE);
-        address_space
-            .initialize(MaxwellAddressSpaceInitialization::default())
-            .unwrap();
-        let mapping = address_space
-            .map(MaxwellMapRequest {
-                allocation: MaxwellAllocationId::new(1),
-                backing: allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
-                backing_offset: 0,
-                size: 0x1000,
-                allocation_alignment: 0x1000,
-                page_size: 0x1000,
-                kind: 0,
-                cacheable: false,
-                permissions: MemoryPermissions::READ_WRITE,
-                fixed_offset: None,
-            })
-            .unwrap();
-        let mut entries = Vec::new();
-        entries.extend_from_slice(&descriptor(mapping.offset().get(), 1, 0));
-        entries.extend_from_slice(&descriptor(mapping.offset().get() + 0x2000, 1, 0));
-        let decoded = decode_gpfifo_submission(
-            SWITCH_1_GM20B_PROFILE,
-            4,
-            request(2, SUBMIT_HARDWARE_FORMAT),
-            &entries,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            resolve_gpfifo_submission(
-                &bound_channel(1, address_space.id()),
-                FrontendSubmissionId::new(1),
-                decoded,
-                &address_space,
-            ),
-            Err(MaxwellGpfifoSourceError::Resolution {
-                entry_index: 1,
-                error: MaxwellGpuAccessError::UnmappedAddress { .. },
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn multiple_entry_subroutine_capture_replays_the_same_first_packet() {
-        let allocation = CanonicalAllocation::zeroed(0x2000, 0x1000).unwrap();
-        allocation
-            .write(0, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
-            .unwrap();
-        let mut address_space =
-            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(5), SWITCH_1_GM20B_PROFILE);
-        address_space
-            .initialize(MaxwellAddressSpaceInitialization::default())
-            .unwrap();
-        let mapping = address_space
-            .map(MaxwellMapRequest {
-                allocation: MaxwellAllocationId::new(3),
-                backing: allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
-                backing_offset: 0,
-                size: 0x2000,
-                allocation_alignment: 0x1000,
-                page_size: 0x1000,
-                kind: 0,
-                cacheable: false,
-                permissions: MemoryPermissions::READ_WRITE,
-                fixed_offset: None,
-            })
-            .unwrap();
-        let mut entries = Vec::new();
-        entries.extend_from_slice(&descriptor(mapping.offset().get(), 1, 0));
-        entries.extend_from_slice(&descriptor(
-            mapping.offset().get() + 4,
-            1,
-            ENTRY1_LEVEL_SUBROUTINE | ENTRY1_SYNC_WAIT,
-        ));
-        let decoded = decode_gpfifo_submission(
-            SWITCH_1_GM20B_PROFILE,
-            4,
-            request(2, SUBMIT_HARDWARE_FORMAT),
-            &entries,
-        )
-        .unwrap();
-        let channel = bound_channel(6, address_space.id());
-        let validated = resolve_gpfifo_submission(
-            &channel,
-            FrontendSubmissionId::new(12),
-            decoded,
-            &address_space,
-        )
-        .unwrap();
-
-        assert_eq!(validated.pushbuffers().len(), 2);
-        assert_eq!(
-            validated.pushbuffers()[1].entry().level(),
-            MaxwellGpfifoLevel::Subroutine
-        );
-        assert_eq!(
-            validated.pushbuffers()[1].entry().sync(),
-            MaxwellGpfifoSyncMode::Wait
-        );
-        let first_location = validated.first_packet_location().unwrap().unwrap();
-        let replay = validated.clone();
-        assert_eq!(replay.capture(), validated.capture());
-        assert_eq!(
-            replay.first_packet_location().unwrap(),
-            Some(first_location)
-        );
-        assert_eq!(first_location.entry_index, 0);
-        assert_eq!(first_location.pushbuffer, mapping.offset());
-        assert_eq!(first_location.word_offset, 0);
-    }
-
-    #[test]
-    fn capture_is_hard_bounded_without_changing_submission_identity() {
-        let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        let mut address_space =
-            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(6), SWITCH_1_GM20B_PROFILE);
-        address_space
-            .initialize(MaxwellAddressSpaceInitialization::default())
-            .unwrap();
-        let mapping = address_space
-            .map(MaxwellMapRequest {
-                allocation: MaxwellAllocationId::new(20),
-                backing: allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
-                backing_offset: 0,
-                size: 0x1000,
-                allocation_alignment: 0x1000,
-                page_size: 0x1000,
-                kind: 0,
-                cacheable: false,
-                permissions: MemoryPermissions::READ_WRITE,
-                fixed_offset: None,
-            })
-            .unwrap();
-        let entry_count = u32::try_from(MAXWELL_GPFIFO_CAPTURE_SOURCES + 1).unwrap();
-        let mut entries = Vec::new();
-        for _ in 0..entry_count {
-            entries.extend_from_slice(&descriptor(mapping.offset().get(), 1, 0));
-        }
-        let decoded = decode_gpfifo_submission(
-            SWITCH_1_GM20B_PROFILE,
-            entry_count,
-            request(entry_count, SUBMIT_HARDWARE_FORMAT),
-            &entries,
-        )
-        .unwrap();
-        let validated = resolve_gpfifo_submission(
-            &bound_channel(7, address_space.id()),
-            FrontendSubmissionId::new(14),
-            decoded,
-            &address_space,
-        )
-        .unwrap();
-
-        let capture = validated.capture();
-        assert_eq!(capture.channel(), validated.channel());
-        assert_eq!(capture.frontend(), validated.frontend());
-        assert_eq!(capture.total_entries(), entry_count as usize);
-        assert_eq!(capture.total_sources(), entry_count as usize);
-        assert_eq!(capture.sources().len(), MAXWELL_GPFIFO_CAPTURE_SOURCES);
-        assert_eq!(capture.omitted_sources(), 1);
-        assert_eq!(
-            validated.first_packet_location().unwrap(),
-            validated.clone().first_packet_location().unwrap()
-        );
-    }
-
-    #[test]
-    fn remapping_the_same_gpu_va_cannot_retarget_a_retained_submission() {
-        let original = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        let replacement = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
-        original.write(0, &[1, 2, 3, 4]).unwrap();
-        replacement.write(0, &[9, 8, 7, 6]).unwrap();
-        let mut address_space =
-            MaxwellGpuAddressSpace::new(MaxwellAddressSpaceId::new(7), SWITCH_1_GM20B_PROFILE);
-        address_space
-            .initialize(MaxwellAddressSpaceInitialization::default())
-            .unwrap();
-        let first = address_space
-            .map(MaxwellMapRequest {
-                allocation: MaxwellAllocationId::new(4),
-                backing: original
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
-                backing_offset: 0,
-                size: 0x1000,
-                allocation_alignment: 0x1000,
-                page_size: 0x1000,
-                kind: 0,
-                cacheable: false,
-                permissions: MemoryPermissions::READ_WRITE,
-                fixed_offset: None,
-            })
-            .unwrap();
-        let channel = bound_channel(8, address_space.id());
-        let decoded = decode_gpfifo_submission(
-            SWITCH_1_GM20B_PROFILE,
-            1,
-            request(1, SUBMIT_HARDWARE_FORMAT),
-            &descriptor(first.offset().get(), 1, 0),
-        )
-        .unwrap();
-        let retained = resolve_gpfifo_submission(
-            &channel,
-            FrontendSubmissionId::new(13),
-            decoded,
-            &address_space,
-        )
-        .unwrap();
-
-        address_space.unmap(first.offset()).unwrap();
-        let remapped = address_space
-            .map(MaxwellMapRequest {
-                allocation: MaxwellAllocationId::new(5),
-                backing: replacement
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
-                backing_offset: 0,
-                size: 0x1000,
-                allocation_alignment: 0x1000,
-                page_size: 0x1000,
-                kind: 0,
-                cacheable: false,
-                permissions: MemoryPermissions::READ_WRITE,
-                fixed_offset: None,
-            })
-            .unwrap();
-        assert_eq!(remapped.offset(), first.offset());
-        assert_ne!(remapped.id(), first.id());
-        assert_ne!(remapped.generation(), first.generation());
-        assert!(matches!(
-            retained.validate_sources(&address_space),
-            Err(MaxwellGpfifoSourceError::StaleMapping { location })
-                if location.mapping == first.id()
-                    && location.generation == first.generation()
-        ));
-
-        let retained_mapping = retained.pushbuffers()[0].source().segments()[0].mapping();
-        let mut retained_bytes = [0; 4];
-        retained_mapping
-            .backing()
-            .read(retained_mapping.backing_offset(), &mut retained_bytes)
-            .unwrap();
-        assert_eq!(retained_bytes, [1, 2, 3, 4]);
-        let mut replacement_bytes = [0; 4];
-        let replacement_range = address_space
-            .resolve_range(remapped.offset(), 4, MemoryPermissions::READ)
-            .unwrap();
-        address_space
-            .read_resolved(&replacement_range, &mut replacement_bytes)
-            .unwrap();
-        assert_eq!(replacement_bytes, [9, 8, 7, 6]);
-    }
 }

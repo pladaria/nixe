@@ -152,9 +152,6 @@ impl Dispatch {
     pub fn recording_handle(&self) -> RecordingHandle {
         self.recorder.handle.clone()
     }
-    pub fn finish_recording(&self) -> Result<(), VulkanError> {
-        self.recorder.finish()
-    }
     pub unsafe fn dynamic_state(
         &self,
         command: vk::CommandBuffer,

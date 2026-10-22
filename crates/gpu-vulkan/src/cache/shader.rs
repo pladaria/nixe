@@ -222,6 +222,9 @@ pub struct ShaderCompiler {
     stages: Arc<stages::Stages>,
 }
 impl ShaderCompiler {
+    pub(crate) fn bind_wakeup(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.pool.bind_wakeup(wake);
+    }
     pub fn new(
         namespace: ShaderNamespace,
         pool: Arc<CompilePool>,

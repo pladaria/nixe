@@ -9,6 +9,73 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Debug)]
+pub(crate) enum RenderError {
+    Stopped,
+    Memory(Arc<nixe_memory::MemoryError>),
+    Diagnostic(Box<str>),
+}
+impl std::fmt::Display for RenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stopped => f.write_str("DSP stopped"),
+            Self::Memory(error) => write!(f, "DSP memory access: {error}"),
+            Self::Diagnostic(detail) => f.write_str(detail),
+        }
+    }
+}
+impl From<Arc<nixe_memory::MemoryError>> for RenderError {
+    fn from(error: Arc<nixe_memory::MemoryError>) -> Self {
+        Self::Memory(error)
+    }
+}
+impl From<Box<str>> for RenderError {
+    fn from(detail: Box<str>) -> Self {
+        Self::Diagnostic(detail)
+    }
+}
+impl From<&str> for RenderError {
+    fn from(detail: &str) -> Self {
+        Self::Diagnostic(detail.into())
+    }
+}
+
+/// Device completion and shutdown share one wake predicate. The DSP owns its
+/// state while waiting; this mutex protects only its host scheduling flags.
+#[derive(Clone)]
+pub(super) struct RenderMemory(Arc<(Mutex<WorkerControl>, Condvar)>);
+impl RenderMemory {
+    #[cfg(test)]
+    pub(super) fn testing() -> Self {
+        Self(Arc::new((
+            Mutex::new(WorkerControl::default()),
+            Condvar::new(),
+        )))
+    }
+    pub(super) fn wait(
+        &self,
+        mut pending: nixe_memory::PendingAccess,
+    ) -> Result<nixe_memory::AccessResult, RenderError> {
+        let wake = self.0.clone();
+        pending.set_waker(Arc::new(move || {
+            // Synchronize with the check-to-sleep interval even when the GPU
+            // completes before this worker has entered the condition wait.
+            let _control = wake.0.lock().unwrap();
+            wake.1.notify_all();
+        }));
+        let mut control = self.0.0.lock().unwrap();
+        loop {
+            if let Some(result) = pending.poll() {
+                return result.map_err(RenderError::Memory);
+            }
+            if control.stop {
+                return Err(RenderError::Stopped);
+            }
+            control = self.0.1.wait(control).unwrap();
+        }
+    }
+}
+
 const BLOCK: Duration = Duration::from_millis(5);
 const BUFFER_COUNT: usize = 3;
 
@@ -42,6 +109,7 @@ impl RendererWorker {
     pub(super) fn start(
         state: &AudioRendererState,
         backend: &dyn AudioBackend,
+        initial: &mut super::update::RendererUpdateState,
     ) -> Result<Self, Box<str>> {
         let stop = Arc::new((Mutex::new(WorkerControl::default()), Condvar::new()));
         let wake = stop.clone();
@@ -65,19 +133,18 @@ impl RendererWorker {
             .collect();
         let update = state.update.clone();
         let signal = state.signal.clone();
+        let failure = state.failure.clone();
         let thread_stop = stop.clone();
         output.start().map_err(|error| error.0.into_boxed_str())?;
-        {
-            let mut state = update.lock().unwrap();
-            state.frames = 0;
-            state.started = true;
-        }
+        initial.frames = 0;
+        initial.started = true;
         let thread = match thread::Builder::new()
             .name("nixe-audren".into())
             .spawn(move || {
                 // Release a pause waiter on normal completion and unwinding.
                 let _finished = WorkerFinished(thread_stop.clone());
-                let result = (|| -> Result<(), Box<str>> {
+                let memory = RenderMemory(thread_stop.clone());
+                let result = (|| -> Result<(), RenderError> {
                     let mut next = Instant::now();
                     loop {
                         let now = Instant::now();
@@ -115,13 +182,18 @@ impl RendererWorker {
                             continue;
                         };
                         {
-                            let mut state = update.lock().unwrap();
-                            let has_sink = buffers.render(
+                            let mut state = update.take_blocking();
+                            let has_sink = match buffers.render(
+                                &memory,
                                 &mut state,
                                 &params,
                                 &mut pcm,
                                 devices.volume(crate::audio_device::ACTIVE_DEVICE),
-                            )?;
+                            ) {
+                                Ok(has_sink) => has_sink,
+                                Err(RenderError::Stopped) => break,
+                                Err(error) => return Err(error),
+                            };
                             if has_sink {
                                 output
                                     .append(state.frames, pcm)
@@ -139,19 +211,21 @@ impl RendererWorker {
                             next = Instant::now();
                         }
                     }
-                    output.stop().map_err(|error| error.0.into_boxed_str())
+                    output
+                        .stop()
+                        .map_err(|error| RenderError::Diagnostic(error.0.into_boxed_str()))
                 })();
                 if let Err(error) = result {
                     log::error!("audio renderer worker failed: {error}");
-                    let mut state = update.lock().unwrap();
-                    state.failure = Some(error);
+                    let mut state = update.take_blocking();
+                    let _first_failure = failure.set(error);
                     state.started = false;
                     signal.signal();
                 }
             }) {
             Ok(thread) => thread,
             Err(error) => {
-                state.update.lock().unwrap().started = false;
+                initial.started = false;
                 return Err(format!("creating audio renderer worker: {error}").into());
             }
         };
@@ -187,22 +261,21 @@ impl AudioRendererState {
             worker.set_paused(paused);
         }
     }
-    pub(crate) fn start(&self, backend: &dyn AudioBackend) -> Result<(), Box<str>> {
+    pub(crate) async fn start(&self, backend: &dyn AudioBackend) -> Result<(), Box<str>> {
+        let mut state = self.update.take().await;
         let mut worker = self.worker.lock().unwrap();
         if worker.is_none() {
             if self.parameters.performance_frames != 0 {
                 return Err("Start: renderer performance histories are not implemented".into());
             }
-            *worker = Some(RendererWorker::start(self, backend)?);
+            *worker = Some(RendererWorker::start(self, backend, &mut state)?);
             log::debug!(
                 "audio renderer started: sample-rate={} samples={} pcm-buffers={BUFFER_COUNT}",
                 self.parameters.sample_rate,
                 self.parameters.samples
             );
-        } else {
-            // Start resets the elapsed-frame count even for an active renderer.
-            self.update.lock().unwrap().frames = 0;
         }
+        state.frames = 0;
         Ok(())
     }
 
@@ -211,7 +284,7 @@ impl AudioRendererState {
         // so closing the last guest handle also stops and joins it without a cycle.
         let mut worker = self.worker.lock().unwrap();
         drop(worker.take());
-        let mut state = self.update.lock().unwrap();
+        let mut state = self.update.take_blocking();
         state.started = false;
         log::debug!("audio renderer stopped: rendered-blocks={}", state.frames);
     }
@@ -221,10 +294,105 @@ impl AudioRendererState {
 mod tests {
     use super::*;
     use crate::audio_renderer::{AudioRendererManagerSession, PARAMETER_SIZE, RendererParameters};
+    use crate::test_memory::{run, transfer};
     use nixe_audio::{AudioDevice, AudioError, AudioFeed};
-    use nixe_memory::{CanonicalAllocation, GuestVirtualAddress, MemoryPermissions};
-    use nixe_runtime::TransferMemoryObject;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Endpoint {
+        requests: std::sync::mpsc::Sender<nixe_memory::DeviceAccessRequest>,
+        cancelled: std::sync::mpsc::Sender<nixe_memory::AccessRequestId>,
+    }
+    impl nixe_memory::DeviceAccessEndpoint for Endpoint {
+        fn submit(&self, request: nixe_memory::DeviceAccessRequest) {
+            self.requests.send(request).unwrap();
+        }
+        fn cancel(&self, id: nixe_memory::AccessRequestId) {
+            let _ = self.cancelled.send(id);
+        }
+        fn allocation_released(&self, _: nixe_memory::MachineId, _: nixe_memory::AllocationId) {}
+        fn physical_retired(
+            &self,
+            _: nixe_memory::MachineId,
+            _: nixe_memory::AllocationId,
+            _: Box<[nixe_memory::Extent]>,
+        ) {
+        }
+        fn allocation_pressure(&self, _: nixe_memory::MachineId, _: u64) {}
+    }
+    #[test]
+    fn pending_dsp_reads_retain_exact_bytes_and_preserve_device_failures() {
+        use crate::{audio_renderer::buffer::Attachment, test_memory::physical};
+        use nixe_memory::{AccessResult, DeviceAccessEndpoint, MemoryError};
+        let ranges = physical(&[0; 8]);
+        let machine = ranges[0].allocation().machine().clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let (cancelled, _) = std::sync::mpsc::channel();
+        let endpoint: Arc<dyn DeviceAccessEndpoint> = Arc::new(Endpoint {
+            requests: send,
+            cancelled,
+        });
+        machine.set_device_endpoint(&endpoint);
+        machine.publish_device_write(&ranges, || Ok(())).unwrap();
+        for fail in [false, true] {
+            let attachment = Attachment {
+                address: 0x1000,
+                ranges: nixe_memory::CapturedMemory::new(ranges.clone()).unwrap(),
+                bytes: 8,
+                pool: Some(0),
+            };
+            let worker = thread::spawn(move || {
+                let mut bytes = [0; 3];
+                attachment
+                    .read(&RenderMemory::testing(), 2, &mut bytes)
+                    .map(|()| bytes)
+            });
+            let request = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(request.bytes(), 3);
+            assert_eq!(request.ranges()[0].offset(), 2);
+            if fail {
+                let failure =
+                    Arc::new(MemoryError::Execution("device lost during DSP read".into()));
+                request.finish(Err(failure.clone()));
+                let Err(RenderError::Memory(actual)) = worker.join().unwrap() else {
+                    panic!("device failure was lost");
+                };
+                assert!(Arc::ptr_eq(&actual, &failure));
+            } else {
+                request.finish(Ok(AccessResult::Read(Box::new([4, 5, 6]))));
+                assert_eq!(worker.join().unwrap().unwrap(), [4, 5, 6]);
+            }
+        }
+    }
+    #[test]
+    fn shutdown_cancels_a_pending_device_read_without_waiting_for_gpu_completion() {
+        use crate::test_memory::physical;
+        use nixe_memory::{AccessOperation, DeviceAccessEndpoint};
+        let ranges = physical(&[0; 8]);
+        let machine = ranges[0].allocation().machine().clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let (cancelled, cancellations) = std::sync::mpsc::channel();
+        let endpoint: Arc<dyn DeviceAccessEndpoint> = Arc::new(Endpoint {
+            requests: send,
+            cancelled,
+        });
+        machine.set_device_endpoint(&endpoint);
+        let pending = machine
+            .request_device_access(ranges, AccessOperation::Read)
+            .unwrap();
+        let request = receive.recv().unwrap();
+        let identity = request.identity();
+        let memory = RenderMemory::testing();
+        let stop = memory.0.clone();
+        let worker = thread::spawn(move || memory.wait(pending));
+        stop.0.lock().unwrap().stop = true;
+        stop.1.notify_all();
+        assert!(matches!(worker.join().unwrap(), Err(RenderError::Stopped)));
+        assert_eq!(
+            cancellations.recv_timeout(Duration::from_secs(2)).unwrap(),
+            identity
+        );
+        assert!(request.is_cancelled());
+    }
 
     #[derive(Default)]
     struct Backend {
@@ -276,21 +444,18 @@ mod tests {
         ] {
             data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
-        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
-        let transfer = TransferMemoryObject::new(
-            GuestVirtualAddress::new(0x1000),
+        let transfer = transfer(&vec![0; 4096]);
+        let session = run(AudioRendererManagerSession::default().open(
+            RendererParameters::decode(&data),
+            transfer,
             4096,
-            MemoryPermissions::NONE,
-            allocation
-                .backing_range(MemoryPermissions::READ_WRITE)
-                .unwrap(),
-        );
-        let session = AudioRendererManagerSession::default()
-            .open(RendererParameters::decode(&data), transfer, 4096, 1, 1)
-            .unwrap()
-            .unwrap();
+            1,
+            1,
+        ))
+        .unwrap()
+        .unwrap();
         {
-            let mut state = session.0.update.lock().unwrap();
+            let mut state = session.0.update.take_blocking();
             let mut mix = Box::new([0; 0x930]);
             mix[..4].copy_from_slice(&1_f32.to_le_bytes());
             mix[4..8].copy_from_slice(&48000_u32.to_le_bytes());
@@ -305,33 +470,33 @@ mod tests {
             state.sinks = vec![sink];
         }
         let backend = Backend::default();
-        session.0.start(&backend).unwrap();
+        run(session.0.start(&backend)).unwrap();
         let feed = backend.feed.lock().unwrap().take().unwrap();
-        wait_until(|| session.0.update.lock().unwrap().frames == BUFFER_COUNT as u64);
+        wait_until(|| session.0.update.take_blocking().frames == BUFFER_COUNT as u64);
         assert!(session.0.event.is_signalled());
         // No host consumption: execution must stay bounded, not fabricate a
         // renderer frame counter from elapsed wall time.
         thread::sleep(BLOCK * 4);
-        assert_eq!(session.0.update.lock().unwrap().frames, BUFFER_COUNT as u64);
+        assert_eq!(session.0.update.take_blocking().frames, BUFFER_COUNT as u64);
         feed.render(&mut [1; 480]);
-        wait_until(|| session.0.update.lock().unwrap().frames == BUFFER_COUNT as u64 + 1);
+        wait_until(|| session.0.update.take_blocking().frames == BUFFER_COUNT as u64 + 1);
         session.0.set_host_paused(true);
-        let paused_frames = session.0.update.lock().unwrap().frames;
+        let paused_frames = session.0.update.take_blocking().frames;
         feed.render(&mut [1; 480]);
         thread::sleep(BLOCK * 3);
-        assert_eq!(session.0.update.lock().unwrap().frames, paused_frames);
-        assert!(session.0.update.lock().unwrap().started);
+        assert_eq!(session.0.update.take_blocking().frames, paused_frames);
+        assert!(session.0.update.take_blocking().started);
         session.0.set_host_paused(false);
-        wait_until(|| session.0.update.lock().unwrap().frames > paused_frames);
+        wait_until(|| session.0.update.take_blocking().frames > paused_frames);
         session.0.set_host_paused(true);
         session.0.stop();
         assert_eq!(backend.live.load(Ordering::SeqCst), 0);
-        assert!(!session.0.update.lock().unwrap().started);
-        let stopped_frames = session.0.update.lock().unwrap().frames;
+        assert!(!session.0.update.take_blocking().started);
+        let stopped_frames = session.0.update.take_blocking().frames;
         thread::sleep(BLOCK * 2);
-        assert_eq!(session.0.update.lock().unwrap().frames, stopped_frames);
-        session.0.start(&backend).unwrap();
-        wait_until(|| session.0.update.lock().unwrap().frames > 0);
+        assert_eq!(session.0.update.take_blocking().frames, stopped_frames);
+        run(session.0.start(&backend)).unwrap();
+        wait_until(|| session.0.update.take_blocking().frames > 0);
         let clone = session.clone();
         drop(session);
         assert_eq!(backend.live.load(Ordering::SeqCst), 1);
@@ -358,29 +523,29 @@ mod tests {
             rendering_device: 0,
             execution_mode: 0,
         };
-        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
-        let transfer = TransferMemoryObject::new(
-            GuestVirtualAddress::new(0x1000),
-            4096,
-            MemoryPermissions::NONE,
-            allocation
-                .backing_range(MemoryPermissions::READ_WRITE)
-                .unwrap(),
-        );
-        let session = AudioRendererManagerSession::default()
-            .open(parameters, transfer, 4096, 1, 1)
-            .unwrap()
-            .unwrap();
+        let transfer = transfer(&vec![0; 4096]);
+        let session =
+            run(AudioRendererManagerSession::default().open(parameters, transfer, 4096, 1, 1))
+                .unwrap()
+                .unwrap();
         let mut sink = [0; 0x140];
         sink[0] = 1;
         sink[1] = 1;
         sink[0x120..0x124].copy_from_slice(&4_u32.to_le_bytes());
-        session.0.update.lock().unwrap().sinks = vec![sink];
-        session.0.start(&Backend::default()).unwrap();
+        session.0.update.take_blocking().sinks = vec![sink];
+        run(session.0.start(&Backend::default())).unwrap();
         wait_until(|| session.0.event.is_signalled());
-        let state = session.0.update.lock().unwrap();
+        let state = session.0.update.take_blocking();
         assert_eq!(state.frames, 0);
         assert!(!state.started);
-        assert!(state.failure.as_ref().unwrap().contains("4 channels"));
+        assert!(
+            session
+                .0
+                .failure
+                .get()
+                .unwrap()
+                .to_string()
+                .contains("4 channels")
+        );
     }
 }

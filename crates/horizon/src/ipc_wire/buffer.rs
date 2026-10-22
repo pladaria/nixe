@@ -172,13 +172,19 @@ mod tests {
 
     #[test]
     fn auto_select_input_decodes_exactly_one_active_descriptor_side() {
-        assert_eq!(auto_select_input((0, 0), (0x2000, 8)), Ok((0x2000, 8)));
-        assert_eq!(auto_select_input((0x3000, 4), (0, 0)), Ok((0x3000, 4)));
         assert_eq!(
+            (auto_select_input((0, 0), (0x2000, 8))).unwrap(),
+            (0x2000, 8)
+        );
+        assert_eq!(
+            (auto_select_input((0x3000, 4), (0, 0))).unwrap(),
+            (0x3000, 4)
+        );
+        assert!(matches!(
             auto_select_input((0x1000, 4), (0x2000, 4)),
             Err(IpcWireError::Malformed(
                 "auto-select input has both descriptor sides active"
             ))
-        );
+        ));
     }
 }

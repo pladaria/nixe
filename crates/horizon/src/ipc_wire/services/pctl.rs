@@ -40,7 +40,7 @@ impl ParentalControlServiceCommand {
 }
 
 pub(in crate::ipc_wire) fn dispatch_parental_control(
-    process: &mut ExceptionProcessContext<'_>,
+    process: &mut Request,
     factory: &ParentalControlFactorySession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -101,7 +101,7 @@ pub(in crate::ipc_wire) fn dispatch_parental_control(
 }
 
 fn dispatch_parental_control_factory(
-    process: &mut ExceptionProcessContext<'_>,
+    process: &mut Request,
     factory: &ParentalControlFactorySession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -157,13 +157,8 @@ fn dispatch_parental_control_factory(
                 )
             } else {
                 let handle = process
-                    .handles_mut()
-                    .insert(HorizonIpcObject::ParentalControlService(service))
-                    .map_err(|_| {
-                        IpcWireError::HostResourceExhausted(
-                            "installing a parental-control child handle",
-                        )
-                    })?;
+                    .return_handle(HorizonIpcObject::ParentalControlService(service))
+                    .map_err(IpcWireError::Handle)?;
                 Ok((
                     encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
                     Some(handle),

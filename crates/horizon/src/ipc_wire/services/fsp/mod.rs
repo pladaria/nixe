@@ -11,7 +11,7 @@ mod system_data;
 pub(super) use save::open_save_data;
 pub(super) use system_data::open_system_data;
 
-use nixe_runtime::ExceptionProcessContext;
+use crate::ipc_wire::request::Request;
 
 use crate::ipc_wire::IpcWireError;
 use crate::ipc_wire::io::has_ipc_descriptors;
@@ -89,8 +89,8 @@ pub(super) fn decode_root_request(
     }
 }
 
-pub(super) fn decode_object_request(
-    process: &ExceptionProcessContext<'_>,
+pub(super) async fn decode_object_request(
+    process: &Request,
     object: &SemanticIpcObject,
     request: &CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -98,13 +98,13 @@ pub(super) fn decode_object_request(
     match object {
         SemanticIpcObject::ReadOnlyFileSystem(_)
         | SemanticIpcObject::HostDirectoryFileSystem(_) => {
-            filesystem::decode(process, object, request, hipc)
+            filesystem::decode(process, object, request, hipc).await
         }
         SemanticIpcObject::ReadOnlyFile(_) | SemanticIpcObject::HostFile(_) => {
-            file::decode(process, object, request, hipc)
+            file::decode(process, object, request, hipc).await
         }
-        SemanticIpcObject::ReadOnlyStorage(_) => storage::decode(request, hipc),
-        SemanticIpcObject::ReadOnlyDirectory(_) => directory::decode(request, hipc),
+        SemanticIpcObject::ReadOnlyStorage(_) => storage::decode(request, hipc).await,
+        SemanticIpcObject::ReadOnlyDirectory(_) => directory::decode(request, hipc).await,
     }
 }
 

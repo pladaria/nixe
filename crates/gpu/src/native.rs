@@ -1,8 +1,10 @@
 //! Immutable guest facts at the native execution boundary. No host handles,
 //! resource-creation transactions, pass commands or aggregate access plans.
+use crate::physical::{Footprint, PhysicalMapping};
 use crate::*;
-use nixe_memory::CanonicalBackingRange;
+use nixe_memory::AllocationRange;
 use std::{
+    cell::RefCell,
     hash::{Hash, Hasher},
     sync::Arc,
 };
@@ -11,6 +13,7 @@ use std::{
 /// logical allocation IDs cross the native presentation boundary.
 #[derive(Clone, Debug)]
 pub struct NativePresentationImage {
+    pub inputs: Vec<AllocationRange>,
     pub planes: Arc<[GuestImagePlane]>,
     pub extent: [u32; 2],
     pub format: crate::PresentationImageFormat,
@@ -41,7 +44,7 @@ impl GuestImage {
 pub enum GuestBinding {
     /// An explicitly unbound buffer: reads return zero and writes are discarded.
     NullBuffer,
-    Buffer(CanonicalBackingRange),
+    Buffer(Arc<PhysicalMapping>),
     Image {
         image: GuestImage,
         /// Shader view dimensionality remains arrayed for a single layer.
@@ -52,7 +55,7 @@ pub enum GuestBinding {
 #[derive(Clone, Debug)]
 pub struct GuestVertexBuffer {
     pub binding: u32,
-    pub backing: CanonicalBackingRange,
+    pub backing: Arc<PhysicalMapping>,
 }
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct GuestVertexLayout {
@@ -73,7 +76,7 @@ pub struct GuestProgram {
 /// Index bytes come either from guest memory or from ordered inline methods.
 #[derive(Clone, Debug)]
 pub enum GuestIndexBuffer {
-    Canonical(CanonicalBackingRange, IndexType),
+    Canonical(Arc<PhysicalMapping>, IndexType),
     Inline(Arc<[u8]>),
 }
 #[derive(Clone, Debug)]
@@ -193,15 +196,13 @@ pub enum NativeCommand {
     Sequence(Box<[NativeCommand]>),
     /// Orders the device stream without waiting for it on the host.
     WaitForIdle,
-    /// Ordered command-processor write. Inline writes to CPU-owned storage are
-    /// committed at this recording position after prior input snapshots. Release
-    /// writes and device-owned targets require actual producer completion for
-    /// CPU visibility, including when the payload is already known.
-    WriteMemory {
-        target: CanonicalBackingRange,
+    /// Ordered report payload. A fence commits preceding buffer publications.
+    /// Ordinary inline writes execute directly on the command owner.
+    ReportMemory {
+        target: Vec<AllocationRange>,
         offset: u64,
         bytes: Arc<[u8]>,
-        after_prior_work: bool,
+        fence: bool,
     },
     Draw {
         state: Arc<GuestDrawState>,
@@ -251,6 +252,126 @@ pub struct NativeSubmission {
     pub segment: FrontendSubmissionSegment,
     pub final_segment: bool,
     pub commands: Vec<NativeCommand>,
+    // Only a suspended preparation acquires RAM ownership. Warm consumption
+    // remains direct, and weak prepared-state caches cannot retain these pins.
+    suspended_inputs: RefCell<Option<Vec<AllocationRange>>>,
+}
+impl NativeSubmission {
+    pub fn new(
+        frontend: FrontendSubmissionId,
+        segment: FrontendSubmissionSegment,
+        final_segment: bool,
+        commands: Vec<NativeCommand>,
+    ) -> Self {
+        Self {
+            frontend,
+            segment,
+            final_segment,
+            commands,
+            suspended_inputs: RefCell::new(None),
+        }
+    }
+    /// Retain the original physical inputs before servicing control during a
+    /// cold compile wait. Repeated polls acquire no additional pins. The batch
+    /// owns them through actual consumption; cache entries remain weak.
+    pub fn retain_suspended_inputs(&self) -> Result<(), nixe_memory::MemoryError> {
+        let mut retained = self.suspended_inputs.borrow_mut();
+        if retained.is_none() {
+            let mut inputs = Vec::new();
+            for command in &self.commands {
+                command.retain_inputs(&mut inputs)?;
+            }
+            *retained = Some(inputs);
+        }
+        Ok(())
+    }
+}
+impl NativeCommand {
+    fn retain_inputs(
+        &self,
+        inputs: &mut Vec<AllocationRange>,
+    ) -> Result<(), nixe_memory::MemoryError> {
+        fn buffer(
+            input: &PhysicalMapping,
+            inputs: &mut Vec<AllocationRange>,
+        ) -> Result<(), nixe_memory::MemoryError> {
+            inputs.extend(input.pin(0, input.bytes())?);
+            Ok(())
+        }
+        fn image(
+            input: &GuestImage,
+            inputs: &mut Vec<AllocationRange>,
+        ) -> Result<(), nixe_memory::MemoryError> {
+            for plane in input.planes.iter() {
+                let range = plane.footprint.bounds();
+                inputs.extend(
+                    plane
+                        .footprint
+                        .mapping()
+                        .pin(range.start, range.end - range.start)?,
+                );
+            }
+            Ok(())
+        }
+        fn program(
+            input: &GuestProgram,
+            inputs: &mut Vec<AllocationRange>,
+        ) -> Result<(), nixe_memory::MemoryError> {
+            for (_, binding) in &input.bindings {
+                match binding {
+                    GuestBinding::Buffer(input) => buffer(input, inputs)?,
+                    GuestBinding::Image { image: input, .. } => image(input, inputs)?,
+                    GuestBinding::NullBuffer | GuestBinding::Sampler(_) => {}
+                }
+            }
+            Ok(())
+        }
+        match self {
+            Self::Sequence(commands) => {
+                for command in commands {
+                    command.retain_inputs(inputs)?;
+                }
+            }
+            Self::Draw { state, .. } => {
+                program(&state.program, inputs)?;
+                for vertex in &state.vertices {
+                    buffer(&vertex.backing, inputs)?;
+                }
+                if let Some(GuestIndexBuffer::Canonical(input, _)) = &state.index {
+                    buffer(input, inputs)?;
+                }
+                for input in state.colors.iter().chain(state.depth_stencil.iter()) {
+                    image(input, inputs)?;
+                }
+            }
+            Self::Dispatch { program: input, .. } => program(input, inputs)?,
+            Self::Clear { image: input, .. } => image(input, inputs)?,
+            Self::Blit {
+                source,
+                destination,
+                ..
+            } => {
+                image(source, inputs)?;
+                image(destination, inputs)?;
+            }
+            Self::ConvertNv12 { images, .. } => {
+                for input in images.iter() {
+                    image(input, inputs)?;
+                }
+            }
+            Self::UploadPlanes { images, .. } | Self::ImportDecodedPlanes { images, .. } => {
+                for input in images.iter() {
+                    image(input, inputs)?;
+                }
+            }
+            // ReportMemory already owns its exact AllocationRange values.
+            Self::ReportMemory { .. }
+            | Self::WaitForIdle
+            | Self::Ordering(_)
+            | Self::Barrier(_) => {}
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -264,7 +385,112 @@ pub struct GuestImagePlane {
     pub mip_level: u32,
     pub array_layer: u32,
     pub aspect: GuestImageAspect,
-    pub backing: CanonicalBackingRange,
+    pub footprint: Arc<Footprint>,
     pub row_pitch: u64,
     pub bytes_per_block: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nixe_memory::{Allocation, Machine, PAGE_SIZE};
+
+    fn program(backing: Arc<PhysicalMapping>) -> Arc<GuestProgram> {
+        Arc::new(GuestProgram {
+            identity: PreparedStateId::new(1, 1),
+            shader: Arc::new(GuestShaderCode {
+                identity: crate::shader_identity::ContentId::of(b"suspended-input-test", &[]),
+                stages: Box::new([]),
+            }),
+            bindings: Box::new([(
+                crate::shader_module::ResourceId(0),
+                GuestBinding::Buffer(backing),
+            )]),
+            shared_memory_bytes: 0,
+        })
+    }
+    fn input(allocation: &Allocation, start: u64, bytes: u64) -> Arc<PhysicalMapping> {
+        PhysicalMapping::new(&[AllocationRange::new(
+            allocation.pin_range(start, bytes).unwrap(),
+            start,
+            bytes,
+        )
+        .unwrap()])
+        .unwrap()
+    }
+    fn batch(program: Arc<GuestProgram>) -> NativeSubmission {
+        NativeSubmission::new(
+            FrontendSubmissionId::new(1),
+            FrontendSubmissionSegment::FIRST,
+            true,
+            vec![NativeCommand::Dispatch {
+                program,
+                groups: [1, 1, 1],
+            }],
+        )
+    }
+
+    #[test]
+    fn suspended_input_keeps_its_original_page_until_consumption_and_caches_remain_weak() {
+        let machine = Machine::new(3 * PAGE_SIZE).unwrap();
+        let account = machine.account(3 * PAGE_SIZE).unwrap();
+        let allocation = account.allocate(3 * PAGE_SIZE).unwrap();
+        let mapping = input(&allocation, PAGE_SIZE + 17, 8);
+        let cached = program(Arc::clone(&mapping));
+        let work = batch(Arc::clone(&cached));
+        work.retain_suspended_inputs().unwrap();
+        for _ in 0..8 {
+            work.retain_suspended_inputs().unwrap();
+        }
+        drop(allocation);
+        assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
+        let recycled = account.allocate(2 * PAGE_SIZE).unwrap();
+        machine
+            .write_resolved(&mapping.pin(0, 8).unwrap(), &[0x5a; 8])
+            .unwrap();
+        let mut bytes = [0; 8];
+        machine
+            .capture_stream(&mapping.pin(0, 8).unwrap(), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, [0x5a; 8]);
+        drop(work);
+        assert_eq!(machine.statistics().allocated_bytes, 2 * PAGE_SIZE);
+        assert!(
+            mapping.pin(0, 8).is_err(),
+            "prepared/cache references must not own RAM"
+        );
+        drop((cached, recycled));
+        assert_eq!(machine.statistics().allocated_bytes, 0);
+    }
+
+    #[test]
+    fn warm_metadata_and_a_failed_suspension_capture_cannot_retain_guest_ram() {
+        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
+        let account = machine.account(2 * PAGE_SIZE).unwrap();
+        let first = account.allocate(PAGE_SIZE).unwrap();
+        let retired = account.allocate(PAGE_SIZE).unwrap();
+        let retired_mapping = input(&retired, 0, 4);
+        let unused = batch(program(Arc::clone(&retired_mapping)));
+        drop(retired);
+        assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
+        let work = NativeSubmission::new(
+            FrontendSubmissionId::new(2),
+            FrontendSubmissionSegment::FIRST,
+            true,
+            vec![NativeCommand::Sequence(Box::new([
+                NativeCommand::Dispatch {
+                    program: program(input(&first, 0, 4)),
+                    groups: [1, 1, 1],
+                },
+                NativeCommand::Dispatch {
+                    program: program(retired_mapping),
+                    groups: [1, 1, 1],
+                },
+            ]))],
+        );
+        assert!(work.retain_suspended_inputs().is_err());
+        drop(first);
+        assert_eq!(machine.statistics().allocated_bytes, 0);
+        drop((unused, work));
+    }
 }

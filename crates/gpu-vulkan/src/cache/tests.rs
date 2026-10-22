@@ -1,15 +1,9 @@
 use super::*;
+use crate::test_device as support;
 use crate::*;
 use ash::vk;
 use nixe_gpu::shader_identity::{ContentId, ShaderNamespace};
 use std::{sync::Arc, time::Duration};
-mod support {
-    use crate as nixe_gpu_vulkan;
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/device.rs"
-    ));
-}
 mod gate {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -68,14 +62,12 @@ fn native_graphics_cache_normalizes_dynamic_state_and_reuses_library_parts() {
     );
     let pipelines = PipelineCompiler::new(&device, Arc::clone(&pool), &config).unwrap();
     let state = GraphicsState::color(vk::Format::R8G8B8A8_UNORM);
-    let first = ready(
-        pipelines
-            .request(PipelineRecipe::Graphics {
-                shader: Arc::clone(&shader),
-                state: state.clone(),
-            })
-            .unwrap(),
-    );
+    let first = pipelines
+        .request(PipelineRecipe::Graphics {
+            shader: Arc::clone(&shader),
+            state: state.clone(),
+        })
+        .unwrap();
     if device.profile().dynamic_state.base {
         let mut changed = state.clone();
         changed.cull = vk::CullModeFlags::BACK;
@@ -83,30 +75,27 @@ fn native_graphics_cache_normalizes_dynamic_state_and_reuses_library_parts() {
         changed.depth_test = true;
         changed.depth_write = true;
         changed.depth_compare = vk::CompareOp::LESS;
-        let same = ready(
-            pipelines
-                .request(PipelineRecipe::Graphics {
-                    shader: Arc::clone(&shader),
-                    state: changed,
-                })
-                .unwrap(),
-        );
+        let same = pipelines
+            .request(PipelineRecipe::Graphics {
+                shader: Arc::clone(&shader),
+                state: changed,
+            })
+            .unwrap();
         assert!(Arc::ptr_eq(&first, &same));
     }
+    let first_metrics = first.metrics().unwrap();
     let mut changed = state;
     changed.colors[0].1.write_mask =
         vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B;
-    let other = ready(
-        pipelines
-            .request(PipelineRecipe::Graphics {
-                shader,
-                state: changed,
-            })
-            .unwrap(),
-    );
+    let other = pipelines
+        .request(PipelineRecipe::Graphics {
+            shader,
+            state: changed,
+        })
+        .unwrap();
     if pipelines.strategy() == PipelineStrategy::Libraries {
-        assert_eq!(first.metrics.libraries_created, 4);
-        assert_eq!(other.metrics.libraries_created, 1);
+        assert_eq!(first_metrics.libraries_created, 4);
+        assert_eq!(other.metrics().unwrap().libraries_created, 1);
     }
     drop(first);
     drop(other);
@@ -135,7 +124,7 @@ fn descriptor_pressure(api: ApiPreference) {
         &device.profile().shader_compiler.profile,
         [crate::test_shaders::increment(7, 4)],
     );
-    let pipeline = ready(pipelines.request(PipelineRecipe::Compute(shader)).unwrap());
+    let pipeline = pipelines.request(PipelineRecipe::Compute(shader)).unwrap();
     let alignment = device
         .profile()
         .limits
@@ -280,7 +269,7 @@ fn dynamic_offsets_reuse_one_set_and_preserve_bounds_and_gpu_leases() {
         &device.profile().shader_compiler.profile,
         [crate::test_shaders::increment(7, 4)],
     );
-    let pipeline = ready(pipelines.request(PipelineRecipe::Compute(shader)).unwrap());
+    let pipeline = pipelines.request(PipelineRecipe::Compute(shader)).unwrap();
     assert_eq!(&*pipeline.layout.dynamic_bindings, &[0]);
     let alignment = device
         .profile()
@@ -624,7 +613,7 @@ fn guest_compilation_artifact_creates_native_compute_pipeline() {
             .unwrap(),
     );
     let pipelines = PipelineCompiler::new(&device, pool, &config).unwrap();
-    let pipeline = ready(pipelines.request(PipelineRecipe::Compute(shader)).unwrap());
+    let pipeline = pipelines.request(PipelineRecipe::Compute(shader)).unwrap();
     assert_eq!(pipeline.bind_point, vk::PipelineBindPoint::COMPUTE);
     assert!(pipeline.layout.key.bindings.is_empty());
     drop(pipeline);

@@ -5,9 +5,7 @@
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/memory/pool_mapper.cpp
 
 use super::RendererParameters;
-use nixe_memory::{
-    CanonicalBackingRange, CanonicalRangeTranslationError, CanonicalRangeTranslationErrorReason,
-};
+use nixe_memory::{AllocationRange, MemoryError};
 use std::ops::Range;
 
 pub(crate) const HEADER_SIZE: usize = 0x40;
@@ -30,7 +28,7 @@ fn put_word(data: &mut [u8], offset: usize, value: u32) {
 pub(crate) enum UpdateError {
     Invalid,
     Unsupported(Box<str>),
-    Mapping(CanonicalRangeTranslationError),
+    Mapping(MemoryError),
 }
 
 #[derive(Debug)]
@@ -138,7 +136,8 @@ impl UpdateLayout {
 #[derive(Debug)]
 pub(super) struct MemoryPool {
     pub(super) address: u64,
-    pub(super) backing: CanonicalBackingRange,
+    pub(super) ranges: nixe_memory::CapturedMemory,
+    pub(super) bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -153,7 +152,6 @@ pub(crate) struct RendererUpdateState {
     pub(super) effect_order: Vec<Vec<usize>>,
     pub(crate) started: bool,
     pub(super) frames: u64,
-    pub(crate) failure: Option<Box<str>>,
     performance_target: u32,
     force_mapping: bool,
     updates: u64,
@@ -165,7 +163,7 @@ impl RendererUpdateState {
         params: &RendererParameters,
         layout: &UpdateLayout,
         input: &[u8],
-        translate: impl Fn(u64, u64) -> Result<CanonicalBackingRange, CanonicalRangeTranslationError>,
+        translate: impl Fn(u64, u64) -> Result<Vec<AllocationRange>, MemoryError>,
     ) -> Result<Vec<u8>, UpdateError> {
         let revision = params.revision_number().unwrap();
         let behavior = &input[layout.behavior.clone()];
@@ -199,30 +197,28 @@ impl RendererUpdateState {
                 && size.is_multiple_of(4096)
             {
                 let status = match requested {
-                    4 => match translate(address, size) {
-                        Ok(backing) => {
-                            self.pools[i] = Some(MemoryPool { address, backing });
-                            5 // Attached: actual retained canonical RAM, no identity-map stub.
+                    4 => {
+                        match translate(address, size).and_then(nixe_memory::CapturedMemory::new) {
+                            Ok(ranges) => {
+                                self.pools[i] = Some(MemoryPool {
+                                    address,
+                                    ranges,
+                                    bytes: size,
+                                });
+                                5 // Attached: actual retained canonical RAM, no identity-map stub.
+                            }
+                            Err(error) if error.is_access_fault() => {
+                                self.pools[i] = None;
+                                0 // Failed attachment leaves the output state invalid.
+                            }
+                            Err(error) => return Err(UpdateError::Mapping(error)),
                         }
-                        Err(error)
-                            if matches!(
-                                error.reason,
-                                CanonicalRangeTranslationErrorReason::Unmapped
-                                    | CanonicalRangeTranslationErrorReason::AddressOverflow
-                                    | CanonicalRangeTranslationErrorReason::PermissionDenied
-                                    | CanonicalRangeTranslationErrorReason::DeviceMemory
-                            ) =>
-                        {
-                            self.pools[i] = None;
-                            0 // Failed attachment leaves the output state invalid.
-                        }
-                        Err(error) => return Err(UpdateError::Mapping(error)),
-                    },
+                    }
                     2 if !self.voices.iter().any(|voice| voice.uses_pool(i))
                         && !self.effects.iter().any(|effect| effect.uses_pool(i))
-                        && self.pools[i].as_ref().is_some_and(|pool| {
-                            pool.address == address && pool.backing.size() == size
-                        }) =>
+                        && self.pools[i]
+                            .as_ref()
+                            .is_some_and(|pool| pool.address == address && pool.bytes == size) =>
                     {
                         self.pools[i] = None;
                         3 // Detached.
@@ -458,7 +454,7 @@ impl RendererUpdateState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+    use crate::{audio_renderer::worker::RenderMemory, test_memory::physical};
 
     fn params() -> RendererParameters {
         let mut data = [0; super::super::PARAMETER_SIZE];
@@ -570,16 +566,11 @@ mod tests {
         let params = params();
         let mut data = packet(true);
         let layout = layout(&data).unwrap();
-        let memory = CanonicalAllocation::zeroed(4096, 4096).unwrap();
-        memory
-            .write(
-                0,
-                &[100_i16, -200, 300, -400]
-                    .into_iter()
-                    .flat_map(i16::to_le_bytes)
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
+        let mut samples = vec![0; 4096];
+        for (out, sample) in samples.chunks_exact_mut(2).zip([100_i16, -200, 300, -400]) {
+            out.copy_from_slice(&sample.to_le_bytes());
+        }
+        let ranges = physical(&samples);
         data[0x50..0x58].copy_from_slice(&0x1000_u64.to_le_bytes());
         data[0x58..0x60].copy_from_slice(&4096_u64.to_le_bytes());
         put_word(&mut data, 0x60, 4);
@@ -612,12 +603,16 @@ mod tests {
         state
             .update(&params, &layout, &data, |address, size| {
                 assert_eq!((address, size), (0x1000, 4096));
-                Ok(memory.backing_range(MemoryPermissions::READ_WRITE).unwrap())
+                Ok(ranges.clone())
             })
             .unwrap();
         let mut pcm = vec![0; 480];
         let mut renderer = super::super::render::RenderBuffers::new(&params);
-        assert!(renderer.render(&mut state, &params, &mut pcm, 1.0).unwrap());
+        assert!(
+            renderer
+                .render(&RenderMemory::testing(), &mut state, &params, &mut pcm, 1.0)
+                .unwrap()
+        );
         assert_eq!(&pcm[..8], &[100, 100, -200, -200, 300, 300, -400, -400]);
         assert!(pcm[8..].iter().all(|&sample| sample == 0));
         put_word(&mut data, 0x60, 0);
@@ -630,15 +625,17 @@ mod tests {
             .unwrap();
         assert_eq!(wide(&output, 0x90), 4);
         assert_eq!(word(&output, 0x98), 1);
-        renderer.render(&mut state, &params, &mut pcm, 1.0).unwrap();
+        renderer
+            .render(&RenderMemory::testing(), &mut state, &params, &mut pcm, 1.0)
+            .unwrap();
         assert!(pcm.iter().all(|&sample| sample == 0));
     }
 
     #[test]
     fn pool_attachment_retains_real_bytes_and_detach_checks_identity() {
-        let memory = CanonicalAllocation::zeroed(4096, 4096).unwrap();
-        memory.write(0, &[0xab]).unwrap();
-        let backing = memory.backing_range(MemoryPermissions::READ_WRITE).unwrap();
+        let mut initial = vec![0; 4096];
+        initial[0] = 0xab;
+        let ranges = physical(&initial);
         let mut state = RendererUpdateState::default();
         let mut data = packet(true);
         data[0x50..0x58].copy_from_slice(&0x1000_u64.to_le_bytes());
@@ -651,19 +648,20 @@ mod tests {
                 &data,
                 |address, size| {
                     assert_eq!((address, size), (0x1000, 4096));
-                    Ok(backing.clone())
+                    Ok(ranges.clone())
                 },
             )
             .unwrap();
         assert_eq!(word(&output, 0x40), 5);
-        drop(backing);
-        drop(memory);
+        drop(ranges);
         let mut byte = [0];
-        state.pools[0]
-            .as_ref()
+        let ranges = &state.pools[0].as_ref().unwrap().ranges;
+        ranges[0]
+            .allocation()
+            .machine()
+            .read_captured_into(ranges, 0, &mut byte)
             .unwrap()
-            .backing
-            .read(0, &mut byte)
+            .into_ready()
             .unwrap();
         assert_eq!(byte, [0xab]);
         put_word(&mut data, 0x60, 2);

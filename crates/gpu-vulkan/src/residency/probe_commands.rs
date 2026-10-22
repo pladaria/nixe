@@ -118,7 +118,6 @@ impl VulkanResidency {
                 "conversion dispatch exceeds host workgroup count; split the word interval",
             ));
         }
-        self.prepare_write(Resource::Buffer(id), offset, size)?;
         let owner = Arc::clone(&self.device.owner);
         let program = self.helpers.compute(&owner, binding)?;
         let (pipeline, layout, set_layout) = (program.pipeline, program.layout, program.set_layout);
@@ -275,13 +274,13 @@ impl VulkanResidency {
         self.barriers.emit(&mut self.device);
         let slot = &mut self.device.submission.slots[index];
         let command = slot.command;
-        self.device.dispatch.finish_recording()?;
+        self.device.dispatch.recording_handle().finish()?;
         unsafe {
-            if slot.bound_compute != pipeline {
+            {
                 owner
                     .device
                     .cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
-                slot.bound_compute = pipeline;
+                slot.bound_compute = 0;
                 slot.bound_set = vk::DescriptorSet::null();
                 slot.bound_descriptor_buffer = 0;
                 slot.bound_descriptor_offset = u64::MAX;
@@ -358,9 +357,12 @@ impl VulkanResidency {
                     );
                 }
             }
-            owner.device.cmd_dispatch(command, groups, 1, 1);
         }
-        self.record_authority(Resource::Buffer(id), offset, size)?;
+        let writer = self.prepare_write(Resource::Buffer(id), offset, size)?;
+        self.publish_effect(&[writer], |_| unsafe {
+            owner.device.cmd_dispatch(command, groups, 1, 1);
+        })?;
+        self.finish_buffer_write(id, offset, size)?;
         self.device.work_ticket()
     }
 }

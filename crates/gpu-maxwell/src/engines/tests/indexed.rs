@@ -15,26 +15,20 @@ fn configure_indices(channel: &mut MaxwellGpuChannel, address: u64, format: u32,
 
 #[test]
 fn indexed_storage_is_demand_bounded_without_inventing_a_limit() {
-    let allocation = CanonicalAllocation::zeroed(0x1000, 0x1000).unwrap();
     let mut space = resource_address_space();
-    let address = map_resource(
-        &mut space,
-        allocation
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap(),
-        93,
-        0,
-    )
-    .offset()
-    .get();
+    let allocation = crate::test_memory::allocate(space.memory().machine(), 0x1000);
+    let address = map_resource(&mut space, crate::test_memory::ranges(&allocation), 93, 0)
+        .offset()
+        .get();
     let mut channel = three_d_channel();
     configure_indices(&mut channel, address + 4090, 1, 0);
     for count in [3, 4] {
         let dispatch = dispatch_method(&mut channel, 0x17e0 / 4, count).unwrap();
         let result = resolve_maxwell_three_d_resources_for_roles(
             dispatch.operations()[0].state(),
-            &space,
+            space.memory(),
             &[MaxwellThreeDResourceRole::IndexBuffer],
+            &mut crate::test_memory::access(space.memory().machine()),
         );
         assert_eq!(result.is_ok(), count == 3);
     }
@@ -43,8 +37,9 @@ fn indexed_storage_is_demand_bounded_without_inventing_a_limit() {
     assert!(
         resolve_maxwell_three_d_resources_for_roles(
             channel.three_d(),
-            &space,
-            &[MaxwellThreeDResourceRole::IndexBuffer]
+            space.memory(),
+            &[MaxwellThreeDResourceRole::IndexBuffer],
+            &mut crate::test_memory::access(space.memory().machine())
         )
         .is_err()
     );
@@ -52,8 +47,9 @@ fn indexed_storage_is_demand_bounded_without_inventing_a_limit() {
     assert!(
         resolve_maxwell_three_d_resources_for_roles(
             channel.three_d(),
-            &space,
-            &[MaxwellThreeDResourceRole::IndexBuffer]
+            space.memory(),
+            &[MaxwellThreeDResourceRole::IndexBuffer],
+            &mut crate::test_memory::access(space.memory().machine())
         )
         .is_err()
     );
@@ -63,8 +59,9 @@ fn indexed_storage_is_demand_bounded_without_inventing_a_limit() {
     assert!(
         resolve_maxwell_three_d_resources_for_roles(
             channel.three_d(),
-            &space,
-            &[MaxwellThreeDResourceRole::IndexBuffer]
+            space.memory(),
+            &[MaxwellThreeDResourceRole::IndexBuffer],
+            &mut crate::test_memory::access(space.memory().machine())
         )
         .is_err()
     );

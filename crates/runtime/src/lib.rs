@@ -10,6 +10,7 @@ mod external_event;
 mod handle;
 mod launch_plan;
 mod launcher;
+pub mod memory;
 mod module_memory;
 mod process;
 mod process_mount;
@@ -18,7 +19,9 @@ mod virtual_time;
 pub use transactional_directory::{DirectoryWriteLease, TransactionalDirectory};
 
 pub use address_wait::{
-    AddressWaitCompletion, AddressWaitRegistry, AddressWaitResult, PriorityAddressWaitQueue,
+    AddressOperationGuard, AddressSignalTargets, AddressWaitCompletion, AddressWaitRegistry,
+    AddressWaitResult, ConditionAcquire, ConditionClaim, ConditionSignal, ConditionWait,
+    MutexHandoff, PriorityAddressWaitQueue,
 };
 pub use coordinator::{
     CoordinatorDrainReport, CoordinatorError, CoordinatorExecution, CoordinatorResourceCounts,
@@ -40,8 +43,8 @@ pub use external_event::{
     ExternalEventSequence, ExternalEventSource, SequencedExternalEvent,
 };
 pub use handle::{
-    EventObject, EventWaitOutcome, HandleError, HandleObject, HandleTable, HandleValue,
-    MAX_SESSION_REQUESTS, MAX_SHARED_MEMORY_BYTES, PortEndpoint, PortError, PortObject,
+    EventFuture, EventObject, EventWaitOutcome, HandleError, HandleObject, HandleReservation,
+    HandleTable, HandleValue, MAX_SESSION_REQUESTS, PortEndpoint, PortError, PortObject,
     ProcessObject, ReadableEventObject, SessionEndpoint, SessionError, SessionMessage,
     SessionObject, SessionRequestOwner, SessionRequestResult, SharedMemoryObject, ThreadObject,
     TransferMemoryObject, WritableEventObject,
@@ -52,10 +55,7 @@ pub use launch_plan::{
     PackagedIdentity, ReadOnlyMount,
 };
 pub use launcher::{LaunchError, LaunchStage, Launcher, LauncherInput};
-pub use module_memory::{
-    BackendInstallError, InstallStage, ModuleInstallError, ModuleMemoryBackend, PageRequest,
-    install_prepared_module,
-};
+pub use module_memory::{InstallStage, ModuleInstallError, install_prepared_module};
 pub use nixe_scheduler::{ProcessLifecycle, ThreadLifecycle};
 pub use process::{
     CpuBackendConfig, ExecutionReport, ExecutionStop, GuestStackFrame, GuestThread,

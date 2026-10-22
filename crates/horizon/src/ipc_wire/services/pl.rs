@@ -3,7 +3,7 @@ use crate::SharedFontSession;
 
 // https://github.com/switchbrew/libnx/blob/master/nx/source/services/pl.c
 pub(in crate::ipc_wire) fn dispatch_shared_font(
-    process: &mut ExceptionProcessContext<'_>,
+    process: &mut Request,
     session: &SharedFontSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
@@ -17,13 +17,10 @@ pub(in crate::ipc_wire) fn dispatch_shared_font(
     }
     let resource_error = |reason: String| IpcWireError::SharedFont(reason.into_boxed_str());
     if request.command_id == 4 {
-        let shared = session
-            .shared_memory(process.memory())
-            .map_err(resource_error)?;
+        let shared = session.shared_memory();
         let handle = process
-            .handles_mut()
-            .insert(shared)
-            .map_err(|_| IpcWireError::HostResourceExhausted("returning shared font memory"))?;
+            .return_handle(shared)
+            .map_err(IpcWireError::Handle)?;
         return semantic_success(request.token, false, &[], &[handle], &[], None);
     }
     let font = request_u32(request.data, 0).unwrap();
@@ -33,23 +30,17 @@ pub(in crate::ipc_wire) fn dispatch_shared_font(
     let mut data = Vec::new();
     match request.command_id {
         0 => {
-            session
-                .request_load(process.memory(), font)
-                .map_err(resource_error)?;
+            session.request_load(font).map_err(resource_error)?;
         }
         1 => {
             // Horizon prepares the system fonts independently of application
             // RequestLoad calls. Materialize that backing on first consumption;
             // never leave clients polling an idle host-side loader forever.
-            session
-                .request_load(process.memory(), font)
-                .map_err(resource_error)?;
+            session.request_load(font).map_err(resource_error)?;
             data.extend_from_slice(&1_u32.to_le_bytes());
         }
         2 | 3 => {
-            let region = session
-                .request_load(process.memory(), font)
-                .map_err(resource_error)?;
+            let region = session.request_load(font).map_err(resource_error)?;
             let value = if request.command_id == 2 {
                 region.size
             } else {

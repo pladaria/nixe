@@ -5,20 +5,21 @@
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/audio_render_manager.cpp
 
 use crate::audio_device::{AudioDeviceSession, AudioDeviceState};
-use nixe_memory::{CanonicalWriteBatch, CanonicalWriteBatchError};
 use nixe_runtime::{
     EventObject, ExternalEventSource, ReadableEventObject, TransferMemoryObject,
     WritableEventObject,
 };
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 mod biquad;
 mod buffer;
 mod effect;
 mod render;
 mod resample;
+mod state;
 pub(crate) mod update;
 mod voice;
 mod worker;
+pub(crate) use worker::RenderError;
 
 pub(crate) const PARAMETER_SIZE: usize = 0x34;
 
@@ -150,21 +151,27 @@ pub(crate) struct AudioRendererState {
     pub(crate) event: ReadableEventObject,
     signal: WritableEventObject,
     pub(crate) rendering_time_limit: Mutex<u32>,
-    pub(crate) update: Arc<Mutex<update::RendererUpdateState>>,
+    pub(crate) update: Arc<state::UpdateSlot>,
+    pub(crate) failure: Arc<OnceLock<RenderError>>,
     worker: Mutex<Option<worker::RendererWorker>>,
     devices: Arc<AudioDeviceState>,
     // Closing the client's copied handle must not free the renderer's work memory.
-    _work_memory: TransferMemoryObject,
+    _work_memory: Arc<TransferMemoryObject>,
     _applet_resource_user_id: u64,
     _process_id: u64,
 }
 
 impl AudioRendererManagerSession {
     pub(crate) fn set_host_paused(&self, paused: bool) {
-        for slot in self.slots.lock().unwrap().iter() {
-            if let Some(state) = slot.upgrade() {
-                state.set_host_paused(paused);
-            }
+        let states: Vec<_> = self
+            .slots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for state in states {
+            state.set_host_paused(paused);
         }
     }
     pub(crate) fn device(
@@ -181,44 +188,45 @@ impl AudioRendererManagerSession {
         )
     }
 
-    pub(crate) fn open(
+    pub(crate) async fn open(
         &self,
         parameters: RendererParameters,
-        work_memory: TransferMemoryObject,
+        work_memory: Arc<TransferMemoryObject>,
         work_size: u64,
         applet_resource_user_id: u64,
         process_id: u64,
-    ) -> Result<Option<AudioRendererSession>, CanonicalWriteBatchError> {
-        let mut slots = self.slots.lock().unwrap();
-        let Some(slot) = slots.iter_mut().find(|slot| slot.strong_count() == 0) else {
-            return Ok(None);
-        };
-        // Initialize the transferred backing itself, independent of the owner's
-        // virtual alias permissions or later closure of its transfer handle.
-        // https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/system.cpp
-        let zeroes = [0; 4096];
-        let mut writes = CanonicalWriteBatch::new();
-        let mut offset = 0;
-        while offset < work_size {
-            let count = (work_size - offset).min(zeroes.len() as u64) as usize;
-            writes.stage(work_memory.backing(), offset, &zeroes[..count])?;
-            offset += count as u64;
-        }
-        writes.commit()?;
+    ) -> Result<Option<AudioRendererSession>, Arc<nixe_memory::MemoryError>> {
         let (signal, event) = EventObject::create_pair_with_source(ExternalEventSource::Device);
         let state = Arc::new(AudioRendererState {
             parameters,
             event,
             signal,
             rendering_time_limit: Mutex::new(100),
-            update: Arc::new(Mutex::new(update::RendererUpdateState::default())),
+            update: Arc::default(),
+            failure: Arc::default(),
             worker: Mutex::new(None),
             devices: self.devices.clone(),
             _work_memory: work_memory,
             _applet_resource_user_id: applet_resource_user_id,
             _process_id: process_id,
         });
-        *slot = Arc::downgrade(&state);
+        {
+            let mut slots = self.slots.lock().unwrap();
+            let Some(slot) = slots.iter_mut().find(|slot| slot.strong_count() == 0) else {
+                return Ok(None);
+            };
+            *slot = Arc::downgrade(&state);
+        }
+        // The pending open owns its slot and transfer object, so the service
+        // lock is not held while the device resolves an exact work-memory write.
+        let zeroes = [0; 4096];
+        let mut offset = 0;
+        while offset < work_size {
+            let count = (work_size - offset).min(zeroes.len() as u64) as usize;
+            crate::system_memory::write_transfer(&state._work_memory, offset, &zeroes[..count])
+                .await?;
+            offset += count as u64;
+        }
         Ok(Some(AudioRendererSession(state)))
     }
 }
@@ -226,7 +234,7 @@ impl AudioRendererManagerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nixe_memory::{CanonicalAllocation, GuestVirtualAddress, MemoryPermissions};
+    use crate::test_memory::{run, transfer};
 
     fn parameters(revision: u8) -> RendererParameters {
         let mut data = [0; PARAMETER_SIZE];
@@ -284,11 +292,11 @@ mod tests {
             u32::from_le_bytes(*b"REV7") + 1,
         ] {
             params.revision = revision;
-            assert_eq!(params.revision_number(), None);
+            assert!((params.revision_number()).is_none());
         }
         params.voices = u32::MAX;
         params.splitters = u32::MAX;
-        assert_eq!(params.work_buffer_size(7), None);
+        assert!((params.work_buffer_size(7)).is_none());
     }
 
     #[test]
@@ -309,18 +317,11 @@ mod tests {
         let manager = AudioRendererManagerSession::default();
         let connection = manager.clone();
         let device = connection.device(7, 1, Arc::new(Backend)).unwrap();
-        let memory = CanonicalAllocation::zeroed(0x50000, 4096).unwrap();
-        let transfer = TransferMemoryObject::new(
-            GuestVirtualAddress::new(0x1000),
-            0x50000,
-            MemoryPermissions::NONE,
-            memory.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
-        );
+        let transfer = transfer(&vec![0; 0x50000]);
         device
             .state
             .set_volume(crate::audio_device::ACTIVE_DEVICE, 0.5);
-        let first = manager
-            .open(parameters(7), transfer.clone(), 0x50000, 1, 1)
+        let first = run(manager.open(parameters(7), transfer.clone(), 0x50000, 1, 1))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -336,8 +337,7 @@ mod tests {
         );
         drop(device);
         drop(connection);
-        let second = manager
-            .open(parameters(7), transfer, 0x50000, 1, 1)
+        let second = run(manager.open(parameters(7), transfer, 0x50000, 1, 1))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -353,26 +353,24 @@ mod tests {
 
     #[test]
     fn renderer_initializes_retained_memory_and_releases_slots_after_the_last_clone() {
-        let memory = CanonicalAllocation::zeroed(0x51000, 4096).unwrap();
-        memory.write(0, &vec![0xcc; 0x51000]).unwrap();
-        let transfer = TransferMemoryObject::new(
-            GuestVirtualAddress::new(0x1000),
-            0x51000,
-            MemoryPermissions::NONE,
-            memory.backing_range(MemoryPermissions::READ_WRITE).unwrap(),
-        );
+        let transfer = transfer(&vec![0xcc; 0x51000]);
+        let ranges = transfer.ranges().clone();
         let manager = AudioRendererManagerSession::default();
         let another_manager_connection = manager.clone();
         let open = |manager: &AudioRendererManagerSession| {
-            manager
-                .open(parameters(7), transfer.clone(), 0x50000, 1, 1)
-                .unwrap()
+            run(manager.open(parameters(7), transfer.clone(), 0x50000, 1, 1)).unwrap()
         };
         let first = open(&manager).unwrap();
         let second = open(&another_manager_connection).unwrap();
         assert!(open(&manager).is_none());
         let mut bytes = vec![0; 0x51000];
-        memory.read(0, &mut bytes).unwrap();
+        ranges[0]
+            .allocation()
+            .machine()
+            .read_captured_into(&ranges, 0, &mut bytes)
+            .unwrap()
+            .into_ready()
+            .unwrap();
         assert!(bytes[..0x50000].iter().all(|&byte| byte == 0));
         assert!(bytes[0x50000..].iter().all(|&byte| byte == 0xcc));
         assert!(!first.0.event.is_signalled());

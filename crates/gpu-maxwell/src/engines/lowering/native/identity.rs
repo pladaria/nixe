@@ -28,8 +28,7 @@ impl PartialEq for ImageKey {
                         .all(|(a, b)| {
                             a.subresources() == b.subresources()
                                 && a.layout() == b.layout()
-                                && a.backing().range().byte_mapping_key()
-                                    == b.backing().range().byte_mapping_key()
+                                && a.backing().mapping() == b.backing().mapping()
                         })))
     }
 }
@@ -44,7 +43,7 @@ impl Hash for ImageKey {
         for binding in self.view.bindings() {
             binding.subresources().hash(state);
             binding.layout().hash(state);
-            binding.backing().range().byte_mapping_key().hash(state);
+            binding.backing().mapping().hash(state);
         }
     }
 }
@@ -88,7 +87,7 @@ impl Hash for ProgramKey {
             std::mem::discriminant(binding).hash(state);
             match binding {
                 GuestBinding::NullBuffer => (),
-                GuestBinding::Buffer(b) => b.byte_mapping_key().hash(state),
+                GuestBinding::Buffer(b) => b.hash(state),
                 GuestBinding::Image { image, arrayed } => {
                     (Arc::as_ptr(&image.planes) as *const GuestImagePlane).hash(state);
                     image.description.hash(state);
@@ -122,16 +121,16 @@ impl PartialEq for DrawKey {
         a.parameters.identity == b.parameters.identity
             && a.program.identity == b.program.identity
             && a.vertices.len() == b.vertices.len()
-            && a.vertices.iter().zip(&b.vertices).all(|(a, b)| {
-                a.binding == b.binding
-                    && a.backing.byte_mapping_key() == b.backing.byte_mapping_key()
-            })
+            && a.vertices
+                .iter()
+                .zip(&b.vertices)
+                .all(|(a, b)| a.binding == b.binding && a.backing == b.backing)
             && match (&a.index, &b.index) {
                 (None, None) => true,
                 (
                     Some(GuestIndexBuffer::Canonical(a, at)),
                     Some(GuestIndexBuffer::Canonical(b, bt)),
-                ) => at == bt && a.byte_mapping_key() == b.byte_mapping_key(),
+                ) => at == bt && a == b,
                 (Some(GuestIndexBuffer::Inline(a)), Some(GuestIndexBuffer::Inline(b))) => {
                     Arc::ptr_eq(a, b)
                 }
@@ -155,13 +154,13 @@ impl Hash for DrawKey {
         a.vertices.len().hash(state);
         for vertex in &a.vertices {
             vertex.binding.hash(state);
-            vertex.backing.byte_mapping_key().hash(state);
+            vertex.backing.hash(state);
         }
         match &a.index {
             None => 0_u8.hash(state),
             Some(GuestIndexBuffer::Canonical(backing, kind)) => {
                 1_u8.hash(state);
-                backing.byte_mapping_key().hash(state);
+                backing.hash(state);
                 kind.hash(state);
             }
             Some(GuestIndexBuffer::Inline(bytes)) => {
@@ -231,9 +230,9 @@ mod tests {
         ImageExtent, ImageFormat, ImageId, ImageKind, ImageMemoryLayout, ImageSubresourceRange,
         ImageView, SampleCount, Swizzle,
     };
-    use nixe_memory::{CanonicalAllocation, MemoryPermissions};
+    use nixe_memory::Allocation;
 
-    fn image_key(allocation: &CanonicalAllocation, width: u32) -> ImageKey {
+    fn image_key(allocation: &Allocation, width: u32) -> ImageKey {
         let description = ImageDescription::new(
             ImageDimension::Two,
             ImageExtent::new(width, 8, 1).unwrap(),
@@ -248,9 +247,7 @@ mod tests {
             GpuAllocationId::new(1),
             GpuAllocationDescription::new(4096, 1).unwrap(),
             0,
-            allocation
-                .backing_range(MemoryPermissions::READ_WRITE)
-                .unwrap(),
+            crate::test_memory::mapping(allocation),
         )
         .unwrap();
         ImageKey {
@@ -283,11 +280,12 @@ mod tests {
 
     #[test]
     fn image_metadata_survives_content_updates_and_resource_reidentification() {
-        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        let machine = crate::test_memory::machine();
+        let allocation = crate::test_memory::allocate(&machine, 4096);
         let first = image_key(&allocation, 16);
         let mut states = nixe_gpu::WorkingSet::new(4, 4096);
         states.insert(first.clone(), 7, 512);
-        allocation.write(0, &[1, 2, 3, 4]).unwrap();
+        crate::test_memory::write(&allocation, 0, &[1, 2, 3, 4]).unwrap();
         let mut updated = image_key(&allocation, 16);
         updated.view = updated.view.with_image(ImageId::new(19));
         assert_eq!(states.get(&updated), Some(&7));
@@ -303,38 +301,38 @@ mod tests {
         assert_eq!(states.get(&updated), Some(&7));
         // Identical storage/pitch with a different extent must not reuse planes.
         assert_eq!(states.get(&image_key(&allocation, 8)), None);
-        let replacement = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+        let replacement = crate::test_memory::allocate(&machine, 4096);
         assert_eq!(states.get(&image_key(&replacement, 16)), None);
         updated.canonical_texels = false;
         assert_eq!(states.get(&updated), None);
     }
 
     #[test]
-    fn image_metadata_eviction_retains_outstanding_physical_storage() {
-        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
+    fn image_metadata_eviction_keeps_the_view_without_retaining_guest_ram() {
+        let machine = crate::test_memory::machine();
+        let allocation = crate::test_memory::allocate(&machine, 4096);
         let retained = image_key(&allocation, 16);
         let mut states = nixe_gpu::WorkingSet::new(1, 512);
         states.insert(retained.clone(), 7, 512);
         states.insert(image_key(&allocation, 8), 8, 512);
         assert_eq!(states.usage(), (1, 512));
         assert_eq!(states.get(&retained), None);
-        allocation.write(0, &[5]).unwrap();
+        crate::test_memory::write(&allocation, 0, &[5]).unwrap();
         drop(allocation);
-        let mut bytes = [0];
-        retained.view.bindings()[0]
-            .backing()
-            .range()
-            .read(0, &mut bytes)
-            .unwrap();
-        assert_eq!(bytes, [5]);
+        assert!(
+            retained.view.bindings()[0]
+                .backing()
+                .mapping()
+                .pin(0, 1)
+                .is_err()
+        );
     }
 
     #[test]
     fn program_identity_ignores_cpu_versions_but_distinguishes_physical_bindings() {
-        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
-        let backing = allocation
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap();
+        let machine = crate::test_memory::machine();
+        let allocation = crate::test_memory::allocate(&machine, 4096);
+        let backing = crate::test_memory::mapping(&allocation);
         let code = Arc::new(GuestShaderCode {
             identity: nixe_gpu::shader_identity::ContentId::of(b"program-intern-test", &[]),
             stages: Box::new([]),
@@ -350,13 +348,11 @@ mod tests {
         let first = key(backing.clone());
         let mut states = nixe_gpu::WorkingSet::new(4, 1 << 20);
         states.insert(first.clone(), Arc::clone(&first.0), program_bytes(&first.0));
-        allocation.write(0, &[1, 2, 3, 4]).unwrap();
-        let updated = key(backing.snapshot_subrange(0, 4096).unwrap());
+        crate::test_memory::write(&allocation, 0, &[1, 2, 3, 4]).unwrap();
+        let updated = key(backing.clone());
         assert!(Arc::ptr_eq(states.get(&updated).unwrap(), &first.0));
-        let replacement = CanonicalAllocation::zeroed(4096, 4096).unwrap();
-        let remapped = key(replacement
-            .backing_range(MemoryPermissions::READ_WRITE)
-            .unwrap());
+        let replacement = crate::test_memory::allocate(&machine, 4096);
+        let remapped = key(crate::test_memory::mapping(&replacement));
         assert!(states.get(&remapped).is_none());
     }
 }

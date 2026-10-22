@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
-use nixe_memory::{AddressSpaceId, CanonicalBackingRange, GuestVirtualAddress, MemoryPermissions};
+use nixe_memory::{AddressSpaceId, AllocationRange, GuestVirtualAddress, MemoryPermissions};
+use std::sync::Arc;
 
 // Switch nvmap ABI values and parameter behavior:
 // https://switchbrew.org/w/index.php?title=NV_services&oldid=14790#/dev/nvmap
@@ -194,19 +195,19 @@ impl NvMapAllocationMetadata {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct NvMapCanonicalStorage {
+#[derive(Clone, Debug)]
+struct NvMapStorage {
     allocation: NvMapAllocationMetadata,
     cpu_mapping: NvMapCpuMapping,
-    backing: CanonicalBackingRange,
+    ranges: Arc<[AllocationRange]>,
 }
 
 /// Retained semantic `nvmap` object independent from handles and exported IDs.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct NvMapObject {
     id: NvMapObjectId,
     size: u32,
-    storage: Option<NvMapCanonicalStorage>,
+    storage: Option<NvMapStorage>,
 }
 
 impl NvMapObject {
@@ -226,12 +227,12 @@ impl NvMapObject {
         self.storage.as_ref().map(|storage| storage.cpu_mapping)
     }
 
-    /// Returns the canonical byte identity retained by this object.
-    pub fn backing(&self) -> Option<&CanonicalBackingRange> {
-        self.storage.as_ref().map(|storage| &storage.backing)
+    /// Exact accepted CPU physical spans pinned for this object's lifetime.
+    pub fn ranges(&self) -> Option<&[AllocationRange]> {
+        self.storage.as_ref().map(|storage| storage.ranges.as_ref())
     }
 
-    /// Validates an image interpretation against this object's canonical storage.
+    /// Validates an image interpretation against this object's physical storage.
     pub fn validate_image_view(
         &self,
         metadata: &NvMapImageViewMetadata,
@@ -247,7 +248,15 @@ impl NvMapObject {
                 .offset
                 .checked_add(plane.size)
                 .ok_or(NvMapViewError::RangeOverflow)?;
-            if plane.size == 0 || end > u64::from(self.size) || end > storage.backing.size() {
+            if plane.size == 0
+                || end > u64::from(self.size)
+                || end
+                    > storage
+                        .ranges
+                        .iter()
+                        .map(AllocationRange::bytes)
+                        .sum::<u64>()
+            {
                 return Err(NvMapViewError::PlaneOutsideObject);
             }
         }
@@ -360,7 +369,7 @@ pub enum NvMapViewError {
 impl Display for NvMapViewError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnallocatedObject => formatter.write_str("nvmap object has no canonical backing"),
+            Self::UnallocatedObject => formatter.write_str("nvmap object has no physical backing"),
             Self::MissingPlanes => formatter.write_str("nvmap image view has no planes"),
             Self::PlaneOutsideObject => {
                 formatter.write_str("nvmap image view plane exceeds its object")
@@ -509,16 +518,19 @@ impl NvMapObjects {
         handle: NvMapHandle,
         allocation: NvMapAllocationMetadata,
         cpu_mapping: NvMapCpuMapping,
-        backing: CanonicalBackingRange,
+        ranges: Arc<[AllocationRange]>,
     ) -> Result<(), NvMapStateError> {
         allocation.validate()?;
-        if backing.size() == 0
-            || backing.size()
+        let bytes = ranges
+            .iter()
+            .try_fold(0u64, |bytes, range| bytes.checked_add(range.bytes()))
+            .ok_or(NvMapStateError::InvalidBacking)?;
+        if bytes == 0
+            || bytes
                 != allocation.backing_size(self.object_by_owned_handle(owner, handle)?.size())?
-            || backing.segments().iter().any(|segment| {
-                !segment
-                    .permissions()
-                    .contains(allocation.cpu_mapping_permissions())
+            || ranges.iter().any(|range| {
+                range.allocation().machine().identity()
+                    != ranges[0].allocation().machine().identity()
             })
         {
             return Err(NvMapStateError::InvalidBacking);
@@ -540,10 +552,10 @@ impl NvMapObjects {
         if object.storage.is_some() {
             return Err(NvMapStateError::AlreadyAllocated);
         }
-        object.storage = Some(NvMapCanonicalStorage {
+        object.storage = Some(NvMapStorage {
             allocation,
             cpu_mapping,
-            backing,
+            ranges,
         });
         Ok(())
     }
@@ -785,8 +797,8 @@ mod tests {
         for handle in [third, first, second] {
             let id = objects.exported_id(owner, handle).unwrap();
             assert_eq!(id.raw(), handle.raw());
-            assert_eq!(objects.exported_id(owner, handle), Ok(id));
-            assert_eq!(objects.import(owner, id), Ok(handle));
+            assert_eq!((objects.exported_id(owner, handle)).unwrap(), id);
+            assert_eq!((objects.import(owner, id)).unwrap(), handle);
             let object = objects.object_by_handle(handle).unwrap();
             assert_eq!(objects.object_by_exported_id(id).unwrap().id(), object.id());
 
@@ -794,10 +806,10 @@ mod tests {
             assert!(objects.object_by_exported_id(id).is_some());
             objects.free(owner, handle).unwrap();
             assert!(objects.object_by_exported_id(id).is_none());
-            assert_eq!(
+            assert!(matches!(
                 objects.import(owner, id),
                 Err(NvMapStateError::BadParameter)
-            );
+            ));
         }
     }
 
@@ -808,32 +820,140 @@ mod tests {
         let mut objects = NvMapObjects::default();
         let handle = objects.create(owner, 0x1000).unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             objects.allocation_backing_size(
                 foreign,
                 handle,
                 NvMapAllocationMetadata::new(0, 0, 0x1000, 0),
             ),
             Err(NvMapStateError::InvalidOwner)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             objects.parameter(foreign, handle, 1),
             Err(NvMapStateError::InvalidOwner)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             objects.exported_id(foreign, handle),
             Err(NvMapStateError::InvalidOwner)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             objects.free(foreign, handle),
             Err(NvMapStateError::InvalidOwner)
-        );
+        ));
 
         let exported_id = objects.exported_id(owner, handle).unwrap();
-        assert_eq!(
+        assert!(matches!(
             objects.import(foreign, exported_id),
             Err(NvMapStateError::InvalidOwner)
-        );
+        ));
         assert!(objects.object_by_handle(handle).is_ok());
+    }
+    #[test]
+    fn accepted_nvmap_spans_preserve_physical_aliases_across_cpu_remap_and_release() {
+        use nixe_memory::{Access, AddressSpace, AddressWidth, AllocationRange, Machine};
+        let machine = Machine::new(0x4000).unwrap();
+        let account = machine.account(0x4000).unwrap();
+        let first = account.allocate(0x2000).unwrap();
+        let second = account.allocate(0x2000).unwrap();
+        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits39).unwrap();
+        let address = GuestVirtualAddress::new(0x10000);
+        space
+            .map(address, first.clone(), 0, 0x2000, MemoryPermissions::READ)
+            .unwrap();
+        let accepted = space
+            .capture(address, 0x2000, MemoryPermissions::READ)
+            .unwrap();
+        let physical = nixe_gpu::physical::PhysicalMapping::new(&accepted).unwrap();
+        let mut objects = NvMapObjects::default();
+        let owner = NvMapOwner::new(7);
+        let handle = objects.create(owner, 0x1800).unwrap();
+        let metadata = NvMapAllocationMetadata::new(0, 0, 0x1000, 0);
+        objects
+            .allocate(
+                owner,
+                handle,
+                metadata,
+                NvMapCpuMapping::new(space.identity(), address),
+                accepted.into(),
+            )
+            .unwrap();
+        let object = objects.object_by_owned_handle(owner, handle).unwrap();
+        assert_eq!(
+            object
+                .ranges()
+                .unwrap()
+                .iter()
+                .map(AllocationRange::bytes)
+                .sum::<u64>(),
+            0x2000
+        );
+        assert_eq!(
+            *nixe_gpu::physical::PhysicalMapping::new(object.ranges().unwrap()).unwrap(),
+            *physical
+        );
+        // CPU access flags qualify capture only; GPU writes use accepted pins.
+        assert!(space.capture(address, 1, MemoryPermissions::WRITE).is_err());
+        let word = nixe_memory::CapturedMemory::new(
+            nixe_memory::capture_subrange(object.ranges().unwrap(), 7, 4).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            machine.write_captured(&word, 0, &[1, 2, 3, 4]).unwrap(),
+            Access::Ready(())
+        ));
+        drop(word);
+        space.unmap(address, 0x2000).unwrap();
+        space
+            .map(
+                address,
+                second.clone(),
+                0,
+                0x2000,
+                MemoryPermissions::READ_WRITE,
+            )
+            .unwrap();
+        let object = objects.object_by_owned_handle(owner, handle).unwrap();
+        let word = nixe_memory::CapturedMemory::new(
+            nixe_memory::capture_subrange(object.ranges().unwrap(), 7, 4).unwrap(),
+        )
+        .unwrap();
+        let mut bytes = [0; 4];
+        assert!(matches!(
+            machine.read_captured_into(&word, 0, &mut bytes).unwrap(),
+            Access::Ready(())
+        ));
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        let mut cpu_bytes = [9; 4];
+        let current = space
+            .capture(
+                GuestVirtualAddress::new(address.get() + 7),
+                4,
+                MemoryPermissions::READ,
+            )
+            .unwrap();
+        let current = nixe_memory::CapturedMemory::new(current).unwrap();
+        assert!(matches!(
+            machine
+                .read_captured_into(&current, 0, &mut cpu_bytes)
+                .unwrap(),
+            Access::Ready(())
+        ));
+        assert_eq!(cpu_bytes, [0; 4]);
+        drop(current);
+        drop(first);
+        assert_eq!(account.used_bytes(), 0x2000);
+        assert_eq!(machine.statistics().allocated_bytes, 0x4000);
+        let id = objects.exported_id(owner, handle).unwrap();
+        assert_eq!(objects.import(owner, id).unwrap(), handle);
+        objects.free(owner, handle).unwrap();
+        assert!(objects.object_by_handle(handle).is_ok());
+        objects.free(owner, handle).unwrap();
+        assert!(objects.object_by_handle(handle).is_err());
+        assert_eq!(machine.statistics().allocated_bytes, 0x3000);
+        drop(word);
+        assert_eq!(machine.statistics().allocated_bytes, 0x2000);
+        drop(second);
+        drop(space);
+        assert_eq!(machine.statistics().allocated_bytes, 0);
     }
 }

@@ -1,6 +1,4 @@
-use nixe_gpu_vulkan::{
-    BarrierPolicy, DeviceOptions, RecordingPolicy, VulkanDevice, VulkanResidency,
-};
+use nixe_gpu_vulkan::{DeviceOptions, VulkanDevice, VulkanResidency};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = VulkanDevice::new(
         DeviceOptions {
@@ -17,16 +15,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         return Err("binding probe requires a hardware GPU".into());
     }
-    let policy = RecordingPolicy {
-        barriers: if std::env::args().any(|arg| arg == "--per-resource") {
-            BarrierPolicy::PerResource
-        } else {
-            BarrierPolicy::ScopedMemory
-        },
-        ..Default::default()
-    };
-    let mut cache = VulkanResidency::with_recording_policy(device, 64 * 1024 * 1024, policy)?;
-    println!("barrier_policy={:?}", policy.barriers);
+    let mut cache = VulkanResidency::new(
+        nixe_memory::Machine::switch_ram()?,
+        device,
+        64 * 1024 * 1024,
+    )?;
     println!(
         "adapter={}; driver={}; validation=disabled; words=1024; dispatches=256; trials=7",
         cache.device().profile().name,

@@ -1,5 +1,5 @@
 use nixe_cpu::execution::CpuControl;
-use nixe_cpu::memory::ExecutionMemory;
+use nixe_runtime::memory::ProcessMemory;
 use nixe_runtime::{
     EventObject, ExternalEventSender, HandleObject, ReadableEventObject, RuntimeCoordinator,
     SharedMemoryObject, ThreadObject, WritableEventObject,
@@ -9,8 +9,9 @@ fn assert_send<T: Send>() {}
 fn assert_send_sync<T: Send + Sync>() {}
 
 #[test]
-fn future_worker_reachable_values_have_explicit_thread_traits() {
-    assert_send_sync::<ExecutionMemory>();
+fn shared_kernel_resources_are_safe_to_retain_across_workers() {
+    assert_send_sync::<ProcessMemory>();
+    assert_send_sync::<nixe_runtime::AddressWaitRegistry>();
     assert_send_sync::<CpuControl>();
     assert_send_sync::<EventObject>();
     assert_send_sync::<ReadableEventObject>();

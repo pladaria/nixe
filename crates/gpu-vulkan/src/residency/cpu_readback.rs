@@ -1,7 +1,9 @@
-//! Demanded transfers are recorded by the queue owner and scattered only after
-//! their real timeline point. CPU callers wait in the mailbox, not this recorder.
+//! Exact owned operations complete after their actual native transfers. Staging
+//! contains only requested producer bytes, with no whole-page RAM baseline.
 use super::*;
 use crate::ReadbackTicket;
+use nixe_gpu::authority::{AccessReadback, ReadbackPublication};
+use nixe_memory::{AccessRequestId, DeviceAccessRequest};
 use std::collections::VecDeque;
 
 pub(super) struct Scatter {
@@ -16,53 +18,55 @@ pub(super) struct Transfer {
     pub windows: Vec<(readback::WindowKey, usize, usize)>,
 }
 pub(super) struct CpuReadback {
-    baseline: Arc<[u8]>,
+    plans: Vec<AccessReadback<Resource>>,
     pub bytes: Box<[u8]>,
     pub transfers: VecDeque<Transfer>,
     pub waiting_windows: usize,
-    completed: DeviceVisibilityPoint,
+    required_tick: u64,
     sealed: bool,
 }
 impl VulkanResidency {
-    pub(crate) fn cpu_readback_submission_pending(&self) -> Result<bool, VulkanError> {
-        let submitted = self.device.submitted_tick();
-        for job in self.cpu_readbacks.values() {
-            if self
-                .device
-                .visibility_work(job.completed)?
-                .is_some_and(|work| work.tick() > submitted)
-                || job
-                    .transfers
-                    .back()
-                    .is_some_and(|transfer| transfer.ticket.work().tick() > submitted)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+    pub(crate) fn readback_submission_pending(&self) -> bool {
+        let scheduled = self.device.scheduled_tick();
+        self.buffer_downloads
+            .back()
+            .is_some_and(|job| job.work().tick() > scheduled)
+            || self.cpu_readbacks.values().any(|job| {
+                job.required_tick > scheduled
+                    || job
+                        .transfers
+                        .back()
+                        .is_some_and(|t| t.ticket.work().tick() > scheduled)
+            })
     }
 
-    pub(crate) fn cpu_readback_point(&self) -> Result<Option<u64>, VulkanError> {
-        let mut first = None;
-        for job in self.cpu_readbacks.values() {
-            let point = if let Some(transfer) = job.transfers.front() {
-                Some(transfer.ticket.work().tick())
-            } else {
-                self.device
-                    .visibility_work(job.completed)?
-                    .map(WorkTicket::tick)
-            };
-            if let Some(point) = point
-                && point > self.device.completed_tick()
-            {
-                first = Some(first.map_or(point, |old: u64| old.min(point)));
-            }
-        }
-        Ok(first)
+    pub(crate) fn readback_point(&self) -> Option<u64> {
+        let completed = self.device.completed_tick();
+        self.cpu_readbacks
+            .values()
+            .filter_map(|job| {
+                let point = if let Some(transfer) = job.transfers.front() {
+                    Some(transfer.ticket.work().tick())
+                } else if job.waiting_windows == 0 {
+                    Some(job.required_tick)
+                } else {
+                    // Another job owns the shared window's real transfer ticket.
+                    None
+                };
+                point.filter(|&tick| tick > completed)
+            })
+            .chain(
+                self.buffer_downloads
+                    .front()
+                    .map(|job| job.work().tick())
+                    .filter(|&tick| tick > completed),
+            )
+            .min()
     }
 
-    pub(super) fn progress_cpu_readbacks(&mut self) -> Result<(), VulkanError> {
+    pub(super) fn progress_readbacks(&mut self) -> Result<(), VulkanError> {
         let completed = self.device.poll_progress()?;
+        self.publish_buffer_downloads(completed)?;
         let mut windows = Vec::new();
         for job in self.cpu_readbacks.values_mut() {
             while job
@@ -70,9 +74,7 @@ impl VulkanResidency {
                 .front()
                 .is_some_and(|t| t.ticket.work().tick() <= completed)
             {
-                let transfer = job.transfers.pop_front().unwrap();
-                // readback observes the already cached completed point: no
-                // Vulkan wait or speculative host read is needed here.
+                let transfer = job.transfers.pop_front().expect("completed transfer");
                 let data = self.device.readback(transfer.ticket)?;
                 self.statistics.native_readback_bytes += transfer.bytes;
                 for copy in transfer.copies {
@@ -106,18 +108,66 @@ impl VulkanResidency {
                     .saturating_mul(2) as usize,
             );
         }
+        let ready: Vec<_> = self
+            .cpu_readbacks
+            .iter()
+            .filter_map(|(&id, job)| {
+                (job.sealed
+                    && job.transfers.is_empty()
+                    && job.waiting_windows == 0
+                    && (job.required_tick <= completed
+                        || self.authority.access_request(id).is_none()))
+                .then_some(id)
+            })
+            .collect();
+        for id in ready {
+            let job = self.cpu_readbacks.remove(&id).expect("completed demand");
+            if self
+                .authority
+                .access_request(id)
+                .is_some_and(DeviceAccessRequest::is_cancelled)
+            {
+                self.cancel_device_access(id)?;
+            }
+            // A cancelled job can still own a native window used by another
+            // request. Retire its native tickets normally, but never its RAM.
+            if self.authority.access_request(id).is_none() {
+                continue;
+            }
+            let mut dirty = Vec::new();
+            for plan in job.plans {
+                let start = plan.source.logical as usize;
+                let end = start + plan.source.bytes as usize;
+                match self
+                    .authority
+                    .publish_access_readback(&self.memory, plan, &job.bytes[start..end], &mut dirty)
+                    .map_err(memory_error)?
+                {
+                    ReadbackPublication::Published { bytes } => {
+                        self.statistics.canonical_readback_bytes += bytes;
+                    }
+                    ReadbackPublication::Obsolete | ReadbackPublication::Replan => break,
+                }
+            }
+            self.invalidate_cpu_buffers(&dirty)?;
+            self.authority
+                .retire_unused_device_pages(&self.memory, &dirty)?;
+            if self.authority.access_can_complete(id) {
+                self.authority.complete_access(&self.memory, id)?;
+            }
+        }
         Ok(())
     }
 
     /// Full staging is actual backpressure. Retire completed demands first;
-    /// wait only if a real submitted use is required to free the bounded arena.
-    pub(super) fn reserve_cpu_readback(
+    /// wait only for actual work required to free the bounded arena.
+    pub(super) fn reserve_readback(
         &mut self,
         bytes: u64,
         alignment: u64,
     ) -> Result<(usize, crate::queue::Slice, ReadbackTicket), VulkanError> {
         loop {
-            self.progress_cpu_readbacks()?;
+            self.progress_readbacks()?;
             match self
                 .device
                 .submission
@@ -127,10 +177,11 @@ impl VulkanResidency {
                 Err(error @ VulkanError::QueuePressure { pending, .. }) => {
                     let submitted = self.flush()?;
                     let demand = self
-                        .cpu_readback_point()?
+                        .readback_point()
                         .map(|t| self.device.submission.ticket(t));
-                    let point = pending.or(submitted).or(demand);
-                    let Some(work) = point else { return Err(error) };
+                    let Some(work) = pending.or(submitted).or(demand) else {
+                        return Err(error);
+                    };
                     let _trace = nixe_gpu::trace::span("resource_pressure_wait", work.tick(), 1, 0);
                     self.device.wait_for_work(work, std::time::Duration::MAX)?;
                 }
@@ -139,140 +190,139 @@ impl VulkanResidency {
         }
     }
 
-    pub(super) fn enqueue_cpu_transfer(
-        &mut self,
-        request: CpuVisibilityRequest,
-        transfer: Transfer,
-    ) {
-        let job = self
-            .cpu_readbacks
+    pub(super) fn enqueue_cpu_transfer(&mut self, request: AccessRequestId, transfer: Transfer) {
+        self.cpu_readbacks
             .get_mut(&request)
-            .expect("registered demand");
-        // A download's host ticket is readiness, not a new guest content
-        // version. CPU acknowledgement must still name the actual producer.
-        job.transfers.push_back(transfer);
+            .expect("registered demand")
+            .transfers
+            .push_back(transfer);
     }
 
-    pub(crate) fn request_cpu_page(
+    pub(crate) fn fail_device_accesses(&mut self, cause: Arc<nixe_memory::MemoryError>) {
+        self.authority.fail_accesses(cause);
+    }
+    pub(crate) fn queue_device_access(
         &mut self,
-        request: CpuVisibilityRequest,
-    ) -> Result<Option<Box<[u8]>>, VulkanError> {
-        if request.device != NonCpuDeviceId::new(self.instance.get()) {
-            return Err(VulkanError::InvalidResource(
-                "CPU visibility requested from foreign Vulkan owner",
-            ));
-        }
-        self.progress_cpu_readbacks()?;
-        if !self.cpu_readbacks.contains_key(&request) {
-            let (baseline, bytes) = {
-                let pages = self.visibility.pages.lock().unwrap();
-                let page = pages
-                    .get(&request.page)
-                    .ok_or(VulkanError::InvalidResource(
-                        "CPU visibility has no preserved page baseline",
-                    ))?;
-                if page.bytes.len() != request.size {
-                    return Err(VulkanError::InvalidResource(
-                        "CPU visibility page size mismatch",
-                    ));
-                }
-                if page.completed.is_some_and(|p| p >= request.visible_at) {
-                    return Ok(Some(page.bytes.as_ref().into()));
-                }
-                (Arc::clone(&page.baseline), page.bytes.as_ref().into())
-            };
-            let writes = self
-                .index
-                .pages
-                .get(&request.page)
-                .map(|p| p.resolved_writes())
-                .unwrap_or_default();
-            let point = writes
-                .iter()
-                .fold(request.visible_at, |p, w| p.max(w.point));
-            self.cpu_readbacks.insert(
-                request,
-                CpuReadback {
-                    bytes,
-                    baseline,
-                    transfers: VecDeque::new(),
-                    waiting_windows: 0,
-                    completed: point,
-                    sealed: false,
-                },
-            );
-            nixe_gpu::trace::detail_event(
-                "readback_page",
-                request.visible_at.get(),
-                request.page.store().get(),
-                request.page.page().get(),
-            );
-            if let Err(error) = self.record_cpu_authorities(request, &writes) {
-                if let Some(job) = self.cpu_readbacks.remove(&request) {
-                    for transfer in job.transfers {
-                        self.device.discard_readback(transfer.ticket)?;
-                    }
-                }
-                return Err(error);
-            }
-            self.statistics.canonical_readback_bytes +=
-                writes.iter().map(|w| w.end - w.start).sum::<u64>();
-            self.cpu_readbacks.get_mut(&request).unwrap().sealed = true;
-            // A capture of this recording's producer freezes its byte version.
-            // Reading an older prefix must not split unrelated current writes.
-            if self.device.visibility_work(point)?.is_some_and(|work| {
-                self.device
-                    .submission
-                    .recording
-                    .is_some_and(|index| self.device.submission.slots[index].tick == work.tick())
-            }) {
-                self.device.end_visibility_scope();
-            }
-            self.progress_cpu_readbacks()?;
-        }
-        let ready = self.cpu_readbacks.get(&request).is_some_and(|job| {
-            job.sealed
-                && job.transfers.is_empty()
-                && job.waiting_windows == 0
-                && job.completed.get() <= self.device.completed_visibility()
-        });
-        if !ready {
-            return Ok(None);
-        }
-        let job = self.cpu_readbacks.remove(&request).unwrap();
-        let mut pages = self.visibility.pages.lock().unwrap();
-        if let Some(page) = pages.get_mut(&request.page)
-            && Arc::ptr_eq(&page.baseline, &job.baseline)
-            && page.completed.is_none_or(|p| p <= job.completed)
-        {
-            page.bytes = Arc::from(job.bytes.as_ref());
-            page.completed = Some(job.completed);
-        }
-        Ok(Some(job.bytes))
+        request: DeviceAccessRequest,
+    ) -> Result<(), VulkanError> {
+        self.authority.queue_access(request)?;
+        self.progress_device_accesses()
     }
 
-    /// Owner-local memory transformations genuinely consume these bytes. They
-    /// use the same transfer implementation with a targeted synchronous wait.
-    pub fn materialize_cpu_page(
+    pub(crate) fn cancel_device_access(
         &mut self,
-        request: CpuVisibilityRequest,
-    ) -> Result<Box<[u8]>, VulkanError> {
-        let _trace = nixe_gpu::trace::span(
-            "cpu_readback",
-            request.visible_at.get(),
-            request.size as u64,
-            0,
-        );
+        request: AccessRequestId,
+    ) -> Result<(), VulkanError> {
+        self.authority.cancel_access(&self.memory, request)?;
+        Ok(())
+    }
+
+    /// The authority retains the operation and its physical dependency through
+    /// application. No CPU receives permission to perform a later RAM write.
+    pub(crate) fn progress_device_accesses(&mut self) -> Result<(), VulkanError> {
         loop {
-            if let Some(bytes) = self.request_cpu_page(request)? {
-                return Ok(bytes);
+            self.progress_readbacks()?;
+            let pending: Vec<_> = self.authority.access_requests().collect();
+            let mut progressed = false;
+            for id in pending {
+                if self
+                    .authority
+                    .access_request(id)
+                    .is_some_and(DeviceAccessRequest::is_cancelled)
+                {
+                    self.cancel_device_access(id)?;
+                    progressed = true;
+                    continue;
+                }
+                if self.cpu_readbacks.contains_key(&id) || !self.authority.access_can_prepare(id) {
+                    continue;
+                }
+                let request = self
+                    .authority
+                    .access_request(id)
+                    .expect("pending exact access");
+                if !matches!(request.operation(), nixe_memory::AccessOperation::Write(_))
+                    && self
+                        .buffer_downloads
+                        .iter()
+                        .any(|download| download.overlaps(request.ranges()))
+                {
+                    // A fence already owns this transfer. Let its exact publication
+                    // satisfy the CPU demand instead of downloading the bytes twice.
+                    continue;
+                }
+                let plans = self.authority.prepare_access(id).map_err(memory_error)?;
+                progressed = true;
+                if plans.is_empty() {
+                    let memory = self.memory.clone();
+                    self.consume_cpu_writes(memory.collect_cpu_writes()?)?;
+                    self.authority.complete_access(&self.memory, id)?;
+                    continue;
+                }
+                let bytes = self
+                    .authority
+                    .access_request(id)
+                    .expect("pending request")
+                    .bytes();
+                let bytes = plans.iter().fold(bytes, |size, plan| {
+                    size.max((plan.source.logical + plan.source.bytes) as usize)
+                });
+                let required_tick = plans
+                    .iter()
+                    .map(|p| p.source.producer.expect("device source").tick.0)
+                    .max()
+                    .expect("nonempty readback plan");
+                let sources: Vec<_> = plans.iter().map(|p| p.source).collect();
+                self.cpu_readbacks.insert(
+                    id,
+                    CpuReadback {
+                        plans,
+                        bytes: vec![0; bytes].into_boxed_slice(),
+                        transfers: VecDeque::new(),
+                        waiting_windows: 0,
+                        required_tick,
+                        sealed: false,
+                    },
+                );
+                // Large demands can retire completed staging during recording;
+                // sealing prevents those partial transfers completing a request.
+                self.record_access_readbacks(id, &sources)?;
+                self.cpu_readbacks
+                    .get_mut(&id)
+                    .expect("recording demand")
+                    .sealed = true;
+            }
+            if !progressed {
+                return Ok(());
+            }
+        }
+    }
+
+    /// A command-owner read uses the same authority in place. It never submits
+    /// an access to its own endpoint or waits for its own inbox to service it.
+    pub(crate) fn access_memory(
+        &mut self,
+        ranges: Vec<nixe_memory::AllocationRange>,
+        operation: nixe_memory::AccessOperation,
+    ) -> Result<nixe_memory::AccessResult, VulkanError> {
+        if let Some(result) = self.memory.try_access_captured(&ranges, &operation)? {
+            return Ok(result);
+        }
+        let (request, mut result) = self.memory.prepare_device_access(ranges, operation)?;
+        self.queue_device_access(request)?;
+        loop {
+            self.progress_device_accesses()?;
+            if let Some(result) = result.poll() {
+                return result.map_err(VulkanError::from);
             }
             self.flush()?;
-            let point = self
-                .cpu_readback_point()?
-                .ok_or(VulkanError::InvalidResource(
-                    "pending CPU demand has no producing point",
-                ))?;
+            self.progress_device_accesses()?;
+            if let Some(result) = result.poll() {
+                return result.map_err(VulkanError::from);
+            }
+            let point = self.readback_point().ok_or(VulkanError::InvalidResource(
+                "pending exact owner access has no native progress point",
+            ))?;
             self.device.wait_for_work(
                 self.device.submission.ticket(point),
                 std::time::Duration::MAX,

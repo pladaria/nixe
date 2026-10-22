@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nixe-memory.workspace = true
 smallvec = "1"
 rustc-hash.workspace = true
 twox-hash.workspace = true
@@ -17,7 +18,6 @@ nixe-video.workspace = true
 raw-window-handle.workspace = true
 nixe-gpu.workspace = true
 nixe-shader-recompiler.workspace = true
-nixe-memory.workspace = true
 
 [features]
 performance-counters = ["nixe-gpu/performance-counters"]

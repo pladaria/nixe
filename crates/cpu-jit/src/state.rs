@@ -121,7 +121,7 @@ impl ThreadState {
         }
         // A different destination may not replace an unexported guest. The
         // runtime evicts its old occupant before dispatching a new lease.
-        // The unique JitThread is the sole claimant. Other owners can only
+        // The unique native core is the sole claimant. Other owners can only
         // release, after their final register access; there are no competing
         // claimants requiring an atomic read/modify/write on every switch.
         if core.context_owned.load(Ordering::Acquire) {

@@ -15,7 +15,7 @@ use super::{
     NvDrvFileDescriptor, NvDrvValidationReason, UnsupportedNvDrvOperation, input_u32,
     require_input_size, write_u32,
 };
-use nixe_gpu::{GuestSyncpointId, GuestSyncpointValue, GuestTimelinePoint};
+use nixe_gpu::GuestSyncpointId;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -25,15 +25,13 @@ struct Channel {
     nvmap_fd: Option<NvDrvFileDescriptor>,
     timeout: u32,
     pins: BTreeMap<u64, u32>,
-    packet: PacketState,
-    registers: Vec<u32>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct Host1x {
     channels: BTreeMap<NvDrvFileDescriptor, Channel>,
     mappings: video::Mappings,
-    worker: Option<worker::Worker>,
+    worker: Option<Arc<worker::Worker>>,
 }
 
 impl Host1x {
@@ -45,8 +43,6 @@ impl Host1x {
                 nvmap_fd: None,
                 timeout: 0,
                 pins: BTreeMap::new(),
-                packet: PacketState::default(),
-                registers: vec![0; 0x446],
             },
         );
     }
@@ -66,7 +62,9 @@ impl Host1x {
         Some(channel.syncpoint)
     }
     pub(super) fn clear(&mut self) {
-        self.worker.take();
+        if let Some(worker) = self.worker.take() {
+            worker.shutdown();
+        }
         self.channels.clear();
         Arc::make_mut(&mut self.mappings).clear();
     }
@@ -86,7 +84,7 @@ impl Host1x {
         descriptor: NvDrvDeviceDescriptor,
         request: u32,
         input: &[u8],
-    ) -> Result<Vec<u8>, NvDrvCallError> {
+    ) -> Result<crate::nvdrv::LockedIoctlOutcome, NvDrvCallError> {
         self.require_healthy()
             .map_err(NvDrvCallError::Unsupported)?;
         let unsupported = || {
@@ -101,10 +99,18 @@ impl Host1x {
             })
         };
         if request & 0xc000_ffff == 0xc000_0001 {
-            return self.submit(nvmap, control, gpu, descriptor, request, input);
+            return self
+                .submit(nvmap, control, gpu, descriptor, request, input)
+                .map(crate::nvdrv::LockedIoctlOutcome::Host1xCapture);
         }
         if matches!(request & 0xc000_ffff, 0xc000_0009 | 0xc000_000a) {
-            return self.map_buffers(nvmap, descriptor, request, input);
+            return self
+                .map_buffers(nvmap, descriptor, request, input)
+                .map(|bytes| {
+                    crate::nvdrv::LockedIoctlOutcome::Standard(
+                        crate::nvdrv::NvHostCtrlIoctlOutcome::Complete(bytes),
+                    )
+                });
         }
         let channel = self
             .channels
@@ -141,12 +147,15 @@ impl Host1x {
             }
             _ => return Err(unsupported()),
         }
-        Ok(output)
+        Ok(crate::nvdrv::LockedIoctlOutcome::Standard(
+            crate::nvdrv::NvHostCtrlIoctlOutcome::Complete(output),
+        ))
     }
 }
 
 #[derive(Clone, Debug)]
 struct Mapping {
+    physical: Arc<nixe_gpu::physical::PhysicalMapping>,
     object: NvMapObject,
     references: u32,
 }
@@ -227,7 +236,7 @@ impl Host1x {
         descriptor: NvDrvDeviceDescriptor,
         request: u32,
         input: &[u8],
-    ) -> Result<Vec<u8>, NvDrvCallError> {
+    ) -> Result<CaptureSubmission, NvDrvCallError> {
         if input.len() < 16 {
             return Err(NV_BAD_PARAMETER.into());
         }
@@ -267,7 +276,7 @@ impl Host1x {
         if channel.nvmap_fd.is_none() {
             return Err(super::NV_INVALID_STATE.into());
         }
-        let mut writes = nixe_memory::CanonicalWriteBatch::new();
+        let mut writes = Vec::new();
         for index in 0..relocations {
             let offset = buffer_end + index * 16;
             let command = nvmap
@@ -290,175 +299,185 @@ impl Host1x {
                 return Err(NV_BAD_PARAMETER.into());
             }
             let address = base.checked_add(target_offset).ok_or(NV_BAD_PARAMETER)? >> shift;
-            writes
-                .stage(
-                    command.backing().ok_or(super::NV_INVALID_STATE)?,
-                    u64::from(input_u32(input, offset + 4)?),
-                    &address.to_le_bytes(),
-                )
-                .map_err(|error| execution_error(descriptor, request, error.to_string()))?;
-        }
-        writes
-            .commit_ordered()
+            let ranges = nixe_memory::capture_subrange(
+                command.ranges().ok_or(super::NV_INVALID_STATE)?,
+                u64::from(input_u32(input, offset + 4)?),
+                4,
+            )
             .map_err(|error| execution_error(descriptor, request, error.to_string()))?;
-        let mut increments = BTreeMap::<u32, u32>::new();
-        let mut operations = Vec::new();
+            writes.push((ranges, address.to_le_bytes()));
+        }
+        let mut commands = Vec::new();
         for index in 0..buffers {
             let offset = 16 + index * 12;
             let object = nvmap
                 .object_snapshot_by_owned_handle(owner, NvMapHandle::new(input_u32(input, offset)?))
                 .map_err(super::nvmap_driver_result)?;
             let count = input_u32(input, offset + 8)?;
-            let length = (count as usize).checked_mul(4).ok_or(NV_BAD_PARAMETER)?;
-            if count > i32::MAX as u32 || length > object.size() as usize {
+            let length = (count as u64).checked_mul(4).ok_or(NV_BAD_PARAMETER)?;
+            if count > i32::MAX as u32 || length == 0 {
                 return Err(NV_BAD_PARAMETER.into());
             }
-            let mut bytes = vec![0; length];
-            object
-                .backing()
-                .ok_or(super::NV_INVALID_STATE)?
-                .read(u64::from(input_u32(input, offset + 4)?), &mut bytes)
-                .map_err(|error| execution_error(descriptor, request, error.to_string()))?;
-            for word in bytes.chunks_exact(4) {
-                let word = u32::from_le_bytes(word.try_into().unwrap());
-                let Some((class, method, argument)) = channel
-                    .packet
-                    .word(word)
-                    .map_err(|error| execution_error(descriptor, request, error))?
-                else {
-                    continue;
-                };
-                log::trace!(
-                    "Host1x method: fd={} class={class:#x} method={method:#x} argument={argument:#010x}",
-                    descriptor.fd()
-                );
-                if class == 1 {
-                    match method {
-                        0x4e => channel.packet.wait_value = argument,
-                        0x8 | 0x50 => {
-                            let point = GuestTimelinePoint::new(
-                                GuestSyncpointId::new(argument),
-                                GuestSyncpointValue::new(channel.packet.wait_value),
-                            );
-                            operations.push(worker::Operation::Wait(point));
-                        }
-                        _ => {
-                            return Err(execution_error(
-                                descriptor,
-                                request,
-                                format!("unsupported Host1x control method {method:#x}"),
-                            ));
-                        }
-                    }
-                    continue;
-                }
-                let expected = if descriptor.kind() == NvDrvDeviceKind::HostNvDec {
-                    0xf0
-                } else {
-                    0x5d
-                };
-                if class != expected {
-                    return Err(execution_error(
-                        descriptor,
-                        request,
-                        format!("unsupported channel class {class:#x}"),
-                    ));
-                }
-                match method {
-                    0 => {
-                        if argument & !0xffff != 0 || argument >> 8 > 2 {
-                            return Err(execution_error(
-                                descriptor,
-                                request,
-                                "unsupported syncpoint increment condition",
-                            ));
-                        }
-                        let id = argument & 0xff;
-                        let count = increments.entry(id).or_default();
-                        *count = count.checked_add(1).ok_or(super::NV_OVERFLOW)?;
-                    }
-                    0x10 => channel.packet.engine_method = argument,
-                    0x11 => {
-                        let method = channel.packet.engine_method;
-                        let register =
-                            channel.registers.get_mut(method as usize).ok_or_else(|| {
-                                execution_error(
-                                    descriptor,
-                                    request,
-                                    format!("engine register out of range: {method:#x}"),
-                                )
-                            })?;
-                        *register = argument;
-                        log::trace!(
-                            "Host1x engine: fd={} method={method:#x} argument={argument:#010x}",
-                            descriptor.fd()
-                        );
-                        if method == 0xc0 {
-                            operations.push(worker::Operation::Execute(channel.registers.clone()));
-                        }
-                    }
-                    _ => {
-                        return Err(execution_error(
-                            descriptor,
-                            request,
-                            format!("unsupported THI method {method:#x} argument={argument:#x}"),
-                        ));
-                    }
-                }
-            }
+            commands.push(
+                nixe_memory::capture_subrange(
+                    object.ranges().ok_or(super::NV_INVALID_STATE)?,
+                    u64::from(input_u32(input, offset + 4)?),
+                    length,
+                )
+                .map_err(|error| execution_error(descriptor, request, error.to_string()))?,
+            );
         }
-        let mut output = input.to_vec();
-        let mut completions = Vec::new();
+        let mut advertised = BTreeMap::new();
+        let mut counts = Vec::new();
         for index in 0..syncpoints {
             let offset = shift_end + index * 20;
             let id = input_u32(input, offset)?;
             let count = input_u32(input, offset + 4)?;
-            if id != channel.syncpoint.get() || increments.remove(&id).unwrap_or(0) != count {
-                return Err(execution_error(
-                    descriptor,
-                    request,
-                    "submission syncpoint increments do not match executed commands",
-                ));
+            if id != channel.syncpoint.get() || advertised.insert(id, count).is_some() {
+                return Err(NV_BAD_PARAMETER.into());
             }
+            counts.push(count);
         }
-        if !increments.is_empty() {
-            return Err(execution_error(
-                descriptor,
-                request,
-                "unadvertised syncpoint increments",
-            ));
-        }
-        let mut control_guard = control
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for index in 0..syncpoints {
-            let count = input_u32(input, shift_end + index * 20 + 4)?;
-            let reservation = control_guard.reserve_channel_submission(
-                descriptor,
-                request,
-                channel.syncpoint,
-                count,
-            )?;
-            write_u32(
-                &mut output,
-                sync_end + index * 4,
-                reservation.point().value().get(),
-            )?;
-            completions.push(reservation);
-        }
-        drop(control_guard);
         if self.worker.is_none() {
-            self.worker = Some(worker::Worker::new(Arc::clone(control), gpu.cloned())?);
+            self.worker = Some(Arc::new(worker::Worker::new(
+                Arc::clone(control),
+                gpu.cloned(),
+            )?));
         }
-        self.worker.as_ref().unwrap().submit(worker::Job {
+        Ok(CaptureSubmission {
             descriptor,
             request,
-            operations,
-            completions,
+            writes,
+            commands,
+            advertised,
+            counts,
+            output: input.to_vec(),
+            fence_offset: sync_end,
+            syncpoint: channel.syncpoint,
+            control: Arc::clone(control),
+            worker: Arc::clone(self.worker.as_ref().unwrap()),
             mappings: Arc::clone(&self.mappings),
             timeout: channel.timeout,
-        })?;
-        Ok(output)
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CaptureSubmission {
+    descriptor: NvDrvDeviceDescriptor,
+    request: u32,
+    writes: Vec<(Vec<nixe_memory::AllocationRange>, [u8; 4])>,
+    commands: Vec<Vec<nixe_memory::AllocationRange>>,
+    advertised: BTreeMap<u32, u32>,
+    counts: Vec<u32>,
+    output: Vec<u8>,
+    fence_offset: usize,
+    syncpoint: GuestSyncpointId,
+    control: Arc<Mutex<NvHostControl>>,
+    worker: Arc<worker::Worker>,
+    mappings: video::Mappings,
+    timeout: u32,
+}
+impl CaptureSubmission {
+    pub(crate) async fn finish(
+        mut self,
+    ) -> Result<super::NvDrvIoctlResponse, UnsupportedNvDrvOperation> {
+        let fail = |error: String| match execution_error(self.descriptor, self.request, error) {
+            NvDrvCallError::Unsupported(error) => error,
+            NvDrvCallError::GuestResult(_) => unreachable!("execution errors retain context"),
+        };
+        for (ranges, bytes) in self.writes {
+            let machine = ranges[0].allocation().machine();
+            match machine
+                .access_captured(
+                    &ranges,
+                    nixe_memory::AccessOperation::Write(Box::new(bytes)),
+                )
+                .map_err(|error| fail(error.to_string()))?
+            {
+                nixe_memory::Access::Ready(nixe_memory::AccessResult::Written) => {}
+                nixe_memory::Access::Pending(pending) => {
+                    assert!(matches!(
+                        pending.await.map_err(|fault| {
+                            UnsupportedNvDrvOperation::PhysicalMemory {
+                                context: NvDrvErrorContext::new(
+                                    self.descriptor.kind(),
+                                    self.request,
+                                    self.descriptor.fd(),
+                                    None,
+                                    NvDrvValidationReason::PhysicalMemoryUnavailable,
+                                ),
+                                fault,
+                            }
+                        })?,
+                        nixe_memory::AccessResult::Written
+                    ));
+                }
+                _ => unreachable!("write returns written"),
+            }
+        }
+        let mut captured = Vec::with_capacity(self.commands.len());
+        for ranges in self.commands {
+            let machine = ranges[0].allocation().machine();
+            let result =
+                match machine
+                    .access_captured(&ranges, nixe_memory::AccessOperation::Read)
+                    .map_err(|error| fail(error.to_string()))?
+                {
+                    nixe_memory::Access::Ready(result) => result,
+                    nixe_memory::Access::Pending(pending) => pending.await.map_err(|fault| {
+                        UnsupportedNvDrvOperation::PhysicalMemory {
+                            context: NvDrvErrorContext::new(
+                                self.descriptor.kind(),
+                                self.request,
+                                self.descriptor.fd(),
+                                None,
+                                NvDrvValidationReason::PhysicalMemoryUnavailable,
+                            ),
+                            fault,
+                        }
+                    })?,
+                };
+            let nixe_memory::AccessResult::Read(bytes) = result else {
+                unreachable!("read returns bytes")
+            };
+            captured.push(bytes);
+        }
+        // Reserve and enqueue under one short control lock so concurrent channel
+        // submissions cannot publish reservations in the opposite queue order.
+        let mut control = self
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut completions = Vec::with_capacity(self.counts.len());
+        for (index, count) in self.counts.into_iter().enumerate() {
+            let reservation = control
+                .reserve_channel_submission(self.descriptor, self.request, self.syncpoint, count)
+                .map_err(|error| fail(error.to_string()))?;
+            write_u32(
+                &mut self.output,
+                self.fence_offset + index * 4,
+                reservation.point().value().get(),
+            )
+            .map_err(|error| fail(error.to_string()))?;
+            completions.push(reservation);
+        }
+        self.worker
+            .submit(worker::Job {
+                descriptor: self.descriptor,
+                request: self.request,
+                commands: captured,
+                advertised: self.advertised,
+                completions,
+                mappings: self.mappings,
+                timeout: self.timeout,
+            })
+            .map_err(|error| fail(error.to_string()))?;
+        Ok(super::NvDrvIoctlResponse {
+            output: self.output,
+            additional_output: Vec::new(),
+            driver_result: super::NV_SUCCESS,
+        })
     }
 }
 
@@ -500,7 +519,7 @@ impl Host1x {
                 )
                 .map_err(super::nvmap_driver_result)?;
             let id = object.id().raw();
-            if object.backing().is_none() {
+            if object.ranges().is_none() {
                 return Err(super::NV_INVALID_STATE.into());
             }
             if unmap {
@@ -545,6 +564,10 @@ impl Host1x {
                     Arc::make_mut(&mut self.mappings).insert(
                         address,
                         Mapping {
+                            physical: nixe_gpu::physical::PhysicalMapping::new(
+                                object.ranges().unwrap(),
+                            )
+                            .map_err(|e| execution_error(descriptor, request, e.to_string()))?,
                             object,
                             references: 1,
                         },
@@ -568,9 +591,7 @@ mod tests {
     use super::super::nvmap::{NvMapAllocationMetadata, NvMapCpuMapping};
     use super::super::{NvDrvDescriptorOwner, NvDrvPermissionProfile, NvDrvSessionId};
     use super::*;
-    use nixe_memory::{
-        AddressSpaceId, CanonicalAllocation, GuestVirtualAddress, MemoryPermissions,
-    };
+    use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
     fn descriptor(fd: u32, kind: NvDrvDeviceKind) -> NvDrvDeviceDescriptor {
         NvDrvDeviceDescriptor::open(
@@ -585,17 +606,19 @@ mod tests {
         let mut nvmap = NvMapObjects::default();
         let owner = NvMapOwner::new(1);
         let handle = nvmap.create(owner, 4096).unwrap();
-        let allocation = CanonicalAllocation::zeroed(4096, 4096).unwrap();
-        allocation.write(7, &[42]).unwrap();
+        let machine = crate::test_memory::machine();
+        let allocation = machine.account(4096).unwrap().allocate(4096).unwrap();
+        let input = nixe_memory::AllocationRange::new(allocation.pin(), 0, 4096).unwrap();
+        machine
+            .write_resolved(&[input.slice(7, [42].len() as u64).unwrap()], &[42])
+            .unwrap();
         nvmap
             .allocate(
                 owner,
                 handle,
                 NvMapAllocationMetadata::new(0, 0, 4096, 0),
                 NvMapCpuMapping::new(AddressSpaceId::new(1), GuestVirtualAddress::new(0x1000)),
-                allocation
-                    .backing_range(MemoryPermissions::READ_WRITE)
-                    .unwrap(),
+                Arc::from([input.clone()]),
             )
             .unwrap();
         let devices = BTreeMap::from([(
@@ -633,16 +656,17 @@ mod tests {
                     &map,
                 )
                 .unwrap();
+            let crate::nvdrv::LockedIoctlOutcome::Standard(
+                crate::nvdrv::NvHostCtrlIoctlOutcome::Complete(output),
+            ) = output
+            else {
+                panic!("expected completed map ioctl")
+            };
             assert_eq!(input_u32(&output, 16).unwrap(), 4096);
         }
         assert_eq!(host.mappings[&4096].references, 2);
         let mut byte = [0];
-        host.mappings[&4096]
-            .object
-            .backing()
-            .unwrap()
-            .read(7, &mut byte)
-            .unwrap();
+        crate::test_memory::read(&host.mappings[&4096].physical.pin(7, 1).unwrap(), &mut byte);
         assert_eq!(byte, [42]);
         host.close(NvDrvFileDescriptor::new(2));
         assert_eq!(host.mappings[&4096].references, 1);
@@ -680,6 +704,12 @@ mod tests {
                 &map,
             )
             .unwrap();
+        let crate::nvdrv::LockedIoctlOutcome::Standard(
+            crate::nvdrv::NvHostCtrlIoctlOutcome::Complete(output),
+        ) = output
+        else {
+            panic!("expected completed map ioctl")
+        };
         assert_eq!(input_u32(&output, 16).unwrap(), 4096);
         host.clear();
         assert!(host.mappings.is_empty());

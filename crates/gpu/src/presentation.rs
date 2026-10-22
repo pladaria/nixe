@@ -3,7 +3,7 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, mpsc};
 
-use nixe_memory::CanonicalCpuWriteDependency;
+use nixe_memory::AllocationRange;
 
 use crate::{BackendInstanceId, BackingView, ImageDescription, ImageMemoryLayout};
 
@@ -22,11 +22,10 @@ pub enum PresentationImageFormat {
 
 /// Complete retained source for one GPU presentation operation.
 ///
-/// The backing preserves canonical byte identity after the guest mapping or
-/// nvmap handle disappears. Backends may export a compatible device-authored
-/// image directly or import this source into a reusable resident image; they
-/// must not materialize a software-rendered host frame.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The accepted physical inputs survive CPU remap or nvmap-handle retirement.
+/// Cached interpretation metadata holds weak identities; the graphics owner
+/// consumes these inputs before delegating native recording.
+#[derive(Clone, Debug)]
 pub struct PresentationImageRequest {
     /// Whether canonical bytes can be decoded as this image. Opaque storage
     /// requires a current resident producer; importing it would corrupt pixels.
@@ -37,7 +36,8 @@ pub struct PresentationImageRequest {
     pub format: PresentationImageFormat,
     pub layout: ImageMemoryLayout,
     pub row_pitch: u32,
-    pub cpu_writes: CanonicalCpuWriteDependency,
+    /// Exact accepted source pins, released after the graphics owner consumes it.
+    pub inputs: Vec<AllocationRange>,
 }
 
 /// An immutable presentation lease over a backend-resident image.

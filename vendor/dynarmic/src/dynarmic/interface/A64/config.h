@@ -105,7 +105,8 @@ struct UserCallbacks {
     // Writes through these callbacks may not be aligned.
     /// Cold physical-exclusive access preparation. No memory operation is
     /// committed by a failed reservation. Reads halt/retry after activating a
-    /// table entry. Writes validate {value[2], identity, version} again and replace
+    /// table entry. Writes validate {value[2], identity, version, device epoch,
+    /// canonical byte address, width, observed value[2]} again and replace
     /// data[0] with the conditional-store result, including observer publication.
     virtual void PreparePhysicalExclusive(VAddr, size_t, bool, u64*) {}
 
@@ -147,11 +148,13 @@ struct UserConfig {
     size_t processor_id = 0;
     ExclusiveMonitor* global_monitor = nullptr;
 
-    /// Optional sparse physical-reservation table (one uintptr_t per 4 KiB VA
-    /// page). Entries reference {canonical_base, identity, uint64_t versions[64]}.
-    /// All aliases and all external writers must use the same version words.
+    /// Optional canonical page table. Each atomic64 entry stores a tagged RAM
+    /// or physical-monitor pointer. Monitors contain canonical page
+    /// address, lifetime identity and the configured version/epoch metadata.
+    /// Aliases and atomic/exclusive writers share these version words.
+    /// Ordinary native stores remain direct; exclusive commit uses value CAS.
     /// Odd versions are locked; even versions identify completed writes.
-    /// Publication of a new entry must drain earlier uninstrumented writers.
+    /// Monitor publication must quiesce native readers of this entry.
     uintptr_t physical_exclusive_page_table = 0;
 
     /// This selects other optimizations than can't otherwise be disabled by setting other
@@ -260,10 +263,6 @@ struct UserConfig {
     /// Recompiled code will use the page_table if this is available, otherwise memory
     /// accesses will hit the memory callbacks.
     bool recompile_on_fastmem_failure = true;
-    /// Optional per-core external-fault classification, read only in the cold
-    /// fault callback. Persistent exceptional accesses may be recompiled while
-    /// transient tracking/ownership faults retain generated direct accesses.
-    const bool* persistent_fastmem_fault = nullptr;
     /// Declares how many valid address bits are there in virtual addresses.
     /// Determines the size of fastmem arena. Valid values are between 12 and 64 inclusive.
     /// This is only used if fastmem_pointer is set.

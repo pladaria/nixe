@@ -7,42 +7,13 @@ use crate::execution::{MaxwellFrontend, MaxwellSubmissionPlanner};
 pub use crate::pushbuffer::packet::MaxwellCommandSourceScratch;
 use crate::pushbuffer::packet::{DecodedPackets, SubmissionWords};
 use crate::{
-    MaxwellEngineDispatchError, MaxwellFrontendDispatch, MaxwellGpuAddressSpace, MaxwellGpuChannel,
+    MaxwellEngineDispatchError, MaxwellFrontendDispatch, MaxwellGpuChannel, MaxwellGpuMemory,
     MaxwellPushbufferDecodeError, MaxwellSubmissionExecutionError, MaxwellSubmissionExecutionPlan,
     MaxwellSubmissionExecutionStep,
 };
 
-/// Hard bound for a failure-only command dump.
-// Retain up to 256 KiB of commands so ordinary multi-entry submissions
-// include the failing packet rather than only their initialization prefix.
-// This allocation occurs exclusively on the diagnostic failure path.
-pub const MAXWELL_FRONTEND_DIAGNOSTIC_WORDS: usize = 65_536;
-
-/// Raw command prefix reconstructed from retained sources after a failure.
-pub struct MaxwellFrontendDiagnostic {
-    total_words: usize,
-    words: Box<[u32]>,
-}
-
-impl MaxwellFrontendDiagnostic {
-    #[must_use]
-    pub const fn total_words(&self) -> usize {
-        self.total_words
-    }
-
-    #[must_use]
-    pub const fn words(&self) -> &[u32] {
-        &self.words
-    }
-
-    #[must_use]
-    pub const fn is_complete(&self) -> bool {
-        self.total_words == self.words.len()
-    }
-}
-
 /// First semantic failure while consuming a retained command stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum MaxwellFrontendDispatchError {
     EmptySubmission,
     Delivery(Box<str>),
@@ -77,18 +48,28 @@ impl std::error::Error for MaxwellFrontendDispatchError {}
 pub fn stream_maxwell_frontend<L: MaxwellFrontend>(
     dispatch: &MaxwellFrontendDispatch,
     channel: &mut MaxwellGpuChannel,
-    address_space: &MaxwellGpuAddressSpace,
+    address_space: &MaxwellGpuMemory,
     cache: &mut L,
     sources: &mut MaxwellCommandSourceScratch,
+    access: &mut nixe_gpu::MemoryAccess<'_>,
     synchronize: &mut dyn FnMut() -> Result<(), Box<str>>,
     consume: &mut impl FnMut(
         std::vec::Drain<'_, MaxwellSubmissionExecutionStep<L::Work>>,
     ) -> Result<(), Box<str>>,
 ) -> Result<MaxwellSubmissionExecutionPlan<L::Work>, MaxwellFrontendDispatchError> {
     let submission = dispatch.scheduled().submission();
+    let access = std::cell::RefCell::new(access);
+    let mut source_access = |ranges, operation| (access.borrow_mut())(ranges, operation);
+    let mut effect_access = |ranges, operation| (access.borrow_mut())(ranges, operation);
     let packet_scratch = sources.take_packet_scratch();
     let mut packets = DecodedPackets::with_scratch(
-        SubmissionWords::new(submission, address_space, sources, synchronize),
+        SubmissionWords::new(
+            submission,
+            address_space,
+            sources,
+            synchronize,
+            &mut source_access,
+        ),
         packet_scratch,
     );
     let mut planner = MaxwellSubmissionPlanner::new(
@@ -96,6 +77,7 @@ pub fn stream_maxwell_frontend<L: MaxwellFrontend>(
         dispatch.scheduled().frontend(),
         dispatch.scheduled().completion(),
         cache,
+        &mut effect_access,
     );
     if submission.decoded().mode().fence_get() {
         planner.set_driver_completion_increments(2);
@@ -112,7 +94,7 @@ fn lower_packets_streamed<
 >(
     packets: &mut DecodedPackets<I>,
     channel: &mut MaxwellGpuChannel,
-    mut planner: MaxwellSubmissionPlanner<'_, L>,
+    mut planner: MaxwellSubmissionPlanner<'_, '_, L>,
     consume: &mut impl FnMut(
         std::vec::Drain<'_, MaxwellSubmissionExecutionStep<L::Work>>,
     ) -> Result<(), Box<str>>,
@@ -159,11 +141,14 @@ fn lower_packets_streamed<
                 Ok(())
             },
         )
-        .map_err(|error| match error {
-            MaxwellEngineStreamError::Dispatch(error) => {
-                MaxwellFrontendDispatchError::EngineDispatch(error)
+        .map_err(|error| {
+            log::debug!("failed Maxwell packet: {packet:x?}; MME parameters={mme_parameters:x?}; emitted={mme_methods:x?}");
+            match error {
+                MaxwellEngineStreamError::Dispatch(error) => {
+                    MaxwellFrontendDispatchError::EngineDispatch(error)
+                }
+                MaxwellEngineStreamError::Consumer(error) => error,
             }
-            MaxwellEngineStreamError::Consumer(error) => error,
         })?;
         if let Some(steps) = planner.finish_packet() {
             #[cfg(feature = "performance-counters")]
@@ -193,72 +178,3 @@ fn lower_packets_streamed<
     }
     Ok(plan)
 }
-
-/// Reconstructs a bounded raw command prefix from sources already retained by
-/// a failed dispatch. Normal submissions never call this function.
-pub fn diagnose_maxwell_frontend(
-    dispatch: &MaxwellFrontendDispatch,
-) -> Result<MaxwellFrontendDiagnostic, Box<str>> {
-    let submission = dispatch.scheduled().submission();
-    let total_words = submission
-        .pushbuffers()
-        .iter()
-        .try_fold(0_usize, |total, pushbuffer| {
-            usize::try_from(pushbuffer.entry().word_count())
-                .ok()
-                .and_then(|words| total.checked_add(words))
-        })
-        .ok_or_else(|| Box::<str>::from("Maxwell diagnostic word count overflows"))?;
-    let retained_words = total_words.min(MAXWELL_FRONTEND_DIAGNOSTIC_WORDS);
-    let mut words = Vec::new();
-    words
-        .try_reserve_exact(retained_words)
-        .map_err(|_| Box::<str>::from("Maxwell diagnostic allocation failed"))?;
-    for pushbuffer in submission.pushbuffers() {
-        let remaining_words = retained_words - words.len();
-        if remaining_words == 0 {
-            break;
-        }
-        let entry_words = usize::try_from(pushbuffer.entry().word_count())
-            .map_err(|_| Box::<str>::from("Maxwell diagnostic entry size overflows"))?;
-        let read_words = remaining_words.min(entry_words);
-        let read_bytes = read_words
-            .checked_mul(4)
-            .ok_or_else(|| Box::<str>::from("Maxwell diagnostic byte count overflows"))?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(read_bytes)
-            .map_err(|_| Box::<str>::from("Maxwell diagnostic allocation failed"))?;
-        bytes.resize(read_bytes, 0);
-        let mut copied = 0;
-        for segment in pushbuffer.source().segments() {
-            let count = usize::try_from(segment.size())
-                .unwrap_or(usize::MAX)
-                .min(read_bytes - copied);
-            segment
-                .mapping()
-                .backing()
-                .read(segment.backing_offset(), &mut bytes[copied..copied + count])
-                .map_err(|error| error.to_string().into_boxed_str())?;
-            copied += count;
-            if copied == read_bytes {
-                break;
-            }
-        }
-        if copied != read_bytes {
-            return Err("retained Maxwell diagnostic source is incomplete".into());
-        }
-        words.extend(
-            bytes
-                .chunks_exact(4)
-                .map(|word| u32::from_le_bytes(word.try_into().expect("word chunk is complete"))),
-        );
-    }
-    Ok(MaxwellFrontendDiagnostic {
-        total_words,
-        words: words.into_boxed_slice(),
-    })
-}
-
-#[cfg(test)]
-mod tests;

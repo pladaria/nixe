@@ -1,7 +1,7 @@
 //! Encoding for responses produced by the typed filesystem and add-on backends.
 
+use crate::ipc_wire::request::Request;
 use nixe_memory::GuestVirtualAddress;
-use nixe_runtime::ExceptionProcessContext;
 
 use super::super::IpcWireError;
 use super::super::buffer::one_receive_buffer;
@@ -18,8 +18,8 @@ use crate::{
 
 const STORAGE_READ_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
-pub(super) fn encode_semantic_response(
-    process: &mut ExceptionProcessContext<'_>,
+pub(super) async fn encode_semantic_response(
+    process: &mut Request,
     domain_session: Option<&IpcSession>,
     target_object: Option<&SemanticIpcObject>,
     request: CmifRequest<'_>,
@@ -89,19 +89,8 @@ pub(super) fn encode_semantic_response(
             &[],
             None,
         ),
-        IpcResponse::Handle(handle) => {
+        IpcResponse::Object(object) => {
             if is_domain {
-                let object = process
-                    .handles_mut()
-                    .close(handle)
-                    .map_err(|_| IpcWireError::Internal("semantic child handle disappeared"))?;
-                let Some(HorizonIpcObject::SemanticObject(object)) =
-                    object.downcast_ref::<HorizonIpcObject>().cloned()
-                else {
-                    return Err(IpcWireError::Internal(
-                        "semantic dispatch returned a non-semantic child handle",
-                    ));
-                };
                 let Some(object_id) =
                     domain_session.and_then(|session| session.insert_object(object))
                 else {
@@ -113,12 +102,25 @@ pub(super) fn encode_semantic_response(
                 };
                 semantic_success(request.token, true, &[], &[], &[object_id], None)
             } else {
+                let handle = match process.return_handle(HorizonIpcObject::SemanticObject(object)) {
+                    Ok(handle) => handle,
+                    Err(_) => {
+                        return semantic_error(
+                            request.token,
+                            domain_session,
+                            HorizonIpcResult::from_semantic(
+                                domain_session.map_or(IpcService::FileSystem, IpcSession::service),
+                                IpcResultCode::RESOURCE_LIMIT,
+                            ),
+                        );
+                    }
+                };
                 semantic_success(request.token, false, &[], &[], &[], Some(handle))
             }
         }
         IpcResponse::Data(data) => {
             let descriptor = one_receive_buffer(hipc)?;
-            write_descriptor_bytes(process, descriptor, &data)?;
+            write_descriptor_bytes(process, descriptor, &data).await?;
             let count = u64::try_from(data.len())
                 .map_err(|_| IpcWireError::Malformed("file read count overflows"))?;
             semantic_success(
@@ -144,7 +146,9 @@ pub(super) fn encode_semantic_response(
                 descriptor.size,
                 offset,
                 size,
-            ) {
+            )
+            .await
+            {
                 Ok(()) => semantic_success(request.token, is_domain, &[], &[], &[], None),
                 Err(StorageReadError::Source) => semantic_error(
                     request.token,
@@ -177,7 +181,7 @@ pub(super) fn encode_semantic_response(
                 };
                 encoded[start + 0x308..start + 0x310].copy_from_slice(&entry.size().to_le_bytes());
             }
-            write_descriptor_bytes(process, descriptor, &encoded)?;
+            write_descriptor_bytes(process, descriptor, &encoded).await?;
             let count = u64::try_from(entries.len())
                 .map_err(|_| IpcWireError::Malformed("directory entry count overflows"))?;
             semantic_success(
@@ -203,7 +207,7 @@ pub(super) fn encode_semantic_response(
                 };
                 encoded.extend_from_slice(&index.to_le_bytes());
             }
-            write_descriptor_bytes(process, descriptor, &encoded)?;
+            write_descriptor_bytes(process, descriptor, &encoded).await?;
             let count = u32::try_from(encoded.len() / 4)
                 .map_err(|_| IpcWireError::Malformed("add-on count overflows"))?;
             semantic_success(
@@ -215,7 +219,8 @@ pub(super) fn encode_semantic_response(
                 None,
             )
         }
-        IpcResponse::Event(handle) => {
+        IpcResponse::Event(event) => {
+            let handle = process.return_handle(event).map_err(IpcWireError::Handle)?;
             semantic_success(request.token, is_domain, &[], &[handle], &[], None)
         }
     }
@@ -232,8 +237,8 @@ impl From<IpcWireError> for StorageReadError {
     }
 }
 
-fn write_storage_read(
-    process: &ExceptionProcessContext<'_>,
+async fn write_storage_read(
+    process: &Request,
     storage: &ReadOnlyStorage,
     guest_address: u64,
     descriptor_size: u64,
@@ -283,7 +288,7 @@ fn write_storage_read(
                     .map_err(|_| IpcWireError::Internal("storage read address overflows"))?,
             )
             .ok_or(IpcWireError::Internal("storage read address overflows"))?;
-        write_bytes(process, destination, &buffer[..chunk_size])?;
+        write_bytes(process, destination, &buffer[..chunk_size]).await?;
         transferred += chunk_size;
     }
     Ok(())

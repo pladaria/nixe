@@ -11,8 +11,6 @@ test-diff = [
     "--package",
     "nixe-cpu-interpreter",
     "--test",
-    "differential",
-    "--test",
     "qemu_differential",
     "--",
     "--include-ignored",

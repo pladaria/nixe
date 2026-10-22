@@ -8,7 +8,7 @@ use super::{
     MaxwellComputeAddress, MaxwellComputeState,
     qmd::{MaxwellComputeQmd, QMD_SIZE},
 };
-use crate::{MaxwellGpuAccessError, MaxwellGpuAddressSpace, MaxwellMethodSource};
+use crate::{MaxwellGpuAccessError, MaxwellGpuMemory, MaxwellMethodSource};
 
 /// One scheduled QMD at its `SEND_SIGNALING_PCAS_B` trigger.
 /// Recording a launch never publishes completion or runs host work.
@@ -49,7 +49,7 @@ impl MaxwellComputeLaunch {
 }
 
 /// Failure while consuming a scheduled QMD. No completion is emitted on failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum MaxwellComputeLaunchError {
     Execution {
         source: Box<MaxwellMethodSource>,
@@ -83,7 +83,7 @@ pub enum MaxwellComputeLaunchError {
     CanonicalRead {
         source: Box<MaxwellMethodSource>,
         address: u64,
-        error: nixe_memory::CanonicalRangeAccessError,
+        error: std::sync::Arc<nixe_memory::MemoryError>,
     },
     QmdVersion {
         source: Box<MaxwellMethodSource>,
@@ -205,7 +205,8 @@ impl MaxwellResolvedComputeLaunch {
 pub(crate) fn resolve_compute_launch(
     launch: &MaxwellComputeLaunch,
     state: &MaxwellComputeState,
-    address_space: &MaxwellGpuAddressSpace,
+    address_space: &MaxwellGpuMemory,
+    access: &mut nixe_gpu::MemoryAccess<'_>,
 ) -> Result<MaxwellResolvedComputeLaunch, MaxwellComputeLaunchError> {
     let source = launch.source();
     if state.shader_exceptions_enable().value() == Some(&true) {
@@ -224,28 +225,10 @@ pub(crate) fn resolve_compute_launch(
         .address(address)
         .map_err(MaxwellGpuAccessError::Address)
         .map_err(memory_error)?;
-    let range = address_space
-        .resolve_range(gpu_address, QMD_SIZE as u64, MemoryPermissions::READ)
-        .map_err(memory_error)?;
     let mut bytes = [0; QMD_SIZE];
-    let mut copied = 0;
-    // Resolve each trigger afresh, including INVALIDATE=0: we keep no QMD cache.
-    // Earlier inline/DMA effects have already been consumed by the owner.
-    // Canonical physical aliases therefore observe the same committed bytes.
-    for segment in range.segments() {
-        let end = copied + segment.size() as usize;
-        let output = &mut bytes[copied..end];
-        segment
-            .mapping()
-            .backing()
-            .read(segment.backing_offset(), output)
-            .map_err(|error| MaxwellComputeLaunchError::CanonicalRead {
-                source: Box::new(source),
-                address,
-                error,
-            })?;
-        copied = end;
-    }
+    address_space
+        .read_into(gpu_address, &mut bytes, access)
+        .map_err(memory_error)?;
     let qmd = MaxwellComputeQmd::decode(&bytes).map_err(|(major, minor)| {
         MaxwellComputeLaunchError::QmdVersion {
             source: Box::new(source),
@@ -328,7 +311,8 @@ impl MaxwellResolvedComputeLaunch {
     pub(crate) fn native_resources(
         &self,
         info: &nixe_shader_recompiler::artifact::ShaderInfo,
-        space: &MaxwellGpuAddressSpace,
+        space: &MaxwellGpuMemory,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<
         Vec<(
             nixe_gpu::shader_module::ResourceId,
@@ -392,22 +376,21 @@ impl MaxwellResolvedComputeLaunch {
             let pointer_address = cb
                 .checked_add(offset)
                 .ok_or_else(|| fail(slot, "storage descriptor address overflows"))?;
-            let pointer = resolve(pointer_address, 12, MemoryPermissions::READ)?;
+            let pointer = space.address(pointer_address).map_err(|error| {
+                MaxwellComputeLaunchError::Address {
+                    source: Box::new(self.source),
+                    address: pointer_address,
+                    error: MaxwellGpuAccessError::Address(error),
+                }
+            })?;
             let mut bytes = [0; 12];
-            let mut copied = 0;
-            for segment in pointer.segments() {
-                let end = copied + segment.size() as usize;
-                segment
-                    .mapping()
-                    .backing()
-                    .read(segment.backing_offset(), &mut bytes[copied..end])
-                    .map_err(|error| MaxwellComputeLaunchError::CanonicalRead {
-                        source: Box::new(self.source),
-                        address: pointer_address,
-                        error,
-                    })?;
-                copied = end;
-            }
+            space
+                .read_into(pointer, &mut bytes, access)
+                .map_err(|error| MaxwellComputeLaunchError::Address {
+                    source: Box::new(self.source),
+                    address: pointer_address,
+                    error,
+                })?;
             let address = u64::from_le_bytes(bytes[..8].try_into().unwrap());
             let size = u64::from(u32::from_le_bytes(bytes[8..12].try_into().unwrap()));
             if address == 0 {
@@ -504,9 +487,7 @@ mod native_tests {
     #[test]
     fn native_compute_uses_owned_captures_and_specializes_execution_facts() {
         let (allocation, space, base) = crate::shader::test_support::mapped_memory();
-        allocation
-            .write(8, &0xe300_0000_0007_000fu64.to_le_bytes())
-            .unwrap();
+        crate::test_memory::write(&allocation, 8, &0xe300_0000_0007_000fu64.to_le_bytes()).unwrap();
         let mut words = [0; 64];
         words[0x48 / 4] = (4 << 16) | 0x17;
         words[0x4c / 4] = 0x0001_0001;
@@ -530,7 +511,12 @@ mod native_tests {
         let mut frontend = crate::MaxwellNativeFrontend::new(config.clone());
 
         let first = frontend
-            .lower_launch(&launch(words), &space, FrontendSubmissionId::new(1))
+            .lower_launch(
+                &launch(words),
+                space.memory(),
+                FrontendSubmissionId::new(1),
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
             .unwrap();
         let NativeCommand::Dispatch { program: first, .. } = first.command else {
             panic!("dispatch expected")
@@ -546,7 +532,12 @@ mod native_tests {
         assert_eq!(artifacts[0].execution.workgroup_size, [4, 1, 1]);
         words[0x30 / 4] = 5;
         let second = frontend
-            .lower_launch(&launch(words), &space, FrontendSubmissionId::new(2))
+            .lower_launch(
+                &launch(words),
+                space.memory(),
+                FrontendSubmissionId::new(2),
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
             .unwrap();
         let NativeCommand::Dispatch {
             program: second,
@@ -560,7 +551,12 @@ mod native_tests {
         assert_eq!(frontend.statistics.shader_captures, 1);
         words[0x44 / 4] = 64;
         let third = frontend
-            .lower_launch(&launch(words), &space, FrontendSubmissionId::new(3))
+            .lower_launch(
+                &launch(words),
+                space.memory(),
+                FrontendSubmissionId::new(3),
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
             .unwrap();
         let NativeCommand::Dispatch { program: third, .. } = third.command else {
             panic!("dispatch expected")
@@ -604,14 +600,20 @@ mod native_tests {
             })
             .unwrap();
         crate::shader::test_support::write_shader_words(
-            &space,
+            space.memory(),
             &[
                 (base + 0x110, base as u32 + 0x300),
                 (base + 0x114, (base >> 32) as u32),
                 (base + 0x118, 128),
             ],
         );
-        let resources = launch.native_resources(info, &space).unwrap();
+        let resources = launch
+            .native_resources(
+                info,
+                space.memory(),
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
         assert_eq!(resources.len(), 2);
         assert_eq!(
             resources[0]
@@ -643,7 +645,13 @@ mod native_tests {
                 is_written: true,
             })
             .unwrap();
-        let resources = launch.native_resources(info, &space).unwrap();
+        let resources = launch
+            .native_resources(
+                info,
+                space.memory(),
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
         assert_eq!(resources.len(), 3);
         assert!(resources[2].1.is_none());
     }
