@@ -36,13 +36,17 @@ impl VulkanResidency {
     pub(crate) fn commit_buffer_downloads(&mut self) -> Result<(), VulkanError> {
         let mut pending = std::mem::take(&mut self.buffer_writes);
         let limit = self.device.submission.configuration.arena_bytes;
-        for &id in &pending {
+        for (&id, writes) in &mut pending {
             let Ok(buffer) = self.buffer(id) else {
                 continue;
             };
-            let literal = buffer.known.as_ref().map(|known| Arc::clone(&known.bytes));
-            let geometry = buffer.contents.geometry.clone();
-            for footprint in geometry {
+            let mapping = Arc::clone(buffer.contents.geometry[0].mapping());
+            normalize(writes);
+            for &(start, bytes) in writes.iter() {
+                let footprint = Footprint::new(
+                    Arc::clone(&mapping),
+                    nixe_gpu::physical::WriteDomain::Buffer { start, bytes },
+                )?;
                 let snapshots = self.authority.resolve_footprint(&footprint)?;
                 for snapshot in snapshots {
                     let Some(producer) = snapshot
@@ -71,11 +75,21 @@ impl VulkanResidency {
                         // Literal releases still publish RAM at their fence.
                         // Retain their existing payload instead of uploading
                         // and downloading bytes that the owner already knows.
-                        let source = if let Some(literal) = &literal {
+                        let literal = self
+                            .buffer(id)?
+                            .known
+                            .iter()
+                            .find(|known| {
+                                known.offset <= producer.native + offset
+                                    && producer.native + offset + bytes
+                                        <= known.offset + known.bytes.len() as u64
+                            })
+                            .map(|known| (known.offset, Arc::clone(&known.bytes)));
+                        let source = if let Some((base, literal)) = literal {
                             Source::Literal {
                                 work: self.device.work_ticket()?,
-                                bytes: Arc::clone(literal),
-                                offset: (producer.native + offset) as usize,
+                                bytes: literal,
+                                offset: (producer.native + offset - base) as usize,
                             }
                         } else {
                             Source::Native(self.download_buffer(

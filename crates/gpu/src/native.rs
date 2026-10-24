@@ -191,8 +191,19 @@ impl GuestDrawParameters {
             && self.alpha_to_coverage == other.alpha_to_coverage
     }
 }
+#[derive(Clone, Copy, Debug)]
+pub struct BufferCopyRegion {
+    pub source: u64,
+    pub destination: u64,
+    pub bytes: u64,
+}
 #[derive(Clone, Debug)]
 pub enum NativeCommand {
+    CopyBuffer {
+        source: Arc<PhysicalMapping>,
+        destination: Arc<PhysicalMapping>,
+        regions: Box<[BufferCopyRegion]>,
+    },
     Sequence(Box<[NativeCommand]>),
     /// Orders the device stream without waiting for it on the host.
     WaitForIdle,
@@ -327,6 +338,14 @@ impl NativeCommand {
             Ok(())
         }
         match self {
+            Self::CopyBuffer {
+                source,
+                destination,
+                ..
+            } => {
+                buffer(source, inputs)?;
+                buffer(destination, inputs)?;
+            }
             Self::Sequence(commands) => {
                 for command in commands {
                     command.retain_inputs(inputs)?;

@@ -87,7 +87,9 @@ impl MaxwellNativeFrontend {
     pub fn new(configuration: nixe_gpu::shader_compilation::Configuration) -> Self {
         Self {
             presentation: Vec::new(),
-            resources: Default::default(),
+            resources: MaxwellThreeDResolvedResourceCache::new(
+                configuration.host.min_ssbo_alignment,
+            ),
             draw_roles: Vec::new(),
             code: None,
             source_codes: nixe_gpu::WorkingSet::new(2048, 32 * 1024 * 1024),
@@ -1052,7 +1054,12 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             code
         };
         let resources = launch
-            .native_resources(&inputs.stages[0].info, space, access)
+            .native_resources(
+                &inputs.stages[0].info,
+                self.configuration.host.min_ssbo_alignment.max(1),
+                space,
+                access,
+            )
             .map_err(Error::ComputeLaunch)?;
         let mut bindings = Vec::new();
         for (resource, range) in resources {

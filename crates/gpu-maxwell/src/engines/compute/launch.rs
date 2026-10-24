@@ -311,6 +311,7 @@ impl MaxwellResolvedComputeLaunch {
     pub(crate) fn native_resources(
         &self,
         info: &nixe_shader_recompiler::artifact::ShaderInfo,
+        storage_alignment: u64,
         space: &MaxwellGpuMemory,
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<
@@ -417,21 +418,24 @@ impl MaxwellResolvedComputeLaunch {
             } else {
                 MemoryPermissions::READ
             };
-            let range = resolve(address, size, permissions).map_err(|error| match error {
-                MaxwellComputeLaunchError::Address {
-                    source,
-                    address,
-                    error,
-                } => MaxwellComputeLaunchError::GlobalBufferAddress {
-                    source,
-                    constant_buffer: slot,
-                    byte_offset: descriptor.cbuf_offset.0,
-                    address,
-                    size,
-                    error,
+            let aligned = address / storage_alignment * storage_alignment;
+            let range = resolve(aligned, size + address - aligned, permissions).map_err(
+                |error| match error {
+                    MaxwellComputeLaunchError::Address {
+                        source,
+                        address,
+                        error,
+                    } => MaxwellComputeLaunchError::GlobalBufferAddress {
+                        source,
+                        constant_buffer: slot,
+                        byte_offset: descriptor.cbuf_offset.0,
+                        address,
+                        size,
+                        error,
+                    },
+                    error => error,
                 },
-                error => error,
-            })?;
+            )?;
             result.push((
                 resource(
                     &ResourceSource::StorageBuffer(descriptor.clone()),
@@ -602,7 +606,7 @@ mod native_tests {
         crate::shader::test_support::write_shader_words(
             space.memory(),
             &[
-                (base + 0x110, base as u32 + 0x300),
+                (base + 0x110, base as u32 + 0x304),
                 (base + 0x114, (base >> 32) as u32),
                 (base + 0x118, 128),
             ],
@@ -610,6 +614,7 @@ mod native_tests {
         let resources = launch
             .native_resources(
                 info,
+                256,
                 space.memory(),
                 &mut crate::test_memory::access(space.memory().machine()),
             )
@@ -635,7 +640,7 @@ mod native_tests {
                 .iter()
                 .map(|s| s.size())
                 .sum::<u64>(),
-            128
+            132
         );
         info.storage_buffers_descriptors
             .push(StorageBufferDescriptor {
@@ -648,6 +653,7 @@ mod native_tests {
         let resources = launch
             .native_resources(
                 info,
+                256,
                 space.memory(),
                 &mut crate::test_memory::access(space.memory().machine()),
             )

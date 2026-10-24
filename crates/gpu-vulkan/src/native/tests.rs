@@ -200,7 +200,8 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
     let id = execution
         .residency
         .buffer_for(backing.clone(), vk::BufferUsageFlags::TRANSFER_DST)
-        .unwrap();
+        .unwrap()
+        .buffer;
     assert_eq!(
         execution
             .residency
@@ -619,7 +620,10 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         .buffer_for_deferred_import(target, vk::BufferUsageFlags::TRANSFER_DST)
         .unwrap();
     assert_eq!(
-        execution.residency.read_buffer(id, 0, 16).unwrap(),
+        execution
+            .residency
+            .read_buffer(id.buffer, id.offset, 16)
+            .unwrap(),
         [0x71; 16],
         "the real GPU bytes must agree with canonical publication"
     );
@@ -627,7 +631,7 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     // be read from the GPU rather than replaying the preceding host value.
     let written = execution
         .residency
-        .write_buffer(id, 0, &[0xa7; 16])
+        .write_buffer(id.buffer, id.offset, &[0xa7; 16])
         .unwrap();
     assert_eq!(written.consumed, 16);
     assert_eq!(
@@ -685,33 +689,29 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         )
         .unwrap();
     let (_copied, copied) = backing_allocation(&execution.residency, 16, 16, 0);
-    let destination = execution
-        .residency
-        .buffer_for_deferred_import(copied.clone(), vk::BufferUsageFlags::TRANSFER_DST)
-        .unwrap();
-    let uploaded_before_consumer = execution.residency.statistics().cpu_uploaded_bytes;
+    let regions = [nixe_gpu::native::BufferCopyRegion {
+        source: 64,
+        destination: 0,
+        bytes: 16,
+    }];
     execution
         .residency
-        .copy_buffer(source, 0, source, 0, 16)
+        .copy_physical_buffers(&whole, &copied, &regions)
+        .unwrap();
+    let uploaded = execution.residency.statistics().cpu_uploaded_bytes;
+    execution
+        .residency
+        .copy_physical_buffers(&whole, &copied, &regions)
         .unwrap();
     assert_eq!(
         execution.residency.statistics().cpu_uploaded_bytes,
-        uploaded_before_consumer,
-        "a self-copy neither consumes nor discards the deferred literal"
-    );
-    execution
-        .residency
-        .copy_buffer(source, 0, destination, 0, 16)
-        .unwrap();
-    assert_eq!(
-        execution.residency.statistics().cpu_uploaded_bytes,
-        uploaded_before_consumer + 16,
-        "the first GPU consumer materializes the payload once"
+        uploaded,
+        "repeated native consumers reuse the materialized payload and page baseline"
     );
     assert_eq!(
         execution
             .residency
-            .write_buffer(source, 4, &[0xd5; 4])
+            .write_buffer(source.buffer, source.offset + 4, &[0xd5; 4])
             .unwrap()
             .consumed,
         4
@@ -916,7 +916,11 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     assert_eq!(execution.statistics.warm_draws, 31);
     let bytes = cpu_read(&mut execution.residency, &backing);
     assert!(bytes.chunks_exact(4).all(|p| p == [0, 255, 0, 255]));
-    assert!(execution.residency.statistics().cpu_streamed_bytes > 0);
+    assert_eq!(
+        execution.residency.statistics().cpu_streamed_bytes,
+        0,
+        "vertices use retained buffers"
+    );
     // Acceptance of a read snapshot need not submit a command buffer. A
     // following CPU write is uploaded after that read, with a native WAR edge.
     let prefix = NativeSubmission::new(
@@ -1241,7 +1245,8 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let native_uniform = execution
         .residency
         .buffer_for(uniform_backing, vk::BufferUsageFlags::STORAGE_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     assert_eq!(
         execution
             .residency
@@ -1924,7 +1929,8 @@ fn recorder_prefixes_retain_gpu_versions_without_allocating_completion_records()
         let buffer = execution
             .residency
             .buffer_for(backing.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
-            .unwrap();
+            .unwrap()
+            .buffer;
         assert_eq!(
             execution
                 .residency

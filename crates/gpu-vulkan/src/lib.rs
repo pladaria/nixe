@@ -23,8 +23,9 @@ mod transfer;
 pub use memory::NativeImageDescription;
 pub use residency::{
     AccessScope, AttachmentId, AttachmentLoad, AttachmentStore, BarrierPolicy, BarrierStatistics,
-    BufferId, BufferUpload, ImageId, ImagePlane, ImageViewDescription, ImageViewId, LayoutPolicy,
-    PreparedNv12, RecordingPolicy, ResidencyStatistics, VulkanResidency, nv12_pipeline,
+    BufferId, BufferRange, BufferUpload, ImageId, ImagePlane, ImageViewDescription, ImageViewId,
+    LayoutPolicy, PreparedNv12, RecordingPolicy, ResidencyStatistics, VulkanResidency,
+    nv12_pipeline,
 };
 mod validation;
 pub use gpu_allocator::MemoryLocation;

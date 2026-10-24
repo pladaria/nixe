@@ -296,7 +296,7 @@ fn exercise(api: ApiPreference, recording: RecordingPolicy) {
     let alias = buffer(&mut cache, bytes.slice(4, 64).unwrap());
     assert_eq!(cache.statistics().canonical_readback_bytes, 0);
     assert_eq!(
-        cache.read_buffer(alias, 0, 64).unwrap(),
+        cache.read_buffer(alias, 4, 64).unwrap(),
         0x44112233u32.to_ne_bytes().repeat(16)
     );
     let (_allocation_5, image_bytes) = backing_allocation(&cache, 4096, 4096, 0x77);
@@ -432,7 +432,7 @@ fn binding_candidates_execute_identical_words_and_recycle_descriptors() {
             } else {
                 vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             };
-        let id = cache.buffer_for(bytes.clone(), usage).unwrap();
+        let id = cache.buffer_for(bytes.clone(), usage).unwrap().buffer;
         for _ in 0..10 {
             cache.fill_buffer(id, 12, 128, 0xbbaaccdd).unwrap();
             cache.swap_rgba8_words_binding(id, 12, 32, binding).unwrap();
@@ -882,7 +882,8 @@ fn packed_depth_stencil_authority_preserves_both_aspects_and_padding() {
     // subsequent stencil write must retain that producer's new depth bytes.
     let buffer = cache
         .buffer_for(physical.clone(), vk::BufferUsageFlags::TRANSFER_DST)
-        .unwrap();
+        .unwrap()
+        .buffer;
     cache.fill_buffer_range(buffer, 0, 4, 25).unwrap();
     cache.clear_depth_stencil(image, 1, 0., 41).unwrap();
     cache.flush().unwrap();

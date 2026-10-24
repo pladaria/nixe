@@ -80,7 +80,9 @@ impl VulkanResidency {
                 } else {
                     vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                 };
-            let buffer = self.buffer_for(PhysicalMapping::new(&[range])?, usage)?;
+            let buffer = self
+                .buffer_for(PhysicalMapping::new(&[range])?, usage)?
+                .buffer;
             // Compile and establish residency before either clock starts.
             self.swap_rgba8_words_binding(buffer, 0, 1024, binding)?;
             let work = self.flush()?.expect("warmup recording");

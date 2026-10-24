@@ -825,7 +825,7 @@ impl QueueState {
             },
         ))
     }
-    fn reserve_slice(
+    pub(crate) fn reserve_slice(
         &mut self,
         size: u64,
         upload: bool,

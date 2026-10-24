@@ -40,6 +40,7 @@ impl Bitmap {
 }
 pub(crate) struct Tracking {
     observed: Bitmap,
+    buffer_observed: Bitmap,
     device_observed: Bitmap,
     dirty: Bitmap,
     reserved: Bitmap,
@@ -191,6 +192,7 @@ impl Tracking {
     pub fn new(bytes: u64) -> Self {
         Self {
             observed: Bitmap::new(bytes / PAGE_SIZE, 0),
+            buffer_observed: Bitmap::new(bytes / PAGE_SIZE, 0),
             device_observed: Bitmap::new(bytes / PAGE_SIZE, 0),
             dirty: Bitmap::new(bytes / PAGE_SIZE, 0),
             reserved: Bitmap::new(bytes / PAGE_SIZE, 0),
@@ -205,7 +207,18 @@ impl Tracking {
         }
     }
     pub fn observed(&self, page: u64) -> bool {
-        self.observed.get(page)
+        self.observed.get(page) || self.buffer_observed.get(page)
+    }
+    fn all_observed(&self, extent: Extent) -> bool {
+        bitmap_words(extent).all(|(word, mask)| {
+            (self.observed.0[word].load(Ordering::Acquire)
+                | self.buffer_observed.0[word].load(Ordering::Acquire))
+                & mask
+                == mask
+        })
+    }
+    fn any_observed(&self, extent: Extent) -> bool {
+        self.observed.any(extent) || self.buffer_observed.any(extent)
     }
     pub fn code(&self, page: u64) -> bool {
         self.code.get(page)
@@ -250,6 +263,7 @@ impl Tracking {
         let mut observers = self.observers.lock().unwrap();
         for &extent in extents {
             self.code.update_range(extent, false, |_| {});
+            self.buffer_observed.update_range(extent, false, |_| {});
             self.observed.update_range(extent, false, |page| {
                 let mut device_only = false;
                 if let Some(registered) = observers.pages.get_mut(&page) {
@@ -333,6 +347,7 @@ impl Tracking {
     ) {
         let mut observers = self.observers.lock().unwrap();
         for extent in extents {
+            self.observed.update_range(extent, true, |_| {});
             for page in pages(extent) {
                 if device_writes {
                     self.device_observed.update_range(
@@ -356,7 +371,7 @@ impl Tracking {
     fn statistics(&self) -> TrackingStatistics {
         let observers = self.observers.lock().unwrap();
         TrackingStatistics {
-            bitmap_bytes: self.observed.0.len() * 48,
+            bitmap_bytes: self.observed.0.len() * 56,
             observer_pages: observers.pages.len(),
             observer_registrations: observers
                 .pages
@@ -1440,6 +1455,39 @@ impl Machine {
         copies: &[PhysicalCapture],
         destination: &mut [u8],
     ) -> Result<Observation, MemoryError> {
+        let observation = Observation::default();
+        self.capture_scattered(inputs, copies, destination, Some(&observation))?;
+        Ok(observation)
+    }
+    /// Inspect weak cache metadata without acquiring a physical input lease.
+    /// Actual capture/publication still retains the allocation independently.
+    pub fn buffer_pages_tracked(&self, extent: Extent) -> bool {
+        bitmap_words(extent).all(|(word, mask)| {
+            self.tracking()
+                .buffer_observed
+                .0
+                .get(word)
+                .is_some_and(|bits| bits.load(Ordering::Acquire) & mask == mask)
+        })
+    }
+    /// Retained buffers consume dirty-page notifications instead of rebuilding
+    /// per-buffer observations. Device materialization preserves this CPU watch.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/memory_tracker_base.h
+    pub fn capture_buffer_scattered(
+        &self,
+        inputs: &[AllocationRange],
+        copies: &[PhysicalCapture],
+        destination: &mut [u8],
+    ) -> Result<(), MemoryError> {
+        self.capture_scattered(inputs, copies, destination, None)
+    }
+    fn capture_scattered(
+        &self,
+        inputs: &[AllocationRange],
+        copies: &[PhysicalCapture],
+        destination: &mut [u8],
+        observation: Option<&Observation>,
+    ) -> Result<(), MemoryError> {
         self.validate_ranges(inputs)?;
         let mut extents: Vec<_> = inputs
             .iter()
@@ -1479,10 +1527,17 @@ impl Machine {
                 ));
             }
         }
-        let observation = Observation::default();
         let capture = |destination: &mut [u8]| {
-            self.tracking()
-                .register(retained.iter().copied(), &observation, true, false);
+            if let Some(observation) = observation {
+                self.tracking()
+                    .register(retained.iter().copied(), observation, true, false);
+            } else {
+                for &extent in &retained {
+                    self.tracking()
+                        .buffer_observed
+                        .update_range(extent, true, |_| {});
+                }
+            }
             for copy in copies {
                 let source = self
                     .arena()
@@ -1505,21 +1560,26 @@ impl Machine {
             let _access = self.physical_access().enter_many(&retained);
             if retained
                 .iter()
-                .all(|&extent| pages(extent).all(|page| self.tracking().observed(page)))
+                .all(|&extent| self.tracking().all_observed(extent))
             {
                 capture(destination);
-                return Ok(observation);
+                return Ok(());
             }
         }
         self.tracking_transition(inputs, |batch, _| {
             for &extent in &retained {
-                self.tracking().observed.update_range(extent, true, |_| {});
+                let bitmap = if observation.is_some() {
+                    &self.tracking().observed
+                } else {
+                    &self.tracking().buffer_observed
+                };
+                bitmap.update_range(extent, true, |_| {});
             }
             batch.refresh()?;
             capture(destination);
             Ok(())
         })?;
-        Ok(observation)
+        Ok(())
     }
     /// Streaming captures keep dirty RAM dirty and do not install observers or
     /// change native protection. Callers supply the owned upload destination.
@@ -1610,7 +1670,9 @@ impl Machine {
                             bytes: (stop - begin) as u64,
                         };
                         if let Some(batch) = batch {
-                            batch.invalidate(self, &[target]);
+                            // Materializing a native producer is a device write,
+                            // not a CPU mutation that requires another upload.
+                            batch.invalidate_from(self, &[target], true);
                         }
                         // The transition retains aliases and closes physical access.
                         unsafe {
@@ -1628,6 +1690,8 @@ impl Machine {
         let index = self.aliases();
         if extents.iter().all(|&extent| {
             pages(extent).all(|page| self.tracking().device.get(page))
+                // Buffer watches survive materialization and need no observer
+                // invalidation or additional protection transition here.
                 && !self.tracking().observed.any(extent)
         }) {
             let closed = self.physical_access().close(&extents);
@@ -1754,7 +1818,7 @@ impl Machine {
         }
         if extents
             .iter()
-            .any(|&extent| self.tracking().observed.any(extent))
+            .any(|&extent| self.tracking().any_observed(extent))
         {
             return None;
         }
@@ -2683,6 +2747,14 @@ mod tests {
             .unwrap();
         assert_eq!(machine.tracking_statistics().protection_calls, protected);
         assert!(!native.is_invalid());
+        assert!(machine.take_cpu_modified_pages().is_empty());
+        machine
+            .write_download(&input, &vec![0x73; PAGE_SIZE as usize], || {
+                Ok(std::iter::once(0..PAGE_SIZE as usize).collect())
+            })
+            .unwrap();
+        assert!(!native.is_invalid());
+        assert!(machine.take_cpu_modified_pages().is_empty());
         machine
             .retire_device_pages(std::slice::from_ref(&input))
             .unwrap();
@@ -2693,6 +2765,85 @@ mod tests {
         space.write_value(base, 4, 7).unwrap().into_ready().unwrap();
         assert!(native.is_invalid());
         assert!(host_store(&space, base.get()));
+    }
+    #[test]
+    fn buffer_dirty_watch_survives_snapshot_invalidation_and_download() {
+        let machine = Machine::new(PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(PAGE_SIZE)
+            .unwrap()
+            .allocate(PAGE_SIZE)
+            .unwrap();
+        let input = AllocationRange::new(allocation.pin(), 0, PAGE_SIZE).unwrap();
+        let physical = input.physical_extents().next().unwrap().start;
+        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
+        let base = GuestVirtualAddress::new(0x7000);
+        space
+            .map(
+                base,
+                allocation,
+                0,
+                PAGE_SIZE,
+                MemoryPermissions::READ_WRITE,
+            )
+            .unwrap();
+        machine
+            .capture_buffer_scattered(std::slice::from_ref(&input), &[], &mut [])
+            .unwrap();
+        assert_eq!(machine.tracking_statistics().observer_registrations, 0);
+        let snapshot = Observation::default();
+        machine
+            .access_captured(
+                std::slice::from_ref(&input),
+                crate::AccessOperation::ReadObserved(snapshot.clone()),
+            )
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        machine
+            .publish_device_write(std::slice::from_ref(&input), || Ok(()))
+            .unwrap();
+        assert!(snapshot.is_invalid());
+        machine
+            .write_download(&input, &vec![0x73; PAGE_SIZE as usize], || {
+                Ok(std::iter::once(0..PAGE_SIZE as usize).collect())
+            })
+            .unwrap();
+        machine
+            .retire_device_pages(std::slice::from_ref(&input))
+            .unwrap();
+        assert!(machine.take_cpu_modified_pages().is_empty());
+        assert!(!host_store(&space, base.get()));
+        space.write_value(base, 4, 7).unwrap().into_ready().unwrap();
+        assert_eq!(
+            machine.take_cpu_modified_pages(),
+            [Extent {
+                start: physical,
+                bytes: PAGE_SIZE
+            }]
+        );
+        assert!(host_store(&space, base.get()));
+        let copy = PhysicalCapture {
+            source: Extent {
+                start: physical,
+                bytes: 4,
+            },
+            destination: 0,
+        };
+        let mut captured = [0; 4];
+        machine
+            .capture_buffer_scattered(&[input.slice(0, 4).unwrap()], &[copy], &mut captured)
+            .unwrap();
+        assert_eq!(captured, 42u32.to_le_bytes());
+        assert!(!host_store(&space, base.get()));
+        space.write_value(base, 4, 9).unwrap().into_ready().unwrap();
+        assert_eq!(
+            machine.take_cpu_modified_pages(),
+            [Extent {
+                start: physical,
+                bytes: PAGE_SIZE
+            }]
+        );
     }
     #[test]
     fn repeated_device_publication_invalidates_new_code_without_reprotecting_pages() {

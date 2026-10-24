@@ -30,7 +30,8 @@ fn null_storage_buffers_read_zero_and_discard_writes_and_atomics() {
     let (_allocation_1, backing) = backing_allocation(&cache, 4096, 4096, 0x19);
     let destination = cache
         .buffer_for(backing.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     let mut s = Shader::new(Stage::Compute);
     s.storage();
     s.program
@@ -91,13 +92,15 @@ fn dispatch_alias_import_keeps_prepared_physical_page_baseline() {
             whole.slice(0, 16).unwrap(),
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )
-        .unwrap();
+        .unwrap()
+        .buffer;
     let source = cache
         .buffer_for(
             whole.slice(128, 16).unwrap(),
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )
-        .unwrap();
+        .unwrap()
+        .buffer;
     let mut shader = increment();
     shader
         .program
@@ -137,7 +140,7 @@ fn dispatch_alias_import_keeps_prepared_physical_page_baseline() {
                 },
                 Binding::Buffer {
                     buffer: source,
-                    offset: 0,
+                    offset: 128,
                     size: 16,
                 },
             ],
@@ -298,7 +301,8 @@ fn streams(
     crate::residency::tests::cpu_write(cache, &allocation, 24, &bytes).unwrap();
     let vertex = cache
         .buffer_for(backing.clone(), vk::BufferUsageFlags::VERTEX_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     // Skip one index and use a signed base vertex. Ordered vertices stay 0,1,2.
     crate::residency::tests::cpu_write(
         cache,
@@ -315,7 +319,8 @@ fn streams(
             backing,
             vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::VERTEX_BUFFER,
         )
-        .unwrap();
+        .unwrap()
+        .buffer;
     (
         Box::new([VertexBuffer {
             binding: 0,
@@ -396,7 +401,7 @@ fn gathered_draw_inputs_reuse_versions_and_observe_intervening_gpu_writes() {
         first_vertex: 0,
         first_instance: 0,
     }];
-    cache.draws_streamed(&draw, &arguments, &[]).unwrap();
+    cache.draws(&draw, &arguments, &[]).unwrap();
     cache.flush().unwrap();
     let old_output = cpu_read(&mut cache, &pixels);
     for row in 0..8 {
@@ -414,7 +419,7 @@ fn gathered_draw_inputs_reuse_versions_and_observe_intervening_gpu_writes() {
         .unwrap();
     assert_eq!(upload.consumed, replacement.len());
     cache
-        .draws_streamed(
+        .draws(
             &draw,
             &[Draw::Direct {
                 vertices: 3,
@@ -620,7 +625,8 @@ fn compute(api: ApiPreference) {
     let (_allocation_3, backing) = backing_allocation(&cache, 4096, 4096, 0);
     let buffer = cache
         .buffer_for(backing.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     let (allocation, args) = backing_allocation(&cache, 4096, 4096, 0);
     crate::residency::tests::cpu_write(
         &mut cache,
@@ -634,7 +640,8 @@ fn compute(api: ApiPreference) {
     .unwrap();
     let indirect = cache
         .buffer_for(args, vk::BufferUsageFlags::INDIRECT_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     let program = cache
         .prepare_program(
             pipeline,
@@ -883,18 +890,25 @@ impl Utilities for VulkanResidency {
         let pipeline = compiler(self)
             .request(PipelineRecipe::Compute(shader))
             .unwrap();
+        let alignment = self
+            .device
+            .profile()
+            .limits
+            .min_storage_buffer_offset_alignment;
+        let base = interval.offset / alignment * alignment;
+        let first = ((interval.offset - base) / 4) as u32;
         let program = self.prepare_program(
             pipeline,
             &[Binding::Buffer {
-                buffer: interval,
-                offset: 0,
-                size: u64::from(count) * 4,
+                buffer: interval.buffer,
+                offset: base,
+                size: (interval.offset - base) + u64::from(count) * 4,
             }],
         )?;
         self.dispatch(
             &program,
             Dispatch::Direct([count.div_ceil(64), 1, 1]),
-            &[0u32, count]
+            &[first, count]
                 .into_iter()
                 .flat_map(u32::to_le_bytes)
                 .collect::<Vec<_>>(),
@@ -1836,7 +1850,8 @@ fn compute_produced_indexed_indirect_draw_scaled32_and_first_instance() {
     .unwrap();
     let instance = cache
         .buffer_for(colors, vk::BufferUsageFlags::VERTEX_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     let vertices = Box::new([
         vertices[0],
         VertexBuffer {
@@ -1855,7 +1870,8 @@ fn compute_produced_indexed_indirect_draw_scaled32_and_first_instance() {
             commands,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
         )
-        .unwrap();
+        .unwrap()
+        .buffer;
     let mut f = Shader::new(Stage::Compute);
     f.storage();
     for (i, value) in [3u32, 1, 1, u32::MAX, 1].into_iter().enumerate() {
@@ -2292,11 +2308,13 @@ fn quad_geometry(provoking_first: bool) {
     .unwrap();
     let vertex = cache
         .buffer_for(vertices, vk::BufferUsageFlags::VERTEX_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     let (_allocation_8, counters) = backing_allocation(&cache, 4096, 4096, 0);
     let buffer = cache
         .buffer_for(counters.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     let program = cache
         .prepare_program(
             pipeline,
@@ -2413,7 +2431,8 @@ fn native_fill_rectangle_and_front_and_back_culling() {
     .unwrap();
     let vertex = cache
         .buffer_for(vertices, vk::BufferUsageFlags::VERTEX_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     let (target, pixels, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
@@ -2827,7 +2846,8 @@ fn gpu_image_buffer_reconstruction_coalesces_page_boundaries() {
     let before = cache.barrier_statistics().calls;
     let buffer = cache
         .buffer_for(storage, vk::BufferUsageFlags::STORAGE_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     assert_eq!(cache.statistics.native_readback_bytes, 0);
     assert_eq!(
         cache.read_buffer(buffer, 0, 16384).unwrap(),
@@ -3264,7 +3284,8 @@ fn unaligned_fill_and_native_565_to_bgra_blit_preserve_unselected_bytes() {
     let (_allocation_16, bytes) = backing_allocation(&cache, 4096, 4096, 0x5a);
     let buffer = cache
         .buffer_for(bytes.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     cache.fill_buffer_range(buffer, 7, 13, 0x44332211).unwrap();
     cache.flush().unwrap();
     let result = cpu_read(&mut cache, &bytes);
@@ -3409,7 +3430,8 @@ fn native_rectangular_wireframe_width_changes_coverage() {
     .unwrap();
     let vertex = cache
         .buffer_for(vertices, vk::BufferUsageFlags::VERTEX_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     let (target, pixels, _image_allocation) = image(
         &mut cache,
         vk::Format::R8G8B8A8_UNORM,
@@ -3533,7 +3555,8 @@ fn shader_storage_alias_becomes_sampled_texture_without_cpu_readback() {
             source_bytes.slice(32, 4).unwrap(),
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )
-        .unwrap();
+        .unwrap()
+        .buffer;
     let mut f = Shader::new(Stage::Compute);
     f.storage();
     f.op(
@@ -3550,7 +3573,7 @@ fn shader_storage_alias_becomes_sampled_texture_without_cpu_readback() {
             pipeline,
             &[Binding::Buffer {
                 buffer,
-                offset: 0,
+                offset: 32,
                 size: 4,
             }],
         )
@@ -3712,7 +3735,8 @@ fn affine_fixed_point_sampling_reverses_crops_and_preserves_destination_padding(
     let pixels: Vec<_> = (0..8_u8).flat_map(|i| [i * 16, 0, 0, 255]).collect();
     let buffer = cache
         .buffer_for(source_bytes.clone(), vk::BufferUsageFlags::TRANSFER_SRC)
-        .unwrap();
+        .unwrap()
+        .buffer;
     let uploaded = cache.write_buffer(buffer, 0, &pixels).unwrap();
     assert_eq!(uploaded.consumed, pixels.len());
     cache.ensure_image(source).unwrap();
@@ -4195,6 +4219,13 @@ fn transfer_writes_skip_old_destination_import_and_preserve_exterior_producers()
 
 #[test]
 fn uniform_word_addressing_dynamic_offsets_and_cpu_gpu_producers_keep_visibility() {
+    uniform_visibility(false);
+}
+#[test]
+fn unaligned_uniforms_preserve_cpu_captures_and_native_producers() {
+    uniform_visibility(true);
+}
+fn uniform_visibility(unaligned: bool) {
     let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
         return;
     };
@@ -4206,15 +4237,18 @@ fn uniform_word_addressing_dynamic_offsets_and_cpu_gpu_producers_keep_visibility
         .limits
         .min_uniform_buffer_offset_alignment
         .max(16);
+    let alignment = alignment + if unaligned { 4 } else { 0 };
     let (input_allocation, input_backing) =
         backing_allocation(&cache, (alignment * 2 + 80) as usize, 4096, 0x19);
     let (_allocation_20, output_backing) = backing_allocation(&cache, 4096, 4096, 0x71);
     let input = cache
         .buffer_for(input_backing.clone(), vk::BufferUsageFlags::UNIFORM_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     let output = cache
         .buffer_for(output_backing.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
-        .unwrap();
+        .unwrap()
+        .buffer;
     let mut f = Shader::new(Stage::Compute);
     f.storage();
     f.program.info.used_constant_buffer_types = Type::U32;
@@ -4306,4 +4340,102 @@ fn uniform_word_addressing_dynamic_offsets_and_cpu_gpu_producers_keep_visibility
     drop(compilers);
     drop(cache);
     monitor.check().unwrap();
+}
+
+#[test]
+fn streamed_uniform_bindings_preserve_merged_aliases_and_independent_sources() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let compilers = Compilers::new(&cache);
+    let alignment = cache
+        .device
+        .profile()
+        .limits
+        .min_uniform_buffer_offset_alignment
+        .max(16);
+    let (a, a_mapping) = backing_allocation(&cache, 4096, 4096, 0x11);
+    let (_b, b_mapping) = backing_allocation(&cache, 4096, 4096, 0x22);
+    let (_output, output_mapping) = backing_allocation(&cache, 4096, 4096, 0);
+    let a_id = super::super::tests::buffer(&mut cache, a_mapping);
+    let b_id = super::super::tests::buffer(&mut cache, b_mapping);
+    let output_id = super::super::tests::buffer(&mut cache, output_mapping.clone());
+    let mut shader = Shader::new(Stage::Compute);
+    shader.storage();
+    shader.program.info.used_constant_buffer_types = Type::U32;
+    for index in 0..3 {
+        shader
+            .program
+            .info
+            .constant_buffer_descriptors
+            .push(ConstantBufferDescriptor {
+                index: CbufIndex(index),
+                count: 1,
+            })
+            .unwrap();
+        let value = shader.op(O::GetCbufU32, &[V::U32(index), V::U32(0)]);
+        shader.op(O::WriteStorage32, &[V::U32(0), V::U32(index * 4), value]);
+    }
+    let shader = compilers.shader(&cache, [shader]);
+    let pipeline = compilers
+        .pipelines
+        .request(PipelineRecipe::Compute(shader))
+        .unwrap();
+    let program = cache
+        .prepare_program(
+            pipeline,
+            &[
+                Binding::Buffer {
+                    buffer: a_id,
+                    offset: 0,
+                    size: alignment + 4,
+                },
+                Binding::Buffer {
+                    buffer: a_id,
+                    offset: alignment,
+                    size: 4,
+                },
+                Binding::Buffer {
+                    buffer: b_id,
+                    offset: 0,
+                    size: 4,
+                },
+                Binding::Buffer {
+                    buffer: output_id,
+                    offset: 0,
+                    size: 12,
+                },
+            ],
+        )
+        .unwrap();
+    for expected in [0x33333333u32, 0x44444444] {
+        super::super::tests::cpu_write(&mut cache, &a, alignment as usize, &expected.to_le_bytes())
+            .unwrap();
+        cache
+            .dispatch(&program, Dispatch::Direct([1, 1, 1]), &[])
+            .unwrap();
+        let bytes = cpu_read(&mut cache, &output_mapping);
+        assert_eq!(
+            &bytes[..12],
+            &[0x11111111u32, expected, 0x22222222]
+                .map(u32::to_le_bytes)
+                .concat()
+        );
+    }
+    // One merged uniform becomes native-produced; the other must still stream.
+    cache.fill_buffer(a_id, alignment, 4, 0x55555555).unwrap();
+    cache
+        .dispatch(&program, Dispatch::Direct([1, 1, 1]), &[])
+        .unwrap();
+    assert_eq!(
+        &cpu_read(&mut cache, &output_mapping)[..12],
+        &[0x11111111u32, 0x55555555, 0x22222222]
+            .map(u32::to_le_bytes)
+            .concat()
+    );
+    drop(program);
+    drop(compilers);
+    drop(cache);
+    validation.check().unwrap();
 }

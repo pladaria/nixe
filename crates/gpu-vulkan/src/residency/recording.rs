@@ -3,6 +3,119 @@
 use super::*;
 use crate::ReadbackTicket;
 impl VulkanResidency {
+    /// Capture dirty RAM directly into one mapped upload batch, bounded by the
+    /// arena capacity. Region offsets retain their order across chunk boundaries.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+    pub(super) fn upload_buffer_captures(
+        &mut self,
+        id: BufferId,
+        inputs: &[nixe_memory::AllocationRange],
+        copies: &[nixe_memory::PhysicalCapture],
+        windows: &[(u64, usize, usize)],
+        packed: usize,
+    ) -> Result<(), VulkanError> {
+        let limit = self.device.submission.configuration.arena_bytes as usize;
+        let mut captures = Vec::new();
+        let mut regions = Vec::new();
+        let mut retained = Vec::new();
+        let mut input_index = 0;
+        let mut input_offset = 0;
+        for begin in (0..packed).step_by(limit) {
+            let end = (begin + limit).min(packed);
+            retained.clear();
+            let mut remaining = (end - begin) as u64;
+            while remaining != 0 {
+                let input = inputs.get(input_index).ok_or(VulkanError::InvalidResource(
+                    "buffer upload capture exceeds retained inputs",
+                ))?;
+                let bytes = remaining.min(input.bytes() - input_offset);
+                retained.push(input.slice(input_offset, bytes)?);
+                remaining -= bytes;
+                input_offset += bytes;
+                if input_offset == input.bytes() {
+                    input_index += 1;
+                    input_offset = 0;
+                }
+            }
+            captures.clear();
+            let first = copies
+                .partition_point(|copy| copy.destination + copy.source.bytes as usize <= begin);
+            for copy in &copies[first..] {
+                if copy.destination >= end {
+                    break;
+                }
+                let start = copy.destination.max(begin);
+                let stop = (copy.destination + copy.source.bytes as usize).min(end);
+                captures.push(nixe_memory::PhysicalCapture {
+                    source: nixe_memory::Extent {
+                        start: nixe_memory::ArenaOffset::new(
+                            copy.source.start.get() + (start - copy.destination) as u64,
+                        ),
+                        bytes: (stop - start) as u64,
+                    },
+                    destination: start - begin,
+                });
+            }
+            // Resolve lazy literals/hazards before reserving the capture's slot:
+            // those operations may consume staging or submit earlier commands.
+            regions.clear();
+            let first = windows.partition_point(|&(_, start, bytes)| start + bytes <= begin);
+            for &(offset, start, bytes) in &windows[first..] {
+                if start >= end {
+                    break;
+                }
+                let low = start.max(begin);
+                let high = (start + bytes).min(end);
+                let destination = offset + (low - start) as u64;
+                self.buffer_access_range(
+                    id,
+                    destination,
+                    (high - low) as u64,
+                    AccessScope::new(
+                        vk::PipelineStageFlags2::COPY,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                    ),
+                )?;
+                regions.push(
+                    vk::BufferCopy::default()
+                        .src_offset((low - begin) as u64)
+                        .dst_offset(destination)
+                        .size((high - low) as u64),
+                );
+            }
+            let (slot, slice) = self.reserve_upload_space((end - begin) as u64, 4)?;
+            let upload = self.device.submission.slots[slot].upload_buffer(slice);
+            unsafe {
+                upload.write_with(slice.offset, slice.size, |destination| {
+                    self.memory
+                        .capture_buffer_scattered(&retained, &captures, destination)
+                        .map_err(memory_error)
+                })?;
+            }
+            let source = upload.handle;
+            for region in &mut regions {
+                region.src_offset += slice.offset;
+            }
+            let work = self.device.work_ticket()?;
+            self.contents_mut(Resource::Buffer(id)).last_use = Some(work);
+            self.barriers.emit(&mut self.device);
+            unsafe {
+                self.device.dispatch.cmd_copy_buffer(
+                    self.device.submission.slots[slot].command,
+                    source,
+                    self.buffer(id)?.native.handle,
+                    &regions,
+                );
+            }
+            for region in &regions {
+                self.contents_mut(Resource::Buffer(id))
+                    .validate_interval(region.dst_offset, region.size);
+            }
+            self.invalidate_cpu_buffers(&[])?;
+            self.statistics.cpu_uploaded_bytes += (end - begin) as u64;
+        }
+        Ok(())
+    }
     pub(super) fn check_buffer_range(
         &self,
         id: BufferId,
@@ -28,20 +141,29 @@ impl VulkanResidency {
         bytes: &[u8],
         alignment: u64,
     ) -> Result<(usize, crate::queue::Slice), VulkanError> {
+        let (slot, slice) = self.reserve_upload_space(bytes.len() as u64, alignment)?;
+        let buffer = self.device.submission.slots[slot].upload_buffer(slice);
+        unsafe {
+            buffer.write_range(slice.offset, bytes)?;
+        }
+        Ok((slot, slice))
+    }
+    pub(super) fn reserve_upload_space(
+        &mut self,
+        size: u64,
+        alignment: u64,
+    ) -> Result<(usize, crate::queue::Slice), VulkanError> {
         loop {
-            match self
-                .device
-                .submission
-                .reserve_upload_aligned(bytes, alignment)
-            {
+            match self.device.submission.reserve_slice(size, true, alignment) {
                 Ok(reservation) => return Ok(reservation),
                 Err(error @ VulkanError::QueuePressure { pending, .. }) => {
-                    // Submit an oversized resource's recorded prefix, then wait
-                    // only for work that can release bounded staging capacity.
                     let flushed = self.flush()?;
                     let Some(work) = pending.or(flushed) else {
                         return Err(error);
                     };
+                    self.statistics.staging_pressure_waits += 1;
+                    let _wait =
+                        nixe_gpu::trace::span("staging_pressure_wait", work.tick(), size, 0);
                     self.device.wait_for_work(work, std::time::Duration::MAX)?;
                 }
                 Err(error) => return Err(error),
@@ -90,73 +212,6 @@ impl VulkanResidency {
         }
         Ok(())
     }
-    pub(super) fn copy_buffer_effect(
-        &mut self,
-        writer: WriterId,
-        source: BufferId,
-        offset: u64,
-        destination: BufferId,
-        destination_offset: u64,
-        bytes: u64,
-    ) -> Result<(), VulkanError> {
-        let scratch = if source == destination {
-            Some(self.temporary_buffer(bytes, &[Resource::Buffer(source)])?)
-        } else {
-            None
-        };
-        let src = self.buffer_access_range(
-            source,
-            offset,
-            bytes,
-            AccessScope::new(
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_READ,
-            ),
-        )?;
-        let dst = self.buffer_access_range(
-            destination,
-            destination_offset,
-            bytes,
-            AccessScope::new(
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-        )?;
-        let slot = self.device.begin_recording()?;
-        let command = self.device.submission.slots[slot].command;
-        self.barriers.emit(&mut self.device);
-        let (source, source_offset) = if let Some(scratch) = &scratch {
-            unsafe {
-                self.device.dispatch.cmd_copy_buffer(
-                    command,
-                    src,
-                    scratch.handle,
-                    &[vk::BufferCopy::default().src_offset(offset).size(bytes)],
-                );
-                scratch_read_barrier(&self.device, command, scratch.handle, bytes);
-            }
-            (scratch.handle, 0)
-        } else {
-            (src, offset)
-        };
-        self.publish_effect(&[writer], |device| unsafe {
-            device.dispatch.cmd_copy_buffer(
-                command,
-                source,
-                dst,
-                &[vk::BufferCopy::default()
-                    .src_offset(source_offset)
-                    .dst_offset(destination_offset)
-                    .size(bytes)],
-            );
-        })?;
-        if let Some(scratch) = scratch {
-            let work = self.device.work_ticket()?;
-            self.device.retire_buffer(scratch, work)?;
-        }
-        self.statistics.gpu_copied_bytes += bytes;
-        Ok(())
-    }
     pub(super) fn copy_source(
         &mut self,
         source: Resource,
@@ -168,11 +223,8 @@ impl VulkanResidency {
         self.check_buffer_range(destination, destination_offset, size)?;
         if let Resource::Buffer(source) = source {
             self.check_buffer_range(source, offset, size)?;
-            if source == destination && offset == destination_offset {
-                self.contents_mut(Resource::Buffer(destination))
-                    .validate_interval(destination_offset, size);
-                return Ok(());
-            }
+            // Merges copy distinct entries; self aliases are snapshotted by refresh_buffer.
+            debug_assert_ne!(source, destination);
             let src = self.buffer_access_range(
                 source,
                 offset,
@@ -193,46 +245,20 @@ impl VulkanResidency {
             )?;
             let index = self.device.begin_recording()?;
             let command = self.device.submission.slots[index].command;
-            if source == destination {
-                // Vulkan disallows overlapping source/destination memory. A
-                // GPU temporary preserves ordered repeated-canonical offsets.
-                let scratch = self.temporary_buffer(
-                    size,
-                    &[Resource::Buffer(source), Resource::Buffer(destination)],
-                )?;
-                self.barriers.emit(&mut self.device);
-                unsafe {
-                    self.device.dispatch.cmd_copy_buffer(
-                        command,
-                        src,
-                        scratch.handle,
-                        &[vk::BufferCopy::default().src_offset(offset).size(size)],
-                    );
-                    scratch_read_barrier(&self.device, command, scratch.handle, size);
-                    self.device.dispatch.cmd_copy_buffer(
-                        command,
-                        scratch.handle,
-                        dst,
-                        &[vk::BufferCopy::default()
-                            .dst_offset(destination_offset)
-                            .size(size)],
-                    );
-                }
-                let work = self.device.work_ticket()?;
-                self.device.retire_buffer(scratch, work)?;
-            } else {
-                self.barriers.emit(&mut self.device);
-                unsafe {
-                    self.device.dispatch.cmd_copy_buffer(
-                        command,
-                        src,
-                        dst,
-                        &[vk::BufferCopy::default()
-                            .src_offset(offset)
-                            .dst_offset(destination_offset)
-                            .size(size)],
-                    );
-                }
+            let work = self.device.work_ticket()?;
+            self.contents_mut(Resource::Buffer(source)).last_use = Some(work);
+            self.contents_mut(Resource::Buffer(destination)).last_use = Some(work);
+            self.barriers.emit(&mut self.device);
+            unsafe {
+                self.device.dispatch.cmd_copy_buffer(
+                    command,
+                    src,
+                    dst,
+                    &[vk::BufferCopy::default()
+                        .src_offset(offset)
+                        .dst_offset(destination_offset)
+                        .size(size)],
+                );
             }
             self.statistics.gpu_copied_bytes += size;
         } else if let Resource::Image(source) = source {
@@ -424,9 +450,13 @@ impl VulkanResidency {
             ))?;
             match producer.resource {
                 Resource::Buffer(id) => {
-                    if let Some(known) = &self.buffer(id)?.known {
+                    if let Some(known) = self.buffer(id)?.known.iter().find(|known| {
+                        known.offset <= producer.native
+                            && producer.native + write.bytes
+                                <= known.offset + known.bytes.len() as u64
+                    }) {
                         let literal = Arc::clone(&known.bytes);
-                        let start = producer.native as usize;
+                        let start = (producer.native - known.offset) as usize;
                         let end = start.checked_add(write.bytes as usize).ok_or(
                             VulkanError::InvalidResource("literal readback interval overflows"),
                         )?;
@@ -752,5 +782,196 @@ pub(super) fn scratch_read_barrier(
             command,
             &vk::DependencyInfo::default().buffer_memory_barriers(&barriers),
         );
+    }
+}
+
+impl VulkanResidency {
+    pub(crate) fn copy_physical_buffers(
+        &mut self,
+        source: &Arc<PhysicalMapping>,
+        destination: &Arc<PhysicalMapping>,
+        regions: &[nixe_gpu::native::BufferCopyRegion],
+    ) -> Result<(), VulkanError> {
+        let retained = self.constructing.len();
+        let result = self.copy_physical_buffers_inner(source, destination, regions);
+        self.constructing.truncate(retained);
+        result
+    }
+    fn copy_physical_buffers_inner(
+        &mut self,
+        source: &Arc<PhysicalMapping>,
+        destination: &Arc<PhysicalMapping>,
+        regions: &[nixe_gpu::native::BufferCopyRegion],
+    ) -> Result<(), VulkanError> {
+        if regions.is_empty() {
+            return Ok(());
+        }
+        for region in regions {
+            if region.bytes == 0
+                || region
+                    .source
+                    .checked_add(region.bytes)
+                    .is_none_or(|end| end > source.bytes())
+                || region
+                    .destination
+                    .checked_add(region.bytes)
+                    .is_none_or(|end| end > destination.bytes())
+            {
+                return Err(VulkanError::InvalidResource(
+                    "native copy exceeds physical inputs",
+                ));
+            }
+        }
+        let (source, destination) = loop {
+            let src = self.buffer_for_deferred_import(
+                Arc::clone(source),
+                vk::BufferUsageFlags::TRANSFER_SRC,
+            )?;
+            self.constructing.push(Resource::Buffer(src.buffer));
+            let dst = self.buffer_for_deferred_import(
+                Arc::clone(destination),
+                vk::BufferUsageFlags::TRANSFER_DST,
+            )?;
+            if self.buffer(src.buffer).is_ok() {
+                break (src, dst);
+            }
+        };
+        let resources = [
+            Resource::Buffer(source.buffer),
+            Resource::Buffer(destination.buffer),
+        ];
+        self.constructing.extend(resources);
+        let result = (|| {
+            let mut read: Vec<_> = regions
+                .iter()
+                .map(|r| (source.offset + r.source, r.bytes))
+                .collect();
+            let mut written: Vec<_> = regions
+                .iter()
+                .map(|r| (destination.offset + r.destination, r.bytes))
+                .collect();
+            normalize(&mut read);
+            normalize(&mut written);
+            for &(offset, bytes) in &read {
+                self.ensure_buffer_range(source.buffer, offset, bytes)?;
+            }
+            let mut next = 0;
+            let overlapping = source.buffer == destination.buffer
+                && read.iter().any(|&(offset, bytes)| {
+                    while next < written.len() && written[next].0 + written[next].1 <= offset {
+                        next += 1;
+                    }
+                    written
+                        .get(next)
+                        .is_some_and(|&(start, _)| start < offset + bytes)
+                });
+            let scratch_bytes = read.iter().map(|&(_, bytes)| bytes).sum();
+            let scratch = if overlapping {
+                Some(Arc::new(self.temporary_buffer(scratch_bytes, &resources)?))
+            } else {
+                None
+            };
+            for &(offset, bytes) in &read {
+                self.buffer_access_range(
+                    source.buffer,
+                    offset,
+                    bytes,
+                    AccessScope::new(
+                        vk::PipelineStageFlags2::COPY,
+                        vk::AccessFlags2::TRANSFER_READ,
+                    ),
+                )?;
+            }
+            let source_handle = self.buffer(source.buffer)?.native.handle;
+            let mut packed = Vec::new();
+            if let Some(scratch) = &scratch {
+                let mut offset = 0;
+                for &(start, bytes) in &read {
+                    packed.push(
+                        vk::BufferCopy::default()
+                            .src_offset(start)
+                            .dst_offset(offset)
+                            .size(bytes),
+                    );
+                    offset += bytes;
+                }
+                let slot = self.device.begin_recording()?;
+                self.barriers.emit(&mut self.device);
+                let command = self.device.submission.slots[slot].command;
+                let work = self.device.work_ticket()?;
+                self.device.retire_buffer(Arc::clone(scratch), work)?;
+                unsafe {
+                    self.device.dispatch.cmd_copy_buffer(
+                        command,
+                        source_handle,
+                        scratch.handle,
+                        &packed,
+                    );
+                    scratch_read_barrier(&self.device, command, scratch.handle, scratch_bytes);
+                }
+                self.statistics.gpu_copied_bytes += scratch_bytes;
+            }
+            let mut writers = Vec::with_capacity(written.len());
+            for &(offset, bytes) in &written {
+                writers.push(self.prepare_write(
+                    Resource::Buffer(destination.buffer),
+                    offset,
+                    bytes,
+                )?);
+                self.buffer_access_range(
+                    destination.buffer,
+                    offset,
+                    bytes,
+                    AccessScope::new(
+                        vk::PipelineStageFlags2::COPY,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                    ),
+                )?;
+            }
+            let copies: Vec<_> = regions
+                .iter()
+                .map(|region| {
+                    vk::BufferCopy::default()
+                        .src_offset(if scratch.is_some() {
+                            let start = source.offset + region.source;
+                            let i = packed.partition_point(|copy| copy.src_offset <= start) - 1;
+                            packed[i].dst_offset + start - packed[i].src_offset
+                        } else {
+                            source.offset + region.source
+                        })
+                        .dst_offset(destination.offset + region.destination)
+                        .size(region.bytes)
+                })
+                .collect();
+            let slot = self.device.begin_recording()?;
+            self.barriers.emit(&mut self.device);
+            let target = self.buffer(destination.buffer)?.native.handle;
+            let command = self.device.submission.slots[slot].command;
+            if let Some(scratch) = &scratch {
+                let work = self.device.work_ticket()?;
+                self.device.retire_buffer(Arc::clone(scratch), work)?;
+            }
+            let source_handle = scratch
+                .as_ref()
+                .map_or(source_handle, |scratch| scratch.handle);
+            let work = self.device.work_ticket()?;
+            self.contents_mut(Resource::Buffer(source.buffer)).last_use = Some(work);
+            self.contents_mut(Resource::Buffer(destination.buffer))
+                .last_use = Some(work);
+            self.publish_effect(&writers, |device| unsafe {
+                device
+                    .dispatch
+                    .cmd_copy_buffer(command, source_handle, target, &copies);
+            })?;
+            for (offset, bytes) in written {
+                self.finish_buffer_write(destination.buffer, offset, bytes)?;
+            }
+            self.statistics.gpu_copied_bytes += regions.iter().map(|r| r.bytes).sum::<u64>();
+            Ok(())
+        })();
+        for resource in resources.into_iter().rev() {
+            self.unpin(resource);
+        }
+        result
     }
 }

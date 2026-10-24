@@ -1,9 +1,11 @@
 //! Physical buffer interpretations, immutable uploads and native alias reconstruction.
 use super::*;
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub(super) struct BufferKey {
-    pub geometry: Vec<Arc<Footprint>>,
-    pub bytes: u64,
+/// A retained native buffer and the addressed subrange within it.
+#[derive(Clone, Copy, Debug)]
+pub struct BufferRange {
+    pub buffer: BufferId,
+    pub offset: u64,
+    pub size: u64,
 }
 #[derive(Clone, Copy)]
 pub(super) struct BufferStreamRequest {
@@ -13,41 +15,227 @@ pub(super) struct BufferStreamRequest {
     pub alignment: u64,
 }
 pub(super) type BufferStream = Option<(Arc<AllocatedBuffer>, u64)>;
-pub(super) struct StreamedBuffer {
-    work: WorkTicket,
-    window: (u64, u64),
-    buffer: Arc<AllocatedBuffer>,
-    offset: u64,
-}
 impl VulkanResidency {
     pub fn buffer_for(
         &mut self,
         backing: Arc<PhysicalMapping>,
         usage: vk::BufferUsageFlags,
-    ) -> Result<BufferId, VulkanError> {
+    ) -> Result<BufferRange, VulkanError> {
         self.create_buffer(backing, usage, true)
     }
-    /// Prepare identity/allocation without reading guest bytes or recording a
-    /// transfer. The ordered draw/dispatch consumer calls ensure_buffer once.
+    /// Resolve retained identity without importing bytes until ordered use.
     pub fn buffer_for_deferred_import(
         &mut self,
         backing: Arc<PhysicalMapping>,
         usage: vk::BufferUsageFlags,
-    ) -> Result<BufferId, VulkanError> {
+    ) -> Result<BufferRange, VulkanError> {
         self.create_buffer(backing, usage, false)
     }
     fn create_buffer(
         &mut self,
-        backing: Arc<PhysicalMapping>,
+        requested: Arc<PhysicalMapping>,
         usage: vk::BufferUsageFlags,
         initialize: bool,
-    ) -> Result<BufferId, VulkanError> {
-        let bytes = backing.bytes();
+    ) -> Result<BufferRange, VulkanError> {
+        let _trace = nixe_gpu::trace::span("buffer_lookup", requested.bytes(), 0, 0);
+        self.invalidate_cpu_buffers(&[])?;
+        // A buffer's physical coverage is independent of the current binding's
+        // role. Vulkan storage is allocated for all ordinary buffer consumers.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+        let usage = usage
+            | vk::BufferUsageFlags::VERTEX_BUFFER
+            | vk::BufferUsageFlags::INDEX_BUFFER
+            | vk::BufferUsageFlags::INDIRECT_BUFFER
+            | vk::BufferUsageFlags::UNIFORM_BUFFER
+            | vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
+            | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER;
+        // Look up retained coverage before expanding or pinning a new mapping.
+        // Any containing interpretation must cover the first requested byte.
+        let mut found = None;
+        self.authority.visit_resource_overlaps(
+            nixe_memory::Extent {
+                start: requested.spans()[0].start,
+                bytes: 1,
+            },
+            |resource, _, _| {
+                if found.is_some() {
+                    return;
+                }
+                let Resource::Buffer(id) = resource else {
+                    return;
+                };
+                let Ok(entry) = self.buffer(id) else { return };
+                let [old] = entry.contents.geometry.as_slice() else {
+                    return;
+                };
+                if entry.binding_valid
+                    && entry.usage.contains(usage)
+                    && matches!(old.domain(), nixe_gpu::physical::WriteDomain::Buffer { .. })
+                    && let Some(offset) = old.mapping().containing_offset(&requested)
+                {
+                    found = Some((id, offset));
+                }
+            },
+        );
+        if let Some((id, offset)) = found {
+            if initialize {
+                self.ensure_buffer_range(id, offset, requested.bytes())?;
+            }
+            self.touch(Resource::Buffer(id));
+            self.statistics.cache_hits += 1;
+            return Ok(BufferRange {
+                buffer: id,
+                offset,
+                size: requested.bytes(),
+            });
+        }
+        let mut mapping = requested.expanded_buffer(nixe_memory::PAGE_SIZE)?;
+        let mut overlaps = Vec::new();
+        let mut growth = 0u32;
+        loop {
+            let footprint = Footprint::new(
+                Arc::clone(&mapping),
+                nixe_gpu::physical::WriteDomain::Buffer {
+                    start: 0,
+                    bytes: mapping.bytes(),
+                },
+            )?;
+            let mut expanded = false;
+            for resource in self.authority.resource_candidates(&footprint) {
+                let Resource::Buffer(id) = resource else {
+                    continue;
+                };
+                let entry = self.buffer(id)?;
+                if !entry.binding_valid {
+                    continue;
+                }
+                let [old] = entry.contents.geometry.as_slice() else {
+                    continue;
+                };
+                if !matches!(old.domain(), nixe_gpu::physical::WriteDomain::Buffer { .. }) {
+                    continue;
+                }
+                if overlaps.contains(&id) {
+                    continue;
+                }
+                let joined = join_buffers(&mapping, old.mapping())?;
+                let Some(joined) = joined else { continue };
+                if entry.contents.touched + 1 >= self.epoch {
+                    growth = growth.max(entry.growth.saturating_add(1));
+                }
+                overlaps.push(id);
+                if joined.bytes() != mapping.bytes() {
+                    mapping = joined;
+                    expanded = true;
+                }
+            }
+            if growth >= 4 && !overlaps.is_empty() {
+                let grown = mapping.expanded_buffer(1024 * 1024)?;
+                if grown.bytes() != mapping.bytes() {
+                    mapping = grown;
+                    expanded = true;
+                }
+            }
+            if !expanded {
+                break;
+            }
+        }
+        let offset = mapping
+            .containing_offset(&requested)
+            .ok_or(VulkanError::InvalidResource(
+                "buffer merge changed request addressing",
+            ))?;
+        let bytes = mapping.bytes();
         let footprint = Footprint::new(
-            backing,
+            Arc::clone(&mapping),
             nixe_gpu::physical::WriteDomain::Buffer { start: 0, bytes },
         )?;
-        self.buffer_for_geometry(vec![footprint], bytes, usage, initialize)
+        self.constructing
+            .extend(overlaps.iter().copied().map(Resource::Buffer));
+        let created = self.buffer_for_geometry(vec![footprint], bytes, usage, false);
+        for &id in overlaps.iter().rev() {
+            self.unpin(Resource::Buffer(id));
+        }
+        let id = created?;
+        self.constructing.push(Resource::Buffer(id));
+        let merged = (|| {
+            for old in overlaps {
+                if old == id {
+                    continue;
+                }
+                let _merge =
+                    nixe_gpu::trace::span("buffer_merge", old.slot as u64, id.slot as u64, 0);
+                let old_mapping = Arc::clone(self.buffer(old)?.contents.geometry[0].mapping());
+                let destination = mapping
+                    .containing_offset(&old_mapping)
+                    .ok_or(VulkanError::InvalidResource("buffer merge lost overlap"))?;
+                let old_bytes = old_mapping.bytes();
+                // Preserve native contents without downloading to RAM. Dirty
+                // CPU ranges remain dirty in the new entry until consumption.
+                let invalid = self.buffer(id)?.contents.invalid.clone();
+                let old_current = self.buffer(old)?.contents.observations_current();
+                self.copy_source(Resource::Buffer(old), 0, id, destination, old_bytes)?;
+                self.contents_mut(Resource::Buffer(id)).invalid = invalid;
+                let valid = if old_current {
+                    self.buffer(old)?.contents.invalid.clone()
+                } else {
+                    vec![(0, old_bytes)]
+                };
+                let mut cursor = 0;
+                for (begin, size) in valid.into_iter().chain([(old_bytes, 0)]) {
+                    if begin > cursor {
+                        self.contents_mut(Resource::Buffer(id))
+                            .validate_interval(destination + cursor, begin - cursor);
+                    }
+                    cursor = cursor.max(begin + size);
+                }
+                let tick = nixe_gpu::authority::NativeTick(self.device.work_ticket()?.tick());
+                self.authority.relocate_buffer(
+                    Resource::Buffer(old),
+                    Resource::Buffer(id),
+                    tick,
+                )?;
+                let plans =
+                    std::mem::take(&mut self.buffers[old.slot].entry.as_mut().unwrap().write_plans);
+                self.buffers[id.slot]
+                    .entry
+                    .as_mut()
+                    .unwrap()
+                    .write_plans
+                    .extend(
+                        plans
+                            .into_iter()
+                            .map(|(start, size, writer)| (start + destination, size, writer)),
+                    );
+                if let Some(writes) = self.buffer_writes.remove(&old) {
+                    self.buffer_writes.entry(id).or_default().extend(
+                        writes
+                            .into_iter()
+                            .map(|(start, size)| (destination + start, size)),
+                    );
+                }
+                self.retire_entry(Resource::Buffer(old))?;
+                self.statistics.buffer_merges += 1;
+            }
+            self.buffers[id.slot].entry.as_mut().unwrap().growth = growth;
+            let footprint = Arc::clone(&self.buffer(id)?.contents.geometry[0]);
+            let observation = self
+                .authority
+                .observe_native(Resource::Buffer(id), footprint)?;
+            self.contents_mut(Resource::Buffer(id)).device = vec![observation];
+            if initialize {
+                self.ensure_buffer_range(id, offset, requested.bytes())?;
+            }
+            self.touch(Resource::Buffer(id));
+            Ok(BufferRange {
+                buffer: id,
+                offset,
+                size: requested.bytes(),
+            })
+        })();
+        self.unpin(Resource::Buffer(id));
+        merged
     }
     pub(super) fn buffer_for_geometry(
         &mut self,
@@ -65,15 +253,21 @@ impl VulkanResidency {
             ));
         }
         let usage = usage | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
-        let key = BufferKey {
-            geometry: geometry.clone(),
-            bytes,
-        };
-        let candidate = self.buffer_views.get(&key).and_then(|views| {
-            views.iter().find_map(|&id| {
-                let entry = self.buffer(id).ok()?;
-                entry.usage.contains(usage).then_some(id)
-            })
+        let candidate = geometry.first().and_then(|first| {
+            self.authority
+                .resource_candidates(first)
+                .into_iter()
+                .find_map(|resource| {
+                    let Resource::Buffer(id) = resource else {
+                        return None;
+                    };
+                    let entry = self.buffer(id).ok()?;
+                    (entry.binding_valid
+                        && entry.native.size() == bytes
+                        && entry.contents.geometry == geometry
+                        && entry.usage.contains(usage))
+                    .then_some(id)
+                })
         });
         if let Some(id) = candidate {
             if initialize {
@@ -125,10 +319,12 @@ impl VulkanResidency {
         self.buffers[slot] = Slot {
             generation,
             entry: Some(BufferEntry {
-                known: None,
-                streamed: None,
+                known: Vec::new(),
+                growth: 0,
+                binding_valid: true,
                 write_plans: Vec::new(),
                 contents: Contents {
+                    lru: None,
                     invalid: vec![(0, bytes)],
                     geometry: geometry.clone(),
                     cpu: Vec::new(),
@@ -146,6 +342,7 @@ impl VulkanResidency {
         self.authority
             .register(Resource::Buffer(id), geometry.clone())
             .map_err(memory_error)?;
+
         let observations = geometry
             .into_iter()
             .map(|f| self.authority.observe_native(Resource::Buffer(id), f))
@@ -156,7 +353,7 @@ impl VulkanResidency {
             .expect("buffer")
             .contents
             .device = observations;
-        self.buffer_views.entry(key).or_default().push(id);
+        self.statistics.buffer_allocations += 1;
         if initialize {
             self.ensure_buffer(id)?;
         }
@@ -165,88 +362,186 @@ impl VulkanResidency {
     }
     /// Frequently rewritten CPU uniforms receive immutable upload slices. They
     /// stay dirty and do not install page observers or quiesce running cores.
-    pub(super) fn stream_buffers(
+    pub(super) fn stream_buffer(
         &mut self,
-        requests: &[Option<BufferStreamRequest>],
-    ) -> Result<Vec<BufferStream>, VulkanError> {
-        let mut streams = vec![None; requests.len()];
-        for (index, request) in requests.iter().enumerate() {
-            let Some(request) = request else { continue };
-            self.check_buffer_range(request.id, request.offset, request.size)?;
-            if request.size > 64 * 1024
-                || request.size > self.device.submission.configuration.arena_bytes
-            {
-                continue;
+        request: BufferStreamRequest,
+    ) -> Result<BufferStream, VulkanError> {
+        self.check_buffer_range(request.id, request.offset, request.size)?;
+        if request.size > 64 * 1024
+            || request.size > self.device.submission.configuration.arena_bytes
+        {
+            return Ok(None);
+        }
+        let entry = self.buffer(request.id)?;
+        let [full] = entry.contents.geometry.as_slice() else {
+            return Ok(None);
+        };
+        if !matches!(
+            full.domain(),
+            nixe_gpu::physical::WriteDomain::Buffer { .. }
+        ) || self
+            .authority
+            .has_buffer_producer(full.mapping(), request.offset, request.size)?
+        {
+            return Ok(None);
+        }
+        let mapping = Arc::clone(full.mapping());
+        let result = (|| {
+            mapping.pin_into(request.offset, request.size, &mut self.stream_inputs)?;
+            let (slot, slice) =
+                self.reserve_upload_space(request.size, request.alignment.max(4))?;
+            let upload = self.device.submission.slots[slot].upload_buffer(slice);
+            unsafe {
+                upload.write_with(slice.offset, request.size, |bytes| {
+                    self.memory
+                        .capture_stream(&self.stream_inputs, bytes)
+                        .map_err(memory_error)
+                })?;
             }
-            let entry = self.buffer(request.id)?;
-            let [full] = entry.contents.geometry.as_slice() else {
-                continue;
-            };
-            if !matches!(
-                full.domain(),
-                nixe_gpu::physical::WriteDomain::Buffer { .. }
-            ) {
-                continue;
-            }
-            let footprint = Footprint::new(
-                Arc::clone(full.mapping()),
-                nixe_gpu::physical::WriteDomain::Buffer {
-                    start: request.offset,
-                    bytes: request.size,
-                },
-            )?;
-            if self
-                .authority
-                .resolve_footprint(&footprint)?
-                .iter()
-                .any(|p| p.producer.is_some())
-            {
-                continue;
-            }
-            let work = self.device.work_ticket()?;
-            let entry = self.buffer(request.id)?;
-            if entry.contents.current()
-                && !entry.contents.cpu.is_empty()
-                && let Some(stream) = &entry.streamed
-                && stream.work == work
-                && stream.window == (request.offset, request.size)
-                && stream.offset.is_multiple_of(request.alignment)
-            {
-                streams[index] = Some((Arc::clone(&stream.buffer), stream.offset));
-                self.statistics.cpu_stream_hits += 1;
-                let slot = self.device.submission.recording.expect("stream recording");
-                self.device.submission.retain_stream_upload(slot);
-                continue;
-            }
-            let inputs = footprint.mapping().pin(request.offset, request.size)?;
-            let mut bytes = vec![0; request.size as usize];
-            self.memory.capture_stream(&inputs, &mut bytes)?;
-            let (slot, slice) = self.reserve_upload(&bytes, request.alignment.max(4))?;
             self.device.submission.retain_stream_upload(slot);
             let native = self.device.submission.slots[slot].upload_lease(slice);
-            let work = self.device.work_ticket()?;
-            let entry = self.buffers[request.id.slot]
-                .entry
-                .as_mut()
-                .expect("buffer");
-            entry.streamed = Some(StreamedBuffer {
-                work,
-                window: (request.offset, request.size),
-                buffer: Arc::clone(&native),
-                offset: slice.offset,
-            });
-            entry.contents.last_use = Some(work);
-            streams[index] = Some((native, slice.offset));
+            self.touch(Resource::Buffer(request.id));
             self.statistics.cpu_streamed_bytes += request.size;
+            Ok(Some((native, slice.offset)))
+        })();
+        self.stream_inputs.clear();
+        result
+    }
+    pub(super) fn aligned_uniform_copy(
+        &mut self,
+        id: BufferId,
+        offset: u64,
+        size: u64,
+    ) -> Result<Arc<AllocatedBuffer>, VulkanError> {
+        self.ensure_buffer_range(id, offset, size)?;
+        let copy = Arc::new(self.allocate_buffer(
+            size,
+            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        )?);
+        let source = self.buffer_access_range(
+            id,
+            offset,
+            size,
+            AccessScope::new(
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_READ,
+            ),
+        )?;
+        let slot = self.device.begin_recording()?;
+        self.barriers.emit(&mut self.device);
+        let command = self.device.submission.slots[slot].command;
+        unsafe {
+            self.device.dispatch.cmd_copy_buffer(
+                command,
+                source,
+                copy.handle,
+                &[vk::BufferCopy::default().src_offset(offset).size(size)],
+            );
+            let barrier = [vk::BufferMemoryBarrier2::default()
+                .buffer(copy.handle)
+                .size(size)
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(vk::AccessFlags2::UNIFORM_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)];
+            self.device.dispatch.barrier(
+                command,
+                &vk::DependencyInfo::default().buffer_memory_barriers(&barrier),
+            );
         }
-        Ok(streams)
+        // The recording slot owns the transfer; its descriptor record extends
+        // the allocation through the actual shader consumer if preparation submits.
+        let work = self.device.work_ticket()?;
+        self.device.retire_buffer(Arc::clone(&copy), work)?;
+        self.statistics.gpu_copied_bytes += size;
+        Ok(copy)
+    }
+    pub(super) fn track_buffer_cpu(
+        &mut self,
+        id: BufferId,
+        offset: u64,
+        bytes: u64,
+    ) -> Result<(), VulkanError> {
+        let contents = &self.buffer(id)?.contents;
+        if let [full] = contents.geometry.as_slice()
+            && matches!(
+                full.domain(),
+                nixe_gpu::physical::WriteDomain::Buffer { .. }
+            )
+        {
+            let end = offset + bytes;
+            let spans = full.mapping().spans();
+            let first = spans.partition_point(|span| span.logical + span.bytes <= offset);
+            if spans[first..]
+                .iter()
+                .take_while(|span| span.logical < end)
+                .all(|span| {
+                    let start = offset.max(span.logical);
+                    let stop = end.min(span.logical + span.bytes);
+                    self.memory.buffer_pages_tracked(nixe_memory::Extent {
+                        start: nixe_memory::ArenaOffset::new(
+                            span.start.get() + start - span.logical,
+                        ),
+                        bytes: stop - start,
+                    })
+                })
+            {
+                return Ok(());
+            }
+            let inputs = full.mapping().pin(offset, bytes)?;
+            self.memory
+                .capture_buffer_scattered(&inputs, &[], &mut [])?;
+            return Ok(());
+        }
+        if !contents.cpu.is_empty() && contents.cpu.iter().all(|o| !o.is_invalid()) {
+            return Ok(());
+        }
+        // Native-only destinations need CPU tracking too: after their download
+        // retires device authority, subsequent RAM stores must dirty the cache.
+        let mut pages = Vec::new();
+        for footprint in &contents.geometry {
+            footprint.mapping().observed_pages(footprint, &mut pages)?;
+        }
+        let inputs = nixe_gpu::physical::pin_selected_pages(pages)?;
+        let cpu = self.memory.capture_clean_scattered(&inputs, &[], &mut [])?;
+        self.contents_mut(Resource::Buffer(id)).cpu = vec![cpu];
+        Ok(())
+    }
+    pub(crate) fn buffer_binding_current(&self, id: BufferId) -> bool {
+        self.buffer(id).is_ok_and(|entry| entry.binding_valid)
     }
     pub fn ensure_buffer(&mut self, id: BufferId) -> Result<(), VulkanError> {
-        if self.buffer(id)?.contents.current() {
+        self.ensure_buffer_range(id, 0, self.buffer(id)?.native.size())
+    }
+    pub(super) fn ensure_buffer_range(
+        &mut self,
+        id: BufferId,
+        offset: u64,
+        size: u64,
+    ) -> Result<(), VulkanError> {
+        self.check_buffer_range(id, offset, size)?;
+        if !self.buffer_binding_current(id) {
+            return Err(VulkanError::InvalidResource(
+                "buffer binding has retired physical coverage",
+            ));
+        }
+        self.invalidate_cpu_buffers(&[])?;
+        let contents = &self.buffer(id)?.contents;
+        let first = contents
+            .invalid
+            .partition_point(|&(start, bytes)| start + bytes <= offset);
+        if contents.observations_current()
+            && contents
+                .invalid
+                .get(first)
+                .is_none_or(|&(start, _)| start >= offset + size)
+        {
             return Ok(());
         }
         self.constructing.push(Resource::Buffer(id));
-        let result = self.refresh_buffer(id, true);
+        let result = self.refresh_buffer(id, true, Some((offset, size)));
         self.unpin(Resource::Buffer(id));
         result
     }
@@ -254,6 +549,7 @@ impl VulkanResidency {
         &mut self,
         id: BufferId,
         upload_cpu: bool,
+        requested: Option<(u64, u64)>,
     ) -> Result<(), VulkanError> {
         let _trace = nixe_gpu::trace::span(
             "buffer_refresh",
@@ -261,22 +557,54 @@ impl VulkanResidency {
             self.buffer(id)?.native.size(),
             0,
         );
-        let geometry = self.buffer(id)?.contents.geometry.clone();
+        self.invalidate_cpu_buffers(&[])?;
+        let mut geometry = self.buffer(id)?.contents.geometry.clone();
+        let ordinary = matches!(geometry.as_slice(), [f] if matches!(f.domain(), nixe_gpu::physical::WriteDomain::Buffer { .. }));
+        let size = self.buffer(id)?.native.size();
+        let changed = self
+            .buffer(id)?
+            .contents
+            .device
+            .iter()
+            .any(ResourceObservation::is_invalid);
+        if changed {
+            let device = geometry
+                .iter()
+                .map(|f| {
+                    self.authority
+                        .observe_native(Resource::Buffer(id), Arc::clone(f))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let contents = self.contents_mut(Resource::Buffer(id));
+            contents.device = device;
+        }
+        let (begin, end) = requested.map_or((0, size), |(offset, bytes)| {
+            let page = nixe_memory::PAGE_SIZE;
+            (
+                offset / page * page,
+                ((offset + bytes).div_ceil(page) * page).min(size),
+            )
+        });
+        if ordinary && !changed {
+            geometry[0] = Footprint::new(
+                Arc::clone(geometry[0].mapping()),
+                nixe_gpu::physical::WriteDomain::Buffer {
+                    start: begin,
+                    bytes: end - begin,
+                },
+            )?;
+        } else if !ordinary && upload_cpu {
+            self.track_buffer_cpu(id, 0, size)?;
+        }
         let mut parts = Vec::new();
         for footprint in &geometry {
             parts.extend(self.authority.resolve_footprint(footprint)?);
         }
         parts.sort_unstable_by_key(|part| part.logical);
-        let device = geometry
-            .iter()
-            .map(|f| {
-                self.authority
-                    .observe_native(Resource::Buffer(id), Arc::clone(f))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let mut copies = Vec::new();
         let mut windows: Vec<(u64, usize, usize)> = Vec::new();
         let mut packed = 0;
+        let mut inputs = Vec::new();
         let unavailable: Vec<_> = if upload_cpu {
             Vec::new()
         } else {
@@ -288,12 +616,47 @@ impl VulkanResidency {
         };
         let invalid = self.buffer(id)?.contents.invalid.clone();
         for part in parts.iter().filter(|p| upload_cpu && p.producer.is_none()) {
-            for &(offset, bytes) in &invalid {
-                let begin = part.logical.max(offset);
-                let end = (part.logical + part.bytes).min(offset + bytes);
+            let first = invalid
+                .partition_point(|&(offset, bytes)| offset + bytes <= part.logical.max(begin));
+            for &(offset, bytes) in &invalid[first..] {
+                if offset >= (part.logical + part.bytes).min(end) {
+                    break;
+                }
+                let begin = part.logical.max(offset).max(begin);
+                let end = (part.logical + part.bytes).min(offset + bytes).min(end);
                 if begin >= end {
                     continue;
                 }
+                let source = nixe_memory::ArenaOffset::new(part.start.get() + begin - part.logical);
+                let (mapping, span) = if ordinary {
+                    let mapping = geometry[0].mapping();
+                    let span = mapping
+                        .spans()
+                        .partition_point(|span| span.logical + span.bytes <= begin);
+                    (mapping, span)
+                } else {
+                    geometry
+                        .iter()
+                        .find_map(|footprint| {
+                            let mapping = footprint.mapping();
+                            mapping
+                                .spans()
+                                .iter()
+                                .position(|span| {
+                                    span.allocation == part.allocation
+                                        && span.start.get() <= source.get()
+                                        && source.get() + end - begin
+                                            <= span.start.get() + span.bytes
+                                })
+                                .map(|span| (mapping, span))
+                        })
+                        .ok_or(VulkanError::InvalidResource(
+                            "CPU upload input has no physical span",
+                        ))?
+                };
+                let pin = mapping.pin_span(span, source, end - begin)?;
+                inputs
+                    .push(pin.ok_or(VulkanError::InvalidResource("CPU upload input has retired"))?);
                 copies.push(nixe_memory::PhysicalCapture {
                     source: nixe_memory::Extent {
                         start: nixe_memory::ArenaOffset::new(
@@ -313,26 +676,13 @@ impl VulkanResidency {
                 packed += (end - begin) as usize;
             }
         }
-        let mut cpu = Vec::new();
-        let mut captured = vec![0; packed];
-        if !copies.is_empty() {
-            let mut pages = Vec::new();
-            for footprint in &geometry {
-                footprint.mapping().observed_pages(footprint, &mut pages)?;
-            }
-            let inputs = nixe_gpu::physical::pin_selected_pages(pages)?;
-            let observation =
-                self.memory
-                    .capture_clean_scattered(&inputs, &copies, &mut captured)?;
-            cpu.push(observation);
-        }
         let self_alias = parts.iter().any(|part| {
             part.producer
                 .is_some_and(|p| p.resource == Resource::Buffer(id) && p.native != part.logical)
         });
         let preserved = if self_alias {
             let bytes = self.buffer(id)?.native.size();
-            let scratch = self.temporary_buffer(bytes, &[Resource::Buffer(id)])?;
+            let scratch = Arc::new(self.temporary_buffer(bytes, &[Resource::Buffer(id)])?);
             let source = self.buffer_access_range(
                 id,
                 0,
@@ -343,6 +693,8 @@ impl VulkanResidency {
                 ),
             )?;
             let slot = self.device.begin_recording()?;
+            let work = self.device.work_ticket()?;
+            self.device.retire_buffer(Arc::clone(&scratch), work)?;
             self.barriers.emit(&mut self.device);
             unsafe {
                 let command = self.device.submission.slots[slot].command;
@@ -363,9 +715,12 @@ impl VulkanResidency {
         } else {
             None
         };
-        for (offset, start, bytes) in windows {
-            self.upload_buffer(id, offset, &captured[start..start + bytes])?;
-        }
+        self.upload_buffer_captures(id, &inputs, &copies, &windows, packed)?;
+        let native_valid: Vec<_> = parts
+            .iter()
+            .filter(|p| p.producer.is_some())
+            .map(|p| (p.logical, p.bytes))
+            .collect();
         let mut images = rustc_hash::FxHashMap::<ImageId, Vec<(u64, u64, u64)>>::default();
         let mut buffers: Vec<(Resource, u64, u64, u64)> = Vec::new();
         for part in parts {
@@ -408,6 +763,8 @@ impl VulkanResidency {
                     ),
                 )?;
                 let slot = self.device.begin_recording()?;
+                let work = self.device.work_ticket()?;
+                self.device.retire_buffer(Arc::clone(scratch), work)?;
                 self.barriers.emit(&mut self.device);
                 unsafe {
                     self.device.dispatch.cmd_copy_buffer(
@@ -427,17 +784,56 @@ impl VulkanResidency {
         for (image, copies) in images {
             self.copy_image_buffer_regions(image, id, &copies)?;
         }
-        if let Some(scratch) = preserved {
-            let work = self.device.work_ticket()?;
-            self.device.retire_buffer(scratch, work)?;
-        }
         let entry = self.buffers[id.slot].entry.as_mut().expect("buffer");
-        entry.contents.cpu = cpu;
-        entry.contents.device = device;
-        entry.contents.invalid = unavailable;
+        if upload_cpu {
+            entry.contents.validate_intervals(&native_valid);
+        } else {
+            entry.contents.invalid = unavailable;
+        }
+        // Publish the captured version before consuming racing CPU stores. The
+        // persistent page watch keeps future stores dirty without a new observer.
+        self.invalidate_cpu_buffers(&[])?;
         Ok(())
     }
     pub fn buffer_lease(&self, id: BufferId) -> Result<Arc<AllocatedBuffer>, VulkanError> {
         Ok(Arc::clone(&self.buffer(id)?.native))
     }
+}
+
+fn join_buffers(
+    a: &Arc<PhysicalMapping>,
+    b: &Arc<PhysicalMapping>,
+) -> Result<Option<Arc<PhysicalMapping>>, VulkanError> {
+    if a.containing_offset(b).is_some() {
+        return Ok(Some(Arc::clone(a)));
+    }
+    if b.containing_offset(a).is_some() {
+        return Ok(Some(Arc::clone(b)));
+    }
+    for (first, second) in [(a, b), (b, a)] {
+        let head = &second.spans()[0];
+        for span in first.spans() {
+            if span.allocation != head.allocation
+                || head.start < span.start
+                || head.start.get() >= span.start.get() + span.bytes
+            {
+                continue;
+            }
+            let base = span.logical + head.start.get() - span.start.get();
+            let overlap = first.bytes() - base;
+            if overlap >= second.bytes() {
+                continue;
+            }
+            let suffix = first.slice(base, overlap)?;
+            let prefix = second.slice(0, overlap)?;
+            if suffix.containing_offset(&prefix) != Some(0) {
+                continue;
+            }
+            return Ok(Some(PhysicalMapping::join(&[
+                Arc::clone(first),
+                second.slice(overlap, second.bytes() - overlap)?,
+            ])?));
+        }
+    }
+    Ok(None)
 }

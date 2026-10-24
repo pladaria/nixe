@@ -195,6 +195,14 @@ pub(crate) fn allocate_buffer_charged(
             linear: true,
             allocation_scheme: scheme,
         })?;
+    if allocation
+        .memory_properties()
+        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    {
+        owner
+            .local_allocation_bytes
+            .fetch_add(allocation.size(), std::sync::atomic::Ordering::Relaxed);
+    }
     buffer.allocation = Some(allocation);
     let allocation = buffer.allocation.as_ref().expect("allocated buffer");
     // SAFETY: this allocation meets the buffer's original requirements, and
@@ -246,32 +254,45 @@ impl AllocatedBuffer {
             .size(size))
     }
     pub(crate) unsafe fn write_range(&self, offset: u64, bytes: &[u8]) -> Result<(), VulkanError> {
-        self.check_range(offset, bytes.len() as u64)?;
+        unsafe {
+            self.write_with(offset, bytes.len() as u64, |destination| {
+                destination.copy_from_slice(bytes);
+                Ok(())
+            })
+        }
+    }
+    /// Caller owns fresh, atom-isolated upload space with no queued GPU use.
+    pub(crate) unsafe fn write_with<T>(
+        &self,
+        offset: u64,
+        length: u64,
+        fill: impl FnOnce(&mut [u8]) -> Result<T, VulkanError>,
+    ) -> Result<T, VulkanError> {
+        self.check_range(offset, length)?;
         let allocation = self.allocation.as_ref().expect("bound buffer");
         let ptr = allocation.mapped_ptr().ok_or(VulkanError::InvalidResource(
             "upload memory is not host visible",
         ))?;
-        let offset_host = usize::try_from(offset).map_err(|_| {
+        let offset = usize::try_from(offset).map_err(|_| {
             VulkanError::InvalidResource("mapped offset exceeds host address space")
         })?;
-        // SAFETY: caller excludes other host accesses and GPU use of these atoms; mapped_ptr includes
-        // the suballocation offset and the requested range is in bounds.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                ptr.as_ptr().cast::<u8>().add(offset_host),
-                bytes.len(),
-            );
-        }
+        let length_host = usize::try_from(length).map_err(|_| {
+            VulkanError::InvalidResource("mapped length exceeds host address space")
+        })?;
+        // SAFETY: fresh reservation excludes host/GPU users; bounds checked above.
+        let destination = unsafe {
+            std::slice::from_raw_parts_mut(ptr.as_ptr().cast::<u8>().add(offset), length_host)
+        };
+        let result = fill(destination)?;
         if !allocation
             .memory_properties()
             .contains(vk::MemoryPropertyFlags::HOST_COHERENT)
         {
-            let range = self.mapped_range(offset, bytes.len() as u64)?;
+            let range = self.mapped_range(offset as u64, length)?;
             unsafe { self.owner.device.flush_mapped_memory_ranges(&[range]) }
                 .map_err(|e| VulkanError::vk("vkFlushMappedMemoryRanges", e))?;
         }
-        Ok(())
+        Ok(result)
     }
     pub(crate) unsafe fn read_range(
         &self,
@@ -326,6 +347,15 @@ impl Drop for AllocatedBuffer {
         unsafe {
             self.owner.device.destroy_buffer(self.handle, None);
         }
+        if let Some(allocation) = self.allocation.as_ref()
+            && allocation
+                .memory_properties()
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        {
+            self.owner
+                .local_allocation_bytes
+                .fetch_sub(allocation.size(), std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(allocation) = self.allocation.take()
             && let Err(e) = self
                 .owner
@@ -345,6 +375,15 @@ impl Drop for AllocatedImage {
         // SAFETY: the same retained-completion/ownership rule as AllocatedBuffer.
         unsafe {
             self.owner.device.destroy_image(self.handle, None);
+        }
+        if let Some(allocation) = self.allocation.as_ref()
+            && allocation
+                .memory_properties()
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        {
+            self.owner
+                .local_allocation_bytes
+                .fetch_sub(allocation.size(), std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(allocation) = self.allocation.take()
             && let Err(e) = self
@@ -554,6 +593,14 @@ pub(crate) fn allocate_image_charged(
             })?,
     );
     let allocation = image.allocation.as_ref().expect("allocated image");
+    if allocation
+        .memory_properties()
+        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    {
+        owner
+            .local_allocation_bytes
+            .fetch_add(allocation.size(), std::sync::atomic::Ordering::Relaxed);
+    }
     unsafe {
         owner
             .device

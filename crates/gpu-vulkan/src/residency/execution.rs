@@ -103,21 +103,26 @@ pub struct PreparedProgram {
     pub(super) pipeline: Arc<NativePipeline>,
     // Explicit host bindings are owned by the host texture cache.
     record: Option<Arc<BindingRecord>>,
-    resources: Box<[DescriptorResource]>,
+    bindings: Box<[Binding]>,
     pub(super) uses: Box<[Use]>,
-    // Descriptor-order correspondence to the merged canonical access windows.
-    binding_uses: Box<[Option<usize>]>,
-    buffer_alignments: Box<[u64]>,
+    // Descriptor indices grouped by their streamed canonical access window.
+    uniform_bindings: Box<[usize]>,
+    uniforms: Box<[(usize, buffer::BufferStreamRequest, std::ops::Range<usize>)]>,
+    unaligned_uniforms: bool,
     dynamic_offsets: Box<[u32]>,
 }
 impl PreparedProgram {
+    pub(crate) fn pipeline(&self) -> &Arc<NativePipeline> {
+        &self.pipeline
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + std::mem::size_of_val(self.uses.as_ref())
-            + std::mem::size_of_val(self.binding_uses.as_ref())
-            + std::mem::size_of_val(self.buffer_alignments.as_ref())
+            + std::mem::size_of_val(self.uniform_bindings.as_ref())
+            + std::mem::size_of_val(self.uniforms.as_ref())
             + std::mem::size_of_val(self.dynamic_offsets.as_ref())
-            + std::mem::size_of_val(self.resources.as_ref())
+            + std::mem::size_of_val(self.bindings.as_ref())
     }
 }
 #[derive(Clone, Copy, Debug)]
@@ -128,8 +133,6 @@ pub enum Dispatch {
 struct GraphicsStreams {
     dynamic_offsets: Option<Vec<u32>>,
     record: Option<Arc<BindingRecord>>,
-    program_mask: Vec<bool>,
-    vertices: Vec<buffer::BufferStream>,
 }
 impl VulkanResidency {
     /// Host-only sampled resources are synchronized by their concrete owner;
@@ -146,10 +149,11 @@ impl VulkanResidency {
                 pipeline,
                 dynamic_offsets,
                 record: Some(record),
-                resources: Box::new([]),
+                bindings: Box::new([]),
                 uses: Box::new([]),
-                binding_uses: Box::new([]),
-                buffer_alignments: Box::new([]),
+                uniform_bindings: Box::new([]),
+                uniforms: Box::new([]),
+                unaligned_uniforms: false,
             },
             parameters,
         )
@@ -162,6 +166,20 @@ impl VulkanResidency {
         self.device.end_rendering();
         self.graphics_state(graphics)?;
         self.program_bind(&graphics.program, push).map(|_| ())
+    }
+    pub(crate) fn program_current(&self, program: &PreparedProgram) -> bool {
+        self.bindings_current(&program.bindings)
+    }
+    pub(crate) fn bindings_current(&self, bindings: &[Binding]) -> bool {
+        bindings.iter().all(|binding| match binding {
+            Binding::Buffer { buffer, .. } | Binding::TexelBuffer { buffer, .. } => {
+                self.buffer_binding_current(*buffer)
+            }
+            Binding::Image(view) | Binding::CombinedImageSampler { image: view, .. } => {
+                self.image(view.image).is_ok()
+            }
+            _ => true,
+        })
     }
     pub fn prepare_program(
         &self,
@@ -432,85 +450,90 @@ impl VulkanResidency {
                     buffer_alignments[*index].max(limits.min_texel_buffer_offset_alignment);
             }
         }
+        // Unaligned uniforms are rebound to an aligned immutable allocation at
+        // consumption, either a CPU stream or a native copy of retained data.
+        let mut unaligned_uniforms = false;
+        for (resource, binding) in resources.iter_mut().zip(&pipeline.layout.key.bindings) {
+            if matches!(
+                binding.kind,
+                vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+            ) && let DescriptorResource::Buffer { offset, .. } = resource
+                && !offset.is_multiple_of(limits.min_uniform_buffer_offset_alignment)
+            {
+                *offset = 0;
+                unaligned_uniforms = true;
+            }
+        }
         let dynamic_offsets = pipeline
             .layout
             .split_dynamic_offsets(&mut resources, &self.device.profile().limits, Vec::new())?
             .into_boxed_slice();
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+        let mut uniform_bindings: Vec<_> = binding_uses
+            .iter()
+            .enumerate()
+            .filter_map(|(binding, &usage)| {
+                let index = usage?;
+                matches!(merged[index], Use::Buffer { scope, size, .. }
+                    if scope.access == vk::AccessFlags2::UNIFORM_READ && size <= 64 * 1024)
+                .then_some((index, binding))
+            })
+            .collect();
+        uniform_bindings.sort_unstable_by_key(|&(index, _)| index);
+        let uniforms = merged
+            .iter()
+            .zip(&buffer_alignments)
+            .enumerate()
+            .filter_map(|(index, (usage, &alignment))| match *usage {
+                Use::Buffer {
+                    id,
+                    offset,
+                    size,
+                    scope,
+                } if scope.access == vk::AccessFlags2::UNIFORM_READ && size <= 64 * 1024 => Some((
+                    index,
+                    buffer::BufferStreamRequest {
+                        id,
+                        offset,
+                        size,
+                        alignment,
+                    },
+                    uniform_bindings.partition_point(|&(usage, _)| usage < index)
+                        ..uniform_bindings.partition_point(|&(usage, _)| usage <= index),
+                )),
+                _ => None,
+            })
+            .collect();
         Ok(PreparedProgram {
             pipeline,
             record: None,
-            resources: resources.into_boxed_slice(),
+            bindings: bindings.to_vec().into_boxed_slice(),
             uses: merged.into_boxed_slice(),
-            binding_uses,
-            buffer_alignments,
+            uniform_bindings: uniform_bindings
+                .into_iter()
+                .map(|(_, binding)| binding)
+                .collect(),
+            uniforms,
+            unaligned_uniforms,
             dynamic_offsets,
         })
     }
     fn stream_graphics(
         &mut self,
         program: &PreparedProgram,
-        vertices: &[VertexBuffer],
     ) -> Result<GraphicsStreams, VulkanError> {
-        let mut requests = program
-            .uses
-            .iter()
-            .zip(&program.buffer_alignments)
-            .map(|(usage, &alignment)| match *usage {
-                Use::Buffer {
-                    id,
-                    offset,
-                    size,
-                    scope,
-                } if !scope.writes() => Some(buffer::BufferStreamRequest {
-                    id,
-                    offset,
-                    size,
-                    alignment,
-                }),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        requests.extend(vertices.iter().map(|vertex| {
-            Some(buffer::BufferStreamRequest {
-                id: vertex.buffer,
-                offset: vertex.offset,
-                size: vertex.size,
-                alignment: 4,
-            })
-        }));
-        let mut streams = self.stream_buffers(&requests)?;
-        let vertices = streams.split_off(program.uses.len());
-        let program_mask = streams.iter().map(Option::is_some).collect();
-        if streams.iter().all(Option::is_none) {
-            return Ok(GraphicsStreams {
-                dynamic_offsets: None,
-                record: None,
-                program_mask,
-                vertices,
-            });
-        }
+        self.streamed_uses.clear();
         let mut resources = std::mem::take(&mut self.descriptor_resources);
         resources.clear();
-        resources.extend_from_slice(&program.resources);
-        for (&index, &dynamic) in program
-            .pipeline
-            .layout
-            .dynamic_bindings
-            .iter()
-            .zip(&program.dynamic_offsets)
-        {
-            if let DescriptorResource::Buffer { offset, .. } = &mut resources[index] {
-                *offset += u64::from(dynamic);
+        for (index, request, bindings) in &program.uniforms {
+            let Some((buffer, base)) = self.stream_buffer(*request)? else {
+                continue;
+            };
+            if resources.is_empty() {
+                self.resolve_bindings(program, &mut resources)?;
             }
-        }
-        for (resource, usage) in resources.iter_mut().zip(&program.binding_uses) {
-            if let Some(index) = usage
-                && let Some((buffer, base)) = &streams[*index]
-            {
-                let Use::Buffer { offset: start, .. } = program.uses[*index] else {
-                    unreachable!()
-                };
-                match resource {
+            for &binding in &program.uniform_bindings[bindings.clone()] {
+                match &mut resources[binding] {
                     DescriptorResource::Buffer {
                         buffer: lease,
                         offset,
@@ -521,14 +544,51 @@ impl VulkanResidency {
                         offset,
                         ..
                     } => {
-                        *lease = Arc::clone(buffer);
-                        *offset = base + *offset - start;
+                        *lease = Arc::clone(&buffer);
+                        *offset = base + *offset - request.offset;
                     }
                     _ => (),
                 }
             }
+            self.streamed_uses.push(*index);
+        }
+        if resources.is_empty() && !program.unaligned_uniforms {
+            self.descriptor_resources = resources;
+            return Ok(GraphicsStreams {
+                dynamic_offsets: None,
+                record: None,
+            });
+        }
+        if resources.is_empty() {
+            self.resolve_bindings(program, &mut resources)?;
         }
         let limits = self.device.profile().limits;
+        if program.unaligned_uniforms {
+            for ((resource, binding), description) in resources
+                .iter_mut()
+                .zip(&program.bindings)
+                .zip(&program.pipeline.layout.key.bindings)
+            {
+                if matches!(
+                    description.kind,
+                    vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                ) && let DescriptorResource::Buffer {
+                    buffer: native,
+                    offset,
+                    range,
+                } = resource
+                    && !offset.is_multiple_of(limits.min_uniform_buffer_offset_alignment)
+                    && let Binding::Buffer {
+                        buffer,
+                        offset: source,
+                        ..
+                    } = binding
+                {
+                    *native = self.aligned_uniform_copy(*buffer, *source, *range)?;
+                    *offset = 0;
+                }
+            }
+        }
         let offsets = std::mem::take(&mut self.descriptor_offsets);
         let dynamic_offsets =
             program
@@ -541,24 +601,15 @@ impl VulkanResidency {
         Ok(GraphicsStreams {
             dynamic_offsets: Some(dynamic_offsets),
             record: Some(result?),
-            program_mask,
-            vertices,
         })
-    }
-    pub(super) fn program_access(
-        &mut self,
-        program: &PreparedProgram,
-    ) -> Result<smallvec::SmallVec<[WriterId; 16]>, VulkanError> {
-        self.program_access_except(program, &[])
     }
     fn program_access_except(
         &mut self,
         program: &PreparedProgram,
-        streamed: &[bool],
     ) -> Result<smallvec::SmallVec<[WriterId; 16]>, VulkanError> {
         let mut writers = smallvec::SmallVec::new();
         for (index, &resource) in program.uses.iter().enumerate() {
-            if streamed.get(index).copied().unwrap_or(false) {
+            if self.streamed_uses.binary_search(&index).is_ok() {
                 continue;
             }
             match resource {
@@ -568,7 +619,7 @@ impl VulkanResidency {
                     size,
                     scope,
                 } => {
-                    self.ensure_buffer(id)?;
+                    self.ensure_buffer_range(id, offset, size)?;
                     // Preserve bytes not actually written by a conditional shader
                     // store, even in a descriptor classified as write-only.
                     if scope.writes() {
@@ -634,11 +685,85 @@ impl VulkanResidency {
         if let Some(record) = &program.record {
             return Ok(Some(Arc::clone(record)));
         }
-        if program.resources.is_empty() {
+        if program.bindings.is_empty() {
             return Ok(None);
         }
-        self.slot_descriptors(&program.pipeline.layout, &program.resources)
-            .map(Some)
+        let mut resources = std::mem::take(&mut self.descriptor_resources);
+        resources.clear();
+        self.resolve_bindings(program, &mut resources)?;
+        for (&index, &dynamic) in program
+            .pipeline
+            .layout
+            .dynamic_bindings
+            .iter()
+            .zip(&program.dynamic_offsets)
+        {
+            if let DescriptorResource::Buffer { offset, .. } = &mut resources[index] {
+                *offset -= u64::from(dynamic);
+            }
+        }
+        let result = self.slot_descriptors(&program.pipeline.layout, &resources);
+        resources.clear();
+        self.descriptor_resources = resources;
+        result.map(Some)
+    }
+    fn resolve_bindings(
+        &self,
+        program: &PreparedProgram,
+        resources: &mut Vec<DescriptorResource>,
+    ) -> Result<(), VulkanError> {
+        for binding in &program.bindings {
+            resources.push(match binding {
+                Binding::NullBuffer => DescriptorResource::NullBuffer,
+                Binding::Buffer {
+                    buffer,
+                    offset,
+                    size,
+                } => DescriptorResource::Buffer {
+                    buffer: self.buffer_lease(*buffer)?,
+                    offset: *offset,
+                    range: *size,
+                },
+                Binding::TexelBuffer {
+                    buffer,
+                    offset,
+                    size,
+                    format,
+                    element_bytes,
+                } => DescriptorResource::TexelBuffer {
+                    buffer: self.buffer_lease(*buffer)?,
+                    offset: *offset,
+                    range: *size,
+                    format: *format,
+                    element_bytes: *element_bytes,
+                },
+                Binding::Image(image) => DescriptorResource::Image {
+                    view: self.image_view_lease(*image)?,
+                    layout: vk::ImageLayout::GENERAL,
+                },
+                Binding::CombinedImageSampler { image, sampler } => {
+                    DescriptorResource::CombinedImageSampler {
+                        view: self.image_view_lease(*image)?,
+                        layout: vk::ImageLayout::GENERAL,
+                        sampler: Arc::clone(sampler),
+                    }
+                }
+                Binding::Sampler(sampler) => DescriptorResource::Sampler(Arc::clone(sampler)),
+            });
+        }
+        Ok(())
+    }
+    pub(crate) fn retain_program_effect(&mut self, program: &PreparedProgram) {
+        self.constructing
+            .extend(program.bindings.iter().filter_map(|binding| match binding {
+                Binding::Buffer { buffer, .. } | Binding::TexelBuffer { buffer, .. } => {
+                    Some(Resource::Buffer(*buffer))
+                }
+                Binding::Image(view) | Binding::CombinedImageSampler { image: view, .. } => {
+                    Some(Resource::Image(view.image))
+                }
+                _ => None,
+            }));
     }
     fn slot_descriptors(
         &mut self,
@@ -716,14 +841,23 @@ impl VulkanResidency {
         dispatch: Dispatch,
         push: &[u8],
     ) -> Result<WorkTicket, VulkanError> {
-        loop {
-            match self.dispatch_inner(program, dispatch, push) {
+        let retained = self.constructing.len();
+        self.retain_program_effect(program);
+        if let Dispatch::Indirect { buffer, .. } = dispatch {
+            self.constructing.push(Resource::Buffer(buffer));
+        }
+        let result = (|| loop {
+            let result = self.dispatch_inner(program, dispatch, push);
+            self.device.submission.release_stream_uploads();
+            match result {
                 Err(VulkanError::DescriptorPressure) => {
                     self.flush()?;
                 }
                 result => return result,
             }
-        }
+        })();
+        self.constructing.truncate(retained);
+        result
     }
     fn dispatch_inner(
         &mut self,
@@ -750,7 +884,8 @@ impl VulkanResidency {
                 return self.device.work_ticket();
             }
         }
-        let writers = self.program_access(program)?;
+        let streams = self.stream_graphics(program)?;
+        let writers = self.program_access_except(program)?;
         let indirect = match dispatch {
             Dispatch::Indirect { buffer, offset } => {
                 Some(self.indirect_buffer(buffer, offset, 12)?)
@@ -758,7 +893,22 @@ impl VulkanResidency {
             _ => None,
         };
         self.barriers.emit(&mut self.device);
-        let command = self.program_bind(program, push)?;
+        let record = match streams.record {
+            Some(record) => Some(record),
+            None => self.program_record(program)?,
+        };
+        let command = self.program_bind_record(
+            program,
+            push,
+            record.as_ref(),
+            streams
+                .dynamic_offsets
+                .as_deref()
+                .unwrap_or(&program.dynamic_offsets),
+        )?;
+        if let Some(offsets) = streams.dynamic_offsets {
+            self.descriptor_offsets = offsets;
+        }
         self.publish_effect(&writers, |device| unsafe {
             match dispatch {
                 Dispatch::Direct([x, y, z]) => device.dispatch.cmd_dispatch(command, x, y, z),
@@ -788,7 +938,7 @@ impl VulkanResidency {
                 "indirect execution requires aligned INDIRECT_BUFFER storage",
             ));
         }
-        self.ensure_buffer(buffer)?;
+        self.ensure_buffer_range(buffer, offset, size)?;
         self.buffer_access_range(
             buffer,
             offset,

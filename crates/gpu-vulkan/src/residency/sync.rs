@@ -115,13 +115,28 @@ impl BufferAccess {
         mut emit: impl FnMut(u64, u64, Dependency),
     ) {
         let end = offset + size;
+        let first = self.spans.partition_point(|span| span.end <= offset);
+        let last = self.spans.partition_point(|span| span.start < end);
+        // Repeated reads do not change interval boundaries or visibility.
+        if !next.writes()
+            && self.spans[first..last].iter().all(|span| {
+                let state = &span.state;
+                state.readers.stages.contains(next.stages)
+                    && state.readers.access.contains(next.access)
+                    && (state.writer.stages.is_empty()
+                        || state.visible.iter().any(|scope| {
+                            scope.stages.contains(next.stages) && scope.access.contains(next.access)
+                        }))
+            })
+        {
+            return;
+        }
         for boundary in [offset, end] {
-            if let Some(index) = self
-                .spans
-                .iter()
-                .position(|span| span.start < boundary && boundary < span.end)
+            let index = self.spans.partition_point(|span| span.end <= boundary);
+            if let Some(span) = self.spans.get_mut(index)
+                && span.start < boundary
+                && boundary < span.end
             {
-                let span = &mut self.spans[index];
                 let right = BufferSpan {
                     start: boundary,
                     end: span.end,
@@ -131,23 +146,28 @@ impl BufferAccess {
                 self.spans.insert(index + 1, right);
             }
         }
-        for span in &mut self.spans {
-            if span.start >= offset
-                && span.end <= end
-                && let Some(dependency) = span.state.access(next)
-            {
+        let first = self.spans.partition_point(|span| span.end <= offset);
+        let last = self.spans.partition_point(|span| span.start < end);
+        for span in &mut self.spans[first..last] {
+            if let Some(dependency) = span.state.access(next) {
                 emit(span.start, span.end - span.start, dependency);
             }
         }
-        let mut index = 1;
-        while index < self.spans.len() {
-            if self.spans[index - 1].state == self.spans[index].state {
-                self.spans[index - 1].end = self.spans[index].end;
-                self.spans.remove(index);
+        // Only the affected intervals and their neighbors can now coalesce.
+        // Compact once; repeated Vec::remove would shift the tail quadratically.
+        let mut write = first.saturating_sub(1);
+        let stop = (last + 1).min(self.spans.len());
+        for read in write + 1..stop {
+            if self.spans[write].state == self.spans[read].state {
+                self.spans[write].end = self.spans[read].end;
             } else {
-                index += 1;
+                write += 1;
+                if write != read {
+                    self.spans.swap(write, read);
+                }
             }
         }
+        self.spans.drain(write + 1..stop);
     }
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -348,21 +368,25 @@ impl VulkanResidency {
         // ticket. First physical use materializes the literal in queue order;
         // subsequent partial writers therefore preserve the remaining bytes.
         // Clear the flag before upload_buffer re-enters buffer_access_range.
-        let pending = self.buffers[id.slot]
+        let pending: Vec<_> = self.buffers[id.slot]
             .entry
             .as_mut()
             .expect("buffer")
             .known
-            .as_mut()
-            .and_then(|known| {
-                if !known.pending_upload {
+            .iter_mut()
+            .filter_map(|known| {
+                if !known.pending_upload
+                    || known.offset >= offset + size
+                    || known.offset + known.bytes.len() as u64 <= offset
+                {
                     return None;
                 }
                 known.pending_upload = false;
-                Some(Arc::clone(&known.bytes))
-            });
-        if let Some(bytes) = pending {
-            self.upload_buffer(id, 0, &bytes)?;
+                Some((known.offset, Arc::clone(&known.bytes)))
+            })
+            .collect();
+        for (offset, bytes) in pending {
+            self.upload_buffer(id, offset, &bytes)?;
         }
         self.device.begin_recording()?;
         let work = self.device.work_ticket()?;
@@ -378,7 +402,7 @@ impl VulkanResidency {
                     .dependency(self.barrier_policy, handle, offset, size, dependency)
             });
         entry.contents.last_use = Some(work);
-        entry.contents.touched = work.tick();
+        self.touch(Resource::Buffer(id));
         Ok(handle)
     }
     pub(super) fn image_access_subresources(
@@ -474,8 +498,9 @@ impl VulkanResidency {
             cell.layout = layout;
         }
         entry.contents.last_use = Some(work);
-        entry.contents.touched = work.tick();
-        Ok((entry.native.handle, layout))
+        let handle = entry.native.handle;
+        self.touch(Resource::Image(id));
+        Ok((handle, layout))
     }
 }
 
@@ -484,6 +509,55 @@ mod tests {
     use super::*;
     fn scope(stage: vk::PipelineStageFlags2, access: vk::AccessFlags2) -> AccessScope {
         AccessScope::new(stage, access)
+    }
+    #[test]
+    fn split_and_coalesced_hazards_match_independent_byte_states() {
+        let scopes = [
+            scope(
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            ),
+            scope(
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_READ,
+            ),
+            scope(
+                vk::PipelineStageFlags2::VERTEX_SHADER,
+                vk::AccessFlags2::UNIFORM_READ,
+            ),
+            scope(
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_STORAGE_WRITE,
+            ),
+        ];
+        let mut state = BufferAccess::new(64);
+        let mut bytes = vec![AccessState::default(); 64];
+        let mut random = 0x42bc_a981u64;
+        for _ in 0..2000 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let start = (random as usize >> 8) % 64;
+            let end = (start + 1 + (random as usize >> 16) % 64).min(64);
+            let next = scopes[random as usize % scopes.len()];
+            let mut actual = vec![None; 64];
+            state.access(
+                start as u64,
+                (end - start) as u64,
+                next,
+                |offset, size, dependency| {
+                    actual[offset as usize..(offset + size) as usize]
+                        .fill(Some((dependency.source, dependency.destination)));
+                },
+            );
+            let mut expected = vec![None; 64];
+            for i in start..end {
+                expected[i] = bytes[i]
+                    .access(next)
+                    .map(|dependency| (dependency.source, dependency.destination));
+            }
+            assert_eq!(actual, expected);
+        }
     }
     #[test]
     fn independent_ranges_skip_barriers_and_writer_visibility_survives_reads() {

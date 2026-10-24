@@ -363,6 +363,110 @@ impl PhysicalMapping {
     pub fn allocations(&self) -> &[WeakAllocation] {
         &self.allocations
     }
+    /// Native buffer coordinates of an identical physical subrange. This is a
+    /// cold cache lookup; retained bindings keep the resulting offset.
+    pub fn containing_offset(&self, other: &Self) -> Option<u64> {
+        if self.machine != other.machine {
+            return None;
+        }
+        if self == other {
+            return Some(0);
+        }
+        let first = other.spans.first()?;
+        for (index, span) in self.spans.iter().enumerate() {
+            if span.allocation != first.allocation
+                || first.start.get() < span.start.get()
+                || first.start.get() >= span.start.get() + span.bytes
+            {
+                continue;
+            }
+            let base = span.logical + first.start.get() - span.start.get();
+            if base + other.bytes > self.bytes {
+                continue;
+            }
+            let mut current = index;
+            let mut matches = true;
+            for part in &other.spans {
+                let mut cursor = 0;
+                while cursor < part.bytes {
+                    let logical = base + part.logical + cursor;
+                    while self.spans[current].logical + self.spans[current].bytes <= logical {
+                        current += 1;
+                    }
+                    let target = &self.spans[current];
+                    if target.allocation != part.allocation
+                        || target.start.get() + logical - target.logical
+                            != part.start.get() + cursor
+                    {
+                        matches = false;
+                        break;
+                    }
+                    cursor += (target.logical + target.bytes - logical).min(part.bytes - cursor);
+                }
+                if !matches {
+                    break;
+                }
+            }
+            if matches {
+                return Some(base);
+            }
+        }
+        None
+    }
+
+    /// Expand a contiguous buffer inside live allocation pages. Scatter/gather
+    /// mappings keep their original concatenation; holes are never filled by
+    /// reading the enclosing allocation envelope.
+    pub fn expanded_buffer(self: &Arc<Self>, alignment: u64) -> Result<Arc<Self>, MemoryError> {
+        if !alignment.is_power_of_two() {
+            return Err(MemoryError::Invalid(
+                "buffer expansion alignment is invalid",
+            ));
+        }
+        let [span] = self.spans.as_ref() else {
+            return Ok(Arc::clone(self));
+        };
+        let allocation = &self.allocations[span.allocation_index];
+        let pin = allocation
+            .upgrade_range(span.allocation_offset, span.bytes)
+            .ok_or(MemoryError::Invalid("buffer allocation has retired"))?;
+        let start = span.start.get() & !(alignment - 1);
+        let before = (span.start.get() - start).min(span.allocation_offset);
+        let offset = span.allocation_offset - before;
+        let end = (span.start.get() + span.bytes).div_ceil(alignment) * alignment;
+        let limit = (span.allocation_offset + end - span.start.get()).min(pin.bytes());
+        let Some(live) = allocation
+            .live_ranges(offset, limit - offset)?
+            .into_iter()
+            .find(|range| {
+                range.start <= span.allocation_offset
+                    && range.end >= span.allocation_offset + span.bytes
+            })
+        else {
+            return Err(MemoryError::Invalid("buffer allocation has retired"));
+        };
+        let expanded = allocation
+            .upgrade_range(live.start, live.end - live.start)
+            .ok_or(MemoryError::Invalid("buffer expansion has retired"))?;
+        let mapping = Self::new(&[AllocationRange::new(
+            expanded,
+            live.start,
+            live.end - live.start,
+        )?])?;
+        // An allocation can contain nonadjacent physical runs. Restrict growth
+        // to the run containing the request, preserving its native addressing.
+        let part = mapping
+            .spans
+            .iter()
+            .find(|part| {
+                part.start.get() <= span.start.get()
+                    && part.start.get() + part.bytes >= span.start.get() + span.bytes
+            })
+            .ok_or(MemoryError::Invalid(
+                "buffer expansion lost its source span",
+            ))?;
+        mapping.slice(part.logical, part.bytes)
+    }
     pub fn is_injective(&self) -> bool {
         self.injective
     }
@@ -381,13 +485,23 @@ impl PhysicalMapping {
     /// Retain only a concrete input's requested bytes. Cache entries themselves
     /// never call this merely to remain in an LRU.
     pub fn pin(&self, start: u64, bytes: u64) -> Result<Vec<AllocationRange>, MemoryError> {
+        let mut ranges = Vec::new();
+        self.pin_into(start, bytes, &mut ranges)?;
+        Ok(ranges)
+    }
+    /// Append concrete operation inputs using caller-owned reusable storage.
+    pub fn pin_into(
+        &self,
+        start: u64,
+        bytes: u64,
+        ranges: &mut Vec<AllocationRange>,
+    ) -> Result<(), MemoryError> {
         let end = start
             .checked_add(bytes)
             .filter(|&end| bytes != 0 && end <= self.bytes)
             .ok_or(MemoryError::Invalid(
                 "resource input exceeds its physical mapping",
             ))?;
-        let mut ranges = Vec::new();
         let first = self
             .spans
             .partition_point(|span| span.logical + span.bytes <= start);
@@ -408,7 +522,7 @@ impl PhysicalMapping {
                 stop - begin,
             )?);
         }
-        Ok(ranges)
+        Ok(())
     }
     pub fn pin_physical(
         &self,
@@ -1473,6 +1587,68 @@ mod tests {
 mod submapping_tests {
     use super::*;
     use nixe_memory::{Machine, PAGE_SIZE};
+    #[test]
+    fn buffer_expansion_stops_at_retired_holes_and_keeps_fragment_order() {
+        use nixe_memory::{AddressSpace, AddressWidth, GuestVirtualAddress, MemoryPermissions};
+        let machine = Machine::new(4 * PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(4 * PAGE_SIZE)
+            .unwrap()
+            .allocate(4 * PAGE_SIZE)
+            .unwrap();
+        let full =
+            PhysicalMapping::new(&[
+                AllocationRange::new(allocation.pin(), 0, 4 * PAGE_SIZE).unwrap()
+            ])
+            .unwrap();
+        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
+        let base = GuestVirtualAddress::new(PAGE_SIZE);
+        space
+            .map(
+                base,
+                allocation,
+                0,
+                4 * PAGE_SIZE,
+                MemoryPermissions::READ_WRITE,
+            )
+            .unwrap();
+        space
+            .unmap(base.checked_add(PAGE_SIZE).unwrap(), PAGE_SIZE)
+            .unwrap();
+        let left = full
+            .slice(16, 32)
+            .unwrap()
+            .expanded_buffer(1024 * 1024)
+            .unwrap();
+        assert_eq!(left.bytes(), PAGE_SIZE);
+        let right = full
+            .slice(2 * PAGE_SIZE + 16, 32)
+            .unwrap()
+            .expanded_buffer(1024 * 1024)
+            .unwrap();
+        assert_eq!(right.bytes(), 2 * PAGE_SIZE);
+        assert_eq!(
+            right.containing_offset(&full.slice(3 * PAGE_SIZE + 10, 5).unwrap()),
+            Some(PAGE_SIZE + 10)
+        );
+        let fragmented =
+            PhysicalMapping::join(&[left.clone(), right.clone(), left.clone()]).unwrap();
+        assert!(Arc::ptr_eq(
+            &fragmented,
+            &fragmented.expanded_buffer(1024 * 1024).unwrap()
+        ));
+        assert_eq!(
+            fragmented.containing_offset(&PhysicalMapping::join(&[right, left]).unwrap()),
+            Some(PAGE_SIZE)
+        );
+        assert!(
+            full.slice(PAGE_SIZE, 16)
+                .unwrap()
+                .expanded_buffer(PAGE_SIZE)
+                .is_err()
+        );
+    }
+
     #[test]
     fn located_span_pins_check_bounds_and_retain_only_the_requested_page() {
         let machine = Machine::new(3 * PAGE_SIZE).unwrap();

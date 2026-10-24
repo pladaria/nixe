@@ -3,10 +3,12 @@
 mod affine;
 pub use affine::affine_pipeline;
 mod buffer;
+pub use buffer::BufferRange;
 mod buffer_download;
 pub(crate) mod commands;
 mod conversion;
 pub(crate) use conversion::stage as helper_stage;
+mod budget;
 mod cpu_readback;
 mod decoded_texture;
 pub(crate) mod execution;
@@ -55,13 +57,13 @@ macro_rules! cache_id {
 cache_id!(BufferId);
 cache_id!(ImageId);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum Resource {
+pub(crate) enum Resource {
     Buffer(BufferId),
     Image(ImageId),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImageViewId {
-    image: ImageId,
+    pub(crate) image: ImageId,
     view: usize,
 }
 mod attachment;
@@ -70,7 +72,13 @@ struct Slot<T> {
     generation: u32,
     entry: Option<T>,
 }
+#[derive(Clone, Copy)]
+struct LruLinks {
+    previous: Option<Resource>,
+    next: Option<Resource>,
+}
 struct Contents {
+    lru: Option<LruLinks>,
     geometry: Vec<Arc<Footprint>>,
     cpu: Vec<Observation>,
     device: Vec<ResourceObservation>,
@@ -135,6 +143,7 @@ pub struct BufferUpload {
     pub consumed: usize,
 }
 struct KnownBufferBytes {
+    offset: u64,
     bytes: Arc<[u8]>,
     /// A completion effect needs no physical transfer until a GPU access.
     pending_upload: bool,
@@ -143,8 +152,9 @@ struct BufferEntry {
     /// Immutable host-authored payload, valid until another native producer.
     /// CPU publication still waits for the actual producing ticket, including
     /// when the physical buffer has never been consumed by the GPU.
-    known: Option<KnownBufferBytes>,
-    streamed: Option<buffer::StreamedBuffer>,
+    known: Vec<KnownBufferBytes>,
+    growth: u32,
+    binding_valid: bool,
     write_plans: Vec<(u64, u64, WriterId)>,
     contents: Contents,
     native: Arc<AllocatedBuffer>,
@@ -235,13 +245,14 @@ pub struct ResidencyStatistics {
     pub attachment_publication_hits: u64,
     pub cpu_uploaded_bytes: u64,
     pub cpu_streamed_bytes: u64,
-    pub cpu_stream_hits: u64,
     pub gpu_copied_bytes: u64,
     /// Exact bytes transferred to host memory, excluding GPU-only realignment.
     pub native_readback_bytes: u64,
     pub canonical_readback_bytes: u64,
     pub cache_hits: u64,
-    /// Reused physical image-to-buffer copy plans, independent of pixel epochs.
+    pub buffer_allocations: u64,
+    pub buffer_merges: u64,
+    pub staging_pressure_waits: u64,
     pub evictions: u64,
 }
 /// Concrete single-owner storage, selected once at startup. No generic backend
@@ -250,8 +261,14 @@ pub struct VulkanResidency {
     pub(crate) device: VulkanDevice,
     instance: BackendInstanceId,
     buffers: Vec<Slot<BufferEntry>>,
-    buffer_views: rustc_hash::FxHashMap<buffer::BufferKey, Vec<BufferId>>,
     free_buffers: Vec<usize>,
+    epoch: u64,
+    lru_head: Option<Resource>,
+    lru_tail: Option<Resource>,
+    lru_scan: Option<Resource>,
+    budget_ceiling: u64,
+    collection_target: u64,
+    maintenance_at: std::time::Instant,
     images: Vec<Slot<ImageEntry>>,
     attachments: Vec<Slot<attachment::AttachmentEntry>>,
     memory: Machine,
@@ -262,7 +279,7 @@ pub struct VulkanResidency {
     statistics: ResidencyStatistics,
     image_readbacks: readback::ImageReadbacks,
     cpu_readbacks: rustc_hash::FxHashMap<nixe_memory::AccessRequestId, cpu_readback::CpuReadback>,
-    buffer_writes: rustc_hash::FxHashSet<BufferId>,
+    buffer_writes: rustc_hash::FxHashMap<BufferId, Vec<(u64, u64)>>,
     buffer_downloads: std::collections::VecDeque<buffer_download::Download>,
     barriers: sync::Barriers,
     decoder: nixe_gpu::texture_decode::BlockDecoder,
@@ -274,9 +291,11 @@ pub struct VulkanResidency {
     barrier_policy: BarrierPolicy,
     unified_layouts: bool,
     /// Entries needed by a cold reconstruction cannot be evicted by its allocations.
-    constructing: Vec<Resource>,
+    pub(crate) constructing: Vec<Resource>,
     descriptor_resources: Vec<crate::cache::DescriptorResource>,
     descriptor_offsets: Vec<u32>,
+    streamed_uses: Vec<usize>,
+    stream_inputs: Vec<nixe_memory::AllocationRange>,
 }
 impl VulkanResidency {
     pub(crate) fn memory(&self) -> &Machine {
@@ -359,12 +378,18 @@ impl VulkanResidency {
             )
         });
         let (release_sender, releases) = mpsc::channel();
-        Ok(Self {
+        let mut cache = Self {
             device,
             instance,
             buffers: Vec::new(),
-            buffer_views: Default::default(),
             free_buffers: Vec::new(),
+            epoch: 0,
+            lru_head: None,
+            lru_tail: None,
+            lru_scan: None,
+            budget_ceiling: bytes,
+            collection_target: bytes / 8 * 7,
+            maintenance_at: std::time::Instant::now(),
             images: Vec::new(),
             attachments: Vec::new(),
             authority: Authority::new(memory.identity()),
@@ -389,7 +414,11 @@ impl VulkanResidency {
             constructing: Vec::new(),
             descriptor_resources: Vec::new(),
             descriptor_offsets: Vec::new(),
-        })
+            streamed_uses: Vec::new(),
+            stream_inputs: Vec::new(),
+        };
+        cache.maintain_budget(true)?;
+        Ok(cache)
     }
     pub fn device(&self) -> &VulkanDevice {
         &self.device
@@ -458,11 +487,6 @@ impl VulkanResidency {
                 "stale or foreign image cache ID",
             ))
     }
-    fn touch(&mut self, resource: Resource) {
-        // Batch age updates with real native use, not just cold creation order.
-        let age = self.device.submission.scheduled.saturating_add(1);
-        self.contents_mut(resource).touched = age;
-    }
     fn drain_notifications(&mut self) {
         while let Ok(release) = self.releases.try_recv() {
             if release.producer.instance() != self.instance {
@@ -501,6 +525,29 @@ impl VulkanResidency {
             .is_none_or(|used| used > self.budget.limit)
         {
             if !self.evict_one()? {
+                self.flush()?;
+                let completed = self.device.completed_tick();
+                let oldest = self
+                    .device
+                    .submission
+                    .slots
+                    .iter()
+                    .map(|slot| slot.tick)
+                    .filter(|&tick| tick > completed && tick <= self.device.scheduled_tick())
+                    .min();
+                if let Some(tick) = oldest {
+                    self.device.wait_for_work(
+                        self.device.submission.ticket(tick),
+                        std::time::Duration::MAX,
+                    )?;
+                    self.progress_readbacks()?;
+                    for slot in &mut self.device.submission.slots {
+                        if let Some(descriptors) = &mut slot.stream_descriptors {
+                            descriptors.trim();
+                        }
+                    }
+                    continue;
+                }
                 return Err(VulkanError::ResidencyPressure {
                     requested: bytes,
                     allocated: self.budget.used(),
@@ -510,90 +557,11 @@ impl VulkanResidency {
         }
         Ok(self.budget.reserve(bytes))
     }
-    pub fn evict_one(&mut self) -> Result<bool, VulkanError> {
-        self.drain_notifications();
-        let mut candidates: Vec<_> = self
-            .buffers
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, item)| {
-                item.entry
-                    .as_ref()
-                    .filter(|e| Arc::strong_count(&e.native) == 1)
-                    .map(|entry| {
-                        (
-                            Resource::Buffer(BufferId {
-                                instance: self.instance,
-                                slot,
-                                generation: item.generation,
-                            }),
-                            &entry.contents,
-                        )
-                    })
-            })
-            .chain(self.images.iter().enumerate().filter_map(|(slot, item)| {
-                item.entry
-                    .as_ref()
-                    .filter(|entry| {
-                        entry.native_views.iter().all(|v| Arc::strong_count(v) == 1)
-                            && Arc::strong_count(&entry.native) == 1 + entry.native_views.len()
-                            && entry.leases == 0
-                            && entry
-                                .access
-                                .iter()
-                                .all(|cell| cell.ownership == ownership::Ownership::Local)
-                    })
-                    .map(|entry| {
-                        (
-                            Resource::Image(ImageId {
-                                instance: self.instance,
-                                slot,
-                                generation: item.generation,
-                            }),
-                            &entry.contents,
-                        )
-                    })
-            }))
-            .filter(|(resource, _)| !self.constructing.contains(resource))
-            .map(|(resource, contents)| (contents.touched, resource))
-            .collect();
-        // Under allocation pressure, prove authority only until a usable LRU
-        // candidate is found. Do not resolve every candidate's image footprints
-        // just to select the oldest reconstructible allocation.
-        candidates.sort_unstable_by_key(|&(age, _)| age);
-        let mut candidate = None;
-        for (_, resource) in candidates {
-            if self.authority.can_evict(resource).map_err(memory_error)? {
-                candidate = Some(resource);
-                break;
-            }
-        }
-        let Some(resource) = candidate else {
-            return Ok(false);
-        };
-        self.authority
-            .evict_materialized(&self.memory, resource)
-            .map_err(memory_error)?;
-        self.retire_entry(resource)?;
-        self.statistics.evictions += 1;
-        Ok(true)
-    }
     fn retire_entry(&mut self, resource: Resource) -> Result<(), VulkanError> {
+        self.unlink_lru(resource);
         match resource {
             Resource::Buffer(id) => {
                 let entry = self.buffers[id.slot].entry.take().expect("candidate");
-                let key = buffer::BufferKey {
-                    geometry: entry.contents.geometry.clone(),
-                    bytes: entry.native.size(),
-                };
-                let views = self
-                    .buffer_views
-                    .get_mut(&key)
-                    .expect("indexed buffer view");
-                views.retain(|view| *view != id);
-                if views.is_empty() {
-                    self.buffer_views.remove(&key);
-                }
                 if self.buffers[id.slot].generation < u32::MAX {
                     self.free_buffers.push(id.slot);
                 }
@@ -642,6 +610,9 @@ impl VulkanResidency {
                         .map(|p| (p.offset, p.end().expect("image plane") - p.offset))
                         .collect(),
                 };
+                if let Resource::Buffer(id) = resource {
+                    self.buffers[id.slot].entry.as_mut().unwrap().binding_valid = false;
+                }
                 let contents = self.contents_mut(resource);
                 contents.invalid = invalid;
                 contents.cpu.clear();
@@ -759,26 +730,35 @@ impl VulkanResidency {
             ));
         };
         self.check_buffer_range(id, offset, bytes)?;
-        let full = offset == 0 && bytes == self.buffer(id)?.native.size();
-        if !full
-            && self
-                .buffer(id)?
-                .known
-                .as_ref()
-                .is_some_and(|literal| literal.pending_upload)
-        {
-            let size = self.buffer(id)?.native.size();
+        // Whole literal overwrites can discard their pending upload. Partial
+        // overwrites first preserve the untouched bytes in native storage.
+        let partial = self.buffer(id)?.known.iter().any(|literal| {
+            let end = literal.offset + literal.bytes.len() as u64;
+            literal.pending_upload
+                && literal.offset < offset + bytes
+                && offset < end
+                && !(offset <= literal.offset && offset + bytes >= end)
+        });
+        if partial {
             self.buffer_access_range(
                 id,
-                0,
-                size,
+                offset,
+                bytes,
                 AccessScope::new(
                     vk::PipelineStageFlags2::COPY,
                     vk::AccessFlags2::TRANSFER_READ,
                 ),
             )?;
         }
-        self.buffers[id.slot].entry.as_mut().expect("buffer").known = None;
+        self.buffers[id.slot]
+            .entry
+            .as_mut()
+            .unwrap()
+            .known
+            .retain(|literal| {
+                literal.offset >= offset + bytes
+                    || literal.offset + literal.bytes.len() as u64 <= offset
+            });
         let old = self
             .buffer(id)?
             .write_plans
@@ -844,14 +824,15 @@ impl VulkanResidency {
                 .contents
                 .device = observed;
         }
+        self.track_buffer_cpu(id, offset, bytes)?;
         let work = self.device.work_ticket()?;
         let entry = self.buffers[id.slot].entry.as_mut().expect("buffer");
         entry.contents.validate_interval(offset, bytes);
-        if full {
-            entry.contents.cpu.clear();
-        }
         entry.contents.last_use = Some(work);
-        self.buffer_writes.insert(id);
+        self.buffer_writes
+            .entry(id)
+            .or_default()
+            .push((offset, bytes));
         Ok(())
     }
     pub fn write_buffer(
@@ -860,7 +841,6 @@ impl VulkanResidency {
         offset: u64,
         bytes: &[u8],
     ) -> Result<BufferUpload, VulkanError> {
-        self.ensure_buffer(id)?;
         let consumed = bytes
             .len()
             .min(self.device.submission.configuration.arena_bytes as usize);
@@ -911,13 +891,19 @@ impl VulkanResidency {
             mapping,
             vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
         )?;
-        let writer = self.prepare_write(Resource::Buffer(id), 0, bytes.len() as u64)?;
+        let writer = self.prepare_write(Resource::Buffer(id.buffer), id.offset, id.size)?;
         self.publish_effect(&[writer], |_| ())?;
-        self.finish_buffer_write(id, 0, bytes.len() as u64)?;
-        self.buffers[id.slot].entry.as_mut().expect("buffer").known = Some(KnownBufferBytes {
-            bytes: Arc::clone(bytes),
-            pending_upload: true,
-        });
+        self.finish_buffer_write(id.buffer, id.offset, id.size)?;
+        self.buffers[id.buffer.slot]
+            .entry
+            .as_mut()
+            .expect("buffer")
+            .known
+            .push(KnownBufferBytes {
+                offset: id.offset,
+                bytes: Arc::clone(bytes),
+                pending_upload: true,
+            });
         // Query reports accumulate until a real fence commits the producing
         // prefix. They must not create a submission/completion per timestamp.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/fence_manager.h
@@ -925,44 +911,6 @@ impl VulkanResidency {
             self.commit_buffer_downloads()?;
         }
         Ok(())
-    }
-    pub fn copy_buffer(
-        &mut self,
-        source: BufferId,
-        source_offset: u64,
-        destination: BufferId,
-        destination_offset: u64,
-        size: u64,
-    ) -> Result<WorkTicket, VulkanError> {
-        self.check_buffer_range(source, source_offset, size)?;
-        self.check_buffer_range(destination, destination_offset, size)?;
-        if source == destination && source_offset == destination_offset {
-            // A logical no-op must retain a deferred literal and its producer.
-            return self.device.work_ticket();
-        }
-        self.ensure_buffer(source)?;
-        if destination_offset == 0 && size == self.buffer(destination)?.native.size() {
-            // Every destination byte is replaced. Preserve canonical mixed-page
-            // authority below, but do not upload an obsolete native baseline.
-            self.buffers[destination.slot]
-                .entry
-                .as_mut()
-                .expect("buffer")
-                .known = None;
-        } else {
-            self.ensure_buffer(destination)?;
-        }
-        let writer = self.prepare_write(Resource::Buffer(destination), destination_offset, size)?;
-        self.copy_buffer_effect(
-            writer,
-            source,
-            source_offset,
-            destination,
-            destination_offset,
-            size,
-        )?;
-        self.finish_buffer_write(destination, destination_offset, size)?;
-        self.device.work_ticket()
     }
     pub fn flush(&mut self) -> Result<Option<WorkTicket>, VulkanError> {
         self.flush_with_sync(&[], &[])
@@ -1033,7 +981,7 @@ impl VulkanResidency {
         offset: u64,
         size: u64,
     ) -> Result<Vec<u8>, VulkanError> {
-        self.ensure_buffer(id)?;
+        self.ensure_buffer_range(id, offset, size)?;
         self.read_buffer_native(id, offset, size)
     }
 }

@@ -322,7 +322,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
                 persistent_bytes: config.gpu.persistent_bytes,
                 ..Default::default()
             },
-            1024 * 1024 * 1024,
+            u64::MAX, // Residency derives its headroom from the device heap budget.
         )
         .map_err(|e| e.to_string())?;
         if let Some(client) = native_presentation {

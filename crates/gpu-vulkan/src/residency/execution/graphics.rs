@@ -166,8 +166,7 @@ pub struct PreparedDraw {
     graphics: PreparedGraphics,
     targets: Arc<PreparedTargets>,
     vertices: Box<[VertexBuffer]>,
-    _vertex_leases: Box<[Arc<AllocatedBuffer>]>,
-    index: Option<(IndexBuffer, Arc<AllocatedBuffer>)>,
+    index: Option<IndexBuffer>,
     inline_index: Option<InlineIndex>,
 }
 impl PreparedDraw {
@@ -182,6 +181,19 @@ impl PreparedDraw {
     }
 }
 impl VulkanResidency {
+    pub(crate) fn draw_current(&self, draw: &PreparedDraw) -> bool {
+        self.program_current(&draw.graphics.program)
+            && self.targets_current(&draw.targets)
+            && draw
+                .vertices
+                .iter()
+                .all(|vertex| self.buffer_binding_current(vertex.buffer))
+            && draw
+                .index
+                .as_ref()
+                .is_none_or(|index| self.buffer_binding_current(index.buffer))
+    }
+
     pub(crate) fn targets_current(&self, targets: &PreparedTargets) -> bool {
         targets
             .attachments()
@@ -489,24 +501,23 @@ impl VulkanResidency {
                 "vertex streams do not match compiled binding slots",
             ));
         }
-        let vertex_leases = vertices
-            .iter()
-            .map(|v| {
-                self.check_buffer_range(v.buffer, v.offset, v.size)?;
-                let buffer = self.buffer_lease(v.buffer)?;
-                if !buffer.usage.contains(vk::BufferUsageFlags::VERTEX_BUFFER) {
-                    return Err(VulkanError::InvalidResource(
-                        "vertex stream lacks VERTEX_BUFFER usage",
-                    ));
-                }
-                Ok(buffer)
-            })
-            .collect::<Result<_, _>>()?;
+        for vertex in &vertices {
+            self.check_buffer_range(vertex.buffer, vertex.offset, vertex.size)?;
+            if !self
+                .buffer(vertex.buffer)?
+                .usage
+                .contains(vk::BufferUsageFlags::VERTEX_BUFFER)
+            {
+                return Err(VulkanError::InvalidResource(
+                    "vertex stream lacks VERTEX_BUFFER usage",
+                ));
+            }
+        }
         let index = index.map(|i| {
             let size = match i.kind { vk::IndexType::UINT16 => 2, vk::IndexType::UINT32 => 4, vk::IndexType::UINT8_EXT if self.device.profile().index_uint8 => 1, _ => return Err(VulkanError::InvalidResource("native index type requires UINT16/UINT32; frontend must widen unsupported UINT8")) };
             self.check_buffer_range(i.buffer,i.offset,i.size)?;
             if !i.offset.is_multiple_of(size) || !self.buffer(i.buffer)?.usage.contains(vk::BufferUsageFlags::INDEX_BUFFER) { return Err(VulkanError::InvalidResource("index stream requires aligned INDEX_BUFFER storage")); }
-            Ok((i,self.buffer_lease(i.buffer)?))
+            Ok(i)
         }).transpose()?;
         let attachment_images: Vec<_> = targets
             .attachments()
@@ -550,7 +561,7 @@ impl VulkanResidency {
         for vertex in &vertices {
             batchable &= !buffer_overlaps(vertex.buffer, vertex.offset, vertex.size)?;
         }
-        if let Some((index, _)) = &index {
+        if let Some(index) = &index {
             batchable &= !buffer_overlaps(index.buffer, index.offset, index.size)?;
         }
         for usage in &graphics.program.uses {
@@ -571,7 +582,6 @@ impl VulkanResidency {
             graphics,
             targets,
             vertices,
-            _vertex_leases: vertex_leases,
             index,
             inline_index: None,
         })
@@ -592,25 +602,34 @@ impl VulkanResidency {
         draws: &[Draw],
         push: &[u8],
     ) -> Result<WorkTicket, VulkanError> {
-        self.record_draws(prepared, draws, push, false)
-    }
-    pub(crate) fn draws_streamed(
-        &mut self,
-        prepared: &PreparedDraw,
-        draws: &[Draw],
-        push: &[u8],
-    ) -> Result<WorkTicket, VulkanError> {
-        self.record_draws(prepared, draws, push, true)
-    }
-    fn record_draws(
-        &mut self,
-        prepared: &PreparedDraw,
-        draws: &[Draw],
-        push: &[u8],
-        streaming: bool,
-    ) -> Result<WorkTicket, VulkanError> {
-        loop {
-            let result = self.record_draws_inner(prepared, draws, push, streaming);
+        let retained = self.constructing.len();
+        self.retain_program_effect(&prepared.graphics.program);
+        self.constructing.extend(
+            prepared
+                .vertices
+                .iter()
+                .map(|vertex| Resource::Buffer(vertex.buffer)),
+        );
+        self.constructing.extend(
+            prepared
+                .index
+                .iter()
+                .map(|index| Resource::Buffer(index.buffer)),
+        );
+        self.constructing
+            .extend(prepared.targets.attachments().filter_map(|attachment| {
+                match attachment.description.source {
+                    AttachmentSource::Canonical { image, .. } => Some(Resource::Image(image)),
+                    _ => None,
+                }
+            }));
+        self.constructing
+            .extend(draws.iter().filter_map(|draw| match draw {
+                Draw::Indirect { buffer, .. } => Some(Resource::Buffer(*buffer)),
+                _ => None,
+            }));
+        let result = (|| loop {
+            let result = self.record_draws_inner(prepared, draws, push);
             self.device.submission.release_stream_uploads();
             if matches!(result, Err(VulkanError::DescriptorPressure)) {
                 // Descriptor allocation precedes draw emission. Submit the
@@ -620,14 +639,15 @@ impl VulkanResidency {
                 continue;
             }
             return result;
-        }
+        })();
+        self.constructing.truncate(retained);
+        result
     }
     fn record_draws_inner(
         &mut self,
         prepared: &PreparedDraw,
         draws: &[Draw],
         push: &[u8],
-        streaming: bool,
     ) -> Result<WorkTicket, VulkanError> {
         if draws.is_empty() {
             return Err(VulkanError::InvalidResource("empty draw group"));
@@ -674,7 +694,7 @@ impl VulkanResidency {
                     ..
                 } if !is_empty(&draw) => {
                     let (element, size) = match (&prepared.index, &prepared.inline_index) {
-                        (Some((i, _)), None) => (
+                        (Some(i), None) => (
                             match i.kind {
                                 vk::IndexType::UINT16 => 2,
                                 vk::IndexType::UINT8_EXT => 1,
@@ -720,28 +740,22 @@ impl VulkanResidency {
                 None => None,
             }
         };
-        let streaming = streaming && prepared.can_group() && !empty;
+        let streaming = !empty;
         let streams = if streaming {
-            self.stream_graphics(&graphics.program, &prepared.vertices)?
+            self.stream_graphics(&graphics.program)?
         } else {
             GraphicsStreams {
                 dynamic_offsets: None,
                 record: None,
-                program_mask: Vec::new(),
-                vertices: vec![None; prepared.vertices.len()],
             }
         };
         let record = streams.record;
         let mut vertex_bindings = Vec::with_capacity(prepared.vertices.len());
         let mut writers = smallvec::SmallVec::<[WriterId; 16]>::new();
         let indirect = if !empty {
-            writers = self.program_access_except(&graphics.program, &streams.program_mask)?;
-            for (vertex, stream) in prepared.vertices.iter().zip(streams.vertices) {
-                if let Some((buffer, offset)) = stream {
-                    vertex_bindings.push((buffer.handle, offset));
-                    continue;
-                }
-                self.ensure_buffer(vertex.buffer)?;
+            writers = self.program_access_except(&graphics.program)?;
+            for vertex in &prepared.vertices {
+                self.ensure_buffer_range(vertex.buffer, vertex.offset, vertex.size)?;
                 let handle = self.buffer_access_range(
                     vertex.buffer,
                     vertex.offset,
@@ -754,8 +768,8 @@ impl VulkanResidency {
                 vertex_bindings.push((handle, vertex.offset));
             }
             // Input order matches the immutable vertex lease array.
-            if let Some((index, _)) = &prepared.index {
-                self.ensure_buffer(index.buffer)?;
+            if let Some(index) = &prepared.index {
+                self.ensure_buffer_range(index.buffer, index.offset, index.size)?;
                 self.buffer_access_range(
                     index.buffer,
                     index.offset,
@@ -977,6 +991,14 @@ impl VulkanResidency {
         if let Some(offsets) = streams.dynamic_offsets {
             self.descriptor_offsets = offsets;
         }
+        let index_binding = prepared
+            .index
+            .as_ref()
+            .map(|index| {
+                self.buffer(index.buffer)
+                    .map(|entry| (entry.native.handle, index.offset, index.kind))
+            })
+            .transpose()?;
         self.publish_effect(&writers, |device| {
             let index = device.submission.recording.unwrap();
             let slot = &mut device.submission.slots[index];
@@ -991,8 +1013,8 @@ impl VulkanResidency {
             {
                 slot.native_targets.push(Arc::clone(&prepared.targets));
             }
-            // Vertex/index leases can survive removal from the residency index.
-            // Residency last_use also prevents release before this reservation retires.
+            // Actual use ticks retain vertex/index storage through cache merges
+            // and prevent eviction before this command reservation retires.
             let raw = &device.dispatch;
             unsafe {
                 if !empty {
@@ -1006,12 +1028,7 @@ impl VulkanResidency {
                     if let Some(value) = inline_binding
                         .as_ref()
                         .map(|(buffer, offset, kind)| (buffer.handle, *offset, *kind))
-                        .or_else(|| {
-                            prepared
-                                .index
-                                .as_ref()
-                                .map(|(i, buffer)| (buffer.handle, i.offset, i.kind))
-                        })
+                        .or(index_binding)
                         && slot.index_binding != Some(value)
                     {
                         device.submission.statistics.index_binds += 1;

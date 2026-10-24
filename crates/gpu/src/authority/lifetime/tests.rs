@@ -351,3 +351,58 @@ fn delayed_physical_retirement_cannot_discard_a_recycled_allocation() {
             .all(|part| part.producer.is_some_and(|p| p.resource == 2))
     );
 }
+
+#[test]
+fn buffer_relocation_preserves_versions_cpu_holes_and_revalidates_readbacks() {
+    let machine = Machine::new(4 * PAGE_SIZE).unwrap();
+    let allocation = machine
+        .account(4 * PAGE_SIZE)
+        .unwrap()
+        .allocate(4 * PAGE_SIZE)
+        .unwrap();
+    let all = AllocationRange::new(allocation.pin(), 0, 4 * PAGE_SIZE).unwrap();
+    let mapping = PhysicalMapping::new(&[all]).unwrap();
+    let old = mapping.slice(PAGE_SIZE, PAGE_SIZE).unwrap();
+    let full = |mapping: Arc<PhysicalMapping>| {
+        Footprint::new(
+            Arc::clone(&mapping),
+            WriteDomain::Buffer {
+                start: 0,
+                bytes: mapping.bytes(),
+            },
+        )
+        .unwrap()
+    };
+    let mut authority = Authority::new(machine.identity());
+    authority.register(1, vec![full(Arc::clone(&old))]).unwrap();
+    let writer = authority.create_writer(1, full(Arc::clone(&old))).unwrap();
+    let version = authority
+        .publish_write(&machine, writer, || Ok(((), NativeTick(1))))
+        .unwrap()
+        .1;
+    let hole = AllocationRange::new(allocation.pin(), PAGE_SIZE + 16, 16).unwrap();
+    authority.cpu_write(&[hole]).unwrap();
+    let request = AllocationRange::new(allocation.pin(), PAGE_SIZE, 64).unwrap();
+    let before = authority.resolve(std::slice::from_ref(&request)).unwrap();
+    let observation = authority.observe(1, full(old)).unwrap();
+    authority.register(2, vec![full(mapping)]).unwrap();
+    authority.relocate_buffer(1, 2, NativeTick(4)).unwrap();
+    assert!(observation.is_invalid());
+    assert!(authority.mapping(1, 0).is_none());
+    let after = authority.resolve(&[request]).unwrap();
+    assert_eq!(after.len(), 3);
+    assert!(after[1].producer.is_none());
+    for part in [&after[0], &after[2]] {
+        let producer = part.producer.unwrap();
+        assert_eq!(producer.resource, 2);
+        assert_eq!(producer.writer, writer);
+        assert_eq!(producer.sequence, version);
+        assert_eq!(producer.tick, NativeTick(4));
+        assert_eq!(producer.native, PAGE_SIZE + part.logical);
+    }
+    assert!(authority.current_readback(before[0]).unwrap().is_empty());
+    authority
+        .publish_write(&machine, writer, || Ok(((), NativeTick(5))))
+        .unwrap();
+    assert_eq!(authority.live_record_count(), 1);
+}

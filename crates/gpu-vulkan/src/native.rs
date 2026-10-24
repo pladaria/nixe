@@ -349,108 +349,144 @@ impl NativeGpuExecution {
         }
     }
     fn drawing(&mut self, source: &Arc<GuestDrawState>) -> Result<bool, VulkanError> {
-        let id = source.identity;
-        if let Some(draw) = self.drawings.get(&id) {
-            if !Arc::ptr_eq(&draw.source, source) {
-                return Err(VulkanError::InvalidResource(
-                    "prepared draw identity was reused",
-                ));
+        let retained = self.residency.constructing.len();
+        let result = self.prepare_drawing(source);
+        self.residency.constructing.truncate(retained);
+        result
+    }
+    fn prepare_drawing(&mut self, source: &Arc<GuestDrawState>) -> Result<bool, VulkanError> {
+        loop {
+            let id = source.identity;
+            if let Some(draw) = self.drawings.get(&id) {
+                if !Arc::ptr_eq(&draw.source, source) {
+                    return Err(VulkanError::InvalidResource(
+                        "prepared draw identity was reused",
+                    ));
+                }
+                if self.residency.draw_current(&draw.draw) {
+                    return Ok(true);
+                }
             }
+            self.drawings.remove(&id);
+            let already_prepared = matches!(
+                self.graphics
+                    .get(&(source.parameters.identity, source.program.shader.identity)),
+                Some(Graphics::Ready { .. })
+            );
+            if !self.graphics(source)? {
+                return Ok(false);
+            }
+            let Graphics::Ready { state, push, .. } =
+                &self.graphics[&(source.parameters.identity, source.program.shader.identity)]
+            else {
+                unreachable!()
+            };
+            let pipeline = Arc::clone(state.pipeline());
+            let push = Arc::clone(push);
+            let program_key = (source.program.identity, Arc::as_ptr(&pipeline) as usize);
+            let program = if let Some(program) = self
+                .programs
+                .get(&program_key)
+                .filter(|program| self.residency.program_current(program))
+            {
+                self.statistics.reused_programs += 1;
+                Arc::clone(program)
+            } else {
+                let bindings = self.bindings(&source.program, &pipeline)?;
+                let program = Arc::new(self.residency.prepare_program(pipeline, &bindings)?);
+                self.programs
+                    .insert(program_key, Arc::clone(&program), program.retained_bytes());
+                program
+            };
+            let Graphics::Ready { state, .. } =
+                &self.graphics[&(source.parameters.identity, source.program.shader.identity)]
+            else {
+                unreachable!()
+            };
+            self.residency.retain_program_effect(&program);
+            let graphics = state.bind(program)?;
+            let targets = self.targets(source)?;
+            let mut vertices = Vec::new();
+            for v in &source.vertices {
+                let buffer = self.residency.buffer_for_deferred_import(
+                    v.backing.clone(),
+                    vk::BufferUsageFlags::VERTEX_BUFFER,
+                )?;
+                self.residency
+                    .constructing
+                    .push(crate::residency::Resource::Buffer(buffer.buffer));
+                vertices.push(VertexBuffer {
+                    binding: v.binding,
+                    buffer: buffer.buffer,
+                    offset: buffer.offset,
+                    size: buffer.size,
+                });
+            }
+            let index = source
+                .index
+                .as_ref()
+                .map(|index| {
+                    let GuestIndexBuffer::Canonical(backing, kind) = index else {
+                        return Ok(None);
+                    };
+                    let buffer = self.residency.buffer_for_deferred_import(
+                        backing.clone(),
+                        vk::BufferUsageFlags::INDEX_BUFFER,
+                    )?;
+                    self.residency
+                        .constructing
+                        .push(crate::residency::Resource::Buffer(buffer.buffer));
+                    Ok::<_, VulkanError>(Some(IndexBuffer {
+                        buffer: buffer.buffer,
+                        offset: buffer.offset,
+                        size: buffer.size,
+                        kind: match kind {
+                            nixe_gpu::IndexType::Uint8 => vk::IndexType::UINT8_EXT,
+                            nixe_gpu::IndexType::Uint16 => vk::IndexType::UINT16,
+                            nixe_gpu::IndexType::Uint32 => vk::IndexType::UINT32,
+                        },
+                    }))
+                })
+                .transpose()?
+                .flatten();
+            if vertices
+                .iter()
+                .any(|v| !self.residency.buffer_binding_current(v.buffer))
+                || index.is_some_and(|i| !self.residency.buffer_binding_current(i.buffer))
+            {
+                continue;
+            }
+            let draw = if let Some(GuestIndexBuffer::Inline(bytes)) = &source.index {
+                self.residency.prepare_inline_index_draw(
+                    graphics,
+                    targets,
+                    vertices.into_boxed_slice(),
+                    Arc::clone(bytes),
+                )?
+            } else {
+                self.residency.prepare_draw(
+                    graphics,
+                    targets,
+                    vertices.into_boxed_slice(),
+                    index,
+                )?
+            };
+            if !self.residency.draw_current(&draw) {
+                continue;
+            }
+            self.statistics.prepared_draws += 1;
+            self.statistics.reused_graphics += u64::from(already_prepared);
+            self.drawings.insert(
+                id,
+                Drawing {
+                    source: Arc::clone(source),
+                    draw,
+                    push,
+                    recorded: false,
+                },
+            );
             return Ok(true);
         }
-        let already_prepared = matches!(
-            self.graphics
-                .get(&(source.parameters.identity, source.program.shader.identity)),
-            Some(Graphics::Ready { .. })
-        );
-        if !self.graphics(source)? {
-            return Ok(false);
-        }
-        let Graphics::Ready { state, push, .. } =
-            &self.graphics[&(source.parameters.identity, source.program.shader.identity)]
-        else {
-            unreachable!()
-        };
-        let pipeline = Arc::clone(state.pipeline());
-        let push = Arc::clone(push);
-        let program_key = (source.program.identity, Arc::as_ptr(&pipeline) as usize);
-        let program = if let Some(program) = self.programs.get(&program_key) {
-            self.statistics.reused_programs += 1;
-            Arc::clone(program)
-        } else {
-            let bindings = self.bindings(&source.program, &pipeline)?;
-            let program = Arc::new(self.residency.prepare_program(pipeline, &bindings)?);
-            self.programs
-                .insert(program_key, Arc::clone(&program), program.retained_bytes());
-            program
-        };
-        let Graphics::Ready { state, .. } =
-            &self.graphics[&(source.parameters.identity, source.program.shader.identity)]
-        else {
-            unreachable!()
-        };
-        let graphics = state.bind(program)?;
-        let targets = self.targets(source)?;
-        let mut vertices = Vec::new();
-        for v in &source.vertices {
-            let buffer = self.residency.buffer_for_deferred_import(
-                v.backing.clone(),
-                vk::BufferUsageFlags::VERTEX_BUFFER,
-            )?;
-            vertices.push(VertexBuffer {
-                binding: v.binding,
-                buffer,
-                offset: 0,
-                size: v.backing.bytes(),
-            });
-        }
-        let index = source
-            .index
-            .as_ref()
-            .map(|index| {
-                let GuestIndexBuffer::Canonical(backing, kind) = index else {
-                    return Ok(None);
-                };
-                let buffer = self.residency.buffer_for_deferred_import(
-                    backing.clone(),
-                    vk::BufferUsageFlags::INDEX_BUFFER,
-                )?;
-                Ok::<_, VulkanError>(Some(IndexBuffer {
-                    buffer,
-                    offset: 0,
-                    size: backing.bytes(),
-                    kind: match kind {
-                        nixe_gpu::IndexType::Uint8 => vk::IndexType::UINT8_EXT,
-                        nixe_gpu::IndexType::Uint16 => vk::IndexType::UINT16,
-                        nixe_gpu::IndexType::Uint32 => vk::IndexType::UINT32,
-                    },
-                }))
-            })
-            .transpose()?
-            .flatten();
-        let draw = if let Some(GuestIndexBuffer::Inline(bytes)) = &source.index {
-            self.residency.prepare_inline_index_draw(
-                graphics,
-                targets,
-                vertices.into_boxed_slice(),
-                Arc::clone(bytes),
-            )?
-        } else {
-            self.residency
-                .prepare_draw(graphics, targets, vertices.into_boxed_slice(), index)?
-        };
-        self.statistics.prepared_draws += 1;
-        self.statistics.reused_graphics += u64::from(already_prepared);
-        self.drawings.insert(
-            id,
-            Drawing {
-                source: Arc::clone(source),
-                draw,
-                push,
-                recorded: false,
-            },
-        );
-        Ok(true)
     }
     fn computing(&mut self, source: &Arc<GuestProgram>) -> Result<bool, VulkanError> {
         let id = source.identity;
@@ -467,6 +503,19 @@ impl NativeGpuExecution {
                     source: Arc::clone(source),
                 },
             );
+        }
+        if let Computing::Ready { program, .. } = &self.computing[&id] {
+            if self.residency.program_current(program) {
+                return Ok(true);
+            }
+            let pipeline = Arc::clone(program.pipeline());
+            let bindings = self.bindings(source, &pipeline)?;
+            let program = self.residency.prepare_program(pipeline, &bindings)?;
+            let Computing::Ready { program: old, .. } = self.computing.get_mut(&id).unwrap() else {
+                unreachable!()
+            };
+            *old = program;
+            return Ok(true);
         }
         let ready = match &self.computing[&id] {
             Computing::Ready { .. } => return Ok(true),
@@ -552,6 +601,15 @@ impl NativeGpuExecution {
     }
     fn command(&mut self, command: &NativeCommand) -> Result<(), VulkanError> {
         match command {
+            NativeCommand::CopyBuffer {
+                source,
+                destination,
+                regions,
+            } => {
+                self.residency
+                    .copy_physical_buffers(source, destination, regions)?;
+            }
+
             NativeCommand::WaitForIdle => self.residency.order_device()?,
             NativeCommand::ReportMemory {
                 target,
@@ -564,6 +622,11 @@ impl NativeGpuExecution {
             }
             NativeCommand::Sequence(commands) => self.record_commands(commands)?,
             NativeCommand::Draw { state, arguments } => {
+                if !self.drawing(state)? {
+                    return Err(VulkanError::InvalidResource(
+                        "prepared draw compilation became pending",
+                    ));
+                }
                 let Drawing {
                     source,
                     draw,
@@ -579,12 +642,17 @@ impl NativeGpuExecution {
                     ));
                 }
                 self.residency
-                    .draws_streamed(draw, &[state::arguments(*arguments)], push)?;
+                    .draws(draw, &[state::arguments(*arguments)], push)?;
                 self.statistics.draws += 1;
                 self.statistics.warm_draws += u64::from(*recorded);
                 *recorded = true;
             }
             NativeCommand::Dispatch { program, groups } => {
+                if !self.computing(program)? {
+                    return Err(VulkanError::InvalidResource(
+                        "prepared dispatch compilation became pending",
+                    ));
+                }
                 let Computing::Ready { program, push, .. } = &self.computing[&program.identity]
                 else {
                     return Err(VulkanError::InvalidResource(
@@ -658,6 +726,13 @@ impl NativeGpuExecution {
     fn record_commands(&mut self, commands: &[NativeCommand]) -> Result<(), VulkanError> {
         let mut at = 0;
         while at < commands.len() {
+            if let NativeCommand::Draw { state, .. } = &commands[at]
+                && !self.drawing(state)?
+            {
+                return Err(VulkanError::InvalidResource(
+                    "prepared draw compilation became pending",
+                ));
+            }
             if let NativeCommand::Draw { state, arguments } = &commands[at]
                 && let Some(Drawing {
                     draw,
@@ -684,8 +759,7 @@ impl NativeGpuExecution {
                     }
                     end += 1;
                 }
-                self.residency
-                    .draws_streamed(draw, &self.draw_arguments, push)?;
+                self.residency.draws(draw, &self.draw_arguments, push)?;
                 self.statistics.draws += (end - at) as u64;
                 self.statistics.warm_draws += (end - at) as u64 - u64::from(!*recorded);
                 *recorded = true;
@@ -846,6 +920,9 @@ impl GpuExecution for NativeGpuExecution {
         Ok(())
     }
     fn service_host(&mut self) -> Result<(), BackendRuntimeError> {
+        if self.host.is_none() {
+            self.residency.maintain_budget(false).map_err(runtime)?;
+        }
         let Some(mut host) = self.host.take() else {
             return Ok(());
         };
@@ -1105,6 +1182,7 @@ impl GpuExecution for NativeGpuExecution {
         self.residency
             .consume_cpu_writes(cpu_writes)
             .map_err(runtime)?;
+        self.residency.maintain_budget(true).map_err(runtime)?;
         nixe_gpu::trace::event(
             "frame_work",
             self.statistics.draws,
@@ -1122,6 +1200,12 @@ impl GpuExecution for NativeGpuExecution {
             self.residency.statistics().cpu_uploaded_bytes,
             self.residency.statistics().cpu_streamed_bytes,
             self.residency.statistics().gpu_copied_bytes,
+        );
+        nixe_gpu::trace::event(
+            "frame_buffers",
+            self.residency.statistics().buffer_allocations,
+            self.residency.statistics().buffer_merges,
+            self.residency.statistics().staging_pressure_waits,
         );
         self.frames
             .capture(&mut self.residency, request, &mut self.descriptors)

@@ -902,6 +902,85 @@ impl<R: Copy + Eq + Hash> Authority<R> {
         result.sort_unstable_by_key(|span| span.logical);
         Ok(result)
     }
+    /// Uniform streaming only needs to know whether any native producer owns
+    /// these bytes, not which producer wins each byte. CPU overwrites subtract
+    /// holes from every writer, so this query needs no sorted resolution or
+    /// duplicate ownership index.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/memory_tracker_base.h
+    pub fn has_buffer_producer(
+        &self,
+        mapping: &PhysicalMapping,
+        start: u64,
+        bytes: u64,
+    ) -> Result<bool, MemoryError> {
+        let end = start
+            .checked_add(bytes)
+            .filter(|&end| bytes != 0 && end <= mapping.bytes())
+            .ok_or(MemoryError::Invalid(
+                "buffer producer query exceeds mapping",
+            ))?;
+        if mapping.machine() != self.machine {
+            return Err(MemoryError::Invalid(
+                "buffer producer query names another machine",
+            ));
+        }
+        let first = mapping
+            .spans()
+            .partition_point(|span| span.logical + span.bytes <= start);
+        for span in &mapping.spans()[first..] {
+            if span.logical >= end {
+                break;
+            }
+            let low = span.start.get() + start.max(span.logical) - span.logical;
+            let high = span.start.get() + end.min(span.logical + span.bytes) - span.logical;
+            let mut found = false;
+            let mut result = Ok(());
+            self.index.overlapping(low, high, |candidate| {
+                if found || result.is_err() {
+                    return;
+                }
+                let Indexed::Resource(candidate) = candidate else {
+                    return;
+                };
+                let resource = &self.resources[&candidate.resource];
+                let owner = resource.footprints[candidate.footprint].mapping();
+                if owner.spans()[candidate.span].allocation != span.allocation {
+                    return;
+                }
+                for id in &resource.writers {
+                    let writer = &self.writers[id];
+                    if writer.sequence.0 == 0 || !Arc::ptr_eq(writer.footprint.mapping(), owner) {
+                        continue;
+                    }
+                    result = writer.visit(
+                        candidate.span,
+                        ArenaOffset::new(low),
+                        high - low,
+                        |part, _| {
+                            let covered = writer
+                                .holes
+                                .range(..=(span.allocation, part.start.get()))
+                                .next_back()
+                                .is_some_and(|(&(allocation, _), &stop)| {
+                                    allocation == span.allocation
+                                        && stop >= part.start.get() + part.bytes
+                                });
+                            found = !covered;
+                            !found
+                        },
+                    );
+                    if found || result.is_err() {
+                        break;
+                    }
+                }
+            });
+            result?;
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     /// Resolve exact image/aspect or buffer coverage into the destination's
     /// native byte coordinates. Row padding and native-only lanes are absent.
     /// This queries weak metadata; the consuming operation retains its own

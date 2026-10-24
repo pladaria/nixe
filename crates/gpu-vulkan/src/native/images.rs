@@ -300,42 +300,68 @@ impl NativeGpuExecution {
                 .map(|index| &program.bindings[index].1)
                 .map_err(|_| VulkanError::InvalidResource("reflected shader resource is missing"))
         };
-        let mut result = Vec::with_capacity(pipeline.binding_origins.len());
-        for origin in &pipeline.binding_origins {
-            let binding = lookup(origin.resource)?;
-            if let Some(sampler) = origin.sampler {
-                let GuestBinding::Image { image, arrayed } = binding else {
-                    return Err(VulkanError::InvalidResource(
-                        "combined descriptor requires an image",
-                    ));
-                };
-                let GuestBinding::Sampler(sampler) = lookup(sampler)? else {
-                    return Err(VulkanError::InvalidResource(
-                        "combined descriptor requires a sampler",
-                    ));
-                };
-                let image = self.view(image, *arrayed)?;
-                let sampler = self.guest_sampler(sampler)?;
-                result.push(Binding::CombinedImageSampler { image, sampler });
-                continue;
-            }
-            result.push(match binding {
-                GuestBinding::NullBuffer => Binding::NullBuffer,
-                GuestBinding::Buffer(backing) => Binding::Buffer {
-                    buffer: self.residency.buffer_for_deferred_import(
-                        backing.clone(),
-                        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER,
-                    )?,
-                    offset: 0,
-                    size: backing.bytes(),
-                },
-                GuestBinding::Image { image, arrayed } => {
-                    Binding::Image(self.view(image, *arrayed)?)
+        let retained = self.residency.constructing.len();
+        let result = (|| loop {
+            let mut result = Vec::with_capacity(pipeline.binding_origins.len());
+            for origin in &pipeline.binding_origins {
+                let binding = lookup(origin.resource)?;
+                if let Some(sampler) = origin.sampler {
+                    let GuestBinding::Image { image, arrayed } = binding else {
+                        return Err(VulkanError::InvalidResource(
+                            "combined descriptor requires an image",
+                        ));
+                    };
+                    let GuestBinding::Sampler(sampler) = lookup(sampler)? else {
+                        return Err(VulkanError::InvalidResource(
+                            "combined descriptor requires a sampler",
+                        ));
+                    };
+                    let image = self.view(image, *arrayed)?;
+                    let sampler = self.guest_sampler(sampler)?;
+                    result.push(Binding::CombinedImageSampler { image, sampler });
+                    self.residency
+                        .constructing
+                        .push(crate::residency::Resource::Image(image.image));
+                    continue;
                 }
-                GuestBinding::Sampler(s) => Binding::Sampler(self.guest_sampler(s)?),
-            });
-        }
-        Ok(result)
+                result.push(match binding {
+                    GuestBinding::NullBuffer => Binding::NullBuffer,
+                    GuestBinding::Buffer(backing) => {
+                        let range = self.residency.buffer_for_deferred_import(
+                            Arc::clone(backing),
+                            vk::BufferUsageFlags::STORAGE_BUFFER
+                                | vk::BufferUsageFlags::UNIFORM_BUFFER,
+                        )?;
+                        Binding::Buffer {
+                            buffer: range.buffer,
+                            offset: range.offset,
+                            size: range.size,
+                        }
+                    }
+                    GuestBinding::Image { image, arrayed } => {
+                        Binding::Image(self.view(image, *arrayed)?)
+                    }
+                    GuestBinding::Sampler(s) => Binding::Sampler(self.guest_sampler(s)?),
+                });
+                match result.last().unwrap() {
+                    Binding::Buffer { buffer, .. } | Binding::TexelBuffer { buffer, .. } => self
+                        .residency
+                        .constructing
+                        .push(crate::residency::Resource::Buffer(*buffer)),
+                    Binding::Image(view) | Binding::CombinedImageSampler { image: view, .. } => {
+                        self.residency
+                            .constructing
+                            .push(crate::residency::Resource::Image(view.image))
+                    }
+                    _ => (),
+                }
+            }
+            if self.residency.bindings_current(&result) {
+                return Ok(result);
+            }
+        })();
+        self.residency.constructing.truncate(retained);
+        result
     }
     fn guest_sampler(
         &mut self,

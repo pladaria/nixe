@@ -401,16 +401,20 @@ fn ordered_literal_fences_publish_ram_and_reopen_aliases_without_readback() {
         }
         // A later CPU overwrite must survive both queued literal publications.
         let native = core.enter_native().unwrap();
-        assert!(
-            space
-                .write_native(
-                    &native,
-                    GuestVirtualAddress::new(3 * PAGE_SIZE + 131),
-                    &[99]
-                )
-                .unwrap()
-        );
+        let address = GuestVirtualAddress::new(3 * PAGE_SIZE + 131);
+        let written = space.write_native(&native, address, &[99]).unwrap();
         drop(native);
+        if !written {
+            // A retained buffer still observes CPU writes after device coverage
+            // retires. Resolve that first store through the normal owner path.
+            let ranges = space.capture(address, 1, MemoryPermissions::WRITE).unwrap();
+            assert!(matches!(
+                execution
+                    .access_memory(ranges, nixe_memory::AccessOperation::Write(Box::new([99])))
+                    .unwrap(),
+                nixe_memory::AccessResult::Written
+            ));
+        }
         execution.synchronize_command_sources().unwrap();
         for _ in 0..2 {
             assert!(execution.poll_completion().unwrap().is_some());
@@ -469,7 +473,8 @@ fn buffer_fence_downloads_publish_current_ranges_before_later_cpu_scalar_reads()
             PhysicalMapping::new(std::slice::from_ref(&range)).unwrap(),
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )
-        .unwrap();
+        .unwrap()
+        .buffer;
     assert_eq!(
         residency
             .write_buffer(id, 0, &vec![7; PAGE_SIZE as usize])

@@ -12,7 +12,6 @@ impl VulkanResidency {
         size: u64,
         value: u32,
     ) -> Result<WorkTicket, VulkanError> {
-        self.ensure_buffer(id)?;
         self.check_buffer_range(id, offset, size)?;
         let pattern = value.to_le_bytes();
         let prefix = ((4 - offset % 4) % 4).min(size);
@@ -60,7 +59,6 @@ impl VulkanResidency {
         size: u64,
         value: u32,
     ) -> Result<WorkTicket, VulkanError> {
-        self.ensure_buffer(id)?;
         self.check_buffer_range(id, offset, size)?;
         if !offset.is_multiple_of(4) || !size.is_multiple_of(4) {
             return Err(VulkanError::InvalidResource(

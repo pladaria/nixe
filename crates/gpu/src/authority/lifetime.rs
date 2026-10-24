@@ -5,6 +5,94 @@ use nixe_memory::{Extent, Machine};
 mod tests;
 
 impl<R: Copy + Eq + Hash> Authority<R> {
+    /// A native buffer merge copies the old storage before changing its source
+    /// coordinates. Versions, CPU holes and pending access dependencies survive;
+    /// a previously issued readback is revalidated against the new resource.
+    pub fn relocate_buffer(
+        &mut self,
+        source: R,
+        destination: R,
+        tick: NativeTick,
+    ) -> Result<(), MemoryError> {
+        if source == destination {
+            return Err(MemoryError::Invalid(
+                "buffer relocation requires distinct resources",
+            ));
+        }
+        let source_entry = self
+            .resources
+            .get(&source)
+            .ok_or(MemoryError::Invalid("buffer relocation source is absent"))?;
+        let destination_entry = self
+            .resources
+            .get(&destination)
+            .ok_or(MemoryError::Invalid(
+                "buffer relocation destination is absent",
+            ))?;
+        let ([old], [new]) = (
+            source_entry.footprints.as_slice(),
+            destination_entry.footprints.as_slice(),
+        ) else {
+            return Err(MemoryError::Invalid(
+                "buffer relocation requires linear geometry",
+            ));
+        };
+        if !matches!(old.domain(), crate::physical::WriteDomain::Buffer { .. })
+            || !matches!(new.domain(), crate::physical::WriteDomain::Buffer { .. })
+        {
+            return Err(MemoryError::Invalid(
+                "buffer relocation requires linear geometry",
+            ));
+        }
+        let offset = new
+            .mapping()
+            .containing_offset(old.mapping())
+            .ok_or(MemoryError::Invalid(
+                "buffer relocation changes physical addressing",
+            ))?;
+        let mut replacements = Vec::new();
+        for &id in &source_entry.writers {
+            let crate::physical::WriteDomain::Buffer { start, bytes } =
+                self.writers[&id].footprint.domain()
+            else {
+                return Err(MemoryError::Invalid(
+                    "buffer relocation has a non-linear writer",
+                ));
+            };
+            replacements.push((
+                id,
+                Footprint::new(
+                    Arc::clone(new.mapping()),
+                    crate::physical::WriteDomain::Buffer {
+                        start: start + offset,
+                        bytes,
+                    },
+                )?,
+            ));
+        }
+        let entry = self.resources.remove(&source).unwrap();
+        for key in entry.registrations {
+            self.index.remove(key);
+        }
+        for flag in entry
+            .consumers
+            .into_iter()
+            .filter_map(|consumer| consumer.invalid.upgrade())
+        {
+            flag.store(true, Ordering::Release);
+        }
+        for (id, footprint) in replacements {
+            let writer = self.writers.get_mut(&id).unwrap();
+            writer.resource = destination;
+            writer.footprint = footprint;
+            writer.tick = tick;
+        }
+        let target = self.resources.get_mut(&destination).unwrap();
+        target.writers.extend(entry.writers);
+        target.live_writers += entry.live_writers;
+        target.normalize_at = target.live_writers.saturating_mul(2).max(64);
+        Ok(())
+    }
     /// Cold native-budget selection consults the same exact producer index.
     /// A never-written resource is immediately reconstructible; materialized
     /// writers can leave without allowing hidden older versions to resurface.

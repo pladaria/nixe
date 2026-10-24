@@ -22,6 +22,12 @@ pub trait MaxwellWorkBatch<W: MaxwellWork + ?Sized>: Default + Send {
         bytes: &[u8],
         fence: bool,
     );
+    fn copy_buffer(
+        &mut self,
+        source: Arc<nixe_gpu::physical::PhysicalMapping>,
+        destination: Arc<nixe_gpu::physical::PhysicalMapping>,
+        regions: Box<[nixe_gpu::native::BufferCopyRegion]>,
+    );
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -81,6 +87,19 @@ impl MaxwellWorkBatch<nixe_gpu::native::NativeWork> for NativeWorkBatch {
                 offset,
                 bytes: Arc::from(bytes),
                 fence,
+            });
+    }
+    fn copy_buffer(
+        &mut self,
+        source: Arc<nixe_gpu::physical::PhysicalMapping>,
+        destination: Arc<nixe_gpu::physical::PhysicalMapping>,
+        regions: Box<[nixe_gpu::native::BufferCopyRegion]>,
+    ) {
+        self.commands
+            .push(nixe_gpu::native::NativeCommand::CopyBuffer {
+                source,
+                destination,
+                regions,
             });
     }
     fn len(&self) -> usize {

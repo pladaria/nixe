@@ -89,19 +89,6 @@ impl<W: MaxwellWork> MaxwellSubmissionExecutionPlan<W> {
     pub const fn completion(&self) -> Option<GuestTimelinePoint> {
         self.completion
     }
-
-    /// Returns whether this plan contains work which must cross a neutral GPU
-    /// backend instead of the canonical-memory initialization executor.
-    #[must_use]
-    pub fn requires_backend(&self) -> bool {
-        self.steps.iter().any(|step| {
-            matches!(
-                step,
-                MaxwellSubmissionExecutionStep::Ordering(_)
-                    | MaxwellSubmissionExecutionStep::Gpu(_)
-            )
-        })
-    }
 }
 
 /// Failure before guest completion publication at the Maxwell/backend bridge.
@@ -1113,10 +1100,49 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
                     source,
                     destination,
                 } => {
-                    let _trace = nixe_gpu::trace::span("canonical_copy", self.frontend.get(), 0, 0);
-                    stage_memory_copy(*operation, source, destination, access).map_err(
-                        |error| MaxwellBackendExecutionError::Canonical(Box::new(error)),
-                    )?;
+                    if operation.has_remap() {
+                        stage_memory_copy(*operation, source, destination, access).map_err(
+                            |error| MaxwellBackendExecutionError::Canonical(Box::new(error)),
+                        )?;
+                    } else {
+                        let physical = |range: &MaxwellResolvedRange| -> Result<_, MaxwellBackendExecutionError> {
+                            let mappings = range.segments().iter().map(|segment|
+                                segment.mapping().physical().slice(segment.backing_offset(), segment.size()))
+                                .collect::<Result<Vec<_>, _>>();
+                            mappings.and_then(|mappings| nixe_gpu::physical::PhysicalMapping::join(&mappings))
+                                .map_err(|error| MaxwellBackendExecutionError::Canonical(Box::new(
+                                    MaxwellCanonicalExecutionError::MemoryCopyTransaction { source: operation.source(), error: Arc::new(error) })))
+                        };
+                        let mut regions: Vec<nixe_gpu::native::BufferCopyRegion> = Vec::new();
+                        for run in operation.byte_regions() {
+                            let (source, destination, bytes) = run.map_err(|error| {
+                                MaxwellBackendExecutionError::Canonical(Box::new(
+                                    MaxwellCanonicalExecutionError::MemoryCopyTransform {
+                                        source: operation.source(),
+                                        error,
+                                    },
+                                ))
+                            })?;
+                            if let Some(last) = regions.last_mut()
+                                && last.source + last.bytes == source as u64
+                                && last.destination + last.bytes == destination as u64
+                            {
+                                last.bytes += bytes as u64;
+                            } else {
+                                regions.push(nixe_gpu::native::BufferCopyRegion {
+                                    source: source as u64,
+                                    destination: destination as u64,
+                                    bytes: bytes as u64,
+                                });
+                            }
+                        }
+                        self.batch.copy_buffer(
+                            physical(source)?,
+                            physical(destination)?,
+                            regions.into_boxed_slice(),
+                        );
+                        self.segments.remaining_operations -= 1;
+                    }
                     self.next_step += 1;
                 }
                 MaxwellSubmissionExecutionStep::Gpu(work) => {
@@ -1147,12 +1173,10 @@ impl<W: MaxwellWork> MaxwellBackendExecution<W> {
     fn step_requires_submission(&self, step: &MaxwellSubmissionExecutionStep<W>) -> bool {
         // Native recording captures every preceding consumer before CPU bytes
         // change. No retained access inventory is needed across GPU operations.
-        !self.batch.is_empty()
-            && matches!(
-                step,
-                MaxwellSubmissionExecutionStep::InlineWrite { .. }
-                    | MaxwellSubmissionExecutionStep::MemoryCopy { .. }
-            )
+        !self.batch.is_empty() && matches!(step, MaxwellSubmissionExecutionStep::InlineWrite { .. })
+            || !self.batch.is_empty()
+                && matches!(step, MaxwellSubmissionExecutionStep::MemoryCopy { operation, .. } if operation.has_remap()
+                )
     }
 
     fn take_segment(
@@ -1247,7 +1271,7 @@ fn backend_step_prepares_work<W: MaxwellWork>(step: &MaxwellSubmissionExecutionS
         MaxwellSubmissionExecutionStep::WaitForIdle
             | MaxwellSubmissionExecutionStep::SemaphoreWrite { .. }
             | MaxwellSubmissionExecutionStep::NotificationWrite { .. }
-    )
+    ) || matches!(step, MaxwellSubmissionExecutionStep::MemoryCopy { operation, .. } if !operation.has_remap())
 }
 fn too_many_backend_segments() -> MaxwellBackendExecutionError {
     MaxwellBackendExecutionError::InvalidSubmission(
@@ -1307,57 +1331,28 @@ fn stage_memory_copy(
     else {
         unreachable!("read operation returns bytes")
     };
-    if !operation.has_remap() {
-        let mut runs = operation
-            .byte_regions()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(
-                |error| MaxwellCanonicalExecutionError::MemoryCopyTransform {
-                    source: operation.source(),
-                    error,
-                },
-            )?;
-        runs.sort_unstable_by_key(|&(_, destination, _)| destination);
-        let mut i = 0;
-        while i < runs.len() {
-            let (src, dst, mut size) = runs[i];
-            i += 1;
-            while i < runs.len() && runs[i].0 == src + size && runs[i].1 == dst + size {
-                size += runs[i].2;
-                i += 1;
-            }
-            write_memory_copy_subrange(
-                destination,
-                dst,
-                &source_bytes[src..src + size],
-                operation.source(),
-                access,
-            )?;
-        }
-    } else {
-        let mut bytes = memory_copy_buffer(operation.destination_range_size(), operation.source())?;
-        operation
-            .copy_bytes(&source_bytes, &mut bytes)
-            .map_err(
-                |error| MaxwellCanonicalExecutionError::MemoryCopyTransform {
-                    source: operation.source(),
-                    error,
-                },
-            )?;
-        for span in operation.written_spans().map_err(|error| {
-            MaxwellCanonicalExecutionError::MemoryCopyTransform {
+    let mut bytes = memory_copy_buffer(operation.destination_range_size(), operation.source())?;
+    operation
+        .copy_bytes(&source_bytes, &mut bytes)
+        .map_err(
+            |error| MaxwellCanonicalExecutionError::MemoryCopyTransform {
                 source: operation.source(),
                 error,
-            }
-        })? {
-            write_memory_copy_subrange(
-                destination,
-                span.start,
-                &bytes[span],
-                operation.source(),
-                access,
-            )?;
+            },
+        )?;
+    for span in operation.written_spans().map_err(|error| {
+        MaxwellCanonicalExecutionError::MemoryCopyTransform {
+            source: operation.source(),
+            error,
         }
+    })? {
+        write_memory_copy_subrange(
+            destination,
+            span.start,
+            &bytes[span],
+            operation.source(),
+            access,
+        )?;
     }
     Ok(())
 }
@@ -1487,7 +1482,6 @@ mod tests {
         plan: MaxwellSubmissionExecutionPlan,
         timestamp: u64,
     ) -> Result<Option<GuestTimelinePoint>, MaxwellBackendExecutionError> {
-        assert!(!plan.requires_backend());
         let mut execution = execution_from_plan(plan);
         while let Some(segment) =
             execution.next_segment_with_memory(timestamp, &mut crate::test_memory::apply)?
@@ -1502,6 +1496,50 @@ mod tests {
         }
         assert!(execution.is_finished());
         Ok(execution.completion())
+    }
+
+    // Interpret only the emitted copy regions as a reference for layout lowering.
+    // Native execution and overlapping-copy semantics are tested on Vulkan.
+    fn execute_copy_test_plan(plan: MaxwellSubmissionExecutionPlan) {
+        let mut execution = execution_from_plan(plan);
+        let mut count = 0;
+        while let Some(segment) = execution
+            .next_segment_with_memory(0, &mut |_, _| {
+                panic!("ordinary copies must not access canonical bytes in the frontend")
+            })
+            .unwrap()
+        {
+            for command in &segment.commands {
+                let nixe_gpu::native::NativeCommand::CopyBuffer {
+                    source,
+                    destination,
+                    regions,
+                } = command
+                else {
+                    panic!("expected native copy command");
+                };
+                let nixe_memory::AccessResult::Read(bytes) = crate::test_memory::apply(
+                    source.pin(0, source.bytes()).unwrap(),
+                    nixe_memory::AccessOperation::Read,
+                )
+                .unwrap() else {
+                    panic!("read result")
+                };
+                for region in regions {
+                    let start = region.source as usize;
+                    let end = start + region.bytes as usize;
+                    crate::test_memory::apply(
+                        destination.pin(region.destination, region.bytes).unwrap(),
+                        nixe_memory::AccessOperation::Write(bytes[start..end].into()),
+                    )
+                    .unwrap();
+                }
+                count += 1;
+            }
+            execution.accept_segment();
+        }
+        assert!(count > 0);
+        assert!(execution.is_finished());
     }
 
     fn packet(
@@ -2412,7 +2450,7 @@ mod tests {
             plan.steps(),
             [MaxwellSubmissionExecutionStep::MemoryCopy { .. }]
         ));
-        execute_canonical_test_plan(plan, 0).unwrap();
+        execute_copy_test_plan(plan);
         let mut actual = [0; 0x1000];
         crate::test_memory::read(&output, 0, &mut actual).unwrap();
         let mut expected = [0xaa; 0x1000];
@@ -2446,7 +2484,7 @@ mod tests {
             &mut MaxwellNativeFrontend::new(Default::default()),
         )
         .unwrap();
-        execute_canonical_test_plan(plan, 0).unwrap();
+        execute_copy_test_plan(plan);
         crate::test_memory::read(&output, 0, &mut actual).unwrap();
         assert_eq!(actual, expected);
         for (method, value) in [(0x088c, 0), (0x08d0, 0), (0x08d8, 0)] {

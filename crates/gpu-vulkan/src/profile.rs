@@ -403,6 +403,7 @@ impl FeatureSet {
             self.names.push(ash::ext::pipeline_creation_feedback::NAME);
         }
         for name in [
+            ash::ext::memory_budget::NAME,
             ash::khr::external_memory_fd::NAME,
             ash::khr::external_semaphore_fd::NAME,
         ] {

@@ -187,6 +187,7 @@ impl VulkanResidency {
             generation,
             entry: Some(ImageEntry {
                 contents: Contents {
+                    lru: None,
                     geometry: geometry.clone(),
                     cpu: Vec::new(),
                     device: Vec::new(),
@@ -598,7 +599,7 @@ impl VulkanResidency {
                 canonical_import,
             )?;
             if !canonical_import {
-                self.refresh_buffer(source, false)?;
+                self.refresh_buffer(source, false, None)?;
             }
             let cpu = self.buffer(source)?.contents.cpu.clone();
             self.constructing.push(Resource::Buffer(source));

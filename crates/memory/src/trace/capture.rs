@@ -214,6 +214,7 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
                 | "frame_work"
                 | "frame_queue"
                 | "frame_memory"
+                | "frame_buffers"
                 | "performance_clock_sync"
                 | "shader_compile"
                 | "pipeline_compile"

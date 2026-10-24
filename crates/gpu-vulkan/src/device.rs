@@ -55,6 +55,7 @@ pub(crate) struct DeviceOwner {
     pub allocator: Mutex<Option<Allocator>>,
     pub debug: Option<ash::ext::debug_utils::Device>,
     pub non_coherent_atom_size: u64,
+    pub local_allocation_bytes: std::sync::atomic::AtomicU64,
 }
 impl DeviceOwner {
     pub fn name<T: Handle>(&self, handle: T, name: &str) -> Result<(), VulkanError> {
@@ -98,6 +99,51 @@ struct Candidate {
 }
 
 impl VulkanDevice {
+    pub(crate) fn local_memory_budget(&self) -> (u64, u64) {
+        let available = self
+            .profile
+            .enabled_extensions
+            .iter()
+            .any(|name| name == "VK_EXT_memory_budget");
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut properties = vk::PhysicalDeviceMemoryProperties2::default();
+        if available {
+            properties = properties.push_next(&mut budget);
+        }
+        unsafe {
+            self.owner
+                .instance
+                .instance
+                .get_physical_device_memory_properties2(self.owner.physical, &mut properties);
+        }
+        let heaps = &properties.memory_properties.memory_heaps
+            [..properties.memory_properties.memory_heap_count as usize];
+        let mut capacity = 0;
+        let mut usage = 0;
+        for (index, heap) in heaps.iter().enumerate() {
+            if !heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                continue;
+            }
+            capacity += if available {
+                budget.heap_budget[index]
+            } else {
+                heap.size
+            };
+            if available {
+                usage += budget.heap_usage[index];
+            }
+        }
+        // Driver usage includes allocator blocks, imported storage and internal
+        // native objects. Allocation accounting is the fallback without EXT.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/vulkan_common/vulkan_device.cpp
+        usage = usage.max(
+            self.owner
+                .local_allocation_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        (capacity, usage)
+    }
+
     pub fn new(options: DeviceOptions, target: Option<SurfaceTarget>) -> Result<Self, VulkanError> {
         Self::with_queue_configuration(options, target, QueueConfiguration::default())
     }
@@ -185,6 +231,7 @@ impl VulkanDevice {
             allocator: Mutex::new(None),
             debug,
             non_coherent_atom_size: selected.profile.limits.non_coherent_atom_size,
+            local_allocation_bytes: std::sync::atomic::AtomicU64::new(0),
         });
         // The owner exists before any subsequent fallible creation, so failures
         // destroy the independent device and instance without a resource rollback layer.

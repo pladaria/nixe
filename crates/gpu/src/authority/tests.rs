@@ -956,6 +956,20 @@ fn producer_sequence_cpu_subtraction_and_readback_match_an_independent_byte_mode
             }
         }
         assert_eq!(actual, expected, "step {step}");
+        let mapping = PhysicalMapping::new(&demand).unwrap();
+        for start in 0..64 {
+            let bytes = (64 - start).min(9);
+            assert_eq!(
+                authority
+                    .has_buffer_producer(&mapping, start, bytes)
+                    .unwrap(),
+                expected[start as usize..(start + bytes) as usize]
+                    .iter()
+                    .any(Option::is_some),
+                "producer query at step {step}, byte {start}"
+            );
+        }
+
         assert!(!unrelated.is_invalid());
     }
     authority.record_write(first, NativeTick(1001)).unwrap();

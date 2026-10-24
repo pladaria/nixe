@@ -617,6 +617,7 @@ pub(crate) fn resolve_resource_roles(
         required_roles,
         inspect_complete_state,
         &[],
+        1,
         None,
         access,
     )
@@ -631,6 +632,7 @@ fn resolve_maxwell_three_d_resources_inner(
 
     inspect_complete_state: bool,
     buffer_sizes: &[(MaxwellThreeDResourceRole, MaxwellShaderBufferSize)],
+    storage_alignment: u64,
     retained_backings: Option<&mut MaxwellThreeDRetainedBackingCache>,
     access: &mut nixe_gpu::MemoryAccess<'_>,
 ) -> Result<
@@ -794,7 +796,15 @@ fn resolve_maxwell_three_d_resources_inner(
                 .iter()
                 .find_map(|(r, size)| (*r == role).then_some(*size))
                 .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-            builder.storage_buffer(state, role, group, slot, byte_offset, size)?;
+            builder.storage_buffer(
+                state,
+                role,
+                group,
+                slot,
+                byte_offset,
+                size,
+                storage_alignment,
+            )?;
         }
     }
     let texture_headers_required = required_roles.iter().any(|role| {
@@ -956,6 +966,7 @@ struct ColorBlitCacheEntry {
 
 #[derive(Debug, Default)]
 pub(crate) struct MaxwellThreeDResolvedResourceCache {
+    storage_alignment: u64,
     blits: HashMap<ColorBlitKey, ColorBlitCacheEntry>,
     solid_images: HashMap<SolidImageKey, ColorBlitCacheEntry>,
     entries: Vec<MaxwellThreeDResolvedResourceCacheEntry>,
@@ -970,6 +981,13 @@ pub(crate) struct MaxwellThreeDResolvedResourceCache {
 }
 
 impl MaxwellThreeDResolvedResourceCache {
+    pub(crate) fn new(storage_alignment: u64) -> Self {
+        Self {
+            storage_alignment: storage_alignment.max(1),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn resolve_solid_image(
         &mut self,
         request: &crate::engines::twod::MaxwellTwoDSolidOperation,
@@ -1340,6 +1358,7 @@ impl MaxwellThreeDResolvedResourceCache {
             required_roles,
             inspect_complete_state,
             buffer_sizes,
+            self.storage_alignment.max(1),
             Some(&mut self.retained_backings),
             access,
         )?;
@@ -1939,6 +1958,7 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn storage_buffer(
         &mut self,
         state: &MaxwellThreeDState,
@@ -1947,6 +1967,7 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         slot: u8,
         byte_offset: u32,
         size: MaxwellShaderBufferSize,
+        alignment: u64,
     ) -> Result<(), MaxwellThreeDResourceError> {
         // NVN storage descriptors contain a u64 GPU VA and a u32 byte size.
         // Descriptor contents are draw state, not shader translation identity.
@@ -2024,10 +2045,11 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
                 address: target,
             });
         }
+        let aligned = target / alignment * alignment;
         self.buffer(
             role,
-            MaxwellThreeDUnresolvedAddress::new((target >> 32) as u8, target as u32),
-            target_size,
+            MaxwellThreeDUnresolvedAddress::new((aligned >> 32) as u8, aligned as u32),
+            target_size + target - aligned,
         )
     }
 
