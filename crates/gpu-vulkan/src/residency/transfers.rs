@@ -128,20 +128,6 @@ impl VulkanResidency {
         }
         Ok(p)
     }
-    pub(super) fn image_rect_bytes(p: ImagePlane, rect: vk::Rect2D) -> Vec<(u64, u64)> {
-        let start = rect.offset.y as u32 / p.block_extent.height;
-        let rows = rect.extent.height.div_ceil(p.block_extent.height);
-        let x =
-            u64::from(rect.offset.x as u32 / p.block_extent.width) * u64::from(p.bytes_per_block);
-        let size = u64::from(rect.extent.width.div_ceil(p.block_extent.width))
-            * u64::from(p.bytes_per_block);
-        let mut intervals = Vec::with_capacity(rows as usize);
-        for row in start..start + rows {
-            intervals.push((p.offset + u64::from(row) * p.row_pitch + x, size));
-        }
-        normalize(&mut intervals);
-        intervals
-    }
     pub(super) fn prepare_image_rect(
         &mut self,
         id: ImageId,
@@ -153,12 +139,9 @@ impl VulkanResidency {
                 "decoded compressed textures are read-only; writes require the encoded canonical representation",
             ));
         }
-        if self.image(id)?.leases != 0 {
-            return Err(VulkanError::InvalidResource(
-                "image write would overwrite a leased version",
-            ));
-        }
-        self.observe_image_cpu_writes(id)?;
+        // Exact transfers only author this rectangle. Conditional shader writes
+        // prepare initialized contents in program/attachment consumption instead.
+        self.invalidate_cpu_resources(&[])?;
         self.prepare_image_write(id, p, rect)
     }
     pub(super) fn finish_image_rect(
@@ -167,13 +150,6 @@ impl VulkanResidency {
         p: ImagePlane,
         rect: vk::Rect2D,
     ) -> Result<(), VulkanError> {
-        for (offset, bytes) in Self::image_rect_bytes(
-            self.image(id)?.storage_plane(p),
-            self.image(id)?.storage_rect(rect),
-        ) {
-            self.contents_mut(Resource::Image(id))
-                .validate_interval(offset, bytes);
-        }
         let full = self.image(id)?.planes.len() == 1 && rect == full_rect(p);
         if full {
             if self
@@ -205,10 +181,18 @@ impl VulkanResidency {
                 .entry
                 .as_mut()
                 .expect("image")
-                .contents
-                .cpu
-                .clear();
+                .synchronized = true;
         }
+        // Bound cached replay plans after their commands have been published.
+        // Authority retains any released writer that still owns newest bytes.
+        if self.image(id)?.write_plans.len() > 64 {
+            let plans =
+                std::mem::take(&mut self.images[id.slot].entry.as_mut().unwrap().write_plans);
+            for (_, writer) in plans {
+                self.authority.release_writer(writer)?;
+            }
+        }
+        self.track_image_cpu(id)?;
         self.define_image_rect(id, p, rect);
         self.advance_image_producer(id)
     }
@@ -255,6 +239,24 @@ impl VulkanResidency {
             .iter()
             .position(|plane| *plane == p)
             .expect("plane");
+        let contains = |outer: vk::Rect2D, inner: vk::Rect2D| {
+            outer.offset.x <= inner.offset.x
+                && outer.offset.y <= inner.offset.y
+                && outer.offset.x as i64 + i64::from(outer.extent.width)
+                    >= inner.offset.x as i64 + i64::from(inner.extent.width)
+                && outer.offset.y as i64 + i64::from(outer.extent.height)
+                    >= inner.offset.y as i64 + i64::from(inner.extent.height)
+        };
+        if entry
+            .discarded
+            .iter()
+            .any(|&(p, old)| p == plane && contains(old, rect))
+        {
+            return;
+        }
+        entry
+            .discarded
+            .retain(|&(p, old)| p != plane || !contains(rect, old));
         entry.discarded.push((plane, rect));
     }
     pub(super) fn require_image_initialized(
@@ -490,7 +492,13 @@ impl VulkanResidency {
         };
         let dst = self.checked_image_rect(destination, destination_plane, rect)?;
         self.ensure_image_initialized(source, src, source_rect)?;
-        if src.aspect != dst.aspect
+        if self.image(source)?.description.samples != self.image(destination)?.description.samples
+            || !format::copy_compatible(
+                self.image(source)?.description.format,
+                self.image(destination)?.description.format,
+                src.aspect,
+            )
+            || src.aspect != dst.aspect
             || src.block_extent != dst.block_extent
             || src.bytes_per_block != dst.bytes_per_block
         {
@@ -502,12 +510,17 @@ impl VulkanResidency {
             && src.mip_level == dst.mip_level
             && src.array_layer == dst.array_layer
         {
+            if self.image(source)?.description.samples != vk::SampleCountFlags::TYPE_1 {
+                return Err(VulkanError::InvalidResource(
+                    "overlapping multisample image copy requires a sample-preserving snapshot",
+                ));
+            }
             let writer = self.prepare_image_rect(destination, dst, rect)?;
             let row_bytes = u64::from(source_rect.extent.width.div_ceil(src.block_extent.width))
                 * u64::from(src.bytes_per_block);
             let size =
                 row_bytes * u64::from(source_rect.extent.height.div_ceil(src.block_extent.height));
-            let scratch = self.temporary_buffer(size, &[Resource::Image(source)])?;
+            let scratch = Arc::new(self.temporary_buffer(size, &[Resource::Image(source)])?);
             let (handle, read_layout) = self.image_access_subresources(
                 source,
                 plane_range(src),
@@ -520,6 +533,8 @@ impl VulkanResidency {
             self.barriers.emit(&mut self.device);
             let index = self.device.begin_recording()?;
             let command = self.device.submission.slots[index].command;
+            let work = self.device.work_ticket()?;
+            self.device.retire_buffer(Arc::clone(&scratch), work)?;
             let extent = vk::Extent3D {
                 width: rect.extent.width,
                 height: rect.extent.height,

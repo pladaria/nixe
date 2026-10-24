@@ -1,57 +1,159 @@
 //! Native image representations, compatible views and GPU-only byte realignment.
 use super::recording::scratch_read_barrier;
 use super::*;
+mod aliases;
 impl VulkanResidency {
+    // Image interpretations belong to their resident entry and retire with it.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
+    pub(crate) fn guest_image(
+        &mut self,
+        guest: &nixe_gpu::native::GuestImage,
+        view_format: Option<vk::Format>,
+    ) -> Result<Option<(ImageId, [u32; 2])>, VulkanError> {
+        let Some(plane) = guest.planes.first() else {
+            return Ok(None);
+        };
+        let footprint = &plane.footprint;
+        let start = footprint.bounds().start;
+        let spans = footprint.mapping().spans();
+        let first = &spans[spans.partition_point(|span| span.logical + span.bytes <= start)];
+        let mut found = None;
+        let mut failure = None;
+        self.authority.visit_resource_overlaps(
+            nixe_memory::Extent {
+                start: nixe_memory::ArenaOffset::new(first.start.get() + start - first.logical),
+                bytes: 1,
+            },
+            |resource, _, _| {
+                let Resource::Image(id) = resource else {
+                    return;
+                };
+                let Ok(entry) = self.image(id) else { return };
+                if !entry.binding_valid {
+                    return;
+                }
+                let Some(source) = &entry.guest else { return };
+                if source.same_storage(guest) {
+                    found = Some((id, [0, 0]));
+                    return;
+                }
+                if found.is_some() {
+                    return;
+                }
+                let Some(format) = view_format else { return };
+                let a = source.description;
+                let b = guest.description;
+                if a.dimension() != b.dimension()
+                    || a.kind() != b.kind()
+                    || a.samples() != b.samples()
+                    || source.sample_grid != guest.sample_grid
+                    || source.canonical_texels != guest.canonical_texels
+                    || (a.format() != b.format()
+                        && (entry.decoded.is_some()
+                            || !entry
+                                .description
+                                .flags
+                                .contains(vk::ImageCreateFlags::MUTABLE_FORMAT)
+                            || !format::view_compatible(entry.description.format, format)))
+                {
+                    return;
+                }
+                let Some(first) = source.planes.iter().find(|p| same_plane_storage(p, plane))
+                else {
+                    return;
+                };
+                let Some(base_mip) = first.mip_level.checked_sub(plane.mip_level) else {
+                    return;
+                };
+                let Some(base_layer) = first.array_layer.checked_sub(plane.array_layer) else {
+                    return;
+                };
+                let end_mip = base_mip + u32::from(b.mip_levels());
+                let end_layer = base_layer + u32::from(b.array_layers());
+                if a.mip_extent(base_mip as u8) != Some(b.extent())
+                    || end_mip > u32::from(a.mip_levels())
+                    || end_layer > u32::from(a.array_layers())
+                {
+                    return;
+                }
+                let mut stored = source.planes.iter().filter(|p| {
+                    (base_mip..end_mip).contains(&p.mip_level)
+                        && (base_layer..end_layer).contains(&p.array_layer)
+                });
+                if !guest.planes.iter().all(|p| {
+                    stored.next().is_some_and(|s| {
+                        s.mip_level == p.mip_level + base_mip
+                            && s.array_layer == p.array_layer + base_layer
+                            && same_plane_storage(s, p)
+                    })
+                }) || stored.next().is_some()
+                {
+                    return;
+                }
+                if a.format() != b.format() && !entry.views.iter().any(|view| view.format == format)
+                {
+                    match unsafe {
+                        self.device
+                            .owner
+                            .instance
+                            .instance
+                            .get_physical_device_image_format_properties(
+                                self.device.owner.physical,
+                                format,
+                                entry.description.image_type,
+                                vk::ImageTiling::OPTIMAL,
+                                entry.description.usage,
+                                entry.description.flags,
+                            )
+                    } {
+                        Ok(_) => (),
+                        Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => return,
+                        Err(error) => {
+                            failure = Some(VulkanError::vk("compatible image view format", error));
+                            return;
+                        }
+                    }
+                }
+                found = Some((id, [base_mip, base_layer]));
+            },
+        );
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if let Some((id, _)) = found {
+            self.touch(Resource::Image(id));
+            self.statistics.cache_hits += 1;
+        }
+        Ok(found)
+    }
+    pub(crate) fn set_guest_image(&mut self, id: ImageId, guest: &nixe_gpu::native::GuestImage) {
+        self.images[id.slot]
+            .entry
+            .as_mut()
+            .expect("registered image")
+            .guest = Some(guest.clone());
+    }
+    pub(crate) fn image_binding_current(&self, id: ImageId) -> bool {
+        self.image(id).is_ok_and(|entry| entry.binding_valid)
+    }
+
+    /// Register canonical storage; actual LOAD or shader consumption imports it.
     pub fn image_for(
         &mut self,
         geometry: Vec<Arc<Footprint>>,
         description: NativeImageDescription,
         planes: Vec<ImagePlane>,
     ) -> Result<ImageId, VulkanError> {
-        self.create_image(geometry, description, planes, true)
+        self.create_image_representation(geometry, description, planes, true, None, [1, 1])
     }
     /// Allocate an undefined native target for an actual device producer.
-    /// LOAD/read consumption is checked; allocation is never a fabricated clear.
     pub fn image_for_device_write(
         &mut self,
         geometry: Vec<Arc<Footprint>>,
         description: NativeImageDescription,
         planes: Vec<ImagePlane>,
     ) -> Result<ImageId, VulkanError> {
-        self.create_image(geometry, description, planes, false)
-    }
-    fn create_image(
-        &mut self,
-        geometry: Vec<Arc<Footprint>>,
-        mut description: NativeImageDescription,
-        planes: Vec<ImagePlane>,
-        initialize: bool,
-    ) -> Result<ImageId, VulkanError> {
-        description.usage |= vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-        let id = self.create_image_representation(
-            geometry,
-            description,
-            planes,
-            initialize,
-            None,
-            [1, 1],
-        )?;
-        if initialize {
-            self.ensure_image(id)?;
-        }
-        Ok(id)
-    }
-    /// Register canonical storage without importing bytes ahead of consumption.
-    /// Full device writes validate their own coverage; an actual LOAD or shader
-    /// read imports the remaining canonical contents through ensure_image.
-    pub fn image_for_deferred_import(
-        &mut self,
-        geometry: Vec<Arc<Footprint>>,
-        mut description: NativeImageDescription,
-        planes: Vec<ImagePlane>,
-    ) -> Result<ImageId, VulkanError> {
-        description.usage |= vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-        self.create_image_representation(geometry, description, planes, true, None, [1, 1])
+        self.create_image_representation(geometry, description, planes, false, None, [1, 1])
     }
     /// Device-authored samples share canonical ownership with ordinary images.
     /// Their sample grid is supplied by the frontend, independently of host layout.
@@ -76,12 +178,13 @@ impl VulkanResidency {
     pub(super) fn create_image_representation(
         &mut self,
         geometry: Vec<Arc<Footprint>>,
-        description: NativeImageDescription,
+        mut description: NativeImageDescription,
         planes: Vec<ImagePlane>,
         initialize: bool,
         decoded: Option<super::decoded_texture::DecodedImage>,
         sample_grid: [u32; 2],
     ) -> Result<ImageId, VulkanError> {
+        description.usage |= vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
         if description.samples != vk::SampleCountFlags::TYPE_1 && initialize {
             return Err(VulkanError::InvalidResource(
                 "multisample canonical import requires sample conversion",
@@ -94,7 +197,6 @@ impl VulkanResidency {
         } else {
             validate_planes(&geometry, description, &planes, sample_grid)?;
         }
-        self.drain_notifications();
         if geometry
             .iter()
             .any(|footprint| footprint.mapping().machine() != self.memory.identity())
@@ -117,13 +219,14 @@ impl VulkanResidency {
                     flags: entry.description.flags,
                     ..description
                 };
-                (entry.description == compatible
+                (entry.binding_valid
+                    && entry.description == compatible
                     && entry.description.usage.contains(description.usage)
                     && entry.description.flags.contains(description.flags)
                     && entry.decoded == decoded
                     && entry.canonical_import == initialize
                     && entry.sample_grid == sample_grid
-                    && entry.planes == planes
+                    && entry.planes.as_ref() == planes
                     && entry.contents.geometry == geometry)
                     .then_some(id)
             });
@@ -140,31 +243,7 @@ impl VulkanResidency {
             "resident image",
             |bytes| self.reserve(bytes),
         )?;
-        let source_planes = decoded
-            .as_ref()
-            .map_or(planes.as_slice(), |decoded| decoded.planes.as_slice());
-        let invalid = source_planes
-            .iter()
-            .map(|plane| {
-                let storage = ImagePlane {
-                    extent: vk::Extent3D {
-                        width: plane.extent.width * sample_grid[0],
-                        height: plane.extent.height * sample_grid[1],
-                        depth: 1,
-                    },
-                    ..*plane
-                };
-                (
-                    storage.offset,
-                    storage.end().expect("validated native plane") - storage.offset,
-                )
-            })
-            .collect();
-        let slot = self
-            .images
-            .iter()
-            .position(|slot| slot.entry.is_none() && slot.generation < u32::MAX)
-            .unwrap_or(self.images.len());
+        let slot = self.free_images.pop().unwrap_or(self.images.len());
         if slot == self.images.len() {
             self.images.push(Slot {
                 generation: 0,
@@ -186,18 +265,21 @@ impl VulkanResidency {
         self.images[slot] = Slot {
             generation,
             entry: Some(ImageEntry {
+                synchronized: false,
+                synchronized_sequence: 0,
+                cpu_tracked: false,
+                guest: None,
+                binding_valid: true,
                 contents: Contents {
                     lru: None,
                     geometry: geometry.clone(),
-                    cpu: Vec::new(),
                     device: Vec::new(),
-                    invalid,
                     last_use: None,
                     touched: 0,
                 },
                 native: Arc::new(native),
                 description,
-                planes: planes.clone(),
+                planes: planes.clone().into(),
                 sample_grid,
                 views: Vec::new(),
                 native_views: Vec::new(),
@@ -208,19 +290,14 @@ impl VulkanResidency {
                 ),
                 version: 0,
                 producer: None,
-                leases: 0,
                 decoded,
                 canonical_import: initialize,
-                write_plans: Vec::new(),
-                discarded: if initialize {
-                    Vec::new()
-                } else {
-                    planes
-                        .iter()
-                        .enumerate()
-                        .map(|(index, &plane)| (index, super::transfers::full_rect(plane)))
-                        .collect()
-                },
+                write_plans: Default::default(),
+                discarded: planes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &plane)| (index, super::transfers::full_rect(plane)))
+                    .collect(),
             }),
         };
         self.authority
@@ -236,6 +313,8 @@ impl VulkanResidency {
             .expect("image")
             .contents
             .device = observations;
+        self.statistics.image_allocations += 1;
+        self.statistics.image_layout_plans += self.image(id)?.contents.geometry.len() as u64;
         self.touch(Resource::Image(id));
         Ok(id)
     }
@@ -246,36 +325,37 @@ impl VulkanResidency {
         rect: vk::Rect2D,
     ) -> Result<WriterId, VulkanError> {
         let entry = self.image(id)?;
-        let old = entry
-            .write_plans
-            .iter()
-            .find(|(p, r, _)| *p == plane && *r == rect)
-            .map(|p| p.2);
-        let writer = if let Some(writer) = old {
+        let index =
+            entry
+                .planes
+                .iter()
+                .position(|p| *p == plane)
+                .ok_or(VulkanError::InvalidResource(
+                    "write plane is absent from image",
+                ))?;
+        let geometry = &entry.contents.geometry[index];
+        let nixe_gpu::physical::WriteDomain::Image(mut domain) = geometry.domain() else {
+            return Err(VulkanError::InvalidResource(
+                "image writer has no image footprint",
+            ));
+        };
+        let stored = entry.storage_rect(rect);
+        let x = stored.offset.x as u32 / plane.block_extent.width;
+        let y = stored.offset.y as u32 / plane.block_extent.height;
+        domain.rect = nixe_gpu::physical::ByteRect {
+            x,
+            y,
+            width: (stored.offset.x as u32 + stored.extent.width)
+                .div_ceil(plane.block_extent.width)
+                - x,
+            height: (stored.offset.y as u32 + stored.extent.height)
+                .div_ceil(plane.block_extent.height)
+                - y,
+        };
+        let key = (index, domain.rect);
+        let writer = if let Some(&writer) = entry.write_plans.get(&key) {
             writer
         } else {
-            let index = entry.planes.iter().position(|p| *p == plane).ok_or(
-                VulkanError::InvalidResource("write plane is absent from image"),
-            )?;
-            let geometry = &entry.contents.geometry[index];
-            let nixe_gpu::physical::WriteDomain::Image(mut domain) = geometry.domain() else {
-                return Err(VulkanError::InvalidResource(
-                    "image writer has no image footprint",
-                ));
-            };
-            let stored = entry.storage_rect(rect);
-            let x = stored.offset.x as u32 / plane.block_extent.width;
-            let y = stored.offset.y as u32 / plane.block_extent.height;
-            domain.rect = nixe_gpu::physical::ByteRect {
-                x,
-                y,
-                width: (stored.offset.x as u32 + stored.extent.width)
-                    .div_ceil(plane.block_extent.width)
-                    - x,
-                height: (stored.offset.y as u32 + stored.extent.height)
-                    .div_ceil(plane.block_extent.height)
-                    - y,
-            };
             let footprint = Footprint::new(
                 Arc::clone(geometry.mapping()),
                 nixe_gpu::physical::WriteDomain::Image(domain),
@@ -288,18 +368,25 @@ impl VulkanResidency {
                 .as_mut()
                 .expect("image")
                 .write_plans
-                .push((plane, rect, writer));
+                .insert(key, writer);
             writer
         };
         self.wait_writer(writer)
     }
     pub fn ensure_image(&mut self, id: ImageId) -> Result<(), VulkanError> {
-        let current = self.image(id)?.contents.current();
+        self.invalidate_cpu_resources(&[])?;
+        let current = self.image(id)?.current();
         if current {
             return Ok(());
         }
         if self.refresh_native_alias(id)? {
-            return Ok(());
+            self.track_image_cpu(id)?;
+            self.images[id.slot]
+                .entry
+                .as_mut()
+                .unwrap()
+                .synchronized_sequence = self.authority.modification_sequence().get();
+            return self.invalidate_cpu_resources(&[]);
         }
         let entry = self.image(id)?;
         if entry.description.samples != vk::SampleCountFlags::TYPE_1 {
@@ -307,15 +394,18 @@ impl VulkanResidency {
                 "multisample reconstruction needs a compatible native alias or sample conversion",
             ));
         }
-        if entry.leases != 0 {
-            return Err(VulkanError::InvalidResource(
-                "image refresh would overwrite a leased version",
-            ));
-        }
         self.constructing.push(Resource::Image(id));
-        let result = self.refresh_image(id);
+        let result = self
+            .refresh_image(id)
+            .and_then(|()| self.track_image_cpu(id));
         self.unpin(Resource::Image(id));
-        result
+        result?;
+        self.images[id.slot]
+            .entry
+            .as_mut()
+            .unwrap()
+            .synchronized_sequence = self.authority.modification_sequence().get();
+        self.invalidate_cpu_resources(&[])
     }
     pub(super) fn ensure_image_initialized(
         &mut self,
@@ -323,17 +413,12 @@ impl VulkanResidency {
         plane: ImagePlane,
         rect: vk::Rect2D,
     ) -> Result<(), VulkanError> {
-        if self.image(id)?.contents.current()
-            && self.require_image_initialized(id, plane, rect).is_ok()
-        {
-            return Ok(());
-        }
         self.ensure_image(id)?;
         self.require_image_initialized(id, plane, rect)
     }
     fn refresh_native_alias(&mut self, id: ImageId) -> Result<bool, VulkanError> {
         let target = self.image(id)?;
-        if target.leases != 0 || target.decoded.is_some() {
+        if target.decoded.is_some() {
             return Ok(false);
         }
         let geometry = target.contents.geometry.clone();
@@ -343,15 +428,21 @@ impl VulkanResidency {
         let canonical_import = target.canonical_import;
         let mut complete_source = None;
         let mut native_current = true;
+        let mut undefined_planes = Vec::new();
         // Depth and stencil can have independent modification state. Keep an
         // aspect already produced here, and leave an unproduced native aspect
         // undefined, without expanding either into per-texel byte records.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
         for (index, footprint) in geometry.iter().enumerate() {
             let source = self.authority.covering_resource(footprint)?;
+            let undefined =
+                !canonical_import && source.is_none() && !self.authority.has_writers(footprint);
+            if undefined {
+                undefined_planes.push(planes[index]);
+            }
             native_current &= (source == Some(Resource::Image(id))
                 && footprint.mapping().is_injective())
-                || (!canonical_import && !self.authority.has_writers(footprint));
+                || undefined;
             if index == 0 {
                 complete_source = source;
             } else if source != complete_source {
@@ -359,21 +450,32 @@ impl VulkanResidency {
             }
         }
         if native_current {
+            for plane in undefined_planes {
+                self.mark_image_discarded(
+                    id,
+                    plane,
+                    vk::Rect2D {
+                        offset: Default::default(),
+                        extent: vk::Extent2D {
+                            width: plane.extent.width,
+                            height: plane.extent.height,
+                        },
+                    },
+                );
+            }
             let observed = geometry
                 .into_iter()
                 .map(|f| self.authority.observe_native(Resource::Image(id), f))
                 .collect::<Result<Vec<_>, _>>()?;
             let entry = self.images[id.slot].entry.as_mut().expect("image");
-            entry.contents.cpu.clear();
             entry.contents.device = observed;
-            entry.contents.invalid.clear();
+            entry.synchronized = true;
             return Ok(true);
         }
-        let candidates = if let Some(source) = complete_source {
-            vec![source]
-        } else {
-            self.authority.resource_candidates(&geometry[0])
+        let Some(source) = complete_source else {
+            return Ok(false);
         };
+        let candidates = [source];
         let mut selected = None;
         for resource in candidates {
             let Resource::Image(source) = resource else {
@@ -395,22 +497,19 @@ impl VulkanResidency {
                 || entry.sample_grid != sample_grid
                 || entry.planes.len() != planes.len()
                 || (complete_source != Some(resource)
-                    && (!entry.contents.current() || !entry.discarded.is_empty()))
+                    && (!entry.current() || !entry.discarded.is_empty()))
                 || entry.description.extent.width < description.extent.width
                 || entry.description.extent.height < description.extent.height
-                || !entry.planes.iter().zip(&planes).all(|(a, b)| {
+                || !entry.planes.iter().zip(planes.iter()).all(|(a, b)| {
                     a.aspect == b.aspect
                         && a.mip_level == b.mip_level
                         && a.array_layer == b.array_layer
                         && a.block_extent == b.block_extent
                         && a.bytes_per_block == b.bytes_per_block
                 })
-                || (entry.description.format != description.format
-                    && planes.iter().any(|p| {
-                        p.aspect != vk::ImageAspectFlags::COLOR
-                            || format::copy_block(entry.description.format, p.aspect)
-                                != format::copy_block(description.format, p.aspect)
-                    }))
+                || planes.iter().any(|p| {
+                    !format::copy_compatible(entry.description.format, description.format, p.aspect)
+                })
             {
                 continue;
             }
@@ -429,11 +528,6 @@ impl VulkanResidency {
         let Some(source) = selected else {
             return Ok(false);
         };
-        let cpu = if complete_source == Some(Resource::Image(source)) {
-            Vec::new()
-        } else {
-            self.image(source)?.contents.cpu.clone()
-        };
         let device = geometry
             .iter()
             .map(|f| {
@@ -441,7 +535,7 @@ impl VulkanResidency {
                     .observe_native(Resource::Image(id), Arc::clone(f))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        for plane in planes {
+        for plane in planes.iter().copied() {
             let (src, src_layout) = self.image_access_subresources(
                 source,
                 commands::plane_range(plane),
@@ -477,11 +571,18 @@ impl VulkanResidency {
                 );
             }
         }
+        self.statistics.gpu_copied_bytes += planes
+            .iter()
+            .map(|plane| {
+                plane.row_bytes()
+                    * u64::from(plane.rows())
+                    * u64::from(description.samples.as_raw())
+            })
+            .sum::<u64>();
         let work = self.device.work_ticket()?;
         let entry = self.images[id.slot].entry.as_mut().expect("image");
-        entry.contents.cpu = cpu;
         entry.contents.device = device;
-        entry.contents.invalid.clear();
+        entry.synchronized = true;
         entry.discarded.clear();
         entry.producer = Some(work);
         entry.version = entry
@@ -492,27 +593,18 @@ impl VulkanResidency {
             ))?;
         Ok(true)
     }
-    pub(super) fn observe_image_cpu_writes(&mut self, id: ImageId) -> Result<(), VulkanError> {
-        if self.image(id)?.contents.observations_current() {
+    pub(super) fn track_image_cpu(&mut self, id: ImageId) -> Result<(), VulkanError> {
+        if self.image(id)?.cpu_tracked {
             return Ok(());
         }
-        let planes = self.image(id)?.planes.clone();
-        let observed = self
-            .image(id)?
-            .contents
-            .geometry
-            .clone()
-            .into_iter()
-            .map(|f| self.authority.observe_native(Resource::Image(id), f))
-            .collect::<Result<Vec<_>, _>>()?;
-        let entry = self.images[id.slot].entry.as_mut().expect("image");
-        entry.contents.invalid = planes
-            .into_iter()
-            .map(|p| (p.offset, p.end().expect("validated image plane") - p.offset))
-            .collect();
-        normalize(&mut entry.contents.invalid);
-        entry.contents.cpu.clear();
-        entry.contents.device = observed;
+        let mut pages = Vec::new();
+        for footprint in &self.image(id)?.contents.geometry {
+            footprint.mapping().observed_pages(footprint, &mut pages)?;
+        }
+        let inputs = nixe_gpu::physical::pin_selected_pages(pages)?;
+        self.memory
+            .capture_resource_scattered(&inputs, &[], &mut [])?;
+        self.images[id.slot].entry.as_mut().unwrap().cpu_tracked = true;
         Ok(())
     }
     fn refresh_image(&mut self, id: ImageId) -> Result<(), VulkanError> {
@@ -555,18 +647,19 @@ impl VulkanResidency {
                 })
             })
         {
+            self.discard_cpu_image_holes(id, &parts)?;
             let entry = self.images[id.slot].entry.as_mut().expect("image");
-            entry.contents.cpu.clear();
             entry.contents.device = device;
-            entry.contents.invalid.clear();
+            entry.synchronized = true;
             return Ok(());
         }
-        let cpu = if canonical_import
+        if canonical_import
             && parts.iter().all(|p| p.producer.is_none())
             && planes.iter().all(|p| {
                 p.row_pitch == p.row_bytes()
                     && p.row_pitch <= self.device.submission.configuration.arena_bytes
-            }) {
+            })
+        {
             let mut inputs = Vec::new();
             for footprint in &geometry {
                 footprint.mapping().observed_pages(footprint, &mut inputs)?;
@@ -583,49 +676,24 @@ impl VulkanResidency {
                 })
                 .collect();
             let mut captured = vec![0; bytes as usize];
-            let observation =
-                self.memory
-                    .capture_clean_scattered(&inputs, &copies, &mut captured)?;
-            for plane in &planes {
+            self.memory
+                .capture_resource_scattered(&inputs, &copies, &mut captured)?;
+            for plane in planes.iter() {
                 let end = plane.end().expect("validated plane") as usize;
                 self.upload_cpu_image_rows(id, *plane, 0, &captured[plane.offset as usize..end])?;
             }
-            vec![observation]
         } else {
-            let source = self.buffer_for_geometry(
-                geometry,
-                bytes,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                canonical_import,
-            )?;
-            if !canonical_import {
-                self.refresh_buffer(source, false, None)?;
-            }
-            let cpu = self.buffer(source)?.contents.cpu.clone();
-            self.constructing.push(Resource::Buffer(source));
-            let mut dirty: Vec<_> = if canonical_import {
-                planes
-                    .iter()
-                    .map(|p| (p.offset, p.end().expect("validated plane") - p.offset))
-                    .collect()
-            } else {
-                parts
-                    .iter()
-                    .filter(|part| part.producer.is_some())
-                    .map(|part| (part.logical, part.bytes))
-                    .collect()
-            };
-            normalize(&mut dirty);
-            let result = self.copy_rows_to_image(source, 0, id, &dirty, &[]);
-            self.unpin(Resource::Buffer(source));
-            result?;
-            cpu
-        };
+            self.refresh_image_intersections(id, &parts, bytes)?;
+        }
+        // A copy of a partially covered transfer block must not validate CPU
+        // bytes which this opaque representation cannot import.
+        if !canonical_import {
+            self.discard_cpu_image_holes(id, &parts)?;
+        }
         let work = self.device.work_ticket()?;
         let entry = self.images[id.slot].entry.as_mut().expect("image");
-        entry.contents.cpu = cpu;
         entry.contents.device = device;
-        entry.contents.invalid.clear();
+        entry.synchronized = true;
         entry.producer = Some(work);
         entry.version = entry
             .version
@@ -633,6 +701,67 @@ impl VulkanResidency {
             .ok_or(VulkanError::InvalidResource(
                 "image content version exhausted",
             ))?;
+        Ok(())
+    }
+    fn discard_cpu_image_holes(
+        &mut self,
+        id: ImageId,
+        parts: &[nixe_gpu::authority::ResolvedBytes<Resource>],
+    ) -> Result<(), VulkanError> {
+        let planes = self.image(id)?.planes.clone();
+        let mut holes: Vec<_> = parts
+            .iter()
+            .filter(|p| p.producer.is_none())
+            .map(|p| (p.logical, p.bytes))
+            .collect();
+        normalize(&mut holes);
+        for (start, bytes) in holes {
+            for &plane in planes.iter() {
+                let begin = start.max(plane.offset);
+                let end = (start + bytes).min(plane.end().unwrap());
+                if begin >= end {
+                    continue;
+                }
+                let block = u64::from(plane.bytes_per_block);
+                let first = (begin - plane.offset) / plane.row_pitch;
+                let last = (end - plane.offset).div_ceil(plane.row_pitch);
+                let mut row = first;
+                while row < last {
+                    let base = plane.offset + row * plane.row_pitch;
+                    let low = begin.max(base);
+                    let high = end.min(base + plane.row_bytes());
+                    if low >= high {
+                        row += 1;
+                        continue;
+                    }
+                    let rows = if low == base && high == base + plane.row_bytes() {
+                        (1 + (end - high) / plane.row_pitch).min(last - row)
+                    } else {
+                        1
+                    };
+                    let x = ((low - base) / block) as u32 * plane.block_extent.width;
+                    let stop = (((high - base).div_ceil(block)) as u32 * plane.block_extent.width)
+                        .min(plane.extent.width);
+                    let y = row as u32 * plane.block_extent.height;
+                    self.mark_image_discarded(
+                        id,
+                        plane,
+                        vk::Rect2D {
+                            offset: vk::Offset2D {
+                                x: x as i32,
+                                y: y as i32,
+                            },
+                            extent: vk::Extent2D {
+                                width: stop - x,
+                                height: (rows as u32 * plane.block_extent.height)
+                                    .min(plane.extent.height - y),
+                            },
+                        },
+                    );
+                    row += rows;
+                }
+            }
+        }
         Ok(())
     }
     fn upload_cpu_image_rows(
@@ -708,31 +837,38 @@ impl VulkanResidency {
         }
         Ok(())
     }
-    fn copy_rows_to_image(
+    pub(super) fn copy_rows_to_image(
         &mut self,
-        source: BufferId,
+        source: &Arc<AllocatedBuffer>,
         source_offset: u64,
         image: ImageId,
         dirty: &[(u64, u64)],
-        writers: &[WriterId],
     ) -> Result<(), VulkanError> {
         let planes = self.image(image)?.planes.clone();
         let mut pieces = Vec::new();
-        for plane in planes {
-            let index = self
-                .image(image)?
-                .planes
-                .iter()
-                .position(|p| *p == plane)
-                .expect("plane");
+        for (index, plane) in planes.iter().copied().enumerate() {
             let nixe_gpu::physical::WriteDomain::Image(domain) =
                 self.image(image)?.contents.geometry[index].domain()
             else {
                 unreachable!()
             };
-            for row in 0..plane.rows() {
+            let Some(&(first, _)) = dirty.first() else {
+                break;
+            };
+            let &(last, bytes) = dirty.last().unwrap();
+            let first_row =
+                (first.saturating_sub(plane.offset) / plane.row_pitch).min(u64::from(plane.rows()));
+            let last_row = ((last + bytes)
+                .saturating_sub(plane.offset)
+                .div_ceil(plane.row_pitch))
+            .min(u64::from(plane.rows()));
+            for row in first_row as u32..last_row as u32 {
                 let offset = plane.offset + plane.row_pitch * u64::from(row);
-                for &(start, length) in dirty {
+                let first = dirty.partition_point(|&(start, bytes)| start + bytes <= offset);
+                for &(start, length) in &dirty[first..] {
+                    if start >= offset + plane.row_bytes() {
+                        break;
+                    }
                     let begin = start.max(offset);
                     let end = (start + length).min(offset + plane.row_bytes());
                     if begin >= end {
@@ -746,7 +882,6 @@ impl VulkanResidency {
                     }
                     let logical = offset + first * block;
                     let length = (stop - first) * block;
-                    self.check_buffer_range(source, source_offset + logical, length)?;
                     pieces.push(ImagePiece {
                         plane,
                         row,
@@ -766,38 +901,28 @@ impl VulkanResidency {
         }
         let scratch = if pieces
             .iter()
-            .all(|piece| piece.direct(source_offset + piece.logical))
+            .all(|piece| piece.direct(piece.logical - source_offset))
         {
             None
         } else {
             let (size, slices) = packed_slices(&pieces)?;
-            let scratch =
-                self.temporary_buffer(size, &[Resource::Buffer(source), Resource::Image(image)])?;
+            let scratch = self.temporary_buffer(size, &[Resource::Image(image)])?;
             Some((scratch, slices))
         };
-        let src = self.buffer(source)?.native.handle;
-        for piece in &pieces {
-            self.buffer_access_range(
-                source,
-                source_offset + piece.logical,
-                piece.length,
-                AccessScope::new(
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_READ,
-                ),
-            )?;
-        }
+        let src = source.handle;
         let (dst, layout) =
             self.image_regions_access(image, &pieces, vk::AccessFlags2::TRANSFER_WRITE)?;
         let index = self.device.begin_recording()?;
         let command = self.device.submission.slots[index].command;
+        let work = self.device.work_ticket()?;
+        self.device.retire_buffer(Arc::clone(source), work)?;
         let regions = if let Some((scratch, slices)) = &scratch {
             let copies: Vec<_> = pieces
                 .iter()
                 .zip(slices)
                 .map(|(piece, &start)| {
                     vk::BufferCopy::default()
-                        .src_offset(source_offset + piece.logical)
+                        .src_offset(piece.logical - source_offset)
                         .dst_offset(start)
                         .size(piece.length)
                 })
@@ -817,19 +942,19 @@ impl VulkanResidency {
         } else {
             pieces
                 .iter()
-                .map(|piece| piece.region(source_offset + piece.logical))
+                .map(|piece| piece.region(piece.logical - source_offset))
                 .collect()
         };
         self.barriers.emit(&mut self.device);
-        self.publish_effect(writers, |device| unsafe {
-            device.dispatch.cmd_copy_buffer_to_image(
+        unsafe {
+            self.device.dispatch.cmd_copy_buffer_to_image(
                 command,
                 scratch.as_ref().map_or(src, |(buffer, _)| buffer.handle),
                 dst,
                 layout,
                 &regions,
             );
-        })?;
+        }
         if let Some((scratch, _)) = scratch {
             let work = self.device.work_ticket()?;
             self.device.retire_buffer(scratch, work)?;
@@ -857,41 +982,6 @@ impl VulkanResidency {
         self.statistics.gpu_copied_bytes += pieces.iter().map(|piece| piece.length).sum::<u64>();
         Ok(())
     }
-    /// Transfer-authored image bytes become authoritative only for texel rows;
-    /// canonical pitch padding and disjoint writers remain untouched.
-    pub fn write_image_from_buffer(
-        &mut self,
-        image: ImageId,
-        source: BufferId,
-        source_offset: u64,
-    ) -> Result<WorkTicket, VulkanError> {
-        self.ensure_buffer(source)?;
-        self.ensure_image(image)?;
-        if self.image(image)?.leases != 0 {
-            return Err(VulkanError::InvalidResource(
-                "cannot overwrite a leased image",
-            ));
-        }
-        let planes = self.image(image)?.planes.clone();
-        let mut writers = smallvec::SmallVec::<[WriterId; 8]>::new();
-        for &plane in &planes {
-            writers.push(self.prepare_image_rect(image, plane, transfers::full_rect(plane))?);
-        }
-        let dirty: Vec<_> = planes
-            .iter()
-            .map(|plane| {
-                (
-                    plane.offset,
-                    plane.end().expect("image plane") - plane.offset,
-                )
-            })
-            .collect();
-        self.copy_rows_to_image(source, source_offset, image, &dirty, &writers)?;
-        for plane in planes {
-            self.finish_image_rect(image, plane, transfers::full_rect(plane))?;
-        }
-        self.device.work_ticket()
-    }
     pub fn image_view(
         &mut self,
         image: ImageId,
@@ -903,15 +993,8 @@ impl VulkanResidency {
         }
         let d = description;
         let same_format = d.format == entry.description.format;
-        let rgba_pair = matches!(
-            (entry.description.format, d.format),
-            (vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_SRGB)
-                | (vk::Format::R8G8B8A8_SRGB, vk::Format::R8G8B8A8_UNORM)
-                | (vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB)
-                | (vk::Format::B8G8R8A8_SRGB, vk::Format::B8G8R8A8_UNORM)
-        );
         if !same_format
-            && (!rgba_pair
+            && (!format::view_compatible(entry.description.format, d.format)
                 || !entry
                     .description
                     .flags
@@ -1041,33 +1124,8 @@ impl VulkanResidency {
                 Arc::clone(&entry.native),
                 handle,
             )));
+        self.statistics.image_view_allocations += 1;
         Ok(ImageViewId { image, view })
-    }
-    pub fn lease_image(&mut self, image: ImageId) -> Result<PresentationLease, VulkanError> {
-        self.ensure_image(image)?;
-        self.flush()?;
-        let entry = self.image(image)?;
-        let producer = entry
-            .producer
-            .ok_or(VulkanError::InvalidResource(
-                "image has no producing native work",
-            ))?
-            .submission();
-        let version = entry.version;
-        self.images[image.slot]
-            .entry
-            .as_mut()
-            .expect("image")
-            .leases += 1;
-        Ok(PresentationLease::new(
-            PresentationImageId {
-                slot: image.slot as u64,
-                generation: image.generation,
-            },
-            version,
-            producer,
-            self.release_sender.clone(),
-        ))
     }
     pub(super) fn image_pieces(
         &self,
@@ -1096,7 +1154,7 @@ impl VulkanResidency {
             .ok_or(VulkanError::InvalidResource("image interval overflow"))?;
         let mut result = Vec::new();
         let mut consumed = 0;
-        for &native_plane in &entry.planes {
+        for &native_plane in entry.planes.iter() {
             let plane = entry.storage_plane(native_plane);
             // Authority often names only a few bytes of one packed texel.
             // Locate its rows arithmetically instead of scanning the full mip
@@ -1520,3 +1578,62 @@ impl VulkanResidency {
 
 #[cfg(test)]
 mod tests;
+
+// Compare physical placement without requiring the two mappings to share a
+// logical origin. A view of a mip/layer commonly starts at a sliced mapping.
+fn same_plane_storage(
+    a: &nixe_gpu::native::GuestImagePlane,
+    b: &nixe_gpu::native::GuestImagePlane,
+) -> bool {
+    if a.aspect != b.aspect || a.row_pitch != b.row_pitch || a.bytes_per_block != b.bytes_per_block
+    {
+        return false;
+    }
+    if a.footprint == b.footprint {
+        return true;
+    }
+    let (
+        nixe_gpu::physical::WriteDomain::Image(mut x),
+        nixe_gpu::physical::WriteDomain::Image(mut y),
+    ) = (a.footprint.domain(), b.footprint.domain())
+    else {
+        return false;
+    };
+    x.base = 0;
+    y.base = 0;
+    x.native_base = 0;
+    y.native_base = 0;
+    if x != y || a.footprint.mapping().machine() != b.footprint.mapping().machine() {
+        return false;
+    }
+    let ar = a.footprint.bounds();
+    let br = b.footprint.bounds();
+    if ar.end - ar.start != br.end - br.start {
+        return false;
+    }
+    let aa = a.footprint.mapping().spans();
+    let bb = b.footprint.mapping().spans();
+    let mut i = aa.partition_point(|s| s.logical + s.bytes <= ar.start);
+    let mut j = bb.partition_point(|s| s.logical + s.bytes <= br.start);
+    let mut offset = 0;
+    while offset < ar.end - ar.start {
+        let (x, y) = (&aa[i], &bb[j]);
+        let xs = ar.start + offset;
+        let ys = br.start + offset;
+        if x.allocation != y.allocation
+            || x.start.get() + xs - x.logical != y.start.get() + ys - y.logical
+        {
+            return false;
+        }
+        offset += (x.logical + x.bytes - xs)
+            .min(y.logical + y.bytes - ys)
+            .min(ar.end - xs);
+        if ar.start + offset == x.logical + x.bytes {
+            i += 1;
+        }
+        if br.start + offset == y.logical + y.bytes {
+            j += 1;
+        }
+    }
+    true
+}

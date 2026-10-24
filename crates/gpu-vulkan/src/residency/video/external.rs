@@ -75,14 +75,14 @@ struct Transfer {
 }
 impl Transfer {
     fn new(cache: &mut VulkanResidency, frame: &DeviceImageFrame) -> Result<Self, VulkanError> {
-        let device = &cache.device;
-        let uuid = device_uuid(device).ok_or(VulkanError::InvalidResource(
+        let owner = cache.device.owner.clone();
+        let uuid = device_uuid(&cache.device).ok_or(VulkanError::InvalidResource(
             "device does not support external video memory/semaphore export",
         ))?;
         let pitch = u64::from(frame.width.div_ceil(2) * 2).next_multiple_of(4);
         let chroma = (pitch * u64::from(frame.height)).next_multiple_of(4);
         let size = chroma + pitch * u64::from(frame.height.div_ceil(2));
-        let raw = &device.owner.device;
+        let raw = &owner.device;
         let mut external = vk::ExternalMemoryBufferCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
         let buffer = unsafe {
@@ -97,27 +97,19 @@ impl Transfer {
         }
         .map_err(|error| VulkanError::vk("create external video buffer", error))?;
         let mut allocation = Allocation {
-            owner: device.owner.clone(),
+            owner: owner.clone(),
             buffer,
             memory: vk::DeviceMemory::null(),
             ready: vk::Semaphore::null(),
             charge: None,
         };
         let requirements = unsafe { raw.get_buffer_memory_requirements(buffer) };
-        allocation.charge = cache.budget.reserve(requirements.size);
-        if allocation.charge.is_none() {
-            return Err(VulkanError::ResidencyPressure {
-                requested: requirements.size,
-                allocated: cache.budget.used(),
-                budget: cache.budget.limit,
-            });
-        }
+        allocation.charge = cache.reserve(requirements.size)?;
         let types = unsafe {
-            device
-                .owner
+            owner
                 .instance
                 .instance
-                .get_physical_device_memory_properties(device.owner.physical)
+                .get_physical_device_memory_properties(owner.physical)
         };
         let memory_type = (0..types.memory_type_count)
             .find(|&index| {
@@ -145,8 +137,7 @@ impl Transfer {
         .map_err(|error| VulkanError::vk("allocate external video memory", error))?;
         unsafe { raw.bind_buffer_memory(buffer, allocation.memory, 0) }
             .map_err(|error| VulkanError::vk("bind external video memory", error))?;
-        let memory_api =
-            ash::khr::external_memory_fd::Device::new(&device.owner.instance.instance, raw);
+        let memory_api = ash::khr::external_memory_fd::Device::new(&owner.instance.instance, raw);
         let fd = unsafe {
             memory_api.get_memory_fd(
                 &vk::MemoryGetFdInfoKHR::default()
@@ -166,7 +157,7 @@ impl Transfer {
         }
         .map_err(|error| VulkanError::vk("create external video semaphore", error))?;
         let semaphore_api =
-            ash::khr::external_semaphore_fd::Device::new(&device.owner.instance.instance, raw);
+            ash::khr::external_semaphore_fd::Device::new(&owner.instance.instance, raw);
         let fd = unsafe {
             semaphore_api.get_semaphore_fd(
                 &vk::SemaphoreGetFdInfoKHR::default()
@@ -231,23 +222,32 @@ impl VideoTransfers {
             }
         }
     }
-    pub(crate) fn import(
+    pub(crate) fn evict_idle(&mut self, completed: u64) -> bool {
+        self.retire_sources(completed);
+        let Some(index) = self.slots.iter().position(|slot| slot.pending.is_none()) else {
+            return false;
+        };
+        self.slots.swap_remove(index);
+        true
+    }
+}
+impl VulkanResidency {
+    pub(crate) fn import_decoded_planes(
         &mut self,
-        cache: &mut VulkanResidency,
         images: [ImageId; 2],
         frame: &DeviceImageFrame,
     ) -> Result<(), VulkanError> {
         if frame.width == 0
             || frame.height == 0
-            || frame.width > cache.device.profile().limits.max_image_dimension2_d
-            || frame.height > cache.device.profile().limits.max_image_dimension2_d
+            || frame.width > self.device.profile().limits.max_image_dimension2_d
+            || frame.height > self.device.profile().limits.max_image_dimension2_d
         {
             return Err(VulkanError::InvalidResource(
                 "invalid decoded frame dimensions",
             ));
         }
         for (index, image) in images.iter().enumerate() {
-            let description = cache.image(*image)?.description;
+            let description = self.image(*image)?.description;
             let (width, height, format) = if index == 0 {
                 (frame.width, frame.height, vk::Format::R8_UNORM)
             } else {
@@ -269,109 +269,122 @@ impl VideoTransfers {
                 ));
             }
         }
-        let completed = cache.device.poll_progress()?;
+        let completed = self.device.poll_progress()?;
         let idle = |slot: &Transfer| slot.pending.is_none_or(|work| work.tick() <= completed);
-        let reusable = self.slots.iter().position(|slot| {
+        let reusable = self.video.slots.iter().position(|slot| {
             slot.context == frame.source.transfer_context()
                 && slot.dimensions == [frame.width, frame.height]
                 && idle(slot)
         });
         let index = if let Some(index) = reusable {
-            self.statistics.reused_imports += 1;
+            self.video.statistics.reused_imports += 1;
             index
         } else {
-            if self.slots.len() == cache.device.submission.configuration.command_slots {
-                let index = self.slots.iter().position(idle).unwrap_or_else(|| {
-                    self.slots
+            if self.video.slots.len() == self.device.submission.configuration.command_slots {
+                let index = self.video.slots.iter().position(idle).unwrap_or_else(|| {
+                    self.video
+                        .slots
                         .iter()
                         .enumerate()
                         .min_by_key(|(_, slot)| slot.pending.unwrap().tick())
                         .unwrap()
                         .0
                 });
-                if !idle(&self.slots[index]) {
-                    self.statistics.pressure_waits += 1;
-                    cache.device.wait_for_work(
-                        self.slots[index].pending.unwrap(),
+                if !idle(&self.video.slots[index]) {
+                    self.video.statistics.pressure_waits += 1;
+                    self.device.wait_for_work(
+                        self.video.slots[index].pending.unwrap(),
                         std::time::Duration::MAX,
                     )?;
                 }
-                self.slots.swap_remove(index);
+                self.video.slots.swap_remove(index);
             }
-            self.slots.push(Transfer::new(cache, frame)?);
-            self.statistics.imports += 1;
-            self.slots.len() - 1
+            let transfer = Transfer::new(self, frame)?;
+            self.video.slots.push(transfer);
+            self.video.statistics.imports += 1;
+            self.video.slots.len() - 1
         };
         // Reserve the consumer before starting asynchronous external writes.
         // An error while recording still submits the recorded prefix with its
         // wait, so ordinary shutdown cannot race the external producer.
-        cache.device.begin_recording()?;
-        let transfer = &mut self.slots[index];
-        transfer.source = Some(Arc::clone(&frame.source));
-        frame
-            .source
-            .enqueue_nv12(transfer.target.as_mut())
-            .map_err(VulkanError::ExternalVideo)?;
-        let family = cache.device.queues().graphics_compute_family;
-        let acquire = vk::BufferMemoryBarrier2::default()
-            .buffer(transfer.allocation.buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
-            .dst_queue_family_index(family)
-            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-            .dst_access_mask(vk::AccessFlags2::TRANSFER_READ);
-        let recorded = (|| -> Result<(), VulkanError> {
-            cache.barriers.queue_buffer(acquire);
-            for (plane, image) in images.into_iter().enumerate() {
-                let width = if plane == 0 {
-                    frame.width
-                } else {
-                    frame.width.div_ceil(2)
-                };
-                let height = if plane == 0 {
-                    frame.height
-                } else {
-                    frame.height.div_ceil(2)
-                };
-                unsafe {
-                    cache.video_plane_from_buffer(
-                        image,
-                        transfer.allocation.buffer,
-                        if plane == 0 { 0 } else { transfer.chroma },
-                        transfer.pitch,
-                        vk::Rect2D {
-                            offset: vk::Offset2D::default(),
-                            extent: vk::Extent2D { width, height },
-                        },
-                    )?;
-                }
-            }
-            let release = vk::BufferMemoryBarrier2::default()
-                .buffer(transfer.allocation.buffer)
+        self.device.begin_recording()?;
+        let mut transfer = self.video.slots.swap_remove(index);
+        let result = (|| {
+            transfer.source = Some(Arc::clone(&frame.source));
+            frame
+                .source
+                .enqueue_nv12(transfer.target.as_mut())
+                .map_err(VulkanError::ExternalVideo)?;
+            let (buffer, ready, pitch, chroma) = (
+                transfer.allocation.buffer,
+                transfer.allocation.ready,
+                transfer.pitch,
+                transfer.chroma,
+            );
+            let family = self.device.queues().graphics_compute_family;
+            let acquire = vk::BufferMemoryBarrier2::default()
+                .buffer(buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE)
-                .src_queue_family_index(family)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_READ);
-            cache.barriers.queue_buffer(release);
+                .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+                .dst_queue_family_index(family)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ);
+            let recorded = (|| -> Result<(), VulkanError> {
+                self.barriers.queue_buffer(acquire);
+                for (plane, image) in images.into_iter().enumerate() {
+                    let width = if plane == 0 {
+                        frame.width
+                    } else {
+                        frame.width.div_ceil(2)
+                    };
+                    let height = if plane == 0 {
+                        frame.height
+                    } else {
+                        frame.height.div_ceil(2)
+                    };
+                    unsafe {
+                        self.video_plane_from_buffer(
+                            image,
+                            buffer,
+                            if plane == 0 { 0 } else { chroma },
+                            pitch,
+                            vk::Rect2D {
+                                offset: vk::Offset2D::default(),
+                                extent: vk::Extent2D { width, height },
+                            },
+                        )?;
+                    }
+                }
+                let release = vk::BufferMemoryBarrier2::default()
+                    .buffer(buffer)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE)
+                    .src_queue_family_index(family)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_READ);
+                self.barriers.queue_buffer(release);
+                Ok(())
+            })();
+            let wait = vk::SemaphoreSubmitInfo::default()
+                .semaphore(ready)
+                .stage_mask(vk::PipelineStageFlags2::COPY);
+            let work = self
+                .flush_with_sync(&[wait], &[])?
+                .ok_or(VulkanError::InvalidResource(
+                    "external video transfer has no consumer submission",
+                ))?;
+            transfer.pending = Some(work);
+            recorded?;
+            self.video.statistics.frames += 1;
+            self.video.statistics.transferred_bytes += u64::from(frame.width)
+                * u64::from(frame.height)
+                + u64::from(frame.width.div_ceil(2) * 2) * u64::from(frame.height.div_ceil(2));
             Ok(())
         })();
-        let wait = vk::SemaphoreSubmitInfo::default()
-            .semaphore(transfer.allocation.ready)
-            .stage_mask(vk::PipelineStageFlags2::COPY);
-        let work = cache
-            .flush_with_sync(&[wait], &[])?
-            .ok_or(VulkanError::InvalidResource(
-                "external video transfer has no consumer submission",
-            ))?;
-        transfer.pending = Some(work);
-        recorded?;
-        self.statistics.frames += 1;
-        self.statistics.transferred_bytes += u64::from(frame.width) * u64::from(frame.height)
-            + u64::from(frame.width.div_ceil(2) * 2) * u64::from(frame.height.div_ceil(2));
-        Ok(())
+        self.video.slots.push(transfer);
+        result
     }
 }
 
@@ -398,6 +411,52 @@ mod tests {
     }
 
     #[test]
+    fn external_video_and_native_buffers_share_pressure_reclamation() {
+        let Some(mut cache) =
+            crate::residency::tests::cache(crate::ApiPreference::Auto, 8 * 1024 * 1024)
+        else {
+            return;
+        };
+        if device_uuid(&cache.device).is_none() {
+            return;
+        }
+        let validation = cache.device.validation_monitor();
+        let frame = DeviceImageFrame {
+            width: 64,
+            height: 64,
+            source: Arc::new(Source),
+        };
+        let before = cache.allocated_bytes();
+        let transfer = Transfer::new(&mut cache, &frame).unwrap();
+        let transfer_bytes = cache.allocated_bytes() - before;
+        drop(transfer);
+        let (_allocation, backing) =
+            crate::residency::tests::backing_allocation(&cache, 16384, 4096, 0);
+        let buffer = cache
+            .buffer_for_deferred_import(backing.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
+            .unwrap()
+            .buffer;
+        let buffer_bytes = cache.allocated_bytes() - before;
+        cache.budget.limit = before + transfer_bytes.max(buffer_bytes);
+        let transfer = Transfer::new(&mut cache, &frame).unwrap();
+        assert!(
+            cache.buffer(buffer).is_err(),
+            "external reservation evicts an idle native allocation"
+        );
+        cache.video.slots.push(transfer);
+        cache
+            .buffer_for_deferred_import(backing, vk::BufferUsageFlags::STORAGE_BUFFER)
+            .unwrap();
+        assert!(
+            cache.video.slots.is_empty(),
+            "ordinary allocations reclaim idle external transfers"
+        );
+        assert!(cache.allocated_bytes() <= cache.budget.limit);
+        drop(cache);
+        validation.check().unwrap();
+    }
+
+    #[test]
     fn completed_video_copies_release_decoder_surfaces_and_keep_reusable_imports() {
         let Some(mut cache) =
             crate::residency::tests::cache(crate::ApiPreference::Auto, 8 * 1024 * 1024)
@@ -408,7 +467,6 @@ mod tests {
             return;
         }
         let validation = cache.device.validation_monitor();
-        let mut transfers = VideoTransfers::default();
         let mut sources = Vec::new();
         let mut tickets = Vec::new();
         for _ in 0..2 {
@@ -423,11 +481,11 @@ mod tests {
             let work = cache.device.work_ticket().unwrap();
             transfer.pending = Some(work);
             transfer.source = Some(Arc::clone(&frame.source));
-            transfers.slots.push(transfer);
+            cache.video.slots.push(transfer);
             cache.flush().unwrap();
             tickets.push(work);
         }
-        transfers.retire_sources(tickets[0].tick() - 1);
+        cache.video.retire_sources(tickets[0].tick() - 1);
         assert!(sources.iter().all(|source| source.upgrade().is_some()));
         for (index, work) in tickets.into_iter().enumerate() {
             assert!(
@@ -436,18 +494,17 @@ mod tests {
                     .wait_for_work(work, std::time::Duration::from_secs(5))
                     .unwrap()
             );
-            transfers.retire_sources(work.tick());
+            cache.video.retire_sources(work.tick());
             assert!(sources[index].upgrade().is_none());
             if index == 0 {
                 assert!(sources[1].upgrade().is_some());
             }
             assert_eq!(
-                transfers.slots.len(),
+                cache.video.slots.len(),
                 2,
                 "external allocations stay reusable"
             );
         }
-        drop(transfers);
         drop(cache);
         validation.check().unwrap();
     }

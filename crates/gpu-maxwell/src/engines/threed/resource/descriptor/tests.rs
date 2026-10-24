@@ -55,13 +55,13 @@ fn bounded_descriptor_eviction_keeps_owned_bytes_without_retaining_ram() {
     let machine = allocation.pin().machine().clone();
     let mut access = test_memory::access(&machine);
     let mut cache = Cache {
-        entries: nixe_gpu::WorkingSet::new(2, 64 * 1024),
+        tables: nixe_gpu::WorkingSet::new(2, 128 * 1024),
     };
     let retained = cache.read(&mapping, 0, 4, &mut access).unwrap();
-    for offset in (32..256).step_by(32) {
+    for offset in (2048..8192).step_by(2048) {
         cache.read(&mapping, offset, 32, &mut access).unwrap();
     }
-    assert!(cache.entries.usage().0 <= 2);
+    assert!(cache.tables.usage().0 <= 2);
     assert_eq!(retained.bytes, [0; 32]);
     drop(allocation);
     assert_eq!(machine.statistics().allocated_bytes, 0);

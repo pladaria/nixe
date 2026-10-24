@@ -1,5 +1,6 @@
 //! Owned pipeline state; dynamic values are canonicalized out of cache keys.
 use ash::vk;
+use std::sync::Arc;
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct BlendState {
     pub enabled: bool,
@@ -57,12 +58,12 @@ impl Default for StencilState {
 }
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct GraphicsState {
-    pub vertex_bindings: Box<[VertexBinding]>,
-    pub vertex_attributes: Box<[VertexAttribute]>,
+    pub vertex_bindings: Arc<[VertexBinding]>,
+    pub vertex_attributes: Arc<[VertexAttribute]>,
     pub topology: vk::PrimitiveTopology,
     pub primitive_restart: bool,
     pub patch_points: u32,
-    pub colors: Box<[(vk::Format, BlendState)]>,
+    pub colors: Arc<[(vk::Format, BlendState)]>,
     pub depth_format: vk::Format,
     pub stencil_format: vk::Format,
     pub samples: vk::SampleCountFlags,
@@ -90,12 +91,12 @@ pub struct GraphicsState {
 impl GraphicsState {
     pub fn color(format: vk::Format) -> Self {
         Self {
-            vertex_bindings: Box::new([]),
-            vertex_attributes: Box::new([]),
+            vertex_bindings: Arc::from([]),
+            vertex_attributes: Arc::from([]),
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
             primitive_restart: false,
             patch_points: 0,
-            colors: Box::new([(format, BlendState::opaque())]),
+            colors: Arc::from([(format, BlendState::opaque())]),
             depth_format: vk::Format::UNDEFINED,
             stencil_format: vk::Format::UNDEFINED,
             samples: vk::SampleCountFlags::TYPE_1,

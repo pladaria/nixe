@@ -18,7 +18,7 @@ impl VulkanResidency {
                 self.clear_depth_stencil(id, plane, value.depth, value.stencil)
             };
         }
-        self.observe_image_cpu_writes(id)?;
+        self.invalidate_cpu_resources(&[])?;
         let description = self.image(id)?.description;
         let usage = if p.aspect == vk::ImageAspectFlags::COLOR {
             vk::ImageUsageFlags::COLOR_ATTACHMENT
@@ -134,6 +134,23 @@ impl VulkanResidency {
     ) -> Result<WorkTicket, VulkanError> {
         let src = self.checked_image_rect(source, source_plane, source_rect)?;
         let dst = self.checked_image_rect(destination, destination_plane, destination_rect)?;
+        // Equal-format, unscaled nearest transfers preserve encoded bits directly.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
+        if source_rect.extent == destination_rect.extent
+            && filter == vk::Filter::NEAREST
+            && self.image(source)?.description.format == self.image(destination)?.description.format
+            && self.image(source)?.description.samples == vk::SampleCountFlags::TYPE_1
+            && self.image(destination)?.description.samples == vk::SampleCountFlags::TYPE_1
+        {
+            return self.copy_image_region(
+                source,
+                source_plane,
+                source_rect,
+                destination,
+                destination_plane,
+                destination_rect.offset,
+            );
+        }
         if source == destination
             && src.mip_level == dst.mip_level
             && src.array_layer == dst.array_layer

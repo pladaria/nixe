@@ -348,7 +348,7 @@ fn compare_monolithic_and_library_pipeline_creation_and_warm_execution() {
                     | vk::ColorComponentFlags::B,
             ] {
                 let mut state = GraphicsState::color(vk::Format::R8G8B8A8_UNORM);
-                state.colors[0].1.write_mask = mask;
+                std::sync::Arc::make_mut(&mut state.colors)[0].1.write_mask = mask;
                 let pipeline = pipelines
                     .request(PipelineRecipe::Graphics {
                         shader: Arc::clone(shader),

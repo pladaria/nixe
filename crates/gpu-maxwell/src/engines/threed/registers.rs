@@ -233,14 +233,31 @@ pub(super) fn materialize(
     Ok(())
 }
 
-pub(super) fn dependencies(method: GpuMethodId) -> u64 {
-    match method.0 {
+const fn dependency_groups(method: u32) -> u64 {
+    match method {
         0x2390..=0x23fc | 0x2410..=0x24f0 => (1 << 0x23) | (1 << 0x15),
         0x1b0 | 0x1b4 => 1 << 1,
         // BEGIN/END operate the primitive sequence, not immutable draw state.
         0x238c | 0x1614 | 0x1618 | 0x114 | 0x118 | 0x11c | 0x120 | 0x124 | 0x3400..=0x37fc => 0,
         _ => u64::MAX,
     }
+}
+
+static DEPENDENCY_GROUPS: [u64; 4096] = {
+    let mut groups = [0; 4096];
+    let mut index = 0;
+    while index < groups.len() {
+        groups[index] = dependency_groups(index as u32 * 4);
+        index += 1;
+    }
+    groups
+};
+
+pub(super) fn dependencies(method: GpuMethodId) -> u64 {
+    DEPENDENCY_GROUPS
+        .get((method.0 / 4) as usize)
+        .copied()
+        .unwrap_or(u64::MAX)
 }
 
 /// Complete the valid prefix of a contiguous CB data packet in one transition.

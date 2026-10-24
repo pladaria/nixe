@@ -80,7 +80,7 @@ fn null_storage_buffers_read_zero_and_discard_writes_and_atomics() {
     validation.check().unwrap();
 }
 #[test]
-fn dispatch_alias_import_keeps_prepared_physical_page_baseline() {
+fn dispatch_alias_import_preserves_unwritten_shared_page_bytes() {
     let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
         return;
     };
@@ -263,12 +263,12 @@ fn area() -> vk::Rect2D {
 }
 fn graphics_state() -> GraphicsState {
     let mut s = GraphicsState::color(vk::Format::R8G8B8A8_UNORM);
-    s.vertex_bindings = Box::new([VertexBinding {
+    s.vertex_bindings = std::sync::Arc::from([VertexBinding {
         binding: 0,
         stride: 24,
         rate: vk::VertexInputRate::VERTEX,
     }]);
-    s.vertex_attributes = Box::new([
+    s.vertex_attributes = std::sync::Arc::from([
         VertexAttribute {
             location: 0,
             binding: 0,
@@ -923,7 +923,7 @@ impl Utilities for VulkanResidency {
     ) -> Result<WorkTicket, VulkanError> {
         let p = self.image(id)?.planes[plane];
         let format = self.image(id)?.description.format;
-        let source = self.attachment_image(NativeImageDescription {
+        let description = NativeImageDescription {
             image_type: vk::ImageType::TYPE_2D,
             format,
             extent: p.extent,
@@ -932,11 +932,30 @@ impl Utilities for VulkanResidency {
             samples,
             usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
             flags: vk::ImageCreateFlags::empty(),
-        })?;
+        };
+        assert_eq!(samples, vk::SampleCountFlags::TYPE_4);
+        let stored = ImagePlane {
+            offset: 0,
+            row_pitch: u64::from(p.extent.width) * 8,
+            mip_level: 0,
+            array_layer: 0,
+            ..p
+        };
+        let size = stored.row_pitch * u64::from(p.extent.height) * 2;
+        let (_allocation, backing) = backing_allocation(self, size as usize, size as usize, 0);
+        let source = self.multisample_image_for(
+            crate::residency::tests::image_geometry(backing, description, &[stored]),
+            description,
+            vec![stored],
+            [2, 2],
+        )?;
         let rect = transfers::full_rect(p);
         let prepared = solid_prepared(
             self,
-            AttachmentSource::ResidentOnly(source),
+            AttachmentSource::Canonical {
+                image: source,
+                plane: 0,
+            },
             format,
             samples,
             rect.extent,
@@ -958,9 +977,7 @@ impl Utilities for VulkanResidency {
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>(),
         )?;
-        let work = self.resolve_attachment(source, rect, id, plane, Default::default())?;
-        self.release_attachment(source)?;
-        Ok(work)
+        self.resolve_image(source, 0, rect, id, plane, Default::default())
     }
 }
 #[test]
@@ -1053,9 +1070,10 @@ fn blend_masks_depth_stencil_and_dynamic_pipeline_reuse() {
     state.stencil_test = true;
     state.front.pass = vk::StencilOp::REPLACE;
     state.back = state.front;
-    state.colors[0].1.enabled = true;
-    state.colors[0].1.dst_color = vk::BlendFactor::ONE;
-    state.colors[0].1.write_mask = vk::ColorComponentFlags::R | vk::ColorComponentFlags::B;
+    std::sync::Arc::make_mut(&mut state.colors)[0].1.enabled = true;
+    std::sync::Arc::make_mut(&mut state.colors)[0].1.dst_color = vk::BlendFactor::ONE;
+    std::sync::Arc::make_mut(&mut state.colors)[0].1.write_mask =
+        vk::ColorComponentFlags::R | vk::ColorComponentFlags::B;
     let pipeline = compilers
         .pipelines
         .request(PipelineRecipe::Graphics {
@@ -1156,14 +1174,7 @@ fn blend_masks_depth_stencil_and_dynamic_pipeline_reuse() {
     validation.check().unwrap();
 }
 #[test]
-fn sample_mask_native_resolve_and_partial_clear_preserve_padding() {
-    exercise_sample_mask_and_resolve(false);
-}
-#[test]
 fn canonical_multisample_authority_and_native_resolve_preserve_padding() {
-    exercise_sample_mask_and_resolve(true);
-}
-fn exercise_sample_mask_and_resolve(canonical: bool) {
     let Some(mut cache) = cache(ApiPreference::Auto, 32 * 1024 * 1024) else {
         return;
     };
@@ -1188,12 +1199,9 @@ fn exercise_sample_mask_and_resolve(canonical: bool) {
         usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
         flags: vk::ImageCreateFlags::empty(),
     };
-    let mut source_storage = None;
-    let mut _source_allocation = None;
-    let source = if canonical {
-        let (_allocation_5, backing) = backing_allocation(&cache, 1280, 64, 0x39);
-        source_storage = Some(backing.clone());
-        _source_allocation = Some(_allocation_5);
+    let (_source_allocation, source_storage) = backing_allocation(&cache, 1280, 64, 0x39);
+    let source = {
+        let backing = source_storage.clone();
         let image = cache
             .multisample_image_for(
                 crate::residency::tests::image_geometry(
@@ -1231,8 +1239,6 @@ fn exercise_sample_mask_and_resolve(canonical: bool) {
             )
             .unwrap();
         AttachmentSource::Canonical { image, plane: 0 }
-    } else {
-        AttachmentSource::ResidentOnly(cache.attachment_image(description).unwrap())
     };
     let mut state = GraphicsState::color(vk::Format::R8G8B8A8_UNORM);
     state.samples = vk::SampleCountFlags::TYPE_4;
@@ -1285,18 +1291,16 @@ fn exercise_sample_mask_and_resolve(canonical: bool) {
                 .collect::<Vec<_>>(),
         )
         .unwrap();
-    match source {
-        AttachmentSource::Canonical { image, plane } => {
-            cache
-                .resolve_image(image, plane, area(), target, 0, Default::default())
-                .unwrap();
-        }
-        AttachmentSource::ResidentOnly(image) => {
-            cache
-                .resolve_attachment(image, area(), target, 0, Default::default())
-                .unwrap();
-        }
-    }
+    let AttachmentSource::Canonical {
+        image: source_image,
+        plane,
+    } = source
+    else {
+        unreachable!()
+    };
+    cache
+        .resolve_image(source_image, plane, area(), target, 0, Default::default())
+        .unwrap();
     let rect = vk::Rect2D {
         offset: vk::Offset2D { x: 2, y: 3 },
         extent: vk::Extent2D {
@@ -1332,7 +1336,8 @@ fn exercise_sample_mask_and_resolve(canonical: bool) {
         }
         assert_eq!(&result[64 + y * 48..80 + y * 48], &[0x7b; 16]);
     }
-    if let Some(storage) = source_storage {
+    {
+        let storage = source_storage;
         // The guest reinterprets the rendered samples as sRGB before resolving.
         // An UNORM resolve followed by reinterpretation would incorrectly yield 128.
         let source_id = match source {
@@ -1344,7 +1349,7 @@ fn exercise_sample_mask_and_resolve(canonical: bool) {
             format: vk::Format::R8G8B8A8_SRGB,
             ..entry.description
         };
-        let planes = entry.planes.clone();
+        let planes = entry.planes.to_vec();
         let alias = cache
             .multisample_image_for(
                 crate::residency::tests::image_geometry(storage.clone(), srgb_description, &planes),
@@ -1427,7 +1432,7 @@ fn sampled_image_preserves_undefined_padding_without_requiring_the_whole_view() 
         usage: entry.description.usage | vk::ImageUsageFlags::SAMPLED,
         ..entry.description
     };
-    let planes = entry.planes.clone();
+    let planes = entry.planes.to_vec();
     let source = cache
         .image_for_device_write(
             crate::residency::tests::image_geometry(backing, description, &planes),
@@ -1619,6 +1624,7 @@ fn native_bc_extent_astc_decode_dirty_blocks_and_custom_sampler_border() {
             vec![source],
         )
         .unwrap();
+    cache.ensure_image(image).unwrap();
     let before = cache.statistics().cpu_uploaded_bytes;
     cache.ensure_image(image).unwrap();
     assert_eq!(cache.statistics().cpu_uploaded_bytes, before);
@@ -1795,7 +1801,7 @@ fn compute_produced_indexed_indirect_draw_scaled32_and_first_instance() {
     let functions = test_shaders::vertex_fragment(false, true);
     let shader = compilers.shader(&cache, functions);
     let mut state = graphics_state();
-    state.vertex_bindings = Box::new([
+    state.vertex_bindings = std::sync::Arc::from([
         state.vertex_bindings[0],
         VertexBinding {
             binding: 1,
@@ -1803,9 +1809,9 @@ fn compute_produced_indexed_indirect_draw_scaled32_and_first_instance() {
             rate: vk::VertexInputRate::INSTANCE,
         },
     ]);
-    state.vertex_attributes[1].binding = 1;
-    state.vertex_attributes[1].offset = 0;
-    state.vertex_attributes[1].format = vk::Format::R32G32B32_UINT;
+    std::sync::Arc::make_mut(&mut state.vertex_attributes)[1].binding = 1;
+    std::sync::Arc::make_mut(&mut state.vertex_attributes)[1].offset = 0;
+    std::sync::Arc::make_mut(&mut state.vertex_attributes)[1].format = vk::Format::R32G32B32_UINT;
     let pipeline = compilers
         .pipelines
         .request(PipelineRecipe::Graphics {
@@ -2872,12 +2878,12 @@ fn deferred_canonical_import_skips_overwritten_bytes_and_preserves_partial_loads
     );
     let entry = cache.image(template).unwrap();
     let description = entry.description;
-    let planes = entry.planes.clone();
+    let planes = entry.planes.to_vec();
     for full in [false, true] {
         let (_allocation_13, bytes) = backing_allocation(&cache, 4096, 4096, 0x7b);
         let uploaded = cache.statistics.cpu_uploaded_bytes;
         let target = cache
-            .image_for_deferred_import(
+            .image_for(
                 crate::residency::tests::image_geometry(
                     bytes.clone(),
                     description,
@@ -3527,7 +3533,7 @@ fn shader_storage_alias_becomes_sampled_texture_without_cpu_readback() {
     // not a reinterpretation of an unrelated host allocation.
     let mut d = cache.image(source).unwrap().description;
     d.usage |= vk::ImageUsageFlags::SAMPLED;
-    let planes = cache.image(source).unwrap().planes.clone();
+    let planes = cache.image(source).unwrap().planes.to_vec();
     let source = cache
         .image_for(
             crate::residency::tests::image_geometry(source_bytes.clone(), d, &planes),
@@ -3817,7 +3823,7 @@ fn exercise_read_only_depth(api: ApiPreference) {
         depth: 1,
     };
     let depth = cache
-        .image_for_deferred_import(
+        .image_for(
             crate::residency::tests::image_geometry(
                 depth_bytes.clone(),
                 NativeImageDescription {
@@ -4133,7 +4139,7 @@ fn transfer_writes_skip_old_destination_import_and_preserve_exterior_producers()
                 ..cache.image(old).unwrap().description
             };
             let destination = cache
-                .image_for_deferred_import(
+                .image_for(
                     crate::residency::tests::image_geometry(backing.clone(), description, &[plane]),
                     description,
                     vec![plane],

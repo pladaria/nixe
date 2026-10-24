@@ -7,7 +7,7 @@ mod operations;
 mod qmd;
 mod state;
 
-pub(crate) use launch::resolve_compute_launch;
+pub(crate) use launch::{ComputeResources, resolve_compute_launch};
 pub use launch::{MaxwellComputeLaunch, MaxwellComputeLaunchError, MaxwellResolvedComputeLaunch};
 
 pub use operations::{

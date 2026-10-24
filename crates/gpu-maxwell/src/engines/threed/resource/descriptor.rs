@@ -1,28 +1,33 @@
-//! Immutable descriptor bytes with one monotonic invalidation observation.
+//! Indexed descriptor slots with immutable bytes and monotonic invalidation.
+//! Slot indexing and byte comparison follow Eden DescriptorTable:
+//! https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/descriptor_table.h
 use super::*;
 use nixe_gpu::physical::PhysicalMapping;
 use nixe_memory::{AccessOperation, AccessResult, Observation};
 
 #[derive(Clone, Eq, Hash, PartialEq)]
-struct Key {
+struct TableKey {
     parent: Arc<PhysicalMapping>,
-    offset: u64,
+    block: u64,
+    lane: u8,
     size: u8,
 }
+const SLOTS: usize = 64;
+type Slots = Box<[Option<Arc<Snapshot>>; SLOTS]>;
 pub(super) struct Cache {
-    entries: nixe_gpu::WorkingSet<Key, Arc<Snapshot>>,
+    tables: nixe_gpu::WorkingSet<TableKey, Slots>,
 }
 impl Default for Cache {
     fn default() -> Self {
         Self {
-            entries: nixe_gpu::WorkingSet::new(4096, 64 * 1024 * 1024),
+            tables: nixe_gpu::WorkingSet::new(4096, 64 * 1024 * 1024),
         }
     }
 }
 impl std::fmt::Debug for Cache {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DescriptorCache")
-            .field("usage", &self.entries.usage())
+            .field("usage", &self.tables.usage())
             .finish()
     }
 }
@@ -34,30 +39,49 @@ impl Cache {
         size: u8,
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<Arc<Snapshot>, MaxwellThreeDResourceError> {
-        let key = Key {
+        // TIC/TSC indices select dense 32-byte slots. Short CB words and storage
+        // descriptors use their byte lane in the same indexing scheme. Allocate
+        // blocks only as consumed, without sizing storage to an unused pool limit.
+        let key = TableKey {
             parent: Arc::clone(parent),
-            offset,
+            block: offset / (32 * SLOTS as u64),
+            lane: (offset % 32) as u8,
             size,
         };
-        if let Some(snapshot) = self.entries.get(&key)
+        let index = (offset / 32 % SLOTS as u64) as usize;
+        if let Some(snapshot) = self
+            .tables
+            .get(&key)
+            .and_then(|slots| slots[index].as_ref())
             && snapshot.remains_current()
         {
             return Ok(Arc::clone(snapshot));
         }
         let snapshot = Arc::new(Snapshot::read(parent, offset, size, access)?);
-        let weight = std::mem::size_of::<Snapshot>() + parent.metadata_bytes() + 512;
-        self.entries.insert(key, Arc::clone(&snapshot), weight);
+        if let Some(slots) = self.tables.get_mut(&key) {
+            slots[index] = Some(Arc::clone(&snapshot));
+        } else {
+            let mut slots: Slots = Box::new(std::array::from_fn(|_| None));
+            slots[index] = Some(Arc::clone(&snapshot));
+            let weight = SLOTS * (std::mem::size_of::<Snapshot>() + 512)
+                + std::mem::size_of_val(slots.as_ref())
+                + parent.metadata_bytes();
+            self.tables.insert(key, slots, weight);
+        }
         Ok(snapshot)
     }
 }
 #[derive(Debug)]
 pub(super) struct Snapshot {
     pub(super) bytes: [u8; 32],
+    pub(super) parent: Arc<PhysicalMapping>,
+    pub(super) offset: u64,
+    pub(super) size: u8,
     observation: Observation,
 }
 impl Snapshot {
     pub(super) fn read(
-        parent: &PhysicalMapping,
+        parent: &Arc<PhysicalMapping>,
         offset: u64,
         size: u8,
         access: &mut nixe_gpu::MemoryAccess<'_>,
@@ -75,7 +99,13 @@ impl Snapshot {
         };
         let mut bytes = [0; 32];
         bytes[..usize::from(size)].copy_from_slice(&captured);
-        Ok(Self { bytes, observation })
+        Ok(Self {
+            bytes,
+            observation,
+            parent: Arc::clone(parent),
+            offset,
+            size,
+        })
     }
     pub(super) fn remains_current(&self) -> bool {
         !self.observation.is_invalid()

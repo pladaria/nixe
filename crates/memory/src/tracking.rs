@@ -40,7 +40,7 @@ impl Bitmap {
 }
 pub(crate) struct Tracking {
     observed: Bitmap,
-    buffer_observed: Bitmap,
+    resource_observed: Bitmap,
     device_observed: Bitmap,
     dirty: Bitmap,
     reserved: Bitmap,
@@ -192,7 +192,7 @@ impl Tracking {
     pub fn new(bytes: u64) -> Self {
         Self {
             observed: Bitmap::new(bytes / PAGE_SIZE, 0),
-            buffer_observed: Bitmap::new(bytes / PAGE_SIZE, 0),
+            resource_observed: Bitmap::new(bytes / PAGE_SIZE, 0),
             device_observed: Bitmap::new(bytes / PAGE_SIZE, 0),
             dirty: Bitmap::new(bytes / PAGE_SIZE, 0),
             reserved: Bitmap::new(bytes / PAGE_SIZE, 0),
@@ -207,18 +207,18 @@ impl Tracking {
         }
     }
     pub fn observed(&self, page: u64) -> bool {
-        self.observed.get(page) || self.buffer_observed.get(page)
+        self.observed.get(page) || self.resource_observed.get(page)
     }
     fn all_observed(&self, extent: Extent) -> bool {
         bitmap_words(extent).all(|(word, mask)| {
             (self.observed.0[word].load(Ordering::Acquire)
-                | self.buffer_observed.0[word].load(Ordering::Acquire))
+                | self.resource_observed.0[word].load(Ordering::Acquire))
                 & mask
                 == mask
         })
     }
     fn any_observed(&self, extent: Extent) -> bool {
-        self.observed.any(extent) || self.buffer_observed.any(extent)
+        self.observed.any(extent) || self.resource_observed.any(extent)
     }
     pub fn code(&self, page: u64) -> bool {
         self.code.get(page)
@@ -243,7 +243,12 @@ impl Tracking {
     }
     pub fn kind(&self, page: u64) -> u8 {
         crate::address_space::MappedPage::RAM
-            | if self.observed(page) {
+            // Device pages already journal exact CPU stores. Keep the retained
+            // resource watch for later materialization without forcing an extra
+            // observed-memory slow path while that journal owns the writes.
+            | if self.observed.get(page)
+                || (self.resource_observed.get(page) && !self.device.get(page))
+            {
                 crate::address_space::MappedPage::OBSERVED
             } else {
                 0
@@ -263,7 +268,7 @@ impl Tracking {
         let mut observers = self.observers.lock().unwrap();
         for &extent in extents {
             self.code.update_range(extent, false, |_| {});
-            self.buffer_observed.update_range(extent, false, |_| {});
+            self.resource_observed.update_range(extent, false, |_| {});
             self.observed.update_range(extent, false, |page| {
                 let mut device_only = false;
                 if let Some(registered) = observers.pages.get_mut(&page) {
@@ -347,7 +352,11 @@ impl Tracking {
     ) {
         let mut observers = self.observers.lock().unwrap();
         for extent in extents {
-            self.observed.update_range(extent, true, |_| {});
+            // Live native read areas observe device writes only. They do not
+            // establish the CPU store protection required by immutable captures.
+            if cpu_writes {
+                self.observed.update_range(extent, true, |_| {});
+            }
             for page in pages(extent) {
                 if device_writes {
                     self.device_observed.update_range(
@@ -1401,7 +1410,8 @@ impl Machine {
             }
             if extents.iter().all(|&extent| {
                 pages(extent).all(|page| {
-                    self.tracking().observed(page) && (!code || self.tracking().code(page))
+                    self.tracking().kind(page) & crate::address_space::MappedPage::OBSERVED != 0
+                        && (!code || self.tracking().code(page))
                 })
             }) {
                 // Existing protection excludes native stores; the admitted set
@@ -1445,48 +1455,25 @@ impl Machine {
             Ok(Some(bytes.into_boxed_slice()))
         })
     }
-    /// Gather native input once and observe subsequent CPU writes. Native GPU
-    /// coherency belongs to the resource authority; its own device writes do
-    /// not invalidate this CPU modification proof. Layout fragments share one
-    /// observation and retain no individual pins.
-    pub fn capture_clean_scattered(
-        &self,
-        inputs: &[AllocationRange],
-        copies: &[PhysicalCapture],
-        destination: &mut [u8],
-    ) -> Result<Observation, MemoryError> {
-        let observation = Observation::default();
-        self.capture_scattered(inputs, copies, destination, Some(&observation))?;
-        Ok(observation)
-    }
     /// Inspect weak cache metadata without acquiring a physical input lease.
     /// Actual capture/publication still retains the allocation independently.
-    pub fn buffer_pages_tracked(&self, extent: Extent) -> bool {
+    pub fn resource_pages_tracked(&self, extent: Extent) -> bool {
         bitmap_words(extent).all(|(word, mask)| {
             self.tracking()
-                .buffer_observed
+                .resource_observed
                 .0
                 .get(word)
                 .is_some_and(|bits| bits.load(Ordering::Acquire) & mask == mask)
         })
     }
-    /// Retained buffers consume dirty-page notifications instead of rebuilding
-    /// per-buffer observations. Device materialization preserves this CPU watch.
+    /// Retained resources consume dirty-page notifications instead of rebuilding
+    /// per-resource observations. Device materialization preserves this CPU watch.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/memory_tracker_base.h
-    pub fn capture_buffer_scattered(
+    pub fn capture_resource_scattered(
         &self,
         inputs: &[AllocationRange],
         copies: &[PhysicalCapture],
         destination: &mut [u8],
-    ) -> Result<(), MemoryError> {
-        self.capture_scattered(inputs, copies, destination, None)
-    }
-    fn capture_scattered(
-        &self,
-        inputs: &[AllocationRange],
-        copies: &[PhysicalCapture],
-        destination: &mut [u8],
-        observation: Option<&Observation>,
     ) -> Result<(), MemoryError> {
         self.validate_ranges(inputs)?;
         let mut extents: Vec<_> = inputs
@@ -1528,15 +1515,10 @@ impl Machine {
             }
         }
         let capture = |destination: &mut [u8]| {
-            if let Some(observation) = observation {
+            for &extent in &retained {
                 self.tracking()
-                    .register(retained.iter().copied(), observation, true, false);
-            } else {
-                for &extent in &retained {
-                    self.tracking()
-                        .buffer_observed
-                        .update_range(extent, true, |_| {});
-                }
+                    .resource_observed
+                    .update_range(extent, true, |_| {});
             }
             for copy in copies {
                 let source = self
@@ -1568,12 +1550,9 @@ impl Machine {
         }
         self.tracking_transition(inputs, |batch, _| {
             for &extent in &retained {
-                let bitmap = if observation.is_some() {
-                    &self.tracking().observed
-                } else {
-                    &self.tracking().buffer_observed
-                };
-                bitmap.update_range(extent, true, |_| {});
+                self.tracking()
+                    .resource_observed
+                    .update_range(extent, true, |_| {});
             }
             batch.refresh()?;
             capture(destination);
@@ -2219,28 +2198,25 @@ mod tests {
                 )
                 .unwrap();
             let mut bytes = [0xaa; 12];
-            let scattered = read
-                .capture_clean_scattered(
-                    std::slice::from_ref(&range),
-                    &[PhysicalCapture {
-                        source: Extent {
-                            start: range.physical_extents().next().unwrap().start,
-                            bytes: 8,
-                        },
-                        destination: 2,
-                    }],
-                    &mut bytes,
-                )
-                .unwrap();
-            completed
-                .send((result, observation, scattered, bytes))
-                .unwrap();
+            read.capture_resource_scattered(
+                std::slice::from_ref(&range),
+                &[PhysicalCapture {
+                    source: Extent {
+                        start: range.physical_extents().next().unwrap().start,
+                        bytes: 8,
+                    },
+                    destination: 2,
+                }],
+                &mut bytes,
+            )
+            .unwrap();
+            completed.send((result, observation, bytes)).unwrap();
         });
         let captured_while_running = result.recv_timeout(Duration::from_secs(1));
         release.send(()).unwrap();
         native.join().unwrap();
         reader.join().unwrap();
-        let (captured, second, scattered, bytes) =
+        let (captured, second, bytes) =
             captured_while_running.expect("protected RAM capture must not drain the running core");
         assert!(matches!(captured, Access::Ready(AccessResult::Read(_))));
         assert_eq!(bytes, [0xaa, 0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0xaa, 0xaa]);
@@ -2254,7 +2230,6 @@ mod tests {
         ));
         assert!(first.is_invalid());
         assert!(second.is_invalid());
-        assert!(scattered.is_invalid());
     }
     #[test]
     fn fragmented_ram_writes_do_not_publish_dirty_pages_and_defer_device_writes_intact() {
@@ -2384,10 +2359,8 @@ mod tests {
                 })
                 .collect();
             let mut bytes = [0xaa; 20];
-            observations.push(
-                read.capture_clean_scattered(&ranges, &copies, &mut bytes)
-                    .unwrap(),
-            );
+            read.capture_resource_scattered(&ranges, &copies, &mut bytes)
+                .unwrap();
             assert_eq!(&bytes[..16], &[0; 16]);
             assert_eq!(&bytes[16..], &[0xaa; 4]);
             completed.send(observations).unwrap();
@@ -2440,8 +2413,8 @@ mod tests {
             assert!(machine.tracking().observed(page));
             assert!(machine.tracking().code(page));
         }
-        let scattered = machine
-            .capture_clean_scattered(
+        machine
+            .capture_resource_scattered(
                 &ranges,
                 &[
                     PhysicalCapture {
@@ -2462,7 +2435,6 @@ mod tests {
             .into_ready()
             .unwrap();
         assert!(code.is_invalid());
-        assert!(scattered.is_invalid());
         assert!(!first.is_invalid());
         let mut value = [0; 4];
         first_alias
@@ -2684,89 +2656,6 @@ mod tests {
         }
     }
     #[test]
-    fn native_cpu_tracking_survives_device_writes_but_still_observes_a_later_cpu_store() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let input = AllocationRange::new(allocation.pin(), 0, PAGE_SIZE).unwrap();
-        let physical = input.physical_extents().next().unwrap().start;
-        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        let base = GuestVirtualAddress::new(0x7000);
-        space
-            .map(
-                base,
-                allocation,
-                0,
-                PAGE_SIZE,
-                MemoryPermissions::READ_WRITE,
-            )
-            .unwrap();
-        let mut bytes = [0; 4];
-        let native = machine
-            .capture_clean_scattered(
-                std::slice::from_ref(&input),
-                &[PhysicalCapture {
-                    source: Extent {
-                        start: physical,
-                        bytes: 4,
-                    },
-                    destination: 0,
-                }],
-                &mut bytes,
-            )
-            .unwrap();
-        let snapshot = crate::Observation::default();
-        machine
-            .access_captured(
-                std::slice::from_ref(&input),
-                crate::AccessOperation::ReadObserved(snapshot.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        machine
-            .publish_device_write(std::slice::from_ref(&input), || {
-                assert!(snapshot.is_invalid());
-                assert!(!native.is_invalid());
-                Ok(())
-            })
-            .unwrap();
-        assert!(machine.tracking().observed(physical.get() / PAGE_SIZE));
-        assert!(
-            !machine
-                .tracking()
-                .device_observed
-                .get(physical.get() / PAGE_SIZE)
-        );
-        let protected = machine.tracking_statistics().protection_calls;
-        machine
-            .invalidate_device_observations(std::slice::from_ref(&input), || Ok(()))
-            .unwrap();
-        assert_eq!(machine.tracking_statistics().protection_calls, protected);
-        assert!(!native.is_invalid());
-        assert!(machine.take_cpu_modified_pages().is_empty());
-        machine
-            .write_download(&input, &vec![0x73; PAGE_SIZE as usize], || {
-                Ok(std::iter::once(0..PAGE_SIZE as usize).collect())
-            })
-            .unwrap();
-        assert!(!native.is_invalid());
-        assert!(machine.take_cpu_modified_pages().is_empty());
-        machine
-            .retire_device_pages(std::slice::from_ref(&input))
-            .unwrap();
-        assert!(
-            !host_store(&space, base.get()),
-            "CPU observation must remain protected after device retirement"
-        );
-        space.write_value(base, 4, 7).unwrap().into_ready().unwrap();
-        assert!(native.is_invalid());
-        assert!(host_store(&space, base.get()));
-    }
-    #[test]
     fn buffer_dirty_watch_survives_snapshot_invalidation_and_download() {
         let machine = Machine::new(PAGE_SIZE).unwrap();
         let allocation = machine
@@ -2788,7 +2677,7 @@ mod tests {
             )
             .unwrap();
         machine
-            .capture_buffer_scattered(std::slice::from_ref(&input), &[], &mut [])
+            .capture_resource_scattered(std::slice::from_ref(&input), &[], &mut [])
             .unwrap();
         assert_eq!(machine.tracking_statistics().observer_registrations, 0);
         let snapshot = Observation::default();
@@ -2832,7 +2721,7 @@ mod tests {
         };
         let mut captured = [0; 4];
         machine
-            .capture_buffer_scattered(&[input.slice(0, 4).unwrap()], &[copy], &mut captured)
+            .capture_resource_scattered(&[input.slice(0, 4).unwrap()], &[copy], &mut captured)
             .unwrap();
         assert_eq!(captured, 42u32.to_le_bytes());
         assert!(!host_store(&space, base.get()));
@@ -3689,8 +3578,8 @@ mod tests {
             },
         ];
         let mut bytes = [0xcc; 32];
-        let observation = machine
-            .capture_clean_scattered(&[input.clone(), input.clone()], &copies, &mut bytes)
+        machine
+            .capture_resource_scattered(&[input.clone(), input.clone()], &copies, &mut bytes)
             .unwrap();
         assert_eq!(&bytes[0..4], &[4, 5, 6, 7]);
         assert_eq!(&bytes[20..23], &[1, 2, 3]);
@@ -3700,8 +3589,8 @@ mod tests {
                 .chain(&bytes[23..])
                 .all(|byte| *byte == 0xcc)
         );
-        assert_eq!(machine.tracking_statistics().observer_registrations, 2);
-        assert!(!observation.is_invalid());
+        assert_eq!(machine.tracking_statistics().observer_registrations, 0);
+        assert!(machine.resource_pages_tracked(input.physical_extents().next().unwrap()));
         let before = machine.tracking_statistics();
         let invalid = PhysicalCapture {
             source: Extent {
@@ -3712,24 +3601,30 @@ mod tests {
         };
         assert!(
             machine
-                .capture_clean_scattered(std::slice::from_ref(&input), &[invalid], &mut bytes)
+                .capture_resource_scattered(std::slice::from_ref(&input), &[invalid], &mut bytes)
                 .is_err()
         );
         assert!(
             machine
-                .capture_clean_scattered(std::slice::from_ref(&input), &copies, &mut bytes[..2])
+                .capture_resource_scattered(std::slice::from_ref(&input), &copies, &mut bytes[..2])
                 .is_err()
         );
         assert_eq!(machine.tracking_statistics(), before);
         machine.write_resolved(&[first], &[8, 9, 10]).unwrap();
-        assert!(observation.is_invalid());
-        let observation = machine
-            .capture_clean_scattered(std::slice::from_ref(&input), &copies, &mut bytes)
+        assert!(!machine.resource_pages_tracked(Extent {
+            start: physical,
+            bytes: 2 * PAGE_SIZE
+        }));
+        machine
+            .capture_resource_scattered(std::slice::from_ref(&input), &copies, &mut bytes)
             .unwrap();
         drop(second);
         drop(input);
         drop(allocation);
-        assert!(observation.is_invalid());
+        assert!(!machine.resource_pages_tracked(Extent {
+            start: physical,
+            bytes: 2 * PAGE_SIZE
+        }));
         assert_eq!(machine.statistics().allocated_bytes, 0);
     }
 }

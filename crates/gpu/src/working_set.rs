@@ -1,6 +1,6 @@
 //! Bounded derived state with constant-time lookup, refresh and LRU eviction.
 use rustc_hash::FxHashMap;
-use std::hash::Hash;
+use std::{borrow::Borrow, hash::Hash};
 
 struct Entry<K, V> {
     key: K,
@@ -33,13 +33,22 @@ impl<K: Eq + Hash + Clone, V> WorkingSet<K, V> {
             byte_limit,
         }
     }
-    pub fn get(&mut self, key: &K) -> Option<&V> {
+    pub fn get<Q: Eq + Hash + ?Sized>(&mut self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
+        self.get_mut(key).map(|value| &*value)
+    }
+    pub fn get_mut<Q: Eq + Hash + ?Sized>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+    {
         let slot = *self.index.get(key)?;
         if self.last != Some(slot) {
             self.unlink(slot);
             self.append(slot);
         }
-        Some(&self.entries[slot].as_ref().unwrap().value)
+        Some(&mut self.entries[slot].as_mut().unwrap().value)
     }
     pub fn insert(&mut self, key: K, value: V, bytes: usize) {
         if let Some(&slot) = self.index.get(&key) {

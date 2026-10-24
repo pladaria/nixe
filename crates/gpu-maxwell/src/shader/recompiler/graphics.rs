@@ -48,29 +48,9 @@ pub fn graphics_request(
         .value()
         .copied()
         .unwrap_or(0);
-    let pool = bindings.texture_headers();
-    let texture_pool = pool
-        .address()
-        .zip(pool.maximum_index().value().copied())
-        .zip(bindings.sampler_binding().value())
-        .map(|((address, maximum_index), mode)| TexturePool {
-            address: address.get(),
-            maximum_index,
-            via_header_index: *mode == MaxwellThreeDSamplerBindingMode::ViaTextureHeader,
-        });
-    let viewport_transform = match state
-        .fixed_function()
-        .register(R::ViewportScaleOffsetEnable)
-        .value()
-    {
-        Some(V::ViewportScaleOffsetEnable(value)) => Some(u32::from(
-            *value == MaxwellThreeDViewportScaleOffsetEnable::Enabled,
-        )),
-        _ => None,
-    };
     let mut capture_bindings = CaptureBindings {
-        texture_pool,
-        viewport_transform,
+        texture_pool: texture_pool(state),
+        viewport_transform: viewport_transform(state),
         geometry_passthrough_mask: bindings.geometry_passthrough_mask(),
         ..Default::default()
     };
@@ -79,23 +59,14 @@ pub fn graphics_request(
             .groups()
             .get(group as usize)
             .ok_or_else(|| invalid("Graphics constant buffer group is out of range"))?;
-        for (index, binding) in group.constant_buffers().iter().enumerate() {
-            if let Some(binding) = binding.filter(|binding| binding.enabled()) {
-                match binding.address().zip(binding.size()) {
-                    Some((address, size)) => {
-                        capture_bindings.constant_buffers[index] = Some(BufferBinding {
-                            address: address.get(),
-                            size: u64::from(size),
-                        })
-                    }
-                    None => {
-                        capture_bindings.invalid_constant_buffers[index] =
-                            Some("enabled graphics binding has incomplete address or size")
-                    }
-                }
-            }
+        for index in 0..group.constant_buffers().len() {
+            (
+                capture_bindings.constant_buffers[index],
+                capture_bindings.invalid_constant_buffers[index],
+            ) = constant_buffer(state, pipeline.effective_group(), index);
         }
     }
+
     Ok(CaptureRequest {
         address,
         metadata: EnvironmentMetadata {
@@ -107,6 +78,74 @@ pub fn graphics_request(
         },
         bindings: capture_bindings,
     })
+}
+
+fn texture_pool(state: &MaxwellThreeDState) -> Option<TexturePool> {
+    let bindings = state.shader_bindings();
+    let pool = bindings.texture_headers();
+    pool.address()
+        .zip(pool.maximum_index().value().copied())
+        .zip(bindings.sampler_binding().value())
+        .map(|((address, maximum_index), mode)| TexturePool {
+            address: address.get(),
+            maximum_index,
+            via_header_index: *mode == MaxwellThreeDSamplerBindingMode::ViaTextureHeader,
+        })
+}
+fn viewport_transform(state: &MaxwellThreeDState) -> Option<u32> {
+    match state
+        .fixed_function()
+        .register(R::ViewportScaleOffsetEnable)
+        .value()
+    {
+        Some(V::ViewportScaleOffsetEnable(value)) => Some(u32::from(
+            *value == MaxwellThreeDViewportScaleOffsetEnable::Enabled,
+        )),
+        _ => None,
+    }
+}
+fn constant_buffer(
+    state: &MaxwellThreeDState,
+    group: Option<u8>,
+    index: usize,
+) -> (Option<BufferBinding>, Option<&'static str>) {
+    let binding = group
+        .and_then(|group| state.shader_bindings().groups().get(group as usize))
+        .and_then(|group| group.constant_buffers().get(index))
+        .copied()
+        .flatten()
+        .filter(|binding| binding.enabled());
+    match binding {
+        None => (None, None),
+        Some(binding) => match binding.address().zip(binding.size()) {
+            Some((address, size)) => (
+                Some(BufferBinding {
+                    address: address.get(),
+                    size: u64::from(size),
+                }),
+                None,
+            ),
+            None => (
+                None,
+                Some("enabled graphics binding has incomplete address or size"),
+            ),
+        },
+    }
+}
+impl CapturedStage {
+    /// Only bindings read during translation can invalidate the captured environment.
+    pub(crate) fn graphics_bindings_current(
+        &self,
+        state: &MaxwellThreeDState,
+        group: Option<u8>,
+    ) -> bool {
+        self.bindings_match(
+            |index| constant_buffer(state, group, index),
+            texture_pool(state),
+            viewport_transform(state),
+            state.shader_bindings().geometry_passthrough_mask(),
+        )
+    }
 }
 
 #[cfg(test)]

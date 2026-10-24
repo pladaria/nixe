@@ -3,7 +3,10 @@ const MAXWELL_SHADER_READ_LIMIT: usize = 64 * 1024;
 use crate::{MaxwellGpuAccessError, MaxwellGpuMemory, MaxwellShaderStage};
 use nixe_gpu::physical::PhysicalMapping;
 use nixe_memory::{AccessOperation, AccessResult, MemoryPermissions, Observation};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 pub struct MaxwellShaderMemoryCache {
     reads: nixe_gpu::WorkingSet<(crate::MaxwellAddressSpaceId, u64, usize), MaxwellShaderRead>,
@@ -15,37 +18,60 @@ impl Default for MaxwellShaderMemoryCache {
         }
     }
 }
-pub(super) struct MaxwellShaderMemoryView<'a, 'm> {
+pub(crate) struct MaxwellShaderMemoryView<'a, 'm> {
     address_space: &'a MaxwellGpuMemory,
     cache: &'a mut MaxwellShaderMemoryCache,
     access: &'a mut nixe_gpu::MemoryAccess<'m>,
 }
-#[derive(Clone, Debug)]
-pub(super) struct MaxwellShaderRead {
-    pub(super) address: u64,
-    pub(super) stage: MaxwellShaderStage,
-    pub(super) bytes: Arc<[u8]>,
-    pub(super) physical: Arc<PhysicalMapping>,
+#[derive(Debug)]
+pub(crate) struct MaxwellShaderRead {
+    pub(crate) address: u64,
+    pub(crate) stage: MaxwellShaderStage,
+    pub(crate) bytes: Arc<[u8]>,
+    pub(crate) physical: Arc<PhysicalMapping>,
     observation: Observation,
-    pub(super) mappings: Arc<[crate::MaxwellGpuMapping]>,
+    pub(crate) mappings: Arc<[crate::MaxwellGpuMapping]>,
     address_space: crate::MaxwellAddressSpaceId,
-    mapping_generation: nixe_gpu::MappingGeneration,
+    mapping_generation: AtomicU64,
+}
+impl Clone for MaxwellShaderRead {
+    fn clone(&self) -> Self {
+        Self {
+            address: self.address,
+            stage: self.stage,
+            bytes: Arc::clone(&self.bytes),
+            physical: Arc::clone(&self.physical),
+            observation: self.observation.clone(),
+            mappings: Arc::clone(&self.mappings),
+            address_space: self.address_space,
+            mapping_generation: AtomicU64::new(self.mapping_generation.load(Ordering::Relaxed)),
+        }
+    }
 }
 impl MaxwellShaderRead {
     fn mapping_is_current(&self, space: &MaxwellGpuMemory) -> bool {
-        self.address_space == space.id()
-            && (self.mapping_generation == space.mapping_generation()
-                || self
-                    .mappings
-                    .iter()
-                    .all(|mapping| space.retained_mapping_is_current(mapping)))
+        if self.address_space != space.id() {
+            return false;
+        }
+        let generation = space.mapping_generation().get();
+        if self.mapping_generation.load(Ordering::Relaxed) != generation {
+            if !self
+                .mappings
+                .iter()
+                .all(|mapping| space.retained_mapping_is_current(mapping))
+            {
+                return false;
+            }
+            self.mapping_generation.store(generation, Ordering::Relaxed);
+        }
+        true
     }
-    pub(super) fn is_current(&self, space: &MaxwellGpuMemory) -> bool {
+    pub(crate) fn is_current(&self, space: &MaxwellGpuMemory) -> bool {
         !self.observation.is_invalid() && self.mapping_is_current(space)
     }
 }
 impl<'a, 'm> MaxwellShaderMemoryView<'a, 'm> {
-    pub(super) fn new(
+    pub(crate) fn new(
         address_space: &'a MaxwellGpuMemory,
         cache: &'a mut MaxwellShaderMemoryCache,
         access: &'a mut nixe_gpu::MemoryAccess<'m>,
@@ -56,7 +82,7 @@ impl<'a, 'm> MaxwellShaderMemoryView<'a, 'm> {
             access,
         }
     }
-    pub(super) fn read(
+    pub(crate) fn read(
         &mut self,
         stage: MaxwellShaderStage,
         address: u64,
@@ -131,7 +157,7 @@ impl<'a, 'm> MaxwellShaderMemoryView<'a, 'm> {
             observation,
             mappings,
             address_space: self.address_space.id(),
-            mapping_generation: self.address_space.mapping_generation(),
+            mapping_generation: AtomicU64::new(self.address_space.mapping_generation().get()),
         };
         let weight = std::mem::size_of::<MaxwellShaderRead>()
             + read.bytes.len()
@@ -144,7 +170,7 @@ impl<'a, 'm> MaxwellShaderMemoryView<'a, 'm> {
 }
 
 #[derive(Debug)]
-pub(super) enum ShaderCaptureError {
+pub(crate) enum ShaderCaptureError {
     ReadTooLarge {
         requested: usize,
         limit: usize,
@@ -237,6 +263,67 @@ mod tests {
         assert_eq!(&*next.bytes, &[7; 4]);
         assert_eq!(readbacks, 1);
         assert!(!first.is_current(space.memory()));
+    }
+
+    #[test]
+    fn unrelated_mapping_refreshes_the_retained_generation_once() {
+        let (_allocation, mut space, base) = mapped_memory();
+        let memory = space.memory().machine().clone();
+        let mut cache = MaxwellShaderMemoryCache::default();
+        let read = MaxwellShaderMemoryView::new(
+            space.memory(),
+            &mut cache,
+            &mut test_memory::access(&memory),
+        )
+        .read(MaxwellShaderStage::Compute, base, 4)
+        .unwrap();
+        let old = read.mapping_generation.load(Ordering::Relaxed);
+        let unrelated = test_memory::allocate(&memory, 0x1000);
+        space
+            .map(crate::MaxwellMapRequest {
+                allocation: crate::MaxwellAllocationId::new(2),
+                backing: test_memory::ranges(&unrelated),
+                backing_offset: 0,
+                size: 0x1000,
+                allocation_alignment: 0x1000,
+                page_size: 0,
+                kind: 0,
+                cacheable: false,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        assert_ne!(old, space.memory().mapping_generation().get());
+        assert!(read.is_current(space.memory()));
+        assert_eq!(
+            read.mapping_generation.load(Ordering::Relaxed),
+            space.memory().mapping_generation().get()
+        );
+        assert!(read.is_current(space.memory()));
+        let other = test_memory::allocate(&memory, 0x1000);
+        let mut other_space = crate::MaxwellGpuAddressSpace::new(
+            memory,
+            crate::MaxwellAddressSpaceId::new(2),
+            crate::SWITCH_1_GM20B_PROFILE,
+        );
+        other_space
+            .initialize(crate::MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        other_space
+            .map(crate::MaxwellMapRequest {
+                allocation: crate::MaxwellAllocationId::new(3),
+                backing: test_memory::ranges(&other),
+                backing_offset: 0,
+                size: 0x1000,
+                allocation_alignment: 0x1000,
+                page_size: 0,
+                kind: 0,
+                cacheable: false,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap();
+        assert!(!read.is_current(other_space.memory()));
     }
 
     #[test]

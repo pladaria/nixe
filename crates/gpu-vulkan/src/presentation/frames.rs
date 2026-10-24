@@ -5,12 +5,6 @@ use nixe_gpu::{
     PresentationImageFormat as F, PresentationImageId, PresentationLease, PresentationRelease,
     ResidentImage, SampleCount, native::NativePresentationImage,
 };
-struct Import {
-    planes: Arc<[nixe_gpu::native::GuestImagePlane]>,
-    extent: [u32; 2],
-    format: F,
-    image: ImageId,
-}
 pub(crate) struct Snapshot {
     pub view: Arc<AllocatedImageView>,
     pub format: vk::Format,
@@ -23,8 +17,8 @@ pub(crate) struct Snapshot {
     leases: usize,
 }
 pub(crate) struct Frames {
-    imports: Vec<Import>,
-    snapshots: Vec<Snapshot>,
+    snapshots: Vec<Option<Snapshot>>,
+    generation: u32,
     sender: mpsc::Sender<PresentationRelease>,
     releases: mpsc::Receiver<PresentationRelease>,
 }
@@ -32,15 +26,15 @@ impl Frames {
     pub fn new() -> Self {
         let (sender, releases) = mpsc::channel();
         Self {
-            imports: Vec::new(),
             snapshots: Vec::new(),
+            generation: 0,
             sender,
             releases,
         }
     }
     fn drain(&mut self) {
         while let Ok(release) = self.releases.try_recv() {
-            if let Some(frame) = self.snapshots.get_mut(release.image.slot as usize)
+            if let Some(Some(frame)) = self.snapshots.get_mut(release.image.slot as usize)
                 && frame.generation == release.image.generation
                 && frame.version == release.content_version
                 && frame.work.submission() == release.producer
@@ -57,6 +51,7 @@ impl Frames {
         let frame = self
             .snapshots
             .get(lease.image().slot as usize)
+            .and_then(Option::as_ref)
             .ok_or(VulkanError::InvalidResource("foreign presentation slot"))?;
         if frame.generation != lease.image().generation
             || frame.version != lease.content_version()
@@ -73,7 +68,10 @@ impl Frames {
         let slot = image.lease().image().slot as usize;
         self.get(image)?;
         // The lease's producer stays immutable; actual last use is tracked separately.
-        self.snapshots[slot].last_use = work;
+        self.snapshots[slot]
+            .as_mut()
+            .expect("validated frame")
+            .last_use = work;
         Ok(())
     }
     pub fn capture(
@@ -89,117 +87,58 @@ impl Frames {
             F::Rgb565 => vk::Format::R16_UINT,
             F::Rgba4444 => vk::Format::R16_UINT,
         };
-        let image = if let Some(import) = self.imports.iter().find(|i| {
-            Arc::ptr_eq(&i.planes, &source.planes)
-                && i.extent == source.extent
-                && i.format == source.format
-                && cache
-                    .require_frame_source(i.image, source.extent, source.allow_canonical_import)
-                    .is_ok()
-        }) {
-            import.image
-        } else {
-            if source.planes.len() != 1 {
-                return Err(VulkanError::InvalidResource(
-                    "framebuffer requires one color plane",
-                ));
-            }
-            let plane = &source.planes[0];
-            let description = NativeImageDescription {
-                image_type: vk::ImageType::TYPE_2D,
-                format,
-                extent: vk::Extent3D {
-                    width: source.extent[0],
-                    height: source.extent[1],
-                    depth: 1,
-                },
-                mip_levels: 1,
-                array_layers: 1,
-                samples: vk::SampleCountFlags::TYPE_1,
-                usage: vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::TRANSFER_DST
-                    | vk::ImageUsageFlags::SAMPLED,
-                flags: vk::ImageCreateFlags::empty(),
-            };
-            let planes = vec![ImagePlane {
-                offset: 0,
-                row_pitch: plane.row_pitch,
-                mip_level: 0,
-                array_layer: 0,
-                extent: description.extent,
-                aspect: vk::ImageAspectFlags::COLOR,
-                block_extent: vk::Extent2D {
-                    width: 1,
-                    height: 1,
-                },
-                bytes_per_block: plane.bytes_per_block,
-            }];
-            log::trace!(
-                "native framebuffer import: extent={:?} format={:?} segments={}",
-                source.extent,
-                source.format,
-                plane.footprint.mapping().spans().len()
-            );
-            let image = if let Some(image) =
-                cache.resident_frame_source(&plane.footprint, description, &planes)
-            {
-                image
-            } else if source.allow_canonical_import {
-                cache.image_for(vec![Arc::clone(&plane.footprint)], description, planes)?
-            } else {
-                return Err(VulkanError::InvalidResource(
-                    "opaque framebuffer requires a matching native resident representation",
-                ));
-            };
-            log::trace!("native framebuffer resident source: {image:?}");
-            self.imports
-                .retain(|i| !Arc::ptr_eq(&i.planes, &source.planes));
-            if self.imports.len() == 16 {
-                self.imports.remove(0);
-            }
-            self.imports.push(Import {
-                planes: Arc::clone(&source.planes),
-                extent: source.extent,
-                format: source.format,
-                image,
-            });
-            image
-        };
-        if !source.allow_canonical_import {
-            cache.require_resident_frame(image, source.extent)?;
-        }
-        // Keep the source allocation alive while charging/allocating its
-        // snapshot; residency pressure must not evict a selected CPU mirror.
-        let (native, layout) = cache.host_source(image, source.extent)?;
         cache.device_mut().poll_progress()?;
-        let completed = cache.device().queue_usage().completed_tick;
-        let slot = self.snapshots.iter().position(|s| {
-            s.leases == 0
-                && s.last_use.tick() <= completed
-                && s.extent == source.extent
-                && s.format == format
+        // Wait for and release incompatible unleased storage before allocating
+        // either the new guest source or its snapshot. Live leases stay intact.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/present/layer.cpp
+        for entry in &mut self.snapshots {
+            if entry
+                .as_ref()
+                .is_some_and(|s| s.leases == 0 && (s.extent != source.extent || s.format != format))
+            {
+                let last_use = entry.as_ref().expect("incompatible snapshot").last_use;
+                if last_use.tick() > cache.device().completed_tick() {
+                    cache.flush()?;
+                    cache
+                        .device_mut()
+                        .wait_for_work(last_use, std::time::Duration::MAX)?;
+                }
+                let old = entry.take().expect("completed snapshot");
+                descriptors.forget_image(&old.view);
+            }
+        }
+        let image = cache.presentation_source(&source, format)?;
+        // The actual native use retains the selected source while its snapshot
+        // allocation can invoke residency eviction.
+        let (native, layout) = cache.host_source(image, source.extent)?;
+        let completed = cache.device().completed_tick();
+        let slot = self.snapshots.iter().position(|entry| {
+            entry.as_ref().is_some_and(|s| {
+                s.leases == 0
+                    && s.last_use.tick() <= completed
+                    && s.extent == source.extent
+                    && s.format == format
+            })
         });
         let slot = if let Some(slot) = slot {
             slot
         } else {
-            let reusable = self
+            let slot = self
                 .snapshots
                 .iter()
-                .position(|s| s.leases == 0 && s.last_use.tick() <= completed);
-            if reusable.is_none() && self.snapshots.len() == 12 {
+                .position(Option::is_none)
+                .unwrap_or(self.snapshots.len());
+            if slot == 12 {
                 return Err(VulkanError::InvalidResource(
                     "presentation snapshot budget is saturated",
                 ));
             }
-            let generation = if let Some(slot) = reusable {
-                descriptors.forget_image(&self.snapshots[slot].view);
-                self.snapshots[slot]
-                    .generation
-                    .checked_add(1)
-                    .expect("presentation generation exhausted")
-            } else {
-                1
-            };
+            let generation = self
+                .generation
+                .checked_add(1)
+                .ok_or(VulkanError::InvalidResource(
+                    "presentation generation exhausted",
+                ))?;
             let native = cache.allocate_host_image(source.extent, format)?;
             let view = super::render::view(cache.device(), native, format)?;
             let work = cache.device_mut().work_ticket()?;
@@ -214,15 +153,17 @@ impl Frames {
                 generation,
                 leases: 0,
             };
-            if let Some(slot) = reusable {
-                self.snapshots[slot] = snapshot;
-                slot
+            // Vacant slots survive allocation failure. Every replacement gets a
+            // fresh generation, even after a failed allocation or a slot change.
+            self.generation = generation;
+            if slot == self.snapshots.len() {
+                self.snapshots.push(Some(snapshot));
             } else {
-                self.snapshots.push(snapshot);
-                self.snapshots.len() - 1
+                self.snapshots[slot] = Some(snapshot);
             }
+            slot
         };
-        let snapshot = &mut self.snapshots[slot];
+        let snapshot = self.snapshots[slot].as_mut().expect("allocated snapshot");
         cache.device_mut().end_rendering();
         let index = cache.device_mut().begin_recording()?;
         let device = cache.device();

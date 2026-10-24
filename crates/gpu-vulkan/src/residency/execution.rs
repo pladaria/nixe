@@ -11,7 +11,6 @@ pub use graphics::{
     AttachmentSource, Draw, IndexBuffer, PreparedDraw, PreparedTargets, RenderAttachment,
     RenderingTargets, VertexBuffer,
 };
-pub(crate) use state::PreparedGraphicsState;
 pub use state::{GraphicsParameters, PreparedGraphics};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -176,7 +175,7 @@ impl VulkanResidency {
                 self.buffer_binding_current(*buffer)
             }
             Binding::Image(view) | Binding::CombinedImageSampler { image: view, .. } => {
-                self.image(view.image).is_ok()
+                self.image_binding_current(view.image)
             }
             _ => true,
         })
@@ -349,7 +348,7 @@ impl VulkanResidency {
                             layout: vk::ImageLayout::GENERAL,
                         },
                     });
-                    for &plane in &image.planes {
+                    for &plane in image.planes.iter() {
                         if description.aspects.intersects(plane.aspect)
                             && (description.base_mip..description.base_mip + description.mip_count)
                                 .contains(&plane.mip_level)

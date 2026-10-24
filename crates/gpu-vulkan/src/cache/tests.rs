@@ -85,7 +85,9 @@ fn native_graphics_cache_normalizes_dynamic_state_and_reuses_library_parts() {
     }
     let first_metrics = first.metrics().unwrap();
     let mut changed = state;
-    changed.colors[0].1.write_mask =
+    std::sync::Arc::make_mut(&mut changed.colors)[0]
+        .1
+        .write_mask =
         vk::ColorComponentFlags::R | vk::ColorComponentFlags::G | vk::ColorComponentFlags::B;
     let other = pipelines
         .request(PipelineRecipe::Graphics {

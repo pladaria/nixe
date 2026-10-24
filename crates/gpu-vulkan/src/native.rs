@@ -1,5 +1,6 @@
 //! Concrete native execution selected at startup. Cold compilation is polled by
 //! the owner; prepared references bypass content hashes and descriptor updates.
+use crate::residency::Resource;
 use crate::{cache::*, *};
 use ash::vk;
 use nixe_gpu::{
@@ -12,9 +13,10 @@ use rustc_hash::FxHashMap as HashMap;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 mod completion;
 mod images;
+mod key;
 mod state;
 use crate::residency::affine_pipeline;
-use images::GuestNativeImage;
+use key::GraphicsKey;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeExecutionStatistics {
@@ -41,9 +43,8 @@ enum Graphics {
         graphics: GraphicsState,
     },
     Ready {
-        source: Arc<GuestDrawParameters>,
-        state: crate::residency::execution::PreparedGraphicsState,
-        push: Arc<[u8]>,
+        pipeline: Arc<NativePipeline>,
+        last_used: u64,
     },
 }
 enum Computing {
@@ -69,20 +70,18 @@ pub struct NativeGpuExecution {
     frames: crate::presentation::Frames,
     host: Option<crate::presentation::Host>,
     residency: VulkanResidency,
-    video: crate::residency::video::VideoTransfers,
     video_device: Option<[u8; 16]>,
     shaders: ShaderCompiler,
     pipelines: Arc<PipelineCompiler>,
     descriptors: DescriptorCache,
     samplers: SamplerCache,
     drawings: HashMap<PreparedStateId, Drawing>,
-    graphics: HashMap<(PreparedStateId, ContentId), Graphics>,
+    graphics: HashMap<GraphicsKey, Graphics>,
     targets: Option<images::Targets>,
     programs: nixe_gpu::WorkingSet<(PreparedStateId, usize), Arc<PreparedProgram>>,
     next_collection: u64,
     recording_batch: Option<(Option<WorkTicket>, usize)>,
     computing: HashMap<PreparedStateId, Computing>,
-    images: HashMap<images::ImageKey, Arc<GuestNativeImage>>,
     draw_arguments: Vec<Draw>,
     affine_pipelines: HashMap<vk::Format, Arc<NativePipeline>>,
     video_pipelines: HashMap<vk::Format, Arc<NativePipeline>>,
@@ -155,7 +154,6 @@ impl NativeGpuExecution {
             .map_err(VulkanError::from)?;
         Ok(Self {
             completion_wakeup: None,
-            video: Default::default(),
             video_device,
             frames: crate::presentation::Frames::new(),
             host: None,
@@ -171,7 +169,6 @@ impl NativeGpuExecution {
             next_collection: 0,
             recording_batch: None,
             computing: HashMap::default(),
-            images: HashMap::default(),
             draw_arguments: Vec::with_capacity(128),
             affine_pipelines: HashMap::default(),
             video_pipelines: HashMap::default(),
@@ -207,7 +204,7 @@ impl NativeGpuExecution {
     }
 
     fn graphics(&mut self, state: &Arc<GuestDrawState>) -> Result<bool, VulkanError> {
-        let id = (state.parameters.identity, state.program.shader.identity);
+        let id = GraphicsKey::new(state, self.device_profile().dynamic_state.base);
         if !self.graphics.contains_key(&id) {
             let graphics = state::graphics(&state.parameters)?;
             let pending = match self.request_shader(&state.program, Some(state)) {
@@ -216,7 +213,7 @@ impl NativeGpuExecution {
                 Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
             };
             self.graphics.insert(
-                id,
+                id.clone(),
                 Graphics::Shader {
                     pending,
                     state: Arc::clone(state),
@@ -224,13 +221,9 @@ impl NativeGpuExecution {
                 },
             );
         }
-        let ready = match &self.graphics[&id] {
-            Graphics::Ready { source, .. } => {
-                if !Arc::ptr_eq(source, &state.parameters) {
-                    return Err(VulkanError::InvalidResource(
-                        "graphics identity was reused for different parameters",
-                    ));
-                }
+        let ready = match self.graphics.get_mut(&id).unwrap() {
+            Graphics::Ready { last_used, .. } => {
+                *last_used = self.statistics.batches;
                 return Ok(true);
             }
             Graphics::Shader { pending, .. } => pending.poll(),
@@ -329,18 +322,12 @@ impl NativeGpuExecution {
                     }
                     Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
                 };
-                let parameters = state::parameters(&state.parameters)?;
-                let push = state::guest_push(&pipeline, Some(&state.parameters))?.into();
-                let prepared = self
-                    .residency
-                    .prepare_graphics_state(pipeline, parameters)?;
                 self.statistics.prepared_graphics += 1;
                 self.graphics.insert(
                     id,
                     Graphics::Ready {
-                        source: Arc::clone(&state.parameters),
-                        state: prepared,
-                        push,
+                        pipeline,
+                        last_used: self.statistics.batches,
                     },
                 );
                 Ok(true)
@@ -368,21 +355,19 @@ impl NativeGpuExecution {
                 }
             }
             self.drawings.remove(&id);
+            let graphics_key = GraphicsKey::new(source, self.device_profile().dynamic_state.base);
             let already_prepared = matches!(
-                self.graphics
-                    .get(&(source.parameters.identity, source.program.shader.identity)),
+                self.graphics.get(&graphics_key),
                 Some(Graphics::Ready { .. })
             );
             if !self.graphics(source)? {
                 return Ok(false);
             }
-            let Graphics::Ready { state, push, .. } =
-                &self.graphics[&(source.parameters.identity, source.program.shader.identity)]
-            else {
+            let Graphics::Ready { pipeline, .. } = &self.graphics[&graphics_key] else {
                 unreachable!()
             };
-            let pipeline = Arc::clone(state.pipeline());
-            let push = Arc::clone(push);
+            let pipeline = Arc::clone(pipeline);
+            let push: Arc<[u8]> = state::guest_push(&pipeline, Some(&source.parameters))?.into();
             let program_key = (source.program.identity, Arc::as_ptr(&pipeline) as usize);
             let program = if let Some(program) = self
                 .programs
@@ -393,21 +378,24 @@ impl NativeGpuExecution {
                 Arc::clone(program)
             } else {
                 let bindings = self.bindings(&source.program, &pipeline)?;
-                let program = Arc::new(self.residency.prepare_program(pipeline, &bindings)?);
+                let program = Arc::new(
+                    self.residency
+                        .prepare_program(Arc::clone(&pipeline), &bindings)?,
+                );
                 self.programs
                     .insert(program_key, Arc::clone(&program), program.retained_bytes());
                 program
             };
-            let Graphics::Ready { state, .. } =
-                &self.graphics[&(source.parameters.identity, source.program.shader.identity)]
-            else {
-                unreachable!()
-            };
+            let parameters =
+                state::parameters(&source.parameters, pipeline.graphics.as_ref().unwrap())?;
+            let state = self
+                .residency
+                .prepare_graphics_state(pipeline, parameters)?;
             self.residency.retain_program_effect(&program);
             let graphics = state.bind(program)?;
             let targets = self.targets(source)?;
             let mut vertices = Vec::new();
-            for v in &source.vertices {
+            for v in source.vertices.iter() {
                 let buffer = self.residency.buffer_for_deferred_import(
                     v.backing.clone(),
                     vk::BufferUsageFlags::VERTEX_BUFFER,
@@ -510,7 +498,9 @@ impl NativeGpuExecution {
             }
             let pipeline = Arc::clone(program.pipeline());
             let bindings = self.bindings(source, &pipeline)?;
-            let program = self.residency.prepare_program(pipeline, &bindings)?;
+            let program = self
+                .residency
+                .prepare_program(Arc::clone(&pipeline), &bindings)?;
             let Computing::Ready { program: old, .. } = self.computing.get_mut(&id).unwrap() else {
                 unreachable!()
             };
@@ -536,7 +526,9 @@ impl NativeGpuExecution {
                 };
                 let bindings = self.bindings(&source, &pipeline)?;
                 let push = state::guest_push(&pipeline, None)?;
-                let program = self.residency.prepare_program(pipeline, &bindings)?;
+                let program = self
+                    .residency
+                    .prepare_program(Arc::clone(&pipeline), &bindings)?;
                 self.computing.insert(
                     id,
                     Computing::Ready {
@@ -696,14 +688,36 @@ impl NativeGpuExecution {
             // demand submit pending work; cache maintenance is not an idle wait.
             NativeCommand::Ordering(_) => {}
             NativeCommand::ConvertNv12 { images, transform } => {
-                let format = images::format(images[2].description.format());
-                let pipeline = Arc::clone(&self.video_pipelines[&format]);
-                let sources = [self.video_view(&images[0])?, self.video_view(&images[1])?];
-                let destination = self.image(&images[2])?.image;
-                let conversion =
+                let retained = self.residency.constructing.len();
+                let result: Result<(), VulkanError> = (|| {
+                    let format = images::format(images[2].description.format());
+                    let pipeline = Arc::clone(&self.video_pipelines[&format]);
+                    let first = self.video_view(&images[0])?;
                     self.residency
-                        .prepare_nv12(pipeline, sources, destination, 0, *transform)?;
-                self.residency.convert_nv12(&conversion)?;
+                        .constructing
+                        .push(Resource::Image(first.image));
+                    let second = self.video_view(&images[1])?;
+                    self.residency
+                        .constructing
+                        .push(Resource::Image(second.image));
+                    let sources = [first, second];
+                    let destination = self.image(&images[2])?;
+                    self.residency
+                        .constructing
+                        .push(Resource::Image(destination));
+                    let conversion = self.residency.prepare_nv12(
+                        pipeline,
+                        sources,
+                        destination,
+                        0,
+                        *transform,
+                    )?;
+                    self.residency.convert_nv12(&conversion)?;
+
+                    Ok(())
+                })();
+                self.residency.constructing.truncate(retained);
+                result?;
             }
             NativeCommand::UploadPlanes {
                 images,
@@ -711,14 +725,25 @@ impl NativeGpuExecution {
                 widths,
             } => {
                 for index in 0..2 {
-                    let image = self.image(&images[index])?.image;
+                    let image = self.image(&images[index])?;
                     self.residency
                         .upload_video_plane(image, widths[index], &bytes[index])?;
                 }
             }
             NativeCommand::ImportDecodedPlanes { images, frame } => {
-                let planes = [self.image(&images[0])?.image, self.image(&images[1])?.image];
-                self.video.import(&mut self.residency, planes, frame)?;
+                let retained = self.residency.constructing.len();
+                let result: Result<(), VulkanError> = (|| {
+                    let first = self.image(&images[0])?;
+                    self.residency.constructing.push(Resource::Image(first));
+                    let second = self.image(&images[1])?;
+                    self.residency.constructing.push(Resource::Image(second));
+                    let planes = [first, second];
+                    self.residency.import_decoded_planes(planes, frame)?;
+
+                    Ok(())
+                })();
+                self.residency.constructing.truncate(retained);
+                result?;
             }
         }
         Ok(())
@@ -860,7 +885,8 @@ impl NativeGpuExecution {
         if !ready {
             return Ok(None);
         };
-        self.video
+        self.residency
+            .video
             .retire_sources(self.residency.device().completed_tick());
         self.residency
             .publish_buffer_downloads(self.residency.device().completed_tick())?;
@@ -1007,7 +1033,9 @@ impl GpuExecution for NativeGpuExecution {
             self.drawings
                 .retain(|_, drawing| Arc::strong_count(&drawing.source) > 1);
             self.graphics.retain(|_, graphics| match graphics {
-                Graphics::Ready { source, .. } => Arc::strong_count(source) > 1,
+                Graphics::Ready { last_used, .. } => {
+                    self.statistics.batches.saturating_sub(*last_used) <= 256
+                }
                 _ => true,
             });
             self.computing.retain(|_, computing| match computing {
@@ -1223,7 +1251,7 @@ impl GpuExecution for NativeGpuExecution {
             host.shutdown(&mut self.residency).map_err(runtime)?;
         }
         #[cfg(target_os = "linux")]
-        log::info!("native Vulkan video: {:?}", self.video.statistics);
+        log::info!("native Vulkan video: {:?}", self.residency.video.statistics);
         log::info!("native Vulkan residency: {:?}", self.residency.statistics());
         log::info!("native Vulkan recording: {:?}", self.recording_statistics());
         log::info!("native Vulkan preparation: {:?}", self.statistics);

@@ -7,7 +7,9 @@ use nixe_memory::MemoryPermissions;
 
 use super::*;
 
+mod bindings;
 mod bulk;
+use bindings::{fixture_bindings, fixture_roles};
 mod compute_launch;
 pub(crate) mod register_benchmark;
 use crate::{

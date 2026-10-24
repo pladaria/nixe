@@ -119,12 +119,12 @@ fn shader(kind: u8) -> Arc<ShaderArtifact> {
 fn state(format: vk::Format, kind: u8) -> GraphicsState {
     let mut state = GraphicsState::color(format);
     if kind == 2 {
-        state.vertex_bindings = Box::new([VertexBinding {
+        state.vertex_bindings = std::sync::Arc::from([VertexBinding {
             binding: 0,
             stride: 20,
             rate: vk::VertexInputRate::VERTEX,
         }]);
-        state.vertex_attributes = Box::new([
+        state.vertex_attributes = std::sync::Arc::from([
             VertexAttribute {
                 location: 0,
                 binding: 0,
@@ -144,7 +144,7 @@ fn state(format: vk::Format, kind: u8) -> GraphicsState {
                 offset: 16,
             },
         ]);
-        state.colors[0].1 = BlendState {
+        std::sync::Arc::make_mut(&mut state.colors)[0].1 = BlendState {
             enabled: true,
             src_color: vk::BlendFactor::ONE,
             dst_color: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
@@ -529,7 +529,7 @@ impl ScreenRenderer {
             }
             let base = (self.vertices.len() / 20) as i32;
             let first = (self.indices.len() / 4) as u32;
-            for vertex in &mesh.vertices {
+            for vertex in mesh.vertices.iter() {
                 for value in [vertex.pos.x, vertex.pos.y, vertex.uv.x, vertex.uv.y] {
                     self.vertices.extend_from_slice(&value.to_le_bytes());
                 }

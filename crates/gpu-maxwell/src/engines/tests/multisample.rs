@@ -233,7 +233,7 @@ fn four_sample_targets_reject_single_sample_kinds_and_short_storage() {
             src.offset().get(),
             Some(u32::from(kind != 0xfe)),
         );
-        let result = resolve_maxwell_three_d_resources(
+        let result = fixture_bindings(
             channel.three_d(),
             address_space.memory(),
             &mut crate::test_memory::access(address_space.memory().machine()),
@@ -248,7 +248,7 @@ fn four_sample_targets_reject_single_sample_kinds_and_short_storage() {
         }
         program_three_d(&mut channel, 0x081c, 512);
         assert!(matches!(
-            resolve_maxwell_three_d_resources(
+            fixture_bindings(
                 channel.three_d(),
                 address_space.memory(),
                 &mut crate::test_memory::access(address_space.memory().machine())

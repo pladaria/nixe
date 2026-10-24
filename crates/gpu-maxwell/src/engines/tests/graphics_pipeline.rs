@@ -189,13 +189,13 @@ fn z_compression_selector_is_typed_depth_state_without_an_operation() {
         assert_eq!(channel.two_d(), &two_d_before);
     }
 
-    let resources = resolve_maxwell_three_d_resources(
+    let resources = fixture_bindings(
         channel.three_d(),
         resource_address_space().memory(),
         &mut crate::test_memory::apply,
     )
     .unwrap();
-    assert!(resources.resources().is_empty());
+    assert!(resources.resources().next().is_none());
 }
 
 #[test]
@@ -296,13 +296,13 @@ fn color_compression_selectors_are_typed_and_isolated_per_target() {
             assert_eq!(channel.two_d(), &two_d_before);
         }
 
-        let resources = resolve_maxwell_three_d_resources(
+        let resources = fixture_bindings(
             channel.three_d(),
             resource_address_space().memory(),
             &mut crate::test_memory::apply,
         )
         .unwrap();
-        assert!(resources.resources().is_empty());
+        assert!(resources.resources().next().is_none());
     }
 }
 
@@ -339,13 +339,11 @@ fn zero_bandwidth_clear_masks_preserve_independent_state_without_gpu_work() {
     assert_eq!(targets.color_zero_bandwidth_clear().value(), None);
     assert_eq!(targets.depth_zero_bandwidth_clear().value(), None);
     let draw_identity = channel.three_d().draw_state_identity();
-    let resource_identity = channel.three_d().resource_state_identity(
-        &[
-            MaxwellThreeDResourceRole::ColorTarget(0),
-            MaxwellThreeDResourceRole::DepthStencilTarget,
-        ],
-        false,
-    );
+    let resource_identities = [
+        MaxwellThreeDResourceRole::ColorTarget(0),
+        MaxwellThreeDResourceRole::DepthStencilTarget,
+    ]
+    .map(|role| channel.three_d().resource_state_identity(role));
     let two_d = channel.two_d().clone();
     for (method, name) in [
         (0x07a4, "SET_COLOR_ZERO_BANDWIDTH_CLEAR"),
@@ -377,7 +375,11 @@ fn zero_bandwidth_clear_masks_preserve_independent_state_without_gpu_work() {
                 Some(dispatch.methods()[0].method().source())
             );
             assert!(draw_identity.matches(channel.three_d()));
-            assert!(resource_identity.matches(channel.three_d()));
+            assert!(
+                resource_identities
+                    .iter()
+                    .all(|identity| identity.matches(channel.three_d()))
+            );
             assert_eq!(channel.two_d(), &two_d);
         }
     }
@@ -437,13 +439,13 @@ fn compression_threshold_is_typed_source_preserving_nonsemantic_policy() {
         assert_eq!(channel.two_d(), &two_d_before);
     }
 
-    let resources = resolve_maxwell_three_d_resources(
+    let resources = fixture_bindings(
         channel.three_d(),
         resource_address_space().memory(),
         &mut crate::test_memory::apply,
     )
     .unwrap();
-    assert!(resources.resources().is_empty());
+    assert!(resources.resources().next().is_none());
 }
 
 #[test]
@@ -723,7 +725,7 @@ fn render_target_state_distinguishes_unset_disabled_ready_and_profile_unavailabl
 }
 
 #[test]
-fn render_target_encodings_reject_atomically_and_cross_register_state_defers_to_consumption() {
+fn malformed_render_target_layout_is_rejected_before_application() {
     let mut channel = three_d_channel();
 
     let malformed_layout = packet(0x0814 / 4, 0x1001);
@@ -733,17 +735,6 @@ fn render_target_encodings_reject_atomically_and_cross_register_state_defers_to_
         Err(MaxwellEngineDispatchError::InvalidMethodEncoding { .. })
     ));
     assert_eq!(channel.three_d(), &before);
-
-    dispatch_method(&mut channel, 0x0814 / 4, 0x1_0000).unwrap();
-    dispatch_method(&mut channel, 0x0820 / 4, 1).unwrap();
-    assert_eq!(
-        channel
-            .three_d()
-            .validate_cross_registers()
-            .unwrap_err()
-            .reason,
-        "a three-dimensional color target cannot select an array layer"
-    );
 }
 
 #[test]
@@ -1903,14 +1894,15 @@ fn depth_layer_reset_is_shared_by_live_state_and_mme_shadow_replay() {
         MaxwellThreeDRegisterOrigin::Unset
     );
     assert!(
-        resolve_maxwell_three_d_resources(
+        fixture_bindings(
             &reset_state,
             resource_address_space().memory(),
             &mut crate::test_memory::apply
         )
         .unwrap()
         .resources()
-        .is_empty()
+        .next()
+        .is_none()
     );
 
     program_three_d(&mut channel, 0x0124, 2);
@@ -2801,7 +2793,7 @@ fn begin_instance_modes_reset_advance_and_preserve_the_instance_sequence() {
 }
 
 #[test]
-fn malformed_vertex_suffix_rejects_atomically_and_index_relationships_defer() {
+fn malformed_vertex_suffix_preserves_applied_prefix() {
     let mut channel = three_d_channel();
     let malformed = incrementing_packet(0x1c00 / 4, &[0x1010, 0, 0x2000, 1, 0x2000]);
     let before = channel.three_d().clone();
@@ -2810,19 +2802,6 @@ fn malformed_vertex_suffix_rejects_atomically_and_index_relationships_defer() {
         Err(MaxwellEngineDispatchError::InvalidMethodEncoding { .. })
     ));
     assert_ne!(channel.three_d(), &before);
-
-    for (method, argument) in [(0x17c8, 0), (0x17cc, 0x1000), (0x17d0, 0), (0x17d4, 0x100e)] {
-        dispatch_method(&mut channel, method / 4, argument).unwrap();
-    }
-    dispatch_method(&mut channel, 0x17d8 / 4, 2).unwrap();
-    assert_eq!(
-        channel
-            .three_d()
-            .validate_cross_registers()
-            .unwrap_err()
-            .reason,
-        "the index-buffer range is not aligned to its element size"
-    );
 }
 
 #[test]
@@ -2843,7 +2822,6 @@ fn vertex_stream_ranges_may_be_reprogrammed_across_packets_before_consumption() 
     // limit. A move in the opposite direction therefore creates a legal,
     // short-lived address > old-limit snapshot between these packets.
     dispatch_incrementing(&mut channel, 0x1c00 / 4, &[0x1018, 0, 0x0941_3000]).unwrap();
-    assert!(channel.three_d().validate_cross_registers().is_err());
 
     dispatch_incrementing(&mut channel, 0x1f00 / 4, &[0, 0x0941_6fbf]).unwrap();
 
@@ -2853,7 +2831,6 @@ fn vertex_stream_ranges_may_be_reprogrammed_across_packets_before_consumption() 
         Some(0x0941_3000)
     );
     assert_eq!(stream.limit().map(|limit| limit.get()), Some(0x0941_6fbf));
-    assert!(channel.three_d().validate_cross_registers().is_ok());
 }
 
 #[test]
@@ -3491,6 +3468,16 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
     assert_eq!(frontend.statistics.shader_captures, 1);
     assert_eq!(frontend.statistics.warm_draws, 31);
     let original = previous.unwrap();
+    // Reconstructing equal image metadata must preserve draw lookup identity.
+    let mut reconstructed = (*original).clone();
+    for image in Arc::make_mut(&mut reconstructed.colors) {
+        image.planes = Arc::from(image.planes.to_vec());
+    }
+    assert_eq!(original.as_ref(), &reconstructed);
+    let mut lookup = nixe_gpu::WorkingSet::new(2, 4096);
+    lookup.insert(Arc::clone(&original), 1, 512);
+    assert_eq!(lookup.get(&reconstructed), Some(&1));
+
     // Every streamed vertex window is a distinct physical binding, while its
     // vertex layout and rasterization semantics retain one prepared identity.
     program_three_d(&mut channel, 0x1f04, (vertex + 0xfff) as u32);
@@ -3514,6 +3501,7 @@ fn native_frontend_reuses_immutable_draw_state_and_only_changes_arguments() {
         assert!(!Arc::ptr_eq(&original, &state));
         assert!(Arc::ptr_eq(&original.parameters, &state.parameters));
         assert!(Arc::ptr_eq(&original.program, &state.program));
+        assert!(Arc::ptr_eq(&original.colors, &state.colors));
         assert_ne!(
             original.vertices[0].backing.as_ref(),
             state.vertices[0].backing.as_ref()

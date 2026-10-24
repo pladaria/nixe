@@ -2488,7 +2488,7 @@ fn shader_local_memory_block_is_typed_source_preserving_and_shader_scoped() {
 }
 
 #[test]
-fn shader_local_memory_fields_are_atomic_and_cross_register_ranges_defer() {
+fn shader_local_memory_rejects_undefined_field_bits_and_preserves_packet_prefix() {
     let mut channel = three_d_channel();
 
     for (method, argument, mask) in [
@@ -2538,16 +2538,6 @@ fn shader_local_memory_fields_are_atomic_and_cross_register_ranges_defer() {
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
     assert_ne!(channel.three_d(), &three_d_before);
-
-    program_three_d(&mut channel, 0x0790, 0xff);
-    program_three_d(&mut channel, 0x0794, u32::MAX);
-    dispatch_incrementing(&mut channel, 0x0798 / 4, &[0, 2]).unwrap();
-    let error = channel.three_d().validate_cross_registers().unwrap_err();
-    assert_eq!(
-        error.reason,
-        "shader-local-memory region exceeds the 40-bit GPU address space"
-    );
-    assert_eq!(error.source.unwrap().method(), GpuMethodId(0x079c));
 }
 
 #[test]

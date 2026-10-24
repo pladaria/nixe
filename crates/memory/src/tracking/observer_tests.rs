@@ -22,6 +22,70 @@ fn capture(machine: &Machine, range: &AllocationRange) -> Observation {
     observation
 }
 
+#[test]
+fn immutable_capture_promotes_resource_watch_to_native_store_protection() {
+    for native_area in [false, true] {
+        let machine = Machine::new(PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(PAGE_SIZE)
+            .unwrap()
+            .allocate(PAGE_SIZE)
+            .unwrap();
+        let range = AllocationRange::new(allocation.pin(), 0, PAGE_SIZE).unwrap();
+        let space = crate::AddressSpace::new(machine.clone(), crate::AddressWidth::Bits32).unwrap();
+        let address = crate::GuestVirtualAddress::new(PAGE_SIZE);
+        space
+            .map(
+                address,
+                allocation,
+                0,
+                PAGE_SIZE,
+                crate::MemoryPermissions::READ_WRITE,
+            )
+            .unwrap();
+        machine
+            .publish_device_write(std::slice::from_ref(&range), || Ok(()))
+            .unwrap();
+        machine.enable_cpu_write_collection().unwrap();
+        machine
+            .capture_resource_scattered(std::slice::from_ref(&range), &[], &mut [])
+            .unwrap();
+        let area = native_area.then(|| {
+            machine
+                .read_native_resolved(std::slice::from_ref(&range), Some(&range))
+                .unwrap()
+        });
+        let snapshot = Observation::default();
+        machine
+            .apply_resolved_access(
+                std::slice::from_ref(&range),
+                &AccessOperation::ReadObserved(snapshot.clone()),
+            )
+            .unwrap();
+        let core = space.register_core(std::sync::Arc::new(|| {}));
+        let native = core.enter_native().unwrap();
+        assert!(
+            !space.write_native(&native, address, &[7; 4]).unwrap(),
+            "a retained immutable snapshot must prevent unobserved native stores"
+        );
+        drop(native);
+        machine
+            .write_resolved(&[range.slice(0, 4).unwrap()], &[7; 4])
+            .unwrap();
+        assert!(snapshot.is_invalid());
+        if let Some(AccessResult::NativeRead {
+            area: Some(area), ..
+        }) = area
+        {
+            assert!(
+                !area.observation().is_invalid(),
+                "live RAM area survives CPU writes"
+            );
+        }
+        machine.disable_cpu_write_collection();
+    }
+}
+
 fn inspections(machine: &Machine) -> usize {
     machine
         .tracking()
@@ -115,25 +179,25 @@ fn pruning_preserves_cpu_device_and_shared_observation_domains() {
         source: second.physical_extents().next().unwrap(),
         destination: 0,
     };
-    let cpu = machine
-        .capture_clean_scattered(std::slice::from_ref(&second), &[copy], &mut [0])
+    machine
+        .capture_resource_scattered(std::slice::from_ref(&second), &[copy], &mut [0])
         .unwrap();
     for _ in 0..128 {
         drop(capture(&machine, &range));
     }
     assert!(!both.is_invalid());
-    assert!(!cpu.is_invalid());
+    assert!(machine.resource_pages_tracked(copy.source));
     assert!(!device.observation().is_invalid());
     machine.write_resolved(&[first], &[1]).unwrap();
     assert!(both.is_invalid());
-    assert!(!cpu.is_invalid());
+    assert!(machine.resource_pages_tracked(copy.source));
     assert!(!device.observation().is_invalid());
     machine
         .publish_device_write(std::slice::from_ref(&second), || Ok(()))
         .unwrap();
     assert!(device.observation().is_invalid());
-    assert!(!cpu.is_invalid());
+    assert!(machine.resource_pages_tracked(copy.source));
     machine.write_resolved(&[second], &[2]).unwrap();
-    assert!(cpu.is_invalid());
+    assert!(!machine.resource_pages_tracked(copy.source));
     assert_eq!(machine.tracking_statistics().observer_registrations, 0);
 }

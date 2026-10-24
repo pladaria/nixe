@@ -50,45 +50,25 @@ ownership. Tests modify CPU vertex inputs between accepted segments and compare
 the two resulting color regions exactly, then demand an unsubmitted producer and
 verify that its new pixels replace the preceding image.
 
-Image footprints cache exact byte mappings, ownership pages and alias coverage.
-Canonical visibility is page-granular: one retained written fragment per touched
-page identifies its ownership domain, used only for access preparation and
-publication. Producer authority keeps every byte span and hole independently.
-Alias coverage checks only binding revisions of the pages it touches. After proving
-the exact byte mapping, depth/stencil footprints from one native image share its
-latest actual use epoch per page. Mapping proofs survive epoch changes and are
-invalidated by authority revisions after foreign writes or CPU acknowledgement.
-Partial/foreign producers expand an image epoch before updating exact byte
-authority. CPU acknowledgements cannot erase newer work. Dirty ranges and
-transfer scratch retain their capacity. D24's unused transfer byte is excluded
-from image bindings as well as producer coverage, so stencil cannot invalidate
-depth through padding. Teardown invalidates unique retained pages directly.
-GPU-only aliases and CPU readback continue using the same canonical byte owners.
-An opaque single-sample image with different geometry can reconstruct through a
-GPU buffer when the canonical index proves complete producer coverage. Missing
-bytes remain undefined; this path never initializes opaque storage from a CPU
-baseline merely because a native allocation exists. Only a read/LOAD triggers
-this proof; partial writes do not reconstruct their untouched destination.
-Cold footprint construction walks the ordered logical intervals and retained
-segments with one cursor. Physical-page grouping uses hash lookup; alias coverage
-joins ordered bindings and write spans after sorting bindings once per change.
-Image dirtiness uses complete transfer blocks, while authority stays byte-exact.
-Normalized dirty sets are unioned in one sweep; a fully dirty image absorbs later
-partial invalidations in constant time.
+Images retain physical/layout identity, compact immutable footprint plans and
+native views. The shared physical interval index finds image and buffer aliases.
+Exact producer domains carry modification sequences separately from completion
+tickets; repeated domains reuse their record. CPU writes invalidate intersecting
+resources through dirty-page tracking, while native writes invalidate their
+actual consumers. Depth, stencil, mips, layers and padding keep separate coverage.
 
-Buffer views use a hash index of immutable physical byte mappings, independent of
-content epochs and capture permissions. Mapping hashes are computed once per
-retained topology; equality still proves the mapping, so collisions cannot alias
-different storage. Usage variants share a small bucket. Eviction removes the view
-and recycles its slot with a new generation. Page binding groups are indexed by
-resource identity; feedback checks query the current attachments directly rather
-than scanning every buffer ever retained on their pages.
+Alias synchronization occurs when a resource is consumed, following the retained
+image and modification-stamp model of Eden's texture cache. Compatible images
+copy only newer intersections. Layout changes and partial transfer blocks use
+transient native storage without creating a second physical resource. Unknown
+opaque bytes remain undefined; only proven contents may be read or conservatively
+published as modified. CPU readbacks publish only still-current producer versions.
 
-Partial image writes retain only touched physical pages. Full-plane footprints
-keep conservative logical page bounds, so striped texture uploads reject distant
-pages before expanding permutations. These immutable footprints outlive the
-bounded partial-rectangle cache. Inverse tile coordinates are shared; tile address
-division happens once per physical tile rather than once per small byte run.
+Buffers retain linear physical mappings, join overlapping storage and import only
+consumed dirty ranges. Images and buffers share the allocation budget and LRU.
+Views and recorded commands retain native objects until their actual uses finish;
+recycled cache slots receive a new generation. No physical allocation is kept
+alive merely because a cached interpretation refers to its weak mapping.
 
 CPU page demand locates image rows arithmetically and groups authoritative
 fragments by source image. Native transfer blocks are merged into bounded row
@@ -124,9 +104,9 @@ continued rendering reuses the existing exact coverage and rasterization orderin
 | Multisample | Canonical native sample ownership with a frontend-defined sample grid, sample mask/alpha-to-coverage and native color resolve. CPU visibility extracts individual samples on demand; sRGB uses a bit-preserving UNORM view. Host-only intermediate attachments share the same recorder. |
 | Empty draw | Attachment loads/clears/stores still execute; there are no shader accesses or writes. Empty direct dispatch has no shader effects. |
 
-Resident-only attachments cannot be evicted as reconstructible cache data. The
-frontend releases them at the end of their real lifetime with `release_attachment`;
-pending resolves/draws keep the image/view alive on the same timeline. Canonical
+Host conversion attachments cannot be reconstructed from guest RAM. The conversion
+recorder releases them after recording; pending commands retain their image/view
+on the same native timeline. Canonical
 MSAA producers serialize RGBA8/BGRA8, D24/D32 and stencil through bounded readback
 windows. Importing arbitrary CPU-written samples, partial undefined MSAA readback,
 multisample shader bindings and 3D canonical imports remain explicitly unsupported.
@@ -165,8 +145,8 @@ Native BC uses real compressed storage even for non-block-aligned base dimension
 eliminating the WebGPU size workaround. Unsupported host ASTC/BC formats use the
 shared exact `texture_decode` implementation. Decoded images observe encoded
 canonical bytes and are read-only representations; they never claim to write back
-encoded data. Only dirty blocks are decoded/uploaded, and unchanged reads do no
-work. Linear ASTC retains FP16 output; sRGB retains the specified UNORM8 decode.
+encoded data. Modified images are decoded into bounded staging rectangles and
+uploaded in batches; unchanged reads do no work. Linear ASTC retains FP16 output; sRGB retains the specified UNORM8 decode.
 GPU-written encoded bytes require real CPU visibility for this CPU decoder.
 A future GPU decoder is a measured optimization, not a reason to approximate ASTC.
 

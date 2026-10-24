@@ -124,7 +124,7 @@ fn tessellation_draw_state_invalidates_without_retranslating_guest_code() {
     assert!(!initial.matches(channel.three_d()));
     program_three_d(&mut channel, 0x324, 0x7fc0_0042);
     assert!(!mode_changed.matches(channel.three_d()));
-    assert!(shader.matches(channel.three_d()));
+    assert!(shader.matches_code(channel.three_d()) && shader.matches_bindings(channel.three_d()));
 }
 
 #[test]

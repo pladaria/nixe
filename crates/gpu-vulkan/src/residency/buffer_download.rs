@@ -147,7 +147,7 @@ impl VulkanResidency {
                     )?
                 }
             };
-            self.invalidate_cpu_buffers(&dirty)?;
+            self.invalidate_cpu_resources(&dirty)?;
             ranges.extend(dirty);
             for span in published {
                 self.statistics.canonical_readback_bytes += span.bytes;

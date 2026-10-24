@@ -79,9 +79,6 @@ impl PreparedGraphicsState {
             parameters: Arc::clone(&self.parameters),
         })
     }
-    pub(crate) fn pipeline(&self) -> &Arc<NativePipeline> {
-        &self.pipeline
-    }
 }
 impl VulkanResidency {
     pub fn prepare_graphics(

@@ -372,15 +372,62 @@ pub(crate) fn footprint_bytes(footprint: &Footprint) -> u64 {
         * u64::from(domain.native_element_bytes)
 }
 pub(crate) fn footprint_buffer(cache: &mut VulkanResidency, footprint: Arc<Footprint>) -> BufferId {
-    let bytes = footprint_bytes(&footprint);
+    let mut parts = Vec::new();
+    for (index, span) in footprint.mapping().spans().iter().enumerate() {
+        footprint
+            .visit(index, span.start, span.bytes, |part| {
+                parts.push((part.native, index, part.start, part.bytes));
+                true
+            })
+            .unwrap();
+    }
+    parts.sort_unstable_by_key(|part| part.0);
+    let ranges: Vec<_> = parts
+        .into_iter()
+        .map(|(_, index, start, bytes)| {
+            footprint
+                .mapping()
+                .pin_span(index, start, bytes)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
     cache
-        .buffer_for_geometry(
-            vec![footprint],
-            bytes,
+        .buffer_for(
+            PhysicalMapping::new(&ranges).unwrap(),
             vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER,
-            true,
         )
         .unwrap()
+        .buffer
+}
+/// Establish image producers using the same native image copy used by guest blits.
+fn copy_fixture_image(
+    cache: &mut VulkanResidency,
+    destination: ImageId,
+    mapping: Arc<PhysicalMapping>,
+) {
+    let entry = cache.image(destination).unwrap();
+    let description = entry.description;
+    let planes = entry.planes.to_vec();
+    let source = cache
+        .image_for(
+            image_geometry(mapping, description, &planes),
+            description,
+            planes.clone(),
+        )
+        .unwrap();
+    for (index, plane) in planes.into_iter().enumerate() {
+        cache
+            .copy_image_region(
+                source,
+                index,
+                transfers::full_rect(plane),
+                destination,
+                index,
+                vk::Offset2D::default(),
+            )
+            .unwrap();
+    }
 }
 pub(crate) fn footprint_read(cache: &mut VulkanResidency, footprint: Arc<Footprint>) -> Vec<u8> {
     let bytes = footprint_bytes(&footprint);
@@ -688,7 +735,6 @@ fn image_publication_refreshes_late_aliases_after_foreign_writes_and_cpu_visibil
             cpu_read(&mut cache, &backing.slice(0, 128).unwrap()),
             expected
         );
-        cache.drain_notifications();
     }
     drop(cache);
     validation.check().unwrap();
@@ -731,8 +777,7 @@ fn image_buffer_aliases_compatible_views_and_partial_readback() {
         1
     );
     let (_allocation_8, source_backing) = backing_allocation(&cache, 4096, 4096, 0x87);
-    let source = buffer(&mut cache, source_backing);
-    cache.write_image_from_buffer(image, source, 0).unwrap();
+    copy_fixture_image(&mut cache, image, source_backing);
     cache.flush().unwrap();
     let alias = buffer(&mut cache, backing.slice(30, 70).unwrap());
     let bytes = cache.read_buffer(alias, 30, 70).unwrap();
@@ -832,51 +877,6 @@ fn budget_retirement_generation_reuse_and_authority_pinning() {
     validation.check().unwrap();
 }
 #[test]
-fn presentation_lease_pins_version_until_last_reference() {
-    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
-        return;
-    };
-    let validation = cache.device.validation_monitor();
-    let (allocation, backing) = backing_allocation(&cache, 4096, 4096, 0x29);
-    let (description, planes) = rgba_image();
-    let image = cache
-        .image_for(
-            crate::residency::tests::image_geometry(backing, description, &planes),
-            description,
-            planes,
-        )
-        .unwrap();
-    let lease = cache.lease_image(image).unwrap();
-    let clone = lease.clone();
-    if let Some(work) = cache.flush().unwrap() {
-        cache.device.wait_for_work(work, Duration::MAX).unwrap();
-    }
-    cache.device.poll_progress().unwrap();
-    while cache.evict_one().unwrap() {}
-    assert!(cache.image(image).is_ok());
-    crate::residency::tests::cpu_write(&mut cache, &allocation, 35, &[0x55; 4]).unwrap();
-    assert!(
-        cache.ensure_image(image).is_err(),
-        "leased bytes cannot be overwritten"
-    );
-    drop(lease);
-    cache.drain_notifications();
-    assert!(cache.ensure_image(image).is_err());
-    drop(clone);
-    cache.drain_notifications();
-    cache.ensure_image(image).unwrap();
-    assert!(cache.image(image).unwrap().version > 1);
-    if let Some(work) = cache.flush().unwrap() {
-        cache.device.wait_for_work(work, Duration::MAX).unwrap();
-    }
-    cache.device.poll_progress().unwrap();
-    while cache.evict_one().unwrap() {}
-    assert!(cache.image(image).is_err());
-    drop(cache);
-    validation.check().unwrap();
-}
-
-#[test]
 fn large_cpu_uploads_progress_with_bounded_staging_and_preserve_gpu_prefixes() {
     let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
         return;
@@ -921,9 +921,8 @@ fn large_cpu_uploads_progress_with_bounded_staging_and_preserve_gpu_prefixes() {
             .wait_for_work(flushed, Duration::from_secs(5))
             .unwrap();
     }
-    cache.preserve_buffer(id).unwrap();
-    assert_eq!(cache.statistics().canonical_readback_bytes - before, 2048);
     assert_eq!(&cpu_read(&mut cache, &range)[..2048], &bytes);
+    assert_eq!(cache.statistics().canonical_readback_bytes - before, 2048);
     assert!(cache.evict_one().unwrap());
     drop(cache);
     validation.check().unwrap();
@@ -1005,6 +1004,7 @@ fn dense_cpu_images_upload_once_without_buffers_and_preserve_later_gpu_writes() 
             vec![plane],
         )
         .unwrap();
+    cache.ensure_image(image).unwrap();
     assert_eq!(
         cache.statistics().cpu_uploaded_bytes,
         footprint_bytes(&backing)
@@ -1201,8 +1201,7 @@ fn native_compressed_blocks_mips_and_layers_preserve_exact_bytes() {
         )
         .unwrap();
     let (_allocation_14, source) = backing_allocation(&cache, 4096, 4096, 0x71);
-    let source = buffer(&mut cache, source);
-    cache.write_image_from_buffer(image, source, 0).unwrap();
+    copy_fixture_image(&mut cache, image, source);
     cache.flush().unwrap();
     // Splitting one BC block requests exactly three bytes, realigned on GPU.
     let alias = buffer(&mut cache, backing.slice(3, 3).unwrap());
@@ -1253,8 +1252,7 @@ fn repeated_image_rows_and_gpu_padding_writes_keep_texel_identity() {
         .unwrap();
     let (source_allocation, source_backing) = backing_allocation(&cache, 4096, 4096, 0x11);
     crate::residency::tests::cpu_write(&mut cache, &source_allocation, 16, &[0x22; 16]).unwrap();
-    let source = buffer(&mut cache, source_backing);
-    cache.write_image_from_buffer(image, source, 0).unwrap();
+    copy_fixture_image(&mut cache, image, source_backing);
     cache.flush().unwrap();
     assert!(
         cache
@@ -1282,6 +1280,7 @@ fn repeated_image_rows_and_gpu_padding_writes_keep_texel_identity() {
             planes,
         )
         .unwrap();
+    cache.ensure_image(image).unwrap();
     let version = cache.image(image).unwrap().version;
     let producer = cache.image(image).unwrap().producer;
     let pad = buffer(&mut cache, backing.slice(48, 8).unwrap());
@@ -1347,8 +1346,7 @@ fn packed_rgb565_keeps_native_storage_without_rgba_expansion() {
         )
         .unwrap();
     let (_allocation_18, source) = backing_allocation(&cache, 4096, 4096, 0x72);
-    let source = buffer(&mut cache, source);
-    cache.write_image_from_buffer(image, source, 0).unwrap();
+    copy_fixture_image(&mut cache, image, source);
     cache.flush().unwrap();
     let bytes = cpu_read(&mut cache, &backing);
     assert_eq!(&bytes[2..14], &[0x72; 12]);
@@ -1529,12 +1527,11 @@ fn pending_producers_and_cpu_downloads_share_one_submission() {
 
     write(&mut cache, id, 128, &[0x55; 16]);
     let before = cache.device.queue_usage().submitted_tick;
-    cache.preserve_buffer(id).unwrap();
     assert_eq!(&cpu_read(&mut cache, &backing)[128..144], &[0x55; 16]);
     assert_eq!(
         cache.device.queue_usage().submitted_tick,
         before + 1,
-        "explicit preservation accepts pending ownership before recording its download"
+        "CPU reads accept pending ownership before recording their download"
     );
 
     let (_allocation_21, backing) = backing_allocation(&cache, 4096, 4096, 0x19);
@@ -1681,8 +1678,7 @@ fn native_scalar_read_materializes_current_image_bytes_once_for_neighbouring_cpu
         )
         .unwrap();
     let (_source, source_backing) = backing_allocation(&cache, 4096, 4096, 0x87);
-    let source = buffer(&mut cache, source_backing);
-    cache.write_image_from_buffer(image, source, 0).unwrap();
+    copy_fixture_image(&mut cache, image, source_backing);
     cpu_write(&mut cache, &allocation, 60, &[0x5a]).unwrap();
     let AccessResult::NativeRead { bytes, area } = cache
         .access_memory(backing.pin(32, 1).unwrap(), AccessOperation::ReadNative)

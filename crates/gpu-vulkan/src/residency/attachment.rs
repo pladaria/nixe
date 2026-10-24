@@ -1,5 +1,5 @@
-//! Resident-only attachments have no invented canonical sample serialization.
-//! Their contents remain native until an ordered resolve produces real texels.
+//! Host conversion attachments have no guest physical identity.
+//! Native references retain their storage through the actual conversion commands.
 use super::*;
 cache_id!(AttachmentId);
 pub(super) struct AttachmentEntry {
@@ -68,9 +68,8 @@ impl VulkanResidency {
         .map_err(|e| VulkanError::vk("resident-only attachment view", e))?;
         let view = Arc::new(crate::AllocatedImageView::from_handle(native, handle));
         let slot = self
-            .attachments
-            .iter()
-            .position(|s| s.entry.is_none() && s.generation < u32::MAX)
+            .free_attachments
+            .pop()
             .unwrap_or(self.attachments.len());
         if slot == self.attachments.len() {
             self.attachments.push(Slot {
@@ -103,12 +102,14 @@ impl VulkanResidency {
             generation,
         })
     }
-    /// Resident-only contents have no reconstruction source, so budget eviction
-    /// must not discard them. The selected frontend releases them when their
-    /// actual guest lifetime ends; GPU references retire on the same timeline.
+    /// Host conversion storage has no canonical reconstruction source. Release
+    /// it after recording; native references retire on the actual use ticket.
     pub fn release_attachment(&mut self, id: AttachmentId) -> Result<(), VulkanError> {
         self.attachment(id)?;
         let entry = self.attachments[id.slot].entry.take().unwrap();
+        if self.attachments[id.slot].generation < u32::MAX {
+            self.free_attachments.push(id.slot);
+        }
         if let Some(work) = entry.last_use {
             self.device.retire_image_views(vec![entry.view], work)?;
         }
@@ -179,103 +180,5 @@ impl VulkanResidency {
             .drain(..)
             .flat_map(|r| transfers::subtract_rect(r, rect))
             .collect();
-    }
-    pub fn resolve_attachment(
-        &mut self,
-        source: AttachmentId,
-        source_rect: vk::Rect2D,
-        destination: ImageId,
-        plane: usize,
-        offset: vk::Offset2D,
-    ) -> Result<WorkTicket, VulkanError> {
-        let s = self.attachment(source)?;
-        let rect = vk::Rect2D {
-            offset,
-            extent: source_rect.extent,
-        };
-        let d = self.checked_image_rect(destination, plane, rect)?;
-        if s.description.samples == vk::SampleCountFlags::TYPE_1
-            || !s
-                .description
-                .usage
-                .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-            || d.aspect != vk::ImageAspectFlags::COLOR
-            || s.description.format != self.image(destination)?.description.format
-            || source_rect.offset.x < 0
-            || source_rect.offset.y < 0
-            || (source_rect.offset.x as u32)
-                .checked_add(source_rect.extent.width)
-                .is_none_or(|v| v > s.description.extent.width)
-            || (source_rect.offset.y as u32)
-                .checked_add(source_rect.extent.height)
-                .is_none_or(|v| v > s.description.extent.height)
-        {
-            return Err(VulkanError::InvalidResource(
-                "color resolve requires equal formats, a multisample source and bounded rectangles",
-            ));
-        }
-        if s.undefined
-            .iter()
-            .any(|r| transfers::intersects(*r, source_rect))
-        {
-            return Err(VulkanError::InvalidResource(
-                "resolve consumes undefined or discarded samples",
-            ));
-        }
-        let writer = self.prepare_image_rect(destination, d, rect)?;
-        let source = self.attachment_access(
-            source,
-            AccessScope::new(
-                vk::PipelineStageFlags2::RESOLVE,
-                vk::AccessFlags2::TRANSFER_READ,
-            ),
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        )?;
-        let (target, layout) = self.image_access_subresources(
-            destination,
-            commands::plane_range(d),
-            AccessScope::new(
-                vk::PipelineStageFlags2::RESOLVE,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        )?;
-        let region = vk::ImageResolve::default()
-            .src_subresource(
-                vk::ImageSubresourceLayers::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .layer_count(1),
-            )
-            .dst_subresource(d.layers())
-            .src_offset(vk::Offset3D {
-                x: source_rect.offset.x,
-                y: source_rect.offset.y,
-                z: 0,
-            })
-            .dst_offset(vk::Offset3D {
-                x: offset.x,
-                y: offset.y,
-                z: 0,
-            })
-            .extent(vk::Extent3D {
-                width: rect.extent.width,
-                height: rect.extent.height,
-                depth: 1,
-            });
-        self.barriers.emit(&mut self.device);
-        let slot = self.device.begin_recording()?;
-        let command = self.device.submission.slots[slot].command;
-        self.publish_effect(&[writer], |device| unsafe {
-            device.dispatch.cmd_resolve_image(
-                command,
-                source,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                target,
-                layout,
-                &[region],
-            );
-        })?;
-        self.finish_image_rect(destination, d, rect)?;
-        self.device.work_ticket()
     }
 }

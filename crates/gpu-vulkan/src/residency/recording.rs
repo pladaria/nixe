@@ -88,7 +88,7 @@ impl VulkanResidency {
             unsafe {
                 upload.write_with(slice.offset, slice.size, |destination| {
                     self.memory
-                        .capture_buffer_scattered(&retained, &captures, destination)
+                        .capture_resource_scattered(&retained, &captures, destination)
                         .map_err(memory_error)
                 })?;
             }
@@ -108,10 +108,10 @@ impl VulkanResidency {
                 );
             }
             for region in &regions {
-                self.contents_mut(Resource::Buffer(id))
+                self.buffer_mut(id)
                     .validate_interval(region.dst_offset, region.size);
             }
-            self.invalidate_cpu_buffers(&[])?;
+            self.invalidate_cpu_resources(&[])?;
             self.statistics.cpu_uploaded_bytes += (end - begin) as u64;
         }
         Ok(())
@@ -206,7 +206,7 @@ impl VulkanResidency {
                     &regions,
                 );
             }
-            self.contents_mut(Resource::Buffer(id))
+            self.buffer_mut(id)
                 .validate_interval(offset + (part * limit) as u64, bytes.len() as u64);
             self.statistics.cpu_uploaded_bytes += bytes.len() as u64;
         }
@@ -319,7 +319,7 @@ impl VulkanResidency {
             }
             self.statistics.gpu_copied_bytes += size;
         }
-        self.contents_mut(Resource::Buffer(destination))
+        self.buffer_mut(destination)
             .validate_interval(destination_offset, size);
         Ok(())
     }
@@ -338,28 +338,49 @@ impl VulkanResidency {
             let (from, to, size) = copies[0];
             return self.copy_source(Resource::Image(source), from, destination, to, size);
         }
-        let mut pieces = Vec::new();
-        let mut offsets = Vec::new();
-        for &(from, to, size) in copies {
-            self.check_buffer_range(destination, to, size)?;
-            for piece in self.image_pieces(source, from, size)? {
-                offsets.push(to + piece.logical - from);
-                pieces.push(piece);
-            }
-        }
-        let Some(&start) = offsets.first() else {
+        if copies.is_empty() {
             return Ok(());
-        };
-        let end = offsets.last().unwrap() + pieces.last().unwrap().length;
-        let dst = self.buffer_access_range(
+        }
+        let begin = copies.iter().map(|c| c.1).min().unwrap();
+        let end = copies.iter().map(|c| c.1 + c.2).max().unwrap();
+        self.buffer_access_range(
             destination,
-            start,
-            end - start,
+            begin,
+            end - begin,
             AccessScope::new(
                 vk::PipelineStageFlags2::COPY,
                 vk::AccessFlags2::TRANSFER_WRITE,
             ),
         )?;
+        let target = Arc::clone(&self.buffer(destination)?.native);
+        self.constructing.push(Resource::Buffer(destination));
+        let result = self.copy_image_bytes(source, &target, copies);
+        self.unpin(Resource::Buffer(destination));
+        result?;
+        let written: Vec<_> = copies.iter().map(|&(_, to, size)| (to, size)).collect();
+        self.buffer_mut(destination).validate_intervals(&written);
+        Ok(())
+    }
+    /// Copy exact encoded intersections into a native transfer destination.
+    /// Temporary layout conversions have no physical identity or cache entry.
+    pub(super) fn copy_image_bytes(
+        &mut self,
+        source: ImageId,
+        destination: &Arc<AllocatedBuffer>,
+        copies: &[(u64, u64, u64)],
+    ) -> Result<(), VulkanError> {
+        let mut pieces = Vec::new();
+        let mut offsets = Vec::new();
+        for &(from, to, size) in copies {
+            for piece in self.image_pieces(source, from, size)? {
+                offsets.push(to + piece.logical - from);
+                pieces.push(piece);
+            }
+        }
+        if pieces.is_empty() {
+            return Ok(());
+        }
+        let dst = destination.handle;
         if pieces.iter().zip(&offsets).all(|(p, &to)| p.direct(to)) {
             let (src, layout) =
                 self.image_regions_access(source, &pieces, vk::AccessFlags2::TRANSFER_READ)?;
@@ -369,6 +390,8 @@ impl VulkanResidency {
                 .map(|(p, &to)| p.region(to))
                 .collect();
             let slot = self.device.begin_recording()?;
+            let work = self.device.work_ticket()?;
+            self.device.retire_buffer(Arc::clone(destination), work)?;
             self.barriers.emit(&mut self.device);
             unsafe {
                 self.device.dispatch.cmd_copy_image_to_buffer(
@@ -380,8 +403,7 @@ impl VulkanResidency {
                 );
             }
         } else {
-            let (scratch, slices) =
-                self.image_pieces_buffer(source, &pieces, &[Resource::Buffer(destination)])?;
+            let (scratch, slices) = self.image_pieces_buffer(source, &pieces, &[])?;
             let regions: Vec<_> = pieces
                 .iter()
                 .zip(&offsets)
@@ -394,6 +416,8 @@ impl VulkanResidency {
                 })
                 .collect();
             let slot = self.device.begin_recording()?;
+            let work = self.device.work_ticket()?;
+            self.device.retire_buffer(Arc::clone(destination), work)?;
             self.barriers.emit(&mut self.device);
             unsafe {
                 self.device.dispatch.cmd_copy_buffer(
@@ -404,9 +428,6 @@ impl VulkanResidency {
                 );
             }
         }
-        let written: Vec<_> = copies.iter().map(|&(_, to, size)| (to, size)).collect();
-        self.contents_mut(Resource::Buffer(destination))
-            .validate_intervals(&written);
         self.statistics.gpu_copied_bytes += copies.iter().map(|&(_, _, size)| size).sum::<u64>();
         Ok(())
     }

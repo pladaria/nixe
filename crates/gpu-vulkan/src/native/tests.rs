@@ -312,7 +312,7 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
     assert_eq!(execution.residency.statistics().native_readback_bytes, 4);
     let bytes = cpu_read(&mut execution.residency, &backing);
     assert_eq!(&bytes[9..13], &[0x43; 4]);
-    execution.residency.preserve_buffer(id).unwrap();
+    assert_eq!(cpu_read(&mut execution.residency, &backing), bytes);
     assert_eq!(execution.residency.statistics().native_readback_bytes, 4);
     execution.teardown().unwrap();
     unsafe { owner.device.destroy_semaphore(gate, None) };
@@ -800,12 +800,12 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             bindings: Box::new([]),
             shared_memory_bytes: 0,
         }),
-        vertices: Box::new([GuestVertexBuffer {
+        vertices: Arc::from([GuestVertexBuffer {
             binding: 0,
             backing: vertex_backing,
         }]),
         index: None,
-        colors: Box::new([image]),
+        colors: Arc::from([image]),
         depth_stencil: None,
         parameters: Arc::new(GuestDrawParameters {
             shader_state: Default::default(),
@@ -863,6 +863,28 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             alpha_to_coverage: false,
         }),
     });
+    // Dynamic-state support affects selection before shader/pipeline lookup.
+    for dynamic in [false, true] {
+        use std::hash::{Hash, Hasher};
+        let key = GraphicsKey::new(&state, dynamic);
+        let mut changed = (*state).clone();
+        let p = Arc::make_mut(&mut changed.parameters);
+        p.scissor.x = 1;
+        p.blend_constants = [0.25; 4];
+        p.render_area.width = 4;
+        let same = GraphicsKey::new(&changed, dynamic);
+        assert!(key == same);
+        let hash = |key: &GraphicsKey| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash(&key), hash(&same));
+        Arc::make_mut(&mut changed.parameters).cull = CullMode::Back;
+        assert_eq!(key == GraphicsKey::new(&changed, dynamic), dynamic);
+        Arc::make_mut(&mut changed.parameters).vertices[0].stride += 4;
+        assert!(key != GraphicsKey::new(&changed, dynamic));
+    }
     let draw = NativeCommand::Draw {
         state: Arc::clone(&state),
         arguments: DrawArguments::NonIndexed {
@@ -1064,7 +1086,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let other_backing = other_backing.slice(0, 72).unwrap();
     let mut other = (*state).clone();
     other.identity = PreparedStateId::new(10, 1);
-    other.vertices[0].backing = other_backing;
+    Arc::make_mut(&mut other.vertices)[0].backing = other_backing;
     let other = Arc::new(other);
     let mut clipped = (*other).clone();
     clipped.identity = PreparedStateId::new(11, 1);
@@ -1160,6 +1182,8 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     );
     ready(&mut execution, &variant);
     assert!(execution.graphics(&state).unwrap());
+    let pipeline_count = execution.pipelines.usage().0;
+    let graphics_count = execution.statistics.prepared_graphics;
     let mut inputs = Vec::new();
     for (index, rgba) in [[0., 1., 0., 1.], [1., 0., 0., 1.], [0., 0., 1., 1.]]
         .into_iter()
@@ -1190,6 +1214,10 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         ready(&mut execution, &submission);
         inputs.push((submission, encode(rgba)));
     }
+    // Dynamic scissor changes and runtime uniform data retain the native
+    // executable; only the recording parameters and buffer visibility change.
+    assert_eq!(execution.pipelines.usage().0, pipeline_count);
+    assert_eq!(execution.statistics.prepared_graphics, graphics_count);
     let scopes = execution.recording_statistics().rendering_scopes;
     let mut sent = Vec::new();
     for (submission, bytes) in &inputs {
@@ -1235,6 +1263,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         finish_next(&mut execution).unwrap().unwrap();
     }
     assert_eq!(execution.descriptors.statistics().updates, updates);
+    assert_eq!(execution.pipelines.usage().0, pipeline_count);
     assert!(
         execution
             .recording_statistics()
@@ -1470,8 +1499,9 @@ fn window_depth_reconstructs_reads_and_clamps_exports(
         let (_allocation_3, depth_backing) = backing_allocation(&execution.residency, 256, 256, 0);
         let mut draw = (**state).clone();
         draw.identity = PreparedStateId::new(4000 + index as u64, 1);
-        draw.vertices[0].backing = vertex_backing.slice(0, 72).unwrap();
-        draw.colors[0].planes = Arc::from([GuestImagePlane {
+        std::sync::Arc::make_mut(&mut draw.vertices)[0].backing =
+            vertex_backing.slice(0, 72).unwrap();
+        std::sync::Arc::make_mut(&mut draw.colors)[0].planes = Arc::from([GuestImagePlane {
             footprint: crate::residency::tests::plane_geometry(
                 color_backing.clone(),
                 [8, 8],
@@ -1590,11 +1620,11 @@ fn render_area_preserves_undefined_padding(
     let (_allocation_4, backing) = backing_allocation(&execution.residency, 256, 256, 0x73);
     let mut draw = (**state).clone();
     draw.identity = PreparedStateId::new(100, 1);
-    draw.colors[0].planes = Arc::from([GuestImagePlane {
+    std::sync::Arc::make_mut(&mut draw.colors)[0].planes = Arc::from([GuestImagePlane {
         footprint: crate::residency::tests::plane_geometry(backing.clone(), [8, 8], 32, 4),
         ..draw.colors[0].planes[0].clone()
     }]);
-    draw.colors[0].canonical_texels = false;
+    std::sync::Arc::make_mut(&mut draw.colors)[0].canonical_texels = false;
     let parameters = Arc::make_mut(&mut draw.parameters);
     parameters.identity = PreparedStateId::new(101, 1);
     parameters.render_area = ScissorRect {
@@ -1990,4 +2020,102 @@ fn recorder_prefixes_retain_gpu_versions_without_allocating_completion_records()
         drop(execution);
         monitor.check().unwrap();
     }
+}
+
+fn pressure_execution(budget: u64) -> Option<NativeGpuExecution> {
+    Some(
+        NativeGpuExecution::new(
+            nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+            support::device_for_test(ApiPreference::Auto)?,
+            ShaderNamespace {
+                guest: *b"nixe-native-test",
+                isa: 1,
+            },
+            CacheConfiguration::default(),
+            budget,
+        )
+        .unwrap(),
+    )
+}
+fn pressure_image(execution: &NativeGpuExecution) -> (nixe_memory::Allocation, GuestImage) {
+    let (allocation, backing) = backing_allocation(&execution.residency, 16384, 4096, 0);
+    (
+        allocation,
+        GuestImage {
+            description: nixe_gpu::ImageDescription::new(
+                ImageDimension::Two,
+                nixe_gpu::ImageExtent::new(64, 64, 1).unwrap(),
+                ImageFormat::Rgba8Unorm,
+                nixe_gpu::ImageKind::Color,
+                1,
+                1,
+                SampleCount::One,
+            )
+            .unwrap(),
+            swizzle: nixe_gpu::Swizzle::IDENTITY,
+            canonical_texels: true,
+            sample_grid: [1, 1],
+            planes: Arc::from([GuestImagePlane {
+                mip_level: 0,
+                array_layer: 0,
+                aspect: nixe_gpu::native::GuestImageAspect::Color,
+                footprint: crate::residency::tests::plane_geometry(backing, [64, 64], 256, 4),
+                row_pitch: 256,
+                bytes_per_block: 4,
+            }]),
+        },
+    )
+}
+#[test]
+fn blit_keeps_selected_source_while_allocating_destination() {
+    let charged = {
+        let Some(mut probe) = pressure_execution(16 * 1024 * 1024) else {
+            return;
+        };
+        let (_allocation, source) = pressure_image(&probe);
+        let before = probe.residency.allocated_bytes();
+        probe.image(&source).unwrap();
+        let charge = probe.residency.allocated_bytes() - before;
+        probe.teardown().unwrap();
+        charge
+    };
+    let mut execution = pressure_execution(2 * charged).unwrap();
+    let validation = execution.residency.device().validation_monitor();
+    let (_a, source) = pressure_image(&execution);
+    let (_b, unrelated) = pressure_image(&execution);
+    let (_c, destination) = pressure_image(&execution);
+    execution.image(&source).unwrap();
+    execution.image(&unrelated).unwrap();
+    let rect = nixe_gpu::ScissorRect {
+        x: 0,
+        y: 0,
+        width: 64,
+        height: 64,
+    };
+    let result = execution.blit(&source, &destination, rect, rect, false, false, None);
+    assert!(execution.residency.constructing.is_empty());
+    assert!(
+        execution
+            .blit(
+                &source,
+                &destination,
+                nixe_gpu::ScissorRect { x: 64, ..rect },
+                rect,
+                false,
+                false,
+                None
+            )
+            .is_err()
+    );
+    assert!(
+        execution.residency.constructing.is_empty(),
+        "failed preparation releases construction retention"
+    );
+    execution.teardown().unwrap();
+    drop(execution);
+    validation.check().unwrap();
+    assert!(
+        result.is_ok(),
+        "budget holds both operands after evicting the unrelated image"
+    );
 }

@@ -156,7 +156,7 @@ pub(super) fn graphics(draw: &GuestDrawParameters) -> Result<GraphicsState, Vulk
     }
     let mut bindings = Vec::new();
     let mut attributes = Vec::new();
-    for v in &draw.vertices {
+    for v in draw.vertices.iter() {
         bindings.push(VertexBinding {
             binding: v.binding,
             stride: v.stride,
@@ -178,12 +178,31 @@ pub(super) fn graphics(draw: &GuestDrawParameters) -> Result<GraphicsState, Vulk
             });
         }
     }
-    state.vertex_bindings = bindings.into_boxed_slice();
-    state.vertex_attributes = attributes.into_boxed_slice();
+    state.vertex_bindings = bindings.into();
+    state.vertex_attributes = attributes.into();
     Ok(state)
 }
-pub(super) fn parameters(draw: &GuestDrawParameters) -> Result<GraphicsParameters, VulkanError> {
-    let state = graphics(draw)?;
+pub(super) fn parameters(
+    draw: &GuestDrawParameters,
+    pipeline: &GraphicsState,
+) -> Result<GraphicsParameters, VulkanError> {
+    let mut state = pipeline.clone();
+    state.cull = match draw.cull {
+        nixe_gpu::CullMode::None => vk::CullModeFlags::NONE,
+        nixe_gpu::CullMode::Front => vk::CullModeFlags::FRONT,
+        nixe_gpu::CullMode::Back => vk::CullModeFlags::BACK,
+        nixe_gpu::CullMode::FrontAndBack => vk::CullModeFlags::FRONT_AND_BACK,
+    };
+    state.front_face = match draw.front_face {
+        nixe_gpu::FrontFace::Clockwise => vk::FrontFace::CLOCKWISE,
+        nixe_gpu::FrontFace::CounterClockwise => vk::FrontFace::COUNTER_CLOCKWISE,
+    };
+    state.depth_test = draw.depth.test_enabled;
+    state.depth_write = draw.depth.write_enabled;
+    state.depth_compare = compare(draw.depth.compare);
+    state.stencil_test = draw.stencil.is_some();
+    state.front = draw.stencil.map(|s| stencil(s.front)).unwrap_or_default();
+    state.back = draw.stencil.map(|s| stencil(s.back)).unwrap_or_default();
     let extent = vk::Extent2D {
         width: draw.extent[0],
         height: draw.extent[1],
@@ -287,7 +306,7 @@ pub(super) fn guest_runtime(
                 "point rasterization requires a finite positive programmed size",
             ))?;
     }
-    for vertex in &draw.vertices {
+    for vertex in draw.vertices.iter() {
         for attribute in &vertex.attributes {
             let ty = if let Some(signed) = vertex::VertexFetchFormat::new(attribute.format).scaled32
             {

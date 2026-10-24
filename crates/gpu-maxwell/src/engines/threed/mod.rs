@@ -143,17 +143,12 @@ pub use render_targets::{
     MaxwellThreeDZCompressionMode,
 };
 pub(crate) use resource::MaxwellThreeDResolvedResourceCache;
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use resource::resolve_resource_roles;
 pub use resource::{
-    MaxwellThreeDDirtySubresource, MaxwellThreeDDirtySubresources, MaxwellThreeDGuestImageFormat,
-    MaxwellThreeDMappingReference, MaxwellThreeDPreservedImageLayout, MaxwellThreeDResolvedBuffer,
-    MaxwellThreeDResolvedImage, MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources,
-    MaxwellThreeDResolvedSampler, MaxwellThreeDResourceAccess, MaxwellThreeDResourceAlias,
-    MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDTextureDimension,
-    MaxwellThreeDTextureReference, resolve_maxwell_three_d_resources,
-    resolve_maxwell_three_d_resources_for_roles,
+    MaxwellThreeDGuestImageFormat, MaxwellThreeDMappingReference,
+    MaxwellThreeDPreservedImageLayout, MaxwellThreeDResolvedBuffer, MaxwellThreeDResolvedImage,
+    MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources, MaxwellThreeDResolvedSampler,
+    MaxwellThreeDResourceAccess, MaxwellThreeDResourceError, MaxwellThreeDResourceRole,
+    MaxwellThreeDTextureDimension, MaxwellThreeDTextureReference,
 };
 pub use shader_execution::{
     MAXWELL_THREE_D_SHADER_LOCAL_MEMORY_PER_WARP_SIZE_MAX,

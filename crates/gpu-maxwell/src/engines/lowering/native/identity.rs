@@ -89,7 +89,7 @@ impl Hash for ProgramKey {
                 GuestBinding::NullBuffer => (),
                 GuestBinding::Buffer(b) => b.hash(state),
                 GuestBinding::Image { image, arrayed } => {
-                    (Arc::as_ptr(&image.planes) as *const GuestImagePlane).hash(state);
+                    image.planes.hash(state);
                     image.description.hash(state);
                     image.swizzle.hash(state);
                     image.sample_grid.hash(state);
@@ -113,72 +113,6 @@ impl Hash for ProgramKey {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct DrawKey(pub Arc<GuestDrawState>);
-impl PartialEq for DrawKey {
-    fn eq(&self, other: &Self) -> bool {
-        let (a, b) = (&self.0, &other.0);
-        a.parameters.identity == b.parameters.identity
-            && a.program.identity == b.program.identity
-            && a.vertices.len() == b.vertices.len()
-            && a.vertices
-                .iter()
-                .zip(&b.vertices)
-                .all(|(a, b)| a.binding == b.binding && a.backing == b.backing)
-            && match (&a.index, &b.index) {
-                (None, None) => true,
-                (
-                    Some(GuestIndexBuffer::Canonical(a, at)),
-                    Some(GuestIndexBuffer::Canonical(b, bt)),
-                ) => at == bt && a == b,
-                (Some(GuestIndexBuffer::Inline(a)), Some(GuestIndexBuffer::Inline(b))) => {
-                    Arc::ptr_eq(a, b)
-                }
-                _ => false,
-            }
-            && a.colors.len() == b.colors.len()
-            && a.colors.iter().zip(&b.colors).all(|(a, b)| a.same_view(b))
-            && match (&a.depth_stencil, &b.depth_stencil) {
-                (None, None) => true,
-                (Some(a), Some(b)) => a.same_view(b),
-                _ => false,
-            }
-    }
-}
-impl Eq for DrawKey {}
-impl Hash for DrawKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        let a = &self.0;
-        a.parameters.identity.hash(state);
-        a.program.identity.hash(state);
-        a.vertices.len().hash(state);
-        for vertex in &a.vertices {
-            vertex.binding.hash(state);
-            vertex.backing.hash(state);
-        }
-        match &a.index {
-            None => 0_u8.hash(state),
-            Some(GuestIndexBuffer::Canonical(backing, kind)) => {
-                1_u8.hash(state);
-                backing.hash(state);
-                kind.hash(state);
-            }
-            Some(GuestIndexBuffer::Inline(bytes)) => {
-                2_u8.hash(state);
-                (Arc::as_ptr(bytes) as *const u8).hash(state);
-            }
-        }
-        a.colors.len().hash(state);
-        for image in a.colors.iter().chain(&a.depth_stencil) {
-            (Arc::as_ptr(&image.planes) as *const GuestImagePlane).hash(state);
-            image.description.hash(state);
-            image.swizzle.hash(state);
-            image.sample_grid.hash(state);
-            image.canonical_texels.hash(state);
-        }
-        a.depth_stencil.is_some().hash(state);
-    }
-}
 pub(super) fn draw_bytes(draw: &GuestDrawState) -> usize {
     std::mem::size_of_val(draw)
         + std::mem::size_of_val(draw.vertices.as_ref())
@@ -354,5 +288,57 @@ mod tests {
         let replacement = crate::test_memory::allocate(&machine, 4096);
         let remapped = key(crate::test_memory::mapping(&replacement));
         assert!(states.get(&remapped).is_none());
+    }
+    #[test]
+    fn reconstructed_image_planes_preserve_program_cache_identity() {
+        let machine = crate::test_memory::machine();
+        let allocation = crate::test_memory::allocate(&machine, 4096);
+        let key = image_key(&allocation, 16);
+        let a = super::super::image::conversion(&nixe_gpu::ConversionImage {
+            description: key.description,
+            allocation: GpuAllocationDescription::new(4096, 1).unwrap(),
+            view: key.view,
+        })
+        .unwrap();
+        let mut b = a.clone();
+        b.planes = Arc::from(a.planes.to_vec());
+        assert!(a.same_view(&b));
+        assert!(!Arc::ptr_eq(&a.planes, &b.planes));
+        let code = Arc::new(GuestShaderCode {
+            identity: nixe_gpu::shader_identity::ContentId::of(b"audit", &[]),
+            stages: Box::new([]),
+        });
+        let key = |image| {
+            ProgramKey(Arc::new(GuestProgram {
+                identity: nixe_gpu::PreparedStateId::new(1, 1),
+                shader: Arc::clone(&code),
+                shared_memory_bytes: 0,
+                bindings: Box::new([(
+                    ResourceId::new(1),
+                    GuestBinding::Image {
+                        image,
+                        arrayed: false,
+                    },
+                )]),
+            }))
+        };
+        let a = key(a);
+        let b = key(b);
+        assert!(a == b);
+        let hash = |key: &ProgramKey| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut h);
+            h.finish()
+        };
+        let mut cache = nixe_gpu::WorkingSet::new(4, 4096);
+        cache.insert(a.clone(), 7, 512);
+        println!(
+            "AUDIT equal_keys={} equal_hashes={} cache_hit={}",
+            a == b,
+            hash(&a) == hash(&b),
+            cache.get(&b).is_some()
+        );
+        assert_eq!(hash(&a), hash(&b));
+        assert_eq!(cache.get(&b), Some(&7));
     }
 }

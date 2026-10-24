@@ -24,7 +24,7 @@ fn indexed_storage_is_demand_bounded_without_inventing_a_limit() {
     configure_indices(&mut channel, address + 4090, 1, 0);
     for count in [3, 4] {
         let dispatch = dispatch_method(&mut channel, 0x17e0 / 4, count).unwrap();
-        let result = resolve_maxwell_three_d_resources_for_roles(
+        let result = fixture_roles(
             dispatch.operations()[0].state(),
             space.memory(),
             &[MaxwellThreeDResourceRole::IndexBuffer],
@@ -35,7 +35,7 @@ fn indexed_storage_is_demand_bounded_without_inventing_a_limit() {
     configure_indices(&mut channel, address, 2, u32::MAX);
     dispatch_method(&mut channel, 0x17e0 / 4, 1).unwrap();
     assert!(
-        resolve_maxwell_three_d_resources_for_roles(
+        fixture_roles(
             channel.three_d(),
             space.memory(),
             &[MaxwellThreeDResourceRole::IndexBuffer],
@@ -45,7 +45,7 @@ fn indexed_storage_is_demand_bounded_without_inventing_a_limit() {
     );
     configure_indices(&mut channel, address + 1, 2, 0);
     assert!(
-        resolve_maxwell_three_d_resources_for_roles(
+        fixture_roles(
             channel.three_d(),
             space.memory(),
             &[MaxwellThreeDResourceRole::IndexBuffer],
@@ -57,7 +57,7 @@ fn indexed_storage_is_demand_bounded_without_inventing_a_limit() {
     program_three_d(&mut channel, 0x17d0, (address >> 32) as u32);
     program_three_d(&mut channel, 0x17d4, address as u32);
     assert!(
-        resolve_maxwell_three_d_resources_for_roles(
+        fixture_roles(
             channel.three_d(),
             space.memory(),
             &[MaxwellThreeDResourceRole::IndexBuffer],

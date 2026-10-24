@@ -191,6 +191,9 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                         // Downloaded GPU bytes now agree with RAM. Retire every
                         // older producer in this page too, so none can resurface
                         // after an ordinary CPU store with direct RAM access.
+                        // Downloading does not change native contents: keep
+                        // content observations valid. CPU writes still invalidate
+                        // resource tracking and exact authority independently.
                         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
                         self.subtract_device_coverage(
                             PhysicalInterval {
@@ -198,7 +201,7 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                                 start,
                                 end: start + PAGE_SIZE,
                             },
-                            true,
+                            false,
                         )?;
                     }
                     for candidate in candidates {

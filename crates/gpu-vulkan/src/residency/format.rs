@@ -110,3 +110,98 @@ pub(super) fn copy_block(
     };
     Some((vk::Extent2D { width, height }, bytes))
 }
+
+// Vulkan compatibility classes, independently checked against the registry's vk.xml.
+// https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#formats-compatibility
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/compatible_formats.cpp
+pub(super) fn view_compatible(source: vk::Format, destination: vk::Format) -> bool {
+    if source == destination {
+        return true;
+    }
+    let class = |format| {
+        let (block, bytes) = copy_block(format, vk::ImageAspectFlags::COLOR)?;
+        if block.width == 1 && block.height == 1 {
+            return Some(bytes);
+        }
+        Some(match format {
+            vk::Format::BC1_RGB_UNORM_BLOCK | vk::Format::BC1_RGB_SRGB_BLOCK => {
+                vk::Format::BC1_RGB_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::BC1_RGBA_UNORM_BLOCK | vk::Format::BC1_RGBA_SRGB_BLOCK => {
+                vk::Format::BC1_RGBA_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::BC2_UNORM_BLOCK | vk::Format::BC2_SRGB_BLOCK => {
+                vk::Format::BC2_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::BC3_UNORM_BLOCK | vk::Format::BC3_SRGB_BLOCK => {
+                vk::Format::BC3_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::BC4_UNORM_BLOCK | vk::Format::BC4_SNORM_BLOCK => {
+                vk::Format::BC4_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::BC5_UNORM_BLOCK | vk::Format::BC5_SNORM_BLOCK => {
+                vk::Format::BC5_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::BC6H_UFLOAT_BLOCK | vk::Format::BC6H_SFLOAT_BLOCK => {
+                vk::Format::BC6H_UFLOAT_BLOCK.as_raw() as u32
+            }
+            vk::Format::BC7_UNORM_BLOCK | vk::Format::BC7_SRGB_BLOCK => {
+                vk::Format::BC7_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_4X4_UNORM_BLOCK | vk::Format::ASTC_4X4_SRGB_BLOCK => {
+                vk::Format::ASTC_4X4_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_5X4_UNORM_BLOCK | vk::Format::ASTC_5X4_SRGB_BLOCK => {
+                vk::Format::ASTC_5X4_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_5X5_UNORM_BLOCK | vk::Format::ASTC_5X5_SRGB_BLOCK => {
+                vk::Format::ASTC_5X5_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_6X5_UNORM_BLOCK | vk::Format::ASTC_6X5_SRGB_BLOCK => {
+                vk::Format::ASTC_6X5_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_6X6_UNORM_BLOCK | vk::Format::ASTC_6X6_SRGB_BLOCK => {
+                vk::Format::ASTC_6X6_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_8X5_UNORM_BLOCK | vk::Format::ASTC_8X5_SRGB_BLOCK => {
+                vk::Format::ASTC_8X5_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_8X6_UNORM_BLOCK | vk::Format::ASTC_8X6_SRGB_BLOCK => {
+                vk::Format::ASTC_8X6_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_8X8_UNORM_BLOCK | vk::Format::ASTC_8X8_SRGB_BLOCK => {
+                vk::Format::ASTC_8X8_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_10X5_UNORM_BLOCK | vk::Format::ASTC_10X5_SRGB_BLOCK => {
+                vk::Format::ASTC_10X5_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_10X6_UNORM_BLOCK | vk::Format::ASTC_10X6_SRGB_BLOCK => {
+                vk::Format::ASTC_10X6_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_10X8_UNORM_BLOCK | vk::Format::ASTC_10X8_SRGB_BLOCK => {
+                vk::Format::ASTC_10X8_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_10X10_UNORM_BLOCK | vk::Format::ASTC_10X10_SRGB_BLOCK => {
+                vk::Format::ASTC_10X10_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_12X10_UNORM_BLOCK | vk::Format::ASTC_12X10_SRGB_BLOCK => {
+                vk::Format::ASTC_12X10_UNORM_BLOCK.as_raw() as u32
+            }
+            vk::Format::ASTC_12X12_UNORM_BLOCK | vk::Format::ASTC_12X12_SRGB_BLOCK => {
+                vk::Format::ASTC_12X12_UNORM_BLOCK.as_raw() as u32
+            }
+            _ => return None,
+        })
+    };
+    class(source).is_some_and(|a| class(destination) == Some(a))
+}
+pub(super) fn copy_compatible(
+    source: vk::Format,
+    destination: vk::Format,
+    aspect: vk::ImageAspectFlags,
+) -> bool {
+    source == destination
+        || aspect == vk::ImageAspectFlags::COLOR
+            && copy_block(source, aspect)
+                .is_some_and(|block| copy_block(destination, aspect) == Some(block))
+}

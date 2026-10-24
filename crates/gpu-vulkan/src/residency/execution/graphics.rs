@@ -115,7 +115,7 @@ impl PreparedTargets {
             && self
                 .colors
                 .iter()
-                .zip(&other.colors)
+                .zip(other.colors.iter())
                 .all(|(a, b)| same(a, b))
             && self.native_depth.map(|a| a.store_op) == other.native_depth.map(|a| a.store_op)
             && self.native_stencil.map(|a| a.store_op) == other.native_stencil.map(|a| a.store_op)
@@ -198,7 +198,7 @@ impl VulkanResidency {
         targets
             .attachments()
             .all(|attachment| match attachment.description.source {
-                AttachmentSource::Canonical { image, .. } => self.image(image).is_ok(),
+                AttachmentSource::Canonical { image, .. } => self.image_binding_current(image),
                 AttachmentSource::ResidentOnly(id) => self.attachment(id).is_ok(),
             })
     }
@@ -431,7 +431,7 @@ impl VulkanResidency {
             || state
                 .colors
                 .iter()
-                .zip(&targets.colors)
+                .zip(targets.colors.iter())
                 .any(|((format, _), a)| {
                     *format != a.as_ref().map_or(vk::Format::UNDEFINED, |a| a.format)
                 })
@@ -754,7 +754,7 @@ impl VulkanResidency {
         let mut writers = smallvec::SmallVec::<[WriterId; 16]>::new();
         let indirect = if !empty {
             writers = self.program_access_except(&graphics.program)?;
-            for vertex in &prepared.vertices {
+            for vertex in prepared.vertices.iter() {
                 self.ensure_buffer_range(vertex.buffer, vertex.offset, vertex.size)?;
                 let handle = self.buffer_access_range(
                     vertex.buffer,
@@ -829,7 +829,7 @@ impl VulkanResidency {
                             && !empty
                             && !self.image(image)?.discarded.is_empty()
                         {
-                            self.observe_image_cpu_writes(image)?;
+                            self.invalidate_cpu_resources(&[])?;
                             prepared
                                 .targets
                                 .colors
@@ -879,7 +879,7 @@ impl VulkanResidency {
                     } else {
                         // CLEAR and DONT_CARE do not consume the previous texels.
                         // Keep undefined/dirty coverage outside the actual write.
-                        self.observe_image_cpu_writes(image)?;
+                        self.invalidate_cpu_resources(&[])?;
                     }
                     if !read_only_attachment(a, &graphics.parameters.state)
                         && (!empty || a.description.load == vk::AttachmentLoadOp::CLEAR)

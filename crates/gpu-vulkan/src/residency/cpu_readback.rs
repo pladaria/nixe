@@ -149,7 +149,7 @@ impl VulkanResidency {
                     ReadbackPublication::Obsolete | ReadbackPublication::Replan => break,
                 }
             }
-            self.invalidate_cpu_buffers(&dirty)?;
+            self.invalidate_cpu_resources(&dirty)?;
             self.authority
                 .retire_unused_device_pages(&self.memory, &dirty)?;
             if self.authority.access_can_complete(id) {

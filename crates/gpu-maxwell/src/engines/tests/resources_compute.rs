@@ -114,7 +114,7 @@ fn non_indexed_resource_scope_ignores_unrelated_partial_index_shadow_state() {
     let address_space = resource_address_space();
 
     assert!(matches!(
-        resolve_maxwell_three_d_resources(
+        fixture_bindings(
             channel.three_d(),
             address_space.memory(),
             &mut crate::test_memory::access(address_space.memory().machine())
@@ -123,26 +123,23 @@ fn non_indexed_resource_scope_ignores_unrelated_partial_index_shadow_state() {
             role: MaxwellThreeDResourceRole::IndexBuffer,
         })
     ));
-    let resources = resolve_resource_roles(
+    let resources = fixture_roles(
         channel.three_d(),
         address_space.memory(),
         &[],
-        false,
         &mut crate::test_memory::access(address_space.memory().machine()),
     )
     .unwrap();
     assert!(
         resources
             .resources()
-            .iter()
             .all(|resource| resource.role() != MaxwellThreeDResourceRole::IndexBuffer)
     );
     assert!(matches!(
-        resolve_resource_roles(
+        fixture_roles(
             channel.three_d(),
             address_space.memory(),
             &[MaxwellThreeDResourceRole::IndexBuffer],
-            false,
             &mut crate::test_memory::access(address_space.memory().machine())
         ),
         Err(MaxwellThreeDResourceError::IncompleteState {
@@ -158,7 +155,7 @@ fn operation_resource_scope_ignores_only_unconsumed_partial_color_targets() {
     let address_space = resource_address_space();
 
     assert!(matches!(
-        resolve_maxwell_three_d_resources(
+        fixture_bindings(
             channel.three_d(),
             address_space.memory(),
             &mut crate::test_memory::access(address_space.memory().machine())
@@ -167,21 +164,19 @@ fn operation_resource_scope_ignores_only_unconsumed_partial_color_targets() {
             role: MaxwellThreeDResourceRole::ColorTarget(0),
         })
     ));
-    let resources = resolve_resource_roles(
+    let resources = fixture_roles(
         channel.three_d(),
         address_space.memory(),
         &[],
-        false,
         &mut crate::test_memory::access(address_space.memory().machine()),
     )
     .unwrap();
-    assert!(resources.resources().is_empty());
+    assert!(resources.resources().next().is_none());
     assert!(matches!(
-        resolve_resource_roles(
+        fixture_roles(
             channel.three_d(),
             address_space.memory(),
             &[MaxwellThreeDResourceRole::ColorTarget(0)],
-            false,
             &mut crate::test_memory::access(address_space.memory().machine())
         ),
         Err(MaxwellThreeDResourceError::IncompleteState {
@@ -205,7 +200,6 @@ fn operation_resource_scope_ignores_an_unreferenced_contradictory_vertex_stream(
     }
     let address_space = resource_address_space();
 
-    assert!(channel.three_d().validate_cross_registers().is_err());
     let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
     let operation = &dispatch.operations()[0];
     let mut roles = Vec::new();
@@ -213,15 +207,14 @@ fn operation_resource_scope_ignores_an_unreferenced_contradictory_vertex_stream(
         .trigger()
         .append_resource_roles(operation.state(), &mut roles);
     assert!(roles.is_empty());
-    let resources = resolve_resource_roles(
+    let resources = fixture_roles(
         operation.state(),
         address_space.memory(),
         &roles,
-        false,
         &mut crate::test_memory::access(address_space.memory().machine()),
     )
     .unwrap();
-    assert!(resources.resources().is_empty());
+    assert!(resources.resources().next().is_none());
 
     let mut consumed = channel;
     program_three_d(&mut consumed, 0x1160, 0x3840_0000);
@@ -233,11 +226,10 @@ fn operation_resource_scope_ignores_an_unreferenced_contradictory_vertex_stream(
         .append_resource_roles(operation.state(), &mut roles);
     assert_eq!(roles, [MaxwellThreeDResourceRole::VertexStream(0)]);
     assert!(matches!(
-        resolve_resource_roles(
+        fixture_roles(
             operation.state(),
             address_space.memory(),
             &roles,
-            false,
             &mut crate::test_memory::access(address_space.memory().machine())
         ),
         Err(MaxwellThreeDResourceError::ContradictoryState {
@@ -261,7 +253,7 @@ fn rgba16_float_targets_preserve_texel_width_and_reject_incompatible_kinds() {
         program_color_target(&mut channel, 0, mapping.offset().get(), 0xca);
         program_three_d(&mut channel, 0x15d0, 0);
         let roles = [MaxwellThreeDResourceRole::ColorTarget(0)];
-        let result = resolve_maxwell_three_d_resources_for_roles(
+        let result = fixture_roles(
             channel.three_d(),
             address_space.memory(),
             &roles,
@@ -274,7 +266,8 @@ fn rgba16_float_targets_preserve_texel_width_and_reject_incompatible_kinds() {
             continue;
         }
         let resources = result.unwrap();
-        let MaxwellThreeDResolvedResource::Image(image) = &resources.resources()[0] else {
+        let MaxwellThreeDResolvedResource::Image(image) = resources.resources().next().unwrap()
+        else {
             panic!("image expected")
         };
         assert_eq!(image.description().format(), ImageFormat::Rgba16Float);
@@ -288,7 +281,7 @@ fn rgba16_float_targets_preserve_texel_width_and_reject_incompatible_kinds() {
         // using the hard-coded C32_MS4 storage family.
         program_three_d(&mut channel, 0x15d0, 2);
         assert!(matches!(
-            resolve_maxwell_three_d_resources_for_roles(
+            fixture_roles(
                 channel.three_d(),
                 address_space.memory(),
                 &roles,
@@ -330,16 +323,16 @@ fn captured_array_color_target_uses_the_verified_zero_layer_reset() {
         MaxwellThreeDRegisterOrigin::VerifiedReset
     );
     assert_eq!(target.layer().value(), Some(&0));
-    let resources = resolve_maxwell_three_d_resources_for_roles(
+    let resources = fixture_roles(
         channel.three_d(),
         address_space.memory(),
         &[MaxwellThreeDResourceRole::ColorTarget(0)],
         &mut crate::test_memory::access(address_space.memory().machine()),
     )
     .unwrap();
-    assert_eq!(resources.resources().len(), 1);
+    assert_eq!(resources.resources().count(), 1);
     assert_eq!(
-        resources.resources()[0].role(),
+        resources.resources().next().unwrap().role(),
         MaxwellThreeDResourceRole::ColorTarget(0)
     );
 }
@@ -368,7 +361,7 @@ fn captured_deko_basic_color_target_accepts_its_matching_c32_pte_kind() {
         program_three_d(&mut channel, method, argument);
     }
 
-    let resources = resolve_maxwell_three_d_resources_for_roles(
+    let resources = fixture_roles(
         channel.three_d(),
         address_space.memory(),
         &[MaxwellThreeDResourceRole::ColorTarget(0)],
@@ -377,7 +370,6 @@ fn captured_deko_basic_color_target_accepts_its_matching_c32_pte_kind() {
     .unwrap();
     let image = resources
         .resources()
-        .iter()
         .find_map(|resource| match resource {
             MaxwellThreeDResolvedResource::Image(image) => Some(image),
             MaxwellThreeDResolvedResource::Buffer(_) => None,
@@ -415,7 +407,7 @@ fn sparse_depth_state_is_validated_only_when_the_attachment_is_consumed() {
         );
         program_three_d(&mut channel, 0x1538, 0);
         assert!(
-            resolve_maxwell_three_d_resources(
+            fixture_bindings(
                 channel.three_d(),
                 space.memory(),
                 &mut crate::test_memory::access(space.memory().machine())
@@ -423,7 +415,7 @@ fn sparse_depth_state_is_validated_only_when_the_attachment_is_consumed() {
             .is_ok()
         );
         program_three_d(&mut channel, 0x1538, 1);
-        let error = resolve_maxwell_three_d_resources(
+        let error = fixture_bindings(
             channel.three_d(),
             space.memory(),
             &mut crate::test_memory::access(space.memory().machine()),
@@ -481,7 +473,7 @@ fn three_d_depth_target_selection_controls_resolution_and_rejects_extra_targets_
     program_three_d(&mut channel, 0x0fe0, 0);
     program_three_d(&mut channel, 0x1538, 0);
     let address_space = resource_address_space();
-    let resources = resolve_maxwell_three_d_resources(
+    let resources = fixture_bindings(
         channel.three_d(),
         address_space.memory(),
         &mut crate::test_memory::access(address_space.memory().machine()),
@@ -490,13 +482,12 @@ fn three_d_depth_target_selection_controls_resolution_and_rejects_extra_targets_
     assert!(
         !resources
             .resources()
-            .iter()
             .any(|resource| resource.role() == MaxwellThreeDResourceRole::DepthStencilTarget)
     );
 
     program_three_d(&mut channel, 0x1538, 1);
     assert!(matches!(
-        resolve_maxwell_three_d_resources(
+        fixture_bindings(
             channel.three_d(),
             address_space.memory(),
             &mut crate::test_memory::access(address_space.memory().machine())
@@ -577,7 +568,7 @@ fn three_d_depth_layer_selects_one_array_subresource() {
         program_three_d(&mut channel, method, argument);
     }
 
-    let resolved = resolve_maxwell_three_d_resources(
+    let resolved = fixture_bindings(
         channel.three_d(),
         address_space.memory(),
         &mut crate::test_memory::access(address_space.memory().machine()),
@@ -585,7 +576,6 @@ fn three_d_depth_layer_selects_one_array_subresource() {
     .unwrap();
     let depth = resolved
         .resources()
-        .iter()
         .find_map(|resource| match resource {
             MaxwellThreeDResolvedResource::Image(image)
                 if image.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
@@ -615,7 +605,7 @@ fn three_d_depth_layer_selects_one_array_subresource() {
 
     program_three_d(&mut channel, 0x179c, 2);
     assert!(matches!(
-        resolve_maxwell_three_d_resources(
+        fixture_bindings(
             channel.three_d(),
             address_space.memory(),
             &mut crate::test_memory::access(address_space.memory().machine())
@@ -628,7 +618,7 @@ fn three_d_depth_layer_selects_one_array_subresource() {
     program_three_d(&mut channel, 0x1230, 0x0001_0002);
     program_three_d(&mut channel, 0x179c, 1);
     assert!(matches!(
-        resolve_maxwell_three_d_resources(
+        fixture_bindings(
             channel.three_d(),
             address_space.memory(),
             &mut crate::test_memory::access(address_space.memory().machine())
@@ -640,7 +630,7 @@ fn three_d_depth_layer_selects_one_array_subresource() {
     program_three_d(&mut channel, 0x179c, 0);
     for raw in [1, 0x10000, 0x10001, 0x10002, 0x1ffff] {
         program_three_d(&mut channel, 0x1230, raw);
-        let resolved = resolve_maxwell_three_d_resources(
+        let resolved = fixture_bindings(
             channel.three_d(),
             address_space.memory(),
             &mut crate::test_memory::access(address_space.memory().machine()),
@@ -648,7 +638,6 @@ fn three_d_depth_layer_selects_one_array_subresource() {
         .unwrap();
         let depth = resolved
             .resources()
-            .iter()
             .find_map(|resource| match resource {
                 MaxwellThreeDResolvedResource::Image(image)
                     if image.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
@@ -668,7 +657,7 @@ fn three_d_depth_layer_selects_one_array_subresource() {
     }
     program_three_d(&mut channel, 0x1230, 0);
     assert!(matches!(
-        resolve_maxwell_three_d_resources(
+        fixture_bindings(
             channel.three_d(),
             address_space.memory(),
             &mut crate::test_memory::access(address_space.memory().machine())
@@ -746,7 +735,7 @@ fn three_d_stencil8_z24_preserves_guest_packing_with_neutral_depth_stencil_seman
         program_three_d(&mut channel, method, argument);
     }
 
-    let resolved = resolve_maxwell_three_d_resources(
+    let resolved = fixture_bindings(
         channel.three_d(),
         address_space.memory(),
         &mut crate::test_memory::access(address_space.memory().machine()),
@@ -754,7 +743,6 @@ fn three_d_stencil8_z24_preserves_guest_packing_with_neutral_depth_stencil_seman
     .unwrap();
     let depth = resolved
         .resources()
-        .iter()
         .find_map(|resource| match resource {
             MaxwellThreeDResolvedResource::Image(image)
                 if image.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
@@ -775,7 +763,7 @@ fn three_d_stencil8_z24_preserves_guest_packing_with_neutral_depth_stencil_seman
     assert_eq!(depth.source().size(), 0x8000);
 
     program_three_d(&mut channel, 0x0fe8, 0x14);
-    let resolved = resolve_maxwell_three_d_resources(
+    let resolved = fixture_bindings(
         channel.three_d(),
         address_space.memory(),
         &mut crate::test_memory::access(address_space.memory().machine()),
@@ -783,7 +771,6 @@ fn three_d_stencil8_z24_preserves_guest_packing_with_neutral_depth_stencil_seman
     .unwrap();
     let depth = resolved
         .resources()
-        .iter()
         .find_map(|resource| match resource {
             MaxwellThreeDResolvedResource::Image(image)
                 if image.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
@@ -837,7 +824,7 @@ fn depth_2cz_kind_validation_rejects_other_packing_msaa_and_color_kinds() {
                 if let Some(compression) = compression {
                     program_three_d(&mut channel, 0x19cc, compression);
                 }
-                let result = resolve_maxwell_three_d_resources(
+                let result = fixture_bindings(
                     channel.three_d(),
                     address_space.memory(),
                     &mut crate::test_memory::access(address_space.memory().machine()),
@@ -1093,7 +1080,7 @@ fn conditional_constant_buffer_inline_load_is_an_explicit_host_boundary() {
 }
 
 #[test]
-fn incomplete_bindings_reject_and_misaligned_descriptor_tables_defer() {
+fn incomplete_constant_buffer_binding_is_rejected() {
     let mut channel = three_d_channel();
     let before = channel.three_d().clone();
     let bind = packet(0x2410 / 4, 1);
@@ -1102,19 +1089,6 @@ fn incomplete_bindings_reject_and_misaligned_descriptor_tables_defer() {
         Err(MaxwellEngineDispatchError::InvalidMethodEncoding { .. })
     ));
     assert_eq!(channel.three_d(), &before);
-
-    for (method, argument) in [(0x1574, 0), (0x1578, 0x8001)] {
-        dispatch_method(&mut channel, method / 4, argument).unwrap();
-    }
-    dispatch_method(&mut channel, 0x157c / 4, 0).unwrap();
-    assert_eq!(
-        channel
-            .three_d()
-            .validate_cross_registers()
-            .unwrap_err()
-            .reason,
-        "a descriptor pool address/range is misaligned or overflows"
-    );
 }
 
 #[test]
@@ -1148,12 +1122,12 @@ fn linked_sampler_pool_uses_the_texture_limit_and_tracks_mode_changes() {
                 channel.three_d(),
                 address_space.memory(),
                 &roles,
-                false,
                 4,
                 &mut crate::test_memory::access(address_space.memory().machine()),
             )
             .unwrap();
-        let [MaxwellThreeDResolvedResource::Buffer(pool)] = resolved.resources() else {
+        assert_eq!(resolved.resources().count(), 1);
+        let Some(MaxwellThreeDResolvedResource::Buffer(pool)) = resolved.resources().next() else {
             panic!("expected only the consumed sampler pool");
         };
         assert_eq!(pool.role(), MaxwellThreeDResourceRole::Samplers);
@@ -1192,15 +1166,14 @@ fn resource_snapshot_resolves_buffers_aliases_and_content_generations() {
     }
 
     crate::test_memory::write(&allocation, 0, &[0x5a]).unwrap();
-    let mut resolved = resolve_maxwell_three_d_resources(
+    let resolved = fixture_bindings(
         channel.three_d(),
         address_space.memory(),
         &mut crate::test_memory::access(address_space.memory().machine()),
     )
     .unwrap();
-    assert_eq!(resolved.resources().len(), 2);
-    assert_eq!(resolved.aliases().len(), 1);
-    let MaxwellThreeDResolvedResource::Buffer(vertex) = &resolved.resources()[0] else {
+    assert_eq!(resolved.resources().count(), 2);
+    let MaxwellThreeDResolvedResource::Buffer(vertex) = resolved.resources().next().unwrap() else {
         panic!("vertex stream must resolve as a buffer");
     };
     assert_eq!(vertex.role(), MaxwellThreeDResourceRole::VertexStream(0));
@@ -1209,11 +1182,6 @@ fn resource_snapshot_resolves_buffers_aliases_and_content_generations() {
         vertex.view().backing().mapping().spans()[0].allocation,
         allocation.pin().identity()
     );
-    assert!(matches!(
-        resolved.mark_image_dirty(0),
-        Err(MaxwellThreeDResourceError::NotAnImage { resource: 0 })
-    ));
-
     address_space.unmap(first.offset()).unwrap();
     assert!(matches!(
         resolved.validate_mappings(address_space.memory()),
@@ -1246,14 +1214,14 @@ fn resource_snapshot_preserves_block_linear_targets_and_tracks_dirty_images() {
         program_three_d(&mut channel, method, argument);
     }
 
-    let mut resolved = resolve_maxwell_three_d_resources(
+    let resolved = fixture_bindings(
         channel.three_d(),
         address_space.memory(),
         &mut crate::test_memory::access(address_space.memory().machine()),
     )
     .unwrap();
-    assert_eq!(resolved.resources().len(), 1);
-    let MaxwellThreeDResolvedResource::Image(image) = &resolved.resources()[0] else {
+    assert_eq!(resolved.resources().count(), 1);
+    let MaxwellThreeDResolvedResource::Image(image) = resolved.resources().next().unwrap() else {
         panic!("color target must resolve as an image");
     };
     assert_eq!(
@@ -1270,17 +1238,6 @@ fn resource_snapshot_preserves_block_linear_targets_and_tracks_dirty_images() {
             layer_stride: 0x2000,
         })
     );
-    assert!(!resolved.dirty_subresources().contains(0));
-    resolved.mark_image_dirty(0).unwrap();
-    assert!(resolved.dirty_subresources().contains(0));
-    let dirty = resolved.dirty_subresources().entries().next().unwrap();
-    assert_eq!(dirty.resource(), 0);
-    assert_eq!(dirty.subresources().plane, 0);
-    assert_eq!(dirty.subresources().mip_level, 0);
-    assert_eq!(dirty.subresources().base_layer, 0);
-    assert_eq!(dirty.subresources().layer_count, 1);
-    resolved.clear_image_dirty(0);
-    assert!(!resolved.dirty_subresources().contains(0));
 }
 
 #[test]
@@ -1307,7 +1264,7 @@ fn resource_resolution_rejects_the_complete_snapshot_atomically() {
     let state = state_channel.three_d().clone();
 
     assert!(matches!(
-        resolve_maxwell_three_d_resources(
+        fixture_bindings(
             &state,
             address_space.memory(),
             &mut crate::test_memory::access(address_space.memory().machine())
@@ -1337,7 +1294,7 @@ fn resource_resolution_rejects_the_complete_snapshot_atomically() {
         program_three_d(&mut image_channel, method, argument);
     }
     assert!(matches!(
-        resolve_maxwell_three_d_resources(
+        fixture_bindings(
             image_channel.three_d(),
             address_space.memory(),
             &mut crate::test_memory::access(address_space.memory().machine())
@@ -2209,7 +2166,7 @@ fn render_target_discard_is_a_validated_non_destructive_hint() {
     let shaders = channel.three_d().shader_state_identity();
     let resources = channel
         .three_d()
-        .resource_state_identity(&[MaxwellThreeDResourceRole::DepthStencilTarget], false);
+        .resource_state_identity(MaxwellThreeDResourceRole::DepthStencilTarget);
     for color in 0..8 {
         for depth_stencil in 0..2 {
             let raw = (color << 4) | depth_stencil;
@@ -2221,7 +2178,10 @@ fn render_target_discard_is_a_validated_non_destructive_hint() {
             assert_eq!(method.method().source().method(), GpuMethodId(0x0f78));
             assert_eq!(channel, before);
             assert!(draw.matches(channel.three_d()));
-            assert!(shaders.matches(channel.three_d()));
+            assert!(
+                shaders.matches_code(channel.three_d())
+                    && shaders.matches_bindings(channel.three_d())
+            );
             assert!(resources.matches(channel.three_d()));
         }
     }
@@ -3112,14 +3072,15 @@ fn explicit_srgb_surface_format_survives_legacy_srgb_write_state() {
                 channel.three_d().render_targets().srgb_write().source(),
                 Some(dispatch.methods()[0].method().source())
             );
-            let resources = resolve_maxwell_three_d_resources_for_roles(
+            let resources = fixture_roles(
                 channel.three_d(),
                 address_space.memory(),
                 &[MaxwellThreeDResourceRole::ColorTarget(0)],
                 &mut crate::test_memory::access(address_space.memory().machine()),
             )
             .unwrap();
-            let MaxwellThreeDResolvedResource::Image(image) = &resources.resources()[0] else {
+            let MaxwellThreeDResolvedResource::Image(image) = resources.resources().next().unwrap()
+            else {
                 panic!("expected attachment")
             };
             assert_eq!(image.description().format(), expected);
@@ -3151,29 +3112,29 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
             space.memory(),
             &[role],
             &[(role, MaxwellShaderBufferSize::Proven(0x40))],
-            false,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
         .unwrap();
-    for end in [0x40_u64, 0x80, 0x40] {
+    for (iteration, end) in [0x40_u64, 0x80, 0x40].into_iter().enumerate() {
         let resolved = cache
             .resolve_with_buffer_sizes(
                 channel.three_d(),
                 space.memory(),
                 &[role],
                 &[(role, MaxwellShaderBufferSize::Proven(end))],
-                false,
                 8,
                 &mut crate::test_memory::access(space.memory().machine()),
             )
             .unwrap();
-        let [MaxwellThreeDResolvedResource::Buffer(buffer)] = resolved.resources() else {
+        assert_eq!(resolved.resources().count(), 1);
+        let Some(MaxwellThreeDResolvedResource::Buffer(buffer)) = resolved.resources().next()
+        else {
             panic!("expected one constant buffer")
         };
         assert_eq!(buffer.view().size(), end);
-        if end == 0x40 {
-            assert!(std::sync::Arc::ptr_eq(&first, &resolved));
+        if iteration == 0 {
+            assert!(first.same_bindings(&resolved));
         }
     }
     assert!(
@@ -3183,7 +3144,6 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
                 space.memory(),
                 &[role],
                 &[(role, MaxwellShaderBufferSize::Declared)],
-                false,
                 8,
                 &mut crate::test_memory::access(space.memory().machine())
             )
@@ -3197,7 +3157,6 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
                 space.memory(),
                 &[role],
                 &[(role, MaxwellShaderBufferSize::Proven(0x1004))],
-                false,
                 8,
                 &mut crate::test_memory::access(space.memory().machine())
             )
@@ -3210,7 +3169,6 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
                 channel.three_d(),
                 space.memory(),
                 &[role],
-                false,
                 8,
                 &mut crate::test_memory::access(space.memory().machine())
             )
@@ -3257,7 +3215,6 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             space.memory(),
             &[role],
             &sizes,
-            false,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
@@ -3268,19 +3225,45 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             space.memory(),
             &[role],
             &sizes,
-            false,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
         .unwrap();
-    assert!(std::sync::Arc::ptr_eq(&first, &repeated));
+    assert!(first.same_bindings(&repeated));
     let buffer = |resources: &MaxwellThreeDResolvedResources| {
-        let [MaxwellThreeDResolvedResource::Buffer(buffer)] = resources.resources() else {
+        assert_eq!(resources.resources().count(), 1);
+        let Some(MaxwellThreeDResolvedResource::Buffer(buffer)) = resources.resources().next()
+        else {
             panic!("expected one storage buffer")
         };
         (buffer.source().offset().get(), buffer.view().size())
     };
     assert_eq!(buffer(&first), (data_mapping.offset().get(), 128));
+    // A different word on the descriptor page invalidates its observation,
+    // but equal descriptor bytes must retain the already prepared bindings.
+    crate::test_memory::write(&cb, 0x800, &[7]).unwrap();
+    let refreshed = cache
+        .resolve_with_buffer_sizes(
+            channel.three_d(),
+            space.memory(),
+            &[role],
+            &sizes,
+            8,
+            &mut crate::test_memory::access(space.memory().machine()),
+        )
+        .unwrap();
+    assert!(first.same_bindings(&refreshed));
+    let clean = cache
+        .resolve_with_buffer_sizes(
+            channel.three_d(),
+            space.memory(),
+            &[role],
+            &sizes,
+            8,
+            &mut |_, _| panic!("clean descriptors must not be read again"),
+        )
+        .unwrap();
+    assert!(first.same_bindings(&clean));
     crate::test_memory::write(
         &cb,
         0x110,
@@ -3293,7 +3276,6 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             space.memory(),
             &[role],
             &sizes,
-            false,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
@@ -3307,7 +3289,6 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             space.memory(),
             &[role],
             &sizes,
-            false,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
@@ -3319,7 +3300,6 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             space.memory(),
             &[role],
             &[(role, MaxwellShaderBufferSize::Proven(4))],
-            false,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
@@ -3333,7 +3313,6 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
                 space.memory(),
                 &[role],
                 &sizes,
-                false,
                 8,
                 &mut crate::test_memory::access(space.memory().machine())
             )
@@ -3345,7 +3324,6 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             space.memory(),
             &[role],
             &[(role, MaxwellShaderBufferSize::Proven(4))],
-            false,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
@@ -3383,12 +3361,11 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             space.memory(),
             &[role],
             &[(role, MaxwellShaderBufferSize::Proven(4))],
-            false,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
         .unwrap();
-    assert!(!std::sync::Arc::ptr_eq(&before_remap, &remapped_bounded));
+    assert!(!before_remap.same_bindings(&remapped_bounded));
     assert_eq!(
         buffer(&remapped_bounded),
         (data_mapping.offset().get() + 128, 4)
@@ -3399,7 +3376,6 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             space.memory(),
             &[role],
             &sizes,
-            false,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )

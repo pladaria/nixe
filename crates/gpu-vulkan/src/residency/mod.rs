@@ -14,7 +14,6 @@ mod decoded_texture;
 pub(crate) mod execution;
 mod format;
 mod image;
-mod ownership;
 pub(crate) mod presentation;
 #[cfg(feature = "binding-probe")]
 pub(crate) mod probe_commands;
@@ -37,12 +36,12 @@ use crate::{
     },
 };
 use ash::vk;
+use nixe_gpu::BackendInstanceId;
 use nixe_gpu::authority::Authority;
 use nixe_gpu::authority::{ResourceObservation, WriterId};
 use nixe_gpu::physical::{Footprint, PhysicalMapping};
-use nixe_gpu::{BackendInstanceId, PresentationImageId, PresentationLease, PresentationRelease};
-use nixe_memory::{Machine, Observation};
-use std::sync::{Arc, mpsc};
+use nixe_memory::Machine;
+use std::sync::Arc;
 
 macro_rules! cache_id {
     ($name:ident) => {
@@ -80,23 +79,48 @@ struct LruLinks {
 struct Contents {
     lru: Option<LruLinks>,
     geometry: Vec<Arc<Footprint>>,
-    cpu: Vec<Observation>,
     device: Vec<ResourceObservation>,
-    invalid: Vec<(u64, u64)>,
     last_use: Option<WorkTicket>,
     touched: u64,
 }
 impl Contents {
-    fn current(&self) -> bool {
-        self.invalid.is_empty() && self.observations_current()
-    }
     fn observations_current(&self) -> bool {
-        self.cpu.iter().all(|observation| !observation.is_invalid())
-            && self
-                .device
-                .iter()
-                .all(|observation| !observation.is_invalid())
+        self.device
+            .iter()
+            .all(|observation| !observation.is_invalid())
     }
+}
+/// A recorder consumes a bounded prefix; the execution owner retains the rest
+/// under its original admission permit and continues after staging pressure.
+#[must_use]
+#[derive(Clone, Copy, Debug)]
+pub struct BufferUpload {
+    pub work: WorkTicket,
+    pub consumed: usize,
+}
+struct KnownBufferBytes {
+    offset: u64,
+    bytes: Arc<[u8]>,
+    /// A completion effect needs no physical transfer until a GPU access.
+    pending_upload: bool,
+}
+struct BufferEntry {
+    invalid: Vec<(u64, u64)>,
+    /// Immutable host-authored payload, valid until another native producer.
+    /// CPU publication still waits for the actual producing ticket, including
+    /// when the physical buffer has never been consumed by the GPU.
+    known: Vec<KnownBufferBytes>,
+    growth: u32,
+    binding_valid: bool,
+    write_plans: Vec<(u64, u64, WriterId)>,
+    contents: Contents,
+    native: Arc<AllocatedBuffer>,
+    usage: vk::BufferUsageFlags,
+    #[cfg(feature = "binding-probe")]
+    address: vk::DeviceAddress,
+    access: sync::BufferAccess,
+}
+impl BufferEntry {
     fn validate_interval(&mut self, start: u64, size: u64) {
         self.validate_intervals(&[(start, size)]);
     }
@@ -134,53 +158,43 @@ impl Contents {
         self.invalid = invalid;
     }
 }
-/// A recorder consumes a bounded prefix; the execution owner retains the rest
-/// under its original admission permit and continues after staging pressure.
-#[must_use]
-#[derive(Clone, Copy, Debug)]
-pub struct BufferUpload {
-    pub work: WorkTicket,
-    pub consumed: usize,
-}
-struct KnownBufferBytes {
-    offset: u64,
-    bytes: Arc<[u8]>,
-    /// A completion effect needs no physical transfer until a GPU access.
-    pending_upload: bool,
-}
-struct BufferEntry {
-    /// Immutable host-authored payload, valid until another native producer.
-    /// CPU publication still waits for the actual producing ticket, including
-    /// when the physical buffer has never been consumed by the GPU.
-    known: Vec<KnownBufferBytes>,
-    growth: u32,
-    binding_valid: bool,
-    write_plans: Vec<(u64, u64, WriterId)>,
-    contents: Contents,
-    native: Arc<AllocatedBuffer>,
-    usage: vk::BufferUsageFlags,
-    #[cfg(feature = "binding-probe")]
-    address: vk::DeviceAddress,
-    access: sync::BufferAccess,
-}
 pub(crate) struct ImageEntry {
+    synchronized: bool,
+    synchronized_sequence: u64,
+    cpu_tracked: bool,
+    pub(crate) guest: Option<nixe_gpu::native::GuestImage>,
+    binding_valid: bool,
     contents: Contents,
     native: Arc<AllocatedImage>,
     pub(crate) description: NativeImageDescription,
-    pub(crate) planes: Vec<ImagePlane>,
+    pub(crate) planes: Arc<[ImagePlane]>,
     sample_grid: [u32; 2],
     views: Vec<ImageViewDescription>,
     native_views: Vec<Arc<crate::AllocatedImageView>>,
     access: Vec<sync::ImageAccess>,
     version: u64,
     producer: Option<WorkTicket>,
-    leases: usize,
     discarded: Vec<(usize, vk::Rect2D)>,
     decoded: Option<decoded_texture::DecodedImage>,
     canonical_import: bool,
-    write_plans: Vec<(ImagePlane, vk::Rect2D, WriterId)>,
+    write_plans: rustc_hash::FxHashMap<(usize, nixe_gpu::physical::ByteRect), WriterId>,
 }
 impl ImageEntry {
+    fn current(&self) -> bool {
+        self.synchronized
+            && self
+                .contents
+                .device
+                .iter()
+                .all(|observer| !observer.is_invalid())
+    }
+    pub(crate) fn view_format(&self, requested: vk::Format) -> vk::Format {
+        if self.decoded.is_some() {
+            self.description.format
+        } else {
+            requested
+        }
+    }
     fn storage_plane(&self, mut plane: ImagePlane) -> ImagePlane {
         plane.extent.width *= self.sample_grid[0];
         plane.extent.height *= self.sample_grid[1];
@@ -246,11 +260,17 @@ pub struct ResidencyStatistics {
     pub cpu_uploaded_bytes: u64,
     pub cpu_streamed_bytes: u64,
     pub gpu_copied_bytes: u64,
+    pub alias_copy_commands: u64,
+    pub alias_copy_regions: u64,
+    pub decoded_upload_commands: u64,
     /// Exact bytes transferred to host memory, excluding GPU-only realignment.
     pub native_readback_bytes: u64,
     pub canonical_readback_bytes: u64,
     pub cache_hits: u64,
     pub buffer_allocations: u64,
+    pub image_allocations: u64,
+    pub image_layout_plans: u64,
+    pub image_view_allocations: u64,
     pub buffer_merges: u64,
     pub staging_pressure_waits: u64,
     pub evictions: u64,
@@ -270,11 +290,11 @@ pub struct VulkanResidency {
     collection_target: u64,
     maintenance_at: std::time::Instant,
     images: Vec<Slot<ImageEntry>>,
+    free_images: Vec<usize>,
     attachments: Vec<Slot<attachment::AttachmentEntry>>,
+    free_attachments: Vec<usize>,
     memory: Machine,
     authority: Authority<Resource>,
-    releases: mpsc::Receiver<PresentationRelease>,
-    release_sender: mpsc::Sender<PresentationRelease>,
     budget: AllocationBudget,
     statistics: ResidencyStatistics,
     image_readbacks: readback::ImageReadbacks,
@@ -283,6 +303,7 @@ pub struct VulkanResidency {
     buffer_downloads: std::collections::VecDeque<buffer_download::Download>,
     barriers: sync::Barriers,
     decoder: nixe_gpu::texture_decode::BlockDecoder,
+    pub(crate) video: video::VideoTransfers,
     sample_conversion: Option<sample_readback::SampleConversion>,
     #[cfg(feature = "binding-probe")]
     helpers: crate::helpers::Helpers,
@@ -305,7 +326,7 @@ impl VulkanResidency {
         &mut self,
         ranges: Vec<nixe_memory::AllocationRange>,
     ) -> Result<(), VulkanError> {
-        self.invalidate_cpu_buffers(&ranges)?;
+        self.invalidate_cpu_resources(&ranges)?;
         if !ranges.is_empty() {
             self.authority.cpu_write(&ranges)?;
             self.authority
@@ -313,12 +334,13 @@ impl VulkanResidency {
         }
         Ok(())
     }
-    fn invalidate_cpu_buffers(
+    fn invalidate_cpu_resources(
         &mut self,
         ranges: &[nixe_memory::AllocationRange],
     ) -> Result<(), VulkanError> {
         let modified = self.memory.take_cpu_modified_pages();
         let buffers = &mut self.buffers;
+        let images = &mut self.images;
         let mut failure = None;
         let mut touched = smallvec::SmallVec::<[usize; 16]>::new();
         for extent in modified.into_iter().chain(
@@ -328,11 +350,24 @@ impl VulkanResidency {
         ) {
             self.authority
                 .visit_resource_overlaps(extent, |resource, footprint, span| {
-                    let Resource::Buffer(id) = resource else {
+                    if let Resource::Image(id) = resource {
+                        let entry = images[id.slot].entry.as_mut().expect("registered image");
+                        if let Err(error) =
+                            footprint.visit(span, extent.start, extent.bytes, |_| {
+                                entry.synchronized = false;
+                                entry.cpu_tracked = false;
+                                false
+                            })
+                        {
+                            failure = Some(error);
+                        }
                         return;
+                    }
+                    let Resource::Buffer(id) = resource else {
+                        unreachable!()
                     };
                     let entry = buffers[id.slot].entry.as_mut().expect("registered buffer");
-                    if entry.contents.invalid.as_slice() == [(0, entry.native.size())] {
+                    if entry.invalid.as_slice() == [(0, entry.native.size())] {
                         return;
                     }
                     touched.push(id.slot);
@@ -342,15 +377,15 @@ impl VulkanResidency {
                     ) {
                         if let Err(error) =
                             footprint.visit(span, extent.start, extent.bytes, |part| {
-                                entry.contents.invalid.push((part.native, part.bytes));
+                                entry.invalid.push((part.native, part.bytes));
                                 true
                             })
                         {
                             failure = Some(error);
                         }
                     } else {
-                        entry.contents.invalid.clear();
-                        entry.contents.invalid.push((0, entry.native.size()));
+                        entry.invalid.clear();
+                        entry.invalid.push((0, entry.native.size()));
                     }
                 });
         }
@@ -360,7 +395,7 @@ impl VulkanResidency {
         touched.sort_unstable();
         touched.dedup();
         for slot in touched {
-            normalize(&mut buffers[slot].entry.as_mut().unwrap().contents.invalid);
+            normalize(&mut buffers[slot].entry.as_mut().unwrap().invalid);
         }
         Ok(())
     }
@@ -377,7 +412,6 @@ impl VulkanResidency {
                 &device.owner.device,
             )
         });
-        let (release_sender, releases) = mpsc::channel();
         let mut cache = Self {
             device,
             instance,
@@ -391,11 +425,11 @@ impl VulkanResidency {
             collection_target: bytes / 8 * 7,
             maintenance_at: std::time::Instant::now(),
             images: Vec::new(),
+            free_images: Vec::new(),
             attachments: Vec::new(),
+            free_attachments: Vec::new(),
             authority: Authority::new(memory.identity()),
             memory,
-            releases,
-            release_sender,
             budget: AllocationBudget::new(bytes),
             statistics: ResidencyStatistics::default(),
             image_readbacks: readback::ImageReadbacks::default(),
@@ -404,6 +438,7 @@ impl VulkanResidency {
             buffer_downloads: Default::default(),
             barriers: sync::Barriers::default(),
             decoder: Default::default(),
+            video: Default::default(),
             sample_conversion: None,
             #[cfg(feature = "binding-probe")]
             helpers: crate::helpers::Helpers::default(),
@@ -469,6 +504,9 @@ impl VulkanResidency {
             }
         }
     }
+    fn buffer_mut(&mut self, id: BufferId) -> &mut BufferEntry {
+        self.buffers[id.slot].entry.as_mut().expect("live buffer")
+    }
     fn buffer(&self, id: BufferId) -> Result<&BufferEntry, VulkanError> {
         self.buffers
             .get(id.slot)
@@ -487,25 +525,7 @@ impl VulkanResidency {
                 "stale or foreign image cache ID",
             ))
     }
-    fn drain_notifications(&mut self) {
-        while let Ok(release) = self.releases.try_recv() {
-            if release.producer.instance() != self.instance {
-                continue;
-            }
-            if let Some(slot) = self.images.get_mut(release.image.slot as usize)
-                && slot.generation == release.image.generation
-                && let Some(entry) = &mut slot.entry
-                && entry.version == release.content_version
-            {
-                entry.leases = entry
-                    .leases
-                    .checked_sub(1)
-                    .expect("one release per presentation lease");
-            }
-        }
-    }
     fn reserve(&mut self, bytes: u64) -> Result<Option<AllocationCharge>, VulkanError> {
-        self.drain_notifications();
         if let Some(charge) = self.budget.reserve(bytes) {
             return Ok(Some(charge));
         }
@@ -524,6 +544,9 @@ impl VulkanResidency {
             .checked_add(bytes)
             .is_none_or(|used| used > self.budget.limit)
         {
+            if self.video.evict_idle(self.device.completed_tick()) {
+                continue;
+            }
             if !self.evict_one()? {
                 self.flush()?;
                 let completed = self.device.completed_tick();
@@ -571,6 +594,9 @@ impl VulkanResidency {
             }
             Resource::Image(id) => {
                 let entry = self.images[id.slot].entry.take().expect("candidate");
+                if self.images[id.slot].generation < u32::MAX {
+                    self.free_images.push(id.slot);
+                }
                 if let Some(last_use) = entry.contents.last_use {
                     self.device
                         .retire_image_views(entry.native_views, last_use)?;
@@ -601,21 +627,19 @@ impl VulkanResidency {
             if self.authority.mapping(resource, 0).is_none() {
                 self.retire_entry(resource)?;
             } else {
-                let invalid = match resource {
-                    Resource::Buffer(id) => vec![(0, self.buffer(id)?.native.size())],
-                    Resource::Image(id) => self
-                        .image(id)?
-                        .planes
-                        .iter()
-                        .map(|p| (p.offset, p.end().expect("image plane") - p.offset))
-                        .collect(),
-                };
-                if let Resource::Buffer(id) = resource {
-                    self.buffers[id.slot].entry.as_mut().unwrap().binding_valid = false;
+                match resource {
+                    Resource::Buffer(id) => {
+                        let entry = self.buffers[id.slot].entry.as_mut().unwrap();
+                        entry.binding_valid = false;
+                        entry.invalid = vec![(0, entry.native.size())];
+                    }
+                    Resource::Image(id) => {
+                        let entry = self.images[id.slot].entry.as_mut().unwrap();
+                        entry.binding_valid = false;
+                        entry.synchronized = false;
+                        entry.cpu_tracked = false;
+                    }
                 }
-                let contents = self.contents_mut(resource);
-                contents.invalid = invalid;
-                contents.cpu.clear();
             }
         }
         Ok(())
@@ -827,7 +851,7 @@ impl VulkanResidency {
         self.track_buffer_cpu(id, offset, bytes)?;
         let work = self.device.work_ticket()?;
         let entry = self.buffers[id.slot].entry.as_mut().expect("buffer");
-        entry.contents.validate_interval(offset, bytes);
+        entry.validate_interval(offset, bytes);
         entry.contents.last_use = Some(work);
         self.buffer_writes
             .entry(id)
@@ -943,15 +967,6 @@ impl VulkanResidency {
             }
         };
         Ok(work)
-    }
-    /// Explicit preservation for allocation pressure, distinct from automatic
-    /// eviction of reconstructible entries. Only this resource's canonical
-    /// pages are published; native downloads still cover exact producer bytes.
-    pub fn preserve_buffer(&mut self, id: BufferId) -> Result<(), VulkanError> {
-        self.preserve(Resource::Buffer(id))
-    }
-    pub fn preserve_image(&mut self, id: ImageId) -> Result<(), VulkanError> {
-        self.preserve(Resource::Image(id))
     }
     fn preserve(&mut self, resource: Resource) -> Result<(), VulkanError> {
         let geometry = self.contents(resource)?.geometry.clone();

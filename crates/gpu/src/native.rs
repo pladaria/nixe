@@ -33,11 +33,13 @@ pub struct GuestImage {
 }
 impl GuestImage {
     pub fn same_view(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.planes, &other.planes)
-            && self.description == other.description
-            && self.swizzle == other.swizzle
+        self.same_storage(other) && self.swizzle == other.swizzle
+    }
+    pub fn same_storage(&self, other: &Self) -> bool {
+        self.description == other.description
             && self.sample_grid == other.sample_grid
             && self.canonical_texels == other.canonical_texels
+            && self.planes == other.planes
     }
 }
 #[derive(Clone, Debug)]
@@ -83,12 +85,80 @@ pub enum GuestIndexBuffer {
 pub struct GuestDrawState {
     pub identity: PreparedStateId,
     pub program: Arc<GuestProgram>,
-    pub vertices: Box<[GuestVertexBuffer]>,
+    pub vertices: Arc<[GuestVertexBuffer]>,
     pub index: Option<GuestIndexBuffer>,
-    pub colors: Box<[GuestImage]>,
+    pub colors: Arc<[GuestImage]>,
     pub depth_stencil: Option<GuestImage>,
     pub parameters: Arc<GuestDrawParameters>,
 }
+impl PartialEq for GuestDrawState {
+    fn eq(&self, other: &Self) -> bool {
+        let (a, b) = (self, other);
+        a.parameters.identity == b.parameters.identity
+            && a.program.identity == b.program.identity
+            && a.vertices.len() == b.vertices.len()
+            && a.vertices
+                .iter()
+                .zip(b.vertices.iter())
+                .all(|(a, b)| a.binding == b.binding && a.backing == b.backing)
+            && match (&a.index, &b.index) {
+                (None, None) => true,
+                (
+                    Some(GuestIndexBuffer::Canonical(a, at)),
+                    Some(GuestIndexBuffer::Canonical(b, bt)),
+                ) => at == bt && a == b,
+                (Some(GuestIndexBuffer::Inline(a)), Some(GuestIndexBuffer::Inline(b))) => {
+                    Arc::ptr_eq(a, b)
+                }
+                _ => false,
+            }
+            && a.colors.len() == b.colors.len()
+            && a.colors
+                .iter()
+                .zip(b.colors.iter())
+                .all(|(a, b)| a.same_view(b))
+            && match (&a.depth_stencil, &b.depth_stencil) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.same_view(b),
+                _ => false,
+            }
+    }
+}
+impl Eq for GuestDrawState {}
+impl Hash for GuestDrawState {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let a = self;
+        a.parameters.identity.hash(state);
+        a.program.identity.hash(state);
+        a.vertices.len().hash(state);
+        for vertex in a.vertices.iter() {
+            vertex.binding.hash(state);
+            vertex.backing.hash(state);
+        }
+        match &a.index {
+            None => 0_u8.hash(state),
+            Some(GuestIndexBuffer::Canonical(backing, kind)) => {
+                1_u8.hash(state);
+                backing.hash(state);
+                kind.hash(state);
+            }
+            Some(GuestIndexBuffer::Inline(bytes)) => {
+                2_u8.hash(state);
+                (Arc::as_ptr(bytes) as *const u8).hash(state);
+            }
+        }
+        a.colors.len().hash(state);
+        for image in a.colors.iter().chain(&a.depth_stencil) {
+            image.planes.hash(state);
+            image.description.hash(state);
+            image.swizzle.hash(state);
+            image.sample_grid.hash(state);
+            image.canonical_texels.hash(state);
+        }
+        a.depth_stencil.is_some().hash(state);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct GuestShaderState {
     pub base_instance: u32,
@@ -353,7 +423,7 @@ impl NativeCommand {
             }
             Self::Draw { state, .. } => {
                 program(&state.program, inputs)?;
-                for vertex in &state.vertices {
+                for vertex in state.vertices.iter() {
                     buffer(&vertex.backing, inputs)?;
                 }
                 if let Some(GuestIndexBuffer::Canonical(input, _)) = &state.index {
@@ -399,7 +469,7 @@ pub enum GuestImageAspect {
     Depth,
     Stencil,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct GuestImagePlane {
     pub mip_level: u32,
     pub array_layer: u32,

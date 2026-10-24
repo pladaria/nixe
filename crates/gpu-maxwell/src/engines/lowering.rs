@@ -16,17 +16,13 @@ use std::{
 
 #[derive(Clone, Debug)]
 struct DrawAttachmentSelection {
-    colors: Vec<(u8, usize)>,
+    colors: Vec<(u8, MaxwellThreeDResourceRole)>,
     color_outputs: [nixe_gpu::ColorOutputState; 8],
-    depth_stencil: Option<usize>,
+    depth_stencil: Option<MaxwellThreeDResourceRole>,
 }
 
 impl DrawAttachmentSelection {
-    fn attachment_indices(&self) -> Vec<usize> {
-        self.attachment_indices_iter().collect()
-    }
-
-    fn attachment_indices_iter(&self) -> impl Iterator<Item = usize> + '_ {
+    fn attachment_indices_iter(&self) -> impl Iterator<Item = MaxwellThreeDResourceRole> + '_ {
         self.colors
             .iter()
             .map(|(_, index)| *index)
@@ -373,7 +369,7 @@ fn select_draw_attachments(
                 });
             }
         }
-        let index = resource_index(resources, MaxwellThreeDResourceRole::ColorTarget(target))?;
+        let index = MaxwellThreeDResourceRole::ColorTarget(target);
         let image = resolved_image(resources, index)?;
         if image.description().kind() != nixe_gpu::ImageKind::Color {
             return Err(MaxwellLoweringError::ResolvedResourceKindMismatch);
@@ -381,12 +377,8 @@ fn select_draw_attachments(
         colors.push((target, index));
     }
     let depth_stencil = draw_depth_stencil_attachment_required(state)
-        .then(|| {
-            resources.resources().iter().position(|resource| {
-                resource.role() == MaxwellThreeDResourceRole::DepthStencilTarget
-            })
-        })
-        .flatten();
+        .then_some(MaxwellThreeDResourceRole::DepthStencilTarget)
+        .filter(|role| resources.resource(*role).is_some());
     if let Some(index) = depth_stencil {
         let image = resolved_image(resources, index)?;
         if image.description().kind() != nixe_gpu::ImageKind::DepthStencil {
@@ -594,7 +586,7 @@ fn draw_scissor(
     attachments: &DrawAttachmentSelection,
 ) -> Result<nixe_gpu::ScissorRect, MaxwellLoweringError> {
     let (mut width, mut height) = (u32::MAX, u32::MAX);
-    for index in attachments.attachment_indices() {
+    for index in attachments.attachment_indices_iter() {
         let extent = resolved_image(resources, index)?.description().extent();
         width = width.min(extent.width);
         height = height.min(extent.height);
@@ -1182,22 +1174,14 @@ fn neutral_vertex_format(
     Ok(vertex)
 }
 
-fn resource_index(
-    resources: &MaxwellThreeDResolvedResources,
-    role: MaxwellThreeDResourceRole,
-) -> Result<usize, MaxwellLoweringError> {
-    resources
-        .resources()
-        .iter()
-        .position(|resource| resource.role() == role)
-        .ok_or(MaxwellLoweringError::MissingResolvedResource { role })
-}
-
 fn resolved_buffer(
     resources: &MaxwellThreeDResolvedResources,
-    index: usize,
+    index: MaxwellThreeDResourceRole,
 ) -> Result<&super::threed::MaxwellThreeDResolvedBuffer, MaxwellLoweringError> {
-    match &resources.resources()[index] {
+    match resources
+        .resource(index)
+        .ok_or(MaxwellLoweringError::MissingResolvedResource { role: index })?
+    {
         MaxwellThreeDResolvedResource::Buffer(value) => Ok(value),
         _ => Err(MaxwellLoweringError::ResolvedResourceKindMismatch),
     }
@@ -1205,9 +1189,12 @@ fn resolved_buffer(
 
 fn resolved_image(
     resources: &MaxwellThreeDResolvedResources,
-    index: usize,
+    index: MaxwellThreeDResourceRole,
 ) -> Result<&super::threed::MaxwellThreeDResolvedImage, MaxwellLoweringError> {
-    match &resources.resources()[index] {
+    match resources
+        .resource(index)
+        .ok_or(MaxwellLoweringError::MissingResolvedResource { role: index })?
+    {
         MaxwellThreeDResolvedResource::Image(value) => Ok(value),
         _ => Err(MaxwellLoweringError::ResolvedResourceKindMismatch),
     }

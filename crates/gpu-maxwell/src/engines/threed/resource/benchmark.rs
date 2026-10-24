@@ -37,8 +37,7 @@ fn descriptor_lookup_throughput() {
     let mut cache = MaxwellThreeDRetainedBackingCache::default();
     cache.set_view_limit(4096);
     let mut memory_access = crate::test_memory::access(space.memory().machine());
-    let mut builder =
-        ResourceBuilder::new(space.memory(), None, Some(&mut cache), &mut memory_access);
+    let mut builder = ResourceBuilder::new(space.memory(), None, &mut cache, &mut memory_access);
     let address = mapping.offset().get();
     builder
         .buffer(
@@ -83,4 +82,205 @@ fn descriptor_lookup_throughput() {
     println!(
         "{{\"workload\":\"unchanged_descriptor_consumer\",\"iterations\":{iterations},\"seconds\":{seconds},\"cpu_nanoseconds\":{cpu_nanoseconds},\"allocations\":{allocations}}}"
     );
+}
+
+#[test]
+#[ignore = "opt-in retained binding cold/warm allocation measurement"]
+fn retained_bindings_throughput() {
+    use crate::engines::tests::{program_three_d, three_d_channel};
+    let (_allocation, space, address) = crate::shader::test_support::mapped_memory();
+    let mut channel = three_d_channel();
+    for (method, value) in [
+        (0x2380, 64),
+        (0x2384, (address >> 32) as u32),
+        (0x2388, address as u32),
+        (0x2410, 1),
+    ] {
+        program_three_d(&mut channel, method, value);
+    }
+    let roles = [MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 }];
+    let mut access = crate::test_memory::access(space.memory().machine());
+    for cold in [true, false] {
+        let iterations = if cold { 1000 } else { 100000 };
+        let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
+        let first = cache
+            .resolve(channel.three_d(), space.memory(), &roles, 4096, &mut access)
+            .unwrap();
+        ALLOCATIONS.with(|n| n.set(Some(0)));
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            if cold {
+                cache = MaxwellThreeDResolvedResourceCache::new(1);
+            }
+            let bindings = cache
+                .resolve(channel.three_d(), space.memory(), &roles, 4096, &mut access)
+                .unwrap();
+            if !cold {
+                assert!(first.same_bindings(&bindings));
+            }
+            std::hint::black_box(bindings);
+        }
+        let elapsed = start.elapsed();
+        let allocations = ALLOCATIONS.with(|n| n.replace(None).unwrap());
+        if !cold {
+            assert_eq!(allocations, 0);
+        }
+        println!(
+            "retained bindings: cold={cold}, iterations={iterations}, elapsed={elapsed:?}, allocations={allocations}"
+        );
+    }
+}
+
+#[test]
+fn unused_slots_and_inactive_groups_do_not_allocate_or_rebuild() {
+    use crate::engines::tests::{program_three_d, three_d_channel};
+    let (_allocation, space, address) = crate::shader::test_support::mapped_memory();
+    let mut channel = three_d_channel();
+    for (method, value) in [
+        (0x2380, 64),
+        (0x2384, (address >> 32) as u32),
+        (0x2388, address as u32),
+        (0x2410, 1),
+    ] {
+        program_three_d(&mut channel, method, value);
+    }
+    let roles = [MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 }];
+    let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
+    let mut access = crate::test_memory::access(space.memory().machine());
+    let first = cache
+        .resolve(channel.three_d(), space.memory(), &roles, 4096, &mut access)
+        .unwrap();
+    ALLOCATIONS.with(|n| n.set(Some(0)));
+    let repeated = cache
+        .resolve(channel.three_d(), space.memory(), &roles, 4096, &mut access)
+        .unwrap();
+    let warm = ALLOCATIONS.with(|n| n.replace(None).unwrap());
+    assert!(first.same_bindings(&repeated));
+    program_three_d(&mut channel, 0x2410, 17);
+    ALLOCATIONS.with(|n| n.set(Some(0)));
+    let unused = cache
+        .resolve(channel.three_d(), space.memory(), &roles, 4096, &mut access)
+        .unwrap();
+    let unused_count = ALLOCATIONS.with(|n| n.replace(None).unwrap());
+    assert_eq!(
+        first.resource(roles[0]).unwrap().source(),
+        unused.resource(roles[0]).unwrap().source()
+    );
+    cache
+        .resolve(channel.three_d(), space.memory(), &[], 4096, &mut access)
+        .unwrap();
+    ALLOCATIONS.with(|n| n.set(Some(0)));
+    let after = cache
+        .resolve(channel.three_d(), space.memory(), &roles, 4096, &mut access)
+        .unwrap();
+    let after_count = ALLOCATIONS.with(|n| n.replace(None).unwrap());
+    assert_eq!((warm, unused_count, after_count), (0, 0, 0));
+    assert!(first.same_bindings(&unused));
+    assert!(unused.same_bindings(&after));
+    println!(
+        "AUDIT warm={warm}; unused_slot_rebind={unused_count} same_result={}; after_nonconsuming_operation={after_count} same_result={}",
+        first.same_bindings(&unused),
+        unused.same_bindings(&after)
+    );
+}
+
+#[test]
+fn changed_binding_preserves_other_slots_and_cache_pressure_preserves_selected_work() {
+    use crate::engines::tests::{program_three_d, three_d_channel};
+    let (_allocation, space, address) = crate::shader::test_support::mapped_memory();
+    let mut channel = three_d_channel();
+    for (method, value) in [
+        (0x2380, 64),
+        (0x2384, (address >> 32) as u32),
+        (0x2388, address as u32),
+        (0x2410, 1),
+        (0x2410, 17),
+    ] {
+        program_three_d(&mut channel, method, value);
+    }
+    let roles = [
+        MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 },
+        MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 1 },
+    ];
+    let mut cache = MaxwellThreeDResolvedResourceCache::new(1);
+    let mut access = crate::test_memory::access(space.memory().machine());
+    let first = cache
+        .resolve(channel.three_d(), space.memory(), &roles, 4096, &mut access)
+        .unwrap();
+    program_three_d(&mut channel, 0x2388, address as u32 + 64);
+    program_three_d(&mut channel, 0x2410, 17);
+    let changed = cache
+        .resolve(channel.three_d(), space.memory(), &roles, 4096, &mut access)
+        .unwrap();
+    assert!(first.same_resource(&changed, roles[0]));
+    assert!(!first.same_resource(&changed, roles[1]));
+    assert_eq!(
+        changed.resource(roles[1]).unwrap().source().offset().get(),
+        address + 64
+    );
+    // A failed second slot must not leave the first slot's old selection live.
+    program_three_d(&mut channel, 0x2388, address as u32 + 128);
+    program_three_d(&mut channel, 0x2410, 1);
+    program_three_d(&mut channel, 0x2388, address as u32 + 0x2000);
+    program_three_d(&mut channel, 0x2410, 17);
+    assert!(
+        cache
+            .resolve(channel.three_d(), space.memory(), &roles, 4096, &mut access)
+            .is_err()
+    );
+    program_three_d(&mut channel, 0x2388, address as u32 + 256);
+    program_three_d(&mut channel, 0x2410, 17);
+    let changed = cache
+        .resolve(channel.three_d(), space.memory(), &roles, 4096, &mut access)
+        .unwrap();
+    assert_eq!(
+        changed.resource(roles[0]).unwrap().source().offset().get(),
+        address + 128
+    );
+    assert_eq!(
+        changed.resource(roles[1]).unwrap().source().offset().get(),
+        address + 256
+    );
+    for budget in [1, 1024 * 1024] {
+        cache.bindings = nixe_gpu::WorkingSet::new(1, budget);
+        for _ in 0..2 {
+            let pressured = cache
+                .resolve(channel.three_d(), space.memory(), &roles, 4096, &mut access)
+                .unwrap();
+            for role in roles {
+                assert_eq!(
+                    changed.resource(role).unwrap().source(),
+                    pressured.resource(role).unwrap().source()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn paired_texture_identity_tracks_only_both_consumed_constant_slots() {
+    use crate::engines::tests::{program_three_d, three_d_channel};
+    let (_allocation, _space, address) = crate::shader::test_support::mapped_memory();
+    let mut channel = three_d_channel();
+    for (method, value) in [
+        (0x2380, 64),
+        (0x2384, (address >> 32) as u32),
+        (0x2388, address as u32),
+        (0x2410, 17),
+        (0x2410, 49),
+    ] {
+        program_three_d(&mut channel, method, value);
+    }
+    let texture =
+        MaxwellThreeDTextureReference::expression(0, (1, 0, 0), Some((3, 4, 20))).unwrap();
+    let role = MaxwellThreeDResourceRole::Sampler(texture);
+    let original = channel.three_d().resource_state_identity(role);
+    program_three_d(&mut channel, 0x2388, address as u32 + 64);
+    program_three_d(&mut channel, 0x2410, 33);
+    assert!(original.matches(channel.three_d()));
+    program_three_d(&mut channel, 0x2410, 49);
+    assert!(!original.matches(channel.three_d()));
+    let changed = channel.three_d().resource_state_identity(role);
+    program_three_d(&mut channel, 0x2410, 17);
+    assert!(!changed.matches(channel.three_d()));
 }

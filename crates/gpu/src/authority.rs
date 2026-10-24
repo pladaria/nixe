@@ -542,6 +542,12 @@ impl<R: Copy + Eq + Hash> Authority<R> {
     /// Compact actual coverage in version order. Disjoint surviving domains
     /// pay for the next compaction only after their population doubles.
     fn normalize(&mut self, resource: R) -> Result<(), MemoryError> {
+        let _trace = crate::trace::span(
+            "authority_compact",
+            self.resources[&resource].live_writers as u64,
+            0,
+            0,
+        );
         let mut candidates = FxHashSet::default();
         for footprint in &self.resources[&resource].footprints {
             candidates.extend(self.candidates(footprint));
@@ -1283,6 +1289,10 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             );
         }
         Ok(published)
+    }
+    /// Last accepted device modification; readiness remains a native tick.
+    pub fn modification_sequence(&self) -> ModificationSequence {
+        ModificationSequence(self.sequence)
     }
     pub fn writer_count(&self) -> usize {
         self.writers.len()

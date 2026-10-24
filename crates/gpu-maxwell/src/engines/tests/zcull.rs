@@ -25,8 +25,7 @@ fn cube_zcull_configuration_is_typed_source_preserving_and_cache_neutral() {
     let two_d = channel.two_d().clone();
     let draw = before.draw_state_identity();
     let shaders = before.shader_state_identity();
-    let resources =
-        before.resource_state_identity(&[MaxwellThreeDResourceRole::DepthStencilTarget], false);
+    let resources = before.resource_state_identity(MaxwellThreeDResourceRole::DepthStencilTarget);
     for &(method, argument, name) in CUBE_REGION {
         let dispatch = dispatch_method(&mut channel, method / 4, argument).unwrap();
         assert!(dispatch.ordered_operations().is_empty());
@@ -64,7 +63,9 @@ fn cube_zcull_configuration_is_typed_source_preserving_and_cache_neutral() {
         assert_eq!(raw, Some(argument));
         assert_eq!(source, Some(dispatched.method().source()));
         assert!(draw.matches(channel.three_d()));
-        assert!(shaders.matches(channel.three_d()));
+        assert!(
+            shaders.matches_code(channel.three_d()) && shaders.matches_bindings(channel.three_d())
+        );
         assert!(resources.matches(channel.three_d()));
     }
     let state = channel.three_d().zcull();
@@ -300,7 +301,7 @@ fn zcull_storage_retains_addresses_without_creating_attachment_operations() {
     assert!(channel.three_d().draw_state_identity().matches(&before));
     assert!(
         before
-            .resource_state_identity(&[MaxwellThreeDResourceRole::DepthStencilTarget], false)
+            .resource_state_identity(MaxwellThreeDResourceRole::DepthStencilTarget)
             .matches(channel.three_d())
     );
     assert!(dispatch_method(&mut channel, 0x7e8 / 4, 0x100).is_err());
@@ -321,10 +322,7 @@ fn zcull_serialization_does_not_change_depth_resources_or_draw_state() {
             assert!(before.draw_state_identity().matches(channel.three_d()));
             assert!(
                 before
-                    .resource_state_identity(
-                        &[MaxwellThreeDResourceRole::DepthStencilTarget],
-                        false
-                    )
+                    .resource_state_identity(MaxwellThreeDResourceRole::DepthStencilTarget)
                     .matches(channel.three_d())
             );
         }
@@ -393,7 +391,7 @@ fn clearing_zcull_statistics_does_not_clear_depth_or_other_counters() {
     assert_eq!(channel.three_d().zcull(), before.zcull());
     assert!(
         before
-            .resource_state_identity(&[MaxwellThreeDResourceRole::DepthStencilTarget], false)
+            .resource_state_identity(MaxwellThreeDResourceRole::DepthStencilTarget)
             .matches(channel.three_d())
     );
     assert!(dispatch_method(&mut channel, 0x1530 / 4, 1).is_err());

@@ -16,9 +16,14 @@ pub(crate) fn device_uuid(_: &VulkanDevice) -> Option<[u8; 16]> {
 #[cfg(not(target_os = "linux"))]
 impl VideoTransfers {
     pub(crate) fn retire_sources(&mut self, _: u64) {}
-    pub(crate) fn import(
+    pub(crate) fn evict_idle(&mut self, _: u64) -> bool {
+        false
+    }
+}
+#[cfg(not(target_os = "linux"))]
+impl VulkanResidency {
+    pub(crate) fn import_decoded_planes(
         &mut self,
-        _: &mut VulkanResidency,
         _: [ImageId; 2],
         _: &nixe_gpu::DeviceImageFrame,
     ) -> Result<(), VulkanError> {
@@ -190,7 +195,7 @@ mod tests {
                 bytes_per_block: bpp,
             };
             let image = cache
-                .image_for_deferred_import(
+                .image_for(
                     crate::residency::tests::image_geometry(
                         backing.clone(),
                         NativeImageDescription {

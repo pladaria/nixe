@@ -201,7 +201,6 @@ pub(super) struct ImageAccess {
     pub layer: u32,
     pub layout: vk::ImageLayout,
     pub state: AccessState,
-    pub ownership: super::ownership::Ownership,
 }
 pub(super) fn image_states(
     planes: &[ImagePlane],
@@ -227,7 +226,6 @@ pub(super) fn image_states(
                 layer: plane.array_layer,
                 layout: vk::ImageLayout::UNDEFINED,
                 state: AccessState::default(),
-                ownership: super::ownership::Ownership::Local,
             });
         }
     }
@@ -456,11 +454,6 @@ impl VulkanResidency {
                 || cell.layer >= range.base_array_layer + range.layer_count
             {
                 continue;
-            }
-            if cell.ownership != super::ownership::Ownership::Local {
-                return Err(VulkanError::InvalidResource(
-                    "image access requires acquiring its foreign queue ownership",
-                ));
             }
             let preceding = cell.state.preceding();
             let dependency = cell.state.access(scope);

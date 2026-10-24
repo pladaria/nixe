@@ -491,6 +491,7 @@ fn undefined_and_discarded_reads_require_an_actual_producer() {
     let data = cpu_read(&mut cache, &bytes);
     assert_eq!(&data[32..36], &[255, 0, 0, 255]);
     assert_eq!(&data[..32], &[0x5b; 32]);
+    cache.ensure_image_initialized(image, plane, full).unwrap();
     cache
         .raster_fixture(
             image,

@@ -1,35 +1,11 @@
 use super::*;
 use nixe_gpu::{ComponentSwizzle, ImageDimension, ImageFormat as F, SampleCount};
-#[derive(Clone, Debug)]
-struct TransferLayout(std::sync::Weak<[GuestImagePlane]>);
-impl PartialEq for TransferLayout {
-    fn eq(&self, other: &Self) -> bool {
-        std::sync::Weak::ptr_eq(&self.0, &other.0)
-    }
-}
-impl Eq for TransferLayout {}
-impl std::hash::Hash for TransferLayout {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (self.0.as_ptr() as *const GuestImagePlane).hash(state);
-    }
-}
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct ImageKey {
-    description: nixe_gpu::ImageDescription,
-    sample_grid: [u32; 2],
-    planes: TransferLayout,
-}
 pub(super) struct Targets {
-    colors: Box<[GuestImage]>,
+    colors: Arc<[GuestImage]>,
     depth_stencil: Option<GuestImage>,
     area: nixe_gpu::ScissorRect,
     stencil: bool,
     native: Arc<PreparedTargets>,
-}
-pub(super) struct GuestNativeImage {
-    pub image: ImageId,
-    pub planes: Box<[ImagePlane]>,
-    pub format: vk::Format,
 }
 pub(super) fn format(value: F) -> vk::Format {
     match value {
@@ -94,29 +70,10 @@ pub(super) fn format(value: F) -> vk::Format {
     }
 }
 impl NativeGpuExecution {
-    pub(super) fn image(
-        &mut self,
-        guest: &GuestImage,
-    ) -> Result<Arc<GuestNativeImage>, VulkanError> {
-        let key = ImageKey {
-            description: guest.description,
-            sample_grid: guest.sample_grid,
-            planes: TransferLayout(Arc::downgrade(&guest.planes)),
-        };
-        if let Some(image) = self.images.get(&key)
-            && self.residency.image(image.image).is_ok()
-        {
-            return Ok(Arc::clone(image));
+    pub(super) fn image(&mut self, guest: &GuestImage) -> Result<ImageId, VulkanError> {
+        if let Some((image, _)) = self.residency.guest_image(guest, None)? {
+            return Ok(image);
         }
-        self.images.remove(&key);
-        if self.images.len() >= 512 {
-            self.images.retain(|key, image| {
-                key.planes.0.strong_count() > 0 && self.residency.image(image.image).is_ok()
-            });
-        }
-        if self.images.len() >= 4096 {
-            self.images.clear();
-        } // Interpretation lookup only; prepared GPU leases stay valid.
         let format = format(guest.description.format());
         let extent = guest.description.extent();
         let mut geometry = Vec::new();
@@ -196,11 +153,12 @@ impl NativeGpuExecution {
             array_layers: u32::from(guest.description.array_layers()),
             samples: vk::SampleCountFlags::from_raw(guest.description.samples() as u32),
             usage,
-            flags: if guest.description.dimension() == ImageDimension::Cube {
-                vk::ImageCreateFlags::CUBE_COMPATIBLE
-            } else {
-                vk::ImageCreateFlags::empty()
-            },
+            flags: vk::ImageCreateFlags::MUTABLE_FORMAT
+                | if guest.description.dimension() == ImageDimension::Cube {
+                    vk::ImageCreateFlags::CUBE_COMPATIBLE
+                } else {
+                    vk::ImageCreateFlags::empty()
+                },
         };
         let image = if guest.description.samples() != SampleCount::One {
             self.residency.multisample_image_for(
@@ -211,7 +169,7 @@ impl NativeGpuExecution {
             )?
         } else if guest.canonical_texels && bw == 1 && bh == 1 {
             self.residency
-                .image_for_deferred_import(geometry, description, planes.clone())?
+                .image_for(geometry, description, planes.clone())?
         } else if guest.canonical_texels {
             self.residency
                 .sampled_image_for(geometry, description, planes.clone())?
@@ -219,21 +177,15 @@ impl NativeGpuExecution {
             self.residency
                 .image_for_device_write(geometry, description, planes.clone())?
         };
-        let entry = self.residency.image(image)?;
-        let result = Arc::new(GuestNativeImage {
-            image,
-            planes: entry.planes.clone().into_boxed_slice(),
-            format: entry.description.format,
-        });
-        self.images.insert(key, Arc::clone(&result));
-        Ok(result)
+        self.residency.set_guest_image(image, guest);
+        Ok(image)
     }
     pub(super) fn video_view(&mut self, guest: &GuestImage) -> Result<ImageViewId, VulkanError> {
         let native = self.image(guest)?;
         self.residency.image_view(
-            native.image,
+            native,
             ImageViewDescription {
-                format: native.format,
+                format: self.residency.image(native)?.description.format,
                 view_type: vk::ImageViewType::TYPE_2D,
                 aspects: vk::ImageAspectFlags::COLOR,
                 base_mip: 0,
@@ -245,7 +197,12 @@ impl NativeGpuExecution {
         )
     }
     fn view(&mut self, guest: &GuestImage, arrayed: bool) -> Result<ImageViewId, VulkanError> {
-        let native = self.image(guest)?;
+        let requested_format = format(guest.description.format());
+        let (native, [base_mip, base_layer]) =
+            match self.residency.guest_image(guest, Some(requested_format))? {
+                Some(found) => found,
+                None => (self.image(guest)?, [0, 0]),
+            };
         if guest.description.samples() != SampleCount::One {
             return Err(VulkanError::InvalidResource(
                 "multisample sampling requires a multisample shader image binding",
@@ -260,9 +217,9 @@ impl NativeGpuExecution {
             ComponentSwizzle::One => vk::ComponentSwizzle::ONE,
         });
         self.residency.image_view(
-            native.image,
+            native,
             ImageViewDescription {
-                format: native.format,
+                format: self.residency.image(native)?.view_format(requested_format),
                 view_type: if guest.description.dimension() == ImageDimension::Cube {
                     vk::ImageViewType::CUBE
                 } else if arrayed {
@@ -270,10 +227,10 @@ impl NativeGpuExecution {
                 } else {
                     vk::ImageViewType::TYPE_2D
                 },
-                aspects: native.planes[0].aspect,
-                base_mip: 0,
+                aspects: self.residency.image(native)?.planes[0].aspect,
+                base_mip,
                 mip_count: u32::from(guest.description.mip_levels()),
-                base_layer: 0,
+                base_layer,
                 layer_count: if arrayed || guest.description.dimension() == ImageDimension::Cube {
                     u32::from(guest.description.array_layers())
                 } else {
@@ -416,87 +373,95 @@ impl NativeGpuExecution {
         &mut self,
         state: &GuestDrawState,
     ) -> Result<Arc<PreparedTargets>, VulkanError> {
-        // Attachment load/store coverage follows the guest surface clip, not
-        // allocation alignment or a per-draw scissor. Keep viewport coordinates
-        // independent and retain scopes across dynamic scissor changes.
-        // https://docs.vulkan.org/spec/latest/chapters/renderpass.html#renderpass-renderarea
-        let mut area = state.parameters.render_area;
-        // An empty guest clip is enforced by its empty scissor. Vulkan still
-        // requires a nonempty render area for vertex/shader side effects.
-        if area.width == 0 || area.height == 0 {
-            area = nixe_gpu::ScissorRect {
-                x: 0,
-                y: 0,
-                width: state.parameters.extent[0],
-                height: state.parameters.extent[1],
-            };
-        }
-        if let Some(source) = &self.targets
-            && source.area == area
-            && source.stencil == state.parameters.stencil.is_some()
-            && source.colors.len() == state.colors.len()
-            && source
-                .colors
-                .iter()
-                .zip(&state.colors)
-                .all(|(a, b)| a.same_view(b))
-            && match (&source.depth_stencil, &state.depth_stencil) {
-                (None, None) => true,
-                (Some(a), Some(b)) => a.same_view(b),
-                _ => false,
-            }
-            && self.residency.targets_current(&source.native)
-        {
-            return Ok(Arc::clone(&source.native));
-        }
-        let mut colors = Vec::new();
-        for image in &state.colors {
-            let native = self.image(image)?;
-            colors.push(Some(RenderAttachment::color(
-                native.image,
-                0,
-                AttachmentLoad::Load,
-                AttachmentStore::Store,
-            )));
-        }
-        let mut depth = None;
-        let mut stencil = None;
-        if let Some(image) = &state.depth_stencil {
-            let native = self.image(image)?;
-            let selected = native.planes[0];
-            for (plane, p) in native.planes.iter().enumerate().filter(|(_, p)| {
-                p.mip_level == selected.mip_level && p.array_layer == selected.array_layer
-            }) {
-                let a = RenderAttachment {
-                    source: AttachmentSource::Canonical {
-                        image: native.image,
-                        plane,
-                    },
-                    load: vk::AttachmentLoadOp::LOAD,
-                    store: vk::AttachmentStoreOp::STORE,
-                    clear: vk::ClearValue::default(),
+        let retained = self.residency.constructing.len();
+        let result = (|| {
+            // Attachment load/store coverage follows the guest surface clip, not
+            // allocation alignment or a per-draw scissor. Keep viewport coordinates
+            // independent and retain scopes across dynamic scissor changes.
+            // https://docs.vulkan.org/spec/latest/chapters/renderpass.html#renderpass-renderarea
+            let mut area = state.parameters.render_area;
+            // An empty guest clip is enforced by its empty scissor. Vulkan still
+            // requires a nonempty render area for vertex/shader side effects.
+            if area.width == 0 || area.height == 0 {
+                area = nixe_gpu::ScissorRect {
+                    x: 0,
+                    y: 0,
+                    width: state.parameters.extent[0],
+                    height: state.parameters.extent[1],
                 };
-                if p.aspect == vk::ImageAspectFlags::DEPTH {
-                    depth = Some(a)
-                } else if state.parameters.stencil.is_some() {
-                    stencil = Some(a)
+            }
+            if let Some(source) = &self.targets
+                && source.area == area
+                && source.stencil == state.parameters.stencil.is_some()
+                && source.colors.len() == state.colors.len()
+                && source
+                    .colors
+                    .iter()
+                    .zip(state.colors.iter())
+                    .all(|(a, b)| a.same_view(b))
+                && match (&source.depth_stencil, &state.depth_stencil) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => a.same_view(b),
+                    _ => false,
+                }
+                && self.residency.targets_current(&source.native)
+            {
+                return Ok(Arc::clone(&source.native));
+            }
+            let mut colors = Vec::new();
+            for image in state.colors.iter() {
+                let native = self.image(image)?;
+                self.residency.constructing.push(Resource::Image(native));
+                colors.push(Some(RenderAttachment::color(
+                    native,
+                    0,
+                    AttachmentLoad::Load,
+                    AttachmentStore::Store,
+                )));
+            }
+            let mut depth = None;
+            let mut stencil = None;
+            if let Some(image) = &state.depth_stencil {
+                let native = self.image(image)?;
+                self.residency.constructing.push(Resource::Image(native));
+                let planes = &self.residency.image(native)?.planes;
+                let selected = planes[0];
+                for (plane, p) in planes.iter().enumerate().filter(|(_, p)| {
+                    p.mip_level == selected.mip_level && p.array_layer == selected.array_layer
+                }) {
+                    let a = RenderAttachment {
+                        source: AttachmentSource::Canonical {
+                            image: native,
+                            plane,
+                        },
+                        load: vk::AttachmentLoadOp::LOAD,
+                        store: vk::AttachmentStoreOp::STORE,
+                        clear: vk::ClearValue::default(),
+                    };
+                    if p.aspect == vk::ImageAspectFlags::DEPTH {
+                        depth = Some(a)
+                    } else if state.parameters.stencil.is_some() {
+                        stencil = Some(a)
+                    }
                 }
             }
-        }
-        let targets = self.residency.prepare_targets(RenderingTargets {
-            area: rect(area),
-            colors: colors.into_boxed_slice(),
-            depth,
-            stencil,
-        })?;
-        self.targets = Some(Targets {
-            colors: state.colors.clone(),
-            depth_stencil: state.depth_stencil.clone(),
-            area,
-            stencil: state.parameters.stencil.is_some(),
-            native: Arc::clone(&targets),
-        });
-        Ok(targets)
+            let targets = self.residency.prepare_targets(RenderingTargets {
+                area: rect(area),
+                colors: colors.into_boxed_slice(),
+                depth,
+                stencil,
+            })?;
+            self.targets = Some(Targets {
+                colors: state.colors.clone(),
+                depth_stencil: state.depth_stencil.clone(),
+                area,
+                stencil: state.parameters.stencil.is_some(),
+                native: Arc::clone(&targets),
+            });
+            Ok(targets)
+        })();
+        self.residency.constructing.truncate(retained);
+        result
     }
     pub(super) fn clear(
         &mut self,
@@ -505,8 +470,9 @@ impl NativeGpuExecution {
         value: nixe_gpu::ClearValue,
     ) -> Result<(), VulkanError> {
         let native = self.image(image)?;
-        let selected = native.planes[0];
-        for (plane, p) in native.planes.iter().enumerate().filter(|(_, p)| {
+        let planes = Arc::clone(&self.residency.image(native)?.planes);
+        let selected = planes[0];
+        for (plane, p) in planes.iter().enumerate().filter(|(_, p)| {
             p.mip_level == selected.mip_level && p.array_layer == selected.array_layer
         }) {
             let value = match (value, p.aspect) {
@@ -537,7 +503,7 @@ impl NativeGpuExecution {
                 _ => continue,
             };
             self.residency
-                .clear_image_rect(native.image, plane, rect(rectangle), value)?;
+                .clear_image_rect(native, plane, rect(rectangle), value)?;
         }
         Ok(())
     }
@@ -552,74 +518,96 @@ impl NativeGpuExecution {
         resolve: bool,
         sampling: Option<([i64; 2], [i64; 2])>,
     ) -> Result<(), VulkanError> {
-        if resolve {
-            let source = self.image(source)?;
-            let destination = self.image(destination)?;
-            if src.width != dst.width || src.height != dst.height {
-                return Err(VulkanError::InvalidResource(
-                    "multisample resolve cannot scale rectangles",
-                ));
+        let retained = self.residency.constructing.len();
+        let result = (|| {
+            if resolve {
+                let source = self.image(source)?;
+                self.residency.constructing.push(Resource::Image(source));
+                let destination = self.image(destination)?;
+                self.residency
+                    .constructing
+                    .push(Resource::Image(destination));
+                if src.width != dst.width || src.height != dst.height {
+                    return Err(VulkanError::InvalidResource(
+                        "multisample resolve cannot scale rectangles",
+                    ));
+                }
+                self.residency.resolve_image(
+                    source,
+                    0,
+                    rect(src),
+                    destination,
+                    0,
+                    rect(dst).offset,
+                )?;
+                return Ok(());
             }
-            self.residency.resolve_image(
-                source.image,
-                0,
-                rect(src),
-                destination.image,
-                0,
-                rect(dst).offset,
-            )?;
-            return Ok(());
-        }
-        if let Some((first, step)) = sampling {
-            let view = self.view(source, false)?;
+            if let Some((first, step)) = sampling {
+                let view = self.view(source, false)?;
+                self.residency
+                    .constructing
+                    .push(Resource::Image(view.image));
+                let destination = self.image(destination)?;
+                self.residency
+                    .constructing
+                    .push(Resource::Image(destination));
+                let pipeline = Arc::clone(
+                    &self.affine_pipelines[&self.residency.image(destination)?.description.format],
+                );
+                self.residency.affine_blit(
+                    pipeline,
+                    view,
+                    destination,
+                    0,
+                    rect(src),
+                    rect(dst),
+                    first,
+                    step,
+                    linear,
+                )?;
+                return Ok(());
+            }
+            let source = self.image(source)?;
+            self.residency.constructing.push(Resource::Image(source));
             let destination = self.image(destination)?;
-            let pipeline = Arc::clone(&self.affine_pipelines[&destination.format]);
-            self.residency.affine_blit(
-                pipeline,
-                view,
-                destination.image,
-                0,
-                rect(src),
-                rect(dst),
-                first,
-                step,
-                linear,
-            )?;
-            return Ok(());
-        }
-        let source = self.image(source)?;
-        let destination = self.image(destination)?;
-        let selected = source.planes[0];
-        let selected_destination = destination.planes[0];
-        for (plane, p) in source.planes.iter().enumerate().filter(|(_, p)| {
-            p.mip_level == selected.mip_level && p.array_layer == selected.array_layer
-        }) {
-            let destination_plane = destination
-                .planes
-                .iter()
-                .position(|d| {
-                    d.mip_level == selected_destination.mip_level
-                        && d.array_layer == selected_destination.array_layer
-                        && d.aspect == p.aspect
-                })
-                .ok_or(VulkanError::InvalidResource(
-                    "blit destination aspect is absent",
-                ))?;
-            self.residency.blit_image(
-                source.image,
-                plane,
-                rect(src),
-                destination.image,
-                destination_plane,
-                rect(dst),
-                if linear {
-                    vk::Filter::LINEAR
-                } else {
-                    vk::Filter::NEAREST
-                },
-            )?;
-        }
-        Ok(())
+            self.residency
+                .constructing
+                .push(Resource::Image(destination));
+            let source_planes = Arc::clone(&self.residency.image(source)?.planes);
+            let destination_planes = Arc::clone(&self.residency.image(destination)?.planes);
+            let selected = source_planes[0];
+            let selected_destination = destination_planes[0];
+            for (plane, p) in source_planes.iter().enumerate().filter(|(_, p)| {
+                p.mip_level == selected.mip_level && p.array_layer == selected.array_layer
+            }) {
+                let destination_plane = destination_planes
+                    .iter()
+                    .position(|d| {
+                        d.mip_level == selected_destination.mip_level
+                            && d.array_layer == selected_destination.array_layer
+                            && d.aspect == p.aspect
+                    })
+                    .ok_or(VulkanError::InvalidResource(
+                        "blit destination aspect is absent",
+                    ))?;
+                self.residency.blit_image(
+                    source,
+                    plane,
+                    rect(src),
+                    destination,
+                    destination_plane,
+                    rect(dst),
+                    if linear {
+                        vk::Filter::LINEAR
+                    } else {
+                        vk::Filter::NEAREST
+                    },
+                )?;
+            }
+            Ok(())
+        })();
+        self.residency.constructing.truncate(retained);
+        result
     }
 }
 pub(super) fn rect(r: nixe_gpu::ScissorRect) -> vk::Rect2D {
@@ -666,6 +654,137 @@ mod tests {
     use super::*;
     use crate::native::tests::support;
     use crate::residency::tests::backing_allocation;
+
+    #[test]
+    fn contained_mip_and_layer_reuse_native_storage() {
+        let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+            return;
+        };
+        let validation = device.validation_monitor();
+        let mut execution = NativeGpuExecution::new(
+            nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+            device,
+            ShaderNamespace {
+                guest: *b"nixe-native-test",
+                isa: 1,
+            },
+            CacheConfiguration::default(),
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+        let (_allocation, backing) = backing_allocation(&execution.residency, 40960, 4096, 0);
+        let mut planes = Vec::new();
+        let mut offset = 0;
+        for layer in 0..2 {
+            for mip in 0..2 {
+                let side = 64 >> mip;
+                let template = crate::residency::tests::plane_geometry(
+                    backing.clone(),
+                    [side, side],
+                    u64::from(side * 4),
+                    4,
+                );
+                let nixe_gpu::physical::WriteDomain::Image(mut domain) = template.domain() else {
+                    unreachable!()
+                };
+                domain.base = offset;
+                planes.push(GuestImagePlane {
+                    mip_level: mip,
+                    array_layer: layer,
+                    aspect: nixe_gpu::native::GuestImageAspect::Color,
+                    footprint: nixe_gpu::physical::Footprint::new(
+                        backing.clone(),
+                        nixe_gpu::physical::WriteDomain::Image(domain),
+                    )
+                    .unwrap(),
+                    row_pitch: u64::from(side * 4),
+                    bytes_per_block: 4,
+                });
+                offset += u64::from(side * side * 4);
+            }
+        }
+        let whole = GuestImage {
+            description: nixe_gpu::ImageDescription::new(
+                ImageDimension::Two,
+                nixe_gpu::ImageExtent::new(64, 64, 1).unwrap(),
+                F::Rgba8Unorm,
+                nixe_gpu::ImageKind::Color,
+                2,
+                2,
+                SampleCount::One,
+            )
+            .unwrap(),
+            swizzle: nixe_gpu::Swizzle::IDENTITY,
+            canonical_texels: true,
+            sample_grid: [1, 1],
+            planes: planes.into(),
+        };
+        let native = execution.image(&whole).unwrap();
+        let before = execution.residency.statistics();
+        for (mip, layer, offset, side) in [(0, 1, 20480, 64), (1, 1, 36864, 32)] {
+            let part = GuestImage {
+                description: nixe_gpu::ImageDescription::new(
+                    ImageDimension::Two,
+                    nixe_gpu::ImageExtent::new(side, side, 1).unwrap(),
+                    F::Rgba8Srgb,
+                    nixe_gpu::ImageKind::Color,
+                    1,
+                    1,
+                    SampleCount::One,
+                )
+                .unwrap(),
+                planes: Arc::from([GuestImagePlane {
+                    mip_level: 0,
+                    array_layer: 0,
+                    aspect: nixe_gpu::native::GuestImageAspect::Color,
+                    footprint: crate::residency::tests::plane_geometry(
+                        backing.slice(offset, u64::from(side * side * 4)).unwrap(),
+                        [side, side],
+                        u64::from(side * 4),
+                        4,
+                    ),
+                    row_pitch: u64::from(side * 4),
+                    bytes_per_block: 4,
+                }]),
+                ..whole.clone()
+            };
+            let actual = execution.view(&part, false).unwrap();
+            let expected = execution
+                .residency
+                .image_view(
+                    native,
+                    ImageViewDescription {
+                        format: vk::Format::R8G8B8A8_SRGB,
+                        view_type: vk::ImageViewType::TYPE_2D,
+                        aspects: vk::ImageAspectFlags::COLOR,
+                        base_mip: mip,
+                        mip_count: 1,
+                        base_layer: layer,
+                        layer_count: 1,
+                        swizzle: [
+                            vk::ComponentSwizzle::R,
+                            vk::ComponentSwizzle::G,
+                            vk::ComponentSwizzle::B,
+                            vk::ComponentSwizzle::A,
+                        ],
+                    },
+                )
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(execution.view(&part, false).unwrap(), expected);
+        }
+        assert_eq!(
+            execution.residency.statistics().image_allocations,
+            before.image_allocations
+        );
+        assert_eq!(
+            execution.residency.statistics().gpu_copied_bytes,
+            before.gpu_copied_bytes
+        );
+        execution.teardown().unwrap();
+        drop(execution);
+        validation.check().unwrap();
+    }
 
     #[test]
     fn single_layer_texture_keeps_the_shader_array_view_type() {
@@ -716,7 +835,7 @@ mod tests {
         let array = execution.view(&guest, true).unwrap();
         let scalar = execution.view(&guest, false).unwrap();
         assert_ne!(array, scalar);
-        let image = execution.image(&guest).unwrap().image;
+        let image = execution.image(&guest).unwrap();
         let expected = execution
             .residency
             .image_view(
@@ -740,6 +859,79 @@ mod tests {
             .unwrap();
         assert_eq!(array, expected);
         assert_eq!(execution.view(&guest, true).unwrap(), array);
+        let before = execution.residency.statistics();
+        let mut rebuilt = guest.clone();
+        rebuilt.planes = guest
+            .planes
+            .iter()
+            .map(|plane| GuestImagePlane {
+                footprint: nixe_gpu::physical::Footprint::new(
+                    nixe_gpu::physical::PhysicalMapping::new(
+                        &plane
+                            .footprint
+                            .mapping()
+                            .pin(0, plane.footprint.mapping().bytes())
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                    plane.footprint.domain(),
+                )
+                .unwrap(),
+                ..plane.clone()
+            })
+            .collect();
+        assert!(!Arc::ptr_eq(&rebuilt.planes, &guest.planes));
+        assert!(rebuilt.same_view(&guest));
+        assert_eq!(execution.image(&rebuilt).unwrap(), image);
+        assert_eq!(execution.view(&rebuilt, true).unwrap(), array);
+        assert_eq!(
+            execution.residency.statistics().image_allocations,
+            before.image_allocations
+        );
+        assert_eq!(
+            execution.residency.statistics().image_layout_plans,
+            before.image_layout_plans
+        );
+        assert_eq!(
+            execution.residency.statistics().image_view_allocations,
+            before.image_view_allocations
+        );
+        let reinterpret = GuestImage {
+            description: nixe_gpu::ImageDescription::new(
+                ImageDimension::Two,
+                guest.description.extent(),
+                F::Bgra8Srgb,
+                nixe_gpu::ImageKind::Color,
+                1,
+                1,
+                SampleCount::One,
+            )
+            .unwrap(),
+            ..rebuilt.clone()
+        };
+        let view = execution.view(&reinterpret, true).unwrap();
+        assert_eq!(view.image, image);
+        assert_eq!(
+            execution.residency.image(image).unwrap().description.format,
+            vk::Format::R8G8B8A8_UNORM
+        );
+        assert_eq!(
+            execution.residency.statistics().image_allocations,
+            before.image_allocations
+        );
+        assert_eq!(execution.view(&reinterpret, true).unwrap(), view);
+        // Distinct physical storage must not reuse the old native image.
+        let (_other, other) = backing_allocation(&execution.residency, 4096, 4096, 0);
+        rebuilt.planes = Arc::from([GuestImagePlane {
+            footprint: crate::residency::tests::plane_geometry(
+                other.slice(0, 4).unwrap(),
+                [1, 1],
+                4,
+                4,
+            ),
+            ..guest.planes[0].clone()
+        }]);
+        assert_ne!(execution.image(&rebuilt).unwrap(), image);
         execution.teardown().unwrap();
         drop(execution);
         validation.check().unwrap();

@@ -71,41 +71,57 @@ pub struct CapturedStage {
 
 impl CapturedStage {
     pub fn is_current(&self, space: &MaxwellGpuMemory, bindings: &CaptureBindings) -> bool {
+        self.bindings_match(
+            |index| {
+                (
+                    bindings.constant_buffers[index],
+                    bindings.invalid_constant_buffers[index],
+                )
+            },
+            bindings.texture_pool,
+            bindings.viewport_transform,
+            bindings.geometry_passthrough_mask,
+        ) && self.memory_is_current(space)
+    }
+
+    fn bindings_match(
+        &self,
+        binding: impl Fn(usize) -> (Option<BufferBinding>, Option<&'static str>),
+        texture_pool: Option<TexturePool>,
+        viewport_transform: Option<u32>,
+        geometry_passthrough_mask: Option<[u32; 8]>,
+    ) -> bool {
         let observed = self.environment.observations();
         if self.environment.metadata().stage == Stage::Geometry
             && self.environment.metadata().sph.geometry_passthrough() != 0
-            && self.bindings.geometry_passthrough_mask != bindings.geometry_passthrough_mask
+            && self.bindings.geometry_passthrough_mask != geometry_passthrough_mask
         {
             return false;
         }
         let binding_changed = |index: CbufIndex| {
-            self.bindings.constant_buffers.get(index.0 as usize)
-                != bindings.constant_buffers.get(index.0 as usize)
-                || self.bindings.invalid_constant_buffers.get(index.0 as usize)
-                    != bindings.invalid_constant_buffers.get(index.0 as usize)
+            let index = index.0 as usize;
+            index >= 32
+                || binding(index)
+                    != (
+                        self.bindings.constant_buffers[index],
+                        self.bindings.invalid_constant_buffers[index],
+                    )
         };
-        if observed
+        !observed
             .cbuf_words
             .keys()
             .any(|key| binding_changed(key.index))
-            || observed.texture_handles.keys().any(|key| {
+            && !observed.texture_handles.keys().any(|key| {
                 binding_changed(key.index) || key.has_secondary && binding_changed(key.sec_index)
             })
-            || ((!observed.texture_types.is_empty()
-                || !observed.texture_pixel_formats.is_empty()
-                || !observed.texture_integer_formats.is_empty())
-                && self.bindings.texture_pool != bindings.texture_pool)
-            || (self.environment.metadata().stage != Stage::Compute
-                && observed
+            && ((observed.texture_types.is_empty()
+                && observed.texture_pixel_formats.is_empty()
+                && observed.texture_integer_formats.is_empty())
+                || self.bindings.texture_pool == texture_pool)
+            && (self.environment.metadata().stage == Stage::Compute
+                || observed
                     .viewport_transform_state
-                    .is_some_and(|value| Some(value) != bindings.viewport_transform))
-        {
-            return false;
-        }
-        self.code_dependencies
-            .iter()
-            .chain(self.dependencies.iter())
-            .all(|read| read.is_current(space))
+                    .is_none_or(|value| Some(value) == viewport_transform))
     }
 
     fn refresh(

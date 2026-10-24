@@ -1,6 +1,61 @@
 //! Native host consumers share guest residency, exact authority and hazards.
 use super::*;
 impl VulkanResidency {
+    pub(crate) fn presentation_source(
+        &mut self,
+        source: &nixe_gpu::native::NativePresentationImage,
+        format: vk::Format,
+    ) -> Result<ImageId, VulkanError> {
+        self.invalidate_cpu_resources(&[])?;
+        let [plane] = source.planes.as_ref() else {
+            return Err(VulkanError::InvalidResource(
+                "framebuffer requires one color plane",
+            ));
+        };
+        let description = NativeImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            format,
+            extent: vk::Extent3D {
+                width: source.extent[0],
+                height: source.extent[1],
+                depth: 1,
+            },
+            mip_levels: 1,
+            array_layers: 1,
+            samples: vk::SampleCountFlags::TYPE_1,
+            usage: vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::SAMPLED,
+            flags: vk::ImageCreateFlags::empty(),
+        };
+        let native_plane = ImagePlane {
+            offset: 0,
+            row_pitch: plane.row_pitch,
+            mip_level: 0,
+            array_layer: 0,
+            extent: description.extent,
+            aspect: vk::ImageAspectFlags::COLOR,
+            block_extent: vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+            bytes_per_block: plane.bytes_per_block,
+        };
+        if let Some(id) = self.resident_frame_source(&plane.footprint, description, &[native_plane])
+        {
+            return Ok(id);
+        }
+        if !source.allow_canonical_import {
+            return Err(VulkanError::InvalidResource(
+                "opaque framebuffer requires a matching native resident representation",
+            ));
+        }
+        self.image_for(
+            vec![Arc::clone(&plane.footprint)],
+            description,
+            vec![native_plane],
+        )
+    }
     /// A scanout snapshot consumes encoded bytes, rather than the producer's
     /// sampling interpretation. Size-compatible color copies preserve those
     /// bytes exactly; opaque storage must already have a resident producer.
@@ -79,37 +134,35 @@ impl VulkanResidency {
         image: ImageId,
         extent: [u32; 2],
     ) -> Result<(), VulkanError> {
-        self.require_frame_source(image, extent, false)
-    }
-    /// CPU writes refresh an existing import; GPU alias invalidation must
-    /// reselect its current producer instead of rebuilding an obsolete mirror.
-    pub(crate) fn require_frame_source(
-        &self,
-        image: ImageId,
-        extent: [u32; 2],
-        allow_cpu_refresh: bool,
-    ) -> Result<(), VulkanError> {
         let entry = self.image(image)?;
         let plane = entry.planes[0];
-        let bytes = u64::from(extent[1]) * plane.row_pitch;
         if entry.producer.is_none()
             || extent[0] > plane.extent.width
             || extent[1] > plane.extent.height
-            || entry
-                .contents
-                .invalid
-                .iter()
-                .any(|&(offset, length)| offset < bytes && length != 0)
-            || entry
-                .contents
-                .device
-                .iter()
-                .any(ResourceObservation::is_invalid)
-            || (!allow_cpu_refresh && entry.contents.cpu.iter().any(Observation::is_invalid))
         {
             return Err(VulkanError::InvalidResource(
                 "opaque framebuffer has no current resident producer; canonical import is forbidden",
             ));
+        }
+        if !entry.current() {
+            // CPU dirtiness is page-granular; scanout authority is byte-exact.
+            // An unrelated store in the same page must not invalidate opaque
+            // pixels whose complete visible coverage still belongs here.
+            let footprint = &entry.contents.geometry[0];
+            let nixe_gpu::physical::WriteDomain::Image(mut domain) = footprint.domain() else {
+                unreachable!("image footprint")
+            };
+            domain.rect.width = extent[0].div_ceil(plane.block_extent.width);
+            domain.rect.height = extent[1].div_ceil(plane.block_extent.height);
+            let visible = Footprint::new(
+                Arc::clone(footprint.mapping()),
+                nixe_gpu::physical::WriteDomain::Image(domain),
+            )?;
+            if self.authority.covering_resource(&visible)? != Some(Resource::Image(image)) {
+                return Err(VulkanError::InvalidResource(
+                    "framebuffer visible bytes have a newer CPU or alias producer",
+                ));
+            }
         }
         self.require_image_initialized(
             image,

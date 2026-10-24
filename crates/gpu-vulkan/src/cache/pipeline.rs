@@ -752,7 +752,7 @@ impl Compiler {
                 "duplicate vertex binding or attribute location".into(),
             ));
         }
-        for a in &s.vertex_attributes {
+        for a in s.vertex_attributes.iter() {
             let properties = unsafe {
                 self.owner
                     .instance
@@ -766,7 +766,7 @@ impl Compiler {
                 return Err(CompileError::Failed(format!("native vertex format {:?} lacks VERTEX_BUFFER support; use exact SSA pulling",a.format).into()));
             }
         }
-        for &(format, blend) in &s.colors {
+        for &(format, blend) in s.colors.iter() {
             if format == vk::Format::UNDEFINED {
                 continue;
             }
@@ -813,8 +813,8 @@ impl Compiler {
         let fs = part == vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_SHADER;
         let out = part == vk::GraphicsPipelineLibraryFlagsEXT::FRAGMENT_OUTPUT_INTERFACE;
         if !vi {
-            state.vertex_bindings = Box::new([]);
-            state.vertex_attributes = Box::new([]);
+            state.vertex_bindings = std::sync::Arc::from([]);
+            state.vertex_attributes = std::sync::Arc::from([]);
             state.topology = vk::PrimitiveTopology::TRIANGLE_LIST;
             state.primitive_restart = false;
         }
@@ -847,7 +847,7 @@ impl Compiler {
             state.stencil_format = vk::Format::UNDEFINED;
         }
         if !out {
-            state.colors = Box::new([]);
+            state.colors = std::sync::Arc::from([]);
             state.logic_enabled = false;
             state.logic_op = vk::LogicOp::COPY;
         }

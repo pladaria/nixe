@@ -59,16 +59,11 @@ impl VulkanResidency {
             Resource::Buffer(id) => Arc::strong_count(&self.buffer(id).unwrap().native) == 1,
             Resource::Image(id) => {
                 let entry = self.image(id).unwrap();
-                entry.leases == 0
-                    && entry
-                        .native_views
-                        .iter()
-                        .all(|view| Arc::strong_count(view) == 1)
+                entry
+                    .native_views
+                    .iter()
+                    .all(|view| Arc::strong_count(view) == 1)
                     && Arc::strong_count(&entry.native) == 1 + entry.native_views.len()
-                    && entry
-                        .access
-                        .iter()
-                        .all(|cell| cell.ownership == ownership::Ownership::Local)
             }
         }
     }
@@ -87,7 +82,6 @@ impl VulkanResidency {
         Ok(())
     }
     pub fn evict_one(&mut self) -> Result<bool, VulkanError> {
-        self.drain_notifications();
         let mut next = self.lru_head;
         while let Some(resource) = next {
             next = self.contents(resource)?.lru.unwrap().next;
@@ -115,7 +109,6 @@ impl VulkanResidency {
         self.collection_target = (available * 7 / 10)
             .saturating_sub(fixed)
             .min(self.budget_ceiling / 8 * 7);
-        self.drain_notifications();
         if self.budget.used() <= self.collection_target {
             self.lru_scan = None;
             return Ok(());

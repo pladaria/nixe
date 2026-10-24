@@ -38,7 +38,7 @@ impl VulkanResidency {
         initialize: bool,
     ) -> Result<BufferRange, VulkanError> {
         let _trace = nixe_gpu::trace::span("buffer_lookup", requested.bytes(), 0, 0);
-        self.invalidate_cpu_buffers(&[])?;
+        self.invalidate_cpu_resources(&[])?;
         // A buffer's physical coverage is independent of the current binding's
         // role. Vulkan storage is allocated for all ordinary buffer consumers.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
@@ -153,7 +153,7 @@ impl VulkanResidency {
         )?;
         self.constructing
             .extend(overlaps.iter().copied().map(Resource::Buffer));
-        let created = self.buffer_for_geometry(vec![footprint], bytes, usage, false);
+        let created = self.allocate_buffer_entry(footprint, bytes, usage);
         for &id in overlaps.iter().rev() {
             self.unpin(Resource::Buffer(id));
         }
@@ -173,19 +173,19 @@ impl VulkanResidency {
                 let old_bytes = old_mapping.bytes();
                 // Preserve native contents without downloading to RAM. Dirty
                 // CPU ranges remain dirty in the new entry until consumption.
-                let invalid = self.buffer(id)?.contents.invalid.clone();
+                let invalid = self.buffer(id)?.invalid.clone();
                 let old_current = self.buffer(old)?.contents.observations_current();
                 self.copy_source(Resource::Buffer(old), 0, id, destination, old_bytes)?;
-                self.contents_mut(Resource::Buffer(id)).invalid = invalid;
+                self.buffer_mut(id).invalid = invalid;
                 let valid = if old_current {
-                    self.buffer(old)?.contents.invalid.clone()
+                    self.buffer(old)?.invalid.clone()
                 } else {
                     vec![(0, old_bytes)]
                 };
                 let mut cursor = 0;
                 for (begin, size) in valid.into_iter().chain([(old_bytes, 0)]) {
                     if begin > cursor {
-                        self.contents_mut(Resource::Buffer(id))
+                        self.buffer_mut(id)
                             .validate_interval(destination + cursor, begin - cursor);
                     }
                     cursor = cursor.max(begin + size);
@@ -237,14 +237,12 @@ impl VulkanResidency {
         self.unpin(Resource::Buffer(id));
         merged
     }
-    pub(super) fn buffer_for_geometry(
+    fn allocate_buffer_entry(
         &mut self,
-        geometry: Vec<Arc<Footprint>>,
+        footprint: Arc<Footprint>,
         bytes: u64,
         usage: vk::BufferUsageFlags,
-        initialize: bool,
     ) -> Result<BufferId, VulkanError> {
-        self.drain_notifications();
         if usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
             && !self.device.profile().buffer_device_address
         {
@@ -253,39 +251,7 @@ impl VulkanResidency {
             ));
         }
         let usage = usage | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
-        let candidate = geometry.first().and_then(|first| {
-            self.authority
-                .resource_candidates(first)
-                .into_iter()
-                .find_map(|resource| {
-                    let Resource::Buffer(id) = resource else {
-                        return None;
-                    };
-                    let entry = self.buffer(id).ok()?;
-                    (entry.binding_valid
-                        && entry.native.size() == bytes
-                        && entry.contents.geometry == geometry
-                        && entry.usage.contains(usage))
-                    .then_some(id)
-                })
-        });
-        if let Some(id) = candidate {
-            if initialize {
-                self.ensure_buffer(id)?;
-            }
-            self.touch(Resource::Buffer(id));
-            self.statistics.cache_hits += 1;
-            return Ok(id);
-        }
-        if geometry.is_empty()
-            || geometry
-                .iter()
-                .any(|f| f.mapping().machine() != self.memory.identity())
-        {
-            return Err(VulkanError::InvalidResource(
-                "buffer has no geometry or names another physical machine",
-            ));
-        }
+        let geometry = vec![footprint];
         let native = self.allocate_buffer(bytes, usage)?;
         #[cfg(feature = "binding-probe")]
         let address = if usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
@@ -323,11 +289,10 @@ impl VulkanResidency {
                 growth: 0,
                 binding_valid: true,
                 write_plans: Vec::new(),
+                invalid: vec![(0, bytes)],
                 contents: Contents {
                     lru: None,
-                    invalid: vec![(0, bytes)],
                     geometry: geometry.clone(),
-                    cpu: Vec::new(),
                     device: Vec::new(),
                     last_use: None,
                     touched: 0,
@@ -354,9 +319,6 @@ impl VulkanResidency {
             .contents
             .device = observations;
         self.statistics.buffer_allocations += 1;
-        if initialize {
-            self.ensure_buffer(id)?;
-        }
         self.touch(Resource::Buffer(id));
         Ok(id)
     }
@@ -465,48 +427,27 @@ impl VulkanResidency {
         bytes: u64,
     ) -> Result<(), VulkanError> {
         let contents = &self.buffer(id)?.contents;
-        if let [full] = contents.geometry.as_slice()
-            && matches!(
-                full.domain(),
-                nixe_gpu::physical::WriteDomain::Buffer { .. }
-            )
-        {
-            let end = offset + bytes;
-            let spans = full.mapping().spans();
-            let first = spans.partition_point(|span| span.logical + span.bytes <= offset);
-            if spans[first..]
-                .iter()
-                .take_while(|span| span.logical < end)
-                .all(|span| {
-                    let start = offset.max(span.logical);
-                    let stop = end.min(span.logical + span.bytes);
-                    self.memory.buffer_pages_tracked(nixe_memory::Extent {
-                        start: nixe_memory::ArenaOffset::new(
-                            span.start.get() + start - span.logical,
-                        ),
-                        bytes: stop - start,
-                    })
+        let full = &contents.geometry[0];
+        let end = offset + bytes;
+        let spans = full.mapping().spans();
+        let first = spans.partition_point(|span| span.logical + span.bytes <= offset);
+        if spans[first..]
+            .iter()
+            .take_while(|span| span.logical < end)
+            .all(|span| {
+                let start = offset.max(span.logical);
+                let stop = end.min(span.logical + span.bytes);
+                self.memory.resource_pages_tracked(nixe_memory::Extent {
+                    start: nixe_memory::ArenaOffset::new(span.start.get() + start - span.logical),
+                    bytes: stop - start,
                 })
-            {
-                return Ok(());
-            }
-            let inputs = full.mapping().pin(offset, bytes)?;
-            self.memory
-                .capture_buffer_scattered(&inputs, &[], &mut [])?;
+            })
+        {
             return Ok(());
         }
-        if !contents.cpu.is_empty() && contents.cpu.iter().all(|o| !o.is_invalid()) {
-            return Ok(());
-        }
-        // Native-only destinations need CPU tracking too: after their download
-        // retires device authority, subsequent RAM stores must dirty the cache.
-        let mut pages = Vec::new();
-        for footprint in &contents.geometry {
-            footprint.mapping().observed_pages(footprint, &mut pages)?;
-        }
-        let inputs = nixe_gpu::physical::pin_selected_pages(pages)?;
-        let cpu = self.memory.capture_clean_scattered(&inputs, &[], &mut [])?;
-        self.contents_mut(Resource::Buffer(id)).cpu = vec![cpu];
+        let inputs = full.mapping().pin(offset, bytes)?;
+        self.memory
+            .capture_resource_scattered(&inputs, &[], &mut [])?;
         Ok(())
     }
     pub(crate) fn buffer_binding_current(&self, id: BufferId) -> bool {
@@ -527,13 +468,13 @@ impl VulkanResidency {
                 "buffer binding has retired physical coverage",
             ));
         }
-        self.invalidate_cpu_buffers(&[])?;
-        let contents = &self.buffer(id)?.contents;
-        let first = contents
+        self.invalidate_cpu_resources(&[])?;
+        let entry = self.buffer(id)?;
+        let first = entry
             .invalid
             .partition_point(|&(start, bytes)| start + bytes <= offset);
-        if contents.observations_current()
-            && contents
+        if entry.contents.observations_current()
+            && entry
                 .invalid
                 .get(first)
                 .is_none_or(|&(start, _)| start >= offset + size)
@@ -541,15 +482,15 @@ impl VulkanResidency {
             return Ok(());
         }
         self.constructing.push(Resource::Buffer(id));
-        let result = self.refresh_buffer(id, true, Some((offset, size)));
+        let result = self.refresh_buffer(id, offset, size);
         self.unpin(Resource::Buffer(id));
         result
     }
-    pub(super) fn refresh_buffer(
+    fn refresh_buffer(
         &mut self,
         id: BufferId,
-        upload_cpu: bool,
-        requested: Option<(u64, u64)>,
+        offset: u64,
+        requested_size: u64,
     ) -> Result<(), VulkanError> {
         let _trace = nixe_gpu::trace::span(
             "buffer_refresh",
@@ -557,9 +498,8 @@ impl VulkanResidency {
             self.buffer(id)?.native.size(),
             0,
         );
-        self.invalidate_cpu_buffers(&[])?;
+        self.invalidate_cpu_resources(&[])?;
         let mut geometry = self.buffer(id)?.contents.geometry.clone();
-        let ordinary = matches!(geometry.as_slice(), [f] if matches!(f.domain(), nixe_gpu::physical::WriteDomain::Buffer { .. }));
         let size = self.buffer(id)?.native.size();
         let changed = self
             .buffer(id)?
@@ -578,14 +518,10 @@ impl VulkanResidency {
             let contents = self.contents_mut(Resource::Buffer(id));
             contents.device = device;
         }
-        let (begin, end) = requested.map_or((0, size), |(offset, bytes)| {
-            let page = nixe_memory::PAGE_SIZE;
-            (
-                offset / page * page,
-                ((offset + bytes).div_ceil(page) * page).min(size),
-            )
-        });
-        if ordinary && !changed {
+        let page = nixe_memory::PAGE_SIZE;
+        let begin = offset / page * page;
+        let end = ((offset + requested_size).div_ceil(page) * page).min(size);
+        if !changed {
             geometry[0] = Footprint::new(
                 Arc::clone(geometry[0].mapping()),
                 nixe_gpu::physical::WriteDomain::Buffer {
@@ -593,8 +529,6 @@ impl VulkanResidency {
                     bytes: end - begin,
                 },
             )?;
-        } else if !ordinary && upload_cpu {
-            self.track_buffer_cpu(id, 0, size)?;
         }
         let mut parts = Vec::new();
         for footprint in &geometry {
@@ -605,17 +539,8 @@ impl VulkanResidency {
         let mut windows: Vec<(u64, usize, usize)> = Vec::new();
         let mut packed = 0;
         let mut inputs = Vec::new();
-        let unavailable: Vec<_> = if upload_cpu {
-            Vec::new()
-        } else {
-            parts
-                .iter()
-                .filter(|part| part.producer.is_none())
-                .map(|part| (part.logical, part.bytes))
-                .collect()
-        };
-        let invalid = self.buffer(id)?.contents.invalid.clone();
-        for part in parts.iter().filter(|p| upload_cpu && p.producer.is_none()) {
+        let invalid = self.buffer(id)?.invalid.clone();
+        for part in parts.iter().filter(|p| p.producer.is_none()) {
             let first = invalid
                 .partition_point(|&(offset, bytes)| offset + bytes <= part.logical.max(begin));
             for &(offset, bytes) in &invalid[first..] {
@@ -628,32 +553,10 @@ impl VulkanResidency {
                     continue;
                 }
                 let source = nixe_memory::ArenaOffset::new(part.start.get() + begin - part.logical);
-                let (mapping, span) = if ordinary {
-                    let mapping = geometry[0].mapping();
-                    let span = mapping
-                        .spans()
-                        .partition_point(|span| span.logical + span.bytes <= begin);
-                    (mapping, span)
-                } else {
-                    geometry
-                        .iter()
-                        .find_map(|footprint| {
-                            let mapping = footprint.mapping();
-                            mapping
-                                .spans()
-                                .iter()
-                                .position(|span| {
-                                    span.allocation == part.allocation
-                                        && span.start.get() <= source.get()
-                                        && source.get() + end - begin
-                                            <= span.start.get() + span.bytes
-                                })
-                                .map(|span| (mapping, span))
-                        })
-                        .ok_or(VulkanError::InvalidResource(
-                            "CPU upload input has no physical span",
-                        ))?
-                };
+                let mapping = geometry[0].mapping();
+                let span = mapping
+                    .spans()
+                    .partition_point(|span| span.logical + span.bytes <= begin);
                 let pin = mapping.pin_span(span, source, end - begin)?;
                 inputs
                     .push(pin.ok_or(VulkanError::InvalidResource("CPU upload input has retired"))?);
@@ -785,14 +688,10 @@ impl VulkanResidency {
             self.copy_image_buffer_regions(image, id, &copies)?;
         }
         let entry = self.buffers[id.slot].entry.as_mut().expect("buffer");
-        if upload_cpu {
-            entry.contents.validate_intervals(&native_valid);
-        } else {
-            entry.contents.invalid = unavailable;
-        }
+        entry.validate_intervals(&native_valid);
         // Publish the captured version before consuming racing CPU stores. The
         // persistent page watch keeps future stores dirty without a new observer.
-        self.invalidate_cpu_buffers(&[])?;
+        self.invalidate_cpu_resources(&[])?;
         Ok(())
     }
     pub fn buffer_lease(&self, id: BufferId) -> Result<Arc<AllocatedBuffer>, VulkanError> {
