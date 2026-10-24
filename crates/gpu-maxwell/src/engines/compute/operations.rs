@@ -1,6 +1,5 @@
 //! Host-independent `MAXWELL_COMPUTE_B` ordering operations.
 
-use super::MaxwellComputeState;
 use crate::MaxwellMethodSource;
 
 /// Compute shader-cache families selected by an invalidation method.
@@ -67,32 +66,6 @@ impl MaxwellComputeOperationTrigger {
     }
 }
 
-/// One compute trigger paired with the exact channel-state snapshot at that method.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellComputeTriggeredOperation {
-    trigger: MaxwellComputeOperationTrigger,
-    state: MaxwellComputeState,
-}
-
-impl MaxwellComputeTriggeredOperation {
-    pub(crate) const fn new(
-        trigger: MaxwellComputeOperationTrigger,
-        state: MaxwellComputeState,
-    ) -> Self {
-        Self { trigger, state }
-    }
-
-    #[must_use]
-    pub const fn trigger(&self) -> MaxwellComputeOperationTrigger {
-        self.trigger
-    }
-
-    #[must_use]
-    pub const fn state(&self) -> &MaxwellComputeState {
-        &self.state
-    }
-}
-
 /// Validated host-independent lowering of a compute ordering operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellComputeSynchronizationPlan {
@@ -118,10 +91,10 @@ pub enum MaxwellComputeSynchronizationPlan {
 ///
 /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/compute/clb1c0.h#L51-L52
 pub fn lower_maxwell_compute_synchronization(
-    operation: &MaxwellComputeTriggeredOperation,
+    operation: MaxwellComputeOperationTrigger,
     prior_channel_work_pending: bool,
 ) -> MaxwellComputeSynchronizationPlan {
-    match operation.trigger() {
+    match operation {
         MaxwellComputeOperationTrigger::WaitForIdle { .. } => {
             MaxwellComputeSynchronizationPlan::WaitForIdle {
                 prior_work_pending: prior_channel_work_pending,

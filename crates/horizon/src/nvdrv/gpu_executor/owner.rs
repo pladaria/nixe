@@ -3,20 +3,21 @@
 //! queue separates guest memory observation from its native resource consumption.
 use super::*;
 use std::cell::RefCell;
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
-struct GpuWork<W: MaxwellWork> {
-    clock: nixe_runtime::VirtualClock,
+struct GpuWork {
     descriptor: NvDrvDeviceDescriptor,
     request: u32,
-    execution: MaxwellBackendExecution<W>,
+    frontend: FrontendSubmissionId,
     reservation: Option<ReservedTimelinePoint>,
     control: Arc<Mutex<NvHostControl>>,
-    _permit: GpuFrontendPermit,
 }
-struct PendingWork<W: MaxwellWork> {
+struct PendingWork {
     token: BackendSubmissionToken,
-    work: GpuWork<W>,
+    work: GpuWork,
 }
 struct PendingConversion {
     token: BackendSubmissionToken,
@@ -34,13 +35,14 @@ pub(super) fn run<L, E>(
 where
     L: MaxwellFrontend,
     E: GpuExecution<
-            Commands = WorkCommands<L::Work>,
-            ImageRequest = <L::Work as MaxwellWork>::ImageRequest,
+            Commands = nixe_gpu::native::NativeWork,
+            ImageRequest = nixe_gpu::native::NativePresentationImage,
         >,
 {
-    let mut frontend = frontend;
-    let mut owner = Owner::new(&receiver, backend, budget);
-    let mut result = owner.run(&mut frontend);
+    let owner = Rc::new(RefCell::new(Owner::new(
+        &receiver, backend, budget, frontend,
+    )));
+    let mut result = Owner::drive(&owner);
     let shutting_down = budget.is_stopped();
     let cause = result
         .as_ref()
@@ -56,35 +58,49 @@ where
         error.memory_cause = Some(Arc::clone(&cause));
     }
     endpoint.stop(Arc::clone(&cause));
-    if let Some(backend) = owner.backend.borrow_mut().as_mut() {
+    if let Some(backend) = owner.borrow().backend.borrow_mut().as_mut() {
         backend.fail_device_accesses(Arc::clone(&cause));
     }
-    owner.cancel(&cause);
+    owner.borrow_mut().cancel(&cause);
     if shutting_down { Ok(()) } else { result }
 }
 
 struct Owner<
     'a,
-    W: MaxwellWork,
-    E: GpuExecution<Commands = WorkCommands<W>, ImageRequest = W::ImageRequest>,
+    L: MaxwellFrontend,
+    E: GpuExecution<
+            Commands = nixe_gpu::native::NativeWork,
+            ImageRequest = nixe_gpu::native::NativePresentationImage,
+        >,
 > {
     receiver: &'a mpsc::Receiver<GpuMessage>,
     backend: Rc<RefCell<Option<E>>>,
     budget: &'a GpuWorkBudget,
     deferred: VecDeque<GpuMessage>,
     sources: nixe_gpu_maxwell::MaxwellCommandSourceScratch,
-    pending: VecDeque<PendingWork<W>>,
+    frontend: Rc<RefCell<L>>,
+    channels: std::collections::BTreeMap<
+        nixe_gpu_maxwell::MaxwellChannelId,
+        Option<nixe_gpu_maxwell::MaxwellGpuChannel>,
+    >,
+    blocked_effects: usize,
+    recheck: bool,
+    pending: VecDeque<PendingWork>,
     conversions: VecDeque<PendingConversion>,
 }
-impl<'a, W, E> Owner<'a, W, E>
+impl<'a, L, E> Owner<'a, L, E>
 where
-    W: MaxwellWork,
-    E: GpuExecution<Commands = WorkCommands<W>, ImageRequest = W::ImageRequest>,
+    L: MaxwellFrontend,
+    E: GpuExecution<
+            Commands = nixe_gpu::native::NativeWork,
+            ImageRequest = nixe_gpu::native::NativePresentationImage,
+        >,
 {
     fn new(
         receiver: &'a mpsc::Receiver<GpuMessage>,
         backend: Rc<RefCell<Option<E>>>,
         budget: &'a GpuWorkBudget,
+        frontend: L,
     ) -> Self {
         Self {
             receiver,
@@ -92,6 +108,10 @@ where
             budget,
             deferred: VecDeque::new(),
             sources: Default::default(),
+            frontend: Rc::new(RefCell::new(frontend)),
+            channels: Default::default(),
+            blocked_effects: 0,
+            recheck: false,
             pending: VecDeque::new(),
             conversions: VecDeque::new(),
         }
@@ -114,11 +134,8 @@ where
             return Ok(());
         };
         runtime
-            .progress_device_accesses()
+            .progress()
             .map_err(|error| self.runtime_failure(FrontendSubmissionId::new(0), error))?;
-        runtime
-            .service_host()
-            .map_err(|error| self.failure(FrontendSubmissionId::new(0), error.to_string()))?;
         while let Some(completion) = runtime
             .poll_completion()
             .map_err(|error| self.failure(FrontendSubmissionId::new(0), error.to_string()))?
@@ -145,7 +162,7 @@ where
                         self.failure(completion.frontend(), "GPU completed an unknown delivery")
                     })?;
                 let pending = self.pending.remove(index).unwrap();
-                if pending.work.execution.frontend() != completion.frontend() {
+                if pending.work.frontend != completion.frontend() {
                     return Err(
                         self.failure(completion.frontend(), "completion has a different frontend")
                     );
@@ -181,6 +198,10 @@ where
     fn service_control(&mut self, message: GpuMessage) -> Result<(), GpuExecutorFailure> {
         let result = match message {
             GpuMessage::MemoryAccess(request) => {
+                if self.blocked_effects != 0 {
+                    self.deferred.push_front(GpuMessage::MemoryAccess(request));
+                    return Ok(());
+                }
                 if let Some(backend) = self.backend.borrow_mut().as_mut() {
                     backend.queue_device_access(request)
                 } else {
@@ -223,11 +244,10 @@ where
                 .map_or(Ok(()), |backend| {
                     backend.allocation_pressure(machine, bytes)
                 }),
-            GpuMessage::Wake => self
-                .backend
-                .borrow_mut()
-                .as_mut()
-                .map_or(Ok(()), GpuExecution::progress_device_accesses),
+            GpuMessage::Wake => {
+                self.recheck = true;
+                Ok(())
+            }
             message => {
                 self.deferred.push_back(message);
                 Ok(())
@@ -240,82 +260,119 @@ where
         // resources, including when native compilation had to wait. A request
         // must not resolve against authority missing that pending effect.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp
-        while matches!(self.deferred.front(), Some(GpuMessage::MemoryAccess(_))) {
+        while self.blocked_effects == 0
+            && matches!(self.deferred.front(), Some(GpuMessage::MemoryAccess(_)))
+        {
             let message = self.deferred.pop_front().unwrap();
             self.service_control(message)?;
         }
+        let mut serviced = false;
         let mut wake = false;
         while let Ok(message) = self.receiver.try_recv() {
+            serviced = true;
             wake |= matches!(message, GpuMessage::Wake);
             self.service_control(message)?;
         }
-        self.poll()?;
+        if serviced {
+            self.poll()?;
+        }
         if wake && self.budget.take_progress_request() {
             self.flush_progress()?;
         }
         Ok(())
     }
-    fn run<L: MaxwellFrontend<Work = W>>(
-        &mut self,
-        frontend: &mut L,
-    ) -> Result<(), GpuExecutorFailure> {
-        // Eden's GPU thread consumes commands and resources in one ordered pass;
-        // its Vulkan scheduler independently dispatches native recording work.
-        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/gpu_thread.cpp
-        let mut channels = std::collections::BTreeMap::new();
+    fn drive(owner: &Rc<RefCell<Self>>) -> Result<(), GpuExecutorFailure> {
+        // A suspended list keeps its cursor, engine registers and current effect.
+        // Poll peers from here, never recursively from a dependency wait. The
+        // existing inbox carries worker/timeline wakes; no async runtime or
+        // thread per channel is needed. Ingress permits bound the live lists.
+        type Task<'a> = Pin<Box<dyn Future<Output = Result<(), GpuExecutorFailure>> + 'a>>;
+        let mut running: Vec<(Option<nixe_gpu_maxwell::MaxwellChannelId>, Task<'_>)> = Vec::new();
+        let mut context = Context::from_waker(Waker::noop());
         loop {
-            if self.budget.is_stopped() {
+            if owner.borrow().budget.is_stopped() {
                 return Ok(());
             }
-            self.poll()?;
-            if self.budget.take_progress_request() {
-                self.flush_progress()?;
-            }
-            let message = self
-                .deferred
-                .pop_front()
-                .or_else(|| self.receiver.try_recv().ok());
-            let message = if let Some(message) = message {
-                message
-            } else {
-                self.flush_progress()?;
-                match self.receiver.recv() {
-                    Ok(message) => message,
-                    Err(_) => return Ok(()),
+            owner.borrow_mut().recheck = false;
+            owner.borrow_mut().poll()?;
+            let mut index = 0;
+            while index < running.len() {
+                match running[index].1.as_mut().poll(&mut context) {
+                    Poll::Pending => index += 1,
+                    Poll::Ready(result) => {
+                        drop(running.remove(index));
+                        result?;
+                    }
                 }
+            }
+            let message = {
+                let mut state = owner.borrow_mut();
+                if state.budget.take_progress_request() {
+                    state.flush_progress()?;
+                }
+                state.service_ready_control()?;
+                let next = state.deferred.iter().position(|message| match message {
+                    GpuMessage::Submission(queued) => !running
+                        .iter()
+                        .any(|(channel, _)| *channel == Some(queued.submission.channel.id())),
+                    GpuMessage::MemoryAccess(_) => state.blocked_effects == 0,
+                    GpuMessage::CloseChannel(id) => {
+                        !running.iter().any(|(channel, _)| *channel == Some(*id))
+                    }
+                    _ => running.is_empty(),
+                });
+                next.map(|index| state.deferred.remove(index).unwrap())
             };
+            if let Some(message) = message {
+                let channel = match &message {
+                    GpuMessage::Submission(queued) => Some(queued.submission.channel.id()),
+                    _ => None,
+                };
+                running.push((channel, Box::pin(Self::execute(Rc::clone(owner), message))));
+                continue;
+            }
+            if owner.borrow().recheck {
+                continue;
+            }
+            owner.borrow_mut().flush_progress()?;
+            let message = owner.borrow().receiver.recv();
             match message {
-                GpuMessage::Wake
-                | GpuMessage::MemoryAccess(_)
-                | GpuMessage::CancelMemory(_)
-                | GpuMessage::GuestMemoryReleased { .. }
-                | GpuMessage::PhysicalRetired { .. }
-                | GpuMessage::AllocationPressure { .. } => self.service_control(message)?,
-                message => self.execute(frontend, &mut channels, message)?,
+                Ok(message) => owner.borrow_mut().service_control(message)?,
+                Err(_) if running.is_empty() => return Ok(()),
+                Err(_) => {
+                    return Err(owner.borrow().failure(
+                        FrontendSubmissionId::new(0),
+                        "GPU inbox disconnected with suspended commands",
+                    ));
+                }
             }
         }
     }
-    fn execute<L: MaxwellFrontend<Work = W>>(
-        &mut self,
-        frontend: &mut L,
-        channels: &mut std::collections::BTreeMap<
-            nixe_gpu_maxwell::MaxwellChannelId,
-            nixe_gpu_maxwell::MaxwellGpuChannel,
-        >,
+    async fn execute(
+        owner: Rc<RefCell<Self>>,
         message: GpuMessage,
     ) -> Result<(), GpuExecutorFailure> {
-        match message {
-            GpuMessage::Submission(queued) => self.submission(frontend, channels, queued),
+        let frontend = Rc::clone(&owner.borrow().frontend);
+        let mut host = CommandHost {
+            owner: Rc::clone(&owner),
+            clock: Default::default(),
+        };
+        let conversion = match message {
+            GpuMessage::Submission(queued) => return Self::submission(owner, queued).await,
             GpuMessage::CloseChannel(channel) => {
-                channels.remove(&channel);
-                Ok(())
+                owner.borrow_mut().channels.remove(&channel);
+                frontend.borrow_mut().close_channel(channel);
+                return Ok(());
             }
             GpuMessage::PresentImage { request, reply } => {
                 let result = frontend
+                    .borrow_mut()
                     .lower_presentation(request)
                     .map_err(|error| error.to_string().into_boxed_str())
                     .and_then(|request| {
-                        self.backend
+                        owner
+                            .borrow()
+                            .backend
                             .borrow_mut()
                             .as_mut()
                             .ok_or_else(|| Box::<str>::from("GPU backend is unavailable"))?
@@ -325,75 +382,67 @@ where
                 nixe_memory::trace::event("frame_ready", 0, 0, 0);
                 let error = result.as_ref().err().cloned();
                 let _ = reply.send(result);
-                error.map_or(Ok(()), |detail| {
-                    Err(self.failure(FrontendSubmissionId::new(0), detail))
-                })
+                return error.map_or(Ok(()), |detail| {
+                    Err(owner.borrow().failure(FrontendSubmissionId::new(0), detail))
+                });
             }
             GpuMessage::ConvertNv12 {
                 images,
                 transform,
                 reply,
-            } => {
-                let work = frontend.lower_nv12_conversion(*images, transform);
-                self.conversion(work, reply)
-            }
+            } => (
+                frontend
+                    .borrow_mut()
+                    .lower_nv12_conversion(*images, transform),
+                reply,
+            ),
             GpuMessage::DecodedPlanes {
                 images,
                 data,
                 reply,
             } => {
                 let work = match data {
-                    DecodedPlaneData::Device(frame) => {
-                        frontend.lower_device_plane_uploads(*images, frame)
-                    }
+                    DecodedPlaneData::Device(frame) => frontend
+                        .borrow_mut()
+                        .lower_device_plane_uploads(*images, frame),
                     DecodedPlaneData::Linear {
                         bytes,
                         visible_widths,
-                    } => frontend.lower_decoded_plane_uploads(*images, bytes, visible_widths),
+                    } => frontend.borrow_mut().lower_decoded_plane_uploads(
+                        *images,
+                        bytes,
+                        visible_widths,
+                    ),
                 };
-                self.conversion(work, reply)
+                (work, reply)
             }
-            message => {
-                self.service_control(message)?;
-                Ok(())
-            }
-        }
-    }
-    fn conversion(
-        &mut self,
-        work: Result<W, nixe_gpu_maxwell::MaxwellLoweringError>,
-        reply: mpsc::SyncSender<Result<(), Box<str>>>,
-    ) -> Result<(), GpuExecutorFailure> {
-        let work = match work {
-            Ok(work) => work,
-            Err(error) => {
-                let detail = error.to_string().into_boxed_str();
-                let _ = reply.send(Err(detail.clone()));
-                return Err(self.failure(FrontendSubmissionId::new(0), detail));
-            }
+            message => return owner.borrow_mut().service_control(message),
         };
-        let id = work.frontend();
-        let mut batch = W::Batch::default();
-        batch.work(&work);
-        let segment = batch
-            .finish(id, nixe_gpu::FrontendSubmissionSegment::FIRST, true)
-            .map_err(|error| self.failure(id, error.to_string()))?;
-        if let Err(error) = self.prepare(&segment, id) {
-            let _ = reply.send(Err(error.detail.clone()));
-            return Err(error);
+        let (work, reply) = conversion;
+        let result: Result<_, GpuExecutorFailure> = async {
+            let work = work.map_err(|error| {
+                owner
+                    .borrow()
+                    .failure(FrontendSubmissionId::new(0), error.to_string())
+            })?;
+            let id = work.frontend;
+            host.emit_work(&work).await?;
+            let token = owner
+                .borrow()
+                .backend
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .submit(id)
+                .map_err(|error| owner.borrow().failure(id, error.to_string()))?;
+            Ok((id, token))
         }
-        let result = self
-            .backend
-            .borrow_mut()
-            .as_mut()
-            .ok_or_else(|| self.failure(id, "conversion requires an accelerated backend"))?
-            .submit(segment.execution_batch())
-            .map_err(|error| self.failure(id, error.to_string()));
+        .await;
         match result {
-            Ok(token) => {
-                self.conversions.push_back(PendingConversion {
+            Ok((frontend, token)) => {
+                owner.borrow_mut().conversions.push_back(PendingConversion {
                     token,
-                    frontend: id,
+                    frontend,
                     reply,
                 });
                 Ok(())
@@ -404,13 +453,8 @@ where
             }
         }
     }
-    fn submission<L: MaxwellFrontend<Work = W>>(
-        &mut self,
-        frontend: &mut L,
-        channels: &mut std::collections::BTreeMap<
-            nixe_gpu_maxwell::MaxwellChannelId,
-            nixe_gpu_maxwell::MaxwellGpuChannel,
-        >,
+    async fn submission(
+        owner: Rc<RefCell<Self>>,
         queued: GpuQueuedSubmission,
     ) -> Result<(), GpuExecutorFailure> {
         let GpuQueuedSubmission { submission, clock } = queued;
@@ -425,214 +469,73 @@ where
             permit,
         } = submission;
         let id = dispatch.scheduled().frontend();
-        let mut work = GpuWork {
-            clock,
+        let mut host = CommandHost {
+            owner: Rc::clone(&owner),
+            clock: clock.clone(),
+        };
+        let work = GpuWork {
             descriptor,
             request,
-            execution: MaxwellBackendExecution::begin(
-                id,
-                reservation.as_ref().map(ReservedTimelinePoint::point),
-            ),
+            frontend: id,
             reservation,
             control,
-            _permit: permit,
         };
-        let _trace = nixe_memory::trace::span("gpu_command_stream", id.get(), 0, 0);
-        let mut sources = std::mem::take(&mut self.sources);
-        let source_backend = Rc::clone(&self.backend);
-        let result = {
-            let context = channels.entry(channel.id()).or_insert_with(|| {
-                nixe_gpu_maxwell::MaxwellGpuChannel::from_configuration(channel)
-            });
-            context.update_configuration(channel);
-            stream_maxwell_frontend(
-                &dispatch,
+        let (mut sources, mut context, frontend) = {
+            let mut state = owner.borrow_mut();
+            // Leave the slot in place while the list owns its mutable registers.
+            // The scheduler admits at most one list for each channel.
+            let context = state
+                .channels
+                .entry(channel.id())
+                .or_insert_with(|| {
+                    Some(nixe_gpu_maxwell::MaxwellGpuChannel::from_configuration(
+                        channel,
+                    ))
+                })
+                .take()
+                .expect("channel has only one active command list");
+            (
+                std::mem::take(&mut state.sources),
                 context,
-                &address_space,
-                frontend,
-                &mut sources,
-                &mut |ranges, operation| {
-                    let mut backend = source_backend.borrow_mut();
-                    let backend = backend.as_mut().ok_or_else(|| {
-                        Arc::new(MemoryError::Invalid(
-                            "graphics memory access requires an accelerated backend",
-                        ))
-                    })?;
-                    backend
-                        .access_memory(ranges, operation)
-                        .map_err(|error| match error {
-                            nixe_gpu::BackendRuntimeError::Memory(cause) => cause,
-                            other => Arc::new(MemoryError::Execution(other.to_string().into())),
-                        })
-                },
-                &mut || {
-                    source_backend
-                        .borrow_mut()
-                        .as_mut()
-                        .ok_or_else(|| {
-                            Box::<str>::from("command fetch requires an accelerated backend")
-                        })?
-                        .synchronize_command_sources()
-                        .map_err(|error| error.to_string().into())
-                },
-                &mut |steps| {
-                    work.execution.append_steps(steps);
-                    self.consume(&mut work)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string().into_boxed_str())
-                },
+                Rc::clone(&state.frontend),
             )
         };
-        self.sources = sources;
-        let tail = result.map_err(|failure| GpuExecutorFailure {
+        context.update_configuration(channel);
+        let result = stream_maxwell_frontend(
+            &dispatch,
+            &mut context,
+            &address_space,
+            &frontend,
+            &mut sources,
+            &mut host,
+        )
+        .await;
+        let mut state = owner.borrow_mut();
+        *state.channels.get_mut(&channel.id()).unwrap() = Some(context);
+        state.sources.recycle(sources);
+        result.map_err(|failure| GpuExecutorFailure {
             memory_cause: None,
             frontend: id,
             detail: failure.to_string().into(),
             boundary: Some((
                 descriptor,
                 request,
-                Box::new(MaxwellFrontendDispatchBoundary::Frontend {
+                Box::new(MaxwellFrontendDispatchBoundary {
                     dispatch: Box::new(dispatch),
                     failure,
                 }),
             )),
         })?;
-        work.execution.append_steps(tail.into_steps().into_vec());
-        work.execution.seal();
-        let token = self.consume(&mut work)?;
-        if let Some(token) = token {
-            self.pending.push_back(PendingWork { token, work });
-        } else {
-            publish_completion(work)?;
-        }
+        drop(permit);
+        let token = state
+            .backend
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .submit(id)
+            .map_err(|error| state.failure(id, error.to_string()))?;
+        state.pending.push_back(PendingWork { token, work });
         Ok(())
-    }
-    fn consume(
-        &mut self,
-        work: &mut GpuWork<W>,
-    ) -> Result<Option<BackendSubmissionToken>, GpuExecutorFailure> {
-        let id = work.execution.frontend();
-        let mut completion = None;
-        loop {
-            if self.budget.is_stopped() {
-                return Err(self.failure(id, "GPU owner is shutting down"));
-            }
-            let segment = {
-                let mut backend = self.backend.borrow_mut();
-                work.execution
-                    .next_segment_with_memory(
-                        nixe_gpu_maxwell::maxwell_gpu_timestamp(work.clock.scheduler_time_ns()),
-                        &mut |ranges, operation| {
-                            backend
-                                .as_mut()
-                                .ok_or_else(|| {
-                                    Arc::new(MemoryError::Invalid(
-                                        "graphics memory access requires an accelerated backend",
-                                    ))
-                                })?
-                                .access_memory(ranges, operation)
-                                .map_err(|error| match error {
-                                    nixe_gpu::BackendRuntimeError::Memory(cause) => cause,
-                                    other => {
-                                        Arc::new(MemoryError::Execution(other.to_string().into()))
-                                    }
-                                })
-                        },
-                    )
-                    .map_err(|error| self.failure(id, error.to_string()))?
-            };
-            if let Some(segment) = segment {
-                self.prepare(&segment, id)?;
-                {
-                    let mut backend = self.backend.borrow_mut();
-                    let runtime = backend.as_mut().ok_or_else(|| {
-                        self.failure(id, "submission requires an accelerated GPU backend")
-                    })?;
-                    if segment.is_final_segment() {
-                        let token = runtime
-                            .submit(segment.execution_batch())
-                            .map_err(|error| self.failure(id, error.to_string()))?;
-                        assert!(
-                            completion.replace(token).is_none(),
-                            "one completion per delivery"
-                        );
-                    } else {
-                        runtime
-                            .record(segment.execution_batch())
-                            .map_err(|error| self.failure(id, error.to_string()))?;
-                    }
-                }
-                work.execution.recycle_segment(segment);
-                work.execution.accept_segment();
-                work.execution.retire_consumed_steps();
-                if completion.is_none() {
-                    self.service_ready_control()?;
-                }
-                continue;
-            }
-            work.execution.retire_consumed_steps();
-            if completion.is_none() {
-                self.service_ready_control()?;
-            }
-            if work.execution.is_finished() || work.execution.waiting_for_input() {
-                return Ok(completion);
-            }
-            return Err(self.failure(
-                id,
-                "command processor retained an unsupported blocking effect",
-            ));
-        }
-    }
-    fn prepare(
-        &mut self,
-        segment: &<W::Batch as MaxwellWorkBatch<W>>::Segment,
-        id: FrontendSubmissionId,
-    ) -> Result<(), GpuExecutorFailure> {
-        loop {
-            if self.budget.is_stopped() {
-                return Err(self.failure(id, "GPU owner stopped during host preparation"));
-            }
-            let ready = self
-                .backend
-                .borrow_mut()
-                .as_mut()
-                .ok_or_else(|| self.failure(id, "submission requires an accelerated GPU backend"))?
-                .prepare(segment.execution_batch())
-                .map_err(|error| self.failure(id, error.to_string()))?;
-            if ready {
-                return Ok(());
-            }
-            self.pump()?;
-        }
-    }
-    fn pump(&mut self) -> Result<(), GpuExecutorFailure> {
-        self.poll()?;
-        if self.budget.take_progress_request() {
-            self.flush_progress()?;
-        }
-        // Compiler completion has its own wakeup. Waiting for it does not
-        // require submission or guest-visible completion of unrelated work.
-        match self.receiver.recv() {
-            Ok(message @ GpuMessage::MemoryAccess(_)) => {
-                // Keep the existing between-effect control priority and FIFO
-                // order without servicing guest memory inside preparation.
-                let index = self
-                    .deferred
-                    .iter()
-                    .position(|pending| !matches!(pending, GpuMessage::MemoryAccess(_)))
-                    .unwrap_or(self.deferred.len());
-                self.deferred.insert(index, message);
-                Ok(())
-            }
-            Ok(message) => {
-                self.service_control(message)?;
-                Ok(())
-            }
-            Err(_) => Err(self.failure(
-                FrontendSubmissionId::new(0),
-                "GPU inbox disconnected during command consumption",
-            )),
-        }
     }
     fn cancel(&mut self, cause: &Arc<MemoryError>) {
         for pending in self.conversions.drain(..) {
@@ -654,16 +557,8 @@ where
         }
     }
 }
-fn publish_completion<W: MaxwellWork>(work: GpuWork<W>) -> Result<(), GpuExecutorFailure> {
-    let id = work.execution.frontend();
-    if work.execution.completion() != work.reservation.as_ref().map(ReservedTimelinePoint::point) {
-        return Err(GpuExecutorFailure {
-            memory_cause: None,
-            frontend: id,
-            boundary: None,
-            detail: "GPU completion does not match its reserved timeline".into(),
-        });
-    }
+fn publish_completion(work: GpuWork) -> Result<(), GpuExecutorFailure> {
+    let id = work.frontend;
     if let Some(reservation) = work.reservation {
         work.control
             .lock()
@@ -681,3 +576,178 @@ fn publish_completion<W: MaxwellWork>(work: GpuWork<W>) -> Result<(), GpuExecuto
 
 #[cfg(test)]
 mod tests;
+
+struct CommandHost<
+    'a,
+    L: MaxwellFrontend,
+    E: GpuExecution<
+            Commands = nixe_gpu::native::NativeWork,
+            ImageRequest = nixe_gpu::native::NativePresentationImage,
+        >,
+> {
+    owner: Rc<RefCell<Owner<'a, L, E>>>,
+    clock: nixe_runtime::VirtualClock,
+}
+impl<
+    L: MaxwellFrontend,
+    E: GpuExecution<
+            Commands = nixe_gpu::native::NativeWork,
+            ImageRequest = nixe_gpu::native::NativePresentationImage,
+        >,
+> CommandHost<'_, L, E>
+{
+    async fn emit_work(
+        &mut self,
+        command: &nixe_gpu::native::NativeWork,
+    ) -> Result<(), GpuExecutorFailure> {
+        let mut retained = None;
+        let mut blocked = false;
+        let result = poll_fn(|_| {
+            let mut owner = self.owner.borrow_mut();
+            if owner.budget.is_stopped() {
+                return Poll::Ready(Err(
+                    owner.failure(command.frontend, "GPU owner stopped during preparation")
+                ));
+            }
+            let ready = owner
+                .backend
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .consume(command)
+                .map_err(|error| owner.failure(command.frontend, error.to_string()))?;
+            if !ready {
+                if retained.is_none() {
+                    let mut inputs = Vec::new();
+                    command
+                        .command
+                        .retain_inputs(&mut inputs)
+                        .map_err(|error| owner.failure(command.frontend, error.to_string()))?;
+                    retained = Some(inputs);
+                }
+                if !blocked {
+                    blocked = true;
+                    owner.blocked_effects += 1;
+                }
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(()))
+        })
+        .await;
+        if blocked {
+            self.owner.borrow_mut().blocked_effects -= 1;
+        }
+        result
+    }
+}
+impl<
+    L: MaxwellFrontend,
+    E: GpuExecution<
+            Commands = nixe_gpu::native::NativeWork,
+            ImageRequest = nixe_gpu::native::NativePresentationImage,
+        >,
+> nixe_gpu_maxwell::MaxwellCommandHost for CommandHost<'_, L, E>
+{
+    async fn emit(
+        &mut self,
+        work: nixe_gpu::native::NativeWork,
+    ) -> Result<(), nixe_gpu_maxwell::MaxwellSubmissionExecutionError> {
+        self.emit_work(&work).await.map_err(|error| {
+            nixe_gpu_maxwell::MaxwellSubmissionExecutionError::Native(error.to_string().into())
+        })
+    }
+    unsafe fn memory_written(
+        &mut self,
+        machine: nixe_memory::MachineId,
+        extents: &[(nixe_memory::AllocationId, nixe_memory::Extent)],
+    ) -> Result<(), Arc<MemoryError>> {
+        unsafe {
+            self.owner
+                .borrow()
+                .backend
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .memory_written(machine, extents)
+        }
+        .map_err(|error| match error {
+            nixe_gpu::BackendRuntimeError::Memory(cause) => cause,
+            other => Arc::new(MemoryError::Execution(other.to_string().into())),
+        })
+    }
+    fn access(
+        &mut self,
+        ranges: Vec<nixe_memory::AllocationRange>,
+        operation: nixe_memory::AccessOperation,
+    ) -> Result<nixe_memory::AccessResult, Arc<MemoryError>> {
+        let result = self
+            .owner
+            .borrow()
+            .backend
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .access_memory(ranges, operation)
+            .map_err(|error| match error {
+                nixe_gpu::BackendRuntimeError::Memory(cause) => cause,
+                other => Arc::new(MemoryError::Execution(other.to_string().into())),
+            })?;
+        let mut pending = match result {
+            nixe_gpu::OwnerAccess::Ready(result) => return Ok(result),
+            nixe_gpu::OwnerAccess::Pending(pending) => pending,
+        };
+        // Like Eden's synchronous ReadBlock/FlushRegion, resource capture must
+        // finish the actual native producer before reading its bytes. Service
+        // control while waiting, but do not recursively execute another channel.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/memory_manager.cpp
+        self.owner.borrow_mut().blocked_effects += 1;
+        let result = (|| {
+            loop {
+                let mut owner = self.owner.borrow_mut();
+                owner
+                    .poll()
+                    .and_then(|()| owner.flush_progress())
+                    .map_err(|error| {
+                        error
+                            .memory_cause
+                            .unwrap_or_else(|| Arc::new(MemoryError::Execution(error.detail)))
+                    })?;
+                if let Some(result) = pending.poll() {
+                    return result;
+                }
+                if owner.budget.is_stopped() {
+                    return Err(Arc::new(MemoryError::Execution(
+                        "GPU owner stopped during memory access".into(),
+                    )));
+                }
+                match owner.receiver.recv() {
+                    Ok(message) => owner
+                        .service_control(message)
+                        .map_err(|error| Arc::new(MemoryError::Execution(error.detail)))?,
+                    Err(_) => {
+                        return Err(Arc::new(MemoryError::Execution(
+                            "GPU inbox disconnected during memory access".into(),
+                        )));
+                    }
+                }
+            }
+        })();
+        self.owner.borrow_mut().blocked_effects -= 1;
+        result
+    }
+
+    fn control(&mut self) -> Result<(), nixe_gpu_maxwell::MaxwellSubmissionExecutionError> {
+        let mut owner = self.owner.borrow_mut();
+        if owner.budget.is_stopped() {
+            return Err(nixe_gpu_maxwell::MaxwellSubmissionExecutionError::Native(
+                "GPU owner is shutting down".into(),
+            ));
+        }
+        owner.service_ready_control().map_err(|error| {
+            nixe_gpu_maxwell::MaxwellSubmissionExecutionError::Native(error.to_string().into())
+        })
+    }
+    fn timestamp(&self) -> u64 {
+        nixe_gpu_maxwell::maxwell_gpu_timestamp(self.clock.scheduler_time_ns())
+    }
+}

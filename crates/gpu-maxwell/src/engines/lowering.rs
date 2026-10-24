@@ -1841,7 +1841,7 @@ fn validate_consumed_state(
         // Smooth preserves the interpolation selected by translated shader
         // inputs and therefore needs no fixed-function override. Flat shading
         // changes the primitive-wide source value and remains a typed boundary
-        // until T10 represents that override explicitly.
+        // until the shader translator represents that override explicitly.
         return Err(MaxwellLoweringError::UnsupportedShadeModeSemantics(
             MaxwellThreeDShadeMode::Flat,
         ));

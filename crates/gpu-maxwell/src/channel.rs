@@ -171,8 +171,7 @@ impl MaxwellZCullBinding {
 
 /// Scheduling policy selected for initial frontend execution.
 ///
-/// The policy is explicit even before T6-D supplies its queue so no channel
-/// type can accidentally imply that only one channel may exist.
+/// The policy is explicit so no channel type implies that only one channel may exist.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum MaxwellChannelSchedulingPolicy {
     #[default]

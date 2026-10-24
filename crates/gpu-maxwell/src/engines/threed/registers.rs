@@ -182,40 +182,6 @@ pub(super) fn passive(method: GpuMethodId) -> bool {
             .unwrap_or(false)
 }
 
-/// Validate the encoding consumed by the register write, independently of
-/// relational/rendering validation at a later draw. Pure decoders build no
-/// state mirror; repeated equal, already admitted values need no validation.
-#[inline]
-pub(super) fn validate_encoding(
-    source: crate::MaxwellMethodSource,
-    candidate: &MaxwellThreeDFrontendState,
-) -> Result<(), MaxwellEngineDispatchError> {
-    match register_family(source.method().0) {
-        RegisterFamily::VertexAndBinding => {
-            if preflight_vertex_and_binding_state(source, candidate)?.is_none() {
-                return Err(MaxwellEngineDispatchError::UnknownMethod {
-                    source,
-                    class_name: CLASS_NAME,
-                });
-            }
-        }
-        RegisterFamily::InlineToMemory => {
-            inline_to_memory::preflight(source, candidate.operation_state().inline_to_memory())?;
-        }
-        _ => {
-            if let Some(declaration) = METHODS_BY_DWORD[(source.method().0 / 4) as usize].as_ref() {
-                decode_declared_state(source, declaration)?;
-            } else if preflight_output_state(source)?.is_none() {
-                return Err(MaxwellEngineDispatchError::UnknownMethod {
-                    source,
-                    class_name: CLASS_NAME,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 pub(super) fn materialize(
     profile: &MaxwellGpuProfile,
     candidate: &mut MaxwellThreeDFrontendState,
@@ -389,6 +355,55 @@ mod tests {
             current.matches(state.operation_state())
                 && current.matches_parameters(state.operation_state())
         );
+    }
+
+    #[test]
+    fn passive_values_are_decoded_once_when_consumed() {
+        let mut channel = crate::engines::tests::three_d_channel();
+        crate::engines::tests::program_three_d(&mut channel, 0x1220, 5);
+        let source = channel
+            .three_d()
+            .render_targets()
+            .compression_threshold()
+            .source()
+            .unwrap();
+        let (profile, state) = channel.three_d_with_profile_mut();
+        let write = |state: &mut MaxwellThreeDFrontendState, value| {
+            let mut method = MaxwellMethodDispatch::emitted_by_mme(
+                source.emitted_by_mme(GpuMethodId(0x1220), value),
+                CLASS,
+            );
+            write_plain_method(&mut method, state)
+        };
+        assert!(write(state, 13).unwrap());
+        assert!(write(state, 8).unwrap());
+        assert_eq!(
+            state
+                .operation_state()
+                .render_targets()
+                .compression_threshold()
+                .raw(),
+            Some(5)
+        );
+        materialize(profile, state, u64::MAX).unwrap();
+        assert_eq!(
+            state
+                .operation_state()
+                .render_targets()
+                .compression_threshold()
+                .raw(),
+            Some(8)
+        );
+
+        assert!(write(state, 13).unwrap());
+        assert!(matches!(
+            materialize(profile, state, u64::MAX),
+            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
+                source,
+                method_name: "SET_COMPRESSION_THRESHOLD",
+                ..
+            }) if source.argument() == 13
+        ));
     }
 
     #[test]

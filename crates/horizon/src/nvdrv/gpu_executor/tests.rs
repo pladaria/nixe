@@ -80,24 +80,24 @@ fn admission_bounds_real_deliveries_and_teardown_wakes_capacity_waiters() {
     let budget = Arc::new(GpuWorkBudget::default());
     let mut permits = Vec::new();
     for _ in 0..MAX_GPU_SUBMISSIONS_IN_FLIGHT {
-        let Some(GpuSubmissionAdmission::Ready(permit)) = budget.reserve() else {
+        let Some(GpuSubmissionAdmission::Ready(permit)) = budget.reserve(0) else {
             panic!("capacity available");
         };
         permits.push(permit);
     }
     assert!(matches!(
-        budget.reserve(),
+        budget.reserve(0),
         Some(GpuSubmissionAdmission::Pending(_))
     ));
     permits.pop();
     assert!(budget.readable.is_signalled());
-    let Some(GpuSubmissionAdmission::Ready(permit)) = budget.reserve() else {
+    let Some(GpuSubmissionAdmission::Ready(permit)) = budget.reserve(0) else {
         panic!("released capacity");
     };
     permits.push(permit);
     budget.stop();
     assert!(budget.readable.is_signalled());
-    assert!(budget.reserve().is_none());
+    assert!(budget.reserve(0).is_none());
     drop(permits);
     assert_eq!(budget.state.lock().unwrap().active, 0);
 }
@@ -123,7 +123,7 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
         MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellChannelId,
         MaxwellChannelOwner, MaxwellGpfifoSubmitRequest, MaxwellGpuAddressSpace, MaxwellGpuChannel,
         MaxwellScheduler, SWITCH_1_GM20B_PROFILE, decode_gpfifo_submission,
-        resolve_gpfifo_submission,
+        validate_gpfifo_submission,
     };
     use nixe_memory::{AllocationRange, Machine};
 
@@ -154,7 +154,7 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
         &[],
     )
     .unwrap();
-    let retained = resolve_gpfifo_submission(
+    let retained = validate_gpfifo_submission(
         &channel.configuration(),
         FrontendSubmissionId::new(1),
         decoded,
@@ -192,7 +192,7 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
         inputs: vec![input],
     };
     let executor = NvDrvGpuExecutor::new(machine);
-    let GpuSubmissionAdmission::Ready(permit) = executor.reserve_submission().unwrap() else {
+    let GpuSubmissionAdmission::Ready(permit) = executor.reserve_submission(0).unwrap() else {
         panic!()
     };
     let descriptor = NvDrvDeviceDescriptor::open(
@@ -226,4 +226,31 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
             .is_err()
     );
     assert!(executor.teardown().unwrap_err().boundary.is_some());
+}
+
+#[test]
+fn admission_accounts_owned_bytes_and_releases_them_before_device_completion() {
+    let budget = Arc::new(GpuWorkBudget::default());
+    let Some(GpuSubmissionAdmission::Ready(first)) = budget.reserve(MAX_GPU_INGRESS_BYTES - 8)
+    else {
+        panic!("initial capacity")
+    };
+    assert!(matches!(
+        budget.reserve(9),
+        Some(GpuSubmissionAdmission::Pending(_))
+    ));
+    let Some(GpuSubmissionAdmission::Ready(last)) = budget.reserve(8) else {
+        panic!("exact remaining capacity")
+    };
+    assert_eq!(budget.state.lock().unwrap().bytes, MAX_GPU_INGRESS_BYTES);
+    drop(first);
+    assert_eq!(budget.state.lock().unwrap().bytes, 8);
+    let Some(GpuSubmissionAdmission::Ready(replacement)) =
+        budget.reserve(MAX_GPU_INGRESS_BYTES - 8)
+    else {
+        panic!("consumed descriptor storage reusable")
+    };
+    drop(last);
+    drop(replacement);
+    assert_eq!(budget.state.lock().unwrap().bytes, 0);
 }

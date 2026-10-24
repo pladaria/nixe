@@ -221,12 +221,8 @@ impl VulkanResidency {
             self.copy_image_bytes(source, &scratch, &copies)?;
         }
         let slot = self.device.begin_recording()?;
-        scratch_read_barrier(
-            &self.device,
-            self.device.submission.slots[slot].command,
-            scratch.handle,
-            scratch_bytes,
-        );
+        let command = self.device.submission.slots[slot].command;
+        scratch_read_barrier(&mut self.device, command, scratch.handle, scratch_bytes);
         self.copy_rows_to_image(&scratch, base, id, &dirty)
     }
 

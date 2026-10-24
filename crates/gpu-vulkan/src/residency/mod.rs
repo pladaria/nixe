@@ -317,10 +317,30 @@ pub struct VulkanResidency {
     descriptor_offsets: Vec<u32>,
     streamed_uses: Vec<usize>,
     stream_inputs: Vec<nixe_memory::AllocationRange>,
+    uniform_cache_hits: [u64; 18],
+    uniform_cache_shots: [u64; 18],
+    uniform_stream_limit: u64,
 }
 impl VulkanResidency {
     pub(crate) fn memory(&self) -> &Machine {
         &self.memory
+    }
+    pub(crate) unsafe fn owner_memory_written(
+        &mut self,
+        extents: &[(nixe_memory::AllocationId, nixe_memory::Extent)],
+    ) -> Result<(), VulkanError> {
+        // RAM is already updated under the original mapping guard. Exact native
+        // coverage changes now; dirty-page cache invalidation is consumed at the
+        // next resource access, just like the cached-write accumulator.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/memory_manager.cpp
+        self.authority
+            .cpu_write_extents(extents.iter().copied())
+            .map_err(memory_error)?;
+        unsafe {
+            self.authority
+                .retire_unused_device_extents(&self.memory, extents.iter().copied())
+        }
+        .map_err(memory_error)
     }
     pub(crate) fn consume_cpu_writes(
         &mut self,
@@ -451,6 +471,9 @@ impl VulkanResidency {
             descriptor_offsets: Vec::new(),
             streamed_uses: Vec::new(),
             stream_inputs: Vec::new(),
+            uniform_cache_hits: [0; 18],
+            uniform_cache_shots: [0; 18],
+            uniform_stream_limit: 4096,
         };
         cache.maintain_budget(true)?;
         Ok(cache)
@@ -950,9 +973,12 @@ impl VulkanResidency {
             self.barriers.emit(&mut self.device);
         }
         let work = match unsafe {
-            self.device
-                .submission
-                .flush(self.device.queue, &self.device.dispatch, waits, signals)
+            self.device.submission.flush(
+                self.device.queue,
+                &mut self.device.dispatch,
+                waits,
+                signals,
+            )
         } {
             Ok(work) => work,
             Err(error) => {

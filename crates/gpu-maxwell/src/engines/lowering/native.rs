@@ -15,7 +15,7 @@ use nixe_gpu::shader_module::ResourceId;
 type GraphicsSourceKey = [Option<(nixe_shader_recompiler::Stage, u64, Option<u8>, u32)>;
     crate::MAXWELL_PIPELINE_SHADER_COUNT];
 
-type ComputeSourceKey = (u64, [u32; 3], u32, u32, u32);
+type ComputeSourceKey = (crate::MaxwellAddressSpaceId, u64, [u32; 3], u32, u32, u32);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeFrontendStatistics {
@@ -30,6 +30,9 @@ pub struct NativeFrontendStatistics {
 }
 struct Code {
     state: super::super::threed::state::MaxwellThreeDShaderStateIdentity,
+    address_space: crate::MaxwellAddressSpaceId,
+    mapping_generation: u64,
+    code_generation: u64,
     source: GraphicsSourceKey,
     snapshot: Arc<crate::recompiler::CapturedProgram>,
     code: Arc<GuestShaderCode>,
@@ -51,32 +54,55 @@ struct PresentationKey {
     layout: nixe_gpu::ImageMemoryLayout,
     row_pitch: u32,
 }
-pub struct MaxwellNativeFrontend {
-    presentation: Vec<(PresentationKey, Arc<[GuestImagePlane]>)>,
+// Dirty revisions and current bindings belong to the channel. Immutable content
+// caches and the compiler below belong to the command owner and survive switches.
+struct ChannelPreparation {
     resources: super::super::threed::MaxwellThreeDResolvedResourceCache,
     draw_roles: Vec<MaxwellThreeDResourceRole>,
     code: Option<Code>,
-    source_codes: nixe_gpu::WorkingSet<GraphicsSourceKey, Arc<crate::recompiler::CapturedProgram>>,
     prepared: Option<Prepared>,
+    prepared_compute: Option<Arc<GuestProgram>>,
+    compute_resources: Option<super::super::compute::ComputeResources>,
+    compute: Option<Arc<crate::recompiler::CapturedProgram>>,
+}
+pub struct MaxwellNativeFrontend {
+    presentation: Vec<(PresentationKey, Arc<[GuestImagePlane]>)>,
+    source_codes: nixe_gpu::WorkingSet<
+        (crate::MaxwellAddressSpaceId, GraphicsSourceKey),
+        Arc<crate::recompiler::CapturedProgram>,
+    >,
     interfaces: nixe_gpu::WorkingSet<nixe_gpu::shader_identity::ContentId, Arc<ShaderInterface>>,
     parameter_states: nixe_gpu::WorkingSet<ParameterKey, Arc<GuestDrawParameters>>,
     programs: nixe_gpu::WorkingSet<ProgramKey, Arc<GuestProgram>>,
     draws: nixe_gpu::WorkingSet<Arc<GuestDrawState>, Arc<GuestDrawState>>,
     next: u64,
-    methods: Vec<crate::MaxwellMethodDispatch>,
     parameters: Vec<u32>,
     pub statistics: NativeFrontendStatistics,
     image_views: nixe_gpu::WorkingSet<ImageKey, GuestImage>,
     capture_compiler: Option<nixe_shader_recompiler::Compiler>,
     capture_memory: crate::recompiler::MemoryCache,
-    configuration: Arc<nixe_gpu::shader_compilation::Configuration>,
+    configuration: nixe_gpu::shader_compilation::Configuration,
     compute_sources:
         nixe_gpu::WorkingSet<ComputeSourceKey, Arc<crate::recompiler::CapturedProgram>>,
     captured_codes:
         nixe_gpu::WorkingSet<nixe_gpu::shader_identity::ContentId, Arc<GuestShaderCode>>,
-    prepared_compute: Option<Arc<GuestProgram>>,
-    compute_resources: Option<super::super::compute::ComputeResources>,
-    compute: Option<Arc<crate::recompiler::CapturedProgram>>,
+
+    channel: ChannelPreparation,
+    current_channel: Option<crate::MaxwellChannelId>,
+    channels: std::collections::BTreeMap<crate::MaxwellChannelId, Option<ChannelPreparation>>,
+}
+impl ChannelPreparation {
+    fn new(alignment: u64) -> Self {
+        Self {
+            resources: MaxwellThreeDResolvedResourceCache::new(alignment),
+            draw_roles: Vec::new(),
+            code: None,
+            prepared: None,
+            prepared_compute: None,
+            compute_resources: None,
+            compute: None,
+        }
+    }
 }
 fn compilation(error: impl Display) -> Error {
     Error::Native(error.to_string().into())
@@ -86,32 +112,27 @@ fn lowering<T>(result: Result<T, MaxwellLoweringError>) -> Result<T, Error> {
 }
 impl MaxwellNativeFrontend {
     pub fn new(configuration: nixe_gpu::shader_compilation::Configuration) -> Self {
+        let channel = ChannelPreparation::new(configuration.host.min_ssbo_alignment);
         Self {
             presentation: Vec::new(),
-            resources: MaxwellThreeDResolvedResourceCache::new(
-                configuration.host.min_ssbo_alignment,
-            ),
-            draw_roles: Vec::new(),
-            code: None,
             source_codes: nixe_gpu::WorkingSet::new(2048, 32 * 1024 * 1024),
-            prepared: None,
             interfaces: nixe_gpu::WorkingSet::new(2048, 8 * 1024 * 1024),
             parameter_states: nixe_gpu::WorkingSet::new(8192, 16 * 1024 * 1024),
             programs: nixe_gpu::WorkingSet::new(8192, 32 * 1024 * 1024),
             draws: nixe_gpu::WorkingSet::new(8192, 64 * 1024 * 1024),
             next: 1,
-            methods: Vec::new(),
             parameters: Vec::new(),
             statistics: Default::default(),
             image_views: nixe_gpu::WorkingSet::new(4096, IMAGE_VIEW_BYTES),
-            compute: None,
             capture_compiler: None,
             capture_memory: Default::default(),
-            configuration: Arc::new(configuration),
+            configuration,
             compute_sources: nixe_gpu::WorkingSet::new(256, 8 * 1024 * 1024),
             captured_codes: nixe_gpu::WorkingSet::new(2048, 64 * 1024 * 1024),
-            prepared_compute: None,
-            compute_resources: None,
+
+            channel,
+            current_channel: None,
+            channels: Default::default(),
         }
     }
     fn conversion_image(
@@ -137,8 +158,7 @@ impl MaxwellNativeFrontend {
     }
     fn identity(&mut self) -> nixe_gpu::PreparedStateId {
         let id = self.next;
-        self.next = self
-            .next
+        self.next = id
             .checked_add(1)
             .expect("native prepared identity exhausted");
         nixe_gpu::PreparedStateId::new(id, 1)
@@ -149,25 +169,27 @@ impl MaxwellNativeFrontend {
         space: &MaxwellGpuMemory,
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<(), Error> {
-        if let Some(code) = &mut self.code
+        let mapping_generation = space.mapping_generation().get();
+        let code_generation = space.machine().code_generation();
+        if let Some(code) = &mut self.channel.code
             && code.state.matches_code(state)
-            && (code.state.matches_bindings(state)
-                || code
-                    .snapshot
-                    .stages
-                    .iter()
-                    .zip(code.source.iter().flatten())
-                    .all(|(stage, source)| stage.graphics_bindings_current(state, source.2)))
-            && code
+            && code.address_space == space.id()
+        {
+            if code.mapping_generation == mapping_generation
+                && code.code_generation == code_generation
+            {
+                return Ok(());
+            }
+            if code
                 .snapshot
                 .stages
                 .iter()
                 .all(|stage| stage.memory_is_current(space))
-        {
-            if !code.state.matches_bindings(state) {
-                code.state = state.shader_state_identity();
+            {
+                code.mapping_generation = mapping_generation;
+                code.code_generation = code_generation;
+                return Ok(());
             }
-            return Ok(());
         }
         let mut source: GraphicsSourceKey = [None; crate::MAXWELL_PIPELINE_SHADER_COUNT];
         let mut requests = Vec::new();
@@ -193,11 +215,12 @@ impl MaxwellNativeFrontend {
                     .all(|(stage, (_, request))| stage.request_is_current(request, space))
         };
         let cached = self
+            .channel
             .code
             .as_ref()
             .filter(|code| code.source == source)
             .map(|code| Arc::clone(&code.snapshot))
-            .or_else(|| self.source_codes.get(&source).cloned());
+            .or_else(|| self.source_codes.get(&(space.id(), source)).cloned());
         let (cached, refreshed) = match cached {
             Some(snapshot) if valid(&snapshot) => (Some(snapshot), None),
             Some(snapshot) => (
@@ -213,8 +236,11 @@ impl MaxwellNativeFrontend {
         } else if let Some(snapshot) = refreshed {
             self.statistics.revalidated_captures += 1;
             let snapshot = Arc::new(snapshot);
-            self.source_codes
-                .insert(source, Arc::clone(&snapshot), snapshot.retained_bytes());
+            self.source_codes.insert(
+                (space.id(), source),
+                Arc::clone(&snapshot),
+                snapshot.retained_bytes(),
+            );
             snapshot
         } else {
             if self.capture_compiler.is_none() {
@@ -235,7 +261,7 @@ impl MaxwellNativeFrontend {
             self.statistics.shader_captures += 1;
             let weight = snapshot.retained_bytes();
             self.source_codes
-                .insert(source, Arc::clone(&snapshot), weight);
+                .insert((space.id(), source), Arc::clone(&snapshot), weight);
             snapshot
         };
         let inputs = &snapshot.inputs;
@@ -260,8 +286,11 @@ impl MaxwellNativeFrontend {
                 interface
             }
         };
-        self.code = Some(Code {
+        self.channel.code = Some(Code {
             state: state.shader_state_identity(),
+            address_space: space.id(),
+            mapping_generation,
+            code_generation,
             source,
             snapshot,
             code,
@@ -288,6 +317,7 @@ impl MaxwellNativeFrontend {
             return Ok(image.clone());
         }
         let image = GuestImage {
+            view_identity: Some(self.identity()),
             sample_grid: image::sample_grid(resolved.description().samples())?,
             description: resolved.description(),
             swizzle: resolved.view().swizzle(),
@@ -330,8 +360,8 @@ impl MaxwellNativeFrontend {
         }
         self.statistics.draws += 1;
         self.ensure_code(state, space, access)?;
-        let code = self.code.as_ref().unwrap();
-        let reuse_roles = self.prepared.as_ref().is_some_and(|p| {
+        let code = self.channel.code.as_ref().unwrap();
+        let reuse_roles = self.channel.prepared.as_ref().is_some_and(|p| {
             p.state.matches_parameters(state)
                 && Arc::ptr_eq(&p.code, &code.code)
                 && p.indexed == trigger.is_indexed()
@@ -342,16 +372,19 @@ impl MaxwellNativeFrontend {
                     == state.inline_index().is_some()
         });
         let roles = if reuse_roles {
-            self.prepared.as_ref().unwrap().roles.as_ref()
+            self.channel.prepared.as_ref().unwrap().roles.as_ref()
         } else {
-            self.draw_roles.clear();
-            self.draw_roles.extend_from_slice(&code.interface.roles);
-            trigger.append_resource_roles(state, &mut self.draw_roles);
-            self.draw_roles.sort_unstable();
-            self.draw_roles.dedup();
-            self.draw_roles.as_slice()
+            self.channel.draw_roles.clear();
+            self.channel
+                .draw_roles
+                .extend_from_slice(&code.interface.roles);
+            trigger.append_resource_roles(state, &mut self.channel.draw_roles);
+            self.channel.draw_roles.sort_unstable();
+            self.channel.draw_roles.dedup();
+            self.channel.draw_roles.as_slice()
         };
         let resources = self
+            .channel
             .resources
             .resolve_with_buffer_sizes(state, space, roles, &code.interface.sizes, 4096, access)
             .map_err(Error::ThreeDResource)?;
@@ -382,9 +415,9 @@ impl MaxwellNativeFrontend {
                 }
             }
         }
-        if let Some(p) = &self.prepared
+        if let Some(p) = &self.channel.prepared
             && p.state.matches(state)
-            && p.resources.same_bindings(&resources)
+            && p.resources.same_bindings(resources)
             && Arc::ptr_eq(&p.code, &code.code)
             && p.indexed == trigger.is_indexed()
             && p.draw
@@ -407,8 +440,9 @@ impl MaxwellNativeFrontend {
                 },
             });
         }
+        let resources = resources.clone();
         let prepared_roles = if reuse_roles {
-            Arc::clone(&self.prepared.as_ref().unwrap().roles)
+            Arc::clone(&self.channel.prepared.as_ref().unwrap().roles)
         } else {
             Arc::from(prepared_roles)
         };
@@ -416,7 +450,7 @@ impl MaxwellNativeFrontend {
         let shader_pixel_depth = code.interface.pixel_depth;
         let binding_roles = Arc::clone(&code.interface.bindings);
         let mut selection = None;
-        let (colors, depth_stencil) = if let Some(previous) = &self.prepared
+        let (colors, depth_stencil) = if let Some(previous) = &self.channel.prepared
             && previous.resources.same_group(&resources, 3)
             && previous.state.matches_parameters(state)
         {
@@ -445,7 +479,7 @@ impl MaxwellNativeFrontend {
         if extent.contains(&u32::MAX) {
             return Err(compilation("draw has no attachment extent"));
         }
-        let parameters = if let Some(prepared) = &self.prepared
+        let parameters = if let Some(prepared) = &self.channel.prepared
             && prepared.state.matches_parameters(state)
             && Arc::ptr_eq(&prepared.code, &shader)
             && prepared.indexed == trigger.is_indexed()
@@ -651,7 +685,7 @@ impl MaxwellNativeFrontend {
             }
         };
         let program = self.native_program(&shader, &binding_roles, &resources)?;
-        let vertices = if let Some(previous) = &self.prepared
+        let vertices = if let Some(previous) = &self.channel.prepared
             && previous.draw.parameters.vertices == parameters.vertices
             && parameters.vertices.iter().all(|vertex| {
                 previous.resources.same_resource(
@@ -733,7 +767,7 @@ impl MaxwellNativeFrontend {
         };
         // Canonical proofs come from this resolution, independently of the
         // immutable physical bindings retained by the draw template.
-        self.prepared = Some(Prepared {
+        self.channel.prepared = Some(Prepared {
             state: state.draw_state_identity(),
             resources,
             code: shader,
@@ -772,7 +806,7 @@ impl MaxwellNativeFrontend {
         roles: &[(ResourceId, MaxwellThreeDResourceRole)],
         resources: &MaxwellThreeDResolvedResources,
     ) -> Result<Arc<GuestProgram>, Error> {
-        if let Some(previous) = &self.prepared
+        if let Some(previous) = &self.channel.prepared
             && Arc::ptr_eq(&previous.code, shader)
             && previous.resources.same_group(resources, 1)
             && previous.resources.same_group(resources, 2)
@@ -781,6 +815,7 @@ impl MaxwellNativeFrontend {
             return Ok(Arc::clone(&previous.draw.program));
         }
         let previous = self
+            .channel
             .prepared
             .as_ref()
             .filter(|p| {
@@ -870,7 +905,7 @@ fn same_binding(a: &GuestBinding, b: &GuestBinding) -> bool {
                 image: b,
                 arrayed: ab,
             },
-        ) => aa == ab && a.same_view(b),
+        ) => aa == ab && a.same_prepared_view(b),
         (GuestBinding::Sampler(a), GuestBinding::Sampler(b)) => a == b,
         _ => false,
     }
@@ -919,7 +954,29 @@ fn native_arguments(
     draw_arguments(state, trigger)
 }
 impl MaxwellFrontend for MaxwellNativeFrontend {
-    type Work = NativeWork;
+    fn bind_channel(&mut self, channel: crate::MaxwellChannelId) {
+        if self.current_channel == Some(channel) {
+            return;
+        }
+        let next = self
+            .channels
+            .entry(channel)
+            .or_default()
+            .take()
+            .unwrap_or_else(|| ChannelPreparation::new(self.configuration.host.min_ssbo_alignment));
+        let previous = std::mem::replace(&mut self.channel, next);
+        if let Some(id) = self.current_channel.replace(channel) {
+            *self.channels.get_mut(&id).unwrap() = Some(previous);
+        }
+    }
+    fn close_channel(&mut self, channel: crate::MaxwellChannelId) {
+        self.channels.remove(&channel);
+        if self.current_channel == Some(channel) {
+            self.current_channel = None;
+            self.channel = ChannelPreparation::new(self.configuration.host.min_ssbo_alignment);
+        }
+    }
+
     fn lower_presentation(
         &mut self,
         request: nixe_gpu::PresentationImageRequest,
@@ -975,9 +1032,11 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
         let mut roles = Vec::new();
         trigger.append_resource_roles(state, &mut roles);
         let resources = self
+            .channel
             .resources
             .resolve(state, space, &roles, 4096, access)
-            .map_err(Error::ThreeDResource)?;
+            .map_err(Error::ThreeDResource)?
+            .clone();
         let clear = state.render_targets().clear();
         let surface = *clear
             .last_surface()
@@ -1091,9 +1150,9 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
                 .insert(inputs.identity, Arc::clone(&code), weight);
             code
         };
-        if let Some(program) = &self.prepared_compute
+        if let Some(program) = &self.channel.prepared_compute
             && Arc::ptr_eq(&program.shader, &code)
-            && let Some(resources) = &mut self.compute_resources
+            && let Some(resources) = &mut self.channel.compute_resources
             && resources
                 .refresh(launch, space, &mut self.capture_memory, access)
                 .map_err(Error::ComputeLaunch)?
@@ -1127,8 +1186,8 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
                 GuestBinding::Buffer(retained.backing.mapping().clone()),
             ));
         }
-        self.compute_resources = Some(resources);
-        if let Some(old) = &self.prepared_compute
+        self.channel.compute_resources = Some(resources);
+        if let Some(old) = &self.channel.prepared_compute
             && Arc::ptr_eq(&old.shader, &code)
             && old.bindings.len() == bindings.len()
             && old
@@ -1152,7 +1211,7 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             bindings: bindings.into_boxed_slice(),
             shared_memory_bytes: 0,
         });
-        self.prepared_compute = Some(Arc::clone(&program));
+        self.channel.prepared_compute = Some(Arc::clone(&program));
         Ok(NativeWork {
             frontend,
             command: NativeCommand::Dispatch {
@@ -1169,13 +1228,16 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<NativeWork, Error> {
         let resources = self
+            .channel
             .resources
             .resolve_solid_image(request, space, 4096, access)
             .map_err(Error::ThreeDResource)?;
-        let image = lowering(resolved_image(
-            &resources,
-            MaxwellThreeDResourceRole::BlitDestination,
-        ))?;
+        let role = if request.zeta {
+            MaxwellThreeDResourceRole::DepthStencilTarget
+        } else {
+            MaxwellThreeDResourceRole::BlitDestination
+        };
+        let image = lowering(resolved_image(&resources, role))?;
         let value = lowering(resolve::solid_clear_value(
             request.color,
             request.destination.format,
@@ -1185,7 +1247,7 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
         Ok(NativeWork {
             frontend,
             command: NativeCommand::Clear {
-                image: self.image(&resources, MaxwellThreeDResourceRole::BlitDestination)?,
+                image: self.image(&resources, role)?,
                 rectangle: nixe_gpu::ScissorRect {
                     x,
                     y,
@@ -1205,6 +1267,7 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
     ) -> Result<NativeWork, Error> {
         use super::super::twod::blit::BlitKind;
         let resources = self
+            .channel
             .resources
             .resolve_color_images(request, space, 4096, access)
             .map_err(Error::ThreeDResource)?;
@@ -1292,18 +1355,10 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             },
         })
     }
-    fn take_mme_scratch(&mut self) -> (Vec<crate::MaxwellMethodDispatch>, Vec<u32>) {
-        (
-            std::mem::take(&mut self.methods),
-            std::mem::take(&mut self.parameters),
-        )
+    fn take_mme_scratch(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.parameters)
     }
-    fn recycle_mme_scratch(
-        &mut self,
-        methods: Vec<crate::MaxwellMethodDispatch>,
-        parameters: Vec<u32>,
-    ) {
-        self.methods = methods;
+    fn recycle_mme_scratch(&mut self, parameters: Vec<u32>) {
         self.parameters = parameters;
     }
     fn lower_nv12_conversion(
@@ -1418,7 +1473,7 @@ mod producer_tests {
             crate::engines::tests::program_three_d(&mut channel, method, value);
         }
         let mut frontend = MaxwellNativeFrontend::new(Default::default());
-
+        frontend.bind_channel(crate::MaxwellChannelId::new(1));
         frontend
             .ensure_code(
                 channel.three_d(),
@@ -1426,6 +1481,39 @@ mod producer_tests {
                 &mut crate::test_memory::access(space.memory().machine()),
             )
             .unwrap();
+        let code = Arc::clone(&frontend.channel.code.as_ref().unwrap().code);
+        frontend.bind_channel(crate::MaxwellChannelId::new(2));
+        frontend
+            .ensure_code(channel.three_d(), space.memory(), &mut |_, _| {
+                panic!("shared capture should be current")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &code,
+            &frontend.channel.code.as_ref().unwrap().code
+        ));
+        frontend.close_channel(crate::MaxwellChannelId::new(2));
+        frontend.bind_channel(crate::MaxwellChannelId::new(2));
+        frontend
+            .ensure_code(channel.three_d(), space.memory(), &mut |_, _| {
+                panic!("closing a channel must not evict shared code")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &code,
+            &frontend.channel.code.as_ref().unwrap().code
+        ));
+        assert_eq!(frontend.statistics.shader_captures, 1);
+        frontend.bind_channel(crate::MaxwellChannelId::new(1));
+        frontend
+            .ensure_code(channel.three_d(), space.memory(), &mut |_, _| {
+                panic!("switching back must preserve the channel's current code")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &code,
+            &frontend.channel.code.as_ref().unwrap().code
+        ));
         // Rebinding an unused uniform slot does not reconstruct capture requests
         // or touch shader memory, even though the CB register group is dirty.
         use crate::engines::tests::register_benchmark::ALLOCATIONS;
@@ -1449,8 +1537,8 @@ mod producer_tests {
         assert_eq!(allocations, 0);
         assert_eq!(frontend.statistics.shader_captures, 1);
         assert_eq!(frontend.statistics.revalidated_captures, 0);
-        let first = Arc::clone(&frontend.code.as_ref().unwrap().code);
-        let interface = Arc::clone(&frontend.code.as_ref().unwrap().interface);
+        let first = Arc::clone(&frontend.channel.code.as_ref().unwrap().code);
+        let interface = Arc::clone(&frontend.channel.code.as_ref().unwrap().interface);
         assert_eq!(first.stages.len(), 2);
         crate::engines::tests::program_three_d(&mut channel, 0x2044, 0x200);
         frontend
@@ -1460,7 +1548,10 @@ mod producer_tests {
                 &mut crate::test_memory::access(space.memory().machine()),
             )
             .unwrap();
-        assert!(!Arc::ptr_eq(&first, &frontend.code.as_ref().unwrap().code));
+        assert!(!Arc::ptr_eq(
+            &first,
+            &frontend.channel.code.as_ref().unwrap().code
+        ));
         crate::engines::tests::program_three_d(&mut channel, 0x2044, 0x100);
         frontend
             .ensure_code(
@@ -1469,10 +1560,13 @@ mod producer_tests {
                 &mut crate::test_memory::access(space.memory().machine()),
             )
             .unwrap();
-        assert!(Arc::ptr_eq(&first, &frontend.code.as_ref().unwrap().code));
+        assert!(Arc::ptr_eq(
+            &first,
+            &frontend.channel.code.as_ref().unwrap().code
+        ));
         assert!(Arc::ptr_eq(
             &interface,
-            &frontend.code.as_ref().unwrap().interface
+            &frontend.channel.code.as_ref().unwrap().interface
         ));
         assert_eq!(frontend.statistics.shader_captures, 2);
         let word = mov(3f32.to_bits());
@@ -1492,7 +1586,7 @@ mod producer_tests {
             .unwrap();
         assert_ne!(
             first.identity,
-            frontend.code.as_ref().unwrap().code.identity
+            frontend.channel.code.as_ref().unwrap().code.identity
         );
         assert_eq!(frontend.statistics.shader_captures, 3);
     }

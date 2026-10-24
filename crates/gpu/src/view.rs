@@ -1,6 +1,7 @@
 //! Checked resource interpretations over explicit canonical backing ranges.
 
 use std::fmt::{Display, Formatter};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::{BackingView, BufferDescription, BufferId, ImageDescription, ImageId};
@@ -209,6 +210,7 @@ pub struct ImageView {
     swizzle: Swizzle,
     // Reidentifying a checked view never rebuilds its immutable subresource map.
     bindings: Arc<[ImageSubresourceBinding]>,
+    binding_fingerprint: u64,
     storage: ImageStorage,
 }
 
@@ -244,7 +246,7 @@ impl ImageView {
             }
         }
 
-        let bindings = bindings
+        let bindings: Arc<[ImageSubresourceBinding]> = bindings
             .into_iter()
             .map(|(subresources, layout, backing)| ImageSubresourceBinding {
                 subresources,
@@ -253,10 +255,19 @@ impl ImageView {
             })
             .collect::<Vec<_>>()
             .into();
+        let mut hasher = rustc_hash::FxHasher::default();
+        swizzle.hash(&mut hasher);
+        bindings.len().hash(&mut hasher);
+        for binding in bindings.iter() {
+            binding.subresources.hash(&mut hasher);
+            binding.layout.hash(&mut hasher);
+            binding.backing.mapping().hash(&mut hasher);
+        }
         Ok(Self {
             image,
             swizzle,
             bindings,
+            binding_fingerprint: hasher.finish(),
             storage: ImageStorage::CanonicalTexels,
         })
     }
@@ -294,6 +305,11 @@ impl ImageView {
     #[must_use]
     pub const fn image(&self) -> ImageId {
         self.image
+    }
+
+    #[must_use]
+    pub const fn binding_fingerprint(&self) -> u64 {
+        self.binding_fingerprint
     }
     /// Reidentifies the same storage and component interpretation in another
     /// resource list. No binding or storage policy changes.

@@ -259,6 +259,7 @@ impl NativeGpuExecution {
         };
         let retained = self.residency.constructing.len();
         let result = (|| loop {
+            self.residency.constructing.truncate(retained);
             let mut result = Vec::with_capacity(pipeline.binding_origins.len());
             for origin in &pipeline.binding_origins {
                 let binding = lookup(origin.resource)?;
@@ -704,6 +705,7 @@ mod tests {
             }
         }
         let whole = GuestImage {
+            view_identity: None,
             description: nixe_gpu::ImageDescription::new(
                 ImageDimension::Two,
                 nixe_gpu::ImageExtent::new(64, 64, 1).unwrap(),
@@ -723,6 +725,7 @@ mod tests {
         let before = execution.residency.statistics();
         for (mip, layer, offset, side) in [(0, 1, 20480, 64), (1, 1, 36864, 32)] {
             let part = GuestImage {
+                view_identity: None,
                 description: nixe_gpu::ImageDescription::new(
                     ImageDimension::Two,
                     nixe_gpu::ImageExtent::new(side, side, 1).unwrap(),
@@ -805,6 +808,7 @@ mod tests {
         .unwrap();
         let (_allocation, backing) = backing_allocation(&execution.residency, 4096, 4096, 0);
         let guest = GuestImage {
+            view_identity: None,
             description: nixe_gpu::ImageDescription::new(
                 ImageDimension::Two,
                 nixe_gpu::ImageExtent::new(1, 1, 1).unwrap(),
@@ -897,6 +901,7 @@ mod tests {
             before.image_view_allocations
         );
         let reinterpret = GuestImage {
+            view_identity: None,
             description: nixe_gpu::ImageDescription::new(
                 ImageDimension::Two,
                 guest.description.extent(),

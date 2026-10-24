@@ -11,13 +11,14 @@ impl MaxwellNativeFrontend {
         let current = |capture: &crate::recompiler::CapturedProgram| {
             capture.stages[0].request_is_current(&request, space)
         };
-        if let Some(capture) = &self.compute
+        if let Some(capture) = &self.channel.compute
             && current(capture)
         {
             return Ok(Arc::clone(capture));
         }
         let m = &request.metadata;
         let key = (
+            space.id(),
             request.address,
             m.workgroup_size,
             m.local_memory_size,
@@ -66,7 +67,7 @@ impl MaxwellNativeFrontend {
                 .insert(key, Arc::clone(&capture), weight);
             capture
         };
-        self.compute = Some(Arc::clone(&capture));
+        self.channel.compute = Some(Arc::clone(&capture));
         Ok(capture)
     }
 }

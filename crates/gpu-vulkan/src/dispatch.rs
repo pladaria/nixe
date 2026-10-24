@@ -26,6 +26,18 @@ pub(crate) struct Dispatch {
     pub release_swapchain_images: Option<vk::PFN_vkReleaseSwapchainImagesEXT>,
 }
 impl Dispatch {
+    pub(crate) fn flush_chunks(&mut self) -> Result<(), VulkanError> {
+        self.recorder.flush_chunks()
+    }
+
+    pub(crate) fn discard_pending(&mut self) {
+        self.recorder.discard_pending();
+    }
+
+    #[cfg(feature = "binding-probe")]
+    pub(crate) fn finish(&mut self) -> Result<(), VulkanError> {
+        self.recorder.finish()
+    }
     pub fn new(
         instance: &Instance,
         device: &Device,
@@ -136,7 +148,7 @@ impl Dispatch {
     }
     #[cfg(feature = "binding-probe")]
     pub unsafe fn timestamp(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         stage: vk::PipelineStageFlags2,
         pool: vk::QueryPool,
@@ -153,7 +165,7 @@ impl Dispatch {
         self.recorder.handle.clone()
     }
     pub unsafe fn dynamic_state(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         state: &crate::cache::GraphicsState,
     ) {
@@ -162,7 +174,7 @@ impl Dispatch {
             state: commands::DynamicState::from(state),
         });
     }
-    pub unsafe fn barrier(&self, command: vk::CommandBuffer, info: &vk::DependencyInfo<'_>) {
+    pub unsafe fn barrier(&mut self, command: vk::CommandBuffer, info: &vk::DependencyInfo<'_>) {
         debug_assert!(info.p_next.is_null());
         // SAFETY: the caller supplies live arrays; all entries are copied now.
         let memory = if info.memory_barrier_count == 0 {
@@ -246,7 +258,11 @@ impl Dispatch {
                 .collect(),
         });
     }
-    pub unsafe fn begin_rendering(&self, command: vk::CommandBuffer, info: &vk::RenderingInfo<'_>) {
+    pub unsafe fn begin_rendering(
+        &mut self,
+        command: vk::CommandBuffer,
+        info: &vk::RenderingInfo<'_>,
+    ) {
         debug_assert!(info.p_next.is_null());
         let own = |v: &vk::RenderingAttachmentInfo<'_>| {
             debug_assert!(v.p_next.is_null());
@@ -284,7 +300,7 @@ impl Dispatch {
             stencil,
         });
     }
-    pub unsafe fn end_rendering(&self, command: vk::CommandBuffer) {
+    pub unsafe fn end_rendering(&mut self, command: vk::CommandBuffer) {
         self.recorder.push(Command::EndRendering { command });
     }
 }

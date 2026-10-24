@@ -840,7 +840,7 @@ fn budget_retirement_generation_reuse_and_authority_pinning() {
         cache
             .device
             .submission
-            .flush(cache.device.queue, &cache.device.dispatch, &waits, &[])
+            .flush(cache.device.queue, &mut cache.device.dispatch, &waits, &[])
     }
     .unwrap()
     .unwrap();
@@ -1082,7 +1082,11 @@ fn large_uploads_retain_streams_until_their_actual_consumer() {
         &cache.device.dispatch,
     )
     .unwrap();
-    let (stream_slot, stream) = cache.device.submission.reserve_upload(&[0x42; 64]).unwrap();
+    let (stream_slot, stream) = cache
+        .device
+        .submission
+        .reserve_upload(&mut cache.device.dispatch, &[0x42; 64])
+        .unwrap();
     cache.device.submission.retain_stream_upload(stream_slot);
     let source = cache.device.submission.slots[stream_slot].upload_lease(stream);
     // Texture imports can flush repeatedly between preparing a uniform/vertex
@@ -1095,7 +1099,11 @@ fn large_uploads_retain_streams_until_their_actual_consumer() {
         .buffer;
     assert_eq!(cache.statistics().cpu_uploaded_bytes, 4096);
     assert!(cache.device.queue_usage().submitted_tick >= 8);
-    let (slot, destination, readback) = cache.device.submission.reserve_readback(64).unwrap();
+    let (slot, destination, readback) = cache
+        .device
+        .submission
+        .reserve_readback(&mut cache.device.dispatch, 64)
+        .unwrap();
     let command = cache.device.submission.slots[slot].command;
     let target = cache.device.submission.slots[slot]
         .readback_buffer(destination)
@@ -1111,7 +1119,7 @@ fn large_uploads_retain_streams_until_their_actual_consumer() {
                 .size(64)],
         );
     }
-    recording::host_read_barrier(&cache.device, command, target, destination.offset, 64);
+    recording::host_read_barrier(&mut cache.device, command, target, destination.offset, 64);
     cache.device.submission.release_stream_uploads();
     let mut gate = gate::Gate::new(&cache.device);
     let waits = [vk::SemaphoreSubmitInfo::default()
@@ -1128,7 +1136,7 @@ fn large_uploads_retain_streams_until_their_actual_consumer() {
     );
     assert!(
         matches!(
-            cache.device.submission.begin(),
+            cache.device.submission.begin(&mut cache.device.dispatch),
             Err(VulkanError::QueuePressure { pending: Some(work), .. }) if work == consumer
         ),
         "the stream's upload submission has completed, but its actual consumer still owns the arena"
@@ -2310,6 +2318,54 @@ fn fragmented_uploads_cross_staging_chunks_without_losing_or_reordering_bytes() 
         cache.read_buffer(id, 0, expected.len() as u64).unwrap(),
         expected
     );
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
+fn owner_inline_overwrites_keep_gpu_neighbors_without_payload_retention_or_readback() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (allocation, backing) = backing_allocation(&cache, 64, 4096, 0x19);
+    let id = buffer(&mut cache, backing);
+    write(&mut cache, id, 0, &[0x31; 64]);
+    let memory = cache.memory().clone();
+    let field = AllocationRange::new(allocation.pin(), 12, 8).unwrap();
+    let extents: Vec<_> = field
+        .physical_extents()
+        .map(|extent| (allocation.identity(), extent))
+        .collect();
+    let before = cache.statistics().native_readback_bytes;
+    assert!(
+        unsafe { memory.write_mapped_owner(&extents, nixe_memory::WriteSource::Bytes(&[0x72; 8])) }
+            .unwrap()
+    );
+    unsafe { cache.owner_memory_written(&extents) }.unwrap();
+    assert_eq!(cache.statistics().native_readback_bytes, before);
+    let actual = cache.read_buffer(id, 0, 64).unwrap();
+    let mut expected = [0x31; 64];
+    expected[12..20].fill(0x72);
+    assert_eq!(actual, expected);
+    write(&mut cache, id, 0, &[0x43; 64]);
+    let full = AllocationRange::new(allocation.pin(), 0, 64).unwrap();
+    let extents: Vec<_> = full
+        .physical_extents()
+        .map(|extent| (allocation.identity(), extent))
+        .collect();
+    assert!(
+        unsafe {
+            memory.write_mapped_owner(&extents, nixe_memory::WriteSource::Bytes(&[0x54; 64]))
+        }
+        .unwrap()
+    );
+    unsafe { cache.owner_memory_written(&extents) }.unwrap();
+    assert!(
+        memory.try_ram_pointer(&full).unwrap().is_some(),
+        "full overwrite retires obsolete device protection"
+    );
+    assert_eq!(cache.read_buffer(id, 0, 64).unwrap(), [0x54; 64]);
     drop(cache);
     validation.check().unwrap();
 }

@@ -134,107 +134,124 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                 "page retirement names another machine",
             ));
         }
-        let mut examined = FxHashSet::default();
-        let mut retired = Vec::new();
-        for (range_index, range) in ranges.iter().enumerate() {
+        for range in ranges {
             if range.allocation().machine().identity() != self.machine {
                 return Err(MemoryError::Invalid(
                     "page retirement range names another machine",
                 ));
             }
-            let mut logical = range.offset();
-            let allocation = range.allocation().identity();
-            for extent in range.physical_extents() {
-                let end = extent.start.get() + extent.bytes;
-                for start in
-                    (extent.start.get() & !(PAGE_SIZE - 1)..end).step_by(PAGE_SIZE as usize)
-                {
-                    if !examined.insert((allocation, start)) {
-                        continue;
-                    }
-                    let mut pending = false;
-                    let mut candidates = Vec::new();
-                    self.index
-                        .overlapping(start, start + PAGE_SIZE, |indexed| match indexed {
-                            Indexed::Access {
-                                allocation: owner, ..
-                            } if *owner == allocation => pending = true,
-                            Indexed::Resource(candidate) => {
-                                let span = &self.resources[&candidate.resource].footprints
-                                    [candidate.footprint]
-                                    .mapping()
-                                    .spans()[candidate.span];
-                                if span.allocation == allocation {
-                                    candidates.push(*candidate);
-                                }
-                            }
-                            _ => {}
-                        });
-                    if pending {
-                        continue;
-                    }
-                    let mut current = Vec::new();
-                    if self.resolve_ordered(
-                        allocation,
-                        vec![ByteIntersection {
-                            start: ArenaOffset::new(start),
-                            bytes: PAGE_SIZE,
-                            native: 0,
-                        }],
-                        None,
-                        &mut current,
-                        true,
-                    )? {
-                        continue;
-                    }
-                    if current.iter().any(|part| part.producer.is_some()) {
-                        // Downloaded GPU bytes now agree with RAM. Retire every
-                        // older producer in this page too, so none can resurface
-                        // after an ordinary CPU store with direct RAM access.
-                        // Downloading does not change native contents: keep
-                        // content observations valid. CPU writes still invalidate
-                        // resource tracking and exact authority independently.
-                        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
-                        self.subtract_device_coverage(
-                            PhysicalInterval {
-                                allocation,
-                                start,
-                                end: start + PAGE_SIZE,
-                            },
-                            false,
-                        )?;
-                    }
-                    for candidate in candidates {
-                        let resource = &self.resources[&candidate.resource];
-                        let mapping = resource.footprints[candidate.footprint].mapping();
-                        for id in &resource.writers {
-                            let writer = self.writers.get_mut(id).unwrap();
-                            if writer.device_protected
-                                && intersects_span(
-                                    &writer.footprint,
-                                    mapping,
-                                    candidate.span,
-                                    ArenaOffset::new(start),
-                                    PAGE_SIZE,
-                                )?
-                            {
-                                writer.device_protected = false;
+        }
+        // The original inputs retain every complete allocation page.
+        unsafe {
+            self.retire_unused_device_extents(
+                machine,
+                ranges.iter().flat_map(|range| {
+                    range
+                        .physical_extents()
+                        .map(|extent| (range.allocation().identity(), extent))
+                }),
+            )
+        }
+    }
+    /// # Safety
+    /// The caller retains all allocation pages intersecting these extents.
+    pub unsafe fn retire_unused_device_extents(
+        &mut self,
+        machine: &Machine,
+        extents: impl Iterator<Item = (nixe_memory::AllocationId, nixe_memory::Extent)>,
+    ) -> Result<(), MemoryError> {
+        if machine.identity() != self.machine {
+            return Err(MemoryError::Invalid(
+                "page retirement names another machine",
+            ));
+        }
+        let mut examined = FxHashSet::default();
+        let mut retired = Vec::new();
+        for (allocation, extent) in extents {
+            let end = extent.start.get() + extent.bytes;
+            for start in (extent.start.get() & !(PAGE_SIZE - 1)..end).step_by(PAGE_SIZE as usize) {
+                if !examined.insert((allocation, start)) {
+                    continue;
+                }
+                let mut pending = false;
+                let mut candidates = Vec::new();
+                self.index
+                    .overlapping(start, start + PAGE_SIZE, |indexed| match indexed {
+                        Indexed::Access {
+                            allocation: owner, ..
+                        } if *owner == allocation => pending = true,
+                        Indexed::Resource(candidate) => {
+                            let span = &self.resources[&candidate.resource].footprints
+                                [candidate.footprint]
+                                .mapping()
+                                .spans()[candidate.span];
+                            if span.allocation == allocation {
+                                candidates.push(*candidate);
                             }
                         }
-                    }
-                    // Allocation extents are whole pages. The captured interval
-                    // may begin inside a page; extend only within its allocation.
-                    let offset = if start < extent.start.get() {
-                        logical - (extent.start.get() - start)
-                    } else {
-                        logical + start - extent.start.get()
-                    };
-                    retired.push((range_index, offset, offset + PAGE_SIZE));
+                        _ => {}
+                    });
+                if pending {
+                    continue;
                 }
-                logical += extent.bytes;
+                let mut current = Vec::new();
+                if self.resolve_ordered(
+                    allocation,
+                    vec![ByteIntersection {
+                        start: ArenaOffset::new(start),
+                        bytes: PAGE_SIZE,
+                        native: 0,
+                    }],
+                    None,
+                    &mut current,
+                    true,
+                )? {
+                    continue;
+                }
+                if current.iter().any(|part| part.producer.is_some()) {
+                    // Downloaded GPU bytes now agree with RAM. Retire every
+                    // older producer in this page too, so none can resurface
+                    // after an ordinary CPU store with direct RAM access.
+                    // Downloading does not change native contents: keep
+                    // content observations valid. CPU writes still invalidate
+                    // resource tracking and exact authority independently.
+                    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+                    self.subtract_device_coverage(
+                        PhysicalInterval {
+                            allocation,
+                            start,
+                            end: start + PAGE_SIZE,
+                        },
+                        false,
+                    )?;
+                }
+                for candidate in candidates {
+                    let resource = &self.resources[&candidate.resource];
+                    let mapping = resource.footprints[candidate.footprint].mapping();
+                    for id in &resource.writers {
+                        let writer = self.writers.get_mut(id).unwrap();
+                        if writer.device_protected
+                            && intersects_span(
+                                &writer.footprint,
+                                mapping,
+                                candidate.span,
+                                ArenaOffset::new(start),
+                                PAGE_SIZE,
+                            )?
+                        {
+                            writer.device_protected = false;
+                        }
+                    }
+                }
+                retired.push((
+                    allocation,
+                    nixe_memory::Extent {
+                        start: ArenaOffset::new(start),
+                        bytes: PAGE_SIZE,
+                    },
+                ));
             }
         }
-        let retired = crate::physical::pin_intervals(ranges, retired)?;
-        machine.retire_device_pages(&retired)
+        unsafe { machine.retire_device_extents(&retired) }
     }
 }

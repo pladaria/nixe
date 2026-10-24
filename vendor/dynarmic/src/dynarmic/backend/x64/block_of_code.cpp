@@ -411,6 +411,10 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
 }
 
 void BlockOfCode::SwitchMxcsrOnEntry() {
+    // Native calls may leave YMM upper lanes live; the JIT only uses XMM values.
+    if (HasHostFeature(HostFeature::AVX)) {
+        vzeroupper();
+    }
     stmxcsr(dword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, save_host_MXCSR)]);
     ldmxcsr(dword[r15 + jsi.offsetof_guest_MXCSR]);
 }

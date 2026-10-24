@@ -97,6 +97,7 @@ enum LockedIoctlOutcome {
     Standard(NvHostCtrlIoctlOutcome),
     Host1xCapture(host1x::CaptureSubmission),
     DeferredGpuIoctl {
+        storage_bytes: usize,
         gpu: Arc<Mutex<NvHostGpu>>,
         control: Arc<Mutex<NvHostControl>>,
         address_spaces: Arc<Mutex<BTreeMap<NvDrvFileDescriptor, MaxwellGpuAddressSpace>>>,
@@ -140,8 +141,8 @@ impl NvDrvSession {
     where
         L: nixe_gpu_maxwell::MaxwellFrontend,
         E: nixe_gpu::GpuExecution<
-                Commands = nixe_gpu_maxwell::MaxwellWorkCommands<L::Work>,
-                ImageRequest = <L::Work as nixe_gpu_maxwell::MaxwellWork>::ImageRequest,
+                Commands = nixe_gpu::native::NativeWork,
+                ImageRequest = nixe_gpu::native::NativePresentationImage,
             >,
     {
         Self::new_with_executor(
@@ -690,12 +691,15 @@ impl NvDrvSession {
             Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostGpu => {
                 match state.gpu_backend.as_ref().cloned() {
                     Some(gpu_backend) if nvhost_gpu::is_submit_gpfifo(request) => {
-                        Ok(LockedIoctlOutcome::DeferredGpuIoctl {
-                            gpu: Arc::clone(&state.nvhost_gpu),
-                            control: Arc::clone(&state.nvhost_control),
-                            address_spaces: Arc::clone(&state.gpu_address_spaces),
-                            backend: gpu_backend,
-                        })
+                        nvhost_gpu::submission_storage_bytes(request, input, inline.input()).map(
+                            |storage_bytes| LockedIoctlOutcome::DeferredGpuIoctl {
+                                storage_bytes,
+                                gpu: Arc::clone(&state.nvhost_gpu),
+                                control: Arc::clone(&state.nvhost_control),
+                                address_spaces: Arc::clone(&state.gpu_address_spaces),
+                                backend: gpu_backend,
+                            },
+                        )
                     }
                     Some(_) => state
                         .nvhost_gpu
@@ -816,13 +820,14 @@ impl NvDrvSession {
                 Ok(NvDrvIoctlOutcome::PendingHost1x(capture))
             }
             Ok(LockedIoctlOutcome::DeferredGpuIoctl {
+                storage_bytes,
                 gpu,
                 control,
                 address_spaces,
                 backend,
             }) => {
                 let descriptor = descriptor.expect("deferred GPU ioctl has a descriptor");
-                let permit = backend.reserve_submission().map_err(|error| {
+                let permit = backend.reserve_submission(storage_bytes).map_err(|error| {
                     nvhost_gpu::queued_execution_error(descriptor, request, error)
                 })?;
                 let permit = match permit {
@@ -2930,46 +2935,12 @@ mod tests {
             nixe_gpu_maxwell::MaxwellChannelTimeslice::Requested(0x400)
         );
 
-        // T6-C resolves the complete Ioctl2 command source without mutating
-        // the channel. This uninitialized address space fails before any
-        // entry is retained or command word is consumed.
+        // Malformed submission arguments are rejected before scheduling.
         let request = 0xc018_481b;
         let channel_before_submission = session.gpu_channel(channel_fd).unwrap();
         let mut submit = [0_u8; 24];
         submit[8..12].copy_from_slice(&1_u32.to_le_bytes());
         submit[12..16].copy_from_slice(&(4_u32 | 2).to_le_bytes());
-        let mut entry = [0_u8; 8];
-        entry[0..4].copy_from_slice(&0x4000_u32.to_le_bytes());
-        entry[4..8].copy_from_slice(&(4_u32 << 10).to_le_bytes());
-        let Err(UnsupportedNvDrvOperation::GpfifoMemory { context, error }) =
-            session.ioctl2(channel_fd, request, &submit, &entry)
-        else {
-            panic!("unmapped GPFIFO source must return a typed host diagnostic");
-        };
-        assert_eq!(
-            context,
-            NvDrvErrorContext::new(
-                NvDrvDeviceKind::HostGpu,
-                request,
-                channel_fd,
-                None,
-                NvDrvValidationReason::GpfifoMemoryResolutionFailed,
-            )
-        );
-        assert!(matches!(
-            *error,
-            nixe_gpu_maxwell::MaxwellGpfifoSourceError::Resolution {
-                channel,
-                frontend,
-                entry_index: 0,
-                pushbuffer,
-                error: nixe_gpu_maxwell::MaxwellGpuAccessError::NotInitialized,
-                ..
-            } if channel == channel_before_submission.id()
-                && frontend == nixe_gpu::FrontendSubmissionId::new(1)
-                && pushbuffer.get() == 0x4000
-        ));
-
         // A count/byte mismatch is a verified guest argument error. Neither
         // it nor a fatal known-but-unsupported mode may retain a prefix.
         assert_eq!(
@@ -3160,17 +3131,19 @@ mod tests {
             if empty {
                 assert!(matches!(
                     boundary.frontend_failure(),
-                    Some(nixe_gpu_maxwell::MaxwellFrontendDispatchError::EmptySubmission)
+                    nixe_gpu_maxwell::MaxwellFrontendDispatchError::EmptySubmission
                 ));
             } else {
                 assert!(matches!(
                     boundary.frontend_failure(),
-                    Some(nixe_gpu_maxwell::MaxwellFrontendDispatchError::PacketDecode(_))
+                    nixe_gpu_maxwell::MaxwellFrontendDispatchError::PacketDecode(_)
                 ));
                 let submission = boundary.dispatch().scheduled().submission();
-                assert_eq!(submission.capture().sources()[0].mapping, mapping.id());
-                assert_eq!(boundary.first_packet().unwrap().word_offset, 0);
-                let error = boundary.frontend_failure().unwrap().to_string();
+                assert_eq!(
+                    submission.decoded().entries()[0].address(),
+                    mapping.offset()
+                );
+                let error = boundary.frontend_failure().to_string();
                 assert!(error.contains("0x12345678"));
                 drop(allocation);
                 {
@@ -3184,11 +3157,7 @@ mod tests {
                         .unmap(mapping.offset())
                         .unwrap();
                 }
-                assert!(matches!(
-                    submission.validate_sources(&session.gpu_address_space(as_fd).unwrap()),
-                    Err(nixe_gpu_maxwell::MaxwellGpfifoSourceError::StaleMapping { .. })
-                ));
-                assert_eq!(boundary.frontend_failure().unwrap().to_string(), error);
+                assert_eq!(boundary.frontend_failure().to_string(), error);
             }
         }
     }

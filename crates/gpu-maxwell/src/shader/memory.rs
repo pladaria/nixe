@@ -144,7 +144,7 @@ impl<'a, 'm> MaxwellShaderMemoryView<'a, 'm> {
             .map_err(|e| fail(MaxwellGpuAccessError::Backing(Arc::new(e))))?;
         let observation = Observation::default();
         let AccessResult::Read(bytes) =
-            (self.access)(inputs, AccessOperation::ReadObserved(observation.clone()))
+            (self.access)(inputs, AccessOperation::ReadCode(observation.clone()))
                 .map_err(|e| fail(MaxwellGpuAccessError::Backing(e)))?
         else {
             unreachable!("read returns bytes")
@@ -166,6 +166,35 @@ impl<'a, 'm> MaxwellShaderMemoryView<'a, 'm> {
             + 512;
         self.cache.reads.insert(key, read.clone(), weight);
         Ok(read)
+    }
+
+    pub(crate) fn read_data(
+        &mut self,
+        stage: MaxwellShaderStage,
+        address: u64,
+        size: usize,
+    ) -> Result<Arc<[u8]>, ShaderCaptureError> {
+        if size > MAXWELL_SHADER_READ_LIMIT {
+            return Err(ShaderCaptureError::ReadTooLarge {
+                requested: size,
+                limit: MAXWELL_SHADER_READ_LIMIT,
+            });
+        }
+        let fail = |error| ShaderCaptureError::Memory {
+            stage,
+            address,
+            error,
+        };
+        let address = self
+            .address_space
+            .address(address)
+            .map_err(MaxwellGpuAccessError::Address)
+            .map_err(fail)?;
+        let mut bytes = vec![0; size];
+        self.address_space
+            .read_into(address, &mut bytes, self.access)
+            .map_err(fail)?;
+        Ok(bytes.into())
     }
 }
 
@@ -221,7 +250,9 @@ mod tests {
             assert!(Arc::ptr_eq(&first.bytes, &repeated.bytes));
         }
         assert_eq!(ALLOCATIONS.with(|n| n.replace(None).unwrap()), 0);
+        let code_generation = space.memory().machine().code_generation();
         test_memory::write(&allocation, 8, &[9]).unwrap();
+        assert!(space.memory().machine().code_generation() > code_generation);
         let changed = MaxwellShaderMemoryView::new(space.memory(), &mut cache, &mut access)
             .read(MaxwellShaderStage::Compute, base + 8, 4)
             .unwrap();
@@ -245,9 +276,11 @@ mod tests {
         )
         .read(MaxwellShaderStage::Compute, base + 8, 4)
         .unwrap();
+        let code_generation = memory.code_generation();
         memory
             .publish_device_write(&test_memory::ranges(&allocation), || Ok(()))
             .unwrap();
+        assert!(memory.code_generation() > code_generation);
         assert!(!first.is_current(space.memory()));
         let mut readbacks = 0;
         let mut owner = |ranges: Vec<nixe_memory::AllocationRange>, operation| {

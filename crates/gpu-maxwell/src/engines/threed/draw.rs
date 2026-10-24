@@ -9,13 +9,17 @@ pub(super) struct InstanceRun {
     count: u32,
 }
 
+pub(in crate::engines) fn is_pending(state: &MaxwellThreeDFrontendState) -> bool {
+    state.instance_run.is_some()
+}
+
 // Eden's draw manager likewise defers instance sequences until another method
 // consumes them. Resource/state writes and observable operations flush first.
 // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/draw_manager.cpp
-pub(in crate::engines) fn before_method<E>(
+pub(in crate::engines) async fn before_method<E>(
     state: &mut MaxwellThreeDFrontendState,
     source: MaxwellMethodSource,
-    consume: &mut impl FnMut(
+    consume: &mut impl AsyncFnMut(
         PendingEngineOperation,
         &MaxwellThreeDState,
         Option<(u32, u32)>,
@@ -26,6 +30,13 @@ pub(in crate::engines) fn before_method<E>(
     };
     let method = source.method().0;
     let argument = source.argument();
+    if super::registers::passive(source.method())
+        && state.mme().shadow_ram_control().value()
+            != Some(&MaxwellThreeDMmeShadowRamControl::MethodReplay)
+        && state.raw_register_value(source.method()) == Some(argument)
+    {
+        return Ok(());
+    }
     let continuing = state.mme().shadow_ram_control().value()
         != Some(&MaxwellThreeDMmeShadowRamControl::MethodReplay)
         && match method {
@@ -66,17 +77,17 @@ pub(in crate::engines) fn before_method<E>(
             _ => false,
         };
     if !continuing {
-        flush(state, consume)?;
+        flush(state, consume).await?;
     } else if method == 0x1618 {
         state.complete_draw_end();
     }
     Ok(())
 }
 
-pub(in crate::engines) fn operation<E>(
+pub(in crate::engines) async fn operation<E>(
     state: &mut MaxwellThreeDFrontendState,
     operation: PendingEngineOperation,
-    consume: &mut impl FnMut(
+    consume: &mut impl AsyncFnMut(
         PendingEngineOperation,
         &MaxwellThreeDState,
         Option<(u32, u32)>,
@@ -101,13 +112,13 @@ pub(in crate::engines) fn operation<E>(
         }
         return Ok(());
     }
-    flush(state, consume)?;
-    consume(operation, state.operation_state(), None)
+    flush(state, consume).await?;
+    consume(operation, state.operation_state(), None).await
 }
 
-pub(in crate::engines) fn flush<E>(
+pub(in crate::engines) async fn flush<E>(
     state: &mut MaxwellThreeDFrontendState,
-    consume: &mut impl FnMut(
+    consume: &mut impl AsyncFnMut(
         PendingEngineOperation,
         &MaxwellThreeDState,
         Option<(u32, u32)>,
@@ -118,7 +129,8 @@ pub(in crate::engines) fn flush<E>(
             PendingEngineOperation::ThreeD(run.trigger),
             state.operation_state(),
             Some((run.first, run.count)),
-        )?;
+        )
+        .await?;
         state.complete_draw_end();
     }
     Ok(())
@@ -158,7 +170,9 @@ mod tests {
     fn execute(methods: &[(u32, u32)]) -> Vec<(u32, u32, u32, u32)> {
         let mut state = MaxwellThreeDFrontendState::default();
         let mut observed = Vec::new();
-        let mut consume = |operation, state: &MaxwellThreeDState, instances: Option<(u32, u32)>| {
+        let mut consume = async |operation,
+                                 state: &MaxwellThreeDState,
+                                 instances: Option<(u32, u32)>| {
             let PendingEngineOperation::ThreeD(trigger) = operation else {
                 panic!("draw")
             };
@@ -193,13 +207,13 @@ mod tests {
             _error: std::marker::PhantomData,
         };
         for &(method, value) in methods {
-            match host.emit_method((method / 4) as u16, value) {
+            match crate::test_memory::ready(host.emit_method((method / 4) as u16, value)) {
                 Ok(()) => {}
                 Err(MaxwellThreeDMmePreflightError::Dispatch(error)) => panic!("{error}"),
                 Err(MaxwellThreeDMmePreflightError::Consumer(never)) => match never {},
             }
         }
-        flush(host.candidate, host.consume).unwrap();
+        crate::test_memory::ready(flush(host.candidate, host.consume)).unwrap();
         assert!(
             !host
                 .candidate

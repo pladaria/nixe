@@ -1,4 +1,5 @@
 //! Physical dirty summaries and independently invalidated clean observations.
+use crate::physical_access::PhysicalGuard;
 use crate::{AddressSpace, AllocationRange, ArenaOffset, Extent, Machine, MemoryError, PAGE_SIZE};
 use std::{
     collections::HashMap,
@@ -46,6 +47,7 @@ pub(crate) struct Tracking {
     reserved: Bitmap,
     device: Bitmap,
     code: Bitmap,
+    code_generation: AtomicU64,
     monitors: crate::reservation::Monitors,
     observers: Mutex<Observers>,
     cpu_dirty_pending: AtomicBool,
@@ -94,13 +96,81 @@ impl PageObservers {
 }
 struct Observer {
     invalid: Weak<AtomicBool>,
+    extent: Extent,
     cpu_writes: bool,
     device_writes: bool,
+    code: bool,
+}
+
+fn intersects(a: Extent, b: Extent) -> bool {
+    a.start.get() < b.start.get() + b.bytes && b.start.get() < a.start.get() + a.bytes
 }
 /// A cache checks this flag once per use, without walking its physical pages.
 /// The flag never becomes clean again; a new capture creates a new observation.
 #[derive(Clone, Debug)]
 pub struct Observation(Arc<AtomicBool>);
+/// Reuse physical admission while an owner consumes nearby RAM reads.
+/// The caller retains the allocation or the mapping for every read.
+pub struct MappedRamReader<'a> {
+    machine: &'a Machine,
+    guard: Option<PhysicalGuard<'a>>,
+}
+
+impl Machine {
+    pub fn mapped_ram_reader(&self) -> MappedRamReader<'_> {
+        MappedRamReader {
+            machine: self,
+            guard: None,
+        }
+    }
+}
+
+impl MappedRamReader<'_> {
+    pub fn release(&mut self) {
+        self.guard = None;
+    }
+
+    /// # Safety
+    /// The caller retains the physical bytes for the duration of this read.
+    /// The destination must be exclusive host memory disjoint from guest RAM.
+    pub unsafe fn try_read(
+        &mut self,
+        start: ArenaOffset,
+        destination: &mut [u8],
+    ) -> Result<bool, MemoryError> {
+        let extent = Extent {
+            start,
+            bytes: destination.len() as u64,
+        };
+        let source = self
+            .machine
+            .arena()
+            .host_address(start, extent.bytes)
+            .ok_or(MemoryError::Invalid("mapped read exceeds physical RAM"))?;
+        if destination.is_empty() {
+            return Ok(true);
+        }
+        if !self
+            .guard
+            .as_ref()
+            .is_some_and(|guard| guard.covers(extent))
+        {
+            self.guard = Some(self.machine.physical_access().enter(extent));
+        }
+        if pages(extent).any(|page| self.machine.tracking().device.get(page)) {
+            return Ok(false);
+        }
+        unsafe {
+            crate::raw::capture(source.as_ptr(), destination);
+        }
+        #[cfg(any(test, feature = "performance-counters"))]
+        self.machine
+            .tracking()
+            .captured_bytes
+            .fetch_add(extent.bytes, Ordering::Relaxed);
+        Ok(true)
+    }
+}
 impl Default for Observation {
     fn default() -> Self {
         Self(Arc::new(AtomicBool::new(false)))
@@ -116,6 +186,27 @@ impl Observation {
     /// Host metadata only. Subscribers may set this flag, never clear it.
     pub fn weak_invalidation_flag(&self) -> Weak<AtomicBool> {
         Arc::downgrade(&self.0)
+    }
+}
+/// The two sources consumed synchronously by graphics-owner RAM writes.
+#[derive(Clone, Copy)]
+pub enum WriteSource<'a> {
+    Bytes(&'a [u8]),
+    Ram {
+        address: crate::HostAddress,
+        offset: usize,
+        bytes: usize,
+    },
+}
+impl WriteSource<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Ram { bytes, .. } => *bytes,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 /// A checked copy from retained physical input into an owned native snapshot.
@@ -152,6 +243,10 @@ impl ProtectionBatch<'_> {
             .iter()
             .any(|&extent| machine.tracking().code.any(extent))
         {
+            machine
+                .tracking()
+                .code_generation
+                .fetch_add(1, Ordering::AcqRel);
             for alias in &self.aliases {
                 // SAFETY: all affected spaces have drained native execution and
                 // host accesses. Queue invalidations before clearing code watches.
@@ -198,6 +293,7 @@ impl Tracking {
             reserved: Bitmap::new(bytes / PAGE_SIZE, 0),
             device: Bitmap::new(bytes / PAGE_SIZE, 0),
             code: Bitmap::new(bytes / PAGE_SIZE, 0),
+            code_generation: AtomicU64::new(1),
             monitors: crate::reservation::Monitors::default(),
             observers: Mutex::new(Observers::default()),
             cpu_dirty_pending: AtomicBool::new(false),
@@ -270,18 +366,26 @@ impl Tracking {
             self.code.update_range(extent, false, |_| {});
             self.resource_observed.update_range(extent, false, |_| {});
             self.observed.update_range(extent, false, |page| {
-                let mut device_only = false;
+                let page_extent = Extent {
+                    start: ArenaOffset::new(page * PAGE_SIZE),
+                    bytes: PAGE_SIZE,
+                };
+                let mut cpu_observed = false;
+                let mut device_observed = false;
+                let mut code_observed = false;
                 if let Some(registered) = observers.pages.get_mut(&page) {
                     registered.retain(|observer| {
                         let Some(invalid) = observer.invalid.upgrade() else {
                             return false;
                         };
-                        if observer.cpu_writes {
+                        if observer.cpu_writes && intersects(observer.extent, extent) {
                             invalid.store(true, Ordering::Release);
                             false
                         } else {
                             let live = !invalid.load(Ordering::Acquire);
-                            device_only |= live && observer.device_writes;
+                            cpu_observed |= live && observer.cpu_writes;
+                            device_observed |= live && observer.device_writes;
+                            code_observed |= live && observer.code;
                             live
                         }
                     });
@@ -289,14 +393,11 @@ impl Tracking {
                         observers.pages.remove(&page);
                     }
                 }
-                self.device_observed.update_range(
-                    Extent {
-                        start: ArenaOffset::new(page * PAGE_SIZE),
-                        bytes: PAGE_SIZE,
-                    },
-                    device_only,
-                    |_| {},
-                );
+                self.observed
+                    .update_range(page_extent, cpu_observed, |_| {});
+                self.device_observed
+                    .update_range(page_extent, device_observed, |_| {});
+                self.code.update_range(page_extent, code_observed, |_| {});
             });
             for (word, mask) in bitmap_words(extent) {
                 if self.dirty.0[word].fetch_or(mask, Ordering::Release) == 0 {
@@ -313,33 +414,38 @@ impl Tracking {
         for &extent in extents {
             self.code.update_range(extent, false, |_| {});
             self.device_observed.update_range(extent, false, |page| {
-                let empty = if let Some(registered) = observers.pages.get_mut(&page) {
+                let page_extent = Extent {
+                    start: ArenaOffset::new(page * PAGE_SIZE),
+                    bytes: PAGE_SIZE,
+                };
+                let mut cpu_observed = false;
+                let mut device_observed = false;
+                let mut code_observed = false;
+                if let Some(registered) = observers.pages.get_mut(&page) {
                     registered.retain(|observer| {
                         let Some(invalid) = observer.invalid.upgrade() else {
                             return false;
                         };
-                        if observer.device_writes {
+                        if observer.device_writes && intersects(observer.extent, extent) {
                             invalid.store(true, Ordering::Release);
                             false
                         } else {
-                            !invalid.load(Ordering::Acquire)
+                            let live = !invalid.load(Ordering::Acquire);
+                            cpu_observed |= live && observer.cpu_writes;
+                            device_observed |= live && observer.device_writes;
+                            code_observed |= live && observer.code;
+                            live
                         }
                     });
-                    registered.entries.is_empty()
-                } else {
-                    true
-                };
-                if empty {
-                    observers.pages.remove(&page);
-                    self.observed.update_range(
-                        Extent {
-                            start: ArenaOffset::new(page * PAGE_SIZE),
-                            bytes: PAGE_SIZE,
-                        },
-                        false,
-                        |_| {},
-                    );
+                    if registered.entries.is_empty() {
+                        observers.pages.remove(&page);
+                    }
                 }
+                self.device_observed
+                    .update_range(page_extent, device_observed, |_| {});
+                self.code.update_range(page_extent, code_observed, |_| {});
+                self.observed
+                    .update_range(page_extent, cpu_observed, |_| {});
             });
         }
     }
@@ -349,6 +455,7 @@ impl Tracking {
         observation: &Observation,
         cpu_writes: bool,
         device_writes: bool,
+        code: bool,
     ) {
         let mut observers = self.observers.lock().unwrap();
         for extent in extents {
@@ -371,8 +478,21 @@ impl Tracking {
                 let registered = observers.pages.entry(page).or_default();
                 registered.push(Observer {
                     invalid: Arc::downgrade(&observation.0),
+                    extent: if code {
+                        Extent {
+                            start: ArenaOffset::new(page * PAGE_SIZE),
+                            bytes: PAGE_SIZE,
+                        }
+                    } else {
+                        Extent {
+                            start: ArenaOffset::new(extent.start.get().max(page * PAGE_SIZE)),
+                            bytes: (extent.start.get() + extent.bytes).min((page + 1) * PAGE_SIZE)
+                                - extent.start.get().max(page * PAGE_SIZE),
+                        }
+                    },
                     cpu_writes,
                     device_writes,
+                    code,
                 });
             }
         }
@@ -398,6 +518,10 @@ impl Tracking {
     }
 }
 impl Machine {
+    pub fn code_generation(&self) -> u64 {
+        self.tracking().code_generation.load(Ordering::Acquire)
+    }
+
     /// The graphics owner consumes CPU modification pages once, then updates all
     /// registered views before resource capture. These are cache invalidations;
     /// exact CPU/device byte ownership remains with the operation authority.
@@ -534,14 +658,30 @@ impl Machine {
     /// that page protected; memory does not maintain another producer index.
     pub fn retire_device_pages(&self, ranges: &[AllocationRange]) -> Result<(), MemoryError> {
         self.validate_ranges(ranges)?;
-        if ranges
+        let extents: smallvec::SmallVec<[_; 4]> = ranges
             .iter()
-            .flat_map(AllocationRange::physical_extents)
-            .all(|extent| pages(extent).all(|page| !self.tracking().device.get(page)))
+            .flat_map(|range| {
+                range
+                    .physical_extents()
+                    .map(|extent| (range.allocation().identity(), extent))
+            })
+            .collect();
+        unsafe { self.retire_device_extents(&extents) }
+    }
+    /// # Safety
+    /// All allocation pages remain retained; the owner has proved no producer
+    /// or pending access needs device protection on any of these pages.
+    pub unsafe fn retire_device_extents(
+        &self,
+        extents: &[(crate::AllocationId, Extent)],
+    ) -> Result<(), MemoryError> {
+        if extents
+            .iter()
+            .all(|&(_, extent)| !self.tracking().device.any(extent))
         {
             return Ok(());
         }
-        self.tracking_transition(ranges, |batch, extents| {
+        self.tracking_transition_physical(extents.iter().copied(), false, |batch, extents| {
             for &extent in extents {
                 self.tracking().device.update_range(extent, false, |_| {});
             }
@@ -1271,6 +1411,131 @@ impl Machine {
         }
         Ok(self.arena().host_address(extent.start, extent.bytes))
     }
+    /// Write on the graphics owner while the caller holds the original mappings.
+    /// Returns whether device coverage must be subtracted before another effect.
+    /// Cache invalidations accumulate in the existing dirty-page queue.
+    ///
+    /// # Safety
+    /// All destinations and any RAM source must remain retained until the owner
+    /// updates its exact device coverage. The source is RAM-current. No owner
+    /// effect or mapping mutation may run between this write and that update.
+    pub unsafe fn write_mapped_owner(
+        &self,
+        destinations: &[(crate::AllocationId, Extent)],
+        source: WriteSource<'_>,
+    ) -> Result<bool, MemoryError> {
+        let mut bytes = 0usize;
+        let mut extents = smallvec::SmallVec::<[Extent; 4]>::new();
+        for &(_, extent) in destinations {
+            if self
+                .arena()
+                .host_address(extent.start, extent.bytes)
+                .is_none()
+            {
+                return Err(MemoryError::Invalid("mapped write exceeds RAM"));
+            }
+            bytes = bytes
+                .checked_add(extent.bytes as usize)
+                .ok_or(MemoryError::Invalid("mapped write overflows"))?;
+            extents.push(extent);
+        }
+        if source.len() != bytes {
+            return Err(MemoryError::Invalid("mapped write payload length mismatch"));
+        }
+        let source = match source {
+            WriteSource::Ram {
+                address,
+                offset,
+                bytes,
+            } => WriteSource::Ram {
+                address: crate::HostAddress::from_pointer(
+                    (address.as_ptr() as usize)
+                        .checked_add(offset)
+                        .ok_or(MemoryError::Invalid("command address overflows"))?
+                        as *mut u8,
+                ),
+                offset: 0,
+                bytes,
+            },
+            other => other,
+        };
+        let mut overlap = None;
+        if let WriteSource::Ram { address, .. } = source {
+            let base = self
+                .arena()
+                .host_address(ArenaOffset::new(0), 0)
+                .unwrap()
+                .as_ptr() as usize;
+            let relative = (address.as_ptr() as usize)
+                .checked_sub(base)
+                .ok_or(MemoryError::Invalid("foreign command RAM"))?;
+            if self
+                .arena()
+                .host_address(ArenaOffset::new(relative as u64), bytes as u64)
+                .is_none()
+            {
+                return Err(MemoryError::Invalid("command copy exceeds RAM"));
+            }
+            if extents.iter().any(|extent| {
+                extent.start.get() < relative as u64 + bytes as u64
+                    && (relative as u64) < extent.start.get() + extent.bytes
+            }) {
+                let mut saved = vec![0; bytes];
+                unsafe {
+                    crate::raw::capture(address.as_ptr(), &mut saved);
+                }
+                overlap = Some(saved);
+            }
+        }
+        let source = overlap.as_deref().map_or(source, WriteSource::Bytes);
+        let copy = || {
+            let mut offset = 0;
+            for &extent in &extents {
+                let length = extent.bytes as usize;
+                unsafe {
+                    match source {
+                        WriteSource::Bytes(bytes) => {
+                            self.write_admitted(extent, &bytes[offset..offset + length])
+                        }
+                        WriteSource::Ram { address, .. } => crate::raw::copy(
+                            address.as_ptr().add(offset),
+                            self.arena()
+                                .host_address(extent.start, extent.bytes)
+                                .unwrap()
+                                .as_ptr(),
+                            length,
+                        ),
+                    }
+                }
+                offset += length;
+            }
+        };
+        {
+            let _access = self.physical_access().enter_many(&extents);
+            if extents
+                .iter()
+                .all(|&extent| !self.tracking().any_observed(extent))
+            {
+                let device = extents
+                    .iter()
+                    .any(|&extent| self.tracking().device.any(extent));
+                if device {
+                    self.tracking().invalidate(&extents);
+                }
+                copy();
+                return Ok(device);
+            }
+        }
+        self.tracking_transition_physical(destinations.iter().copied(), false, |batch, extents| {
+            let device = extents
+                .iter()
+                .any(|&extent| self.tracking().device.any(extent));
+            batch.invalidate(self, extents);
+            copy();
+            batch.refresh()?;
+            Ok(device)
+        })
+    }
     /// Copy mapped, RAM-current bytes directly to their consumer. Device-owned
     /// pages return false without reading or changing the destination. This
     /// never enqueues a request to the graphics owner's own endpoint.
@@ -1286,29 +1551,7 @@ impl Machine {
         start: ArenaOffset,
         destination: &mut [u8],
     ) -> Result<bool, MemoryError> {
-        let extent = Extent {
-            start,
-            bytes: destination.len() as u64,
-        };
-        let source = self
-            .arena()
-            .host_address(start, extent.bytes)
-            .ok_or(MemoryError::Invalid("mapped read exceeds physical RAM"))?;
-        if destination.is_empty() {
-            return Ok(true);
-        }
-        let _access = self.physical_access().enter(extent);
-        if pages(extent).any(|page| self.tracking().device.get(page)) {
-            return Ok(false);
-        }
-        unsafe {
-            crate::raw::capture(source.as_ptr(), destination);
-        }
-        #[cfg(any(test, feature = "performance-counters"))]
-        self.tracking()
-            .captured_bytes
-            .fetch_add(extent.bytes, Ordering::Relaxed);
-        Ok(true)
+        unsafe { self.mapped_ram_reader().try_read(start, destination) }
     }
     /// Recover a captured code fetch after the C++ compilation/execution frame
     /// and native admission have ended. Registration precedes the byte copy.
@@ -1365,7 +1608,7 @@ impl Machine {
         let observation = Observation::default();
         let _access = self.physical_access().enter(extent);
         self.tracking()
-            .register(std::iter::once(extent), &observation, false, true);
+            .register(std::iter::once(extent), &observation, false, true, false);
         let mut bytes = vec![0; size];
         let mut offset = 0;
         for range in ranges {
@@ -1417,7 +1660,7 @@ impl Machine {
                 // Existing protection excludes native stores; the admitted set
                 // keeps every fragment protected through registration and copy.
                 self.tracking()
-                    .register(extents.iter().copied(), observation, true, true);
+                    .register(extents.iter().copied(), observation, true, true, code);
                 let mut bytes = vec![0; size];
                 let mut offset = 0;
                 for range in ranges {
@@ -1447,7 +1690,7 @@ impl Machine {
             let mut offset = 0;
             for range in ranges {
                 self.tracking()
-                    .register(range.physical_extents(), observation, true, true);
+                    .register(range.physical_extents(), observation, true, true, code);
                 let length = range.bytes() as usize;
                 self.capture_unchecked(range, &mut bytes[offset..offset + length]);
                 offset += length;
@@ -1876,6 +2119,47 @@ mod tests {
     use std::{thread, time::Duration};
 
     #[test]
+    fn shader_observation_survives_disjoint_writes_on_its_page() {
+        let machine = Machine::new(PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(PAGE_SIZE)
+            .unwrap()
+            .allocate(PAGE_SIZE)
+            .unwrap();
+        let range = AllocationRange::new(allocation.pin(), 0, PAGE_SIZE).unwrap();
+        let space = mapping(&machine, allocation, PAGE_SIZE);
+        let shader = Observation::default();
+        machine
+            .access_captured(
+                &[range.slice(64, 16).unwrap()],
+                crate::AccessOperation::ReadObserved(shader.clone()),
+            )
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        let physical = range.physical_extents().next().unwrap().start.get();
+        let protections = machine.tracking_statistics().protection_calls;
+        space
+            .write_value(GuestVirtualAddress::new(PAGE_SIZE + 256), 4, 1)
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        assert!(!shader.is_invalid());
+        assert_eq!(machine.tracking_statistics().protection_calls, protections);
+        machine.tracking().invalidate_device(&[Extent {
+            start: ArenaOffset::new(physical + 512),
+            bytes: 4,
+        }]);
+        assert!(!shader.is_invalid());
+        space
+            .write_value(GuestVirtualAddress::new(PAGE_SIZE + 68), 4, 2)
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        assert!(shader.is_invalid());
+    }
+
+    #[test]
     fn accepted_subrange_access_preserves_fragments_observations_and_remapped_bytes() {
         let machine = Machine::new(8 * PAGE_SIZE).unwrap();
         let account = machine.account(8 * PAGE_SIZE).unwrap();
@@ -2194,7 +2478,7 @@ mod tests {
             let result = read
                 .access_captured(
                     &[range.slice(4, 4).unwrap()],
-                    AccessOperation::ReadObserved(observation.clone()),
+                    crate::AccessOperation::ReadObserved(observation.clone()),
                 )
                 .unwrap();
             let mut bytes = [0xaa; 12];
@@ -2228,9 +2512,80 @@ mod tests {
                 .unwrap(),
             Access::Ready(())
         ));
-        assert!(first.is_invalid());
+        assert!(!first.is_invalid());
         assert!(second.is_invalid());
+        space
+            .write_value(GuestVirtualAddress::new(PAGE_SIZE), 4, 9)
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        assert!(first.is_invalid());
     }
+    #[test]
+    fn owner_ram_copies_scatter_preserve_overlap_and_invalidate_observations() {
+        let machine = Machine::new(4 * PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(4 * PAGE_SIZE)
+            .unwrap()
+            .allocate(4 * PAGE_SIZE)
+            .unwrap();
+        let range = AllocationRange::new(allocation.pin(), 0, 4 * PAGE_SIZE).unwrap();
+        let source = range.slice(0, 1003).unwrap();
+        let payload: Vec<u8> = (0..1003).map(|i| (i % 251) as u8).collect();
+        machine
+            .write_resolved(std::slice::from_ref(&source), &payload)
+            .unwrap();
+        let source_extent = source.physical_extents().next().unwrap();
+        let address = machine
+            .arena()
+            .host_address(source_extent.start, source_extent.bytes)
+            .unwrap();
+        let first = range.slice(PAGE_SIZE + 3, 501).unwrap();
+        let second = range.slice(3 * PAGE_SIZE + 7, 502).unwrap();
+        let extents: Vec<_> = first
+            .physical_extents()
+            .chain(second.physical_extents())
+            .map(|extent| (allocation.identity(), extent))
+            .collect();
+        let input = WriteSource::Ram {
+            address,
+            offset: 0,
+            bytes: payload.len(),
+        };
+        assert!(!unsafe { machine.write_mapped_owner(&extents, input) }.unwrap());
+        let mut actual = vec![0; payload.len()];
+        machine
+            .capture_stream(&[first.clone(), second.clone()], &mut actual)
+            .unwrap();
+        assert_eq!(actual, payload);
+        let overlapping = range.slice(3, 1003).unwrap();
+        let overlap: Vec<_> = overlapping
+            .physical_extents()
+            .map(|extent| (allocation.identity(), extent))
+            .collect();
+        unsafe { machine.write_mapped_owner(&overlap, input) }.unwrap();
+        machine.capture_stream(&[overlapping], &mut actual).unwrap();
+        assert_eq!(actual, payload, "copy must snapshot an overlapping source");
+        machine
+            .write_resolved(std::slice::from_ref(&source), &payload)
+            .unwrap();
+        let observation = Observation::default();
+        machine
+            .access_captured(
+                std::slice::from_ref(&first),
+                crate::AccessOperation::ReadObserved(observation.clone()),
+            )
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        unsafe { machine.write_mapped_owner(&extents, input) }.unwrap();
+        assert!(observation.is_invalid());
+        machine
+            .capture_stream(&[first, second], &mut actual)
+            .unwrap();
+        assert_eq!(actual, payload);
+    }
+
     #[test]
     fn fragmented_ram_writes_do_not_publish_dirty_pages_and_defer_device_writes_intact() {
         let machine = Machine::new(6 * PAGE_SIZE).unwrap();

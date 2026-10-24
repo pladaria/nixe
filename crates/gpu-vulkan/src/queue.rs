@@ -182,11 +182,7 @@ pub(crate) struct Slot {
     pub bound_descriptor_offset: u64,
 }
 impl Slot {
-    fn new(
-        owner: Arc<DeviceOwner>,
-        family: u32,
-        #[cfg(feature = "performance-counters")] recording_handle: crate::dispatch::RecordingHandle,
-    ) -> Result<Self, VulkanError> {
+    fn new(owner: Arc<DeviceOwner>, family: u32) -> Result<Self, VulkanError> {
         // Reset the whole pool after its real last use; no per-buffer reset flag.
         let pool = unsafe {
             owner.device.create_command_pool(
@@ -200,7 +196,7 @@ impl Slot {
         let mut slot = Self {
             stream_descriptors: None,
             #[cfg(feature = "performance-counters")]
-            timing: timing::Queries::new(Arc::clone(&owner), family, recording_handle)?,
+            timing: timing::Queries::new(Arc::clone(&owner), family)?,
             owner,
             pool,
             command: vk::CommandBuffer::null(),
@@ -329,7 +325,7 @@ pub(crate) struct QueueState {
     lost: bool,
 }
 impl QueueState {
-    pub(crate) fn end_rendering(&mut self, dispatch: &crate::dispatch::Dispatch) {
+    pub(crate) fn end_rendering(&mut self, dispatch: &mut crate::dispatch::Dispatch) {
         if let Some(index) = self.recording
             && self.slots[index].active_targets.take().is_some()
         {
@@ -535,7 +531,12 @@ impl QueueState {
             retained_readbacks: self.slots.iter().map(Slot::unread).sum(),
         }
     }
-    pub fn begin(&mut self) -> Result<usize, VulkanError> {
+    pub fn begin(
+        &mut self,
+        dispatch: &mut crate::dispatch::Dispatch,
+    ) -> Result<usize, VulkanError> {
+        #[cfg(not(feature = "performance-counters"))]
+        let _ = dispatch;
         self.check_running()?;
         if let Some(index) = self.recording {
             return Ok(index);
@@ -551,12 +552,8 @@ impl QueueState {
         {
             Some(index) => index,
             None if self.slots.len() < self.configuration.command_slots => {
-                self.slots.push(Slot::new(
-                    Arc::clone(&self.owner),
-                    self.family,
-                    #[cfg(feature = "performance-counters")]
-                    self.recording_handle.clone(),
-                )?);
+                self.slots
+                    .push(Slot::new(Arc::clone(&self.owner), self.family)?);
                 self.slots.len() - 1
             }
             None => return Err(self.pressure()),
@@ -575,7 +572,7 @@ impl QueueState {
         let slot = &mut self.slots[index];
         #[cfg(feature = "performance-counters")]
         if let Some(timing) = &mut slot.timing {
-            timing.begin(slot.command);
+            timing.begin(dispatch, slot.command);
         }
         slot.tick = tick;
         if let Some(arena) = &mut slot.upload {
@@ -614,6 +611,7 @@ impl QueueState {
     }
     pub fn reserve_pair(
         &mut self,
+        dispatch: &mut crate::dispatch::Dispatch,
         bytes: &[u8],
     ) -> Result<(usize, Slice, Slice, ReadbackTicket), VulkanError> {
         if bytes.is_empty() {
@@ -630,7 +628,7 @@ impl QueueState {
                 maximum: max,
             });
         }
-        let index = self.begin()?;
+        let index = self.begin(dispatch)?;
         let slot = &mut self.slots[index];
         for (arena, location, usage, label) in [
             (
@@ -777,15 +775,20 @@ impl QueueState {
         ))
     }
     /// Independent directions avoid allocating or filling the other arena.
-    pub fn reserve_upload(&mut self, bytes: &[u8]) -> Result<(usize, Slice), VulkanError> {
-        self.reserve_upload_aligned(bytes, 4)
+    pub fn reserve_upload(
+        &mut self,
+        dispatch: &mut crate::dispatch::Dispatch,
+        bytes: &[u8],
+    ) -> Result<(usize, Slice), VulkanError> {
+        self.reserve_upload_aligned(dispatch, bytes, 4)
     }
     pub(crate) fn reserve_upload_aligned(
         &mut self,
+        dispatch: &mut crate::dispatch::Dispatch,
         bytes: &[u8],
         alignment: u64,
     ) -> Result<(usize, Slice), VulkanError> {
-        let (index, slice) = self.reserve_slice(bytes.len() as u64, true, alignment)?;
+        let (index, slice) = self.reserve_slice(dispatch, bytes.len() as u64, true, alignment)?;
         let slot = &mut self.slots[index];
         let buffer = match slice.overflow {
             Some(i) => &mut slot.upload_overflow[i].buffer,
@@ -796,12 +799,14 @@ impl QueueState {
     }
     pub fn reserve_readback(
         &mut self,
+        dispatch: &mut crate::dispatch::Dispatch,
         size: u64,
     ) -> Result<(usize, Slice, ReadbackTicket), VulkanError> {
-        self.reserve_readback_aligned(size, 4)
+        self.reserve_readback_aligned(dispatch, size, 4)
     }
     pub fn reserve_readback_aligned(
         &mut self,
+        dispatch: &mut crate::dispatch::Dispatch,
         size: u64,
         alignment: u64,
     ) -> Result<(usize, Slice, ReadbackTicket), VulkanError> {
@@ -810,7 +815,7 @@ impl QueueState {
                 "staging alignment must be a nonzero power of two",
             ));
         }
-        let (index, slice) = self.reserve_slice(size, false, alignment)?;
+        let (index, slice) = self.reserve_slice(dispatch, size, false, alignment)?;
         let slot = &mut self.slots[index];
         let entry = slot.readbacks.len();
         slot.readbacks.push(Some(slice));
@@ -827,6 +832,7 @@ impl QueueState {
     }
     pub(crate) fn reserve_slice(
         &mut self,
+        dispatch: &mut crate::dispatch::Dispatch,
         size: u64,
         upload: bool,
         alignment: u64,
@@ -844,7 +850,7 @@ impl QueueState {
                 maximum,
             });
         }
-        let index = self.begin()?;
+        let index = self.begin(dispatch)?;
         let (location, usage, label) = if upload {
             (
                 MemoryLocation::CpuToGpu,
@@ -955,7 +961,7 @@ impl QueueState {
     pub unsafe fn flush(
         &mut self,
         queue: vk::Queue,
-        dispatch: &crate::dispatch::Dispatch,
+        dispatch: &mut crate::dispatch::Dispatch,
         waits: &[vk::SemaphoreSubmitInfo<'_>],
         extra_signals: &[vk::SemaphoreSubmitInfo<'_>],
     ) -> Result<Option<WorkTicket>, VulkanError> {
@@ -979,7 +985,7 @@ impl QueueState {
         {
             let slot = &mut self.slots[index];
             if let Some(timing) = &mut slot.timing {
-                timing.end(slot.command);
+                timing.end(dispatch, slot.command);
             }
         }
         if extra_signals.len() > 1 {
@@ -998,6 +1004,7 @@ impl QueueState {
         // command buffer in FIFO order while the owner prepares following work.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_scheduler.cpp
         nixe_gpu::trace::detail_event("queue_schedule", tick, 0, 0);
+        dispatch.flush_chunks()?;
         let result = self
             .recording_handle
             .submit(crate::dispatch::QueueSubmission {
@@ -1141,10 +1148,12 @@ impl QueueState {
 }
 impl QueueState {
     fn stop(&mut self) -> Result<(), VulkanError> {
+        if self.stopped && self.slots.is_empty() {
+            return Ok(());
+        }
         let prior_failure = self.progress.failure();
         self.stopped = true;
         self.progress.cancel_pending();
-        self.recording_handle.discard_pending();
         // Shutdown is the explicit worker-drain boundary. Canceled jobs release
         // their parameters; a native call already in progress may still succeed.
         let drain = self.recording_handle.finish();
@@ -1232,14 +1241,14 @@ impl VulkanDevice {
         self.submission.instance
     }
     pub(crate) fn end_rendering(&mut self) {
-        self.submission.end_rendering(&self.dispatch);
+        self.submission.end_rendering(&mut self.dispatch);
     }
     /// Acquire recording capacity with bounded storage. The queue's low-level
     /// begin remains nonblocking; native recording waits only for a submitted
     /// use that can free a slot. Unconsumed readbacks still report pressure.
     pub(crate) fn begin_recording(&mut self) -> Result<usize, VulkanError> {
         loop {
-            match self.submission.begin() {
+            match self.submission.begin(&mut self.dispatch) {
                 Ok(index) => return Ok(index),
                 Err(VulkanError::QueuePressure {
                     pending: Some(work),
@@ -1261,7 +1270,10 @@ impl VulkanDevice {
     }
     /// Submit recorded commands and signal the single timeline, without waiting.
     pub fn flush(&mut self) -> Result<Option<WorkTicket>, VulkanError> {
-        unsafe { self.submission.flush(self.queue, &self.dispatch, &[], &[]) }
+        unsafe {
+            self.submission
+                .flush(self.queue, &mut self.dispatch, &[], &[])
+        }
     }
     pub fn poll_progress(&mut self) -> Result<u64, VulkanError> {
         self.submission.poll()
@@ -1386,7 +1398,14 @@ impl VulkanDevice {
     /// Cancel unsubmitted recording and drain accepted work, without publishing
     /// canceled guest reservations. Dropping the device uses the same last tick.
     pub fn shutdown(&mut self) -> Result<(), VulkanError> {
+        self.dispatch.discard_pending();
         self.submission.stop()
+    }
+}
+
+impl Drop for VulkanDevice {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 

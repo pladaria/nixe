@@ -20,12 +20,10 @@ impl CapturedProgram {
                     std::mem::size_of::<CapturedStage>()
                         + environment_heap_bytes(&stage.environment)
                         + info_heap_bytes(&stage.info)
-                        + (stage.dependencies.len() + stage.code_dependencies.len())
-                            * std::mem::size_of::<MaxwellShaderRead>()
+                        + stage.code_dependencies.len() * std::mem::size_of::<MaxwellShaderRead>()
                         + stage
                             .code_dependencies
                             .iter()
-                            .chain(stage.dependencies.iter())
                             .map(|read| {
                                 read.bytes.len()
                             + read.mappings.len() * std::mem::size_of::<crate::MaxwellGpuMapping>()
@@ -145,13 +143,12 @@ impl CapturedStage {
     pub fn request_is_current(&self, request: &CaptureRequest, space: &MaxwellGpuMemory) -> bool {
         self.address == request.address
             && self.request_metadata == request.metadata
-            && self.is_current(space, &request.bindings)
+            && self.is_current(space)
     }
 
     pub fn memory_is_current(&self, space: &MaxwellGpuMemory) -> bool {
         self.code_dependencies
             .iter()
-            .chain(self.dependencies.iter())
             .all(|read| read.is_current(space))
     }
 }
@@ -223,7 +220,7 @@ mod tests {
         );
         assert_eq!(output[1].stage, Stage::Fragment);
         crate::shader::test_support::write_shader_words(space.memory(), &[(base + 0x50, 0)]);
-        assert!(!capture.stages[0].is_current(space.memory(), &capture.stages[0].bindings));
+        assert!(!capture.stages[0].is_current(space.memory()));
         super::super::tests::refresh_unchanged(&capture.stages[1], space.memory());
     }
 }

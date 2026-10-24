@@ -16,7 +16,7 @@ impl VulkanDevice {
             "transfer device buffer",
         )?;
         let (index, source_slice, destination_slice, ticket) =
-            self.submission.reserve_pair(bytes)?;
+            self.submission.reserve_pair(&mut self.dispatch, bytes)?;
         let command = self.submission.slots[index].command;
         let slot = &self.submission.slots[index];
         let upload = slot.upload_buffer(source_slice).handle;
@@ -85,7 +85,7 @@ impl VulkanDevice {
             "transfer image",
         )?;
         let (index, source_slice, destination_slice, ticket) =
-            self.submission.reserve_pair(bytes)?;
+            self.submission.reserve_pair(&mut self.dispatch, bytes)?;
         let command = self.submission.slots[index].command;
         let slot = &self.submission.slots[index];
         let upload = slot.upload_buffer(source_slice).handle;
@@ -208,7 +208,7 @@ impl VulkanDevice {
     }
 }
 pub(crate) fn host_read_barrier(
-    device: &VulkanDevice,
+    device: &mut VulkanDevice,
     command: vk::CommandBuffer,
     buffer: vk::Buffer,
     offset: u64,

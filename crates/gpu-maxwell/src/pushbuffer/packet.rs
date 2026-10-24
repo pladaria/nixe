@@ -9,12 +9,11 @@
 //! https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/docs/hw/fifo/dma-pusher.rst#gf100-commands
 
 mod methods;
-pub(crate) use methods::PacketScratch;
+use methods::PacketMethods;
 pub use methods::{MaxwellMethodIterator, MaxwellMethodSpan};
-use methods::{PacketMethods, SourceRun};
 mod sources;
+pub(crate) use sources::CommandStream;
 pub use sources::MaxwellCommandSourceScratch;
-pub(crate) use sources::SubmissionWords;
 
 use std::fmt::{Display, Formatter};
 
@@ -71,7 +70,7 @@ const METHOD_ENCODINGS: [MethodEncoding; 4] = [
     },
 ];
 
-/// One command word paired with its exact retained T6 source.
+/// One command word paired with its exact source location.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellPushbufferWord {
     value: u32,
@@ -206,19 +205,6 @@ impl MaxwellDecodedMethodPacket {
     pub fn methods(&self) -> MaxwellMethodSpan<'_> {
         MaxwellMethodSpan::new(self)
     }
-    /// Source identities need validation once per contiguous source run.
-    pub(crate) fn source_runs(&self) -> impl Iterator<Item = MaxwellGpfifoSourceLocation> + '_ {
-        let (first, runs): (_, &[SourceRun]) = match &self.methods {
-            PacketMethods::Empty => (None, &[]),
-            PacketMethods::One(method) => (Some(method.argument_source), &[]),
-            PacketMethods::Many {
-                first_source,
-                sources,
-                ..
-            } => (Some(*first_source), sources),
-        };
-        first.into_iter().chain(runs.iter().map(|run| run.location))
-    }
 }
 
 /// Syntactically decoded PBDMA control instruction.
@@ -234,7 +220,39 @@ pub enum MaxwellPushbufferControl {
     EndSegment,
 }
 
-/// One complete packet or control instruction.
+#[derive(Clone, Copy)]
+pub(crate) enum PacketView<'a> {
+    Methods {
+        header: MaxwellGpfifoSourceLocation,
+        subchannel: Option<MaxwellPushbufferSubchannel>,
+        methods: MaxwellMethodSpan<'a>,
+        last: bool,
+    },
+    Control {
+        operation: MaxwellPushbufferControl,
+        source: MaxwellGpfifoSourceLocation,
+    },
+}
+#[cfg(test)]
+impl MaxwellDecodedPacket {
+    pub(crate) fn view(&self) -> PacketView<'_> {
+        match self {
+            Self::Methods(packet) => PacketView::Methods {
+                header: packet.header(),
+                subchannel: packet.subchannel(),
+                methods: packet.methods(),
+                last: true,
+            },
+            Self::Control { operation, source } => PacketView::Control {
+                operation: *operation,
+                source: *source,
+            },
+        }
+    }
+}
+
+/// Owned diagnostic fixture for a complete packet or control instruction.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellDecodedPacket {
     Methods(MaxwellDecodedMethodPacket),
@@ -244,6 +262,7 @@ pub enum MaxwellDecodedPacket {
     },
 }
 
+#[cfg(test)]
 impl MaxwellDecodedPacket {
     #[must_use]
     pub const fn source(&self) -> MaxwellGpfifoSourceLocation {
@@ -254,13 +273,14 @@ impl MaxwellDecodedPacket {
     }
 }
 
-/// Fully decoded command stream. Constructing this value has no frontend side
-/// effects; callers cannot observe a valid prefix when a later packet fails.
+/// Owned encoded-input fixture for engine unit tests.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellDecodedPushbuffer {
     packets: Box<[MaxwellDecodedPacket]>,
 }
 
+#[cfg(test)]
 impl MaxwellDecodedPushbuffer {
     #[must_use]
     pub fn packets(&self) -> &[MaxwellDecodedPacket] {
@@ -356,155 +376,43 @@ impl From<MaxwellGpfifoSourceError> for MaxwellPushbufferDecodeError {
 /// Method data may cross GPFIFO pushbuffer-segment boundaries, as permitted by
 /// the NVIDIA reference. `EndSegment` discards only the remaining words of its
 /// own GPFIFO entry.
+#[cfg(test)]
 pub fn decode_maxwell_pushbuffer<I>(
     words: I,
 ) -> Result<MaxwellDecodedPushbuffer, MaxwellPushbufferDecodeError>
 where
     I: IntoIterator<Item = Result<MaxwellPushbufferWord, MaxwellGpfifoSourceError>>,
 {
-    let mut packets = Vec::new();
-    for packet in DecodedPackets::new(words.into_iter()) {
-        let packet = packet?;
-        packets
-            .try_reserve(1)
-            .map_err(|_| MaxwellPushbufferDecodeError::ResourceExhausted)?;
-        packets.push(packet);
-    }
-
-    Ok(MaxwellDecodedPushbuffer {
-        packets: packets.into_boxed_slice(),
-    })
+    sources::fixture_packets(words.into_iter().collect::<Result<Vec<_>, _>>()?)
 }
 
-/// Decodes one complete packet at a time without retaining the submission's
-/// expanded method records. A malformed packet terminates the stream.
-pub(crate) struct DecodedPackets<I: Iterator> {
-    words: std::iter::Peekable<I>,
-    end_entry: Option<u32>,
-    finished: bool,
-    scratch: PacketScratch,
+#[derive(Clone, Copy)]
+struct MethodHeader {
+    source: MaxwellGpfifoSourceLocation,
+    mode: MaxwellMethodPacketMode,
+    first: u32,
+    count: u16,
+    immediate: u32,
+    subchannel: Option<MaxwellPushbufferSubchannel>,
 }
-
-impl<I> DecodedPackets<I>
-where
-    I: Iterator<Item = Result<MaxwellPushbufferWord, MaxwellGpfifoSourceError>>,
-{
-    pub(crate) fn new(words: I) -> Self {
-        Self {
-            words: words.peekable(),
-            end_entry: None,
-            finished: false,
-            scratch: PacketScratch::default(),
-        }
-    }
-
-    pub(crate) fn with_scratch(words: I, scratch: PacketScratch) -> Self {
-        Self {
-            words: words.peekable(),
-            end_entry: None,
-            finished: false,
-            scratch,
-        }
-    }
-    pub(crate) fn into_scratch(self) -> PacketScratch {
-        self.scratch
-    }
-    pub(crate) fn recycle(&mut self, packet: MaxwellDecodedPacket) {
-        if let MaxwellDecodedPacket::Methods(MaxwellDecodedMethodPacket {
-            methods: PacketMethods::Many {
-                arguments, sources, ..
-            },
-            ..
-        }) = packet
-        {
-            self.scratch.arguments = arguments;
-            self.scratch.sources = sources;
-        }
-    }
-    fn read(&mut self) -> Result<Option<MaxwellDecodedPacket>, MaxwellPushbufferDecodeError> {
-        if let Some(entry) = self.end_entry.take() {
-            skip_entry_tail(&mut self.words, entry)?;
-        }
-        let Some(header) = next_word(&mut self.words)? else {
-            return Ok(None);
-        };
-        let packet = decode_packet(header, &mut self.words, &mut self.scratch)?;
-        if matches!(
-            packet,
-            MaxwellDecodedPacket::Control {
-                operation: MaxwellPushbufferControl::EndSegment,
-                ..
-            }
-        ) {
-            self.end_entry = Some(header.location.entry_index);
-        }
-        Ok(Some(packet))
-    }
+enum Header {
+    Control(MaxwellPushbufferControl),
+    Methods(MethodHeader),
 }
-
-impl<I> Iterator for DecodedPackets<I>
-where
-    I: Iterator<Item = Result<MaxwellPushbufferWord, MaxwellGpfifoSourceError>>,
-{
-    type Item = Result<MaxwellDecodedPacket, MaxwellPushbufferDecodeError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.finished {
-            return None;
-        }
-        match self.read() {
-            Ok(Some(packet)) => Some(Ok(packet)),
-            Ok(None) => {
-                self.finished = true;
-                None
-            }
-            Err(error) => {
-                self.finished = true;
-                Some(Err(error))
-            }
-        }
-    }
-}
-
-/// Reads the retained T6 sources and decodes their logical command stream.
-/// No channel, scheduler, fence, class, or backend state is mutated.
-pub fn decode_maxwell_submission(
-    submission: &MaxwellValidatedGpfifoSubmission,
-    address_space: &MaxwellGpuMemory,
-    access: &mut nixe_gpu::MemoryAccess<'_>,
-) -> Result<MaxwellDecodedPushbuffer, MaxwellPushbufferDecodeError> {
-    decode_maxwell_pushbuffer(SubmissionWords::new(
-        submission,
-        address_space,
-        &mut MaxwellCommandSourceScratch::default(),
-        &mut || Ok(()),
-        access,
-    ))
-}
-
-fn decode_packet<I>(
-    header: MaxwellPushbufferWord,
-    words: &mut std::iter::Peekable<I>,
-    scratch: &mut PacketScratch,
-) -> Result<MaxwellDecodedPacket, MaxwellPushbufferDecodeError>
-where
-    I: Iterator<Item = Result<MaxwellPushbufferWord, MaxwellGpfifoSourceError>>,
-{
+fn decode_header(header: MaxwellPushbufferWord) -> Result<Header, MaxwellPushbufferDecodeError> {
     let word = header.value;
     if word == 0 {
-        return Ok(control_packet(MaxwellPushbufferControl::Nop, header));
+        return Ok(Header::Control(MaxwellPushbufferControl::Nop));
     }
-
     let opcode = ((word >> SECONDARY_OPCODE_SHIFT) & SECONDARY_OPCODE_MASK) as u8;
     if opcode == OPCODE_GROUP_ZERO {
-        return decode_group_zero_control(header);
+        return decode_group_zero_control(header).map(Header::Control);
     }
     if opcode == OPCODE_END_SEGMENT {
-        return Ok(control_packet(MaxwellPushbufferControl::EndSegment, header));
+        return Ok(Header::Control(MaxwellPushbufferControl::EndSegment));
     }
     let Some(encoding) = METHOD_ENCODINGS
         .iter()
-        .copied()
         .find(|encoding| encoding.opcode == opcode)
     else {
         return Err(MaxwellPushbufferDecodeError::UnknownEncoding {
@@ -513,13 +421,38 @@ where
             secondary_opcode: opcode,
         });
     };
-
-    decode_method_packet(header, encoding.mode, words, scratch)
+    let mode = encoding.mode;
+    let encoded = ((word >> COUNT_SHIFT) & COUNT_MASK) as u16;
+    let count = if mode == MaxwellMethodPacketMode::Immediate {
+        1
+    } else {
+        encoded
+    };
+    if count > 0 && word & METHOD_RESERVED_BIT != 0 {
+        return Err(MaxwellPushbufferDecodeError::ReservedMethodBit {
+            source: header.location,
+            word,
+        });
+    }
+    let first = word & METHOD_ADDRESS_MASK;
+    if count > 0 {
+        validate_method_range(header.location, mode, first, count)?;
+    }
+    Ok(Header::Methods(MethodHeader {
+        source: header.location,
+        mode,
+        first,
+        count,
+        immediate: u32::from(encoded),
+        subchannel: (count > 0).then_some(MaxwellPushbufferSubchannel(
+            ((word >> SUBCHANNEL_SHIFT) & SUBCHANNEL_MASK) as u8,
+        )),
+    }))
 }
 
 fn decode_group_zero_control(
     word: MaxwellPushbufferWord,
-) -> Result<MaxwellDecodedPacket, MaxwellPushbufferDecodeError> {
+) -> Result<MaxwellPushbufferControl, MaxwellPushbufferDecodeError> {
     let opcode = (word.value >> 16) as u16;
     let low = word.value as u16;
     let operation = match opcode {
@@ -537,107 +470,7 @@ fn decode_group_zero_control(
             });
         }
     };
-    Ok(control_packet(operation, word))
-}
-
-fn decode_method_packet<I>(
-    header: MaxwellPushbufferWord,
-    mode: MaxwellMethodPacketMode,
-    words: &mut std::iter::Peekable<I>,
-    scratch: &mut PacketScratch,
-) -> Result<MaxwellDecodedPacket, MaxwellPushbufferDecodeError>
-where
-    I: Iterator<Item = Result<MaxwellPushbufferWord, MaxwellGpfifoSourceError>>,
-{
-    let encoded_count = ((header.value >> COUNT_SHIFT) & COUNT_MASK) as u16;
-    let count = if mode == MaxwellMethodPacketMode::Immediate {
-        1
-    } else {
-        encoded_count
-    };
-    if count == 0 {
-        return Ok(MaxwellDecodedPacket::Methods(MaxwellDecodedMethodPacket {
-            mode,
-            header: header.location,
-            subchannel: None,
-            methods: PacketMethods::Empty,
-        }));
-    }
-    if header.value & METHOD_RESERVED_BIT != 0 {
-        return Err(MaxwellPushbufferDecodeError::ReservedMethodBit {
-            source: header.location,
-            word: header.value,
-        });
-    }
-
-    let first_method_dword = header.value & METHOD_ADDRESS_MASK;
-    validate_method_range(header.location, mode, first_method_dword, count)?;
-    let subchannel =
-        MaxwellPushbufferSubchannel(((header.value >> SUBCHANNEL_SHIFT) & SUBCHANNEL_MASK) as u8);
-    let methods = if count == 1 {
-        let argument = if mode == MaxwellMethodPacketMode::Immediate {
-            MaxwellPushbufferWord::new(u32::from(encoded_count), header.location)
-        } else {
-            next_word(words)?.ok_or(MaxwellPushbufferDecodeError::TruncatedPacket {
-                source: header.location,
-                expected_arguments: count,
-                available_arguments: 0,
-            })?
-        };
-        PacketMethods::One(MaxwellDecodedMethod {
-            method: method_id(first_method_dword),
-            argument: argument.value,
-            argument_source: argument.location,
-        })
-    } else {
-        let mut arguments = std::mem::take(&mut scratch.arguments);
-        arguments.clear();
-        arguments
-            .try_reserve(usize::from(count))
-            .map_err(|_| MaxwellPushbufferDecodeError::ResourceExhausted)?;
-        let mut sources = std::mem::take(&mut scratch.sources);
-        sources.clear();
-        let mut first_source = header.location;
-        let mut base = 0;
-        let mut previous = first_source;
-        for argument_index in 0..count {
-            let Some(argument) = next_word(words)? else {
-                return Err(MaxwellPushbufferDecodeError::TruncatedPacket {
-                    source: header.location,
-                    expected_arguments: count,
-                    available_arguments: argument_index,
-                });
-            };
-            if argument_index == 0 {
-                first_source = argument.location;
-                previous = argument.location;
-            }
-            let mut expected = previous;
-            expected.word_offset += u64::from(argument_index - base);
-            if expected != argument.location {
-                sources.push(SourceRun {
-                    index: argument_index,
-                    location: argument.location,
-                });
-                previous = argument.location;
-                base = argument_index;
-            }
-            arguments.push(argument.value);
-        }
-        PacketMethods::Many {
-            first_method: first_method_dword,
-            arguments,
-            first_source,
-            sources,
-        }
-    };
-
-    Ok(MaxwellDecodedPacket::Methods(MaxwellDecodedMethodPacket {
-        mode,
-        header: header.location,
-        subchannel: Some(subchannel),
-        methods,
-    }))
+    Ok(operation)
 }
 
 fn validate_method_range(
@@ -682,58 +515,22 @@ const fn method_id(dword: u32) -> GpuMethodId {
     GpuMethodId(dword * 4)
 }
 
-const fn control_packet(
-    operation: MaxwellPushbufferControl,
-    word: MaxwellPushbufferWord,
-) -> MaxwellDecodedPacket {
-    MaxwellDecodedPacket::Control {
-        operation,
-        source: word.location,
-    }
-}
-
-fn next_word<I>(
-    words: &mut std::iter::Peekable<I>,
-) -> Result<Option<MaxwellPushbufferWord>, MaxwellPushbufferDecodeError>
-where
-    I: Iterator<Item = Result<MaxwellPushbufferWord, MaxwellGpfifoSourceError>>,
-{
-    words.next().transpose().map_err(Into::into)
-}
-
-fn skip_entry_tail<I>(
-    words: &mut std::iter::Peekable<I>,
-    entry_index: u32,
-) -> Result<(), MaxwellPushbufferDecodeError>
-where
-    I: Iterator<Item = Result<MaxwellPushbufferWord, MaxwellGpfifoSourceError>>,
-{
-    loop {
-        match words.peek() {
-            Some(Ok(word)) if word.location.entry_index == entry_index => {
-                words.next();
-            }
-            Some(Err(_)) => {
-                next_word(words)?;
-            }
-            _ => return Ok(()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::MaxwellGpuAddressSpace;
+    fn control_packet(
+        operation: super::MaxwellPushbufferControl,
+        word: super::MaxwellPushbufferWord,
+    ) -> super::MaxwellDecodedPacket {
+        super::MaxwellDecodedPacket::Control {
+            operation,
+            source: word.location,
+        }
+    }
+
     use nixe_gpu::{FrontendSubmissionId, GpuVirtualAddress, MappingGeneration};
-    use nixe_memory::MemoryPermissions;
 
     use super::*;
-    use crate::{
-        MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
-        MaxwellChannelId, MaxwellChannelOwner, MaxwellGpfifoSubmitRequest, MaxwellGpuChannel,
-        MaxwellMapRequest, MaxwellMappingId, SWITCH_1_GM20B_PROFILE, decode_gpfifo_submission,
-        resolve_gpfifo_submission,
-    };
+    use crate::{MaxwellChannelId, MaxwellMappingId};
 
     fn location(entry: u32, word: u64) -> MaxwellGpfifoSourceLocation {
         MaxwellGpfifoSourceLocation {
@@ -759,33 +556,6 @@ mod tests {
 
     const fn method_header(opcode: u32, method: u32, subchannel: u32, count: u32) -> u32 {
         opcode << 29 | count << 16 | subchannel << 13 | method
-    }
-
-    #[test]
-    fn packet_stream_reads_on_demand_and_stops_at_the_first_decode_error() {
-        let words = [
-            sourced(method_header(4, 0x100, 2, 3), 0, 0),
-            sourced(2 << 29, 0, 1),
-            sourced(method_header(4, 0x101, 2, 5), 0, 2),
-        ];
-        let reads = std::cell::Cell::new(0);
-        let mut packets = DecodedPackets::new(words.into_iter().map(|word| {
-            reads.set(reads.get() + 1);
-            Ok(word)
-        }));
-        assert_eq!(reads.get(), 0);
-        let MaxwellDecodedPacket::Methods(first) = packets.next().unwrap().unwrap() else {
-            panic!("immediate method packet");
-        };
-        assert_eq!(first.methods().get(0).unwrap().method(), GpuMethodId(0x400));
-        assert_eq!(first.methods().get(0).unwrap().argument(), 3);
-        assert_eq!(reads.get(), 1);
-        assert!(matches!(packets.next(), Some(Err(
-            MaxwellPushbufferDecodeError::UnknownEncoding { source, .. }
-        )) if source == location(0, 1)));
-        assert_eq!(reads.get(), 2);
-        assert!(packets.next().is_none());
-        assert_eq!(reads.get(), 2);
     }
 
     #[test]
@@ -1011,141 +781,6 @@ mod tests {
                 sourced(2, 0, 2),
             ]),
             Err(MaxwellPushbufferDecodeError::MethodRangeOverflow { .. })
-        ));
-    }
-
-    #[test]
-    fn complete_stream_decode_never_returns_a_valid_prefix() {
-        let words = [
-            sourced(method_header(4, 0x100, 0, 1), 0, 0),
-            sourced(method_header(3, 0x200, 0, 2), 0, 1),
-            sourced(0x55, 0, 2),
-        ];
-        assert!(matches!(
-            decode(&words),
-            Err(MaxwellPushbufferDecodeError::TruncatedPacket {
-                source,
-                available_arguments: 1,
-                ..
-            }) if source == location(0, 1)
-        ));
-    }
-
-    #[test]
-    fn source_errors_prevent_any_decoded_result() {
-        let input = [
-            Ok(sourced(method_header(4, 0x100, 0, 1), 0, 0)),
-            Err(MaxwellGpfifoSourceError::ResourceExhausted),
-        ];
-        assert!(matches!(
-            decode_maxwell_pushbuffer(input),
-            Err(MaxwellPushbufferDecodeError::Source(
-                MaxwellGpfifoSourceError::ResourceExhausted
-            ))
-        ));
-    }
-
-    #[test]
-    fn retained_submission_decoding_reads_canonical_bytes_and_preserves_mapping_source() {
-        let machine = crate::test_memory::machine();
-        let command_words = [method_header(1, 0x100, 2, 2), 0x1122_3344, 0x5566_7788];
-        let allocation = crate::test_memory::allocate(&machine, 0x1000);
-        let command_bytes = command_words
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect::<Vec<_>>();
-        crate::test_memory::write(&allocation, 0, &command_bytes).unwrap();
-
-        let mut address_space = MaxwellGpuAddressSpace::new(
-            machine.clone(),
-            MaxwellAddressSpaceId::new(2),
-            SWITCH_1_GM20B_PROFILE,
-        );
-        address_space
-            .initialize(MaxwellAddressSpaceInitialization::default())
-            .unwrap();
-        let mapping = address_space
-            .map(MaxwellMapRequest {
-                allocation: MaxwellAllocationId::new(4),
-                backing: crate::test_memory::ranges(&allocation),
-                backing_offset: 0,
-                size: 0x1000,
-                allocation_alignment: 0x1000,
-                page_size: 0x1000,
-                kind: 0,
-                cacheable: false,
-                permissions: MemoryPermissions::READ_WRITE,
-                fixed_offset: None,
-            })
-            .unwrap();
-        let address = mapping.offset().get();
-        let mut descriptor = [0_u8; 8];
-        descriptor[..4].copy_from_slice(&(address as u32).to_le_bytes());
-        descriptor[4..].copy_from_slice(
-            &(((address >> 32) as u32 | ((command_words.len() as u32) << 10)).to_le_bytes()),
-        );
-        let decoded_gpfifo = decode_gpfifo_submission(
-            SWITCH_1_GM20B_PROFILE,
-            8,
-            MaxwellGpfifoSubmitRequest {
-                entry_count: 1,
-                flags: 1 << 2,
-                fence_id: 0,
-                fence_value: 0,
-            },
-            &descriptor,
-        )
-        .unwrap();
-        let mut channel = MaxwellGpuChannel::new(
-            MaxwellChannelId::new(9),
-            MaxwellChannelOwner::new(1),
-            SWITCH_1_GM20B_PROFILE,
-        );
-        channel.bind_address_space(address_space.id()).unwrap();
-        let retained = resolve_gpfifo_submission(
-            &channel,
-            FrontendSubmissionId::new(12),
-            decoded_gpfifo,
-            address_space.memory(),
-        )
-        .unwrap();
-
-        let decoded = decode_maxwell_submission(
-            &retained,
-            address_space.memory(),
-            &mut crate::test_memory::access(address_space.memory().machine()),
-        )
-        .unwrap();
-        let MaxwellDecodedPacket::Methods(packet) = &decoded.packets()[0] else {
-            panic!("expected method packet");
-        };
-        assert_eq!(packet.methods().get(0).unwrap().argument(), 0x1122_3344);
-        assert_eq!(packet.methods().get(1).unwrap().argument(), 0x5566_7788);
-        assert_eq!(packet.header().mapping, mapping.id());
-        assert_eq!(packet.header().generation, mapping.generation());
-        assert_eq!(
-            packet
-                .methods()
-                .get(1)
-                .unwrap()
-                .argument_source()
-                .word_offset,
-            2
-        );
-
-        address_space.unmap(mapping.offset()).unwrap();
-        assert!(matches!(
-            decode_maxwell_submission(
-                &retained,
-                address_space.memory(),
-                &mut crate::test_memory::access(address_space.memory().machine())
-            ),
-            Err(MaxwellPushbufferDecodeError::Source(
-                MaxwellGpfifoSourceError::Access {
-                    error: crate::MaxwellGpuAccessError::StaleMapping { .. },
-                    ..
-                }
-            ))
         ));
     }
 }

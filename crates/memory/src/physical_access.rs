@@ -121,6 +121,11 @@ impl PhysicalAccess {
     }
 }
 impl PhysicalGuard<'_> {
+    pub(crate) fn covers(&self, extent: Extent) -> bool {
+        self.first <= (extent.start.get() >> REGION_SHIFT) as usize
+            && self.end >= (extent.start.get() + extent.bytes).div_ceil(1 << REGION_SHIFT) as usize
+    }
+
     fn release(&mut self) {
         for region in self.first..self.end {
             let before = self.access.regions[region].fetch_sub(1, Ordering::Release);

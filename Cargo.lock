@@ -1395,6 +1395,7 @@ dependencies = [
  "nixe-memory",
  "nixe-shader-recompiler",
  "rustc-hash",
+ "smallvec",
 ]
 
 [[package]]

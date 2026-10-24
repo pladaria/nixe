@@ -63,4 +63,5 @@ pub(super) fn fixture_roles(
     roles.dedup();
     super::super::threed::MaxwellThreeDResolvedResourceCache::new(1)
         .resolve(state, space, &roles, 4096, access)
+        .cloned()
 }

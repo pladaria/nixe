@@ -1,6 +1,6 @@
 use nixe_gpu::{FrontendSubmissionId, GuestTimelinePoint};
 use nixe_gpu_maxwell::*;
-use nixe_memory::{Allocation, Machine, PAGE_SIZE};
+use nixe_memory::{Allocation, Machine, MemoryPermissions, PAGE_SIZE};
 
 #[path = "support/memory.rs"]
 mod memory;
@@ -40,8 +40,8 @@ fn setup() -> (Allocation, MaxwellGpuAddressSpace, MaxwellGpuChannel) {
         &descriptor(mapping.offset().get(), 1),
     )
     .unwrap();
-    // Ensure the helper itself exercises a valid retained source.
-    resolve_gpfifo_submission(
+    // Ensure the helper itself exercises a valid decoded entry.
+    validate_gpfifo_submission(
         &channel.configuration(),
         FrontendSubmissionId::new(0),
         decoded,
@@ -69,33 +69,7 @@ fn submission(
         &descriptor(mapping.offset.get(), 1),
     )
     .unwrap();
-    resolve_gpfifo_submission(
-        channel,
-        FrontendSubmissionId::new(frontend),
-        decoded,
-        address_space.memory(),
-    )
-    .unwrap()
-}
-
-fn empty_submission(
-    channel: &MaxwellChannelConfiguration,
-    address_space: &MaxwellGpuAddressSpace,
-    frontend: u64,
-) -> MaxwellValidatedGpfifoSubmission {
-    let decoded = decode_gpfifo_submission(
-        SWITCH_1_GM20B_PROFILE,
-        8,
-        MaxwellGpfifoSubmitRequest {
-            entry_count: 0,
-            flags: HARDWARE_FORMAT,
-            fence_id: 0,
-            fence_value: 0,
-        },
-        &[],
-    )
-    .unwrap();
-    resolve_gpfifo_submission(
+    validate_gpfifo_submission(
         channel,
         FrontendSubmissionId::new(frontend),
         decoded,
@@ -153,7 +127,7 @@ fn global_fifo_order_is_independent_of_channel_identity() {
 }
 
 #[test]
-fn dispatch_revalidates_before_removing_work_or_reading_a_packet() {
+fn dispatch_defers_stale_mapping_detection_to_command_consumption() {
     let (_allocation, mut address_space, channel) = setup();
     let validated = submission(&channel.configuration(), &address_space, 3);
     let mapping = address_space.mapping_dump(1).entries[0];
@@ -163,13 +137,20 @@ fn dispatch_revalidates_before_removing_work_or_reading_a_packet() {
         .unwrap();
     address_space.unmap(mapping.offset).unwrap();
 
+    let dispatched = scheduler
+        .dispatch_next(true, address_space.memory())
+        .unwrap()
+        .unwrap();
+    assert_eq!(scheduler.pending_count(), 0);
+    let entry = dispatched.scheduled().submission().decoded().entries()[0];
     assert!(matches!(
-        scheduler.dispatch_next(true, address_space.memory()),
-        Err(MaxwellScheduleError::Source(
-            MaxwellGpfifoSourceError::StaleMapping { .. }
-        ))
+        address_space.memory().resolve_range(
+            entry.address(),
+            entry.byte_count(),
+            MemoryPermissions::READ
+        ),
+        Err(MaxwellGpuAccessError::UnmappedAddress { .. })
     ));
-    assert_eq!(scheduler.pending_count(), 1);
 }
 
 #[test]
@@ -192,9 +173,7 @@ fn frontend_boundary_retains_ordering_and_never_claims_completion() {
         dispatch.scheduled().stage(),
         MaxwellSubmissionOrderingStage::FrontendDispatched
     );
-    let boundary = dispatch.unsupported_boundary().unwrap();
-    assert_eq!(boundary.first_packet().unwrap().word_offset, 0);
-    assert!(boundary.dispatch().scheduled().completion().is_none());
+    assert!(dispatch.scheduled().completion().is_none());
 }
 
 #[test]
@@ -240,38 +219,6 @@ fn channel_cancellation_preserves_other_channels_and_does_not_dispatch() {
 }
 
 #[test]
-fn empty_submission_stops_without_fabricating_completion() {
-    let (_allocation, address_space, channel) = setup();
-    let mut scheduler = MaxwellScheduler::default();
-    scheduler
-        .enqueue(
-            &channel.configuration(),
-            empty_submission(&channel.configuration(), &address_space, 7),
-            None,
-            None,
-        )
-        .unwrap();
-
-    let boundary = scheduler
-        .dispatch_next(true, address_space.memory())
-        .unwrap()
-        .unwrap()
-        .unsupported_boundary()
-        .unwrap();
-    assert!(matches!(
-        boundary,
-        MaxwellFrontendDispatchBoundary::EmptySubmission { .. }
-    ));
-    assert_eq!(boundary.first_packet(), None);
-    assert_eq!(
-        boundary.dispatch().scheduled().stage(),
-        MaxwellSubmissionOrderingStage::FrontendDispatched
-    );
-    assert!(boundary.dispatch().scheduled().completion().is_none());
-    assert_eq!(scheduler.pending_count(), 0);
-}
-
-#[test]
 fn pending_dependency_and_teardown_retain_then_release_whole_work() {
     let (_allocation, address_space, channel) = setup();
     let dependency = GuestTimelinePoint::new(
@@ -290,7 +237,7 @@ fn pending_dependency_and_teardown_retain_then_release_whole_work() {
         &descriptor(address_space.mapping_dump(1).entries[0].offset.get(), 1),
     )
     .unwrap();
-    let validated = resolve_gpfifo_submission(
+    let validated = validate_gpfifo_submission(
         &channel.configuration(),
         FrontendSubmissionId::new(8),
         decoded,

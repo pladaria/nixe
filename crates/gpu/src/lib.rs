@@ -26,7 +26,7 @@ mod execution;
 mod presentation;
 mod resource;
 mod runtime;
-pub use execution::{ExecutionBatch, GpuExecution, MemoryAccess, PreparedStateId};
+pub use execution::{GpuExecution, MemoryAccess, OwnerAccess, PreparedStateId};
 mod tessellation;
 pub use tessellation::{
     TessellationControl, TessellationDomain, TessellationMode, TessellationOutput,
@@ -72,9 +72,7 @@ pub use resource::{
     SamplerId, ShaderId, ShaderStage,
 };
 pub use runtime::{BackendExecutionCompletion, BackendRuntimeError};
-pub use submission::{
-    BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId, FrontendSubmissionSegment,
-};
+pub use submission::{BackendInstanceId, BackendSubmissionToken, FrontendSubmissionId};
 pub use synchronization::{
     GuestSyncpointId, GuestSyncpointValue, GuestTimeline, GuestTimelinePoint, OwnerMismatch,
     ReservedTimelinePoint, SyncpointComparisonError, TimelineAdvanceError, TimelineIncrementError,

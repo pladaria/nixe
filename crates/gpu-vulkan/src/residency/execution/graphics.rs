@@ -162,6 +162,8 @@ impl InlineIndex {
     }
 }
 pub struct PreparedDraw {
+    native_vertices: Box<[(vk::Buffer, u64)]>,
+    native_index: Option<(vk::Buffer, u64, vk::IndexType)>,
     batchable: bool,
     graphics: PreparedGraphics,
     targets: Arc<PreparedTargets>,
@@ -577,7 +579,23 @@ impl VulkanResidency {
                     .any(|f| overlaps(f)),
             };
         }
+        let native_vertices = vertices
+            .iter()
+            .map(|v| {
+                self.buffer(v.buffer)
+                    .map(|entry| (entry.native.handle, v.offset))
+            })
+            .collect::<Result<_, _>>()?;
+        let native_index = index
+            .as_ref()
+            .map(|i| {
+                self.buffer(i.buffer)
+                    .map(|entry| (entry.native.handle, i.offset, i.kind))
+            })
+            .transpose()?;
         Ok(PreparedDraw {
+            native_vertices,
+            native_index,
             batchable,
             graphics,
             targets,
@@ -586,20 +604,11 @@ impl VulkanResidency {
             inline_index: None,
         })
     }
+    /// Consume immediately, synchronizing contents independently of cached bindings.
     pub fn draw(
         &mut self,
         prepared: &PreparedDraw,
         draw: Draw,
-        push: &[u8],
-    ) -> Result<WorkTicket, VulkanError> {
-        self.draws(prepared, std::slice::from_ref(&draw), push)
-    }
-    /// One compatible immutable state and several direct arguments. Shader
-    /// writes are a real inter-draw hazard and require separate preparation.
-    pub fn draws(
-        &mut self,
-        prepared: &PreparedDraw,
-        draws: &[Draw],
         push: &[u8],
     ) -> Result<WorkTicket, VulkanError> {
         let retained = self.constructing.len();
@@ -624,12 +633,12 @@ impl VulkanResidency {
                 }
             }));
         self.constructing
-            .extend(draws.iter().filter_map(|draw| match draw {
+            .extend(std::iter::once(&draw).filter_map(|draw| match draw {
                 Draw::Indirect { buffer, .. } => Some(Resource::Buffer(*buffer)),
                 _ => None,
             }));
         let result = (|| loop {
-            let result = self.record_draws_inner(prepared, draws, push);
+            let result = self.record_draw_inner(prepared, draw, push);
             self.device.submission.release_stream_uploads();
             if matches!(result, Err(VulkanError::DescriptorPressure)) {
                 // Descriptor allocation precedes draw emission. Submit the
@@ -643,37 +652,15 @@ impl VulkanResidency {
         self.constructing.truncate(retained);
         result
     }
-    fn record_draws_inner(
+    fn record_draw_inner(
         &mut self,
         prepared: &PreparedDraw,
-        draws: &[Draw],
+        draw: Draw,
         push: &[u8],
     ) -> Result<WorkTicket, VulkanError> {
-        if draws.is_empty() {
-            return Err(VulkanError::InvalidResource("empty draw group"));
-        }
-        if draws.len() > 1
-            && (!prepared.can_group() || draws.iter().any(|d| matches!(d, Draw::Indirect { .. })))
-        {
-            return Err(VulkanError::InvalidResource(
-                "draw group requires direct arguments and read-only shader resources",
-            ));
-        }
         if !prepared.can_group() || !self.rendering_matches(&prepared.targets) {
             self.device.end_rendering();
         }
-        let is_empty = |d: &Draw| match *d {
-            Draw::Direct {
-                vertices,
-                instances,
-                ..
-            } => vertices == 0 || instances == 0,
-            Draw::Indexed {
-                indices, instances, ..
-            } => indices == 0 || instances == 0,
-            Draw::Indirect { count, .. } => count == 0,
-        };
-        let draw = *draws.iter().find(|d| !is_empty(d)).unwrap_or(&draws[0]);
         let graphics = &prepared.graphics;
         let empty = match draw {
             Draw::Direct {
@@ -686,13 +673,13 @@ impl VulkanResidency {
             } => indices == 0 || instances == 0,
             Draw::Indirect { count, .. } => count == 0,
         };
-        for &draw in draws {
+        {
             match draw {
                 Draw::Indexed {
                     indices,
                     first_index,
                     ..
-                } if !is_empty(&draw) => {
+                } if !empty => {
                     let (element, size) = match (&prepared.index, &prepared.inline_index) {
                         (Some(i), None) => (
                             match i.kind {
@@ -750,35 +737,35 @@ impl VulkanResidency {
             }
         };
         let record = streams.record;
-        let mut vertex_bindings = Vec::with_capacity(prepared.vertices.len());
-        let mut writers = smallvec::SmallVec::<[WriterId; 16]>::new();
+        self.invalidate_cpu_resources(&[])?;
+        let mut writers = smallvec::SmallVec::new();
         let indirect = if !empty {
-            writers = self.program_access_except(&graphics.program)?;
-            for vertex in prepared.vertices.iter() {
-                self.ensure_buffer_range(vertex.buffer, vertex.offset, vertex.size)?;
-                let handle = self.buffer_access_range(
-                    vertex.buffer,
-                    vertex.offset,
-                    vertex.size,
-                    AccessScope::new(
-                        vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT,
-                        vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
-                    ),
-                )?;
-                vertex_bindings.push((handle, vertex.offset));
-            }
-            // Input order matches the immutable vertex lease array.
-            if let Some(index) = &prepared.index {
-                self.ensure_buffer_range(index.buffer, index.offset, index.size)?;
-                self.buffer_access_range(
-                    index.buffer,
-                    index.offset,
-                    index.size,
-                    AccessScope::new(
-                        vk::PipelineStageFlags2::INDEX_INPUT,
-                        vk::AccessFlags2::INDEX_READ,
-                    ),
-                )?;
+            {
+                writers = self.program_access_except(&graphics.program)?;
+                for vertex in prepared.vertices.iter() {
+                    self.ensure_buffer_range(vertex.buffer, vertex.offset, vertex.size)?;
+                    self.buffer_access_range(
+                        vertex.buffer,
+                        vertex.offset,
+                        vertex.size,
+                        AccessScope::new(
+                            vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT,
+                            vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
+                        ),
+                    )?;
+                }
+                if let Some(index) = &prepared.index {
+                    self.ensure_buffer_range(index.buffer, index.offset, index.size)?;
+                    self.buffer_access_range(
+                        index.buffer,
+                        index.offset,
+                        index.size,
+                        AccessScope::new(
+                            vk::PipelineStageFlags2::INDEX_INPUT,
+                            vk::AccessFlags2::INDEX_READ,
+                        ),
+                    )?;
+                }
             }
             if let Draw::Indirect {
                 buffer,
@@ -821,102 +808,108 @@ impl VulkanResidency {
             None
         };
         let mut color_loads = None::<Vec<vk::RenderingAttachmentInfo<'static>>>;
-        for a in prepared.targets.attachments() {
-            match a.description.source {
-                AttachmentSource::Canonical { image, .. } => {
-                    if a.description.load == vk::AttachmentLoadOp::LOAD {
-                        let replacement = if a.plane.aspect == vk::ImageAspectFlags::COLOR
-                            && !empty
-                            && !self.image(image)?.discarded.is_empty()
-                        {
-                            self.invalidate_cpu_resources(&[])?;
-                            prepared
-                                .targets
-                                .colors
-                                .iter()
-                                .position(|color| {
-                                    color.as_ref().is_some_and(|color| std::ptr::eq(color, a))
-                                })
-                                .filter(|&index| {
-                                    let state = &graphics.parameters.state;
-                                    let blend = &state.colors[index].1;
-                                    !state.logic_enabled
-                                        && !blend.enabled
-                                        && blend.write_mask
-                                            == (vk::ColorComponentFlags::R
-                                                | vk::ColorComponentFlags::G
-                                                | vk::ColorComponentFlags::B
-                                                | vk::ColorComponentFlags::A)
-                                })
-                        } else {
-                            None
-                        };
-                        // LOAD preserves existing texels; it does not mean the
-                        // guest reads the destination. Replacement draws can
-                        // write an incompletely initialized target. Keep LOAD
-                        // when it preserves defined texels; discard only an
-                        // entirely undefined render area.
-                        // https://docs.vulkan.org/refpages/latest/refpages/source/VkAttachmentLoadOp.html
-                        let discard = replacement.filter(|_| {
-                            self.image(image).unwrap().discarded.iter().any(
-                                |&(plane, undefined)| {
-                                    self.image(image).unwrap().planes[plane] == a.plane
-                                        && transfers::contains_rect(
-                                            undefined,
-                                            prepared.targets.area,
-                                        )
-                                },
-                            )
-                        });
-                        if let Some(index) = discard {
-                            color_loads
-                                .get_or_insert_with(|| prepared.targets.native_colors.to_vec())
-                                [index]
-                                .load_op = vk::AttachmentLoadOp::DONT_CARE;
-                        } else if replacement.is_none() {
-                            self.ensure_image_initialized(image, a.plane, prepared.targets.area)?;
-                        }
-                    } else {
-                        // CLEAR and DONT_CARE do not consume the previous texels.
-                        // Keep undefined/dirty coverage outside the actual write.
-                        self.invalidate_cpu_resources(&[])?;
-                    }
-                    if !read_only_attachment(a, &graphics.parameters.state)
-                        && (!empty || a.description.load == vk::AttachmentLoadOp::CLEAR)
-                    {
-                        let entry = self.image(image)?;
-                        let incomplete = a.description.load == vk::AttachmentLoadOp::LOAD
-                            && entry.discarded.iter().any(|&(index, rect)| {
-                                entry.planes[index] == a.plane
-                                    && transfers::intersects(rect, prepared.targets.area)
+        {
+            for a in prepared.targets.attachments() {
+                match a.description.source {
+                    AttachmentSource::Canonical { image, .. } => {
+                        if a.description.load == vk::AttachmentLoadOp::LOAD {
+                            let replacement = if a.plane.aspect == vk::ImageAspectFlags::COLOR
+                                && !empty
+                                && !self.image(image)?.discarded.is_empty()
+                            {
+                                self.invalidate_cpu_resources(&[])?;
+                                prepared
+                                    .targets
+                                    .colors
+                                    .iter()
+                                    .position(|color| {
+                                        color.as_ref().is_some_and(|color| std::ptr::eq(color, a))
+                                    })
+                                    .filter(|&index| {
+                                        let state = &graphics.parameters.state;
+                                        let blend = &state.colors[index].1;
+                                        !state.logic_enabled
+                                            && !blend.enabled
+                                            && blend.write_mask
+                                                == (vk::ColorComponentFlags::R
+                                                    | vk::ColorComponentFlags::G
+                                                    | vk::ColorComponentFlags::B
+                                                    | vk::ColorComponentFlags::A)
+                                    })
+                            } else {
+                                None
+                            };
+                            // LOAD preserves existing texels; it does not mean the
+                            // guest reads the destination. Replacement draws can
+                            // write an incompletely initialized target. Keep LOAD
+                            // when it preserves defined texels; discard only an
+                            // entirely undefined render area.
+                            // https://docs.vulkan.org/refpages/latest/refpages/source/VkAttachmentLoadOp.html
+                            let discard = replacement.filter(|_| {
+                                self.image(image).unwrap().discarded.iter().any(
+                                    |&(plane, undefined)| {
+                                        self.image(image).unwrap().planes[plane] == a.plane
+                                            && transfers::contains_rect(
+                                                undefined,
+                                                prepared.targets.area,
+                                            )
+                                    },
+                                )
                             });
-                        let regions = if incomplete {
-                            preserved_draw_rects(
-                                prepared.targets.area,
-                                entry.discarded.iter().filter_map(|&(index, rect)| {
-                                    (entry.planes[index] == a.plane).then_some(rect)
-                                }),
-                                &graphics.parameters.scissors,
-                            )
+                            if let Some(index) = discard {
+                                color_loads.get_or_insert_with(|| {
+                                    prepared.targets.native_colors.to_vec()
+                                })[index]
+                                    .load_op = vk::AttachmentLoadOp::DONT_CARE;
+                            } else if replacement.is_none() {
+                                self.ensure_image_initialized(
+                                    image,
+                                    a.plane,
+                                    prepared.targets.area,
+                                )?;
+                            }
                         } else {
-                            vec![prepared.targets.area]
-                        };
-                        for rect in regions {
-                            writers.push(self.prepare_image_rect(image, a.plane, rect)?);
+                            // CLEAR and DONT_CARE do not consume the previous texels.
+                            // Keep undefined/dirty coverage outside the actual write.
+                            self.invalidate_cpu_resources(&[])?;
+                        }
+                        if !read_only_attachment(a, &graphics.parameters.state)
+                            && (!empty || a.description.load == vk::AttachmentLoadOp::CLEAR)
+                        {
+                            let entry = self.image(image)?;
+                            let incomplete = a.description.load == vk::AttachmentLoadOp::LOAD
+                                && entry.discarded.iter().any(|&(index, rect)| {
+                                    entry.planes[index] == a.plane
+                                        && transfers::intersects(rect, prepared.targets.area)
+                                });
+                            let regions = if incomplete {
+                                preserved_draw_rects(
+                                    prepared.targets.area,
+                                    entry.discarded.iter().filter_map(|&(index, rect)| {
+                                        (entry.planes[index] == a.plane).then_some(rect)
+                                    }),
+                                    &graphics.parameters.scissors,
+                                )
+                            } else {
+                                vec![prepared.targets.area]
+                            };
+                            for rect in regions {
+                                writers.push(self.prepare_image_rect(image, a.plane, rect)?);
+                            }
                         }
                     }
-                }
-                AttachmentSource::ResidentOnly(id) => {
-                    if a.description.load == vk::AttachmentLoadOp::LOAD
-                        && self
-                            .attachment(id)?
-                            .undefined
-                            .iter()
-                            .any(|r| transfers::intersects(*r, prepared.targets.area))
-                    {
-                        return Err(VulkanError::InvalidResource(
-                            "attachment LOAD consumes undefined or discarded samples",
-                        ));
+                    AttachmentSource::ResidentOnly(id) => {
+                        if a.description.load == vk::AttachmentLoadOp::LOAD
+                            && self
+                                .attachment(id)?
+                                .undefined
+                                .iter()
+                                .any(|r| transfers::intersects(*r, prepared.targets.area))
+                        {
+                            return Err(VulkanError::InvalidResource(
+                                "attachment LOAD consumes undefined or discarded samples",
+                            ));
+                        }
                     }
                 }
             }
@@ -991,14 +984,7 @@ impl VulkanResidency {
         if let Some(offsets) = streams.dynamic_offsets {
             self.descriptor_offsets = offsets;
         }
-        let index_binding = prepared
-            .index
-            .as_ref()
-            .map(|index| {
-                self.buffer(index.buffer)
-                    .map(|entry| (entry.native.handle, index.offset, index.kind))
-            })
-            .transpose()?;
+        let index_binding = prepared.native_index;
         self.publish_effect(&writers, |device| {
             let index = device.submission.recording.unwrap();
             let slot = &mut device.submission.slots[index];
@@ -1015,10 +1001,10 @@ impl VulkanResidency {
             }
             // Actual use ticks retain vertex/index storage through cache merges
             // and prevent eviction before this command reservation retires.
-            let raw = &device.dispatch;
+            let raw = &mut device.dispatch;
             unsafe {
                 if !empty {
-                    for (v, &value) in prepared.vertices.iter().zip(&vertex_bindings) {
+                    for (v, &value) in prepared.vertices.iter().zip(&prepared.native_vertices) {
                         if slot.vertex_bindings.get(&v.binding) != Some(&value) {
                             device.submission.statistics.vertex_binds += 1;
                             raw.cmd_bind_vertex_buffers(command, v.binding, &[value.0], &[value.1]);
@@ -1053,12 +1039,12 @@ impl VulkanResidency {
                     // No render-pass object, framebuffer cache, HAL encoder or backend segment.
                     // https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdBeginRendering.html
                     device.submission.statistics.rendering_scopes += 1;
-                    device.dispatch.begin_rendering(command, &info);
+                    raw.begin_rendering(command, &info);
                     slot.active_targets = Some(Arc::clone(&prepared.targets));
                 }
                 if !empty {
-                    device.submission.statistics.draw_calls += draws.len() as u64;
-                    for &draw in draws {
+                    device.submission.statistics.draw_calls += 1;
+                    {
                         match draw {
                             Draw::Direct {
                                 vertices,

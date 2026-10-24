@@ -274,7 +274,7 @@ impl VulkanResidency {
         self.barriers.emit(&mut self.device);
         let slot = &mut self.device.submission.slots[index];
         let command = slot.command;
-        self.device.dispatch.recording_handle().finish()?;
+        self.device.dispatch.finish()?;
         unsafe {
             {
                 owner

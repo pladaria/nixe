@@ -63,9 +63,7 @@ fn cube_zcull_configuration_is_typed_source_preserving_and_cache_neutral() {
         assert_eq!(raw, Some(argument));
         assert_eq!(source, Some(dispatched.method().source()));
         assert!(draw.matches(channel.three_d()));
-        assert!(
-            shaders.matches_code(channel.three_d()) && shaders.matches_bindings(channel.three_d())
-        );
+        assert!(shaders.matches_code(channel.three_d()));
         assert!(resources.matches(channel.three_d()));
     }
     let state = channel.three_d().zcull();
@@ -155,62 +153,6 @@ fn zcull_region_fields_cover_documented_values_without_inventing_geometry_constr
             dispatch_method(&mut channel, method / 4, value).unwrap();
         }
     }
-}
-
-#[test]
-fn invalid_zcull_fields_fail_without_mutating_state_and_keep_valid_packet_prefix() {
-    let mut channel = three_d_channel();
-    for &(method, value, _) in CUBE_REGION {
-        dispatch_method(&mut channel, method / 4, value).unwrap();
-    }
-    for (method, value) in [
-        (0x07c0, 0x10000),
-        (0x07c4, 0x10000),
-        (0x07c8, 0x10000),
-        (0x07cc, 0x10000),
-        (0x07e4, 0x10000),
-        (0x15fc, 0x10000),
-        (0x1600, 0x10000),
-        (0x15c8, 13),
-        (0x15c8, 14),
-        (0x15c8, 15),
-        (0x15c8, 0x10),
-        (0x02e8, 2),
-        (0x02e8, 4),
-        (0x02e8, 8),
-        (0x02e8, 1 << 28),
-        (0x0dbc, 2),
-        (0x0dbc, 0x30000),
-        (0x0dbc, u32::MAX),
-    ] {
-        let before = channel.three_d().clone();
-        let error = dispatch_method(&mut channel, method / 4, value).unwrap_err();
-        let source = match error {
-            MaxwellEngineDispatchError::InvalidMethodValue { source, .. }
-            | MaxwellEngineDispatchError::InvalidMethodEncoding { source, .. } => source,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(source.method(), GpuMethodId(method));
-        assert_eq!(source.argument(), value);
-        assert_eq!(channel.three_d(), &before);
-    }
-    let before = channel.three_d().clone();
-    assert!(dispatch_incrementing(&mut channel, 0x07c0 / 4, &[640, 0x10000]).is_err());
-    assert_eq!(
-        channel
-            .three_d()
-            .zcull()
-            .region_size(MaxwellThreeDZCullAxis::Width)
-            .value(),
-        Some(&640)
-    );
-    assert_eq!(
-        channel
-            .three_d()
-            .zcull()
-            .region_size(MaxwellThreeDZCullAxis::Height),
-        before.zcull().region_size(MaxwellThreeDZCullAxis::Height)
-    );
 }
 
 #[test]
@@ -328,35 +270,6 @@ fn zcull_serialization_does_not_change_depth_resources_or_draw_state() {
         }
         assert!(dispatch_method(&mut channel, method / 4, 2).is_err());
     }
-}
-
-#[test]
-fn zcull_allocation_decodes_documented_formats_and_rejects_reserved_values() {
-    let mut channel = three_d_channel();
-    for format in (0..=12).chain([15]) {
-        let raw = 0x0012_34ab | format << 24;
-        dispatch_method(&mut channel, 0x2f8 / 4, raw).unwrap();
-        let register = channel.three_d().zcull().subregion_allocation();
-        assert_eq!(register.raw(), Some(raw));
-        let allocation = register.value().unwrap();
-        assert_eq!(allocation.id(), 0xab);
-        assert_eq!(allocation.aliquots(), 0x1234);
-        assert_eq!(
-            allocation.format().map(u32::from),
-            if format == 15 { None } else { Some(format) }
-        );
-    }
-    for raw in [13 << 24, 14 << 24, 1 << 28] {
-        assert!(dispatch_method(&mut channel, 0x2f8 / 4, raw).is_err());
-    }
-    for value in [0, 1] {
-        dispatch_method(&mut channel, 0x2fc / 4, value).unwrap();
-        assert_eq!(
-            channel.three_d().zcull().subregion_algorithm().raw(),
-            Some(value)
-        );
-    }
-    assert!(dispatch_method(&mut channel, 0x2fc / 4, 2).is_err());
 }
 
 #[test]

@@ -6,9 +6,8 @@ use nixe_gpu::{
     ReservedTimelinePoint, ResidentImage,
 };
 use nixe_gpu_maxwell::{
-    MaxwellBackendExecution, MaxwellChannelConfiguration, MaxwellFrontend, MaxwellFrontendDispatch,
-    MaxwellFrontendDispatchBoundary, MaxwellGpuMemory, MaxwellWork, MaxwellWorkBatch,
-    MaxwellWorkSegment, stream_maxwell_frontend,
+    MaxwellChannelConfiguration, MaxwellFrontend, MaxwellFrontendDispatch,
+    MaxwellFrontendDispatchBoundary, MaxwellGpuMemory, stream_maxwell_frontend,
 };
 use nixe_memory::{
     AccessRequestId, AllocationId, DeviceAccessEndpoint, DeviceAccessRequest, Extent, Machine,
@@ -21,10 +20,9 @@ use std::thread::{self, JoinHandle};
 
 mod owner;
 
-// Admission includes real outstanding GPU completion, not a second command queue.
+// Bound owned ingress independently of native completion.
 const MAX_GPU_SUBMISSIONS_IN_FLIGHT: usize = 3;
-type WorkCommands<W> =
-    <<<W as MaxwellWork>::Batch as MaxwellWorkBatch<W>>::Segment as MaxwellWorkSegment>::Commands;
+const MAX_GPU_INGRESS_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(super) struct GpuExecutorFailure {
@@ -153,14 +151,15 @@ enum GpuMessage {
 #[derive(Debug)]
 struct GpuWorkBudget {
     state: Mutex<GpuWorkBudgetState>,
+    stopped: std::sync::atomic::AtomicBool,
     writable: nixe_runtime::WritableEventObject,
     readable: nixe_runtime::ReadableEventObject,
 }
 #[derive(Debug, Default)]
 struct GpuWorkBudgetState {
     active: usize,
+    bytes: usize,
     progress_requested: bool,
-    stopped: bool,
 }
 impl Default for GpuWorkBudget {
     fn default() -> Self {
@@ -169,6 +168,7 @@ impl Default for GpuWorkBudget {
         );
         Self {
             state: Mutex::default(),
+            stopped: Default::default(),
             writable,
             readable,
         }
@@ -192,44 +192,48 @@ impl PartialEq for PendingGpuSubmission {
 }
 impl Eq for PendingGpuSubmission {}
 impl GpuWorkBudget {
-    fn reserve(self: &Arc<Self>) -> Option<GpuSubmissionAdmission> {
+    fn reserve(self: &Arc<Self>, bytes: usize) -> Option<GpuSubmissionAdmission> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.stopped {
+        if self.is_stopped() {
             return None;
         }
         self.readable.clear();
-        if state.active == MAX_GPU_SUBMISSIONS_IN_FLIGHT {
+        if state.active == MAX_GPU_SUBMISSIONS_IN_FLIGHT
+            || bytes > MAX_GPU_INGRESS_BYTES - state.bytes
+        {
             return Some(GpuSubmissionAdmission::Pending(PendingGpuSubmission(
                 Arc::clone(self),
             )));
         }
         state.active += 1;
+        state.bytes += bytes;
         Some(GpuSubmissionAdmission::Ready(GpuFrontendPermit {
             budget: Arc::clone(self),
+            bytes,
         }))
     }
     fn stop(&self) {
-        self.state
+        // Serialize the final wake with admission clearing its capacity event.
+        let _state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .stopped = true;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
         self.writable.signal();
     }
     fn is_stopped(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .stopped
+        self.stopped.load(std::sync::atomic::Ordering::Acquire)
     }
     fn request_progress(&self) -> Option<bool> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.stopped {
+        if self.is_stopped() {
             return None;
         }
         let wake = !state.progress_requested;
@@ -246,6 +250,7 @@ impl GpuWorkBudget {
 }
 pub(super) struct GpuFrontendPermit {
     budget: Arc<GpuWorkBudget>,
+    bytes: usize,
 }
 impl Drop for GpuFrontendPermit {
     fn drop(&mut self) {
@@ -258,6 +263,7 @@ impl Drop for GpuFrontendPermit {
             .active
             .checked_sub(1)
             .expect("GPU admission is retained once");
+        state.bytes -= self.bytes;
         self.budget.writable.signal();
     }
 }
@@ -343,8 +349,8 @@ impl NvDrvGpuExecutor {
     where
         L: MaxwellFrontend,
         E: GpuExecution<
-                Commands = WorkCommands<L::Work>,
-                ImageRequest = <L::Work as MaxwellWork>::ImageRequest,
+                Commands = nixe_gpu::native::NativeWork,
+                ImageRequest = nixe_gpu::native::NativePresentationImage,
             >,
     {
         let image_device = backend
@@ -491,9 +497,20 @@ impl NvDrvGpuExecutor {
 
     /// Reserves bounded queue capacity and the ordered frontend boundary
     /// before channel state is dispatched and lowered.
-    pub(super) fn reserve_submission(&self) -> Result<GpuSubmissionAdmission, GpuExecutorFailure> {
+    pub(super) fn reserve_submission(
+        &self,
+        bytes: usize,
+    ) -> Result<GpuSubmissionAdmission, GpuExecutorFailure> {
         self.require_healthy()?;
-        self.budget.reserve().ok_or_else(|| {
+        if bytes > MAX_GPU_INGRESS_BYTES {
+            return Err(GpuExecutorFailure {
+                memory_cause: None,
+                boundary: None,
+                frontend: FrontendSubmissionId::new(0),
+                detail: "GPFIFO owned descriptor storage exceeds 64 MiB".into(),
+            });
+        }
+        self.budget.reserve(bytes).ok_or_else(|| {
             self.failure().unwrap_or(GpuExecutorFailure {
                 memory_cause: None,
                 boundary: None,

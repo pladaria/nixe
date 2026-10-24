@@ -7,18 +7,14 @@
 use std::fmt::{Display, Formatter};
 
 use nixe_gpu::{FrontendSubmissionId, GpuVirtualAddress, MappingGeneration};
-use nixe_memory::MemoryPermissions;
 
 use crate::{
-    MaxwellAddressSpaceId, MaxwellAllocationId, MaxwellChannelId, MaxwellGpuAccessError,
-    MaxwellGpuMapping, MaxwellGpuMemory, MaxwellGpuProfile, MaxwellMappingId, MaxwellResolvedRange,
+    MaxwellAddressSpaceId, MaxwellChannelId, MaxwellGpuAccessError, MaxwellGpuMemory,
+    MaxwellGpuProfile, MaxwellMappingId,
 };
 
 /// Size of one hardware-format GPFIFO descriptor.
 pub const MAXWELL_GPFIFO_ENTRY_SIZE: usize = 8;
-
-/// Hard upper bound for mapping records copied into one host diagnostic.
-pub const MAXWELL_GPFIFO_CAPTURE_SOURCES: usize = 64;
 
 const ENTRY0_FETCH_CONDITIONAL: u32 = 1 << 0;
 const ENTRY0_RESERVED: u32 = 1 << 1;
@@ -197,44 +193,13 @@ impl MaxwellDecodedGpfifoSubmission {
     }
 }
 
-/// Exact retained source of one decoded pushbuffer entry.
-///
-/// The resolved range owns canonical backing pages and mapping generations;
-/// it contains neither a guest CPU address nor a host pointer. Consumers must
-/// validate the complete submission against its live address space before
-/// reading the first command word.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellRetainedPushbuffer {
-    entry_index: u32,
-    entry: MaxwellGpfifoEntry,
-    source: MaxwellResolvedRange,
-}
-
-impl MaxwellRetainedPushbuffer {
-    #[must_use]
-    pub const fn entry_index(&self) -> u32 {
-        self.entry_index
-    }
-
-    #[must_use]
-    pub const fn entry(&self) -> MaxwellGpfifoEntry {
-        self.entry
-    }
-
-    #[must_use]
-    pub const fn source(&self) -> &MaxwellResolvedRange {
-        &self.source
-    }
-}
-
-/// Immutable GPFIFO submission whose complete command source is retained.
+/// Validated submission metadata. Command memory is fetched when its entry runs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellValidatedGpfifoSubmission {
     channel: MaxwellChannelId,
     frontend: FrontendSubmissionId,
     address_space: MaxwellAddressSpaceId,
     decoded: MaxwellDecodedGpfifoSubmission,
-    pushbuffers: Box<[MaxwellRetainedPushbuffer]>,
 }
 
 impl MaxwellValidatedGpfifoSubmission {
@@ -256,165 +221,6 @@ impl MaxwellValidatedGpfifoSubmission {
     #[must_use]
     pub const fn decoded(&self) -> &MaxwellDecodedGpfifoSubmission {
         &self.decoded
-    }
-
-    #[must_use]
-    pub fn pushbuffers(&self) -> &[MaxwellRetainedPushbuffer] {
-        &self.pushbuffers
-    }
-
-    /// Returns the exact source of the first packet header, when work exists.
-    ///
-    /// This identifies the frontend-consumer boundary without interpreting a
-    /// Maxwell packet. Packet decoding and method dispatch remain T7 work.
-    pub fn first_packet_location(
-        &self,
-    ) -> Result<Option<MaxwellGpfifoSourceLocation>, MaxwellGpfifoSourceError> {
-        self.pushbuffers
-            .first()
-            .map(|pushbuffer| first_source_location(self, pushbuffer))
-            .transpose()
-    }
-
-    /// Checks every retained mapping before any command backing is accessed.
-    pub fn validate_sources(
-        &self,
-        address_space: &MaxwellGpuMemory,
-    ) -> Result<(), MaxwellGpfifoSourceError> {
-        if address_space.id() != self.address_space {
-            return Err(MaxwellGpfifoSourceError::WrongAddressSpace {
-                expected: self.address_space,
-                actual: address_space.id(),
-            });
-        }
-        for pushbuffer in &self.pushbuffers {
-            for segment in pushbuffer.source.segments() {
-                if !address_space.retained_mapping_is_current(segment.mapping()) {
-                    return Err(MaxwellGpfifoSourceError::StaleMapping {
-                        location: source_location(
-                            self.channel,
-                            self.frontend,
-                            pushbuffer.entry_index,
-                            pushbuffer.entry.address(),
-                            segment.mapping(),
-                            segment.gpu_offset(),
-                        )?,
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Validate the consumed entry's live mappings in read_resolved, without
-    /// rescanning unrelated entries already checked at dispatch admission.
-    pub(crate) fn read_entry(
-        &self,
-        address_space: &MaxwellGpuMemory,
-        entry_index: u32,
-        output: &mut [u8],
-        access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<(), MaxwellGpfifoSourceError> {
-        let pushbuffer = self
-            .pushbuffers
-            .get(entry_index as usize)
-            .ok_or(MaxwellGpfifoSourceError::UnknownEntry { entry_index })?;
-        address_space
-            .read_resolved(&pushbuffer.source, output, access)
-            .map_err(|error| MaxwellGpfifoSourceError::Access {
-                location: first_source_location(self, pushbuffer)
-                    .expect("resolved non-empty range has a first mapping"),
-                error,
-            })
-    }
-
-    /// Resolves the exact retained source location of one command word.
-    pub fn word_location(
-        &self,
-        entry_index: u32,
-        word_offset: u64,
-    ) -> Result<MaxwellGpfifoSourceLocation, MaxwellGpfifoSourceError> {
-        let pushbuffer = self
-            .pushbuffers
-            .get(entry_index as usize)
-            .ok_or(MaxwellGpfifoSourceError::UnknownEntry { entry_index })?;
-        if word_offset >= u64::from(pushbuffer.entry.word_count()) {
-            return Err(MaxwellGpfifoSourceError::UnknownWord {
-                entry_index,
-                word_offset,
-                word_count: pushbuffer.entry.word_count(),
-            });
-        }
-        let byte_offset = word_offset
-            .checked_mul(4)
-            .ok_or(MaxwellGpfifoSourceError::ArithmeticOverflow)?;
-        let address = pushbuffer
-            .entry
-            .address()
-            .get()
-            .checked_add(byte_offset)
-            .ok_or(MaxwellGpfifoSourceError::ArithmeticOverflow)?;
-        let segment = pushbuffer
-            .source
-            .segments()
-            .iter()
-            .find(|segment| {
-                let start = segment.gpu_offset().get();
-                start
-                    .checked_add(segment.size())
-                    .is_some_and(|end| address >= start && address < end)
-            })
-            .ok_or(MaxwellGpfifoSourceError::ArithmeticOverflow)?;
-        source_location(
-            self.channel,
-            self.frontend,
-            entry_index,
-            pushbuffer.entry.address(),
-            segment.mapping(),
-            GpuVirtualAddress::try_new(address, 64)
-                .map_err(|_| MaxwellGpfifoSourceError::ArithmeticOverflow)?,
-        )
-    }
-
-    /// Builds a pointer-free, hard-bounded summary for host diagnostics.
-    #[must_use]
-    pub fn capture(&self) -> MaxwellGpfifoCapture {
-        let mut sources = Vec::new();
-        let total_sources = self
-            .pushbuffers
-            .iter()
-            .map(|pushbuffer| pushbuffer.source.segments().len())
-            .sum();
-        for pushbuffer in &self.pushbuffers {
-            for segment in pushbuffer.source.segments() {
-                if sources.len() == MAXWELL_GPFIFO_CAPTURE_SOURCES {
-                    break;
-                }
-                let mapping = segment.mapping();
-                sources.push(MaxwellGpfifoCaptureSource {
-                    entry_index: pushbuffer.entry_index,
-                    pushbuffer: pushbuffer.entry.address(),
-                    word_offset: (segment.gpu_offset().get() - pushbuffer.entry.address().get())
-                        / 4,
-                    size: segment.size(),
-                    mapping: mapping.id(),
-                    generation: mapping.generation(),
-                    allocation: mapping.allocation(),
-                    backing_offset: segment.backing_offset(),
-                });
-            }
-            if sources.len() == MAXWELL_GPFIFO_CAPTURE_SOURCES {
-                break;
-            }
-        }
-        MaxwellGpfifoCapture {
-            channel: self.channel,
-            frontend: self.frontend,
-            address_space: self.address_space,
-            total_entries: self.pushbuffers.len(),
-            total_sources,
-            sources: sources.into_boxed_slice(),
-        }
     }
 }
 
@@ -446,101 +252,9 @@ impl Display for MaxwellGpfifoSourceLocation {
     }
 }
 
-/// One mapping fragment in a bounded GPFIFO capture.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaxwellGpfifoCaptureSource {
-    pub entry_index: u32,
-    pub pushbuffer: GpuVirtualAddress,
-    pub word_offset: u64,
-    pub size: u64,
-    pub mapping: MaxwellMappingId,
-    pub generation: MappingGeneration,
-    pub allocation: MaxwellAllocationId,
-    pub backing_offset: u64,
-}
-
-/// Bounded metadata capture of a completely retained submission.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellGpfifoCapture {
-    channel: MaxwellChannelId,
-    frontend: FrontendSubmissionId,
-    address_space: MaxwellAddressSpaceId,
-    total_entries: usize,
-    total_sources: usize,
-    sources: Box<[MaxwellGpfifoCaptureSource]>,
-}
-
-impl MaxwellGpfifoCapture {
-    #[must_use]
-    pub const fn channel(&self) -> MaxwellChannelId {
-        self.channel
-    }
-    #[must_use]
-    pub const fn frontend(&self) -> FrontendSubmissionId {
-        self.frontend
-    }
-    #[must_use]
-    pub const fn address_space(&self) -> MaxwellAddressSpaceId {
-        self.address_space
-    }
-    #[must_use]
-    pub const fn total_entries(&self) -> usize {
-        self.total_entries
-    }
-    #[must_use]
-    pub const fn total_sources(&self) -> usize {
-        self.total_sources
-    }
-    #[must_use]
-    pub fn sources(&self) -> &[MaxwellGpfifoCaptureSource] {
-        &self.sources
-    }
-    #[must_use]
-    pub const fn omitted_sources(&self) -> usize {
-        self.total_sources.saturating_sub(self.sources.len())
-    }
-}
-
-impl Display for MaxwellGpfifoCapture {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{} {} address-space={} entries={} sources={} shown={}",
-            self.channel,
-            self.frontend,
-            self.address_space.get(),
-            self.total_entries,
-            self.total_sources,
-            self.sources.len()
-        )?;
-        if let Some(first) = self.sources.first() {
-            write!(
-                formatter,
-                " first=[gpfifo-entry={} pushbuffer={} word-offset={} {} {} {} backing-offset=0x{:x} size=0x{:x}]",
-                first.entry_index,
-                first.pushbuffer,
-                first.word_offset,
-                first.mapping,
-                first.generation,
-                first.allocation,
-                first.backing_offset,
-                first.size
-            )?;
-        }
-        if self.omitted_sources() != 0 {
-            write!(formatter, " sources-truncated={}", self.omitted_sources())?;
-        }
-        Ok(())
-    }
-}
-
-/// Failure while resolving or revalidating a complete command source.
+/// Failure while resolving or reading the current command source.
 #[derive(Clone, Debug)]
 pub enum MaxwellGpfifoSourceError {
-    Synchronization {
-        entry_index: u32,
-        detail: Box<str>,
-    },
     ChannelAddressSpaceUnbound {
         channel: MaxwellChannelId,
     },
@@ -564,9 +278,6 @@ pub enum MaxwellGpfifoSourceError {
         address_space_generation: MappingGeneration,
         error: MaxwellGpuAccessError,
     },
-    StaleMapping {
-        location: MaxwellGpfifoSourceLocation,
-    },
     Access {
         location: MaxwellGpfifoSourceLocation,
         error: MaxwellGpuAccessError,
@@ -578,13 +289,6 @@ pub enum MaxwellGpfifoSourceError {
 impl Display for MaxwellGpfifoSourceError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Synchronization {
-                entry_index,
-                detail,
-            } => write!(
-                formatter,
-                "GPFIFO fetch synchronization failed: entry={entry_index} detail=[{detail}]"
-            ),
             Self::ChannelAddressSpaceUnbound { channel } => write!(
                 formatter,
                 "GPFIFO channel has no bound GPU address space: {channel}"
@@ -616,9 +320,6 @@ impl Display for MaxwellGpfifoSourceError {
                 formatter,
                 "GPFIFO source resolution failed: {channel} {frontend} gpfifo-entry={entry_index} pushbuffer={pushbuffer} word-offset=0 {address_space_generation} detail=[{error}]"
             ),
-            Self::StaleMapping { location } => {
-                write!(formatter, "GPFIFO source mapping is stale: {location}")
-            }
             Self::Access { location, error } => write!(
                 formatter,
                 "GPFIFO source access failed: {location} detail=[{error}]"
@@ -635,8 +336,8 @@ impl Display for MaxwellGpfifoSourceError {
 
 impl std::error::Error for MaxwellGpfifoSourceError {}
 
-/// Resolves and retains every command byte before returning any usable work.
-pub fn resolve_gpfifo_submission(
+/// Verify the channel binding and retain decoded entry addresses for ordered fetch.
+pub fn validate_gpfifo_submission(
     channel: &crate::MaxwellChannelConfiguration,
     frontend: FrontendSubmissionId,
     decoded: MaxwellDecodedGpfifoSubmission,
@@ -655,79 +356,11 @@ pub fn resolve_gpfifo_submission(
             actual: address_space.id(),
         });
     }
-    let mut pushbuffers = Vec::new();
-    pushbuffers
-        .try_reserve_exact(decoded.entries.len())
-        .map_err(|_| MaxwellGpfifoSourceError::ResourceExhausted)?;
-    for (index, entry) in decoded.entries.iter().copied().enumerate() {
-        let entry_index =
-            u32::try_from(index).map_err(|_| MaxwellGpfifoSourceError::ArithmeticOverflow)?;
-        let source = address_space
-            .resolve_range(entry.address(), entry.byte_count(), MemoryPermissions::READ)
-            .map_err(|error| MaxwellGpfifoSourceError::Resolution {
-                channel: channel_id,
-                frontend,
-                entry_index,
-                pushbuffer: entry.address(),
-                address_space_generation: address_space.mapping_generation(),
-                error,
-            })?;
-        pushbuffers.push(MaxwellRetainedPushbuffer {
-            entry_index,
-            entry,
-            source,
-        });
-    }
-    let submission = MaxwellValidatedGpfifoSubmission {
+    Ok(MaxwellValidatedGpfifoSubmission {
         channel: channel_id,
         frontend,
         address_space: address_space.id(),
         decoded,
-        pushbuffers: pushbuffers.into_boxed_slice(),
-    };
-    submission.validate_sources(address_space)?;
-    Ok(submission)
-}
-
-fn first_source_location(
-    submission: &MaxwellValidatedGpfifoSubmission,
-    pushbuffer: &MaxwellRetainedPushbuffer,
-) -> Result<MaxwellGpfifoSourceLocation, MaxwellGpfifoSourceError> {
-    let segment = pushbuffer
-        .source
-        .segments()
-        .first()
-        .ok_or(MaxwellGpfifoSourceError::ArithmeticOverflow)?;
-    source_location(
-        submission.channel,
-        submission.frontend,
-        pushbuffer.entry_index,
-        pushbuffer.entry.address(),
-        segment.mapping(),
-        segment.gpu_offset(),
-    )
-}
-
-fn source_location(
-    channel: MaxwellChannelId,
-    frontend: FrontendSubmissionId,
-    entry_index: u32,
-    pushbuffer: GpuVirtualAddress,
-    mapping: &MaxwellGpuMapping,
-    segment_offset: GpuVirtualAddress,
-) -> Result<MaxwellGpfifoSourceLocation, MaxwellGpfifoSourceError> {
-    let byte_offset = segment_offset
-        .get()
-        .checked_sub(pushbuffer.get())
-        .ok_or(MaxwellGpfifoSourceError::ArithmeticOverflow)?;
-    Ok(MaxwellGpfifoSourceLocation {
-        channel,
-        frontend,
-        entry_index,
-        pushbuffer,
-        word_offset: byte_offset / 4,
-        mapping: mapping.id(),
-        generation: mapping.generation(),
     })
 }
 

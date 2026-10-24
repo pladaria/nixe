@@ -810,18 +810,26 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                 return Err(MemoryError::Invalid("CPU write names another machine"));
             }
         }
-        for range in ranges {
-            let allocation = range.allocation().identity();
-            for extent in range.physical_extents() {
-                self.subtract_device_coverage(
-                    PhysicalInterval {
-                        allocation,
-                        start: extent.start.get(),
-                        end: extent.start.get() + extent.bytes,
-                    },
-                    true,
-                )?;
-            }
+        self.cpu_write_extents(ranges.iter().flat_map(|range| {
+            range
+                .physical_extents()
+                .map(|extent| (range.allocation().identity(), extent))
+        }))
+    }
+    /// Exact overwrite coordinates borrowed from the owner's live mappings.
+    pub fn cpu_write_extents(
+        &mut self,
+        extents: impl Iterator<Item = (nixe_memory::AllocationId, nixe_memory::Extent)>,
+    ) -> Result<(), MemoryError> {
+        for (allocation, extent) in extents {
+            self.subtract_device_coverage(
+                PhysicalInterval {
+                    allocation,
+                    start: extent.start.get(),
+                    end: extent.start.get() + extent.bytes,
+                },
+                true,
+            )?;
         }
         Ok(())
     }

@@ -12,8 +12,8 @@ use nixe_gpu::{FrontendSubmissionId, GuestTimelinePoint, ReservedTimelinePoint};
 
 use crate::{
     MaxwellAddressSpaceId, MaxwellChannelId, MaxwellChannelSchedulingPolicy,
-    MaxwellFrontendDispatchError, MaxwellGpfifoCapture, MaxwellGpfifoSourceError,
-    MaxwellGpfifoSourceLocation, MaxwellGpuMemory, MaxwellValidatedGpfifoSubmission,
+    MaxwellFrontendDispatchError, MaxwellGpfifoSourceError, MaxwellGpuMemory,
+    MaxwellValidatedGpfifoSubmission,
 };
 
 /// Global acceptance order assigned by one deterministic scheduler.
@@ -42,14 +42,12 @@ impl Display for MaxwellSchedulerSequence {
 /// Furthest ordering boundary crossed by a scheduled submission.
 ///
 /// Cache maintenance, decoded resource visibility, GPU writes, host
-/// completion, and fence publication intentionally remain later distinct
-/// stages. T6 cannot cross them before T7 identifies packet semantics and
-/// resource accesses.
+/// completion, and fence publication remain distinct stages.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellSubmissionOrderingStage {
-    /// CPU-produced command bytes were resolved to retained canonical ranges.
-    CommandSourcesRetained,
-    /// The complete retained source was selected for frontend packet decoding.
+    /// Decoded GPFIFO entries and their channel binding were validated.
+    CommandEntriesValidated,
+    /// The command stream was selected for frontend packet decoding.
     FrontendDispatched,
     /// Verified packet cache-maintenance operations have completed.
     CacheMaintenanceComplete,
@@ -59,7 +57,7 @@ pub enum MaxwellSubmissionOrderingStage {
     GpuExecutionComplete,
     /// GPU-produced bytes reached their declared canonical visibility points.
     GpuWritesVisible,
-    /// The reserved T5 point was published after every preceding stage.
+    /// The reserved point was published after every preceding stage.
     FencePublished,
     /// Queued ownership was released without claiming any later stage.
     Cancelled,
@@ -68,7 +66,7 @@ pub enum MaxwellSubmissionOrderingStage {
 impl Display for MaxwellSubmissionOrderingStage {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::CommandSourcesRetained => "command-sources-retained",
+            Self::CommandEntriesValidated => "command-entries-validated",
             Self::FrontendDispatched => "frontend-dispatched",
             Self::CacheMaintenanceComplete => "cache-maintenance-complete",
             Self::DeviceReadsVisible => "device-reads-visible",
@@ -142,78 +140,20 @@ impl MaxwellFrontendDispatch {
     pub const fn scheduled(&self) -> &MaxwellScheduledSubmission {
         &self.scheduled
     }
-
-    #[must_use]
-    pub fn capture(&self) -> MaxwellGpfifoCapture {
-        self.scheduled.submission.capture()
-    }
-
-    /// Stops at the first packet boundary without decoding or executing it.
-    pub fn unsupported_boundary(
-        self,
-    ) -> Result<MaxwellFrontendDispatchBoundary, MaxwellGpfifoSourceError> {
-        let location = self.scheduled.submission.first_packet_location()?;
-        Ok(match location {
-            Some(location) => MaxwellFrontendDispatchBoundary::FirstPacket {
-                dispatch: Box::new(self),
-                location,
-            },
-            None => MaxwellFrontendDispatchBoundary::EmptySubmission {
-                dispatch: Box::new(self),
-            },
-        })
-    }
 }
 
-/// The exact frontend boundary which T7 must consume next.
+/// Fatal consumption boundary. Retains the submission and unpublished completion.
 #[derive(Clone, Debug)]
-pub enum MaxwellFrontendDispatchBoundary {
-    FirstPacket {
-        dispatch: Box<MaxwellFrontendDispatch>,
-        location: MaxwellGpfifoSourceLocation,
-    },
-    EmptySubmission {
-        dispatch: Box<MaxwellFrontendDispatch>,
-    },
-    /// T7 decoded and dispatched the retained command stream and stopped at
-    /// its precise semantic boundary. The scheduled work remains owned here,
-    /// so its completion reservation cannot be published accidentally.
-    Frontend {
-        dispatch: Box<MaxwellFrontendDispatch>,
-        failure: MaxwellFrontendDispatchError,
-    },
+pub struct MaxwellFrontendDispatchBoundary {
+    pub dispatch: Box<MaxwellFrontendDispatch>,
+    pub failure: MaxwellFrontendDispatchError,
 }
-
 impl MaxwellFrontendDispatchBoundary {
-    #[must_use]
-    pub const fn dispatch(&self) -> &MaxwellFrontendDispatch {
-        match self {
-            Self::FirstPacket { dispatch, .. }
-            | Self::EmptySubmission { dispatch }
-            | Self::Frontend { dispatch, .. } => dispatch,
-        }
+    pub fn dispatch(&self) -> &MaxwellFrontendDispatch {
+        &self.dispatch
     }
-
-    #[must_use]
-    pub fn first_packet(&self) -> Option<MaxwellGpfifoSourceLocation> {
-        match self {
-            Self::FirstPacket { location, .. } => Some(*location),
-            Self::EmptySubmission { .. } => None,
-            Self::Frontend { dispatch, .. } => dispatch
-                .scheduled()
-                .submission()
-                .first_packet_location()
-                .ok()
-                .flatten(),
-        }
-    }
-
-    #[must_use]
-    pub const fn frontend_failure(&self) -> Option<&MaxwellFrontendDispatchError> {
-        match self {
-            Self::Frontend { failure, .. } => Some(failure),
-            Self::FirstPacket { .. } | Self::EmptySubmission { .. } => None,
-        }
+    pub fn frontend_failure(&self) -> &MaxwellFrontendDispatchError {
+        &self.failure
     }
 }
 
@@ -234,15 +174,7 @@ impl Display for MaxwellFrontendDispatchBoundary {
         if let Some(completion) = scheduled.completion() {
             write!(formatter, "completion=[{completion}] ")?;
         }
-        match self {
-            Self::FirstPacket { location, .. } => {
-                write!(formatter, "first-unsupported-packet=[{location}]")
-            }
-            Self::EmptySubmission { .. } => {
-                formatter.write_str("empty-submission completion semantics are unavailable")
-            }
-            Self::Frontend { failure, .. } => write!(formatter, "frontend-failure=[{failure}]"),
-        }
+        write!(formatter, "frontend-failure=[{}]", self.failure)
     }
 }
 
@@ -344,7 +276,7 @@ impl MaxwellScheduler {
 
     /// Preflights semantic state and host capacity before a timeline mutates.
     ///
-    /// The caller may reserve the T5 fence after this returns. With exclusive
+    /// The caller may reserve the fence after this returns. With exclusive
     /// access to the scheduler, the following [`Self::enqueue`] cannot need a
     /// collection allocation or discover a mode mismatch.
     pub fn prepare_enqueue(
@@ -393,7 +325,7 @@ impl MaxwellScheduler {
             channel: channel.id(),
             dependency,
             completion,
-            stage: MaxwellSubmissionOrderingStage::CommandSourcesRetained,
+            stage: MaxwellSubmissionOrderingStage::CommandEntriesValidated,
             submission,
         });
         self.next_sequence = next_sequence;
@@ -403,8 +335,7 @@ impl MaxwellScheduler {
     /// Dispatches only the globally oldest submission.
     ///
     /// The dependency is sampled by the Horizon timeline owner and supplied as
-    /// evidence. Source mappings are then revalidated atomically before the
-    /// scheduler transfers ownership to the packet consumer.
+    /// evidence. Each command entry checks its retained mapping when consumed.
     pub fn dispatch_next(
         &mut self,
         dependency_reached: bool,
@@ -418,9 +349,14 @@ impl MaxwellScheduler {
         {
             return Err(MaxwellScheduleError::PendingDependency(dependency));
         }
-        next.submission
-            .validate_sources(address_space)
-            .map_err(MaxwellScheduleError::Source)?;
+        if next.submission.address_space() != address_space.id() {
+            return Err(MaxwellScheduleError::Source(
+                MaxwellGpfifoSourceError::WrongAddressSpace {
+                    expected: next.submission.address_space(),
+                    actual: address_space.id(),
+                },
+            ));
+        }
         let mut scheduled = self.queued.pop_front().expect("front was present");
         self.frontend_ids.remove(&scheduled.frontend());
         scheduled.stage = MaxwellSubmissionOrderingStage::FrontendDispatched;

@@ -166,7 +166,7 @@ impl Frames {
         let snapshot = self.snapshots[slot].as_mut().expect("allocated snapshot");
         cache.device_mut().end_rendering();
         let index = cache.device_mut().begin_recording()?;
-        let device = cache.device();
+        let device = cache.device_mut();
         let command = device.submission.slots[index].command;
         super::render::transition(
             device,

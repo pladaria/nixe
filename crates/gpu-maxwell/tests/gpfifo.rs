@@ -1,6 +1,8 @@
+#[path = "support/command.rs"]
+mod command;
 use nixe_gpu::FrontendSubmissionId;
 use nixe_gpu_maxwell::*;
-use nixe_memory::{AllocationRange, Machine, MemoryPermissions, PAGE_SIZE};
+use nixe_memory::{Machine, PAGE_SIZE};
 
 #[path = "support/memory.rs"]
 mod memory;
@@ -198,113 +200,7 @@ fn accepts_a_completely_empty_hardware_format_submission() {
 }
 
 #[test]
-fn resolves_complete_ranges_and_retains_exact_mapping_lifetimes() {
-    let machine = Machine::new(16 * PAGE_SIZE).unwrap();
-    let first_allocation = memory::allocate(&machine, 0x1000);
-    let second_allocation = memory::allocate(&machine, 0x1000);
-    memory::write(&first_allocation, 0xffc, &[1, 2, 3, 4]);
-    memory::write(&second_allocation, 0, &[5, 6, 7, 8, 9, 10, 11, 12]);
-    let mut address_space = memory::address_space(&machine, 9);
-    let first = memory::map(&mut address_space, &first_allocation, 1);
-    let second = memory::map(&mut address_space, &second_allocation, 2);
-    assert_eq!(second.offset().get(), first.offset().get() + 0x1000);
-
-    let pushbuffer = first.offset().get() + 0xffc;
-    let decoded = decode_gpfifo_submission(
-        SWITCH_1_GM20B_PROFILE,
-        4,
-        request(1, SUBMIT_HARDWARE_FORMAT),
-        &descriptor(pushbuffer, 3, 0),
-    )
-    .unwrap();
-    let channel = bound_channel(4, address_space.id());
-    let validated = resolve_gpfifo_submission(
-        &channel.configuration(),
-        FrontendSubmissionId::new(7),
-        decoded,
-        address_space.memory(),
-    )
-    .unwrap();
-
-    assert_eq!(validated.pushbuffers()[0].source().segments().len(), 2);
-    let capture = validated.capture();
-    assert_eq!(capture.channel(), MaxwellChannelId::new(4));
-    assert_eq!(capture.frontend(), FrontendSubmissionId::new(7));
-    assert_eq!(capture.total_entries(), 1);
-    assert_eq!(capture.total_sources(), 2);
-    assert_eq!(capture.sources()[0].word_offset, 0);
-    assert_eq!(capture.sources()[1].word_offset, 1);
-    let mut bytes = [0; 12];
-    address_space
-        .memory()
-        .read_resolved(
-            validated.pushbuffers()[0].source(),
-            &mut bytes,
-            &mut |_, _| panic!("RAM command read entered backend"),
-        )
-        .unwrap();
-    assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-    let accepted = address_space
-        .memory()
-        .capture(validated.pushbuffers()[0].source())
-        .unwrap();
-    drop(first_allocation);
-    address_space.unmap(first.offset()).unwrap();
-    assert!(matches!(
-        validated.validate_sources(address_space.memory()),
-        Err(MaxwellGpfifoSourceError::StaleMapping { location })
-            if location.entry_index == 0
-                && location.word_offset == 0
-                && location.mapping == first.id()
-                && location.generation == first.generation()
-    ));
-    let accepted = nixe_memory::CapturedMemory::new(accepted).unwrap();
-    let mut retained_bytes = [0; 12];
-    machine
-        .read_captured_into(&accepted, 0, &mut retained_bytes)
-        .unwrap()
-        .into_ready()
-        .unwrap();
-    assert_eq!(retained_bytes, bytes);
-    assert_eq!(machine.statistics().allocated_bytes, 2 * PAGE_SIZE);
-    drop(accepted);
-    assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
-}
-
-#[test]
-fn rejects_a_later_hole_before_returning_a_retained_prefix() {
-    let machine = Machine::new(16 * PAGE_SIZE).unwrap();
-    let allocation = memory::allocate(&machine, 0x1000);
-    let mut address_space = memory::address_space(&machine, 3);
-    let mapping = memory::map(&mut address_space, &allocation, 1);
-    let mut entries = Vec::new();
-    entries.extend_from_slice(&descriptor(mapping.offset().get(), 1, 0));
-    entries.extend_from_slice(&descriptor(mapping.offset().get() + 0x2000, 1, 0));
-    let decoded = decode_gpfifo_submission(
-        SWITCH_1_GM20B_PROFILE,
-        4,
-        request(2, SUBMIT_HARDWARE_FORMAT),
-        &entries,
-    )
-    .unwrap();
-
-    assert!(matches!(
-        resolve_gpfifo_submission(
-            &bound_channel(1, address_space.id()),
-            FrontendSubmissionId::new(1),
-            decoded,
-            address_space.memory(),
-        ),
-        Err(MaxwellGpfifoSourceError::Resolution {
-            entry_index: 1,
-            error: MaxwellGpuAccessError::UnmappedAddress { .. },
-            ..
-        })
-    ));
-}
-
-#[test]
-fn multiple_entry_subroutine_capture_replays_the_same_first_packet() {
+fn multiple_entry_subroutine_metadata_survives_submission_validation() {
     let machine = Machine::new(16 * PAGE_SIZE).unwrap();
     let allocation = memory::allocate(&machine, 0x2000);
     memory::write(
@@ -329,7 +225,7 @@ fn multiple_entry_subroutine_capture_replays_the_same_first_packet() {
     )
     .unwrap();
     let channel = bound_channel(6, address_space.id());
-    let validated = resolve_gpfifo_submission(
+    let validated = validate_gpfifo_submission(
         &channel.configuration(),
         FrontendSubmissionId::new(12),
         decoded,
@@ -337,128 +233,23 @@ fn multiple_entry_subroutine_capture_replays_the_same_first_packet() {
     )
     .unwrap();
 
-    assert_eq!(validated.pushbuffers().len(), 2);
+    assert_eq!(validated.decoded().entries().len(), 2);
     assert_eq!(
-        validated.pushbuffers()[1].entry().level(),
+        validated.decoded().entries()[1].level(),
         MaxwellGpfifoLevel::Subroutine
     );
     assert_eq!(
-        validated.pushbuffers()[1].entry().sync(),
+        validated.decoded().entries()[1].sync(),
         MaxwellGpfifoSyncMode::Wait
     );
-    let first_location = validated.first_packet_location().unwrap().unwrap();
     let replay = validated.clone();
-    assert_eq!(replay.capture(), validated.capture());
-    assert_eq!(
-        replay.first_packet_location().unwrap(),
-        Some(first_location)
-    );
-    assert_eq!(first_location.entry_index, 0);
-    assert_eq!(first_location.pushbuffer, mapping.offset());
-    assert_eq!(first_location.word_offset, 0);
-}
-
-#[test]
-fn capture_is_hard_bounded_without_changing_submission_identity() {
-    let machine = Machine::new(16 * PAGE_SIZE).unwrap();
-    let allocation = memory::allocate(&machine, 0x1000);
-    let mut address_space = memory::address_space(&machine, 6);
-    let mapping = memory::map(&mut address_space, &allocation, 20);
-    let entry_count = u32::try_from(MAXWELL_GPFIFO_CAPTURE_SOURCES + 1).unwrap();
-    let mut entries = Vec::new();
-    for _ in 0..entry_count {
-        entries.extend_from_slice(&descriptor(mapping.offset().get(), 1, 0));
-    }
-    let decoded = decode_gpfifo_submission(
-        SWITCH_1_GM20B_PROFILE,
-        entry_count,
-        request(entry_count, SUBMIT_HARDWARE_FORMAT),
-        &entries,
-    )
-    .unwrap();
-    let validated = resolve_gpfifo_submission(
-        &bound_channel(7, address_space.id()),
-        FrontendSubmissionId::new(14),
-        decoded,
-        address_space.memory(),
-    )
-    .unwrap();
-
-    let capture = validated.capture();
-    assert_eq!(capture.channel(), validated.channel());
-    assert_eq!(capture.frontend(), validated.frontend());
-    assert_eq!(capture.total_entries(), entry_count as usize);
-    assert_eq!(capture.total_sources(), entry_count as usize);
-    assert_eq!(capture.sources().len(), MAXWELL_GPFIFO_CAPTURE_SOURCES);
-    assert_eq!(capture.omitted_sources(), 1);
-    assert_eq!(
-        validated.first_packet_location().unwrap(),
-        validated.clone().first_packet_location().unwrap()
-    );
-}
-
-#[test]
-fn remapping_the_same_gpu_va_cannot_retarget_a_retained_submission() {
-    let machine = Machine::new(16 * PAGE_SIZE).unwrap();
-    let original = memory::allocate(&machine, 0x1000);
-    let replacement = memory::allocate(&machine, 0x1000);
-    memory::write(&original, 0, &[1, 2, 3, 4]);
-    memory::write(&replacement, 0, &[9, 8, 7, 6]);
-    let mut address_space = memory::address_space(&machine, 7);
-    let first = memory::map(&mut address_space, &original, 4);
-    let channel = bound_channel(8, address_space.id());
-    let decoded = decode_gpfifo_submission(
-        SWITCH_1_GM20B_PROFILE,
-        1,
-        request(1, SUBMIT_HARDWARE_FORMAT),
-        &descriptor(first.offset().get(), 1, 0),
-    )
-    .unwrap();
-    let retained = resolve_gpfifo_submission(
-        &channel.configuration(),
-        FrontendSubmissionId::new(13),
-        decoded,
-        address_space.memory(),
-    )
-    .unwrap();
-
-    address_space.unmap(first.offset()).unwrap();
-    let remapped = memory::map(&mut address_space, &replacement, 5);
-    assert_eq!(remapped.offset(), first.offset());
-    assert_ne!(remapped.id(), first.id());
-    assert_ne!(remapped.generation(), first.generation());
-    assert!(matches!(
-        retained.validate_sources(address_space.memory()),
-        Err(MaxwellGpfifoSourceError::StaleMapping { location })
-            if location.mapping == first.id()
-                && location.generation == first.generation()
-    ));
-
-    let mut original_bytes = [0; 4];
-    machine
-        .capture_stream(
-            &[AllocationRange::new(original.pin(), 0, 4).unwrap()],
-            &mut original_bytes,
-        )
-        .unwrap();
-    assert_eq!(original_bytes.as_ref(), &[1, 2, 3, 4]);
-    let mut replacement_bytes = [0; 4];
-    let replacement_range = address_space
-        .memory()
-        .resolve_range(remapped.offset(), 4, MemoryPermissions::READ)
-        .unwrap();
-    address_space
-        .memory()
-        .read_resolved(&replacement_range, &mut replacement_bytes, &mut |_, _| {
-            panic!("RAM command read entered backend")
-        })
-        .unwrap();
-    assert_eq!(replacement_bytes, [9, 8, 7, 6]);
+    assert_eq!(replay, validated);
+    assert_eq!(replay.decoded().entries()[0].address(), mapping.offset());
 }
 
 fn exercise_command_source(split: bool, wait: bool, unmap_during_entry: bool) {
-    use nixe_gpu::CacheMaintenanceOperation;
-    use std::{cell::Cell, sync::Arc};
+    use nixe_gpu::{CacheMaintenanceOperation, native::NativeCommand};
+    use std::cell::RefCell;
     let machine = Machine::new(PAGE_SIZE).unwrap();
     let allocation = memory::allocate(&machine, PAGE_SIZE);
     let mut space = memory::address_space(&machine, 1);
@@ -489,7 +280,7 @@ fn exercise_command_source(split: bool, wait: bool, unmap_during_entry: bool) {
         &descriptors,
     )
     .unwrap();
-    let submission = resolve_gpfifo_submission(
+    let submission = validate_gpfifo_submission(
         &channel.configuration(),
         FrontendSubmissionId::new(1),
         decoded,
@@ -507,49 +298,43 @@ fn exercise_command_source(split: bool, wait: bool, unmap_during_entry: bool) {
     let reader = space.memory().clone();
     let captured_before = machine.tracking_statistics().captured_bytes;
     let mut allocation = Some(allocation);
-    let waits = Cell::new(0);
     let mut observed = Vec::new();
-    let mut access = |ranges: Vec<AllocationRange>, operation| {
-        machine
-            .apply_resolved_access(&ranges, &operation)
-            .map_err(Arc::new)
+    let mut consume = |work: nixe_gpu::native::NativeWork| {
+        let NativeCommand::Ordering(operation) = work.command else {
+            panic!("unexpected native work in command source fixture")
+        };
+        observed.push(operation);
+        if observed.len() == 1 {
+            memory::write(
+                allocation.as_ref().unwrap(),
+                12,
+                &0x7000_0000u32.to_le_bytes(),
+            );
+            if unmap_during_entry {
+                space.unmap(mapping.offset()).unwrap();
+                drop(allocation.take());
+            }
+        }
     };
-    let tail = stream_maxwell_frontend(
+    let mut host = command::Observer {
+        memory: &machine,
+        consume: &mut consume,
+        controls: 0,
+    };
+    let frontend = RefCell::new(MaxwellNativeFrontend::new(Default::default()));
+    let mut scratch = MaxwellCommandSourceScratch::default();
+    command::ready(stream_maxwell_frontend(
         &dispatch,
         &mut channel,
         &reader,
-        &mut MaxwellNativeFrontend::new(Default::default()),
-        &mut MaxwellCommandSourceScratch::default(),
-        &mut access,
-        &mut || {
-            waits.set(waits.get() + 1);
-            Ok(())
-        },
-        &mut |steps| {
-            for step in steps {
-                let MaxwellSubmissionExecutionStep::Ordering(operation) = step else {
-                    panic!("unexpected operation in command capture fixture")
-                };
-                observed.push(operation);
-                if observed.len() == 1 {
-                    assert_eq!(waits.get(), 0);
-                    memory::write(
-                        allocation.as_ref().unwrap(),
-                        12,
-                        &0x7000_0000u32.to_le_bytes(),
-                    );
-                    if unmap_during_entry {
-                        space.unmap(mapping.offset()).unwrap();
-                        drop(allocation.take());
-                    }
-                }
-            }
-            Ok(())
-        },
-    )
+        &frontend,
+        &mut scratch,
+        &mut host,
+    ))
     .unwrap();
-    assert!(tail.into_steps().is_empty());
-    assert_eq!(waits.get(), usize::from(wait));
+    if wait {
+        assert!(host.controls > 0);
+    }
     assert_eq!(
         observed,
         [
@@ -587,6 +372,89 @@ fn following_command_entry_observes_prior_owner_effects() {
 }
 
 #[test]
-fn sync_wait_captures_following_sources_after_the_real_dependency() {
+fn sync_wait_entry_reads_following_source_after_prior_effect() {
     exercise_command_source(true, true, false);
+}
+
+#[test]
+fn later_entry_fetch_uses_the_mapping_current_after_prior_work() {
+    use nixe_gpu::{CacheMaintenanceOperation, native::NativeCommand};
+    use std::cell::RefCell;
+
+    let machine = Machine::new(8 * PAGE_SIZE).unwrap();
+    let first_bytes = memory::allocate(&machine, PAGE_SIZE);
+    let old_bytes = memory::allocate(&machine, PAGE_SIZE);
+    let replacement_bytes = memory::allocate(&machine, PAGE_SIZE);
+    let header = (1u32 << 29) | (1 << 16) | (6 << 13) | (0x002c / 4);
+    for (allocation, argument) in [
+        (&first_bytes, 0x8000_0000u32),
+        (&old_bytes, 0x8000_0000u32),
+        (&replacement_bytes, 0x7000_0000u32),
+    ] {
+        memory::write(allocation, 0, &header.to_le_bytes());
+        memory::write(allocation, 4, &argument.to_le_bytes());
+    }
+    let mut space = memory::address_space(&machine, 10);
+    let first = memory::map(&mut space, &first_bytes, 1);
+    let old = memory::map(&mut space, &old_bytes, 2);
+    let mut descriptors = Vec::new();
+    descriptors.extend_from_slice(&descriptor(first.offset().get(), 2, 0));
+    descriptors.extend_from_slice(&descriptor(old.offset().get(), 2, 0));
+    let decoded = decode_gpfifo_submission(
+        SWITCH_1_GM20B_PROFILE,
+        2,
+        request(2, SUBMIT_HARDWARE_FORMAT),
+        &descriptors,
+    )
+    .unwrap();
+    let mut channel = bound_channel(10, space.id());
+    let submission = validate_gpfifo_submission(
+        &channel.configuration(),
+        FrontendSubmissionId::new(10),
+        decoded,
+        space.memory(),
+    )
+    .unwrap();
+    let mut scheduler = MaxwellScheduler::default();
+    scheduler
+        .enqueue(&channel.configuration(), submission, None, None)
+        .unwrap();
+    let dispatch = scheduler
+        .dispatch_next(true, space.memory())
+        .unwrap()
+        .unwrap();
+    let reader = space.memory().clone();
+    let mut observed = Vec::new();
+    let mut consume = |work: nixe_gpu::native::NativeWork| {
+        let NativeCommand::Ordering(operation) = work.command else {
+            panic!("unexpected native work")
+        };
+        observed.push(operation);
+        if observed.len() == 1 {
+            space.unmap(old.offset()).unwrap();
+            let replacement = memory::map(&mut space, &replacement_bytes, 3);
+            assert_eq!(replacement.offset(), old.offset());
+        }
+    };
+    let mut host = command::Observer {
+        memory: &machine,
+        consume: &mut consume,
+        controls: 0,
+    };
+    command::ready(stream_maxwell_frontend(
+        &dispatch,
+        &mut channel,
+        &reader,
+        &RefCell::new(MaxwellNativeFrontend::new(Default::default())),
+        &mut MaxwellCommandSourceScratch::default(),
+        &mut host,
+    ))
+    .unwrap();
+    assert_eq!(
+        observed,
+        [
+            CacheMaintenanceOperation::FlushDirtyDeviceWrites,
+            CacheMaintenanceOperation::InvalidateDeviceReadCaches,
+        ]
+    );
 }

@@ -2,7 +2,7 @@
 use super::*;
 impl Dispatch {
     pub unsafe fn cmd_bind_pipeline(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         point: vk::PipelineBindPoint,
         pipeline: std::sync::Arc<crate::cache::NativePipeline>,
@@ -14,7 +14,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_bind_descriptor_sets(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         point: vk::PipelineBindPoint,
         layout: vk::PipelineLayout,
@@ -32,7 +32,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_bind_vertex_buffers(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         first: u32,
         buffers: &[vk::Buffer],
@@ -46,7 +46,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_bind_index_buffer(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         buffer: vk::Buffer,
         offset: vk::DeviceSize,
@@ -60,7 +60,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_push_constants(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         layout: vk::PipelineLayout,
         stages: vk::ShaderStageFlags,
@@ -76,7 +76,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_draw(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         vertices: u32,
         instances: u32,
@@ -92,7 +92,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_draw_indexed(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         indices: u32,
         instances: u32,
@@ -110,7 +110,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_draw_indirect(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         buffer: vk::Buffer,
         offset: vk::DeviceSize,
@@ -126,7 +126,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_draw_indexed_indirect(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         buffer: vk::Buffer,
         offset: vk::DeviceSize,
@@ -141,11 +141,11 @@ impl Dispatch {
             stride,
         });
     }
-    pub unsafe fn cmd_dispatch(&self, command: vk::CommandBuffer, x: u32, y: u32, z: u32) {
+    pub unsafe fn cmd_dispatch(&mut self, command: vk::CommandBuffer, x: u32, y: u32, z: u32) {
         self.recorder.push(Command::Dispatch { command, x, y, z });
     }
     pub unsafe fn cmd_dispatch_indirect(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         buffer: vk::Buffer,
         offset: vk::DeviceSize,
@@ -157,7 +157,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_set_viewport(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         first: u32,
         values: &[vk::Viewport],
@@ -169,7 +169,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_set_scissor(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         first: u32,
         values: &[vk::Rect2D],
@@ -180,11 +180,11 @@ impl Dispatch {
             values: values.iter().copied().collect(),
         });
     }
-    pub unsafe fn cmd_set_line_width(&self, command: vk::CommandBuffer, width: f32) {
+    pub unsafe fn cmd_set_line_width(&mut self, command: vk::CommandBuffer, width: f32) {
         self.recorder.push(Command::SetLineWidth { command, width });
     }
     pub unsafe fn cmd_set_depth_bias(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         constant: f32,
         clamp: f32,
@@ -197,14 +197,18 @@ impl Dispatch {
             slope,
         });
     }
-    pub unsafe fn cmd_set_blend_constants(&self, command: vk::CommandBuffer, values: &[f32; 4]) {
+    pub unsafe fn cmd_set_blend_constants(
+        &mut self,
+        command: vk::CommandBuffer,
+        values: &[f32; 4],
+    ) {
         self.recorder.push(Command::SetBlendConstants {
             command,
             values: *values,
         });
     }
     pub unsafe fn cmd_set_stencil_compare_mask(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         face: vk::StencilFaceFlags,
         mask: u32,
@@ -216,7 +220,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_set_stencil_write_mask(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         face: vk::StencilFaceFlags,
         mask: u32,
@@ -228,7 +232,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_set_stencil_reference(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         face: vk::StencilFaceFlags,
         reference: u32,
@@ -240,7 +244,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_set_depth_bounds(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         minimum: f32,
         maximum: f32,
@@ -252,7 +256,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_copy_buffer(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         source: vk::Buffer,
         destination: vk::Buffer,
@@ -266,7 +270,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_copy_buffer_to_image(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         source: vk::Buffer,
         destination: vk::Image,
@@ -282,7 +286,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_copy_image_to_buffer(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         source: vk::Image,
         layout: vk::ImageLayout,
@@ -298,7 +302,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_copy_image(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         source: vk::Image,
         source_layout: vk::ImageLayout,
@@ -317,7 +321,7 @@ impl Dispatch {
     }
     #[allow(clippy::too_many_arguments, reason = "native Vulkan command signature")]
     pub unsafe fn cmd_blit_image(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         source: vk::Image,
         source_layout: vk::ImageLayout,
@@ -337,7 +341,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_resolve_image(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         source: vk::Image,
         source_layout: vk::ImageLayout,
@@ -355,7 +359,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_fill_buffer(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         buffer: vk::Buffer,
         offset: vk::DeviceSize,
@@ -371,7 +375,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_clear_color_image(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         image: vk::Image,
         layout: vk::ImageLayout,
@@ -387,7 +391,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_clear_depth_stencil_image(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         image: vk::Image,
         layout: vk::ImageLayout,
@@ -403,7 +407,7 @@ impl Dispatch {
         });
     }
     pub unsafe fn cmd_clear_attachments(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         attachments: &[vk::ClearAttachment],
         rectangles: &[vk::ClearRect],
@@ -414,9 +418,9 @@ impl Dispatch {
             rectangles: rectangles.iter().copied().collect(),
         });
     }
-    #[cfg(any(test, feature = "binding-probe"))]
+    #[cfg(any(test, feature = "performance-counters", feature = "binding-probe"))]
     pub unsafe fn cmd_reset_query_pool(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         pool: vk::QueryPool,
         first: u32,
@@ -429,9 +433,9 @@ impl Dispatch {
             count,
         });
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "performance-counters"))]
     pub unsafe fn cmd_write_timestamp(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         stage: vk::PipelineStageFlags,
         pool: vk::QueryPool,

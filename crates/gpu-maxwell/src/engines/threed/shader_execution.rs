@@ -447,7 +447,7 @@ impl MaxwellThreeDDirectlyAddressableMemory {
 /// The numeric method encodings are selectors, not literal call counts: for
 /// example, encoding eight selects a limit of 128 visible calls. NVIDIA's
 /// public class header also defines `NoCheck` explicitly. Finite selectors are
-/// checked later against conservative call-use evidence emitted by T10 rather
+/// checked later against conservative call-use evidence from shader translation rather
 /// than being treated as host scheduling hints.
 ///
 /// ABI source:

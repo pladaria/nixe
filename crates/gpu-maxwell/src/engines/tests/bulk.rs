@@ -3,51 +3,75 @@
 use super::*;
 
 type Writes = Vec<(u64, u32)>;
-fn transfer(
+pub(super) fn transfer(
     channel: &mut MaxwellGpuChannel,
     decoded: &MaxwellDecodedPushbuffer,
     scalar: bool,
 ) -> (Writes, usize, Result<(), MaxwellEngineDispatchError>) {
     let mut writes = Vec::new();
     let mut spans = 0;
-    let mut observed = Vec::new();
-    let mut mme = Vec::new();
+    let mut mme = None;
     let mut parameters = Vec::new();
-    let result = stream_maxwell_engine_packet(
-        channel,
-        FrontendSubmissionId::new(3),
-        &decoded.packets()[0],
-        scalar.then_some(&mut observed),
-        &mut mme,
-        &mut parameters,
-        &mut |event| {
-            let (address, offset, value) = match event.operation {
-                PendingEngineOperation::ThreeDInlineConstantBuffer(u) => {
-                    (u.address().get(), u.offset(), u.value())
-                }
-                PendingEngineOperation::InlineToMemory(u) => {
-                    (u.address().get(), u.offset(), u.value())
-                }
-                PendingEngineOperation::ComputeInlineToMemory(u) => {
-                    (u.address().get(), u.offset(), u.value())
-                }
-                _ => panic!("expected a transfer"),
-            };
-            spans += 1;
-            if let Some(words) = event.inline_words {
-                for (i, word) in words.iter().enumerate() {
-                    writes.push((address + u64::from(offset) + i as u64 * 4, word.argument()));
-                }
-            } else {
-                writes.push((address + u64::from(offset), value));
+    let mut consume = async |event: MaxwellEngineEvent<'_>| {
+        let (address, offset, value) = match event.operation {
+            PendingEngineOperation::ThreeDInlineConstantBuffer(u) => {
+                (u.address().get(), u.offset(), u.value())
             }
-            Ok::<_, std::convert::Infallible>(())
-        },
-    )
-    .map_err(|error| match error {
-        MaxwellEngineStreamError::Dispatch(error) => *error,
-        MaxwellEngineStreamError::Consumer(never) => match never {},
-    });
+            PendingEngineOperation::InlineToMemory(u) => (u.address().get(), u.offset(), u.value()),
+            PendingEngineOperation::ComputeInlineToMemory(u) => {
+                (u.address().get(), u.offset(), u.value())
+            }
+            _ => panic!("expected a transfer"),
+        };
+        spans += 1;
+        if let Some(words) = event.inline_words {
+            for (i, word) in words.iter().enumerate() {
+                writes.push((address + u64::from(offset) + i as u64 * 4, word.argument()));
+            }
+        } else {
+            writes.push((address + u64::from(offset), value));
+        }
+        Ok::<_, std::convert::Infallible>(())
+    };
+    let packet = decoded.packets()[0].view();
+    let packets: Vec<_> = if scalar {
+        let crate::pushbuffer::packet::PacketView::Methods {
+            header,
+            subchannel,
+            methods,
+            ..
+        } = packet
+        else {
+            panic!("method packet")
+        };
+        (0..methods.len())
+            .map(|index| crate::pushbuffer::packet::PacketView::Methods {
+                header,
+                subchannel,
+                methods: methods.slice(index..index + 1),
+                last: index + 1 == methods.len(),
+            })
+            .collect()
+    } else {
+        vec![packet]
+    };
+    let result = packets
+        .into_iter()
+        .try_for_each(|packet| {
+            crate::test_memory::ready(stream_maxwell_engine_packet(
+                channel,
+                FrontendSubmissionId::new(3),
+                packet,
+                None,
+                &mut mme,
+                &mut parameters,
+                &mut consume,
+            ))
+        })
+        .map_err(|error| match error {
+            MaxwellEngineStreamError::Dispatch(error) => *error,
+            MaxwellEngineStreamError::Consumer(never) => match never {},
+        });
     (writes, spans, result)
 }
 
@@ -206,21 +230,21 @@ fn packed_inline_indices_are_owned_by_each_end_and_do_not_require_guest_index_st
     let mut channel = three_d_channel();
     program_three_d(&mut channel, 0x1618, 4);
     let mut captures = Vec::new();
-    let mut mme = Vec::new();
+    let mut mme = None;
     let mut parameters = Vec::new();
     for packet in [
         non_incrementing_packet_on_subchannel(0, 0x15ec / 4, &[0x00020001, 0x00040003]),
         non_incrementing_packet_on_subchannel(0, 0x1300 / 4, &[0x08070605, 0x0c0b0a09]),
         packet(0x1614 / 4, 0),
     ] {
-        stream_maxwell_engine_packet(
+        crate::test_memory::ready(stream_maxwell_engine_packet(
             &mut channel,
             FrontendSubmissionId::new(3),
-            &packet.packets()[0],
+            packet.packets()[0].view(),
             None,
             &mut mme,
             &mut parameters,
-            &mut |event| {
+            &mut async |event| {
                 if let PendingEngineOperation::ThreeD(
                     MaxwellThreeDOperationTrigger::DrawIndexBuffer { index_count, .. },
                 ) = event.operation
@@ -240,7 +264,7 @@ fn packed_inline_indices_are_owned_by_each_end_and_do_not_require_guest_index_st
                 }
                 Ok::<_, std::convert::Infallible>(())
             },
-        )
+        ))
         .unwrap_or_else(|_| panic!("inline stream failed"));
     }
     let expected: Vec<u8> = (1_u32..=12).flat_map(u32::to_le_bytes).collect();

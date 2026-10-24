@@ -34,7 +34,7 @@ pub(crate) fn view(
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn transition(
-    device: &VulkanDevice,
+    device: &mut VulkanDevice,
     command: vk::CommandBuffer,
     image: vk::Image,
     old: vk::ImageLayout,
@@ -301,8 +301,11 @@ impl ScreenRenderer {
                     ));
                 }
                 cache.device_mut().end_rendering();
-                let (slot, slice) = cache.device_mut().submission.reserve_upload(&bytes)?;
-                let device = cache.device();
+                let device = cache.device_mut();
+                let (slot, slice) = device
+                    .submission
+                    .reserve_upload(&mut device.dispatch, &bytes)?;
+                let device = cache.device_mut();
                 let command = device.submission.slots[slot].command;
                 let old = if delta.pos.is_none() {
                     vk::ImageLayout::UNDEFINED
@@ -475,7 +478,7 @@ impl ScreenRenderer {
             push[16 + i * 4..20 + i * 4].copy_from_slice(&value.to_le_bytes());
         }
         cache.bind_host_graphics(&graphics, &push)?;
-        let device = cache.device();
+        let device = cache.device_mut();
         let command = device.submission.slots[device.submission.recording.unwrap()].command;
         let attachments = [vk::RenderingAttachmentInfo::default()
             .image_view(target)
@@ -557,14 +560,13 @@ impl ScreenRenderer {
         }
         // The owner staging arena also serves vertex/index fetch directly;
         // these slices cannot recycle before this command slot completes.
-        let (slot, vertices) = cache
-            .device_mut()
+        let device = cache.device_mut();
+        let (slot, vertices) = device
             .submission
-            .reserve_upload(&self.vertices)?;
-        let (index_slot, indices) = cache
-            .device_mut()
+            .reserve_upload(&mut device.dispatch, &self.vertices)?;
+        let (index_slot, indices) = device
             .submission
-            .reserve_upload(&self.indices)?;
+            .reserve_upload(&mut device.dispatch, &self.indices)?;
         if slot != index_slot {
             return Err(VulkanError::InvalidResource(
                 "UI upload unexpectedly changed command slots",
@@ -590,7 +592,7 @@ impl ScreenRenderer {
                 vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
             )];
         unsafe {
-            cache.device().dispatch.barrier(
+            cache.device_mut().dispatch.barrier(
                 command,
                 &vk::DependencyInfo::default().memory_barriers(&dependency),
             );
@@ -608,7 +610,7 @@ impl ScreenRenderer {
             .layer_count(1)
             .color_attachments(&attachments);
         unsafe {
-            cache.device().dispatch.begin_rendering(command, &info);
+            cache.device_mut().dispatch.begin_rendering(command, &info);
         }
         let draw_result = (|| -> Result<(), VulkanError> {
             for (texture, clip, first, count, base) in ranges {
@@ -651,7 +653,7 @@ impl ScreenRenderer {
                 let graphics =
                     cache.prepare_host_graphics(Arc::clone(&pipeline), record, parameters)?;
                 cache.bind_host_graphics(&graphics, &push)?;
-                let device = cache.device();
+                let device = cache.device_mut();
                 let command = device.submission.slots[slot].command;
                 unsafe {
                     device.dispatch.cmd_bind_vertex_buffers(
@@ -678,7 +680,7 @@ impl ScreenRenderer {
             Ok(())
         })();
         unsafe {
-            cache.device().dispatch.end_rendering(command);
+            cache.device_mut().dispatch.end_rendering(command);
         }
         // Host UI changed raw vertex/index binds; invalidate guest bind knowledge.
         cache.device_mut().submission.slots[slot]

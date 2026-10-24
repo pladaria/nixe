@@ -38,6 +38,7 @@ fn padded_rgba_image(input: &AllocationRange) -> nixe_gpu::native::GuestImage {
     )
     .unwrap();
     GuestImage {
+        view_identity: None,
         description: ImageDescription::new(
             ImageDimension::Two,
             ImageExtent::new(4, 4, 1).unwrap(),
@@ -65,9 +66,8 @@ fn padded_rgba_image(input: &AllocationRange) -> nixe_gpu::native::GuestImage {
 #[test]
 fn native_ram_read_resolves_neighbouring_image_and_reopens_both_aliases() {
     use nixe_gpu::{
-        ClearValue, ExecutionBatch, FrontendSubmissionId, FrontendSubmissionSegment, GpuExecution,
-        ScissorRect,
-        native::{NativeCommand, NativeSubmission},
+        ClearValue, FrontendSubmissionId, GpuExecution, ScissorRect,
+        native::{NativeCommand, NativeWork},
         shader_identity::ShaderNamespace,
     };
     use nixe_gpu_vulkan::{NativeGpuExecution, cache::CacheConfiguration};
@@ -110,11 +110,9 @@ fn native_ram_read_resolves_neighbouring_image_and_reopens_both_aliases() {
         8 * 1024 * 1024,
     )
     .unwrap();
-    let submission = NativeSubmission::new(
-        FrontendSubmissionId::new(1),
-        FrontendSubmissionSegment::FIRST,
-        true,
-        vec![NativeCommand::Clear {
+    let submission = NativeWork {
+        frontend: FrontendSubmissionId::new(1),
+        command: NativeCommand::Clear {
             image: padded_rgba_image(&input),
             rectangle: ScissorRect {
                 x: 0,
@@ -123,30 +121,19 @@ fn native_ram_read_resolves_neighbouring_image_and_reopens_both_aliases() {
                 height: 4,
             },
             value: ClearValue::Color([1., 0., 0., 1.]),
-        }],
-    );
-    assert!(
-        execution
-            .prepare(ExecutionBatch {
-                commands: &submission
-            })
-            .unwrap()
-    );
-    execution
-        .record(ExecutionBatch {
-            commands: &submission,
-        })
-        .unwrap();
+        },
+    };
+
+    execution.consume(&submission).unwrap();
     let before = execution.residency_statistics().native_readback_bytes;
     let AccessResult::NativeRead {
         bytes,
         area: Some(area),
-    } = execution
-        .access_memory(
-            vec![input.slice(512, 4).unwrap()],
-            AccessOperation::ReadNative,
-        )
-        .unwrap()
+    } = access(
+        &mut execution,
+        vec![input.slice(512, 4).unwrap()],
+        AccessOperation::ReadNative,
+    )
     else {
         panic!("RAM padding must produce a reusable native read area");
     };
@@ -177,12 +164,11 @@ fn native_ram_read_resolves_neighbouring_image_and_reopens_both_aliases() {
         downloaded
     );
     assert!(matches!(
-        execution
-            .access_memory(
-                vec![input.slice(512, 4).unwrap()],
-                AccessOperation::Write(Box::new(9u32.to_le_bytes()))
-            )
-            .unwrap(),
+        access(
+            &mut execution,
+            vec![input.slice(512, 4).unwrap()],
+            AccessOperation::Write(Box::new(9u32.to_le_bytes()))
+        ),
         AccessResult::Written
     ));
     assert!(!area.observation().is_invalid());
@@ -200,10 +186,11 @@ fn native_ram_read_resolves_neighbouring_image_and_reopens_both_aliases() {
             Some(9)
         );
     }
-    let AccessResult::Read(pixel) = execution
-        .access_memory(vec![input.slice(0, 4).unwrap()], AccessOperation::Read)
-        .unwrap()
-    else {
+    let AccessResult::Read(pixel) = access(
+        &mut execution,
+        vec![input.slice(0, 4).unwrap()],
+        AccessOperation::Read,
+    ) else {
         panic!("expected actual image bytes");
     };
     assert_eq!(*pixel, [255, 0, 0, 255]);
@@ -219,8 +206,8 @@ fn native_ram_read_resolves_neighbouring_image_and_reopens_both_aliases() {
 #[test]
 fn recorded_literal_publishes_after_native_completion_without_a_frontend_token() {
     use nixe_gpu::{
-        ExecutionBatch, FrontendSubmissionId, FrontendSubmissionSegment, GpuExecution,
-        native::{NativeCommand, NativeSubmission},
+        FrontendSubmissionId, GpuExecution,
+        native::{NativeCommand, NativeWork},
         shader_identity::ShaderNamespace,
     };
     use nixe_gpu_vulkan::{NativeGpuExecution, cache::CacheConfiguration};
@@ -263,29 +250,17 @@ fn recorded_literal_publishes_after_native_completion_without_a_frontend_token()
             let _ = wake.send(());
         }))
         .unwrap();
-    let submission = NativeSubmission::new(
-        FrontendSubmissionId::new(1),
-        FrontendSubmissionSegment::FIRST,
-        false,
-        vec![NativeCommand::ReportMemory {
+    let submission = NativeWork {
+        frontend: FrontendSubmissionId::new(1),
+        command: NativeCommand::ReportMemory {
             fence: true,
             target: vec![range.clone()],
             offset: 128,
             bytes: Arc::from(0x12345678u32.to_le_bytes()),
-        }],
-    );
-    assert!(
-        execution
-            .prepare(ExecutionBatch {
-                commands: &submission
-            })
-            .unwrap()
-    );
-    execution
-        .record(ExecutionBatch {
-            commands: &submission,
-        })
-        .unwrap();
+        },
+    };
+
+    execution.consume(&submission).unwrap();
     // Match the owner loop: progress, arm its wakeup, then park. Neither a
     // final frontend delivery nor a CPU read may be needed to submit a release.
     let mut actual = [0; 4];
@@ -293,7 +268,7 @@ fn recorded_literal_publishes_after_native_completion_without_a_frontend_token()
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         assert!(std::time::Instant::now() < deadline);
-        execution.progress_device_accesses().unwrap();
+        execution.progress().unwrap();
         assert!(execution.poll_completion().unwrap().is_none());
         machine
             .capture_stream(std::slice::from_ref(&release), &mut actual)
@@ -321,8 +296,8 @@ fn recorded_literal_publishes_after_native_completion_without_a_frontend_token()
 #[test]
 fn ordered_literal_fences_publish_ram_and_reopen_aliases_without_readback() {
     use nixe_gpu::{
-        ExecutionBatch, FrontendSubmissionId, FrontendSubmissionSegment, GpuExecution,
-        native::{NativeCommand, NativeSubmission},
+        FrontendSubmissionId, GpuExecution,
+        native::{NativeCommand, NativeWork},
         shader_identity::ShaderNamespace,
     };
     use nixe_gpu_vulkan::{NativeGpuExecution, cache::CacheConfiguration};
@@ -365,27 +340,21 @@ fn ordered_literal_fences_publish_ram_and_reopen_aliases_without_readback() {
     for round in 0..16u8 {
         let before = execution.residency_statistics().native_readback_bytes;
         for (index, value) in [round + 1, round + 21].into_iter().enumerate() {
-            let submission = NativeSubmission::new(
-                FrontendSubmissionId::new(u64::from(round) * 2 + index as u64 + 1),
-                FrontendSubmissionSegment::FIRST,
-                true,
-                vec![NativeCommand::ReportMemory {
+            let submission = NativeWork {
+                frontend: FrontendSubmissionId::new(u64::from(round) * 2 + index as u64 + 1),
+                command: NativeCommand::ReportMemory {
                     fence: true,
                     target: vec![range.clone()],
                     offset: 128,
                     bytes: Arc::from([value; 8]),
-                }],
-            );
-            assert!(
-                execution
-                    .prepare(ExecutionBatch {
-                        commands: &submission
-                    })
-                    .unwrap()
-            );
+                },
+            };
+
             execution
-                .submit(ExecutionBatch {
-                    commands: &submission,
+                .consume(&submission)
+                .and_then(|consumed| {
+                    assert!(consumed);
+                    execution.submit(submission.frontend)
                 })
                 .unwrap();
         }
@@ -409,15 +378,22 @@ fn ordered_literal_fences_publish_ram_and_reopen_aliases_without_readback() {
             // retires. Resolve that first store through the normal owner path.
             let ranges = space.capture(address, 1, MemoryPermissions::WRITE).unwrap();
             assert!(matches!(
-                execution
-                    .access_memory(ranges, nixe_memory::AccessOperation::Write(Box::new([99])))
-                    .unwrap(),
+                access(
+                    &mut execution,
+                    ranges,
+                    nixe_memory::AccessOperation::Write(Box::new([99]))
+                ),
                 nixe_memory::AccessResult::Written
             ));
         }
-        execution.synchronize_command_sources().unwrap();
+        execution.progress().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         for _ in 0..2 {
-            assert!(execution.poll_completion().unwrap().is_some());
+            while execution.poll_completion().unwrap().is_none() {
+                assert!(std::time::Instant::now() < deadline);
+                execution.progress().unwrap();
+                std::thread::yield_now();
+            }
         }
         let mut expected = [round + 21; 8];
         expected[3] = 99;
@@ -513,9 +489,8 @@ fn buffer_fence_downloads_publish_current_ranges_before_later_cpu_scalar_reads()
 #[test]
 fn native_owner_consumes_cpu_alias_overwrites_before_real_image_readback_and_replay() {
     use nixe_gpu::{
-        ClearValue, ExecutionBatch, FrontendSubmissionId, FrontendSubmissionSegment, GpuExecution,
-        ScissorRect,
-        native::{NativeCommand, NativeSubmission},
+        ClearValue, FrontendSubmissionId, GpuExecution, ScissorRect,
+        native::{NativeCommand, NativeWork},
         shader_identity::ShaderNamespace,
     };
     use nixe_gpu_vulkan::{NativeGpuExecution, cache::CacheConfiguration};
@@ -585,11 +560,9 @@ fn native_owner_consumes_cpu_alias_overwrites_before_real_image_readback_and_rep
         }
     });
     for frame in 0..32u8 {
-        let submission = NativeSubmission::new(
-            FrontendSubmissionId::new(u64::from(frame) + 1),
-            FrontendSubmissionSegment::FIRST,
-            true,
-            vec![NativeCommand::Clear {
+        let submission = NativeWork {
+            frontend: FrontendSubmissionId::new(u64::from(frame) + 1),
+            command: NativeCommand::Clear {
                 image: image.clone(),
                 rectangle: ScissorRect {
                     x: 0,
@@ -598,26 +571,17 @@ fn native_owner_consumes_cpu_alias_overwrites_before_real_image_readback_and_rep
                     height: 4,
                 },
                 value: ClearValue::Color([1., 0., 0., 1.]),
-            }],
-        );
-        assert!(
-            execution
-                .prepare(ExecutionBatch {
-                    commands: &submission
-                })
-                .unwrap()
-        );
-        execution
-            .record(ExecutionBatch {
-                commands: &submission,
-            })
-            .unwrap();
+            },
+        };
+
+        execution.consume(&submission).unwrap();
         send.send(frame).unwrap();
         completed.recv().unwrap();
-        let AccessResult::Read(actual) = execution
-            .access_memory(vec![input.slice(0, 128).unwrap()], AccessOperation::Read)
-            .unwrap()
-        else {
+        let AccessResult::Read(actual) = access(
+            &mut execution,
+            vec![input.slice(0, 128).unwrap()],
+            AccessOperation::Read,
+        ) else {
             panic!("expected physical readback")
         };
         let mut expected = [0; 128];
@@ -636,4 +600,27 @@ fn native_owner_consumes_cpu_alias_overwrites_before_real_image_readback_and_rep
     execution.teardown().unwrap();
     drop(execution);
     validation.check().unwrap();
+}
+
+fn access(
+    execution: &mut nixe_gpu_vulkan::NativeGpuExecution,
+    ranges: Vec<AllocationRange>,
+    operation: nixe_memory::AccessOperation,
+) -> nixe_memory::AccessResult {
+    use nixe_gpu::{GpuExecution, OwnerAccess};
+    match execution.access_memory(ranges, operation).unwrap() {
+        OwnerAccess::Ready(result) => result,
+        OwnerAccess::Pending(mut pending) => {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                execution.progress().unwrap();
+                if let Some(result) = pending.poll() {
+                    break result.unwrap();
+                }
+                execution.request_completion_wakeup().unwrap();
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        }
+    }
 }

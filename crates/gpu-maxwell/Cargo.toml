@@ -11,6 +11,7 @@ performance-counters = ["nixe-gpu/performance-counters", "nixe-memory/performanc
 nixe-memory.workspace = true
 log.workspace = true
 rustc-hash.workspace = true
+smallvec = "1"
 nixe-gpu.workspace = true
 nixe-shader-recompiler.workspace = true
 

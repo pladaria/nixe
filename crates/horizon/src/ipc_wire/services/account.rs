@@ -303,7 +303,7 @@ async fn dispatch_account_root(
                     HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                 );
             }
-            let locked = user_account_switch_locked.ok_or_else(|| {
+            let locked = user_account_switch_locked.ok_or({
                 IpcWireError::UnsupportedService(UnsupportedServiceOperation::CommandVariant {
                     service: "acc:u0",
                     command_id: request.command_id,

@@ -65,12 +65,12 @@ pub(crate) struct RecordingHandle {
 }
 struct RecordingState {
     sender: mpsc::SyncSender<Work>,
-    recycled: Mutex<mpsc::Receiver<Vec<Command>>>,
-    producer: Mutex<Producer>,
     failure: Arc<OnceLock<NativeFailure>>,
 }
 pub(super) struct Recorder {
     pub(super) handle: RecordingHandle,
+    recycled: mpsc::Receiver<Vec<Command>>,
+    producer: Producer,
     worker: Option<JoinHandle<()>>,
 }
 impl Recorder {
@@ -295,23 +295,57 @@ impl Recorder {
             })?;
         Ok(Self {
             handle: RecordingHandle {
-                inner: Arc::new(RecordingState {
-                    sender,
-                    recycled: Mutex::new(recycled),
-                    failure,
-                    producer: Mutex::new(Producer {
-                        commands: Vec::with_capacity(CHUNK_COMMANDS),
-                        failed: false,
-                    }),
-                }),
+                inner: Arc::new(RecordingState { sender, failure }),
+            },
+            recycled,
+            producer: Producer {
+                commands: Vec::with_capacity(CHUNK_COMMANDS),
+                failed: false,
             },
             worker: Some(worker),
         })
     }
-    pub(crate) fn push(&self, command: Command) {
-        self.handle.push(command);
+    pub(crate) fn push(&mut self, command: Command) {
+        if self.producer.failed {
+            return;
+        }
+        self.producer.commands.push(command);
+        if self.producer.commands.len() == CHUNK_COMMANDS {
+            self.dispatch();
+        }
     }
-    pub(crate) fn finish(&self) -> Result<(), VulkanError> {
+    fn dispatch(&mut self) {
+        if self.producer.commands.is_empty() || self.producer.failed {
+            return;
+        }
+        let replacement = self
+            .recycled
+            .try_recv()
+            .unwrap_or_else(|_| Vec::with_capacity(CHUNK_COMMANDS));
+        let commands = std::mem::replace(&mut self.producer.commands, replacement);
+        if self
+            .handle
+            .inner
+            .sender
+            .send(Work::Commands(commands))
+            .is_err()
+        {
+            self.producer.failed = true;
+        }
+    }
+    pub(crate) fn flush_chunks(&mut self) -> Result<(), VulkanError> {
+        self.handle.check_failure()?;
+        self.dispatch();
+        if self.producer.failed {
+            return Err(RecordingHandle::disconnected());
+        }
+        Ok(())
+    }
+    pub(crate) fn discard_pending(&mut self) {
+        self.producer.commands.clear();
+    }
+    pub(crate) fn finish(&mut self) -> Result<(), VulkanError> {
+        self.flush_chunks()?;
         self.handle.finish()
     }
 }
@@ -337,49 +371,9 @@ impl RecordingHandle {
     fn disconnected() -> VulkanError {
         VulkanError::InvalidResource("Vulkan recording worker stopped before recording completed")
     }
-    pub(crate) fn push(&self, command: Command) {
-        let mut producer = self
-            .inner
-            .producer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if producer.failed {
-            return;
-        }
-        producer.commands.push(command);
-        if producer.commands.len() == CHUNK_COMMANDS {
-            self.dispatch(&mut producer);
-        }
-    }
-    fn dispatch(&self, producer: &mut Producer) {
-        if producer.commands.is_empty() || producer.failed {
-            return;
-        }
-        let replacement = self
-            .inner
-            .recycled
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .try_recv()
-            .unwrap_or_else(|_| Vec::with_capacity(CHUNK_COMMANDS));
-        let commands = std::mem::replace(&mut producer.commands, replacement);
-        if self.inner.sender.send(Work::Commands(commands)).is_err() {
-            producer.failed = true;
-        }
-    }
     fn enqueue(&self, work: Work) -> Result<(), VulkanError> {
         self.check_failure()?;
-        let mut producer = self
-            .inner
-            .producer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.dispatch(&mut producer);
-        if producer.failed {
-            return Err(Self::disconnected());
-        }
         if self.inner.sender.send(work).is_err() {
-            producer.failed = true;
             return Err(Self::disconnected());
         }
         Ok(())
@@ -412,31 +406,11 @@ impl RecordingHandle {
         self.enqueue(Work::Submit(work))
     }
     pub(crate) fn finish(&self) -> Result<(), VulkanError> {
-        let mut producer = self
-            .inner
-            .producer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.dispatch(&mut producer);
-        if !producer.failed {
-            let (reply, completed) = mpsc::sync_channel(1);
-            producer.failed =
-                self.inner.sender.send(Work::Finish(reply)).is_err() || completed.recv().is_err();
-        }
+        let (reply, completed) = mpsc::sync_channel(1);
+        self.enqueue(Work::Finish(reply))?;
+        completed.recv().map_err(|_| Self::disconnected())?;
         self.check_failure()?;
-        if producer.failed {
-            Err(Self::disconnected())
-        } else {
-            Ok(())
-        }
-    }
-    pub(crate) fn discard_pending(&self) {
-        self.inner
-            .producer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .commands
-            .clear();
+        Ok(())
     }
 }
 impl Drop for Recorder {
@@ -612,7 +586,7 @@ mod tests {
     }
     #[test]
     fn failed_submission_retains_the_last_real_tick_and_stops_following_work() {
-        let recorder = recorder();
+        let mut recorder = recorder();
         let submitted = Arc::new(SubmissionProgress::default());
         recorder
             .handle

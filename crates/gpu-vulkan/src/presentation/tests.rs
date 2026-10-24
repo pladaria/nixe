@@ -47,12 +47,15 @@ fn read_in_layout(
     extent: [u32; 2],
     layout: vk::ImageLayout,
 ) -> Vec<u8> {
-    let (slot, slice, ticket) = cache
-        .device_mut()
+    let device = cache.device_mut();
+    let (slot, slice, ticket) = device
         .submission
-        .reserve_readback(u64::from(extent[0]) * u64::from(extent[1]) * 4)
+        .reserve_readback(
+            &mut device.dispatch,
+            u64::from(extent[0]) * u64::from(extent[1]) * 4,
+        )
         .unwrap();
-    let device = cache.device();
+    let device = cache.device_mut();
     let command = device.submission.slots[slot].command;
     render::transition(
         device,
@@ -313,10 +316,11 @@ fn native_frame_snapshots_preserve_versions_crop_formats_and_every_transform() {
                 .allocate_host_image(extent, vk::Format::R8G8B8A8_UNORM)
                 .unwrap();
             let target = render::view(cache.device(), native, vk::Format::R8G8B8A8_UNORM).unwrap();
-            let slot = cache.device_mut().submission.begin().unwrap();
+            let device = cache.device_mut();
+            let slot = device.submission.begin(&mut device.dispatch).unwrap();
             let command = cache.device().submission.slots[slot].command;
             render::transition(
-                cache.device(),
+                cache.device_mut(),
                 command,
                 target.image.handle,
                 vk::ImageLayout::UNDEFINED,
@@ -429,10 +433,11 @@ fn native_ui_texture_updates_blending_clipping_and_free() {
             .allocate_host_image([8, 8], vk::Format::R8G8B8A8_UNORM)
             .unwrap();
         let target = render::view(cache.device(), image, vk::Format::R8G8B8A8_UNORM).unwrap();
-        let slot = cache.device_mut().submission.begin().unwrap();
+        let device = cache.device_mut();
+        let slot = device.submission.begin(&mut device.dispatch).unwrap();
         let command = cache.device().submission.slots[slot].command;
         render::transition(
-            cache.device(),
+            cache.device_mut(),
             command,
             target.image.handle,
             vk::ImageLayout::UNDEFINED,
@@ -443,7 +448,7 @@ fn native_ui_texture_updates_blending_clipping_and_free() {
             vk::AccessFlags2::TRANSFER_WRITE,
         );
         unsafe {
-            cache.device().dispatch.cmd_clear_color_image(
+            cache.device_mut().dispatch.cmd_clear_color_image(
                 command,
                 target.image.handle,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -454,7 +459,7 @@ fn native_ui_texture_updates_blending_clipping_and_free() {
             );
         }
         render::transition(
-            cache.device(),
+            cache.device_mut(),
             command,
             target.image.handle,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -829,10 +834,11 @@ fn scanout_retargets_a_new_producer_and_ignores_undefined_padding() {
         .allocate_host_image([4, 4], vk::Format::R8G8B8A8_UNORM)
         .unwrap();
     let target = render::view(cache.device(), native, vk::Format::R8G8B8A8_UNORM).unwrap();
-    let slot = cache.device_mut().submission.begin().unwrap();
+    let device = cache.device_mut();
+    let slot = device.submission.begin(&mut device.dispatch).unwrap();
     let command = cache.device().submission.slots[slot].command;
     render::transition(
-        cache.device(),
+        cache.device_mut(),
         command,
         target.image.handle,
         vk::ImageLayout::UNDEFINED,
@@ -896,7 +902,7 @@ fn dropping_a_frame_pool_retains_an_in_flight_snapshot_destination() {
     };
     let monitor = device.validation_monitor();
     let mut gate = gate::Gate::new(&device);
-    device.submission.begin().unwrap();
+    device.submission.begin(&mut device.dispatch).unwrap();
     let waits = [vk::SemaphoreSubmitInfo::default()
         .semaphore(gate.handle)
         .value(1)
@@ -904,7 +910,7 @@ fn dropping_a_frame_pool_retains_an_in_flight_snapshot_destination() {
     gate.last_use = unsafe {
         device
             .submission
-            .flush(device.queue, &device.dispatch, &waits, &[])
+            .flush(device.queue, &mut device.dispatch, &waits, &[])
             .unwrap()
             .unwrap()
             .tick()
@@ -1001,7 +1007,7 @@ mod snapshot_replacement {
     fn hold_gpu(cache: &mut VulkanResidency) -> gate::Gate {
         let mut gate = gate::Gate::new(cache.device());
         let device = cache.device_mut();
-        device.submission.begin().unwrap();
+        device.submission.begin(&mut device.dispatch).unwrap();
         let waits = [vk::SemaphoreSubmitInfo::default()
             .semaphore(gate.handle)
             .value(1)
@@ -1009,7 +1015,7 @@ mod snapshot_replacement {
         gate.last_use = unsafe {
             device
                 .submission
-                .flush(device.queue, &device.dispatch, &waits, &[])
+                .flush(device.queue, &mut device.dispatch, &waits, &[])
                 .unwrap()
                 .unwrap()
                 .tick()

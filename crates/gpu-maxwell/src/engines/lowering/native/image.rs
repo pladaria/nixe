@@ -60,6 +60,7 @@ pub(super) fn conversion(image: &nixe_gpu::ConversionImage) -> Result<GuestImage
     let extent = description.extent();
     let bytes = u32::from(description.format().plane_bytes_per_block(0).unwrap());
     Ok(GuestImage {
+        view_identity: None,
         description,
         swizzle: image.view.swizzle(),
         sample_grid: [1, 1],

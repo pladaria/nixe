@@ -932,7 +932,7 @@ impl VulkanResidency {
                 self.device
                     .dispatch
                     .cmd_copy_buffer(command, src, scratch.handle, &copies);
-                scratch_read_barrier(&self.device, command, scratch.handle, scratch.size());
+                scratch_read_barrier(&mut self.device, command, scratch.handle, scratch.size());
             }
             pieces
                 .iter()
@@ -1360,7 +1360,7 @@ impl VulkanResidency {
                 scratch.handle,
                 &regions,
             );
-            scratch_read_barrier(&self.device, command, scratch.handle, size);
+            scratch_read_barrier(&mut self.device, command, scratch.handle, size);
         }
         let handle = scratch.handle;
         let work = self.device.work_ticket()?;

@@ -338,7 +338,7 @@ fn streams(
     )
 }
 #[test]
-fn gathered_draw_inputs_reuse_versions_and_observe_intervening_gpu_writes() {
+fn consecutive_draws_synchronize_inputs_and_observe_intervening_gpu_writes() {
     let Some(mut cache) = cache(ApiPreference::Auto, 32 * 1024 * 1024) else {
         return;
     };
@@ -401,14 +401,25 @@ fn gathered_draw_inputs_reuse_versions_and_observe_intervening_gpu_writes() {
         first_vertex: 0,
         first_instance: 0,
     }];
-    cache.draws(&draw, &arguments, &[]).unwrap();
+    cache.draw(&draw, arguments[0], &[]).unwrap();
+    for _ in 0..8 {
+        cache.draw(&draw, arguments[0], &[]).unwrap();
+    }
+    crate::residency::tests::cpu_write(
+        &mut cache,
+        &_allocation,
+        vertex.offset,
+        &vertex_bytes([1., 0., 0.]),
+    )
+    .unwrap();
+    cache.draw(&draw, arguments[0], &[]).unwrap();
     cache.flush().unwrap();
     let old_output = cpu_read(&mut cache, &pixels);
     for row in 0..8 {
         for pixel in old_output[32 + row * 48..64 + row * 48].chunks_exact(4) {
             assert_eq!(
                 pixel,
-                [0, 0, 255, 255],
+                [255, 0, 0, 255],
                 "CPU inputs were consumed by the draw owner"
             );
         }
@@ -419,14 +430,14 @@ fn gathered_draw_inputs_reuse_versions_and_observe_intervening_gpu_writes() {
         .unwrap();
     assert_eq!(upload.consumed, replacement.len());
     cache
-        .draws(
+        .draw(
             &draw,
-            &[Draw::Direct {
+            Draw::Direct {
                 vertices: 3,
                 instances: 1,
                 first_vertex: 0,
                 first_instance: 0,
-            }],
+            },
             &[],
         )
         .unwrap();
@@ -4225,13 +4236,17 @@ fn transfer_writes_skip_old_destination_import_and_preserve_exterior_producers()
 
 #[test]
 fn uniform_word_addressing_dynamic_offsets_and_cpu_gpu_producers_keep_visibility() {
-    uniform_visibility(false);
+    uniform_visibility(false, 80);
 }
 #[test]
 fn unaligned_uniforms_preserve_cpu_captures_and_native_producers() {
-    uniform_visibility(true);
+    uniform_visibility(true, 80);
 }
-fn uniform_visibility(unaligned: bool) {
+#[test]
+fn large_uniforms_use_cached_uploads_and_adapt_streaming_to_reuse() {
+    uniform_visibility(false, 8192);
+}
+fn uniform_visibility(unaligned: bool, size: u64) {
     let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
         return;
     };
@@ -4245,7 +4260,7 @@ fn uniform_visibility(unaligned: bool) {
         .max(16);
     let alignment = alignment + if unaligned { 4 } else { 0 };
     let (input_allocation, input_backing) =
-        backing_allocation(&cache, (alignment * 2 + 80) as usize, 4096, 0x19);
+        backing_allocation(&cache, (alignment * 2 + size) as usize, 4096, 0x19);
     let (_allocation_20, output_backing) = backing_allocation(&cache, 4096, 4096, 0x71);
     let input = cache
         .buffer_for(input_backing.clone(), vk::BufferUsageFlags::UNIFORM_BUFFER)
@@ -4285,7 +4300,7 @@ fn uniform_visibility(unaligned: bool) {
                 Binding::Buffer {
                     buffer: input,
                     offset: alignment,
-                    size: 80,
+                    size,
                 },
                 Binding::Buffer {
                     buffer: output,
@@ -4319,6 +4334,22 @@ fn uniform_visibility(unaligned: bool) {
         assert_eq!(
             &cpu_read(&mut cache, &output_backing)[..4],
             &expected.to_le_bytes()
+        );
+    }
+    if size > 4096 {
+        let uploaded = cache.statistics().cpu_uploaded_bytes;
+        let streamed = cache.statistics().cpu_streamed_bytes;
+        for _ in 0..300 {
+            cache
+                .dispatch(&program, Dispatch::Direct([1, 1, 1]), &[])
+                .unwrap();
+        }
+        assert_eq!(cache.statistics().cpu_uploaded_bytes, uploaded);
+        assert_eq!(cache.statistics().cpu_streamed_bytes, streamed);
+        cache.tick_uniform_cache();
+        assert_eq!(
+            cache.uniform_stream_limit, 0,
+            "stable cached uniforms prefer reuse"
         );
     }
     // A native producer must become visible to the uniform access class.

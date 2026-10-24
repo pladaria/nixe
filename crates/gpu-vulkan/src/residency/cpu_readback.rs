@@ -168,11 +168,11 @@ impl VulkanResidency {
     ) -> Result<(usize, crate::queue::Slice, ReadbackTicket), VulkanError> {
         loop {
             self.progress_readbacks()?;
-            match self
-                .device
-                .submission
-                .reserve_readback_aligned(bytes, alignment)
-            {
+            match self.device.submission.reserve_readback_aligned(
+                &mut self.device.dispatch,
+                bytes,
+                alignment,
+            ) {
                 Ok(reservation) => return Ok(reservation),
                 Err(error @ VulkanError::QueuePressure { pending, .. }) => {
                     let submitted = self.flush()?;
@@ -298,6 +298,26 @@ impl VulkanResidency {
         }
     }
 
+    /// Retain the demand without blocking the command owner on native completion.
+    pub(crate) fn begin_access_memory(
+        &mut self,
+        ranges: Vec<nixe_memory::AllocationRange>,
+        operation: nixe_memory::AccessOperation,
+    ) -> Result<nixe_gpu::OwnerAccess, VulkanError> {
+        if let Some(result) = self.memory.try_access_captured(&ranges, &operation)? {
+            return Ok(nixe_gpu::OwnerAccess::Ready(result));
+        }
+        let (request, mut result) = self.memory.prepare_device_access(ranges, operation)?;
+        self.queue_device_access(request)?;
+        self.progress_device_accesses()?;
+        if let Some(result) = result.poll() {
+            return result
+                .map(nixe_gpu::OwnerAccess::Ready)
+                .map_err(VulkanError::from);
+        }
+        Ok(nixe_gpu::OwnerAccess::Pending(result))
+    }
+
     /// A command-owner read uses the same authority in place. It never submits
     /// an access to its own endpoint or waits for its own inbox to service it.
     pub(crate) fn access_memory(
@@ -305,11 +325,10 @@ impl VulkanResidency {
         ranges: Vec<nixe_memory::AllocationRange>,
         operation: nixe_memory::AccessOperation,
     ) -> Result<nixe_memory::AccessResult, VulkanError> {
-        if let Some(result) = self.memory.try_access_captured(&ranges, &operation)? {
-            return Ok(result);
-        }
-        let (request, mut result) = self.memory.prepare_device_access(ranges, operation)?;
-        self.queue_device_access(request)?;
+        let mut result = match self.begin_access_memory(ranges, operation)? {
+            nixe_gpu::OwnerAccess::Ready(result) => return Ok(result),
+            nixe_gpu::OwnerAccess::Pending(result) => result,
+        };
         loop {
             self.progress_device_accesses()?;
             if let Some(result) = result.poll() {

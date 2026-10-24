@@ -106,7 +106,7 @@ impl Host {
                 let slot = cache.device_mut().begin_recording()?;
                 let command = cache.device().submission.slots[slot].command;
                 render::transition(
-                    cache.device(),
+                    cache.device_mut(),
                     command,
                     view.image.handle,
                     vk::ImageLayout::UNDEFINED,
@@ -131,7 +131,7 @@ impl Host {
                     false,
                 )?;
                 render::transition(
-                    cache.device(),
+                    cache.device_mut(),
                     command,
                     view.image.handle,
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -180,7 +180,7 @@ impl Host {
         self.pending_surface = Some(acquired);
         let command = cache.device().submission.slots[slot].command;
         render::transition(
-            cache.device(),
+            cache.device_mut(),
             command,
             acquired.image,
             vk::ImageLayout::UNDEFINED,
@@ -224,8 +224,8 @@ impl Host {
                 .layer_count(1)
                 .color_attachments(&attachments);
             unsafe {
-                cache.device().dispatch.begin_rendering(command, &info);
-                cache.device().dispatch.end_rendering(command);
+                cache.device_mut().dispatch.begin_rendering(command, &info);
+                cache.device_mut().dispatch.end_rendering(command);
             }
         }
         if let (Some(ui), Some(pipeline)) = (&mut self.ui, ui_pipeline) {
@@ -240,7 +240,7 @@ impl Host {
             )?;
         }
         render::transition(
-            cache.device(),
+            cache.device_mut(),
             command,
             acquired.image,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -284,7 +284,11 @@ impl Host {
                 .min((capture.extent[1] - capture.next_row) as usize) as u32;
             let size = u64::from(rows) * u64::from(capture.extent[0]) * 4;
             cache.device_mut().end_rendering();
-            let (slot, slice, ticket) = match cache.device_mut().submission.reserve_readback(size) {
+            let device = cache.device_mut();
+            let (slot, slice, ticket) = match device
+                .submission
+                .reserve_readback(&mut device.dispatch, size)
+            {
                 Ok(value) => value,
                 Err(VulkanError::QueuePressure { .. }) => {
                     cache.flush()?;
@@ -292,7 +296,7 @@ impl Host {
                 }
                 Err(error) => return Err(error),
             };
-            let device = cache.device();
+            let device = cache.device_mut();
             let command = device.submission.slots[slot].command;
             let copy = vk::BufferImageCopy::default()
                 .buffer_offset(slice.offset)

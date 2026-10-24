@@ -4,7 +4,6 @@ use crate::physical::{Footprint, PhysicalMapping};
 use crate::*;
 use nixe_memory::AllocationRange;
 use std::{
-    cell::RefCell,
     hash::{Hash, Hasher},
     sync::Arc,
 };
@@ -22,6 +21,8 @@ pub struct NativePresentationImage {
 
 #[derive(Clone, Debug)]
 pub struct GuestImage {
+    /// Stable while the frontend's resolved view remains interned.
+    pub view_identity: Option<PreparedStateId>,
     pub planes: Arc<[GuestImagePlane]>,
     pub description: ImageDescription,
     pub swizzle: Swizzle,
@@ -32,6 +33,13 @@ pub struct GuestImage {
     pub canonical_texels: bool,
 }
 impl GuestImage {
+    pub fn same_prepared_view(&self, other: &Self) -> bool {
+        match (self.view_identity, other.view_identity) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => self.same_view(other),
+            _ => false,
+        }
+    }
     pub fn same_view(&self, other: &Self) -> bool {
         self.same_storage(other) && self.swizzle == other.swizzle
     }
@@ -116,10 +124,10 @@ impl PartialEq for GuestDrawState {
             && a.colors
                 .iter()
                 .zip(b.colors.iter())
-                .all(|(a, b)| a.same_view(b))
+                .all(|(a, b)| a.same_prepared_view(b))
             && match (&a.depth_stencil, &b.depth_stencil) {
                 (None, None) => true,
-                (Some(a), Some(b)) => a.same_view(b),
+                (Some(a), Some(b)) => a.same_prepared_view(b),
                 _ => false,
             }
     }
@@ -149,11 +157,16 @@ impl Hash for GuestDrawState {
         }
         a.colors.len().hash(state);
         for image in a.colors.iter().chain(&a.depth_stencil) {
-            image.planes.hash(state);
-            image.description.hash(state);
-            image.swizzle.hash(state);
-            image.sample_grid.hash(state);
-            image.canonical_texels.hash(state);
+            image.view_identity.is_some().hash(state);
+            if let Some(identity) = image.view_identity {
+                identity.hash(state);
+            } else {
+                image.planes.hash(state);
+                image.description.hash(state);
+                image.swizzle.hash(state);
+                image.sample_grid.hash(state);
+                image.canonical_texels.hash(state);
+            }
         }
         a.depth_stencil.is_some().hash(state);
     }
@@ -328,47 +341,8 @@ pub struct NativeWork {
     pub frontend: FrontendSubmissionId,
     pub command: NativeCommand,
 }
-pub struct NativeSubmission {
-    pub frontend: FrontendSubmissionId,
-    pub segment: FrontendSubmissionSegment,
-    pub final_segment: bool,
-    pub commands: Vec<NativeCommand>,
-    // Only a suspended preparation acquires RAM ownership. Warm consumption
-    // remains direct, and weak prepared-state caches cannot retain these pins.
-    suspended_inputs: RefCell<Option<Vec<AllocationRange>>>,
-}
-impl NativeSubmission {
-    pub fn new(
-        frontend: FrontendSubmissionId,
-        segment: FrontendSubmissionSegment,
-        final_segment: bool,
-        commands: Vec<NativeCommand>,
-    ) -> Self {
-        Self {
-            frontend,
-            segment,
-            final_segment,
-            commands,
-            suspended_inputs: RefCell::new(None),
-        }
-    }
-    /// Retain the original physical inputs before servicing control during a
-    /// cold compile wait. Repeated polls acquire no additional pins. The batch
-    /// owns them through actual consumption; cache entries remain weak.
-    pub fn retain_suspended_inputs(&self) -> Result<(), nixe_memory::MemoryError> {
-        let mut retained = self.suspended_inputs.borrow_mut();
-        if retained.is_none() {
-            let mut inputs = Vec::new();
-            for command in &self.commands {
-                command.retain_inputs(&mut inputs)?;
-            }
-            *retained = Some(inputs);
-        }
-        Ok(())
-    }
-}
 impl NativeCommand {
-    fn retain_inputs(
+    pub fn retain_inputs(
         &self,
         inputs: &mut Vec<AllocationRange>,
     ) -> Result<(), nixe_memory::MemoryError> {
@@ -507,16 +481,14 @@ mod tests {
         .unwrap()])
         .unwrap()
     }
-    fn batch(program: Arc<GuestProgram>) -> NativeSubmission {
-        NativeSubmission::new(
-            FrontendSubmissionId::new(1),
-            FrontendSubmissionSegment::FIRST,
-            true,
-            vec![NativeCommand::Dispatch {
+    fn batch(program: Arc<GuestProgram>) -> NativeWork {
+        NativeWork {
+            frontend: FrontendSubmissionId::new(1),
+            command: NativeCommand::Dispatch {
                 program,
                 groups: [1, 1, 1],
-            }],
-        )
+            },
+        }
     }
 
     #[test]
@@ -527,10 +499,8 @@ mod tests {
         let mapping = input(&allocation, PAGE_SIZE + 17, 8);
         let cached = program(Arc::clone(&mapping));
         let work = batch(Arc::clone(&cached));
-        work.retain_suspended_inputs().unwrap();
-        for _ in 0..8 {
-            work.retain_suspended_inputs().unwrap();
-        }
+        let mut retained = Vec::new();
+        work.command.retain_inputs(&mut retained).unwrap();
         drop(allocation);
         assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
         let recycled = account.allocate(2 * PAGE_SIZE).unwrap();
@@ -542,7 +512,7 @@ mod tests {
             .capture_stream(&mapping.pin(0, 8).unwrap(), &mut bytes)
             .unwrap();
         assert_eq!(bytes, [0x5a; 8]);
-        drop(work);
+        drop((retained, work));
         assert_eq!(machine.statistics().allocated_bytes, 2 * PAGE_SIZE);
         assert!(
             mapping.pin(0, 8).is_err(),
@@ -562,11 +532,9 @@ mod tests {
         let unused = batch(program(Arc::clone(&retired_mapping)));
         drop(retired);
         assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
-        let work = NativeSubmission::new(
-            FrontendSubmissionId::new(2),
-            FrontendSubmissionSegment::FIRST,
-            true,
-            vec![NativeCommand::Sequence(Box::new([
+        let work = NativeWork {
+            frontend: FrontendSubmissionId::new(2),
+            command: NativeCommand::Sequence(Box::new([
                 NativeCommand::Dispatch {
                     program: program(input(&first, 0, 4)),
                     groups: [1, 1, 1],
@@ -575,9 +543,11 @@ mod tests {
                     program: program(retired_mapping),
                     groups: [1, 1, 1],
                 },
-            ]))],
-        );
-        assert!(work.retain_suspended_inputs().is_err());
+            ])),
+        };
+        let mut retained = Vec::new();
+        assert!(work.command.retain_inputs(&mut retained).is_err());
+        drop(retained);
         drop(first);
         assert_eq!(machine.statistics().allocated_bytes, 0);
         drop((unused, work));

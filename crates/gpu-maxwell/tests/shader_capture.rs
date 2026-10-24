@@ -9,7 +9,7 @@ use nixe_shader_recompiler::{Compiler, Stage, environment::EnvironmentMetadata};
 use std::sync::Arc;
 
 #[test]
-fn owned_shader_capture_survives_later_cpu_stores_but_does_not_reuse_stale_proofs() {
+fn owned_shader_capture_rechecks_code_pages_and_reuses_equal_instructions() {
     let machine = Machine::new(PAGE_SIZE).unwrap();
     let allocation = machine
         .account(PAGE_SIZE)
@@ -60,15 +60,9 @@ fn owned_shader_capture_survives_later_cpu_stores_but_does_not_reuse_stale_proof
     let mut compiler = Compiler::new().unwrap();
     let mut memory = MemoryCache::default();
     let mut access = |ranges: Vec<AllocationRange>, operation| {
-        let result = machine
-            .apply_resolved_access(&ranges, &operation)
-            .map_err(Arc::new)?;
-        // Deterministic first-write invalidation after the owned read. It is
-        // unrelated to shader code, but shares its tracked physical page.
         machine
-            .write_resolved(&[input.slice(0x800, 1).unwrap()], &[1])
-            .map_err(Arc::new)?;
-        Ok(result)
+            .apply_resolved_access(&ranges, &operation)
+            .map_err(Arc::new)
     };
     let captured = capture_program(
         &mut compiler,
@@ -79,7 +73,7 @@ fn owned_shader_capture_survives_later_cpu_stores_but_does_not_reuse_stale_proof
         &mut access,
     )
     .unwrap();
-    assert!(!captured.stages[0].request_is_current(&request()[0].1, address_space.memory()));
+    assert!(captured.stages[0].request_is_current(&request()[0].1, address_space.memory()));
     assert_eq!(
         captured.stages[0]
             .environment
@@ -90,12 +84,26 @@ fn owned_shader_capture_survives_later_cpu_stores_but_does_not_reuse_stale_proof
             .collect::<Vec<_>>(),
         [exit]
     );
+    machine
+        .write_resolved(&[input.slice(0x800, 1).unwrap()], &[1])
+        .unwrap();
+    assert!(!captured.stages[0].request_is_current(&request()[0].1, address_space.memory()));
     let refreshed = captured
         .refresh(&request(), address_space.memory(), &mut memory, &mut access)
         .unwrap()
         .unwrap();
     assert!(Arc::ptr_eq(&captured.inputs, &refreshed.inputs));
+    assert!(refreshed.stages[0].request_is_current(&request()[0].1, address_space.memory()));
+    machine
+        .write_resolved(&[input.slice(8, 8).unwrap()], &exit.to_le_bytes())
+        .unwrap();
     assert!(!refreshed.stages[0].request_is_current(&request()[0].1, address_space.memory()));
+    let refreshed = refreshed
+        .refresh(&request(), address_space.memory(), &mut memory, &mut access)
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(&captured.inputs, &refreshed.inputs));
+    assert!(refreshed.stages[0].request_is_current(&request()[0].1, address_space.memory()));
     machine
         .write_resolved(&[input.slice(8, 8).unwrap()], &0u64.to_le_bytes())
         .unwrap();

@@ -107,7 +107,7 @@ impl DirectProgram {
         None
     }
 
-    pub(super) fn execute<H: MaxwellThreeDMmeHost>(
+    pub(super) async fn execute<H: MaxwellThreeDMmeHost>(
         &self,
         parameters: &[u32],
         host: &mut H,
@@ -126,8 +126,14 @@ impl DirectProgram {
                         Value::Constant(value) => value,
                         Value::Parameter(index) => parameters[index],
                     };
-                    host.emit_method(method, value)
-                        .map_err(MaxwellThreeDMmeRunError::Host)?;
+                    if !host
+                        .emit_register(method, value)
+                        .map_err(MaxwellThreeDMmeRunError::Host)?
+                    {
+                        host.emit_method(method, value)
+                            .await
+                            .map_err(MaxwellThreeDMmeRunError::Host)?;
+                    }
                 }
             }
         }
@@ -156,7 +162,10 @@ mod tests {
         fn read_register(&self, _: u16) -> Result<u32, usize> {
             panic!("direct programs contain no register reads")
         }
-        fn emit_method(&mut self, method: u16, value: u32) -> Result<(), usize> {
+        fn emit_register(&mut self, _: u16, _: u32) -> Result<bool, usize> {
+            Ok(false)
+        }
+        async fn emit_method(&mut self, method: u16, value: u32) -> Result<(), usize> {
             if self.fail_at == Some(self.sent.len()) {
                 return Err(23);
             }
@@ -193,6 +202,9 @@ mod tests {
             registers: [0; MME_REGISTER_COUNT],
             pc: 0,
             delayed_pc: None,
+            delay_slot: false,
+            exit_after_delay: false,
+            finished: false,
             next_parameter: 1,
             method_address: 0,
             method_increment: 0,
@@ -201,7 +213,10 @@ mod tests {
             emitted_methods: 0,
         };
         interpreter.registers[1] = parameters[0];
-        while interpreter.step(false)? {}
+        while let Some((method, value)) = interpreter.run_until_effect()? {
+            crate::test_memory::ready(interpreter.host.emit_method(method, value))
+                .map_err(MaxwellThreeDMmeRunError::Host)?;
+        }
         if interpreter.next_parameter != parameters.len() {
             return Err(MaxwellThreeDMmeRunError::Execution(
                 MaxwellThreeDMmeExecutionError::UnconsumedParameters {
@@ -265,7 +280,9 @@ mod tests {
                     };
                     let reference = normalized(interpreted(&program, &parameters, &mut expected));
                     assert_eq!(
-                        normalized(direct.execute(&parameters, &mut actual)),
+                        normalized(crate::test_memory::ready(
+                            direct.execute(&parameters, &mut actual)
+                        )),
                         reference
                     );
                     assert_eq!(actual.sent, expected.sent);

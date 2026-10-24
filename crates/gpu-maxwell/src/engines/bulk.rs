@@ -4,16 +4,18 @@
 use super::*;
 use crate::pushbuffer::dispatch::class_packet_methods;
 
-pub(super) fn stream_packet<E>(
+pub(super) async fn stream_packet<E>(
     channel: &mut MaxwellGpuChannel,
     submission: FrontendSubmissionId,
-    packet: &MaxwellDecodedPacket,
-    consume: &mut impl for<'a> FnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
+    packet: crate::pushbuffer::packet::PacketView<'_>,
+    consume: &mut impl for<'a> AsyncFnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
 ) -> Result<bool, MaxwellEngineStreamError<E>> {
-    let MaxwellDecodedPacket::Methods(packet_methods) = packet else {
+    let crate::pushbuffer::packet::PacketView::Methods {
+        methods: decoded, ..
+    } = packet
+    else {
         return Ok(false);
     };
-    let decoded = packet_methods.methods();
     let Some(first) = decoded.first() else {
         return Ok(false);
     };
@@ -46,13 +48,24 @@ pub(super) fn stream_packet<E>(
         return Ok(false);
     };
     if class == threed::CLASS {
-        let (profile, state) = channel.three_d_with_profile_mut();
+        let state = channel.three_d_mut();
         if state.pending_notification.is_some()
             || state.mme().shadow_ram_control().value()
                 == Some(&MaxwellThreeDMmeShadowRamControl::MethodReplay)
         {
             return Ok(false);
         }
+    } else if !inline || (class != compute::CLASS && class != inline_to_memory::CLASS) {
+        return Ok(false);
+    }
+    flush_before_method(
+        channel,
+        MaxwellMethodSource::decoded(first, subchannel),
+        consume,
+    )
+    .await?;
+    if class == threed::CLASS {
+        let (profile, state) = channel.three_d_with_profile_mut();
         if indices {
             threed::inline_index_words(state, subchannel, data)
                 .map_err(MaxwellEngineStreamError::dispatch)?;
@@ -79,6 +92,7 @@ pub(super) fn stream_packet<E>(
                 compute: None,
                 inline_words: Some(data.slice(..count)),
             })
+            .await
             .map_err(MaxwellEngineStreamError::Consumer)?;
             if count < data.len() {
                 threed::preflight(
@@ -94,8 +108,6 @@ pub(super) fn stream_packet<E>(
             }
             return Ok(true);
         }
-    } else if !inline || (class != compute::CLASS && class != inline_to_memory::CLASS) {
-        return Ok(false);
     }
     if !inline {
         return Ok(false);
@@ -126,6 +138,7 @@ pub(super) fn stream_packet<E>(
             compute: Some(channel.compute()),
             inline_words: Some(tail.slice(..count)),
         })
+        .await
         .map_err(MaxwellEngineStreamError::Consumer)?;
         cursor += count;
     }

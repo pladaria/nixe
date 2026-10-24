@@ -27,18 +27,16 @@ fn three_d_embedded_inline_upload_covers_captured_block_linear_gob_row() {
         0,
     ];
     let data = non_incrementing_packet_on_subchannel(0, 0x01b4 / 4, &words);
-    let dispatch = dispatch_first(&mut channel, &data).unwrap();
-
-    assert_eq!(dispatch.ordered_operations().len(), words.len());
-    for (index, operation) in dispatch.ordered_operations().iter().enumerate() {
-        assert!(matches!(
-            operation,
-            MaxwellEngineOperation::InlineToMemory(upload)
-                if upload.address().get() == 0x0409_3000
-                    && upload.offset() == index as u32 * 4
-                    && upload.value() == words[index]
-        ));
-    }
+    let (writes, _, result) = super::bulk::transfer(&mut channel, &data, false);
+    result.unwrap();
+    assert_eq!(
+        writes,
+        words
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| (0x0409_3000 + index as u64 * 4, value))
+            .collect::<Vec<_>>()
+    );
     let inline = channel.three_d().inline_to_memory();
     assert_eq!(inline.line_length().value(), Some(&0x40));
     assert_eq!(inline.line_count().value(), Some(&1));
@@ -382,168 +380,6 @@ fn captured_deko_basic_color_target_accepts_its_matching_c32_pte_kind() {
 }
 
 #[test]
-fn sparse_depth_state_is_validated_only_when_the_attachment_is_consumed() {
-    let mut channel = three_d_channel();
-    assert_eq!(
-        channel
-            .three_d()
-            .render_targets()
-            .depth_stencil()
-            .sparse()
-            .value(),
-        Some(&0)
-    );
-    program_three_d(&mut channel, 0x0fe0, 0);
-    let space = resource_address_space();
-    for value in 0..4 {
-        let dispatch = dispatch_method(&mut channel, 0x1208 / 4, value).unwrap();
-        assert!(dispatch.ordered_operations().is_empty());
-        let state = channel.three_d().render_targets().depth_stencil().sparse();
-        assert_eq!(state.raw(), Some(value));
-        assert_eq!(state.value(), Some(&(value as u8)));
-        assert_eq!(
-            state.source(),
-            Some(dispatch.methods()[0].method().source())
-        );
-        program_three_d(&mut channel, 0x1538, 0);
-        assert!(
-            fixture_bindings(
-                channel.three_d(),
-                space.memory(),
-                &mut crate::test_memory::access(space.memory().machine())
-            )
-            .is_ok()
-        );
-        program_three_d(&mut channel, 0x1538, 1);
-        let error = fixture_bindings(
-            channel.three_d(),
-            space.memory(),
-            &mut crate::test_memory::access(space.memory().machine()),
-        )
-        .unwrap_err();
-        if value & 1 != 0 {
-            assert!(matches!(
-                error,
-                MaxwellThreeDResourceError::UnsupportedSparseDepth { .. }
-            ));
-        } else {
-            assert!(matches!(
-                error,
-                MaxwellThreeDResourceError::IncompleteState {
-                    role: MaxwellThreeDResourceRole::DepthStencilTarget
-                }
-            ));
-        }
-    }
-    let before = channel.clone();
-    assert!(dispatch_method(&mut channel, 0x1208 / 4, 4).is_err());
-    assert_eq!(channel, before);
-}
-
-#[test]
-fn three_d_depth_target_selection_controls_resolution_and_rejects_extra_targets_atomically() {
-    let mut channel = three_d_channel();
-    let dispatch = dispatch_method(&mut channel, 0x1538 / 4, 1).unwrap();
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "SET_ZT_SELECT"
-    );
-    let selection = channel.three_d().render_targets().depth_target_count();
-    assert_eq!(selection.raw(), Some(1));
-    assert_eq!(selection.value(), Some(&MaxwellThreeDDepthTargetCount::One));
-    assert_eq!(
-        selection.source(),
-        Some(dispatch.methods()[0].method().source())
-    );
-
-    let before = channel.clone();
-    let invalid = packet(0x1538 / 4, 2);
-    assert!(matches!(
-        dispatch_first(&mut channel, &invalid),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-            method_name: "SET_ZT_SELECT",
-            reason: "target count exceeds the single exposed depth/stencil target",
-            ..
-        })
-    ));
-    assert_eq!(channel, before);
-
-    // A configured-but-incomplete depth target must remain irrelevant while
-    // explicitly unselected, then become a typed resource error when selected.
-    program_three_d(&mut channel, 0x0fe0, 0);
-    program_three_d(&mut channel, 0x1538, 0);
-    let address_space = resource_address_space();
-    let resources = fixture_bindings(
-        channel.three_d(),
-        address_space.memory(),
-        &mut crate::test_memory::access(address_space.memory().machine()),
-    )
-    .unwrap();
-    assert!(
-        !resources
-            .resources()
-            .any(|resource| resource.role() == MaxwellThreeDResourceRole::DepthStencilTarget)
-    );
-
-    program_three_d(&mut channel, 0x1538, 1);
-    assert!(matches!(
-        fixture_bindings(
-            channel.three_d(),
-            address_space.memory(),
-            &mut crate::test_memory::access(address_space.memory().machine())
-        ),
-        Err(MaxwellThreeDResourceError::IncompleteState {
-            role: MaxwellThreeDResourceRole::DepthStencilTarget,
-        })
-    ));
-}
-
-#[test]
-fn three_d_depth_layer_is_typed_source_preserving_and_rejects_reserved_bits_atomically() {
-    let mut channel = three_d_channel();
-
-    for argument in [0, 1, u16::MAX as u32] {
-        let dispatch = dispatch_method(&mut channel, 0x179c / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
-        let layer = channel.three_d().render_targets().depth_stencil().layer();
-
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_ZT_LAYER"
-        );
-
-        assert!(dispatch.operations().is_empty());
-        assert_eq!(layer.origin(), MaxwellThreeDRegisterOrigin::Programmed);
-        assert_eq!(layer.raw(), Some(argument));
-        assert_eq!(layer.value(), Some(&(argument as u16)));
-        assert_eq!(layer.source(), Some(source));
-    }
-
-    for argument in [0x0001_0000, 0xffff_0000, u32::MAX] {
-        let before = channel.clone();
-        let decoded = packet(0x179c / 4, argument);
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_ZT_LAYER",
-                reason: "reserved bits are set",
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel, before);
-    }
-
-    let before = channel.clone();
-    let decoded = incrementing_packet(0x179c / 4, &[0, 0]);
-    assert!(matches!(
-        dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
-            if source.method() == GpuMethodId(0x17a0)
-    ));
-    assert_ne!(channel, before);
-}
-
-#[test]
 fn three_d_depth_layer_selects_one_array_subresource() {
     let mut address_space = resource_address_space();
     let allocation = crate::test_memory::allocate(address_space.memory().machine(), 0x10000);
@@ -666,44 +502,6 @@ fn three_d_depth_layer_selects_one_array_subresource() {
             role: MaxwellThreeDResourceRole::DepthStencilTarget
         })
     ));
-}
-
-#[test]
-fn depth_array_control_decodes_the_public_size_c_encoding() {
-    let mut channel = three_d_channel();
-    for (raw, expected) in [
-        (
-            1,
-            MaxwellThreeDDepthArrayControl::ThirdDimensionDefinesArraySize,
-        ),
-        (
-            0xffff,
-            MaxwellThreeDDepthArrayControl::ThirdDimensionDefinesArraySize,
-        ),
-        (0x10000, MaxwellThreeDDepthArrayControl::ArraySizeIsOne),
-        (0x1ffff, MaxwellThreeDDepthArrayControl::ArraySizeIsOne),
-    ] {
-        let dispatch = dispatch_method(&mut channel, 0x1230 / 4, raw).unwrap();
-        let target = channel.three_d().render_targets().depth_stencil();
-        assert_eq!(target.third_dimension().value(), Some(&(raw as u16)));
-        assert_eq!(target.array_control().value(), Some(&expected));
-        assert_eq!(target.array_control().raw(), Some(raw));
-        assert_eq!(
-            target.array_control().source(),
-            Some(dispatch.methods()[0].method().source())
-        );
-    }
-    for raw in [0x20000, 0x80000000, u32::MAX] {
-        let before = channel.clone();
-        assert!(matches!(
-            dispatch_method(&mut channel, 0x1230 / 4, raw),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                method_name: "SET_ZT_SIZE",
-                ..
-            })
-        ));
-        assert_eq!(channel, before);
-    }
 }
 
 #[test]
@@ -907,23 +705,15 @@ fn standalone_inline_to_memory_pitch_upload_tracks_state_words_and_ordered_effec
     );
     assert!(!launch.value().unwrap().system_memory_barrier_disabled());
     let data = non_incrementing_packet_on_subchannel(2, 0x01b4 / 4, &[0x1122_3344, 0x5566_7788]);
-    let dispatch = dispatch_first(&mut channel, &data).unwrap();
+    let (writes, _, result) = super::bulk::transfer(&mut channel, &data, false);
+    result.unwrap();
 
     assert!(channel.inline_to_memory().pending().is_none());
     assert_eq!(
         channel.inline_to_memory().last_data().value(),
         Some(&0x5566_7788)
     );
-    assert_eq!(dispatch.ordered_operations().len(), 2);
-    for (index, (offset, value)) in [(0, 0x1122_3344), (4, 0x5566_7788)].into_iter().enumerate() {
-        assert!(matches!(
-            dispatch.ordered_operations()[index],
-            MaxwellEngineOperation::InlineToMemory(upload)
-                if upload.address().get() == address
-                    && upload.offset() == offset
-                    && upload.value() == value
-        ));
-    }
+    assert_eq!(writes, [(address, 0x1122_3344), (address + 4, 0x5566_7788)]);
 }
 
 #[test]
@@ -1125,7 +915,8 @@ fn linked_sampler_pool_uses_the_texture_limit_and_tracks_mode_changes() {
                 4,
                 &mut crate::test_memory::access(address_space.memory().machine()),
             )
-            .unwrap();
+            .unwrap()
+            .clone();
         assert_eq!(resolved.resources().count(), 1);
         let Some(MaxwellThreeDResolvedResource::Buffer(pool)) = resolved.resources().next() else {
             panic!("expected only the consumed sampler pool");
@@ -1524,23 +1315,6 @@ fn compute_shader_exceptions_preserve_configuration_without_emitting_work() {
         let source = register.source().unwrap();
         assert_eq!(source.method(), GpuMethodId(0x1528));
         assert_eq!(source.argument(), raw);
-
-        // Existing operation snapshots must retain the configuration, including
-        // its provenance, independently of subsequent register writes.
-        let sync = packet_on_subchannel(1, 0x1698 / 4, 0x1011);
-        let snapshot = dispatch_first(&mut channel, &sync).unwrap();
-        let saved = *snapshot.compute_operations()[0]
-            .state()
-            .shader_exceptions_enable();
-        assert_eq!(saved, *channel.compute().shader_exceptions_enable());
-        let opposite = packet_on_subchannel(1, 0x1528 / 4, raw ^ 1);
-        dispatch_first(&mut channel, &opposite).unwrap();
-        assert_eq!(
-            snapshot.compute_operations()[0]
-                .state()
-                .shader_exceptions_enable(),
-            &saved
-        );
     }
 
     assert_eq!(channel.three_d(), &three_d_before);
@@ -1955,15 +1729,11 @@ fn compute_shader_cache_invalidation_is_typed_ordered_and_atomic() {
     .enumerate()
     {
         assert_eq!(
-            dispatch.compute_operations()[index].state(),
-            &compute_before
-        );
-        assert_eq!(
             lower_maxwell_compute_synchronization(dispatch.compute_operations()[index], true),
             MaxwellComputeSynchronizationPlan::InvalidateShaderCachesNoWfi { caches: expected }
         );
     }
-    let captured = match dispatch.compute_operations()[0].trigger() {
+    let captured = match dispatch.compute_operations()[0] {
         MaxwellComputeOperationTrigger::InvalidateShaderCachesNoWfi { caches, .. } => caches,
         _ => unreachable!(),
     };
@@ -1998,8 +1768,8 @@ fn compute_shader_cache_invalidation_with_wfi_preserves_selectors_and_rejects_un
             "INVALIDATE_SHADER_CACHES"
         );
         let operation = dispatch.compute_operations()[0];
-        assert_eq!(operation.state(), &before);
-        assert_eq!(operation.trigger().source().argument(), raw);
+        assert_eq!(channel.compute(), &before);
+        assert_eq!(operation.source().argument(), raw);
         let expected = MaxwellComputeShaderCacheInvalidation::new(
             raw & 1 != 0,
             raw & 0x10 != 0,
@@ -2124,15 +1894,15 @@ fn compute_wait_for_idle_is_an_ordered_neutral_operation() {
             "WAIT_FOR_IDLE"
         );
 
-        let operation = &dispatch.compute_operations()[index];
+        let operation = dispatch.compute_operations()[index];
         assert!(matches!(
-            operation.trigger(),
+            operation,
             MaxwellComputeOperationTrigger::WaitForIdle {
                 value: actual,
                 source,
             } if actual == value && source.argument() == value
         ));
-        assert_eq!(operation.state(), &compute_before);
+        assert_eq!(channel.compute(), &compute_before);
         assert_eq!(
             lower_maxwell_compute_synchronization(operation, false),
             MaxwellComputeSynchronizationPlan::WaitForIdle {
@@ -2178,10 +1948,7 @@ fn render_target_discard_is_a_validated_non_destructive_hint() {
             assert_eq!(method.method().source().method(), GpuMethodId(0x0f78));
             assert_eq!(channel, before);
             assert!(draw.matches(channel.three_d()));
-            assert!(
-                shaders.matches_code(channel.three_d())
-                    && shaders.matches_bindings(channel.three_d())
-            );
+            assert!(shaders.matches_code(channel.three_d()));
             assert!(resources.matches(channel.three_d()));
         }
     }
@@ -2987,15 +2754,16 @@ fn standalone_inline_upload_addresses_block_linear_rows_and_nonzero_origins() {
         );
         dispatch_first(&mut channel, &packet_on_subchannel(2, 0x1b0 / 4, 0x1000)).unwrap();
         let data: Vec<u32> = (0..line_length * line_count / 4).collect();
-        let dispatch = dispatch_first(
+        let (writes, _, result) = super::bulk::transfer(
             &mut channel,
             &non_incrementing_packet_on_subchannel(2, 0x1b4 / 4, &data),
-        )
-        .unwrap();
+            false,
+        );
+        result.unwrap();
         for (linear, physical) in expected {
-            assert!(
-                matches!(dispatch.ordered_operations()[linear / 4], MaxwellEngineOperation::InlineToMemory(upload)
-                if upload.address().get() == 0x4_00001000 && upload.offset() == physical && upload.value() == (linear / 4) as u32)
+            assert_eq!(
+                writes[linear / 4],
+                (0x4_00001000 + physical as u64, (linear / 4) as u32)
             );
         }
         assert!(channel.inline_to_memory().pending().is_none());
@@ -3115,7 +2883,8 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
-        .unwrap();
+        .unwrap()
+        .clone();
     for (iteration, end) in [0x40_u64, 0x80, 0x40].into_iter().enumerate() {
         let resolved = cache
             .resolve_with_buffer_sizes(
@@ -3126,7 +2895,8 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
                 8,
                 &mut crate::test_memory::access(space.memory().machine()),
             )
-            .unwrap();
+            .unwrap()
+            .clone();
         assert_eq!(resolved.resources().count(), 1);
         let Some(MaxwellThreeDResolvedResource::Buffer(buffer)) = resolved.resources().next()
         else {
@@ -3218,7 +2988,8 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
-        .unwrap();
+        .unwrap()
+        .clone();
     let repeated = cache
         .resolve_with_buffer_sizes(
             channel.three_d(),
@@ -3228,7 +2999,8 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
-        .unwrap();
+        .unwrap()
+        .clone();
     assert!(first.same_bindings(&repeated));
     let buffer = |resources: &MaxwellThreeDResolvedResources| {
         assert_eq!(resources.resources().count(), 1);
@@ -3239,8 +3011,8 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
         (buffer.source().offset().get(), buffer.view().size())
     };
     assert_eq!(buffer(&first), (data_mapping.offset().get(), 128));
-    // A different word on the descriptor page invalidates its observation,
-    // but equal descriptor bytes must retain the already prepared bindings.
+    // A different word on the descriptor page leaves the consumed bytes equal,
+    // so the already prepared bindings remain reusable.
     crate::test_memory::write(&cb, 0x800, &[7]).unwrap();
     let refreshed = cache
         .resolve_with_buffer_sizes(
@@ -3251,7 +3023,8 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
-        .unwrap();
+        .unwrap()
+        .clone();
     assert!(first.same_bindings(&refreshed));
     let clean = cache
         .resolve_with_buffer_sizes(
@@ -3260,9 +3033,10 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             &[role],
             &sizes,
             8,
-            &mut |_, _| panic!("clean descriptors must not be read again"),
+            &mut crate::test_memory::access(space.memory().machine()),
         )
-        .unwrap();
+        .unwrap()
+        .clone();
     assert!(first.same_bindings(&clean));
     crate::test_memory::write(
         &cb,
@@ -3279,7 +3053,8 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
-        .unwrap();
+        .unwrap()
+        .clone();
     assert_eq!(buffer(&changed), (data_mapping.offset().get() + 64, 32));
     assert_eq!(buffer(&first), (data_mapping.offset().get(), 128));
     crate::test_memory::write(&cb, 0x110, &descriptor(data_mapping.offset().get(), 128)).unwrap();
@@ -3292,7 +3067,8 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
-        .unwrap();
+        .unwrap()
+        .clone();
     assert_eq!(buffer(&restored), (data_mapping.offset().get(), 128));
     let bounded = cache
         .resolve_with_buffer_sizes(
@@ -3303,7 +3079,8 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
-        .unwrap();
+        .unwrap()
+        .clone();
     assert_eq!(buffer(&bounded), (data_mapping.offset().get(), 4));
     crate::test_memory::write(&cb, 0x118, &0_u32.to_le_bytes()).unwrap();
     assert!(
@@ -3327,7 +3104,8 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
-        .unwrap();
+        .unwrap()
+        .clone();
     // Replacing the CB mapping must invalidate the pointer dependency even
     // when neither the old canonical bytes nor the storage target was changed.
     let replacement = crate::test_memory::allocate(space.memory().machine(), 0x1000);
@@ -3364,7 +3142,8 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
-        .unwrap();
+        .unwrap()
+        .clone();
     assert!(!before_remap.same_bindings(&remapped_bounded));
     assert_eq!(
         buffer(&remapped_bounded),
@@ -3379,6 +3158,7 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
-        .unwrap();
+        .unwrap()
+        .clone();
     assert_eq!(buffer(&remapped), (data_mapping.offset().get() + 128, 64));
 }

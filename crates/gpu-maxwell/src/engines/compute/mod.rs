@@ -12,8 +12,8 @@ pub use launch::{MaxwellComputeLaunch, MaxwellComputeLaunchError, MaxwellResolve
 
 pub use operations::{
     MaxwellComputeOperationTrigger, MaxwellComputeShaderCacheInvalidation,
-    MaxwellComputeSynchronizationPlan, MaxwellComputeTriggeredOperation,
-    MaxwellShaderCacheInvalidation, lower_maxwell_compute_synchronization,
+    MaxwellComputeSynchronizationPlan, MaxwellShaderCacheInvalidation,
+    lower_maxwell_compute_synchronization,
 };
 
 pub use state::{

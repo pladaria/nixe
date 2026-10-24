@@ -53,9 +53,9 @@ pub use engines::{
     MaxwellComputeOperationTrigger, MaxwellComputeProgramState, MaxwellComputeRegister,
     MaxwellComputeRegisterOrigin, MaxwellComputeShaderCacheInvalidation, MaxwellComputeSmCount,
     MaxwellComputeSpaVersion, MaxwellComputeState, MaxwellComputeSynchronizationPlan,
-    MaxwellComputeTriggeredOperation, MaxwellDmaCopyRegister, MaxwellDmaCopyRegisterName,
-    MaxwellDmaCopyState, MaxwellEngineCapability, MaxwellEngineDispatchError,
-    MaxwellEngineMethodMetadata, MaxwellInlineToMemoryAddress, MaxwellInlineToMemoryLaunch,
+    MaxwellDmaCopyRegister, MaxwellDmaCopyRegisterName, MaxwellDmaCopyState,
+    MaxwellEngineCapability, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata,
+    MaxwellInlineToMemoryAddress, MaxwellInlineToMemoryLaunch,
     MaxwellInlineToMemoryPendingTransfer, MaxwellInlineToMemoryRegister,
     MaxwellInlineToMemorySemaphoreStructureSize, MaxwellInlineToMemoryState,
     MaxwellInlineToMemoryUpload, MaxwellLoweringError, MaxwellMemoryCopyComponentSource,
@@ -170,23 +170,17 @@ pub use engines::{
     MaxwellTwoDRenderEnableMode, MaxwellTwoDRenderEnableState, MaxwellTwoDState,
     lower_maxwell_compute_synchronization, lower_maxwell_three_d_synchronization,
 };
-pub use execution::{
-    MaxwellBackendExecution, MaxwellBackendExecutionError, MaxwellCanonicalExecutionError,
-    MaxwellSubmissionExecutionError, MaxwellSubmissionExecutionPlan,
-    MaxwellSubmissionExecutionStep,
-};
+pub use execution::{MaxwellCanonicalExecutionError, MaxwellSubmissionExecutionError};
 
 pub use frontend::{
     MaxwellCommandSourceScratch, MaxwellFrontendDispatchError, stream_maxwell_frontend,
 };
 pub use gpfifo::{
-    MAXWELL_GPFIFO_CAPTURE_SOURCES, MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellDecodedGpfifoSubmission,
-    MaxwellGpfifoCapture, MaxwellGpfifoCaptureSource, MaxwellGpfifoDecodeError, MaxwellGpfifoEntry,
-    MaxwellGpfifoFetchMode, MaxwellGpfifoLevel, MaxwellGpfifoSourceError,
+    MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellDecodedGpfifoSubmission, MaxwellGpfifoDecodeError,
+    MaxwellGpfifoEntry, MaxwellGpfifoFetchMode, MaxwellGpfifoLevel, MaxwellGpfifoSourceError,
     MaxwellGpfifoSourceLocation, MaxwellGpfifoSubmissionMode, MaxwellGpfifoSubmitRequest,
-    MaxwellGpfifoSyncMode, MaxwellInvalidGpfifoSubmission, MaxwellRetainedPushbuffer,
-    MaxwellUnsupportedGpfifoSubmission, MaxwellValidatedGpfifoSubmission, decode_gpfifo_submission,
-    resolve_gpfifo_submission,
+    MaxwellGpfifoSyncMode, MaxwellInvalidGpfifoSubmission, MaxwellUnsupportedGpfifoSubmission,
+    MaxwellValidatedGpfifoSubmission, decode_gpfifo_submission, validate_gpfifo_submission,
 };
 pub use profile::{
     AddressBitCount, ChipName, GpuArchitecture, GpuBusType, GpuFeatureFlags, GpuImplementation,
@@ -205,10 +199,9 @@ pub use pushbuffer::dispatch::{
     MaxwellSetObjectTransition,
 };
 pub use pushbuffer::packet::{
-    MaxwellDecodedMethod, MaxwellDecodedMethodPacket, MaxwellDecodedPacket,
-    MaxwellDecodedPushbuffer, MaxwellMethodIterator, MaxwellMethodPacketMode, MaxwellMethodSpan,
-    MaxwellPushbufferControl, MaxwellPushbufferDecodeError, MaxwellPushbufferSubchannel,
-    MaxwellPushbufferWord, decode_maxwell_pushbuffer, decode_maxwell_submission,
+    MaxwellDecodedMethod, MaxwellDecodedMethodPacket, MaxwellMethodIterator,
+    MaxwellMethodPacketMode, MaxwellMethodSpan, MaxwellPushbufferControl,
+    MaxwellPushbufferDecodeError, MaxwellPushbufferSubchannel, MaxwellPushbufferWord,
 };
 pub use scheduler::{
     MaxwellFrontendDispatch, MaxwellFrontendDispatchBoundary, MaxwellScheduleError,
@@ -216,10 +209,7 @@ pub use scheduler::{
     MaxwellSubmissionOrderingStage,
 };
 
-pub use execution::{MaxwellFrontend, MaxwellWork, MaxwellWorkBatch, MaxwellWorkSegment};
-
-pub type MaxwellWorkCommands<W> =
-    <<<W as MaxwellWork>::Batch as MaxwellWorkBatch<W>>::Segment as MaxwellWorkSegment>::Commands;
+pub use execution::{MaxwellCommandHost, MaxwellFrontend};
 
 pub use engines::{
     MaxwellNativeFrontend, MaxwellResolvedComputeLaunch, MaxwellTwoDSolidOperation,
@@ -230,3 +220,9 @@ pub use shader::recompiler;
 
 #[cfg(test)]
 mod test_memory;
+
+#[cfg(test)]
+pub use pushbuffer::packet::decode_maxwell_pushbuffer;
+
+#[cfg(test)]
+use pushbuffer::packet::{MaxwellDecodedPacket, MaxwellDecodedPushbuffer};

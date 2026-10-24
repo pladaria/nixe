@@ -28,7 +28,6 @@ pub(super) fn select_present_mode(
 
 /// Native scheduling synchronization crosses the owner boundary without guest reads.
 struct Context {
-    recording: crate::dispatch::RecordingHandle,
     progress: Arc<crate::queue::progress::SubmissionProgress>,
     owner: Arc<DeviceOwner>,
     queues: crate::device::QueueSelection,
@@ -43,9 +42,9 @@ impl Context {
             .map_err(|e| VulkanError::vk("WSI graphics completion", e))
     }
     fn drain(&self, work: WorkTicket) -> Result<(), VulkanError> {
-        // Only teardown drains the worker. A failed/canceled queued tick is
-        // never a native use, but an earlier accepted tick still needs retiring.
-        let _ = self.recording.finish();
+        // The owner publishes complete work before handing out this ticket.
+        // Wait for the native worker to accept it before querying the timeline.
+        let _ = self.progress.wait_submitted(work.tick(), None);
         if self
             .progress
             .failure()
@@ -649,7 +648,6 @@ impl Presenter {
             return Err(error);
         }
         let context = Context {
-            recording: device.dispatch.recording_handle(),
             progress: Arc::clone(&device.submission.progress),
             owner: Arc::clone(&device.owner),
             queues: crate::device::QueueSelection {

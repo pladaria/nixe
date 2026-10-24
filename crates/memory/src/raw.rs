@@ -119,6 +119,22 @@ unsafe fn words(source: *const u8, destination: *mut u8, count: usize) {
         asm!("2:", "ldr {value}, [{source}], #8", "str {value}, [{destination}], #8", "subs {count}, {count}, #1", "b.ne 2b", source=inout(reg) source=>_, destination=inout(reg) destination=>_, count=inout(reg) count=>_, value=out(reg) _, options(nostack));
     }
 }
+/// Copy disjoint live RAM without creating Rust references to either range.
+///
+/// # Safety
+/// Both ranges are retained and admitted; source coherence and destination
+/// tracking are resolved. The byte ranges must not overlap.
+pub(crate) unsafe fn copy(source: *const u8, destination: *mut u8, bytes: usize) {
+    let count = bytes / 8;
+    unsafe {
+        words(source, destination, count);
+    }
+    for offset in count * 8..bytes {
+        unsafe {
+            store(destination.add(offset), load(source.add(offset), 1), 1);
+        }
+    }
+}
 /// # Safety
 /// The source is admitted guest RAM with stable physical lifetime. Destination
 /// is exclusively owned host memory, disjoint from the guest backing.

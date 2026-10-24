@@ -34,18 +34,18 @@ unsafe impl GlobalAlloc for CountAllocations {
 fn run(
     channel: &mut MaxwellGpuChannel,
     packet: &MaxwellDecodedPushbuffer,
-    mme: &mut Vec<MaxwellMethodDispatch>,
+    mme: &mut Option<MaxwellMethodDispatch>,
     parameters: &mut Vec<u32>,
 ) {
-    stream_maxwell_engine_packet(
+    crate::test_memory::ready(stream_maxwell_engine_packet(
         channel,
         FrontendSubmissionId::new(3),
-        &packet.packets()[0],
+        packet.packets()[0].view(),
         None,
         mme,
         parameters,
-        &mut |_| Ok::<_, std::convert::Infallible>(()),
-    )
+        &mut async |_| Ok::<_, std::convert::Infallible>(()),
+    ))
     .unwrap_or_else(|_| panic!("benchmark dispatch failed"));
 }
 #[test]
@@ -53,7 +53,7 @@ fn ordinary_register_admission_allocates_nothing_with_a_retained_snapshot() {
     let mut channel = three_d_channel();
     let snapshot = channel.three_d().clone();
     let packets = [packet(0x2380 / 4, 32), packet(0x2380 / 4, 64)];
-    let mut mme = Vec::new();
+    let mut mme = None;
     let mut parameters = Vec::new();
     ALLOCATIONS.with(|n| n.set(Some(0)));
     for i in 0..1000 {
@@ -90,7 +90,7 @@ fn register_dispatch_throughput() {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100000);
     let mut channel = three_d_channel();
-    let mut mme = Vec::new();
+    let mut mme = None;
     let mut parameters = Vec::new();
     let values: Vec<_> = (0..64)
         .map(|i| {

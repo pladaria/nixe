@@ -38,13 +38,7 @@ impl Hash for ImageKey {
         self.encoding.hash(state);
         self.description.hash(state);
         self.canonical_texels.hash(state);
-        self.view.swizzle().hash(state);
-        self.view.bindings().len().hash(state);
-        for binding in self.view.bindings() {
-            binding.subresources().hash(state);
-            binding.layout().hash(state);
-            binding.backing().mapping().hash(state);
-        }
+        self.view.binding_fingerprint().hash(state);
     }
 }
 
@@ -89,11 +83,16 @@ impl Hash for ProgramKey {
                 GuestBinding::NullBuffer => (),
                 GuestBinding::Buffer(b) => b.hash(state),
                 GuestBinding::Image { image, arrayed } => {
-                    image.planes.hash(state);
-                    image.description.hash(state);
-                    image.swizzle.hash(state);
-                    image.sample_grid.hash(state);
-                    image.canonical_texels.hash(state);
+                    image.view_identity.is_some().hash(state);
+                    if let Some(identity) = image.view_identity {
+                        identity.hash(state);
+                    } else {
+                        image.planes.hash(state);
+                        image.description.hash(state);
+                        image.swizzle.hash(state);
+                        image.sample_grid.hash(state);
+                        image.canonical_texels.hash(state);
+                    }
                     arrayed.hash(state);
                 }
                 GuestBinding::Sampler(s) => {
@@ -332,12 +331,6 @@ mod tests {
         };
         let mut cache = nixe_gpu::WorkingSet::new(4, 4096);
         cache.insert(a.clone(), 7, 512);
-        println!(
-            "AUDIT equal_keys={} equal_hashes={} cache_hit={}",
-            a == b,
-            hash(&a) == hash(&b),
-            cache.get(&b).is_some()
-        );
         assert_eq!(hash(&a), hash(&b));
         assert_eq!(cache.get(&b), Some(&7));
     }

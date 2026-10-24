@@ -22,17 +22,6 @@ pub fn write(allocation: &Allocation, offset: u64, bytes: &[u8]) -> Result<(), M
         .machine()
         .write_resolved(std::slice::from_ref(&range), bytes)
 }
-pub fn read(allocation: &Allocation, offset: u64, bytes: &mut [u8]) -> Result<(), MemoryError> {
-    let range = AllocationRange::new(allocation.pin(), offset, bytes.len() as u64)?;
-    let captured = nixe_memory::CapturedMemory::from(range);
-    captured[0]
-        .allocation()
-        .machine()
-        .read_captured_into(&captured, 0, bytes)?
-        .into_ready()
-        .expect("RAM fixture read cannot park");
-    Ok(())
-}
 pub fn access(
     machine: &Machine,
 ) -> impl FnMut(
@@ -60,4 +49,16 @@ pub fn apply(
     memory
         .apply_resolved_access(&ranges, &operation)
         .map_err(std::sync::Arc::new)
+}
+
+/// Run a real command future whose fixture has no external dependency.
+pub(crate) fn ready<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    match future
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    {
+        std::task::Poll::Ready(value) => value,
+        std::task::Poll::Pending => panic!("fixture unexpectedly suspended"),
+    }
 }

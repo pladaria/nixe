@@ -22,6 +22,12 @@ pub type MemoryAccess<'a> = dyn FnMut(
     ) -> Result<AccessResult, Arc<nixe_memory::MemoryError>>
     + 'a;
 
+/// A direct owner operation either completes in RAM or retains one exact device demand.
+pub enum OwnerAccess {
+    Ready(AccessResult),
+    Pending(nixe_memory::PendingAccess),
+}
+
 /// Frontend-owned identity of an immutable prepared state revision.
 ///
 /// Slots may be reused only with a new revision. IDs are scoped to the execution
@@ -47,16 +53,6 @@ impl PreparedStateId {
     }
 }
 
-/// One ordered batch borrowing its immutable frontend-owned data.
-///
-/// Acceptance must capture input snapshots and retain canonical ranges needed
-/// by asynchronous execution. A successful return is not guest completion.
-/// Resource ownership remains with the native command inputs and GPU owner.
-#[derive(Clone, Copy)]
-pub struct ExecutionBatch<'a, C> {
-    pub commands: &'a C,
-}
-
 /// Interface consumed by Horizon's statically instantiated owner loop.
 ///
 /// Access descriptions express guest effects in operation order. Canonical CPU
@@ -73,9 +69,6 @@ pub trait GpuExecution: Send + 'static {
     ) -> Result<(), BackendRuntimeError> {
         Ok(())
     }
-    fn service_host(&mut self) -> Result<(), BackendRuntimeError> {
-        Ok(())
-    }
     /// Submit a required progress point and arrange a wakeup on completion.
     /// The owner polls before registration. If native work completes in that
     /// interval, invoke the bound wakeup immediately rather than losing it.
@@ -83,34 +76,18 @@ pub trait GpuExecution: Send + 'static {
     fn request_completion_wakeup(&mut self) -> Result<(), BackendRuntimeError> {
         Ok(())
     }
-    /// Complete preceding native work before fetching a SYNC_WAIT command source.
-    fn synchronize_command_sources(&mut self) -> Result<(), BackendRuntimeError> {
-        Err(BackendRuntimeError::Backend(
-            "command-source synchronization requires an accelerated backend".into(),
-        ))
-    }
     fn external_image_device(&self) -> Option<[u8; 16]> {
         None
     }
-    /// Poll cold preparation without waiting on compiler workers. No input
-    /// acceptance or guest completion occurs until this returns true.
-    fn prepare(
-        &mut self,
-        _batch: ExecutionBatch<'_, Self::Commands>,
-    ) -> Result<bool, BackendRuntimeError> {
-        Ok(true)
-    }
-    /// Record an ordered prefix and retain its native resources without creating
-    /// a host completion notification. Visibility demands still address the real
-    /// device producer. The delivery's final submit owns its completion ticket.
-    fn record(
-        &mut self,
-        batch: ExecutionBatch<'_, Self::Commands>,
-    ) -> Result<(), BackendRuntimeError>;
+    /// Consume one ordered effect. False means a compiler dependency is pending:
+    /// no guest effect has executed, and the caller may retry after a wake.
+    /// True means resources were consumed and native work was recorded once.
+    fn consume(&mut self, command: &Self::Commands) -> Result<bool, BackendRuntimeError>;
     fn submit(
         &mut self,
-        batch: ExecutionBatch<'_, Self::Commands>,
+        frontend: crate::FrontendSubmissionId,
     ) -> Result<BackendSubmissionToken, BackendRuntimeError>;
+    /// Poll the ready logical prefix after progress; does not repeat maintenance.
     fn poll_completion(
         &mut self,
     ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError>;
@@ -119,7 +96,15 @@ pub trait GpuExecution: Send + 'static {
         &mut self,
         ranges: Vec<AllocationRange>,
         operation: AccessOperation,
-    ) -> Result<AccessResult, BackendRuntimeError>;
+    ) -> Result<OwnerAccess, BackendRuntimeError>;
+    /// Notify an already applied owner write while its original mappings are held.
+    /// # Safety
+    /// The caller holds the original mappings through this synchronous update.
+    unsafe fn memory_written(
+        &mut self,
+        machine: nixe_memory::MachineId,
+        extents: &[(nixe_memory::AllocationId, nixe_memory::Extent)],
+    ) -> Result<(), BackendRuntimeError>;
     /// External operations own their exact inputs and their sole completion.
     fn queue_device_access(
         &mut self,
@@ -127,7 +112,9 @@ pub trait GpuExecution: Send + 'static {
     ) -> Result<(), BackendRuntimeError>;
     fn cancel_device_access(&mut self, request: AccessRequestId)
     -> Result<(), BackendRuntimeError>;
-    fn progress_device_accesses(&mut self) -> Result<(), BackendRuntimeError>;
+    /// Consume CPU invalidations, progress physical requests and service the host
+    /// once at an owner control boundary, before polling logical completions.
+    fn progress(&mut self) -> Result<(), BackendRuntimeError>;
     fn fail_device_accesses(&mut self, cause: Arc<nixe_memory::MemoryError>);
     fn retire_physical_memory(
         &mut self,
@@ -156,17 +143,14 @@ pub trait GpuExecution: Send + 'static {
 // An absent renderer has no constructible execution value. Loader/service-only
 // sessions can retain a typed None without linking any renderer implementation.
 impl GpuExecution for std::convert::Infallible {
-    type Commands = crate::native::NativeSubmission;
+    type Commands = crate::native::NativeWork;
     type ImageRequest = crate::native::NativePresentationImage;
-    fn record(
-        &mut self,
-        _batch: ExecutionBatch<'_, Self::Commands>,
-    ) -> Result<(), BackendRuntimeError> {
+    fn consume(&mut self, _batch: &Self::Commands) -> Result<bool, BackendRuntimeError> {
         match *self {}
     }
     fn submit(
         &mut self,
-        _batch: ExecutionBatch<'_, Self::Commands>,
+        _frontend: crate::FrontendSubmissionId,
     ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
         match *self {}
     }
@@ -179,7 +163,15 @@ impl GpuExecution for std::convert::Infallible {
         &mut self,
         _: Vec<AllocationRange>,
         _: AccessOperation,
-    ) -> Result<AccessResult, BackendRuntimeError> {
+    ) -> Result<OwnerAccess, BackendRuntimeError> {
+        match *self {}
+    }
+    /// Notify an already applied owner write while its original mappings are held.
+    unsafe fn memory_written(
+        &mut self,
+        _machine: nixe_memory::MachineId,
+        _extents: &[(nixe_memory::AllocationId, nixe_memory::Extent)],
+    ) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
     fn queue_device_access(&mut self, _: DeviceAccessRequest) -> Result<(), BackendRuntimeError> {
@@ -188,7 +180,7 @@ impl GpuExecution for std::convert::Infallible {
     fn cancel_device_access(&mut self, _: AccessRequestId) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
-    fn progress_device_accesses(&mut self) -> Result<(), BackendRuntimeError> {
+    fn progress(&mut self) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
     fn fail_device_accesses(&mut self, _: Arc<nixe_memory::MemoryError>) {

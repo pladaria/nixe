@@ -8,7 +8,6 @@ use super::{
     MaxwellComputeInlineToMemoryPendingTransfer, MaxwellComputeInlineToMemoryUpload,
     MaxwellComputeOperationTrigger, MaxwellComputeShaderCacheInvalidation, MaxwellComputeSmCount,
     MaxwellComputeSpaVersion, MaxwellComputeState, MaxwellComputeStateWrite,
-    MaxwellComputeTriggeredOperation,
 };
 use crate::engines::{
     AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation,
@@ -212,9 +211,7 @@ pub(super) fn preflight(
         return Ok(AppliedMethod::new(
             method,
             *declaration.metadata,
-            Some(PendingEngineOperation::ComputeSynchronization(
-                synchronization_snapshot(trigger, candidate),
-            )),
+            Some(PendingEngineOperation::ComputeSynchronization(trigger)),
         ));
     }
     if matches!(declaration.action, MethodAction::InlineToMemoryData) {
@@ -446,19 +443,6 @@ pub(super) fn preflight(
     };
     candidate.apply(write);
     Ok(AppliedMethod::new(method, *declaration.metadata, None))
-}
-
-// Keep the large compute snapshot off the common method dispatch stack. It is
-// needed only by compute synchronization, not by ordinary 3D register writes.
-#[inline(never)]
-fn synchronization_snapshot(
-    trigger: MaxwellComputeOperationTrigger,
-    state: &MaxwellComputeState,
-) -> Box<MaxwellComputeTriggeredOperation> {
-    Box::new(MaxwellComputeTriggeredOperation::new(
-        trigger,
-        state.clone(),
-    ))
 }
 
 fn invalid_encoding(

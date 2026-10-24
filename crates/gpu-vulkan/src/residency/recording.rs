@@ -154,7 +154,12 @@ impl VulkanResidency {
         alignment: u64,
     ) -> Result<(usize, crate::queue::Slice), VulkanError> {
         loop {
-            match self.device.submission.reserve_slice(size, true, alignment) {
+            match self.device.submission.reserve_slice(
+                &mut self.device.dispatch,
+                size,
+                true,
+                alignment,
+            ) {
                 Ok(reservation) => return Ok(reservation),
                 Err(error @ VulkanError::QueuePressure { pending, .. }) => {
                     let flushed = self.flush()?;
@@ -554,7 +559,7 @@ impl VulkanResidency {
                 });
                 packed += length;
             }
-            host_read_barrier(&self.device, command, target, slice.offset, bytes);
+            host_read_barrier(&mut self.device, command, target, slice.offset, bytes);
             self.enqueue_cpu_transfer(
                 request,
                 Transfer {
@@ -705,7 +710,7 @@ impl VulkanResidency {
                         .cmd_copy_image_to_buffer(command, image, layout, buffer, &regions);
                 }
             }
-            host_read_barrier(&self.device, command, buffer, slice.offset, bytes);
+            host_read_barrier(&mut self.device, command, buffer, slice.offset, bytes);
             let mut copies = Vec::new();
             let mut windows = Vec::new();
             for (offset, (key, piece, scatter)) in batch {
@@ -784,7 +789,7 @@ impl VulkanResidency {
 
 pub(super) use crate::transfer::host_read_barrier;
 pub(super) fn scratch_read_barrier(
-    device: &VulkanDevice,
+    device: &mut VulkanDevice,
     command: vk::CommandBuffer,
     buffer: vk::Buffer,
     size: u64,
@@ -928,7 +933,7 @@ impl VulkanResidency {
                         scratch.handle,
                         &packed,
                     );
-                    scratch_read_barrier(&self.device, command, scratch.handle, scratch_bytes);
+                    scratch_read_barrier(&mut self.device, command, scratch.handle, scratch_bytes);
                 }
                 self.statistics.gpu_copied_bytes += scratch_bytes;
             }

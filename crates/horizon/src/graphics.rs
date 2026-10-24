@@ -270,8 +270,8 @@ impl VideoSystem {
     where
         L: nixe_gpu_maxwell::MaxwellFrontend,
         E: nixe_gpu::GpuExecution<
-                Commands = nixe_gpu_maxwell::MaxwellWorkCommands<L::Work>,
-                ImageRequest = <L::Work as nixe_gpu_maxwell::MaxwellWork>::ImageRequest,
+                Commands = nixe_gpu::native::NativeWork,
+                ImageRequest = nixe_gpu::native::NativePresentationImage,
             >,
     {
         Self::with_nvdrv(
@@ -1838,17 +1838,14 @@ mod tests {
     }
 
     impl nixe_gpu::GpuExecution for ResidentTestRuntime {
-        type Commands = nixe_gpu::native::NativeSubmission;
+        type Commands = nixe_gpu::native::NativeWork;
         type ImageRequest = nixe_gpu::native::NativePresentationImage;
-        fn record(
-            &mut self,
-            _batch: nixe_gpu::ExecutionBatch<'_, Self::Commands>,
-        ) -> Result<(), BackendRuntimeError> {
+        fn consume(&mut self, _batch: &Self::Commands) -> Result<bool, BackendRuntimeError> {
             unreachable!("resident presentation fixture records no GPU work")
         }
         fn submit(
             &mut self,
-            _batch: nixe_gpu::ExecutionBatch<'_, Self::Commands>,
+            _frontend: nixe_gpu::FrontendSubmissionId,
         ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
             unreachable!("resident presentation fixture submits no GPU work")
         }
@@ -1862,8 +1859,15 @@ mod tests {
             &mut self,
             _: Vec<nixe_memory::AllocationRange>,
             _: nixe_memory::AccessOperation,
-        ) -> Result<nixe_memory::AccessResult, BackendRuntimeError> {
+        ) -> Result<nixe_gpu::OwnerAccess, BackendRuntimeError> {
             unreachable!("presentation fixture consumes no guest memory")
+        }
+        unsafe fn memory_written(
+            &mut self,
+            _: nixe_memory::MachineId,
+            _: &[(nixe_memory::AllocationId, nixe_memory::Extent)],
+        ) -> Result<(), BackendRuntimeError> {
+            unreachable!("fixture does not produce native memory")
         }
         fn queue_device_access(
             &mut self,
@@ -1877,7 +1881,7 @@ mod tests {
         ) -> Result<(), BackendRuntimeError> {
             unreachable!("presentation fixture has no pending access")
         }
-        fn progress_device_accesses(&mut self) -> Result<(), BackendRuntimeError> {
+        fn progress(&mut self) -> Result<(), BackendRuntimeError> {
             Ok(())
         }
         fn fail_device_accesses(&mut self, _: Arc<nixe_memory::MemoryError>) {}

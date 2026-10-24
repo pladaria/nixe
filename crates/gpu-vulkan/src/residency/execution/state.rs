@@ -208,7 +208,7 @@ impl VulkanResidency {
         }
         self.device.submission.statistics.graphics_updates += 1;
         let p = &graphics.parameters;
-        let raw = &self.device.dispatch;
+        let raw = &mut self.device.dispatch;
         let command = slot.command;
         unsafe {
             raw.cmd_set_viewport(command, 0, &p.viewports);

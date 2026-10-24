@@ -37,7 +37,9 @@ pub use machine::{
 };
 
 pub use reservation::{DeviceWriteEpoch, NativeReservation, Reservation};
-pub use tracking::{Observation, PhysicalCapture, TrackingStatistics};
+pub use tracking::{
+    MappedRamReader, Observation, PhysicalCapture, TrackingStatistics, WriteSource,
+};
 pub use transition::{CodeInvalidation, CoreContext, NativeAdmission};
 pub use virtual_arena::{AddressWidth, MemoryPermissions, VirtualArena};
 

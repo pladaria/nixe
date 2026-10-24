@@ -176,7 +176,7 @@ fn descriptor_pressure(api: ApiPreference) {
     let work = unsafe {
         device
             .submission
-            .flush(device.queue, &device.dispatch, &waits, &[])
+            .flush(device.queue, &mut device.dispatch, &waits, &[])
     }
     .unwrap()
     .unwrap();

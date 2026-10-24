@@ -206,8 +206,8 @@ use mme::{MaxwellThreeDMmeHost, MaxwellThreeDMmeRunError};
 
 use super::{
     AppliedMethod, MaxwellEngineCapability, MaxwellEngineDispatchError,
-    MaxwellEngineMethodDispatch, MaxwellEngineMethodMetadata, MaxwellInlineToMemoryUpload,
-    MaxwellShaderCacheInvalidation, PendingEngineOperation,
+    MaxwellEngineMethodMetadata, MaxwellInlineToMemoryUpload, MaxwellShaderCacheInvalidation,
+    PendingEngineOperation,
 };
 use crate::{
     MaxwellAamVersion, MaxwellAamVersionRange, MaxwellGpuProfile, MaxwellMethodDispatch,
@@ -1193,48 +1193,18 @@ impl<E> MaxwellThreeDMmePreflightError<E> {
     }
 }
 
-pub(super) fn preflight_mme_call<E>(
+pub(super) async fn preflight_mme_call<E>(
     profile: &MaxwellGpuProfile,
-    methods: &[MaxwellMethodDispatch],
-    parameters: &mut Vec<u32>,
+    source: crate::MaxwellMethodSource,
+    parameters: &[u32],
     candidate: &mut MaxwellThreeDFrontendState,
-    observed_methods: Option<&mut Vec<MaxwellEngineMethodDispatch>>,
-    consume: &mut impl FnMut(
+    consume: &mut impl AsyncFnMut(
         PendingEngineOperation,
         &MaxwellThreeDState,
         Option<(u32, u32)>,
     ) -> Result<(), E>,
 ) -> Result<(), MaxwellThreeDMmePreflightError<E>> {
-    let first = methods[0];
-    let source = first.source();
-    let offset = source.method().0 - 0x3800;
-    if offset & 7 != 0 {
-        return Err(MaxwellThreeDMmePreflightError::dispatch(
-            MaxwellEngineDispatchError::MmeExecution {
-                source,
-                error: MaxwellThreeDMmeExecutionError::DataWithoutCall,
-            },
-        ));
-    }
-    let data_method = source.method().0 + 4;
-    if methods.iter().skip(1).any(|method| {
-        let current = method.source().method().0;
-        current != source.method().0 && current != data_method
-    }) {
-        return Err(MaxwellThreeDMmePreflightError::dispatch(
-            MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "CALL_MME_MACRO",
-                reason: "macro parameters target a different indexed aperture",
-            },
-        ));
-    }
-    let macro_index = (offset / 8) as u8;
-    parameters.clear();
-    parameters.try_reserve(methods.len()).map_err(|_| {
-        MaxwellThreeDMmePreflightError::dispatch(MaxwellEngineDispatchError::ResourceExhausted)
-    })?;
-    parameters.extend(methods.iter().map(|method| method.source().argument()));
+    let macro_index = ((source.method().0 - 0x3800) / 8) as u8;
     let program = candidate.mme().program();
 
     {
@@ -1245,7 +1215,7 @@ pub(super) fn preflight_mme_call<E>(
             consume,
             _error: std::marker::PhantomData,
         };
-        match program.execute(macro_index, parameters, &mut host) {
+        match program.execute(macro_index, parameters, &mut host).await {
             Ok(()) => {}
             Err(MaxwellThreeDMmeRunError::Execution(error)) => {
                 return Err(MaxwellThreeDMmePreflightError::dispatch(
@@ -1255,26 +1225,11 @@ pub(super) fn preflight_mme_call<E>(
             Err(MaxwellThreeDMmeRunError::Host(error)) => return Err(error),
         };
     }
-    if let Some(observed_methods) = observed_methods {
-        observed_methods.try_reserve(methods.len()).map_err(|_| {
-            MaxwellThreeDMmePreflightError::dispatch(MaxwellEngineDispatchError::ResourceExhausted)
-        })?;
-        for (index, method) in methods.iter().copied().enumerate() {
-            let source = method.source();
-            let metadata = MaxwellEngineMethodMetadata::new(
-                CLASS,
-                CLASS_NAME,
-                source.method(),
-                if index == 0 {
-                    "CALL_MME_MACRO"
-                } else {
-                    "CALL_MME_DATA"
-                },
-            );
-            observed_methods.push(MaxwellEngineMethodDispatch::new(method, metadata));
-        }
-    }
-    Ok(())
+    // A macro is an explicit draw group, including its deferred END.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
+    draw::flush(candidate, consume)
+        .await
+        .map_err(MaxwellThreeDMmePreflightError::Consumer)
 }
 
 struct MmeDispatchHost<'a, E, F> {
@@ -1287,7 +1242,7 @@ struct MmeDispatchHost<'a, E, F> {
 
 impl<E, F> MaxwellThreeDMmeHost for MmeDispatchHost<'_, E, F>
 where
-    F: FnMut(PendingEngineOperation, &MaxwellThreeDState, Option<(u32, u32)>) -> Result<(), E>,
+    F: AsyncFnMut(PendingEngineOperation, &MaxwellThreeDState, Option<(u32, u32)>) -> Result<(), E>,
 {
     type Error = MaxwellThreeDMmePreflightError<E>;
 
@@ -1304,7 +1259,21 @@ where
             })
     }
 
-    fn emit_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error> {
+    fn emit_register(&mut self, method_dword: u16, argument: u32) -> Result<bool, Self::Error> {
+        if draw::is_pending(self.candidate) {
+            return Ok(false);
+        }
+        let method = GpuMethodId(u32::from(method_dword) * 4);
+        if !is_plain_method(method) {
+            return Ok(false);
+        }
+        let source = self.source.emitted_by_mme(method, argument);
+        write_plain_source(source, self.candidate)
+            .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
+        Ok(true)
+    }
+
+    async fn emit_method(&mut self, method_dword: u16, argument: u32) -> Result<(), Self::Error> {
         let method = GpuMethodId(u32::from(method_dword) * 4);
         if is_mme_aperture(method) {
             return Err(MaxwellThreeDMmePreflightError::dispatch(
@@ -1316,13 +1285,14 @@ where
         }
         let source = self.source.emitted_by_mme(method, argument);
         draw::before_method(self.candidate, source, self.consume)
+            .await
             .map_err(MaxwellThreeDMmePreflightError::Consumer)?;
-        let mut dispatch = MaxwellMethodDispatch::emitted_by_mme(source, CLASS);
-        if write_plain_method(&mut dispatch, self.candidate)
-            .map_err(MaxwellThreeDMmePreflightError::dispatch)?
-        {
+        if is_plain_method(method) {
+            write_plain_source(source, self.candidate)
+                .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
             return Ok(());
         }
+        let mut dispatch = MaxwellMethodDispatch::emitted_by_mme(source, CLASS);
         // MME sends use the same method path, including shadow tracking/replay,
         // as pushbuffer writes. The interpreter and JIT both call CallMethod:
         // https://github.com/eden-emulator/mirror/blob/67bada77f8a43a90da2e94e89b8e7da73c256989/src/video_core/macro.cpp#L664-L666
@@ -1330,6 +1300,7 @@ where
             .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
         if let Some(operation) = lower_pending_operation(prepared.operation, self.candidate) {
             draw::operation(self.candidate, operation, self.consume)
+                .await
                 .map_err(MaxwellThreeDMmePreflightError::Consumer)?;
             self.candidate.complete_inline_draw();
         }
@@ -1444,30 +1415,69 @@ pub(super) fn write_plain_method(
     if !registers::passive(method.source().method()) {
         return Ok(false);
     }
-    let source = method.source();
+    let argument = write_plain_source(method.source(), candidate)?;
+    method.set_effective_argument(argument);
+    Ok(true)
+}
+
+#[inline]
+pub(super) fn write_plain_source(
+    source: crate::MaxwellMethodSource,
+    candidate: &mut MaxwellThreeDFrontendState,
+) -> Result<u32, MaxwellEngineDispatchError> {
+    debug_assert!(registers::passive(source.method()));
     let control = candidate.mme().shadow_ram_control().value().copied();
     let argument = candidate
         .mme()
         .resolve_shadow_argument(source.method(), source.argument())
         .map_err(|error| MaxwellEngineDispatchError::MmeShadowRam { source, error })?;
-    method.set_effective_argument(argument);
+    let effective_source = source.emitted_by_mme(source.method(), argument);
     if candidate.pending_notification.is_some()
         && let Some(declaration) = METHODS_BY_DWORD[(source.method().0 / 4) as usize]
     {
         return Err(invalid_encoding(
-            method.source(),
+            effective_source,
             declaration.metadata.method_name(),
             "pending notification requires completion of a method other than NO_OPERATION",
         ));
     }
-    if candidate.raw_register_value(source.method()) != Some(argument) {
-        registers::validate_encoding(method.source(), candidate)?;
-    }
-    candidate.defer_register(method.source());
+    candidate.defer_register(effective_source);
     candidate
         .mme_mut()
-        .track_shadow_register(control, method.source());
-    Ok(true)
+        .track_shadow_register(control, effective_source);
+    Ok(argument)
+}
+
+pub(super) fn write_plain_span(
+    subchannel: crate::MaxwellPushbufferSubchannel,
+    words: crate::MaxwellMethodSpan<'_>,
+    candidate: &mut MaxwellThreeDFrontendState,
+    mut observe: impl FnMut(crate::MaxwellMethodSource, u32),
+) -> Result<usize, MaxwellEngineDispatchError> {
+    let control = candidate.mme().shadow_ram_control().value().copied();
+    let mut consumed = 0;
+    for decoded in words {
+        if !registers::passive(decoded.method()) {
+            break;
+        }
+        let source = crate::MaxwellMethodSource::decoded(decoded, subchannel);
+        let argument = candidate
+            .mme()
+            .resolve_shadow_argument(source.method(), source.argument())
+            .map_err(|error| MaxwellEngineDispatchError::MmeShadowRam { source, error })?;
+        let effective = source.emitted_by_mme(source.method(), argument);
+        candidate.defer_register(effective);
+        candidate
+            .mme_mut()
+            .track_shadow_register(control, effective);
+        observe(source, argument);
+        consumed += 1;
+    }
+    Ok(consumed)
+}
+
+pub(super) fn is_plain_method(method: GpuMethodId) -> bool {
+    registers::passive(method)
 }
 
 /// Packet index ports normalize packed lanes into the native UINT32 stream.
@@ -1479,7 +1489,7 @@ pub(super) fn inline_index_words(
 ) -> Result<(), MaxwellEngineDispatchError> {
     candidate.append_index_values(
         crate::MaxwellMethodSource::decoded(words.first().unwrap(), subchannel),
-        words.arguments().iter().copied(),
+        words.arguments(),
     )?;
     let last = crate::MaxwellMethodSource::decoded(words.last().unwrap(), subchannel);
     candidate.record_raw_register(last);

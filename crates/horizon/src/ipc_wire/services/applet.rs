@@ -534,7 +534,7 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                         );
                     }
-                    let system = save_data.ok_or_else(|| {
+                    let system = save_data.ok_or({
                         IpcWireError::UnsupportedService(
                             UnsupportedServiceOperation::CommandVariant {
                                 service: "IApplicationFunctions",

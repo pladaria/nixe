@@ -600,28 +600,6 @@ fn scatter_gather_reads_preserve_permissions_holes_and_original_physical_order()
 }
 
 #[test]
-fn inline_append_preserves_shared_extent_and_rejects_cross_mapping_extension() {
-    let mut space = initialized();
-    let (_, ranges) = backing(&space, 0x1000);
-    let mapping = space.map(request(ranges, 0x1000)).unwrap();
-    let mut range = space
-        .memory()
-        .resolve_range(mapping.offset(), 4, MemoryPermissions::WRITE)
-        .unwrap();
-    let retained = range.clone();
-    range
-        .append_inline_word(mapping.offset().get() + 4)
-        .unwrap();
-    assert_eq!(retained.size(), 4);
-    assert_eq!(range.size(), 8);
-    assert_eq!(retained.segments()[0].size(), 4);
-    assert_eq!(
-        range.append_inline_bytes(mapping.offset().get() + 8, 0x1000),
-        None
-    );
-}
-
-#[test]
 fn mapping_diagnostics_are_ordered_bounded_and_do_not_retain_ram() {
     let mut space = initialized();
     let (allocation, ranges) = backing(&space, 0x1000);
@@ -745,4 +723,50 @@ fn concurrent_translation_never_mixes_identity_permissions_kind_and_physical_pag
     }
     stopped.store(true, Ordering::Release);
     assert!(worker.join().unwrap() > 0);
+}
+
+#[test]
+fn direct_ram_write_validates_the_whole_mapping_before_modifying_any_prefix() {
+    let mut space = initialized();
+    let (_allocation, ranges) = backing(&space, 0x2000);
+    let mapping = space.map(request(ranges.clone(), 0x1000)).unwrap();
+    let address = space.address(mapping.offset().get() + 0xffe).unwrap();
+    assert!(matches!(
+        space
+            .memory()
+            .write_from(address, &[1, 2, 3, 4], &mut |_| panic!(
+                "invalid write cannot escape"
+            )),
+        Err(MaxwellGpuAccessError::UnmappedAddress { .. })
+    ));
+    assert_eq!(&read(&space.machine, &ranges)[0xffe..0x1002], &[0; 4]);
+    space
+        .memory()
+        .write_from(mapping.offset(), &[1, 2, 3, 4], &mut |_| {
+            panic!("ordinary RAM write must be direct")
+        })
+        .unwrap();
+    assert_eq!(&read(&space.machine, &ranges)[..4], &[1, 2, 3, 4]);
+}
+
+#[test]
+fn observed_owner_write_invalidates_without_a_retained_request() {
+    let mut space = initialized();
+    let (_old, ranges) = backing(&space, 0x1000);
+    let mapping = space.map(request(ranges.clone(), 0x1000)).unwrap();
+    let observation = nixe_memory::Observation::default();
+    space
+        .machine
+        .access_captured(&ranges, AccessOperation::ReadObserved(observation.clone()))
+        .unwrap()
+        .into_ready()
+        .unwrap();
+    space
+        .memory()
+        .write_from(mapping.offset(), &[4, 3, 2, 1], &mut |_| {
+            panic!("CPU observation requires no device-authority update")
+        })
+        .unwrap();
+    assert!(observation.is_invalid());
+    assert_eq!(&read(&space.machine, &ranges)[..4], &[4, 3, 2, 1]);
 }

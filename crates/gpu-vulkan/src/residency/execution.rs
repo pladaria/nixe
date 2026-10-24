@@ -525,6 +525,11 @@ impl VulkanResidency {
         let mut resources = std::mem::take(&mut self.descriptor_resources);
         resources.clear();
         for (index, request, bindings) in &program.uniforms {
+            self.uniform_cache_shots[0] += 1;
+            let unaligned = !request.offset.is_multiple_of(request.alignment);
+            if !unaligned && request.size > self.uniform_stream_limit {
+                continue;
+            }
             let Some((buffer, base)) = self.stream_buffer(*request)? else {
                 continue;
             };
@@ -618,7 +623,14 @@ impl VulkanResidency {
                     size,
                     scope,
                 } => {
+                    let uploaded = self.statistics.cpu_uploaded_bytes;
                     self.ensure_buffer_range(id, offset, size)?;
+                    if scope.access == vk::AccessFlags2::UNIFORM_READ
+                        && size <= 64 * 1024
+                        && self.statistics.cpu_uploaded_bytes == uploaded
+                    {
+                        self.uniform_cache_hits[0] += 1;
+                    }
                     // Preserve bytes not actually written by a conditional shader
                     // store, even in a descriptor classified as write-only.
                     if scope.writes() {

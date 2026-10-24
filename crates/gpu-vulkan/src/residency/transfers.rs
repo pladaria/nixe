@@ -557,7 +557,7 @@ impl VulkanResidency {
                     &[region],
                 );
             }
-            super::recording::scratch_read_barrier(&self.device, command, scratch.handle, size);
+            super::recording::scratch_read_barrier(&mut self.device, command, scratch.handle, size);
             let (_, write_layout) = self.image_access_subresources(
                 destination,
                 plane_range(dst),

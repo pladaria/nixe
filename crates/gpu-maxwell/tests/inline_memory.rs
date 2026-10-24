@@ -1,13 +1,14 @@
 use nixe_gpu::{FrontendSubmissionId, GuestSyncpointId, native::NativeCommand};
 use nixe_gpu_maxwell::{
     MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
-    MaxwellBackendExecution, MaxwellChannelId, MaxwellChannelOwner, MaxwellCommandSourceScratch,
-    MaxwellGpfifoSubmitRequest, MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellMapRequest,
-    MaxwellMemoryManagerId, MaxwellNativeFrontend, MaxwellScheduler, SWITCH_1_GM20B_PROFILE,
-    decode_gpfifo_submission, resolve_gpfifo_submission, stream_maxwell_frontend,
+    MaxwellChannelId, MaxwellChannelOwner, MaxwellCommandSourceScratch, MaxwellGpfifoSubmitRequest,
+    MaxwellGpuAddressSpace, MaxwellGpuChannel, MaxwellMapRequest, MaxwellMemoryManagerId,
+    MaxwellNativeFrontend, MaxwellScheduler, SWITCH_1_GM20B_PROFILE, decode_gpfifo_submission,
+    stream_maxwell_frontend, validate_gpfifo_submission,
 };
 use nixe_memory::{AllocationRange, Machine, MemoryPermissions, PAGE_SIZE};
-use std::sync::Arc;
+#[path = "support/command.rs"]
+mod command;
 
 #[test]
 fn inline_uploads_are_consumed_between_native_inputs_without_native_delivery() {
@@ -92,7 +93,7 @@ fn inline_uploads_are_consumed_between_native_inputs_without_native_delivery() {
     )
     .unwrap();
     let submission =
-        resolve_gpfifo_submission(&channel.configuration(), frontend, decoded, space.memory())
+        validate_gpfifo_submission(&channel.configuration(), frontend, decoded, space.memory())
             .unwrap();
     let mut scheduler = MaxwellScheduler::default();
     scheduler
@@ -102,68 +103,29 @@ fn inline_uploads_are_consumed_between_native_inputs_without_native_delivery() {
         .dispatch_next(true, space.memory())
         .unwrap()
         .unwrap();
-    let mut execution = MaxwellBackendExecution::begin(frontend, None);
     let mut observed = Vec::new();
-    let mut access = |ranges: Vec<AllocationRange>, operation| {
-        machine
-            .apply_resolved_access(&ranges, &operation)
-            .map_err(Arc::new)
-    };
-    let mut owner_access = |ranges: Vec<AllocationRange>, operation| {
-        machine
-            .apply_resolved_access(&ranges, &operation)
-            .map_err(Arc::new)
-    };
-    let tail = stream_maxwell_frontend(
+    command::ready(stream_maxwell_frontend(
         &dispatch,
         &mut channel,
         space.memory(),
-        &mut MaxwellNativeFrontend::new(Default::default()),
+        &std::cell::RefCell::new(MaxwellNativeFrontend::new(Default::default())),
         &mut MaxwellCommandSourceScratch::default(),
-        &mut access,
-        &mut || panic!("this stream has no command-source wait"),
-        &mut |steps| {
-            execution.append_steps(steps);
-            while let Some(segment) = execution
-                .next_segment_with_memory(0, &mut owner_access)
-                .unwrap()
-            {
-                for command in &segment.commands {
-                    assert!(
-                        matches!(command, NativeCommand::Ordering(_)),
-                        "inline RAM writes must not become native commands"
-                    );
-                    // Stand in for the native consumer's capture, before acceptance.
-                    let mut bytes = [0; 4];
-                    machine
-                        .capture_stream(&[input.slice(0, 4).unwrap()], &mut bytes)
-                        .unwrap();
-                    observed.push(u32::from_le_bytes(bytes));
-                }
-                execution.recycle_segment(segment);
-                execution.accept_segment();
-                execution.retire_consumed_steps();
-            }
-            Ok(())
+        &mut command::Observer {
+            memory: &machine,
+            controls: 0,
+            consume: &mut |work| {
+                assert!(
+                    matches!(work.command, NativeCommand::Ordering(_)),
+                    "inline writes must not become native commands"
+                );
+                let mut bytes = [0; 4];
+                machine
+                    .capture_stream(&[input.slice(0, 4).unwrap()], &mut bytes)
+                    .unwrap();
+                observed.push(u32::from_le_bytes(bytes));
+            },
         },
-    )
+    ))
     .unwrap();
     assert_eq!(observed, [0, 2, 3]);
-    execution.append_steps(tail.into_steps().into_vec());
-    execution.seal();
-    let final_segment = execution
-        .next_segment_with_memory(0, &mut access)
-        .unwrap()
-        .unwrap();
-    assert!(final_segment.final_segment);
-    assert!(final_segment.commands.is_empty());
-    execution.recycle_segment(final_segment);
-    execution.accept_segment();
-    assert!(
-        execution
-            .next_segment_with_memory(0, &mut access)
-            .unwrap()
-            .is_none()
-    );
-    assert!(execution.is_finished());
 }

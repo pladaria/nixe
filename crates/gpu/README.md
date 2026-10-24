@@ -5,21 +5,24 @@ contracts. It contains no guest instruction decoder or host graphics API.
 
 Startup supplies `MaxwellNativeFrontend` and `NativeGpuExecution` to
 `VideoSystem::with_gpu_frontend`. Horizon moves the concrete renderer into its GPU
-owner thread. `ExecutionBatch` borrows an ordered native submission; immutable
-commands retain canonical ranges and prepared shader, binding and graphics state.
+owner thread. `NativeWork` carries one consumed engine operation with physical
+inputs and immutable prepared shader, binding and graphics state.
 
-The GPU owner consumes guest resources, resolves native hazards and schedules recording and submission. The renderer delegates owned native jobs to its Vulkan worker.
-`GpuExecution::prepare` polls cold compilation without accepting a command or
-publishing completion. Pending work retains its delivery permits while the
-owner services visibility and host control. Acceptance captures required inputs;
-completion is reported only after actual GPU work and canonical ownership effects.
-Horizon then publishes the corresponding guest timeline reservation.
+The owner consumes guest resources through `GpuExecution::consume`. It polls cold
+compilation and records the effect once its dependencies are ready, delegating
+owned native jobs to the Vulkan worker. A blocked channel retains its current effect while
+unrelated channels and native progress can advance. External CPU visibility is
+serviced between consumed effects. `progress` performs control-boundary maintenance
+once before polling logical completions. Descriptor admission is released after
+consumption; the separate completion ticket remains pending until actual GPU work
+and canonical ownership effects finish. Horizon then publishes the corresponding
+guest timeline reservation.
 
 Canonical CPU visibility belongs to `nixe-memory`. CPU requests reach the owner
-through `BackendVisibilityRequester`; the owner resolves its own demands inline
-without reentering its inbox. Resource leases preserve accepted uses through
-unmapping and cache eviction. Queue pressure does not silently enlarge budgets or
-drop commands.
+through `DeviceAccessEndpoint`. Owner-local reads either complete in RAM or retain
+one exact device demand; they do not submit a request to their own endpoint.
+Physical pins preserve accepted uses through unmapping and cache eviction.
+Queue pressure does not silently enlarge budgets or drop commands.
 
 `ResidentImage` contains a typed `PresentationLease`: an image generation, content
 version, producer token and last-consumer release channel. Host graphics objects

@@ -4,13 +4,17 @@ use nixe_gpu::{
 };
 use nixe_memory::Allocation;
 use nixe_memory::MemoryPermissions;
+use std::sync::Arc;
 
 use super::*;
 
 mod bindings;
 mod bulk;
 use bindings::{fixture_bindings, fixture_roles};
+mod collector;
 mod compute_launch;
+use collector::*;
+mod direct;
 pub(crate) mod register_benchmark;
 use crate::{
     MaxwellAamVersion, MaxwellAamVersionRange, MaxwellAddressSpaceId,
@@ -54,7 +58,25 @@ fn dispatch_first(
     channel: &mut MaxwellGpuChannel,
     decoded: &MaxwellDecodedPushbuffer,
 ) -> Result<MaxwellEnginePacketDispatch, MaxwellEngineDispatchError> {
-    dispatch_maxwell_engine_packet(channel, FrontendSubmissionId::new(3), &decoded.packets()[0])
+    let streamed = dispatch_maxwell_engine_packet(
+        channel,
+        FrontendSubmissionId::new(3),
+        &decoded.packets()[0],
+    );
+    // Register-state tests deliberately consume all pending typed groups.
+    // The stream collector above observes only the effects emitted at runtime.
+    let (profile, state) = channel.three_d_with_profile_mut();
+    let materialized = threed::materialize_state(profile, state);
+    let mut streamed = streamed?;
+    materialized?;
+    let mut inspector = state.clone();
+    for observed in &mut streamed.methods {
+        if observed.metadata.method_name() == "STATE_REGISTER" {
+            observed.metadata =
+                threed::inspect_state_metadata(profile, observed.method.source(), &mut inspector);
+        }
+    }
+    Ok(streamed)
 }
 
 fn dispatch_method(
@@ -83,7 +105,7 @@ fn dispatch_increment_once(
 
 trait PacketDispatchOperations {
     fn operations(&self) -> Vec<&MaxwellThreeDTriggeredOperation>;
-    fn compute_operations(&self) -> Vec<&MaxwellComputeTriggeredOperation>;
+    fn compute_operations(&self) -> Vec<MaxwellComputeOperationTrigger>;
     fn synchronization_operations(&self) -> Vec<&MaxwellThreeDSynchronizationOperation>;
 }
 
@@ -98,13 +120,11 @@ impl PacketDispatchOperations for MaxwellEnginePacketDispatch {
             .collect()
     }
 
-    fn compute_operations(&self) -> Vec<&MaxwellComputeTriggeredOperation> {
+    fn compute_operations(&self) -> Vec<MaxwellComputeOperationTrigger> {
         self.ordered_operations()
             .iter()
             .filter_map(|operation| match operation {
-                MaxwellEngineOperation::ComputeSynchronization(operation) => {
-                    Some(operation.as_ref())
-                }
+                MaxwellEngineOperation::ComputeSynchronization(operation) => Some(*operation),
                 _ => None,
             })
             .collect()

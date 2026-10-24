@@ -112,7 +112,7 @@ fn finite_wait_shares_one_deadline_across_submission_and_gpu_execution() {
         unsafe {
             device.submission.flush(
                 device.queue,
-                &device.dispatch,
+                &mut device.dispatch,
                 &[vk::SemaphoreSubmitInfo::default()
                     .semaphore(gate.handle)
                     .value(1)
@@ -191,7 +191,7 @@ fn exercise_reuse(api: crate::ApiPreference) {
     let accepted = unsafe {
         device
             .submission
-            .flush(device.queue, &device.dispatch, &waits, &[])
+            .flush(device.queue, &mut device.dispatch, &waits, &[])
     }
     .unwrap()
     .unwrap();
@@ -313,7 +313,7 @@ fn native_recording_waits_for_actual_slot_capacity_without_growing_the_budget() 
     unsafe {
         device.submission.flush(
             device.queue,
-            &device.dispatch,
+            &mut device.dispatch,
             &[vk::SemaphoreSubmitInfo::default()
                 .semaphore(gate.handle)
                 .value(1)
@@ -325,7 +325,7 @@ fn native_recording_waits_for_actual_slot_capacity_without_growing_the_budget() 
     .unwrap();
     gate.last_use = first.tick();
     assert!(
-        matches!(device.submission.begin(), Err(VulkanError::QueuePressure { pending: Some(work), .. }) if work == first)
+        matches!(device.submission.begin(&mut device.dispatch), Err(VulkanError::QueuePressure { pending: Some(work), .. }) if work == first)
     );
     let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let signal = Arc::clone(&released);
@@ -471,12 +471,24 @@ fn staging_overflow_suballocates_small_transfers_and_preserves_unread_slices() {
     let validation = device.validation_monitor();
     // Fill the primary arenas; subsequent small requests must share overflow
     // arenas rather than allocating one native buffer and memory per request.
-    device.submission.reserve_upload(&[0; 4096]).unwrap();
-    let (_, _, unused) = device.submission.reserve_readback(4096).unwrap();
+    device
+        .submission
+        .reserve_upload(&mut device.dispatch, &[0; 4096])
+        .unwrap();
+    let (_, _, unused) = device
+        .submission
+        .reserve_readback(&mut device.dispatch, 4096)
+        .unwrap();
     let mut tickets = Vec::new();
     for value in 0..128u8 {
-        let (index, source) = device.submission.reserve_upload(&[value; 64]).unwrap();
-        let (_, destination, ticket) = device.submission.reserve_readback(64).unwrap();
+        let (index, source) = device
+            .submission
+            .reserve_upload(&mut device.dispatch, &[value; 64])
+            .unwrap();
+        let (_, destination, ticket) = device
+            .submission
+            .reserve_readback(&mut device.dispatch, 64)
+            .unwrap();
         let slot = &device.submission.slots[index];
         unsafe {
             device.dispatch.cmd_copy_buffer(

@@ -4,20 +4,19 @@ pub(super) use crate::test_device as support;
 use nixe_gpu::physical::PhysicalMapping;
 use nixe_gpu::*;
 use std::time::Instant;
-fn ready(execution: &mut NativeGpuExecution, submission: &NativeSubmission) {
+fn consume(
+    execution: &mut NativeGpuExecution,
+    submission: &NativeWork,
+) -> Result<(), BackendRuntimeError> {
     let started = Instant::now();
-    while !execution
-        .prepare(ExecutionBatch {
-            commands: submission,
-        })
-        .unwrap()
-    {
+    while !execution.consume(submission)? {
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "native compilation must publish readiness"
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+    Ok(())
 }
 
 fn finish_next(
@@ -134,51 +133,6 @@ fn captured_graphics(
 }
 
 #[test]
-fn instance_groups_require_matching_geometry_and_contiguous_nonoverflowing_ids() {
-    let direct = |first, count, vertex| Draw::Direct {
-        vertices: 3,
-        instances: count,
-        first_vertex: vertex,
-        first_instance: first,
-    };
-    let mut draw = direct(6, 3, 2);
-    assert!(append_instances(&mut draw, direct(9, 2, 2)));
-    assert!(matches!(
-        draw,
-        Draw::Direct {
-            first_instance: 6,
-            instances: 5,
-            ..
-        }
-    ));
-    assert!(!append_instances(&mut draw, direct(12, 1, 2)));
-    assert!(!append_instances(&mut draw, direct(11, 1, 3)));
-    assert!(!append_instances(
-        &mut direct(0, u32::MAX, 0),
-        direct(u32::MAX, 1, 0)
-    ));
-    let indexed = |first, offset| Draw::Indexed {
-        indices: 6,
-        instances: 1,
-        first_index: 3,
-        vertex_offset: offset,
-        first_instance: first,
-    };
-    let mut draw = indexed(4, -2);
-    assert!(!append_instances(&mut draw, indexed(5, -1)));
-    assert!(!append_instances(&mut draw, direct(5, 1, 3)));
-    assert!(append_instances(&mut draw, indexed(5, -2)));
-    assert!(matches!(
-        draw,
-        Draw::Indexed {
-            first_instance: 4,
-            instances: 2,
-            ..
-        }
-    ));
-}
-
-#[test]
 fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {
         return;
@@ -264,18 +218,16 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
             <= execution.residency.device().scheduled_tick(),
         "a CPU demand must submit its download before unrelated recording"
     );
-    let batch = NativeSubmission::new(
-        FrontendSubmissionId::new(1),
-        FrontendSubmissionSegment::FIRST,
-        true,
-        vec![NativeCommand::WaitForIdle],
-    );
-    ready(&mut execution, &batch);
-    execution
-        .submit(ExecutionBatch { commands: &batch })
+    let batch = NativeWork {
+        frontend: FrontendSubmissionId::new(1),
+        command: NativeCommand::WaitForIdle,
+    };
+
+    consume(&mut execution, &batch)
+        .and_then(|()| execution.submit(batch.frontend))
         .unwrap();
     let submitted = execution.residency.device().scheduled_tick();
-    execution.progress_device_accesses().unwrap();
+    execution.progress().unwrap();
     assert!(pending.poll().is_none());
     assert_eq!(
         execution.residency.device().scheduled_tick(),
@@ -291,7 +243,7 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
     );
     let deadline = Instant::now() + Duration::from_secs(3);
     let result = loop {
-        execution.progress_device_accesses().unwrap();
+        execution.progress().unwrap();
         if let Some(result) = pending.poll() {
             let nixe_memory::AccessResult::Read(bytes) = result.unwrap() else {
                 panic!("expected read")
@@ -342,7 +294,7 @@ fn completion_observer_wakes_earlier_work_before_a_blocked_later_target() {
     unsafe {
         device.submission.flush(
             device.queue,
-            &device.dispatch,
+            &mut device.dispatch,
             &[vk::SemaphoreSubmitInfo::default()
                 .semaphore(gate)
                 .value(1)
@@ -410,28 +362,24 @@ fn completed_native_work_still_wakes_its_pending_logical_completion() {
     )
     .unwrap();
     let (_allocation, whole) = backing_allocation(&execution.residency, 4096, 4096, 0x19);
-    let submission = NativeSubmission::new(
-        FrontendSubmissionId::new(1),
-        FrontendSubmissionSegment::FIRST,
-        true,
-        vec![NativeCommand::ReportMemory {
+    let submission = NativeWork {
+        frontend: FrontendSubmissionId::new(1),
+        command: NativeCommand::ReportMemory {
             fence: true,
             target: whole.pin(0, whole.bytes()).unwrap(),
             offset: 64,
             bytes: Arc::from([0x37; 16]),
-        }],
-    );
+        },
+    };
     let (notify, notifications) = std::sync::mpsc::channel();
     execution
         .bind_host_wakeup(Arc::new(move || {
             let _ = notify.send(());
         }))
         .unwrap();
-    ready(&mut execution, &submission);
-    let token = execution
-        .submit(ExecutionBatch {
-            commands: &submission,
-        })
+
+    let token = consume(&mut execution, &submission)
+        .and_then(|()| execution.submit(submission.frontend))
         .unwrap();
     let work = execution.completions.front().unwrap().work.unwrap();
     execution.residency.flush().unwrap();
@@ -486,33 +434,34 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     }
     .unwrap();
     let submission = |frontend, value| {
-        NativeSubmission::new(
-            FrontendSubmissionId::new(frontend),
-            FrontendSubmissionSegment::FIRST,
-            true,
-            vec![
-                NativeCommand::ReportMemory {
-                    fence: true,
-                    target: whole.pin(0, whole.bytes()).unwrap(),
-                    offset: 128,
-                    bytes: Arc::from([0xa3; 16]),
-                },
-                NativeCommand::WaitForIdle,
-                NativeCommand::ReportMemory {
-                    fence: true,
-                    target: whole.pin(0, whole.bytes()).unwrap(),
-                    offset: 64,
-                    bytes: Arc::from([value ^ 0xff; 16]),
-                },
-                // A later release supersedes only the same exact bytes.
-                NativeCommand::ReportMemory {
-                    fence: true,
-                    target: whole.pin(0, whole.bytes()).unwrap(),
-                    offset: 64,
-                    bytes: Arc::from([value; 16]),
-                },
-            ],
-        )
+        NativeWork {
+            frontend: FrontendSubmissionId::new(frontend),
+            command: NativeCommand::Sequence(
+                vec![
+                    NativeCommand::ReportMemory {
+                        fence: true,
+                        target: whole.pin(0, whole.bytes()).unwrap(),
+                        offset: 128,
+                        bytes: Arc::from([0xa3; 16]),
+                    },
+                    NativeCommand::WaitForIdle,
+                    NativeCommand::ReportMemory {
+                        fence: true,
+                        target: whole.pin(0, whole.bytes()).unwrap(),
+                        offset: 64,
+                        bytes: Arc::from([value ^ 0xff; 16]),
+                    },
+                    // A later release supersedes only the same exact bytes.
+                    NativeCommand::ReportMemory {
+                        fence: true,
+                        target: whole.pin(0, whole.bytes()).unwrap(),
+                        offset: 64,
+                        bytes: Arc::from([value; 16]),
+                    },
+                ]
+                .into_boxed_slice(),
+            ),
+        }
     };
     let (woken, wakeups) = std::sync::mpsc::channel();
     execution
@@ -521,9 +470,9 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         }))
         .unwrap();
     let first = submission(1, 0x37);
-    ready(&mut execution, &first);
-    execution
-        .submit(ExecutionBatch { commands: &first })
+
+    consume(&mut execution, &first)
+        .and_then(|()| execution.submit(first.frontend))
         .unwrap();
     execution
         .residency
@@ -560,9 +509,9 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     // The GPU cannot complete the first batch yet. An unrelated subsequent
     // recording still succeeds; no completion wait is needed for these writes.
     let second = submission(2, 0x71);
-    ready(&mut execution, &second);
-    execution
-        .submit(ExecutionBatch { commands: &second })
+
+    consume(&mut execution, &second)
+        .and_then(|()| execution.submit(second.frontend))
         .unwrap();
     assert!(execution.poll_completion().unwrap().is_none());
     let (request, mut pending) = execution
@@ -578,17 +527,13 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         pending.poll().is_none(),
         "an external CPU demand must leave recording available while the GPU is blocked"
     );
-    let independent = NativeSubmission::new(
-        FrontendSubmissionId::new(90),
-        FrontendSubmissionSegment::FIRST,
-        true,
-        vec![NativeCommand::WaitForIdle],
-    );
-    ready(&mut execution, &independent);
-    execution
-        .submit(ExecutionBatch {
-            commands: &independent,
-        })
+    let independent = NativeWork {
+        frontend: FrontendSubmissionId::new(90),
+        command: NativeCommand::WaitForIdle,
+    };
+
+    consume(&mut execution, &independent)
+        .and_then(|()| execution.submit(independent.frontend))
         .unwrap();
     assert!(!released.load(std::sync::atomic::Ordering::Acquire));
     read_started.send(()).unwrap();
@@ -641,21 +586,19 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     // A host-authored release attaches to the existing real producer prefix.
     // It must not invent an empty submission. A following literal release can
     // share the same preceding producer ticket.
-    let prefix = NativeSubmission::new(
-        FrontendSubmissionId::new(3),
-        FrontendSubmissionSegment::FIRST,
-        true,
-        vec![NativeCommand::ReportMemory {
+    let prefix = NativeWork {
+        frontend: FrontendSubmissionId::new(3),
+        command: NativeCommand::ReportMemory {
             fence: true,
             target: whole.pin(0, whole.bytes()).unwrap(),
             offset: 64,
             bytes: Arc::from([0xb3; 16]),
-        }],
-    );
-    ready(&mut execution, &prefix);
+        },
+    };
+
     let uploaded_before_release = execution.residency.statistics().cpu_uploaded_bytes;
-    execution
-        .submit(ExecutionBatch { commands: &prefix })
+    consume(&mut execution, &prefix)
+        .and_then(|()| execution.submit(prefix.frontend))
         .unwrap();
     let released_tick = execution.completions.back().unwrap().work.unwrap().tick();
     assert_eq!(
@@ -663,22 +606,18 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         uploaded_before_release,
         "a CPU-only completion effect must not upload its known payload"
     );
-    let following = NativeSubmission::new(
-        FrontendSubmissionId::new(4),
-        FrontendSubmissionSegment::FIRST,
-        true,
-        vec![NativeCommand::ReportMemory {
+    let following = NativeWork {
+        frontend: FrontendSubmissionId::new(4),
+        command: NativeCommand::ReportMemory {
             fence: true,
             target: whole.pin(0, whole.bytes()).unwrap(),
             offset: 128,
             bytes: Arc::from([0xc3; 16]),
-        }],
-    );
-    ready(&mut execution, &following);
-    execution
-        .submit(ExecutionBatch {
-            commands: &following,
-        })
+        },
+    };
+
+    consume(&mut execution, &following)
+        .and_then(|()| execution.submit(following.frontend))
         .unwrap();
     assert!(execution.completions.back().unwrap().work.unwrap().tick() >= released_tick);
     let source = execution
@@ -764,6 +703,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     )
     .unwrap();
     let image = GuestImage {
+        view_identity: None,
         sample_grid: [1, 1],
         description,
         swizzle: Swizzle::IDENTITY,
@@ -894,34 +834,19 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             instance_count: 1,
         },
     };
-    let submission = NativeSubmission::new(
-        FrontendSubmissionId::new(1),
-        FrontendSubmissionSegment::FIRST,
-        true,
-        vec![draw; 16],
-    );
-    ready(&mut execution, &submission);
-    assert_eq!(execution.statistics.prepared_draws, 1);
-    // Identical recompiled code can have a new allocation after cold-cache
-    // eviction. Content identity, not its allocation, selects graphics state.
-    let mut recaptured = (*state).clone();
-    let program = Arc::make_mut(&mut recaptured.program);
-    program.shader = Arc::new((*program.shader).clone());
-    let prepared_graphics = execution.statistics.prepared_graphics;
-    assert!(execution.graphics(&Arc::new(recaptured)).unwrap());
-    assert_eq!(execution.statistics.prepared_graphics, prepared_graphics);
+    let submission = NativeWork {
+        frontend: FrontendSubmissionId::new(1),
+        command: NativeCommand::Sequence(vec![draw; 16].into_boxed_slice()),
+    };
+
     for frontend in 1..=2 {
-        let submission = NativeSubmission::new(
-            FrontendSubmissionId::new(frontend),
-            submission.segment,
-            submission.final_segment,
-            submission.commands.clone(),
-        );
-        ready(&mut execution, &submission);
-        execution
-            .submit(ExecutionBatch {
-                commands: &submission,
-            })
+        let submission = NativeWork {
+            frontend: FrontendSubmissionId::new(frontend),
+            command: submission.command.clone(),
+        };
+
+        consume(&mut execution, &submission)
+            .and_then(|()| execution.submit(submission.frontend))
             .unwrap();
         assert_eq!(
             finish_next(&mut execution).unwrap().unwrap().frontend(),
@@ -934,6 +859,15 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         assert_eq!(stats.rendering_scopes, frontend);
     }
     assert_eq!(execution.statistics.prepared_draws, 1);
+    // Identical recompiled code can have a new allocation after cold-cache
+    // eviction. Content identity, not its allocation, selects graphics state.
+    let mut recaptured = (*state).clone();
+    let program = Arc::make_mut(&mut recaptured.program);
+    program.shader = Arc::new((*program.shader).clone());
+    let prepared_graphics = execution.statistics.prepared_graphics;
+    assert!(execution.graphics(&Arc::new(recaptured)).unwrap());
+    assert_eq!(execution.statistics.prepared_graphics, prepared_graphics);
+    assert_eq!(execution.statistics.prepared_draws, 1);
     assert_eq!(execution.statistics.draws, 32);
     assert_eq!(execution.statistics.warm_draws, 31);
     let bytes = cpu_read(&mut execution.residency, &backing);
@@ -945,15 +879,13 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     );
     // Acceptance of a read snapshot need not submit a command buffer. A
     // following CPU write is uploaded after that read, with a native WAR edge.
-    let prefix = NativeSubmission::new(
-        FrontendSubmissionId::new(3),
-        FrontendSubmissionSegment::FIRST,
-        false,
-        submission.commands.clone(),
-    );
-    ready(&mut execution, &prefix);
-    let first = execution
-        .submit(ExecutionBatch { commands: &prefix })
+    let prefix = NativeWork {
+        frontend: FrontendSubmissionId::new(3),
+        command: submission.command.clone(),
+    };
+
+    let first = consume(&mut execution, &prefix)
+        .and_then(|()| execution.submit(prefix.frontend))
         .unwrap();
     assert!(execution.poll_completion().unwrap().is_none());
     assert_eq!(
@@ -985,11 +917,9 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     Arc::make_mut(&mut changed.parameters).identity = PreparedStateId::new(3, 1);
     Arc::make_mut(&mut changed.parameters).scissor.x = 4;
     Arc::make_mut(&mut changed.parameters).scissor.width = 4;
-    let final_segment = NativeSubmission::new(
-        prefix.frontend,
-        prefix.segment,
-        true,
-        vec![NativeCommand::Draw {
+    let final_segment = NativeWork {
+        frontend: prefix.frontend,
+        command: NativeCommand::Draw {
             state: Arc::new(changed),
             arguments: DrawArguments::NonIndexed {
                 first_vertex: 0,
@@ -997,14 +927,14 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                 first_instance: 0,
                 instance_count: 1,
             },
-        }],
-    );
-    ready(&mut execution, &final_segment);
-    let second = execution
-        .submit(ExecutionBatch {
-            commands: &final_segment,
-        })
+        },
+    };
+
+    let selections = execution.statistics.reused_vertex_selections;
+    let second = consume(&mut execution, &final_segment)
+        .and_then(|()| execution.submit(final_segment.frontend))
         .unwrap();
+    assert!(execution.statistics.reused_vertex_selections > selections);
     assert_ne!(first, second);
     let a = finish_next(&mut execution).unwrap().unwrap();
     let b = finish_next(&mut execution).unwrap().unwrap();
@@ -1026,16 +956,14 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     // A CPU/frontend demand after accepting an unfinished native delivery
     // must find a pending producer, force its submission and observe its bytes.
     // Returning the preceding green/red image would silently read stale data.
-    let pending = NativeSubmission::new(
-        FrontendSubmissionId::new(4),
-        FrontendSubmissionSegment::FIRST,
-        false,
-        submission.commands.clone(),
-    );
-    ready(&mut execution, &pending);
+    let pending = NativeWork {
+        frontend: FrontendSubmissionId::new(4),
+        command: submission.command.clone(),
+    };
+
     let submitted = execution.residency.device().queue_usage().submitted_tick;
-    let token = execution
-        .submit(ExecutionBatch { commands: &pending })
+    let token = consume(&mut execution, &pending)
+        .and_then(|()| execution.submit(pending.frontend))
         .unwrap();
     assert_eq!(
         execution.residency.device().queue_usage().submitted_tick,
@@ -1053,8 +981,8 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             .collect::<Vec<_>>(),
     )
     .unwrap();
-    let repeated = execution
-        .submit(ExecutionBatch { commands: &pending })
+    let repeated = consume(&mut execution, &pending)
+        .and_then(|()| execution.submit(pending.frontend))
         .unwrap();
     assert_eq!(
         execution.residency.device().queue_usage().submitted_tick,
@@ -1094,14 +1022,13 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     parameters.identity = PreparedStateId::new(12, 1);
     parameters.scissor.width = 4;
     let clipped = Arc::new(clipped);
+    let selections = execution.statistics.reused_vertex_selections;
     let scopes = execution.recording_statistics().rendering_scopes;
     let mut sent = Vec::new();
     for (index, current) in [&other, &state, &clipped].into_iter().enumerate() {
-        let submission = NativeSubmission::new(
-            FrontendSubmissionId::new(10 + index as u64),
-            FrontendSubmissionSegment::FIRST,
-            false,
-            vec![NativeCommand::Draw {
+        let submission = NativeWork {
+            frontend: FrontendSubmissionId::new(10 + index as u64),
+            command: NativeCommand::Draw {
                 state: Arc::clone(current),
                 arguments: DrawArguments::NonIndexed {
                     first_vertex: 0,
@@ -1109,14 +1036,12 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                     first_instance: 0,
                     instance_count: 1,
                 },
-            }],
-        );
-        ready(&mut execution, &submission);
+            },
+        };
+
         sent.push(
-            execution
-                .submit(ExecutionBatch {
-                    commands: &submission,
-                })
+            consume(&mut execution, &submission)
+                .and_then(|()| execution.submit(submission.frontend))
                 .unwrap(),
         );
     }
@@ -1124,6 +1049,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         execution.recording_statistics().rendering_scopes - scopes,
         1
     );
+    assert!(execution.statistics.reused_vertex_selections > selections);
     assert!(execution.statistics.reused_graphics > 0);
     assert!(execution.statistics.reused_programs > 0);
     let bytes = cpu_read(&mut execution.residency, &backing);
@@ -1166,11 +1092,9 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let uniform_draw = Arc::new(uniform_draw);
     // Parameter identity is independent of shader identity. Preparing an
     // alternative shader with the same parameters must retain both variants.
-    let variant = NativeSubmission::new(
-        FrontendSubmissionId::new(19),
-        FrontendSubmissionSegment::FIRST,
-        false,
-        vec![NativeCommand::Draw {
+    let variant = NativeWork {
+        frontend: FrontendSubmissionId::new(19),
+        command: NativeCommand::Draw {
             state: Arc::clone(&uniform_draw),
             arguments: DrawArguments::NonIndexed {
                 first_vertex: 0,
@@ -1178,9 +1102,11 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                 first_instance: 0,
                 instance_count: 1,
             },
-        }],
-    );
-    ready(&mut execution, &variant);
+        },
+    };
+
+    consume(&mut execution, &variant).unwrap();
+    execution.residency.flush().unwrap();
     assert!(execution.graphics(&state).unwrap());
     let pipeline_count = execution.pipelines.usage().0;
     let graphics_count = execution.statistics.prepared_graphics;
@@ -1197,11 +1123,9 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             parameters.scissor.x = if index == 1 { 4 } else { 0 };
             parameters.scissor.width = 4;
         }
-        let submission = NativeSubmission::new(
-            FrontendSubmissionId::new(20 + index as u64),
-            FrontendSubmissionSegment::FIRST,
-            true,
-            vec![NativeCommand::Draw {
+        let submission = NativeWork {
+            frontend: FrontendSubmissionId::new(20 + index as u64),
+            command: NativeCommand::Draw {
                 state: Arc::new(draw),
                 arguments: DrawArguments::NonIndexed {
                     first_vertex: 0,
@@ -1209,27 +1133,27 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                     first_instance: 0,
                     instance_count: 1,
                 },
-            }],
-        );
-        ready(&mut execution, &submission);
+            },
+        };
+
         inputs.push((submission, encode(rgba)));
     }
     // Dynamic scissor changes and runtime uniform data retain the native
     // executable; only the recording parameters and buffer visibility change.
-    assert_eq!(execution.pipelines.usage().0, pipeline_count);
-    assert_eq!(execution.statistics.prepared_graphics, graphics_count);
+    let selections = execution.statistics.reused_vertex_selections;
     let scopes = execution.recording_statistics().rendering_scopes;
     let mut sent = Vec::new();
     for (submission, bytes) in &inputs {
         crate::residency::tests::cpu_write(&mut execution.residency, &uniform, 0, bytes).unwrap();
         sent.push(
-            execution
-                .submit(ExecutionBatch {
-                    commands: submission,
-                })
+            consume(&mut execution, submission)
+                .and_then(|()| execution.submit(submission.frontend))
                 .unwrap(),
         );
     }
+    assert!(execution.statistics.reused_vertex_selections >= selections + inputs.len() as u64);
+    assert_eq!(execution.pipelines.usage().0, pipeline_count);
+    assert_eq!(execution.statistics.prepared_graphics, graphics_count);
     assert_eq!(
         execution.recording_statistics().rendering_scopes - scopes,
         1
@@ -1256,9 +1180,8 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let updates = execution.descriptors.statistics().updates;
     let repeated = &inputs[2].0;
     for _ in 0..12 {
-        ready(&mut execution, repeated);
-        execution
-            .submit(ExecutionBatch { commands: repeated })
+        consume(&mut execution, repeated)
+            .and_then(|()| execution.submit(repeated.frontend))
             .unwrap();
         finish_next(&mut execution).unwrap().unwrap();
     }
@@ -1289,11 +1212,9 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         .write_buffer(native_uniform, 0, &encode([1., 1., 0., 1.]))
         .unwrap();
     assert_eq!(upload.consumed, 16);
-    let submission = NativeSubmission::new(
-        FrontendSubmissionId::new(30),
-        FrontendSubmissionSegment::FIRST,
-        true,
-        vec![NativeCommand::Draw {
+    let submission = NativeWork {
+        frontend: FrontendSubmissionId::new(30),
+        command: NativeCommand::Draw {
             state: Arc::clone(&uniform_draw),
             arguments: DrawArguments::NonIndexed {
                 first_vertex: 0,
@@ -1301,13 +1222,11 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                 first_instance: 0,
                 instance_count: 1,
             },
-        }],
-    );
-    ready(&mut execution, &submission);
-    execution
-        .submit(ExecutionBatch {
-            commands: &submission,
-        })
+        },
+    };
+
+    consume(&mut execution, &submission)
+        .and_then(|()| execution.submit(submission.frontend))
         .unwrap();
     let bytes = cpu_read(&mut execution.residency, &backing);
     assert!(
@@ -1316,6 +1235,38 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             .all(|pixel| pixel == [255, 255, 0, 255])
     );
     finish_next(&mut execution).unwrap().unwrap();
+    // Reusing a draw for many effects must not age out its graphics pipeline.
+    // A new immutable draw selecting the same graphics state stays warm too.
+    let prepared_graphics = execution.statistics.prepared_graphics;
+    for _ in 0..600 {
+        consume(&mut execution, &submission).unwrap();
+    }
+    let key = GraphicsKey::new(&uniform_draw, execution.device_profile().dynamic_state.base);
+    assert!(matches!(
+        execution.graphics.get(&key),
+        Some(Graphics::Ready { .. })
+    ));
+    let mut next_draw = (*uniform_draw).clone();
+    next_draw.identity = PreparedStateId::new(5000, 1);
+    let next_work = NativeWork {
+        frontend: FrontendSubmissionId::new(5000),
+        command: NativeCommand::Draw {
+            state: Arc::new(next_draw),
+            arguments: DrawArguments::NonIndexed {
+                first_vertex: 0,
+                vertex_count: 3,
+                first_instance: 0,
+                instance_count: 1,
+            },
+        },
+    };
+    consume(&mut execution, &next_work).unwrap();
+    assert_eq!(execution.statistics.prepared_graphics, prepared_graphics);
+    assert!(
+        cpu_read(&mut execution.residency, &backing)
+            .chunks_exact(4)
+            .all(|pixel| pixel == [255, 255, 0, 255])
+    );
     // Retained guest preparations must not pin the persistent host descriptor
     // budget. Force a two-set recording slot and retain many different binding
     // templates, proving pressure splits recording without dropping any draw.
@@ -1347,11 +1298,9 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             GuestBinding::Buffer(backing.slice(0, 16).unwrap()),
         )]);
         source.program = Arc::new(program);
-        let submission = NativeSubmission::new(
-            FrontendSubmissionId::new(1000 + index),
-            FrontendSubmissionSegment::FIRST,
-            true,
-            vec![NativeCommand::Draw {
+        let submission = NativeWork {
+            frontend: FrontendSubmissionId::new(1000 + index),
+            command: NativeCommand::Draw {
                 state: Arc::new(source),
                 arguments: DrawArguments::NonIndexed {
                     first_vertex: 0,
@@ -1359,13 +1308,11 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                     first_instance: 0,
                     instance_count: 1,
                 },
-            }],
-        );
-        ready(&mut execution, &submission);
-        execution
-            .submit(ExecutionBatch {
-                commands: &submission,
-            })
+            },
+        };
+
+        consume(&mut execution, &submission)
+            .and_then(|()| execution.submit(submission.frontend))
             .unwrap();
         retained.push((allocation, submission));
     }
@@ -1374,6 +1321,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let bytes = cpu_read(&mut execution.residency, &backing);
     assert!(bytes.chunks_exact(4).all(|pixel| pixel == [0, 255, 0, 255]));
     drop(retained);
+    overlapping_graphics_buffers_preserve_shader_bindings(&mut execution, &uniform_draw, &backing);
     render_area_preserves_undefined_padding(&mut execution, &state);
     window_depth_reconstructs_reads_and_clamps_exports(&mut execution, &state);
     contiguous_instances_preserve_vertex_inputs(&mut execution, &state, &backing);
@@ -1381,6 +1329,119 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     execution.teardown().unwrap();
     drop(execution);
     monitor.check().unwrap();
+}
+
+fn overlapping_graphics_buffers_preserve_shader_bindings(
+    execution: &mut NativeGpuExecution,
+    template: &Arc<GuestDrawState>,
+    output: &Arc<PhysicalMapping>,
+) {
+    use nixe_memory::PAGE_SIZE;
+    // Resolve a small uniform first, then grow its physical buffer through a
+    // vertex or index range crossing the page boundary. The shader must bind
+    // the surviving buffer, including the uniform value written by the GPU.
+    // The last case reverses the dependency: a shader range grows the vertex buffer.
+    for case in 0..3 {
+        let indexed = case == 1;
+        let (allocation, mapping) = backing_allocation(
+            &execution.residency,
+            2 * PAGE_SIZE as usize,
+            PAGE_SIZE as usize,
+            0,
+        );
+        let uniform = mapping
+            .slice(0, if case == 2 { 2 * PAGE_SIZE } else { 16 })
+            .unwrap();
+        let mut draw = (**template).clone();
+        draw.identity = PreparedStateId::new(10000 + case, 1);
+        let program = Arc::make_mut(&mut draw.program);
+        program.identity = PreparedStateId::new(11000 + case, 1);
+        program.bindings = Box::new([(
+            uniform_color_resource(),
+            GuestBinding::Buffer(Arc::clone(&uniform)),
+        )]);
+        let arguments = if indexed {
+            let offset = PAGE_SIZE - 2;
+            crate::residency::tests::cpu_write(
+                &mut execution.residency,
+                &allocation,
+                offset,
+                &[0, 0, 1, 0, 2, 0],
+            )
+            .unwrap();
+            draw.index = Some(GuestIndexBuffer::Canonical(
+                mapping.slice(offset, 6).unwrap(),
+                IndexType::Uint16,
+            ));
+            DrawArguments::Indexed {
+                first_index: 0,
+                index_count: 3,
+                vertex_offset: 0,
+                first_instance: 0,
+                instance_count: 1,
+            }
+        } else {
+            let offset = if case == 2 { 64 } else { PAGE_SIZE - 24 };
+            let vertices: [f32; 18] = [
+                -1., -1., 0., 0., 1., 0., 3., -1., 0., 0., 1., 0., -1., 3., 0., 0., 1., 0.,
+            ];
+            crate::residency::tests::cpu_write(
+                &mut execution.residency,
+                &allocation,
+                offset,
+                &vertices
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            draw.vertices = Arc::from([GuestVertexBuffer {
+                binding: 0,
+                backing: mapping.slice(offset, 72).unwrap(),
+            }]);
+            draw.index = None;
+            DrawArguments::NonIndexed {
+                first_vertex: 0,
+                vertex_count: 3,
+                first_instance: 0,
+                instance_count: 1,
+            }
+        };
+        let initial = execution
+            .residency
+            .buffer_for_deferred_import(
+                mapping.slice(0, 16).unwrap(),
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+            )
+            .unwrap();
+        let color = [0f32, 1., 0., 1.]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let upload = execution
+            .residency
+            .write_buffer(initial.buffer, initial.offset, &color)
+            .unwrap();
+        assert_eq!(upload.consumed, color.len());
+        let merges = execution.residency.statistics().buffer_merges;
+        let work = NativeWork {
+            frontend: FrontendSubmissionId::new(10000 + case),
+            command: NativeCommand::Draw {
+                state: Arc::new(draw),
+                arguments,
+            },
+        };
+        for _ in 0..2 {
+            consume(execution, &work).unwrap();
+            execution.submit(work.frontend).unwrap();
+            let bytes = cpu_read(&mut execution.residency, output);
+            assert!(bytes.chunks_exact(4).all(|pixel| pixel == [0, 255, 0, 255]));
+            finish_next(execution).unwrap().unwrap();
+        }
+        assert!(execution.residency.statistics().buffer_merges > merges);
+        assert!(!execution.residency.buffer_binding_current(initial.buffer));
+        assert!(execution.residency.constructing.is_empty());
+    }
 }
 
 fn contiguous_instances_preserve_vertex_inputs(
@@ -1427,34 +1488,29 @@ fn contiguous_instances_preserve_vertex_inputs(
     });
     draw.vertices = buffers.into();
     let draw = Arc::new(draw);
-    let command = |first_instance| NativeCommand::Draw {
-        state: Arc::clone(&draw),
-        arguments: DrawArguments::NonIndexed {
-            first_vertex: 0,
-            vertex_count: 3,
-            first_instance,
-            instance_count: 1,
-        },
-    };
     for grouped in [false, true] {
         let before = execution.recording_statistics().draw_calls;
-        let groups = if grouped {
-            vec![vec![command(3), command(4), command(5)]]
+        let instances = if grouped {
+            vec![(3, 3)]
         } else {
-            (3..6).map(|id| vec![command(id)]).collect()
+            (3..6).map(|id| (id, 1)).collect()
         };
-        for commands in groups {
-            let submission = NativeSubmission::new(
-                FrontendSubmissionId::new(3000),
-                FrontendSubmissionSegment::FIRST,
-                true,
-                commands,
-            );
-            ready(execution, &submission);
-            execution
-                .submit(ExecutionBatch {
-                    commands: &submission,
-                })
+        for (first_instance, instance_count) in instances {
+            let submission = NativeWork {
+                frontend: FrontendSubmissionId::new(3000),
+                command: NativeCommand::Draw {
+                    state: Arc::clone(&draw),
+                    arguments: DrawArguments::NonIndexed {
+                        first_vertex: 0,
+                        vertex_count: 3,
+                        first_instance,
+                        instance_count,
+                    },
+                },
+            };
+
+            consume(execution, &submission)
+                .and_then(|()| execution.submit(submission.frontend))
                 .unwrap();
         }
         let bytes = cpu_read(&mut execution.residency, backing);
@@ -1567,11 +1623,9 @@ fn window_depth_reconstructs_reads_and_clamps_exports(
             &execution.device_profile().shader_compiler,
             Some((header, instructions)),
         );
-        let submission = NativeSubmission::new(
-            FrontendSubmissionId::new(4000 + index as u64),
-            FrontendSubmissionSegment::FIRST,
-            true,
-            vec![NativeCommand::Draw {
+        let submission = NativeWork {
+            frontend: FrontendSubmissionId::new(4000 + index as u64),
+            command: NativeCommand::Draw {
                 state: Arc::new(draw),
                 arguments: DrawArguments::NonIndexed {
                     first_vertex: 0,
@@ -1579,13 +1633,11 @@ fn window_depth_reconstructs_reads_and_clamps_exports(
                     first_instance: 0,
                     instance_count: 1,
                 },
-            }],
-        );
-        ready(execution, &submission);
-        execution
-            .submit(ExecutionBatch {
-                commands: &submission,
-            })
+            },
+        };
+
+        consume(execution, &submission)
+            .and_then(|()| execution.submit(submission.frontend))
             .unwrap();
         let guest_z: f32 = transform.map_or(0.625, |[scale, offset]| 0.625 * scale + offset);
         let expected_red = ((guest_z * 0.25 + 0.5) * 255.).round() as u8;
@@ -1643,42 +1695,38 @@ fn render_area_preserves_undefined_padding(
         first_instance: 0,
         instance_count: 1,
     };
-    let first = NativeSubmission::new(
-        FrontendSubmissionId::new(100),
-        FrontendSubmissionSegment::FIRST,
-        false,
-        vec![
-            NativeCommand::Clear {
-                image: image.clone(),
-                rectangle: area,
-                value: ClearValue::Color([0., 0., 1., 1.]),
-            },
-            NativeCommand::Draw {
-                state: Arc::new(draw.clone()),
-                arguments,
-            },
-        ],
-    );
+    let first = NativeWork {
+        frontend: FrontendSubmissionId::new(100),
+        command: NativeCommand::Sequence(
+            vec![
+                NativeCommand::Clear {
+                    image: image.clone(),
+                    rectangle: area,
+                    value: ClearValue::Color([0., 0., 1., 1.]),
+                },
+                NativeCommand::Draw {
+                    state: Arc::new(draw.clone()),
+                    arguments,
+                },
+            ]
+            .into_boxed_slice(),
+        ),
+    };
     let parameters = Arc::make_mut(&mut draw.parameters);
     parameters.identity = PreparedStateId::new(102, 1);
     parameters.scissor.x = 3;
     draw.identity = PreparedStateId::new(103, 1);
-    let second = NativeSubmission::new(
-        FrontendSubmissionId::new(101),
-        FrontendSubmissionSegment::FIRST,
-        false,
-        vec![NativeCommand::Draw {
+    let second = NativeWork {
+        frontend: FrontendSubmissionId::new(101),
+        command: NativeCommand::Draw {
             state: Arc::new(draw),
             arguments,
-        }],
-    );
+        },
+    };
     let scopes = execution.recording_statistics().rendering_scopes;
     for submission in [&first, &second] {
-        ready(execution, submission);
-        execution
-            .submit(ExecutionBatch {
-                commands: submission,
-            })
+        consume(execution, submission)
+            .and_then(|()| execution.submit(submission.frontend))
             .unwrap();
     }
     assert_eq!(
@@ -1757,6 +1805,7 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
         let (_allocation_5, backing) = backing_allocation(&execution.residency, 4096, 4096, 0xa5);
         let backing = backing.slice(0, u64::from(width * height) * bpp).unwrap();
         let image = GuestImage {
+            view_identity: None,
             sample_grid: [1, 1],
             canonical_texels: true,
             swizzle: Swizzle::IDENTITY,
@@ -1805,27 +1854,26 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
     for frame in 0..4 {
         let ys: Arc<[u8]> = (0..15).map(|i| (i * 11 + frame * 13) as u8).collect();
         let uvs: Arc<[u8]> = (0..12).map(|i| (i * 7 + frame * 9) as u8).collect();
-        let submission = NativeSubmission::new(
-            FrontendSubmissionId::new(frame as u64 + 1),
-            FrontendSubmissionSegment::FIRST,
-            true,
-            vec![
-                NativeCommand::UploadPlanes {
-                    images: Box::new([y.clone(), uv.clone()]),
-                    widths: [5, 3],
-                    bytes: [Arc::clone(&ys), Arc::clone(&uvs)],
-                },
-                NativeCommand::ConvertNv12 {
-                    images: Box::new([y.clone(), uv.clone(), output.clone()]),
-                    transform,
-                },
-            ],
-        );
-        ready(&mut execution, &submission);
-        execution
-            .submit(ExecutionBatch {
-                commands: &submission,
-            })
+        let submission = NativeWork {
+            frontend: FrontendSubmissionId::new(frame as u64 + 1),
+            command: NativeCommand::Sequence(
+                vec![
+                    NativeCommand::UploadPlanes {
+                        images: Box::new([y.clone(), uv.clone()]),
+                        widths: [5, 3],
+                        bytes: [Arc::clone(&ys), Arc::clone(&uvs)],
+                    },
+                    NativeCommand::ConvertNv12 {
+                        images: Box::new([y.clone(), uv.clone(), output.clone()]),
+                        transform,
+                    },
+                ]
+                .into_boxed_slice(),
+            ),
+        };
+
+        consume(&mut execution, &submission)
+            .and_then(|()| execution.submit(submission.frontend))
             .unwrap();
         finish_next(&mut execution).unwrap().unwrap();
         let pixels = cpu_read(
@@ -1916,18 +1964,16 @@ fn captured_compute_dispatch_reuses_prepared_pipeline_without_old_ir() {
     )
     .unwrap();
     for value in 1..=2 {
-        let batch = NativeSubmission::new(
-            FrontendSubmissionId::new(value),
-            FrontendSubmissionSegment::FIRST,
-            true,
-            vec![NativeCommand::Dispatch {
+        let batch = NativeWork {
+            frontend: FrontendSubmissionId::new(value),
+            command: NativeCommand::Dispatch {
                 program: Arc::clone(&program),
                 groups: [value as u32, 1, 1],
-            }],
-        );
-        ready(&mut execution, &batch);
-        execution
-            .submit(ExecutionBatch { commands: &batch })
+            },
+        };
+
+        consume(&mut execution, &batch)
+            .and_then(|()| execution.submit(batch.frontend))
             .unwrap();
         finish_next(&mut execution).unwrap().unwrap();
     }
@@ -1970,21 +2016,17 @@ fn recorder_prefixes_retain_gpu_versions_without_allocating_completion_records()
             16
         );
         for value in 1..=128u8 {
-            let prefix = NativeSubmission::new(
-                FrontendSubmissionId::new(1),
-                FrontendSubmissionSegment::FIRST,
-                false,
-                vec![NativeCommand::ReportMemory {
+            let prefix = NativeWork {
+                frontend: FrontendSubmissionId::new(1),
+                command: NativeCommand::ReportMemory {
                     fence: true,
                     target: backing.pin(0, backing.bytes()).unwrap(),
                     offset: 64,
                     bytes: Arc::from([value; 16]),
-                }],
-            );
-            ready(&mut execution, &prefix);
-            execution
-                .record(ExecutionBatch { commands: &prefix })
-                .unwrap();
+                },
+            };
+
+            consume(&mut execution, &prefix).unwrap();
             assert!(execution.completions.is_empty());
             assert!(execution.poll_completion().unwrap().is_none());
         }
@@ -2000,15 +2042,13 @@ fn recorder_prefixes_retain_gpu_versions_without_allocating_completion_records()
             );
             assert!(execution.poll_completion().unwrap().is_none());
         }
-        let tail = NativeSubmission::new(
-            FrontendSubmissionId::new(1),
-            FrontendSubmissionSegment::FIRST,
-            true,
-            vec![NativeCommand::WaitForIdle],
-        );
-        ready(&mut execution, &tail);
-        let token = execution
-            .submit(ExecutionBatch { commands: &tail })
+        let tail = NativeWork {
+            frontend: FrontendSubmissionId::new(1),
+            command: NativeCommand::WaitForIdle,
+        };
+
+        let token = consume(&mut execution, &tail)
+            .and_then(|()| execution.submit(tail.frontend))
             .unwrap();
         assert_eq!(execution.completions.len(), 1);
         let completed = finish_next(&mut execution).unwrap().unwrap();
@@ -2042,6 +2082,7 @@ fn pressure_image(execution: &NativeGpuExecution) -> (nixe_memory::Allocation, G
     (
         allocation,
         GuestImage {
+            view_identity: None,
             description: nixe_gpu::ImageDescription::new(
                 ImageDimension::Two,
                 nixe_gpu::ImageExtent::new(64, 64, 1).unwrap(),

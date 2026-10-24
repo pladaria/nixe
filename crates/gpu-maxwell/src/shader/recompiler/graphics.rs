@@ -132,22 +132,6 @@ fn constant_buffer(
         },
     }
 }
-impl CapturedStage {
-    /// Only bindings read during translation can invalidate the captured environment.
-    pub(crate) fn graphics_bindings_current(
-        &self,
-        state: &MaxwellThreeDState,
-        group: Option<u8>,
-    ) -> bool {
-        self.bindings_match(
-            |index| constant_buffer(state, group, index),
-            texture_pool(state),
-            viewport_transform(state),
-            state.shader_bindings().geometry_passthrough_mask(),
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

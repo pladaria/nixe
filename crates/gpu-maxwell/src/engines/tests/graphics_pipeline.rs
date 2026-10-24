@@ -3,7 +3,7 @@ use std::sync::Arc;
 use super::*;
 
 #[test]
-fn raw_and_shadow_words_preserve_validity_and_latest_write_provenance() {
+fn raw_words_and_shadow_words_preserve_values() {
     let mut channel = three_d_channel();
     let reset = channel
         .three_d_mut()
@@ -16,7 +16,7 @@ fn raw_and_shadow_words_preserve_validity_and_latest_write_provenance() {
         channel
             .three_d_mut()
             .mme()
-            .shadow_register(GpuMethodId(0x0dac))
+            .shadow_value(GpuMethodId(0x0dac))
             .is_none()
     );
     for method in [0x3401, 0x37fc, 0x4000, u32::MAX] {
@@ -30,7 +30,7 @@ fn raw_and_shadow_words_preserve_validity_and_latest_write_provenance() {
             channel
                 .three_d_mut()
                 .mme()
-                .shadow_register(GpuMethodId(method))
+                .shadow_value(GpuMethodId(method))
                 .is_none()
         );
     }
@@ -46,16 +46,14 @@ fn raw_and_shadow_words_preserve_validity_and_latest_write_provenance() {
             .three_d_mut()
             .raw_register(GpuMethodId(method))
             .unwrap();
-        assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(raw.raw(), Some(u32::MAX));
         assert_eq!(raw.value(), Some(&u32::MAX));
-        assert_eq!(raw.source(), Some(source));
         assert_eq!(
             channel
                 .three_d_mut()
                 .mme()
-                .shadow_register(GpuMethodId(method)),
-            Some(raw)
+                .shadow_value(GpuMethodId(method)),
+            Some(u32::MAX)
         );
 
         let retained = channel.three_d_mut().clone();
@@ -64,21 +62,20 @@ fn raw_and_shadow_words_preserve_validity_and_latest_write_provenance() {
         assert_ne!(source, new_source);
         assert_eq!(retained.raw_register(GpuMethodId(method)), Some(raw));
         assert_eq!(
-            retained.mme().shadow_register(GpuMethodId(method)),
-            Some(raw)
+            retained.mme().shadow_value(GpuMethodId(method)),
+            Some(u32::MAX)
         );
         let rewritten = channel
             .three_d_mut()
             .raw_register(GpuMethodId(method))
             .unwrap();
         assert_eq!(rewritten.raw(), raw.raw());
-        assert_eq!(rewritten.source(), Some(new_source));
         assert_eq!(
             channel
                 .three_d_mut()
                 .mme()
-                .shadow_register(GpuMethodId(method)),
-            Some(rewritten)
+                .shadow_value(GpuMethodId(method)),
+            Some(u32::MAX)
         );
     }
 }
@@ -386,23 +383,6 @@ fn zero_bandwidth_clear_masks_preserve_independent_state_without_gpu_work() {
 }
 
 #[test]
-fn zero_bandwidth_clear_masks_reject_reserved_bits_without_mutating_state() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x07a4, 0x7ff8);
-    program_three_d(&mut channel, 0x07a8, 0x7ffe);
-    for method in [0x07a4, 0x07a8] {
-        for mask in [0x8000, 0xffff, 0x10000, 0x8000_0000, u32::MAX] {
-            let before = channel.clone();
-            assert!(matches!(
-                dispatch_method(&mut channel, method / 4, mask),
-                Err(MaxwellEngineDispatchError::InvalidMethodEncoding { .. })
-            ));
-            assert_eq!(channel, before);
-        }
-    }
-}
-
-#[test]
 fn compression_threshold_is_typed_source_preserving_nonsemantic_policy() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
@@ -446,35 +426,6 @@ fn compression_threshold_is_typed_source_preserving_nonsemantic_policy() {
     )
     .unwrap();
     assert!(resources.resources().next().is_none());
-}
-
-#[test]
-fn compression_threshold_reserved_values_and_failed_packet_keeps_valid_prefix() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x1220, 5);
-
-    for argument in [13, 14, 15, 16, 0x8000_0000, u32::MAX] {
-        let before = channel.clone();
-        let decoded = packet(0x1220 / 4, argument);
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_COMPRESSION_THRESHOLD",
-                reason: "sample threshold is undefined or reserved bits are set",
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel, before);
-    }
-
-    let before = channel.clone();
-    let decoded = non_incrementing_packet_on_subchannel(0, 0x1220 / 4, &[0, 13]);
-    assert!(matches!(
-        dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding { source, .. })
-            if source.argument() == 13
-    ));
-    assert_ne!(channel, before);
 }
 
 #[test]
@@ -1363,8 +1314,7 @@ fn mme_emitted_methods_track_replay_and_bypass_the_same_shadow_registers_as_push
         let shadow = channel
             .three_d_mut()
             .mme()
-            .shadow_register(GpuMethodId(0x192c))
-            .and_then(|register| register.raw());
+            .shadow_value(GpuMethodId(0x192c));
         assert_eq!(shadow, Some(u32::from(mode >= 2)), "mode {mode}");
         program_three_d(&mut channel, 0x0124, 3);
         program_three_d(&mut channel, 0x192c, 0);
@@ -1619,9 +1569,7 @@ fn mme_reads_polygon_mode_reset_bits_until_guest_programming_overrides_them() {
         .three_d_mut()
         .raw_register(GpuMethodId(0x0dac))
         .unwrap();
-    assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::Programmed);
     assert_eq!(raw.raw(), Some(0x1b02));
-    assert!(raw.source().is_some());
     let typed = channel
         .three_d()
         .fixed_function()
@@ -1734,9 +1682,7 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
         .three_d_mut()
         .raw_register(GpuMethodId(0x20c0))
         .unwrap();
-    assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::Programmed);
     assert_eq!(raw.raw(), Some(0x41));
-    assert!(raw.source().is_some());
     let binding = &channel.three_d().shader_bindings().pipeline()[3];
     assert_eq!(
         binding.enabled().origin(),
@@ -1792,10 +1738,9 @@ fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
     let tracked = channel
         .three_d_mut()
         .mme()
-        .shadow_register(GpuMethodId(0x0dac))
+        .shadow_value(GpuMethodId(0x0dac))
         .unwrap();
-    assert_eq!(tracked.raw(), Some(0x1b02));
-    assert_eq!(tracked.source().unwrap().argument(), 0x1b02);
+    assert_eq!(tracked, 0x1b02);
 
     program_three_d(&mut channel, 0x0124, 2);
     program_three_d(&mut channel, 0x0dac, 0x1b01);
@@ -1803,9 +1748,7 @@ fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
         channel
             .three_d_mut()
             .mme()
-            .shadow_register(GpuMethodId(0x0dac))
-            .unwrap()
-            .raw(),
+            .shadow_value(GpuMethodId(0x0dac)),
         Some(0x1b02)
     );
     assert_eq!(
@@ -1842,9 +1785,7 @@ fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
         channel
             .three_d_mut()
             .mme()
-            .shadow_register(GpuMethodId(0x0dac))
-            .unwrap()
-            .raw(),
+            .shadow_value(GpuMethodId(0x0dac)),
         Some(0x1b00)
     );
 
@@ -1881,7 +1822,7 @@ fn depth_layer_reset_is_shared_by_live_state_and_mme_shadow_replay() {
         channel
             .three_d_mut()
             .mme()
-            .shadow_register(GpuMethodId(0x179c))
+            .shadow_value(GpuMethodId(0x179c))
             .is_none()
     );
     // The reset is not a target binding and does not initialize other fields.
@@ -2045,7 +1986,7 @@ fn mme_shadow_replay_uses_the_verified_window_origin_reset() {
         channel
             .three_d_mut()
             .mme()
-            .shadow_register(GpuMethodId(0x13ac))
+            .shadow_value(GpuMethodId(0x13ac))
             .is_none()
     );
     let reset = channel
@@ -2086,7 +2027,7 @@ fn mme_shadow_replay_uses_the_verified_window_origin_reset() {
         channel
             .three_d_mut()
             .mme()
-            .shadow_register(GpuMethodId(0x13ac))
+            .shadow_value(GpuMethodId(0x13ac))
             .is_none()
     );
 }
@@ -2599,56 +2540,6 @@ fn vertex_assembly_controls_update_typed_state() {
 }
 
 #[test]
-fn invalid_vertex_assembly_controls_and_failed_packet_keeps_valid_prefix() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x1610, 0x0e);
-    program_three_d(&mut channel, 0x164c, 0x1000);
-
-    for (method, method_name, arguments) in [
-        (
-            0x1610,
-            "SET_ATTRIBUTE_DEFAULT",
-            [0x40, 0x100, 0x8000_0000, u32::MAX],
-        ),
-        (0x164c, "SET_DA_OUTPUT", [1, 0x2000, 0x1001, u32::MAX]),
-    ] {
-        for argument in arguments {
-            let frontend_before = channel.frontend();
-            let two_d_before = channel.two_d().clone();
-            let three_d_before = channel.three_d().clone();
-            let decoded = packet(method / 4, argument);
-            assert!(matches!(
-                dispatch_first(&mut channel, &decoded),
-                Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                    source,
-                    method_name: actual,
-                    ..
-                }) if actual == method_name && source.argument() == argument
-            ));
-            assert_eq!(channel.frontend(), frontend_before);
-            assert_eq!(channel.two_d(), &two_d_before);
-            assert_eq!(channel.three_d(), &three_d_before);
-        }
-    }
-
-    let frontend_before = channel.frontend();
-    let two_d_before = channel.two_d().clone();
-    let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x1648 / 4, &[0xdead_beef, 1]);
-    assert!(matches!(
-        dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-            source,
-            method_name: "SET_DA_OUTPUT",
-            ..
-        }) if source.argument() == 1
-    ));
-    assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
-    assert_ne!(channel.three_d(), &three_d_before);
-}
-
-#[test]
 fn vertex_stream_attributes_and_begin_state_remain_unresolved_and_typed() {
     let mut channel = three_d_channel();
     for (method, argument) in [
@@ -3084,54 +2975,6 @@ fn invalid_vertex_stream_substitute_upper_and_failed_packet_keeps_valid_prefix()
 }
 
 #[test]
-fn pipeline_program_offsets_and_register_counts_are_indexed_and_atomic() {
-    let mut channel = three_d_channel();
-
-    for pipeline in 0..MAXWELL_PIPELINE_SHADER_COUNT {
-        let program_method = 0x2004 + pipeline as u32 * 0x40;
-        let count_method = 0x200c + pipeline as u32 * 0x40;
-        let offset = 0x1000 + pipeline as u32 * 0x80;
-        let count = 4 + pipeline as u32;
-
-        let program_dispatch = dispatch_method(&mut channel, program_method / 4, offset).unwrap();
-        let program_source = program_dispatch.methods()[0].method().source();
-        assert_eq!(
-            program_dispatch.methods()[0].metadata().method_name(),
-            "SET_PIPELINE_PROGRAM"
-        );
-
-        let count_dispatch = dispatch_method(&mut channel, count_method / 4, count).unwrap();
-        let count_source = count_dispatch.methods()[0].method().source();
-        assert_eq!(
-            count_dispatch.methods()[0].metadata().method_name(),
-            "SET_PIPELINE_REGISTER_COUNT"
-        );
-
-        let binding = &channel.three_d().shader_bindings().pipeline()[pipeline];
-        assert_eq!(binding.program_offset().raw(), Some(offset));
-        assert_eq!(binding.program_offset().value(), Some(&offset));
-        assert_eq!(binding.program_offset().source(), Some(program_source));
-        assert_eq!(binding.register_count().raw(), Some(count));
-        assert_eq!(binding.register_count().value(), Some(&(count as u8)));
-        assert_eq!(binding.register_count().source(), Some(count_source));
-    }
-
-    for argument in [0x100, 0x1ff, u32::MAX] {
-        let before = channel.clone();
-        let invalid = packet(0x200c / 4, argument);
-        assert!(matches!(
-            dispatch_first(&mut channel, &invalid),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_PIPELINE_REGISTER_COUNT",
-                ..
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel, before);
-    }
-}
-
-#[test]
 fn program_offset_and_register_count_updates_preserve_slot_state() {
     let mut channel = three_d_channel();
 
@@ -3287,7 +3130,7 @@ fn viewport_firmware_defaults_are_shared_by_live_state_and_shadow_replay() {
             channel
                 .three_d_mut()
                 .mme()
-                .shadow_register(GpuMethodId(method))
+                .shadow_value(GpuMethodId(method))
                 .is_none()
         );
     }

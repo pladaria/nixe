@@ -4,18 +4,13 @@ use nixe_gpu::metrics::{Counter, record};
 
 pub(super) struct Queries {
     owner: Arc<DeviceOwner>,
-    recording: crate::dispatch::RecordingHandle,
     pool: vk::QueryPool,
     period: f64,
     mask: u64,
     pending: bool,
 }
 impl Queries {
-    pub fn new(
-        owner: Arc<DeviceOwner>,
-        family: u32,
-        recording: crate::dispatch::RecordingHandle,
-    ) -> Result<Option<Self>, VulkanError> {
+    pub fn new(owner: Arc<DeviceOwner>, family: u32) -> Result<Option<Self>, VulkanError> {
         let families = unsafe {
             owner
                 .instance
@@ -42,7 +37,6 @@ impl Queries {
         }
         .map_err(|e| VulkanError::vk("queue timing query pool", e))?;
         Ok(Some(Self {
-            recording,
             owner,
             pool,
             period: f64::from(properties.limits.timestamp_period),
@@ -50,30 +44,26 @@ impl Queries {
             pending: false,
         }))
     }
-    pub fn begin(&mut self, command: vk::CommandBuffer) {
-        self.recording
-            .push(crate::dispatch::Command::ResetQueryPool {
+    pub fn begin(&mut self, dispatch: &mut crate::dispatch::Dispatch, command: vk::CommandBuffer) {
+        unsafe {
+            dispatch.cmd_reset_query_pool(command, self.pool, 0, 2);
+            dispatch.cmd_write_timestamp(
                 command,
-                pool: self.pool,
-                first: 0,
-                count: 2,
-            });
-        self.recording
-            .push(crate::dispatch::Command::WriteTimestamp {
-                command,
-                stage: vk::PipelineStageFlags::TOP_OF_PIPE,
-                pool: self.pool,
-                index: 0,
-            });
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                self.pool,
+                0,
+            );
+        }
     }
-    pub fn end(&mut self, command: vk::CommandBuffer) {
-        self.recording
-            .push(crate::dispatch::Command::WriteTimestamp {
+    pub fn end(&mut self, dispatch: &mut crate::dispatch::Dispatch, command: vk::CommandBuffer) {
+        unsafe {
+            dispatch.cmd_write_timestamp(
                 command,
-                stage: vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                pool: self.pool,
-                index: 1,
-            });
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                self.pool,
+                1,
+            );
+        }
         self.pending = true;
     }
     pub fn retire(&mut self) -> Result<(), VulkanError> {

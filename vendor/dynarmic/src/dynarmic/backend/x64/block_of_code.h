@@ -97,6 +97,10 @@ public:
         } else {
             call(fn);
         }
+        // Native helpers may leave YMM upper lanes live before generated SSE resumes.
+        if (HasHostFeature(HostFeature::AVX)) {
+            vzeroupper();
+        }
     }
 
     /// Code emitter: Calls the lambda. Lambda must not have any captures.

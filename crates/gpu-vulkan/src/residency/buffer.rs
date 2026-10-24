@@ -322,6 +322,18 @@ impl VulkanResidency {
         self.touch(Resource::Buffer(id));
         Ok(id)
     }
+    /// Match the cache/stream preference over recent guest frames, independently
+    /// of host presentation frequency. Alignment copies remain mandatory.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+    pub(crate) fn tick_uniform_cache(&mut self) {
+        let hits: u64 = self.uniform_cache_hits.iter().sum();
+        let shots: u64 = self.uniform_cache_shots.iter().sum();
+        self.uniform_stream_limit = if hits * 256 < shots * 251 { 4096 } else { 0 };
+        self.uniform_cache_hits.copy_within(..17, 1);
+        self.uniform_cache_shots.copy_within(..17, 1);
+        self.uniform_cache_hits[0] = 0;
+        self.uniform_cache_shots[0] = 0;
+    }
     /// Frequently rewritten CPU uniforms receive immutable upload slices. They
     /// stay dirty and do not install page observers or quiesce running cores.
     pub(super) fn stream_buffer(
@@ -608,7 +620,7 @@ impl VulkanResidency {
                     &[vk::BufferCopy::default().size(bytes)],
                 );
                 super::recording::scratch_read_barrier(
-                    &self.device,
+                    &mut self.device,
                     command,
                     scratch.handle,
                     bytes,

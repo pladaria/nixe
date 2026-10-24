@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod memory;
 mod table;
 pub use memory::MaxwellGpuMemory;
+pub(crate) use memory::MaxwellGpuReadBatch;
 use nixe_gpu::MappingGeneration;
 use nixe_gpu::MappingGenerationExhausted;
 use table::PageTable;
@@ -402,31 +403,12 @@ pub struct MaxwellResolvedRange {
     offset: GpuVirtualAddress,
     size: u64,
     permissions: MemoryPermissions,
-    // Caches share weak mapping metadata. Inline append alone changes topology;
+    // Caches share weak mapping metadata;
     // accepted native inputs own their physical pins separately.
     segments: Arc<[MaxwellResolvedMapping]>,
 }
 
 impl MaxwellResolvedRange {
-    /// Extend an ordered inline upload within the same mapping lifetime.
-    /// Consumption captures the complete physical range once the run ends.
-    pub(crate) fn append_inline_word(&mut self, address: u64) -> Option<()> {
-        self.append_inline_bytes(address, 4)
-    }
-
-    pub(crate) fn append_inline_bytes(&mut self, address: u64, size: u64) -> Option<()> {
-        if self.offset.get().checked_add(self.size)? != address || self.segments.len() != 1 {
-            return None;
-        }
-        if address.checked_add(size)? > self.segments[0].mapping.end().ok()? {
-            return None;
-        }
-        let segment = &mut Arc::make_mut(&mut self.segments)[0];
-        segment.size += size;
-        self.size += size;
-        Some(())
-    }
-
     #[must_use]
     pub const fn address_space(&self) -> MaxwellAddressSpaceId {
         self.address_space

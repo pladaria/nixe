@@ -1,6 +1,6 @@
 //! The shared GPU page table used directly by the command processor.
 use super::*;
-use std::sync::{RwLock, atomic::AtomicU64};
+use std::sync::{RwLock, RwLockReadGuard, atomic::AtomicU64};
 
 #[derive(Debug)]
 pub(super) struct TranslationState {
@@ -22,7 +22,95 @@ pub(super) struct Mappings {
 pub struct MaxwellGpuMemory {
     pub(super) inner: Arc<TranslationState>,
 }
+pub(crate) struct MaxwellGpuReadBatch<'a> {
+    space: &'a MaxwellGpuMemory,
+    mappings: Option<RwLockReadGuard<'a, Mappings>>,
+    reader: nixe_memory::MappedRamReader<'a>,
+}
+
+impl MaxwellGpuReadBatch<'_> {
+    pub(crate) fn release(&mut self) {
+        self.reader.release();
+        self.mappings = None;
+    }
+
+    pub(crate) fn read_into(
+        &mut self,
+        address: GpuVirtualAddress,
+        output: &mut [u8],
+        access: &mut nixe_gpu::MemoryAccess<'_>,
+    ) -> Result<(), MaxwellGpuAccessError> {
+        let space = self.space;
+        space.validate_resolution_request(address, MemoryPermissions::READ)?;
+        if output.is_empty() {
+            return Ok(());
+        }
+        space
+            .checked_add(address, output.len() as u64 - 1)
+            .map_err(MaxwellGpuAccessError::Address)?;
+        if self.mappings.is_none() {
+            self.mappings = Some(
+                space
+                    .inner
+                    .mappings
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
+        let mappings = self.mappings.as_ref().unwrap();
+        let mut copied = 0;
+        while copied < output.len() {
+            let cursor = space
+                .checked_add(address, copied as u64)
+                .map_err(MaxwellGpuAccessError::Address)?;
+            let entry = mappings
+                .table
+                .get(cursor.get())
+                .ok_or(MaxwellGpuAccessError::UnmappedAddress { address: cursor })?;
+            let mapping = &mappings.live[entry.slot as usize]
+                .as_ref()
+                .unwrap()
+                .descriptor;
+            if !mapping.permissions.contains(MemoryPermissions::READ) {
+                return Err(MaxwellGpuAccessError::PermissionDenied {
+                    address: cursor,
+                    required: MemoryPermissions::READ,
+                    available: mapping.permissions,
+                });
+            }
+            let within = cursor.get() & 0xfff;
+            let bytes = (0x1000 - within).min((output.len() - copied) as u64) as usize;
+            let physical = ArenaOffset::new((u64::from(entry.physical_page) << 12) + within);
+            // SAFETY: the mapping guard retains the live physical pins.
+            if !unsafe {
+                self.reader
+                    .try_read(physical, &mut output[copied..copied + bytes])
+            }
+            .map_err(|error| MaxwellGpuAccessError::Backing(Arc::new(error)))?
+            {
+                let resolved = space.resolve_range_locked(
+                    address,
+                    output.len() as u64,
+                    MemoryPermissions::READ,
+                    mappings,
+                )?;
+                let inputs = space.capture_validated(&resolved)?;
+                self.release();
+                return MaxwellGpuMemory::read_device(inputs, output, access);
+            }
+            copied += bytes;
+        }
+        Ok(())
+    }
+}
 impl MaxwellGpuMemory {
+    pub(crate) fn read_batch(&self) -> MaxwellGpuReadBatch<'_> {
+        MaxwellGpuReadBatch {
+            space: self,
+            mappings: None,
+            reader: self.machine().mapped_ram_reader(),
+        }
+    }
     pub(super) fn new(
         machine: Machine,
         id: MaxwellAddressSpaceId,
@@ -233,30 +321,64 @@ impl MaxwellGpuMemory {
             segments: segments.into(),
         })
     }
-    /// Consume immediate RAM under one mapping lifetime boundary. Retained
-    /// resolution objects are only needed when device coherence can suspend.
+    /// Consume an owner write directly through the page table, as Eden's
+    /// WriteBlockCached does. Only overlapping command RAM needs a temporary copy.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/memory_manager.cpp
-    pub fn read_into(
+    pub(crate) fn write_from(
         &self,
         address: GpuVirtualAddress,
-        output: &mut [u8],
-        access: &mut nixe_gpu::MemoryAccess<'_>,
+        source: &[u8],
+        written: &mut impl FnMut(
+            &[(nixe_memory::AllocationId, nixe_memory::Extent)],
+        ) -> Result<(), Arc<MemoryError>>,
     ) -> Result<(), MaxwellGpuAccessError> {
-        self.validate_resolution_request(address, MemoryPermissions::READ)?;
-        if output.is_empty() {
+        self.write_upload(address, nixe_memory::WriteSource::Bytes(source), written)
+    }
+    pub(crate) fn write_words(
+        &self,
+        address: GpuVirtualAddress,
+        source: crate::MaxwellMethodSpan<'_>,
+        written: &mut impl FnMut(
+            &[(nixe_memory::AllocationId, nixe_memory::Extent)],
+        ) -> Result<(), Arc<MemoryError>>,
+    ) -> Result<(), MaxwellGpuAccessError> {
+        let source = if let Some(bytes) = source.gathered_bytes() {
+            nixe_memory::WriteSource::Bytes(bytes)
+        } else {
+            let (address, offset) = source.ram_bytes().expect("command source");
+            nixe_memory::WriteSource::Ram {
+                address,
+                offset,
+                bytes: source.len() * 4,
+            }
+        };
+        self.write_upload(address, source, written)
+    }
+    fn write_upload(
+        &self,
+        address: GpuVirtualAddress,
+        source: nixe_memory::WriteSource<'_>,
+        written: &mut impl FnMut(
+            &[(nixe_memory::AllocationId, nixe_memory::Extent)],
+        ) -> Result<(), Arc<MemoryError>>,
+    ) -> Result<(), MaxwellGpuAccessError> {
+        self.validate_resolution_request(address, MemoryPermissions::WRITE)?;
+        if source.is_empty() {
             return Ok(());
         }
-        self.checked_add(address, output.len() as u64 - 1)
+        self.checked_add(address, source.len() as u64 - 1)
             .map_err(MaxwellGpuAccessError::Address)?;
         let mappings = self
             .inner
             .mappings
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut copied = 0;
-        while copied < output.len() {
+        let mut extents: smallvec::SmallVec<[(nixe_memory::AllocationId, nixe_memory::Extent); 4]> =
+            smallvec::SmallVec::new();
+        let mut offset = 0;
+        while offset < source.len() as u64 {
             let cursor = self
-                .checked_add(address, copied as u64)
+                .checked_add(address, offset)
                 .map_err(MaxwellGpuAccessError::Address)?;
             let entry = mappings
                 .table
@@ -266,36 +388,45 @@ impl MaxwellGpuMemory {
                 .as_ref()
                 .unwrap()
                 .descriptor;
-            if !mapping.permissions.contains(MemoryPermissions::READ) {
+            if !mapping.permissions.contains(MemoryPermissions::WRITE) {
                 return Err(MaxwellGpuAccessError::PermissionDenied {
                     address: cursor,
-                    required: MemoryPermissions::READ,
+                    required: MemoryPermissions::WRITE,
                     available: mapping.permissions,
                 });
             }
             let within = cursor.get() & 0xfff;
-            let bytes = (0x1000 - within).min((output.len() - copied) as u64) as usize;
-            let physical = ArenaOffset::new((u64::from(entry.physical_page) << 12) + within);
-            // SAFETY: the shared mapping guard retains the live physical pins.
-            if !unsafe {
-                self.machine()
-                    .try_read_mapped_ram(physical, &mut output[copied..copied + bytes])
-            }
-            .map_err(|error| MaxwellGpuAccessError::Backing(Arc::new(error)))?
+            let bytes = (0x1000 - within).min(source.len() as u64 - offset);
+            let start = ArenaOffset::new((u64::from(entry.physical_page) << 12) + within);
+            if let Some((allocation, last)) = extents.last_mut()
+                && *allocation == entry.allocation
+                && last.start.get() + last.bytes == start.get()
             {
-                let resolved = self.resolve_range_locked(
-                    address,
-                    output.len() as u64,
-                    MemoryPermissions::READ,
-                    &mappings,
-                )?;
-                let inputs = self.capture_validated(&resolved)?;
-                drop(mappings);
-                return Self::read_device(inputs, output, access);
+                last.bytes += bytes;
+            } else {
+                extents.push((entry.allocation, nixe_memory::Extent { start, bytes }));
             }
-            copied += bytes;
+            offset += bytes;
+        }
+        // Keep the mapping guard through the write and exact authority update.
+        // No retained request or second address translation is needed on the owner.
+        let device = unsafe { self.machine().write_mapped_owner(&extents, source) }
+            .map_err(|error| MaxwellGpuAccessError::Backing(Arc::new(error)))?;
+        if device {
+            written(&extents).map_err(MaxwellGpuAccessError::Backing)?;
         }
         Ok(())
+    }
+    /// Consume immediate RAM under one mapping lifetime boundary. Retained
+    /// resolution objects are only needed when device coherence can suspend.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/memory_manager.cpp
+    pub fn read_into(
+        &self,
+        address: GpuVirtualAddress,
+        output: &mut [u8],
+        access: &mut nixe_gpu::MemoryAccess<'_>,
+    ) -> Result<(), MaxwellGpuAccessError> {
+        self.read_batch().read_into(address, output, access)
     }
     /// Pin exactly the accepted physical spans, without retaining adjacent
     /// nvmap bytes. Later operations use these pins and never retranslate a VA.
@@ -366,6 +497,46 @@ impl MaxwellGpuMemory {
         let [segment] = resolved.segments() else {
             return Ok(None);
         };
+        self.command_ram_segment(segment)
+    }
+    /// The common single-mapping command entry needs no scatter list allocation.
+    pub(crate) fn command_ram_direct(
+        &self,
+        address: GpuVirtualAddress,
+        size: u64,
+    ) -> Result<
+        Option<(
+            MaxwellResolvedMapping,
+            nixe_memory::HostAddress,
+            AllocationRange,
+        )>,
+        MaxwellGpuAccessError,
+    > {
+        self.validate_resolution_request(address, MemoryPermissions::READ)?;
+        if size == 0 {
+            return Err(MaxwellGpuAccessError::EmptyRange);
+        }
+        self.checked_add(address, size - 1)
+            .map_err(MaxwellGpuAccessError::Address)?;
+        let mappings = self
+            .inner
+            .mappings
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut segment =
+            self.resolve_maximal_locked(address, MemoryPermissions::READ, &mappings)?;
+        if segment.size < size {
+            return Ok(None);
+        }
+        segment.size = size;
+        Ok(self
+            .command_ram_segment(&segment)?
+            .map(|(pointer, pin)| (segment, pointer, pin)))
+    }
+    fn command_ram_segment(
+        &self,
+        segment: &MaxwellResolvedMapping,
+    ) -> Result<Option<(nixe_memory::HostAddress, AllocationRange)>, MaxwellGpuAccessError> {
         let mapping = segment.mapping().physical();
         let begin = segment.backing_offset();
         let spans = mapping.spans();

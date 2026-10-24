@@ -2,12 +2,12 @@
 use super::*;
 use std::time::Instant;
 fn set_dynamic_defaults(
-    device: &VulkanDevice,
+    device: &mut VulkanDevice,
     pipeline: &NativePipeline,
     command: vk::CommandBuffer,
 ) {
     unsafe {
-        let raw = &device.dispatch;
+        let raw = &mut device.dispatch;
         raw.cmd_set_viewport(
             command,
             0,
@@ -103,7 +103,7 @@ fn raster_sample(
         )
     }
     .unwrap();
-    let slot = device.submission.begin().unwrap();
+    let slot = device.submission.begin(&mut device.dispatch).unwrap();
     let command = device.submission.slots[slot].command;
     unsafe {
         device.dispatch.cmd_reset_query_pool(command, query, 0, 2);

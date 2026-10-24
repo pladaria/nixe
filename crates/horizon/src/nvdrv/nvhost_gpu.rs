@@ -12,7 +12,7 @@ use nixe_gpu_maxwell::{
     MaxwellChannelPriority, MaxwellFrontendDispatchBoundary, MaxwellGpfifoDecodeError,
     MaxwellGpfifoSubmitRequest, MaxwellGpuAddressSpace, MaxwellInvalidGpfifoSubmission,
     MaxwellMemoryManagerId, MaxwellScheduleError, MaxwellScheduler, MaxwellZCullMode,
-    decode_gpfifo_submission, resolve_gpfifo_submission,
+    decode_gpfifo_submission, validate_gpfifo_submission,
 };
 use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 
@@ -428,6 +428,30 @@ pub(super) fn is_submit_gpfifo(request: u32) -> bool {
     request == IOCTL_CHANNEL_SUBMIT_GPFIFO2 || is_legacy_submit_gpfifo(request)
 }
 
+pub(super) fn submission_storage_bytes(
+    request: u32,
+    input: &[u8],
+    additional: &[u8],
+) -> Result<usize, NvDrvCallError> {
+    let (header, entries) = if request == IOCTL_CHANNEL_SUBMIT_GPFIFO2 {
+        require_input_size(input, CHANNEL_SUBMIT_GPFIFO_HEADER_SIZE)?;
+        (decode_submit_header(input)?, additional)
+    } else {
+        if !additional.is_empty() {
+            return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
+        }
+        decode_legacy_submit_gpfifo(request, input)?
+    };
+    let count = header.entry_count as usize;
+    if count.checked_mul(MAXWELL_GPFIFO_ENTRY_SIZE) != Some(entries.len()) {
+        return Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER));
+    }
+    // The decoded descriptor array is retained until command consumption.
+    count
+        .checked_mul(std::mem::size_of::<nixe_gpu_maxwell::MaxwellGpfifoEntry>())
+        .ok_or(NvDrvCallError::GuestResult(NV_BAD_PARAMETER))
+}
+
 fn decode_submit_header(input: &[u8]) -> Result<MaxwellGpfifoSubmitRequest, NvDrvCallError> {
     Ok(MaxwellGpfifoSubmitRequest {
         entry_count: input_u32(input, 8)?,
@@ -525,7 +549,7 @@ fn submit_gpfifo(
     let following_frontend_submission = next_frontend_submission
         .checked_add(1)
         .ok_or_else(|| unsupported_state(descriptor, request))?;
-    let validated = resolve_gpfifo_submission(&channel, frontend, decoded, address_space.memory())
+    let validated = validate_gpfifo_submission(&channel, frontend, decoded, address_space.memory())
         .map_err(|error| {
             NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::GpfifoMemory {
                 context: NvDrvErrorContext::new(

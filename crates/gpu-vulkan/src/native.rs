@@ -4,8 +4,8 @@ use crate::residency::Resource;
 use crate::{cache::*, *};
 use ash::vk;
 use nixe_gpu::{
-    BackendExecutionCompletion, BackendRuntimeError, BackendSubmissionToken, ExecutionBatch,
-    FrontendSubmissionId, GpuExecution, PreparedStateId, ResidentImage,
+    BackendExecutionCompletion, BackendRuntimeError, BackendSubmissionToken, FrontendSubmissionId,
+    GpuExecution, PreparedStateId, ResidentImage,
     native::*,
     shader_identity::{ContentId, ShaderNamespace},
 };
@@ -22,6 +22,8 @@ use key::GraphicsKey;
 pub struct NativeExecutionStatistics {
     pub draws: u64,
     pub prepared_draws: u64,
+    pub reused_vertex_selections: u64,
+    pub reused_index_selections: u64,
     pub prepared_graphics: u64,
     pub reused_graphics: u64,
     pub reused_programs: u64,
@@ -44,7 +46,6 @@ enum Graphics {
     },
     Ready {
         pipeline: Arc<NativePipeline>,
-        last_used: u64,
     },
 }
 enum Computing {
@@ -78,11 +79,16 @@ pub struct NativeGpuExecution {
     drawings: HashMap<PreparedStateId, Drawing>,
     graphics: HashMap<GraphicsKey, Graphics>,
     targets: Option<images::Targets>,
+    vertex_buffers: Vec<Option<(GuestVertexBuffer, VertexBuffer)>>,
+    index_buffer: Option<(
+        Arc<nixe_gpu::physical::PhysicalMapping>,
+        nixe_gpu::IndexType,
+        IndexBuffer,
+    )>,
     programs: nixe_gpu::WorkingSet<(PreparedStateId, usize), Arc<PreparedProgram>>,
-    next_collection: u64,
+    next_collection: usize,
     recording_batch: Option<(Option<WorkTicket>, usize)>,
     computing: HashMap<PreparedStateId, Computing>,
-    draw_arguments: Vec<Draw>,
     affine_pipelines: HashMap<vk::Format, Arc<NativePipeline>>,
     video_pipelines: HashMap<vk::Format, Arc<NativePipeline>>,
     completions: VecDeque<Completion>,
@@ -107,6 +113,26 @@ impl NativeGpuExecution {
             wakeup.arm(point).map_err(runtime)?;
         }
         Ok(())
+    }
+    fn service_host(&mut self) -> Result<(), BackendRuntimeError> {
+        if self.host.is_none() {
+            self.residency.maintain_budget(false).map_err(runtime)?;
+        }
+        let Some(mut host) = self.host.take() else {
+            return Ok(());
+        };
+        let result = host.service(
+            &mut self.residency,
+            &mut self.frames,
+            &self.pipelines,
+            &mut self.descriptors,
+            &mut self.samplers,
+        );
+        if let Err(error) = &result {
+            host.client.fail(error.to_string());
+        }
+        self.host = Some(host);
+        result.map_err(runtime)
     }
     pub fn attach_presentation(
         &mut self,
@@ -165,11 +191,12 @@ impl NativeGpuExecution {
             drawings: HashMap::default(),
             graphics: HashMap::default(),
             targets: None,
+            vertex_buffers: Vec::new(),
+            index_buffer: None,
             programs: nixe_gpu::WorkingSet::new(8192, 32 * 1024 * 1024),
             next_collection: 0,
             recording_batch: None,
             computing: HashMap::default(),
-            draw_arguments: Vec::with_capacity(128),
             affine_pipelines: HashMap::default(),
             video_pipelines: HashMap::default(),
             completions: VecDeque::new(),
@@ -222,10 +249,7 @@ impl NativeGpuExecution {
             );
         }
         let ready = match self.graphics.get_mut(&id).unwrap() {
-            Graphics::Ready { last_used, .. } => {
-                *last_used = self.statistics.batches;
-                return Ok(true);
-            }
+            Graphics::Ready { .. } => return Ok(true),
             Graphics::Shader { pending, .. } => pending.poll(),
         };
         let Some(ready) = ready else { return Ok(false) };
@@ -323,13 +347,7 @@ impl NativeGpuExecution {
                     Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
                 };
                 self.statistics.prepared_graphics += 1;
-                self.graphics.insert(
-                    id,
-                    Graphics::Ready {
-                        pipeline,
-                        last_used: self.statistics.batches,
-                    },
-                );
+                self.graphics.insert(id, Graphics::Ready { pipeline });
                 Ok(true)
             }
             _ => unreachable!("only shader preparation can be pending"),
@@ -342,89 +360,66 @@ impl NativeGpuExecution {
         result
     }
     fn prepare_drawing(&mut self, source: &Arc<GuestDrawState>) -> Result<bool, VulkanError> {
+        let id = source.identity;
+        if let Some(draw) = self.drawings.get(&id) {
+            if !Arc::ptr_eq(&draw.source, source) {
+                return Err(VulkanError::InvalidResource(
+                    "prepared draw identity was reused",
+                ));
+            }
+            if self.residency.draw_current(&draw.draw) {
+                return Ok(true);
+            }
+        }
+        self.drawings.remove(&id);
+        let graphics_key = GraphicsKey::new(source, self.device_profile().dynamic_state.base);
+        let already_prepared = matches!(
+            self.graphics.get(&graphics_key),
+            Some(Graphics::Ready { .. })
+        );
+        if !self.graphics(source)? {
+            return Ok(false);
+        }
+        let Graphics::Ready { pipeline, .. } = &self.graphics[&graphics_key] else {
+            unreachable!()
+        };
+        let pipeline = Arc::clone(pipeline);
+        let push: Arc<[u8]> = state::guest_push(&pipeline, Some(&source.parameters))?.into();
+        let parameters =
+            state::parameters(&source.parameters, pipeline.graphics.as_ref().unwrap())?;
+        let state = self
+            .residency
+            .prepare_graphics_state(Arc::clone(&pipeline), parameters)?;
+        let program_key = (source.program.identity, Arc::as_ptr(&pipeline) as usize);
+        let retained = self.residency.constructing.len();
+        // Select the complete binding set before materializing descriptor uses.
+        // Buffer growth may retire an earlier selection. Eden likewise updates
+        // index/vertex buffers before shader buffers and repeats after deletions.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
         loop {
-            let id = source.identity;
-            if let Some(draw) = self.drawings.get(&id) {
-                if !Arc::ptr_eq(&draw.source, source) {
-                    return Err(VulkanError::InvalidResource(
-                        "prepared draw identity was reused",
-                    ));
-                }
-                if self.residency.draw_current(&draw.draw) {
-                    return Ok(true);
-                }
-            }
-            self.drawings.remove(&id);
-            let graphics_key = GraphicsKey::new(source, self.device_profile().dynamic_state.base);
-            let already_prepared = matches!(
-                self.graphics.get(&graphics_key),
-                Some(Graphics::Ready { .. })
-            );
-            if !self.graphics(source)? {
-                return Ok(false);
-            }
-            let Graphics::Ready { pipeline, .. } = &self.graphics[&graphics_key] else {
-                unreachable!()
-            };
-            let pipeline = Arc::clone(pipeline);
-            let push: Arc<[u8]> = state::guest_push(&pipeline, Some(&source.parameters))?.into();
-            let program_key = (source.program.identity, Arc::as_ptr(&pipeline) as usize);
-            let program = if let Some(program) = self
-                .programs
-                .get(&program_key)
-                .filter(|program| self.residency.program_current(program))
-            {
-                self.statistics.reused_programs += 1;
-                Arc::clone(program)
-            } else {
-                let bindings = self.bindings(&source.program, &pipeline)?;
-                let program = Arc::new(
-                    self.residency
-                        .prepare_program(Arc::clone(&pipeline), &bindings)?,
-                );
-                self.programs
-                    .insert(program_key, Arc::clone(&program), program.retained_bytes());
-                program
-            };
-            let parameters =
-                state::parameters(&source.parameters, pipeline.graphics.as_ref().unwrap())?;
-            let state = self
-                .residency
-                .prepare_graphics_state(pipeline, parameters)?;
-            self.residency.retain_program_effect(&program);
-            let graphics = state.bind(program)?;
+            self.residency.constructing.truncate(retained);
             let targets = self.targets(source)?;
-            let mut vertices = Vec::new();
-            for v in source.vertices.iter() {
-                let buffer = self.residency.buffer_for_deferred_import(
-                    v.backing.clone(),
-                    vk::BufferUsageFlags::VERTEX_BUFFER,
-                )?;
-                self.residency
-                    .constructing
-                    .push(crate::residency::Resource::Buffer(buffer.buffer));
-                vertices.push(VertexBuffer {
-                    binding: v.binding,
-                    buffer: buffer.buffer,
-                    offset: buffer.offset,
-                    size: buffer.size,
-                });
-            }
-            let index = source
-                .index
-                .as_ref()
-                .map(|index| {
-                    let GuestIndexBuffer::Canonical(backing, kind) = index else {
-                        return Ok(None);
-                    };
+            // Reuse each binding independently of pipeline and dynamic state.
+            // Native cache retirement invalidates only the affected selection.
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+            let index = if let Some(GuestIndexBuffer::Canonical(backing, kind)) = &source.index {
+                let selected = self
+                    .index_buffer
+                    .as_ref()
+                    .filter(|(old, old_kind, selected)| {
+                        old == backing
+                            && old_kind == kind
+                            && self.residency.buffer_binding_current(selected.buffer)
+                    });
+                let index = if let Some((_, _, selected)) = selected {
+                    self.statistics.reused_index_selections += 1;
+                    *selected
+                } else {
                     let buffer = self.residency.buffer_for_deferred_import(
                         backing.clone(),
                         vk::BufferUsageFlags::INDEX_BUFFER,
                     )?;
-                    self.residency
-                        .constructing
-                        .push(crate::residency::Resource::Buffer(buffer.buffer));
-                    Ok::<_, VulkanError>(Some(IndexBuffer {
+                    IndexBuffer {
                         buffer: buffer.buffer,
                         offset: buffer.offset,
                         size: buffer.size,
@@ -433,17 +428,86 @@ impl NativeGpuExecution {
                             nixe_gpu::IndexType::Uint16 => vk::IndexType::UINT16,
                             nixe_gpu::IndexType::Uint32 => vk::IndexType::UINT32,
                         },
-                    }))
-                })
-                .transpose()?
-                .flatten();
-            if vertices
-                .iter()
-                .any(|v| !self.residency.buffer_binding_current(v.buffer))
+                    }
+                };
+                self.index_buffer = Some((Arc::clone(backing), *kind, index));
+                self.residency
+                    .constructing
+                    .push(Resource::Buffer(index.buffer));
+                Some(index)
+            } else {
+                self.index_buffer = None;
+                None
+            };
+            let mut vertices = Vec::with_capacity(source.vertices.len());
+            for vertex in source.vertices.iter() {
+                let slot = vertex.binding as usize;
+                if vertex.binding >= self.device_profile().limits.max_vertex_input_bindings {
+                    return Err(VulkanError::InvalidResource(
+                        "vertex binding exceeds device limits",
+                    ));
+                }
+                if self.vertex_buffers.len() <= slot {
+                    self.vertex_buffers.resize_with(slot + 1, || None);
+                }
+                let selected = self.vertex_buffers[slot]
+                    .as_ref()
+                    .filter(|(old, selected)| {
+                        old.backing == vertex.backing
+                            && self.residency.buffer_binding_current(selected.buffer)
+                    });
+                let selected = if let Some((_, selected)) = selected {
+                    self.statistics.reused_vertex_selections += 1;
+                    *selected
+                } else {
+                    let buffer = self.residency.buffer_for_deferred_import(
+                        vertex.backing.clone(),
+                        vk::BufferUsageFlags::VERTEX_BUFFER,
+                    )?;
+                    VertexBuffer {
+                        binding: vertex.binding,
+                        buffer: buffer.buffer,
+                        offset: buffer.offset,
+                        size: buffer.size,
+                    }
+                };
+                self.vertex_buffers[slot] = Some((vertex.clone(), selected));
+                self.residency
+                    .constructing
+                    .push(Resource::Buffer(selected.buffer));
+                vertices.push(selected);
+            }
+            let cached = self
+                .programs
+                .get(&program_key)
+                .filter(|program| self.residency.program_current(program))
+                .cloned();
+            let bindings = if cached.is_none() {
+                Some(self.bindings(&source.program, &pipeline)?)
+            } else {
+                None
+            };
+            if !self.residency.targets_current(&targets)
+                || vertices
+                    .iter()
+                    .any(|v| !self.residency.buffer_binding_current(v.buffer))
                 || index.is_some_and(|i| !self.residency.buffer_binding_current(i.buffer))
             {
                 continue;
             }
+            let program = if let Some(program) = cached {
+                self.statistics.reused_programs += 1;
+                program
+            } else {
+                let program = Arc::new(
+                    self.residency
+                        .prepare_program(Arc::clone(&pipeline), bindings.as_ref().unwrap())?,
+                );
+                self.programs
+                    .insert(program_key, Arc::clone(&program), program.retained_bytes());
+                program
+            };
+            let graphics = state.bind(program)?;
             let draw = if let Some(GuestIndexBuffer::Inline(bytes)) = &source.index {
                 self.residency.prepare_inline_index_draw(
                     graphics,
@@ -459,9 +523,6 @@ impl NativeGpuExecution {
                     index,
                 )?
             };
-            if !self.residency.draw_current(&draw) {
-                continue;
-            }
             self.statistics.prepared_draws += 1;
             self.statistics.reused_graphics += u64::from(already_prepared);
             self.drawings.insert(
@@ -551,7 +612,13 @@ impl NativeGpuExecution {
                 }
                 Ok(ready)
             }
-            NativeCommand::Draw { state, .. } => self.drawing(state),
+            NativeCommand::Draw { state, .. } => {
+                if self.drawings.contains_key(&state.identity) {
+                    Ok(true)
+                } else {
+                    self.graphics(state)
+                }
+            }
             NativeCommand::Dispatch { program, .. } => self.computing(program),
             NativeCommand::ConvertNv12 { images, .. } => {
                 let format = images::format(images[2].description.format());
@@ -591,7 +658,18 @@ impl NativeGpuExecution {
             _ => Ok(true),
         }
     }
-    fn command(&mut self, command: &NativeCommand) -> Result<(), VulkanError> {
+    fn command(&mut self, command: &NativeCommand) -> Result<bool, VulkanError> {
+        if matches!(
+            command,
+            NativeCommand::ConvertNv12 { .. }
+                | NativeCommand::Blit {
+                    sampling: Some(_),
+                    ..
+                }
+        ) && !self.prepare_command(command)?
+        {
+            return Ok(false);
+        }
         match command {
             NativeCommand::CopyBuffer {
                 source,
@@ -612,12 +690,21 @@ impl NativeGpuExecution {
                 self.residency
                     .report_memory(target.clone(), *offset, bytes, *fence)?;
             }
-            NativeCommand::Sequence(commands) => self.record_commands(commands)?,
+            NativeCommand::Sequence(commands) => {
+                if !self.prepare_command(command)? {
+                    return Ok(false);
+                }
+                for command in commands {
+                    if !self.command(command)? {
+                        return Err(VulkanError::InvalidResource(
+                            "ready sequence lost compilation dependency",
+                        ));
+                    }
+                }
+            }
             NativeCommand::Draw { state, arguments } => {
                 if !self.drawing(state)? {
-                    return Err(VulkanError::InvalidResource(
-                        "prepared draw compilation became pending",
-                    ));
+                    return Ok(false);
                 }
                 let Drawing {
                     source,
@@ -634,16 +721,14 @@ impl NativeGpuExecution {
                     ));
                 }
                 self.residency
-                    .draws(draw, &[state::arguments(*arguments)], push)?;
+                    .draw(draw, state::arguments(*arguments), push)?;
                 self.statistics.draws += 1;
                 self.statistics.warm_draws += u64::from(*recorded);
                 *recorded = true;
             }
             NativeCommand::Dispatch { program, groups } => {
                 if !self.computing(program)? {
-                    return Err(VulkanError::InvalidResource(
-                        "prepared dispatch compilation became pending",
-                    ));
+                    return Ok(false);
                 }
                 let Computing::Ready { program, push, .. } = &self.computing[&program.identity]
                 else {
@@ -746,60 +831,9 @@ impl NativeGpuExecution {
                 result?;
             }
         }
-        Ok(())
+        Ok(true)
     }
-    fn record_commands(&mut self, commands: &[NativeCommand]) -> Result<(), VulkanError> {
-        let mut at = 0;
-        while at < commands.len() {
-            if let NativeCommand::Draw { state, .. } = &commands[at]
-                && !self.drawing(state)?
-            {
-                return Err(VulkanError::InvalidResource(
-                    "prepared draw compilation became pending",
-                ));
-            }
-            if let NativeCommand::Draw { state, arguments } = &commands[at]
-                && let Some(Drawing {
-                    draw,
-                    push,
-                    recorded,
-                    ..
-                }) = self.drawings.get_mut(&state.identity)
-                && draw.can_group()
-            {
-                self.draw_arguments.clear();
-                self.draw_arguments.push(state::arguments(*arguments));
-                let mut end = at + 1;
-                while let Some(NativeCommand::Draw {
-                    state: next,
-                    arguments,
-                }) = commands.get(end)
-                {
-                    if !Arc::ptr_eq(state, next) {
-                        break;
-                    }
-                    let next = state::arguments(*arguments);
-                    if !append_instances(self.draw_arguments.last_mut().unwrap(), next) {
-                        self.draw_arguments.push(next);
-                    }
-                    end += 1;
-                }
-                self.residency.draws(draw, &self.draw_arguments, push)?;
-                self.statistics.draws += (end - at) as u64;
-                self.statistics.warm_draws += (end - at) as u64 - u64::from(!*recorded);
-                *recorded = true;
-                at = end;
-            } else {
-                self.command(&commands[at])?;
-                at += 1;
-            }
-        }
-        Ok(())
-    }
-    fn record_batch(
-        &mut self,
-        batch: ExecutionBatch<'_, NativeSubmission>,
-    ) -> Result<Option<WorkTicket>, BackendRuntimeError> {
+    fn record_work(&mut self, batch: &NativeWork) -> Result<bool, BackendRuntimeError> {
         let memory = self.residency.memory().clone();
         let cpu_writes = memory
             .collect_cpu_writes()
@@ -807,30 +841,18 @@ impl NativeGpuExecution {
         self.residency
             .consume_cpu_writes(cpu_writes)
             .map_err(runtime)?;
-        let _trace = nixe_gpu::trace::span(
-            "backend_record",
-            batch.commands.frontend.get(),
-            u64::from(batch.commands.segment.get()),
-            batch.commands.commands.len() as u64,
-        );
+        let _trace = nixe_gpu::trace::span("backend_record", batch.frontend.get(), 0, 1);
         #[cfg(feature = "performance-counters")]
         let started = std::time::Instant::now();
-        self.record_commands(&batch.commands.commands)
-            .map_err(runtime)?;
-        if batch.commands.final_segment {
-            self.residency.commit_buffer_downloads().map_err(runtime)?;
+        if !self.command(&batch.command).map_err(runtime)? {
+            return Ok(false);
         }
         let work = self.residency.device().preceding_work();
         // A guest delivery boundary is not a host queue dependency. Publish
         // accepted ownership now; visibility, presentation and completion
         // demand flush the owner. Bound batching to keep the GPU supplied even
         // under a continuous producer that never drains its inbox.
-        let commands = batch
-            .commands
-            .commands
-            .iter()
-            .map(command_count)
-            .sum::<usize>();
+        let commands = command_count(&batch.command);
         let pending = self
             .recording_batch
             .filter(|(previous, _)| *previous == work)
@@ -846,8 +868,8 @@ impl NativeGpuExecution {
         }
         nixe_gpu::trace::detail_event(
             "backend_accept",
-            batch.commands.frontend.get(),
-            u64::from(batch.commands.segment.get()),
+            batch.frontend.get(),
+            0,
             work.map_or(0, WorkTicket::tick),
         );
         #[cfg(feature = "performance-counters")]
@@ -860,7 +882,7 @@ impl NativeGpuExecution {
         }
         self.statistics.batches += 1;
         self.statistics.submits = self.residency.device().submitted_tick();
-        Ok(work)
+        Ok(true)
     }
     fn completion(
         &mut self,
@@ -903,25 +925,8 @@ impl Drop for NativeGpuExecution {
     }
 }
 impl GpuExecution for NativeGpuExecution {
-    type Commands = NativeSubmission;
+    type Commands = NativeWork;
     type ImageRequest = NativePresentationImage;
-    fn synchronize_command_sources(&mut self) -> Result<(), BackendRuntimeError> {
-        let memory = self.residency.memory().clone();
-        let cpu_writes = memory
-            .collect_cpu_writes()
-            .map_err(|error| runtime(VulkanError::from(error)))?;
-        self.residency
-            .consume_cpu_writes(cpu_writes)
-            .map_err(runtime)?;
-        self.residency.flush().map_err(runtime)?;
-        if let Some(work) = self.residency.device().preceding_work() {
-            self.residency
-                .device_mut()
-                .wait_for_work(work, Duration::MAX)
-                .map_err(runtime)?;
-        }
-        Ok(())
-    }
     fn external_image_device(&self) -> Option<[u8; 16]> {
         self.video_device
     }
@@ -945,43 +950,16 @@ impl GpuExecution for NativeGpuExecution {
         }
         Ok(())
     }
-    fn service_host(&mut self) -> Result<(), BackendRuntimeError> {
-        if self.host.is_none() {
-            self.residency.maintain_budget(false).map_err(runtime)?;
-        }
-        let Some(mut host) = self.host.take() else {
-            return Ok(());
-        };
-        let memory = self.residency.memory().clone();
-        let cpu_writes = memory
-            .collect_cpu_writes()
-            .map_err(|error| runtime(VulkanError::from(error)))?;
-        self.residency
-            .consume_cpu_writes(cpu_writes)
-            .map_err(runtime)?;
-        let result = host.service(
-            &mut self.residency,
-            &mut self.frames,
-            &self.pipelines,
-            &mut self.descriptors,
-            &mut self.samplers,
-        );
-        if let Err(error) = &result {
-            host.client.fail(error.to_string());
-        }
-        self.host = Some(host);
-        result.map_err(runtime)
-    }
     fn request_completion_wakeup(&mut self) -> Result<(), BackendRuntimeError> {
-        let Some(wakeup) = &self.completion_wakeup else {
-            return Ok(());
-        };
         let demand = self.residency.readback_point();
         if self.residency.readback_submission_pending() {
             // Feed demanded downloads even while an older frontend completion
             // is pending, without an extra idle wake before their submission.
             self.residency.flush().map_err(runtime)?;
         }
+        let Some(wakeup) = &self.completion_wakeup else {
+            return Ok(());
+        };
         let point = self
             .completions
             .front()
@@ -1007,71 +985,26 @@ impl GpuExecution for NativeGpuExecution {
         // no remaining native point, there is no future timeline event to arm.
         Ok(())
     }
-    fn prepare(
-        &mut self,
-        batch: ExecutionBatch<'_, Self::Commands>,
-    ) -> Result<bool, BackendRuntimeError> {
-        let memory = self.residency.memory().clone();
-        let cpu_writes = memory
-            .collect_cpu_writes()
-            .map_err(|error| runtime(VulkanError::from(error)))?;
-        self.residency
-            .consume_cpu_writes(cpu_writes)
-            .map_err(runtime)?;
-        #[cfg(feature = "performance-counters")]
-        let started = std::time::Instant::now();
-        let _trace = nixe_gpu::trace::span(
-            "backend_prepare",
-            batch.commands.frontend.get(),
-            batch.commands.commands.len() as u64,
-            0,
-        );
-        // Retirement scans are maintenance, not per-batch preparation. The
-        // frontend's bounded working sets retain the reusable active states.
-        if self.statistics.batches >= self.next_collection {
-            self.next_collection = self.statistics.batches.saturating_add(256);
+    fn consume(&mut self, batch: &Self::Commands) -> Result<bool, BackendRuntimeError> {
+        // Retire released frontend states only after the prepared set grows. Warm
+        // effects neither age pipelines nor repeatedly scan unchanged caches.
+        if self.drawings.len() + self.computing.len() >= self.next_collection {
             self.drawings
                 .retain(|_, drawing| Arc::strong_count(&drawing.source) > 1);
-            self.graphics.retain(|_, graphics| match graphics {
-                Graphics::Ready { last_used, .. } => {
-                    self.statistics.batches.saturating_sub(*last_used) <= 256
-                }
-                _ => true,
-            });
             self.computing.retain(|_, computing| match computing {
                 Computing::Ready { source, .. } => Arc::strong_count(source) > 1,
                 _ => true,
             });
+            self.next_collection = self.drawings.len() + self.computing.len() + 256;
         }
-        let mut ready = true;
-        for c in &batch.commands.commands {
-            ready &= self.prepare_command(c).map_err(runtime)?;
-        }
-        if !ready {
-            batch
-                .commands
-                .retain_suspended_inputs()
-                .map_err(|error| runtime(VulkanError::from(error)))?;
-        }
-        #[cfg(feature = "performance-counters")]
-        nixe_gpu::metrics::record(
-            nixe_gpu::metrics::Counter::BackendSubmissionNanoseconds,
-            started.elapsed().as_nanos() as u64,
-        );
-        Ok(ready)
-    }
-    fn record(
-        &mut self,
-        batch: ExecutionBatch<'_, Self::Commands>,
-    ) -> Result<(), BackendRuntimeError> {
-        self.record_batch(batch).map(|_| ())
+        self.record_work(batch)
     }
     fn submit(
         &mut self,
-        batch: ExecutionBatch<'_, Self::Commands>,
+        frontend: FrontendSubmissionId,
     ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
-        let frontend = batch.commands.frontend;
-        let work = self.record_batch(batch)?;
+        self.residency.commit_buffer_downloads().map_err(runtime)?;
+        let work = self.residency.device().preceding_work();
         let token = BackendSubmissionToken::new(
             self.residency.device().submission_instance(),
             self.next,
@@ -1088,20 +1021,13 @@ impl GpuExecution for NativeGpuExecution {
     fn poll_completion(
         &mut self,
     ) -> Result<Option<BackendExecutionCompletion>, BackendRuntimeError> {
-        let memory = self.residency.memory().clone();
-        let cpu_writes = memory
-            .collect_cpu_writes()
-            .map_err(|error| runtime(VulkanError::from(error)))?;
-        self.residency
-            .consume_cpu_writes(cpu_writes)
-            .map_err(runtime)?;
         self.completion(None).map_err(runtime)
     }
     fn access_memory(
         &mut self,
         ranges: Vec<nixe_memory::AllocationRange>,
         operation: nixe_memory::AccessOperation,
-    ) -> Result<nixe_memory::AccessResult, BackendRuntimeError> {
+    ) -> Result<nixe_gpu::OwnerAccess, BackendRuntimeError> {
         let memory = self.residency.memory().clone();
         let cpu_writes = memory
             .collect_cpu_writes()
@@ -1110,8 +1036,16 @@ impl GpuExecution for NativeGpuExecution {
             .consume_cpu_writes(cpu_writes)
             .map_err(runtime)?;
         self.residency
-            .access_memory(ranges, operation)
+            .begin_access_memory(ranges, operation)
             .map_err(runtime)
+    }
+    unsafe fn memory_written(
+        &mut self,
+        machine: nixe_memory::MachineId,
+        extents: &[(nixe_memory::AllocationId, nixe_memory::Extent)],
+    ) -> Result<(), BackendRuntimeError> {
+        self.residency.check_machine(machine).map_err(runtime)?;
+        unsafe { self.residency.owner_memory_written(extents) }.map_err(runtime)
     }
     fn queue_device_access(
         &mut self,
@@ -1145,7 +1079,7 @@ impl GpuExecution for NativeGpuExecution {
             .map_err(runtime)?;
         self.progress_accesses()
     }
-    fn progress_device_accesses(&mut self) -> Result<(), BackendRuntimeError> {
+    fn progress(&mut self) -> Result<(), BackendRuntimeError> {
         let memory = self.residency.memory().clone();
         let cpu_writes = memory
             .collect_cpu_writes()
@@ -1153,7 +1087,8 @@ impl GpuExecution for NativeGpuExecution {
         self.residency
             .consume_cpu_writes(cpu_writes)
             .map_err(runtime)?;
-        self.progress_accesses()
+        self.progress_accesses()?;
+        self.service_host()
     }
     fn fail_device_accesses(&mut self, cause: Arc<nixe_memory::MemoryError>) {
         self.residency.fail_device_accesses(cause);
@@ -1181,7 +1116,7 @@ impl GpuExecution for NativeGpuExecution {
         _: nixe_memory::AllocationId,
     ) -> Result<(), BackendRuntimeError> {
         self.residency.check_machine(machine).map_err(runtime)?;
-        self.progress_device_accesses()
+        self.progress()
     }
     fn allocation_pressure(
         &mut self,
@@ -1210,6 +1145,7 @@ impl GpuExecution for NativeGpuExecution {
         self.residency
             .consume_cpu_writes(cpu_writes)
             .map_err(runtime)?;
+        self.residency.tick_uniform_cache();
         self.residency.maintain_budget(true).map_err(runtime)?;
         nixe_gpu::trace::event(
             "frame_work",
@@ -1281,55 +1217,6 @@ impl GpuExecution for NativeGpuExecution {
             .map_err(runtime)?;
         Ok(())
     }
-}
-
-// The caller requires identical immutable state and read-only shader resources.
-// The shader runtime retains the logical guest base instance independently of
-// each host draw's firstInstance, so contiguous instances preserve shader IDs.
-fn append_instances(previous: &mut Draw, next: Draw) -> bool {
-    let (first, count, next_first, next_count) = match (previous, next) {
-        (
-            Draw::Direct {
-                vertices,
-                instances,
-                first_vertex,
-                first_instance,
-            },
-            Draw::Direct {
-                vertices: nv,
-                instances: ni,
-                first_vertex: nf,
-                first_instance: nb,
-            },
-        ) if *vertices == nv && *first_vertex == nf => (first_instance, instances, nb, ni),
-        (
-            Draw::Indexed {
-                indices,
-                instances,
-                first_index,
-                vertex_offset,
-                first_instance,
-            },
-            Draw::Indexed {
-                indices: nv,
-                instances: ni,
-                first_index: nf,
-                vertex_offset: no,
-                first_instance: nb,
-            },
-        ) if *indices == nv && *first_index == nf && *vertex_offset == no => {
-            (first_instance, instances, nb, ni)
-        }
-        _ => return false,
-    };
-    if first.checked_add(*count) != Some(next_first) {
-        return false;
-    }
-    let Some(combined) = count.checked_add(next_count) else {
-        return false;
-    };
-    *count = combined;
-    true
 }
 
 fn command_count(command: &NativeCommand) -> usize {
