@@ -2,7 +2,6 @@
 use nixe_memory::{
     Access, AccessResult, AddressSpace, AddressSpaceId, AllocationRange, CodeFetch,
     GuestVirtualAddress, MappingObservation, MemoryError, NativeAdmission, Observation,
-    PendingAccess,
 };
 use std::{collections::HashMap, sync::Arc};
 
@@ -164,11 +163,5 @@ impl CodeRead {
                 },
             })
         }))
-    }
-    pub fn pending(&self) -> Option<&PendingAccess> {
-        match &self.access {
-            Some(Access::Pending(pending)) => Some(pending),
-            _ => None,
-        }
     }
 }

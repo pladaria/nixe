@@ -350,10 +350,10 @@ impl NativeAdmission<'_> {
     pub(crate) fn is_active(&self) -> bool {
         self.active.get()
     }
-    /// Capture/pin the old physical operation before suspending. The native
-    /// invocation must have returned first: a paused C++ run/compilation frame
-    /// is not a mapping or code-invalidation safepoint. Recovery may then wait
-    /// on graphics without preventing its mapping/protection writer.
+    /// Capture/pin the consumed physical operation before suspending. A memory
+    /// callback may wait with its native frame suspended: its caller must queue
+    /// code invalidations until native return and synchronize them after resume.
+    /// Translation callbacks cannot suspend while constructing a block.
     pub fn suspend(&self) {
         if self.active.replace(false) {
             self.context.deactivate();

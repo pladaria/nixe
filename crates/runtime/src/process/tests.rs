@@ -67,12 +67,7 @@ fn worker_slice_moves_thread_state_out_of_the_process_until_reconciliation() {
     let vcpu = nixe_scheduler::VirtualCpuId::new(3);
 
     let execution = process
-        .begin_thread_execution(
-            thread,
-            vcpu,
-            1,
-            nixe_cpu::execution::VcpuEventState::default(),
-        )
+        .begin_thread_execution(thread, vcpu, nixe_cpu::execution::VcpuEventState::default())
         .unwrap();
     assert!(process.main_thread().state.is_none());
 
@@ -89,15 +84,14 @@ fn unsynchronized_cpu_failure_discards_state_and_allows_retirement() {
     let mut process = synthetic_process_for_coordinator(1);
     let thread = process.main_thread_id();
     let vcpu = nixe_scheduler::VirtualCpuId::new(0);
-    let mut cpu = process.create_worker_cpu_thread(vcpu).unwrap();
+    let cpu = process.create_worker_cpu_thread(vcpu).unwrap();
     let execution = process
-        .begin_thread_execution(thread, vcpu, 1, Default::default())
+        .begin_thread_execution(thread, vcpu, Default::default())
         .unwrap();
     let failure = ProcessExecutionError::Cpu {
         fault: nixe_cpu::execution::CpuFault {
             backend: "dynarmic",
             kind: nixe_cpu::execution::CpuFaultKind::Internal,
-            progress: 0,
             message: "native execution did not synchronize".into(),
             context: None,
         },
@@ -111,7 +105,7 @@ fn unsynchronized_cpu_failure_discards_state_and_allows_retirement() {
         process.lifecycle(),
         nixe_scheduler::ProcessLifecycle::Faulted
     );
-    cpu.clear_local_exclusive_reservation();
+
     drop(cpu);
     process.complete_cpu_thread_retirement();
 }
@@ -122,14 +116,13 @@ fn concurrent_stop_does_not_hide_an_unsynchronized_native_failure() {
     let thread = process.main_thread_id();
     let vcpu = nixe_scheduler::VirtualCpuId::new(0);
     let execution = process
-        .begin_thread_execution(thread, vcpu, 1, Default::default())
+        .begin_thread_execution(thread, vcpu, Default::default())
         .unwrap();
     assert!(process.terminate_from_host());
     let failure = ProcessExecutionError::Cpu {
         fault: nixe_cpu::execution::CpuFault {
             backend: "dynarmic",
             kind: nixe_cpu::execution::CpuFaultKind::Internal,
-            progress: 0,
             message: "native execution did not synchronize".into(),
             context: None,
         },
@@ -147,7 +140,7 @@ fn panicked_worker_does_not_restore_an_incoming_snapshot() {
     let thread = process.main_thread_id();
     let vcpu = nixe_scheduler::VirtualCpuId::new(0);
     let execution = process
-        .begin_thread_execution(thread, vcpu, 1, Default::default())
+        .begin_thread_execution(thread, vcpu, Default::default())
         .unwrap();
     drop(execution);
     process.abort_thread_execution(thread, vcpu, None);
@@ -219,7 +212,6 @@ fn thread_creation_succeeds_after_heap_consumes_the_application_budget() {
     let profile = nixe_scheduler::MachineSchedulerProfile::new(
         vec![nixe_scheduler::VirtualCpuDescriptor::new(core, 0)],
         nixe_scheduler::PriorityRange::new(0, 63).unwrap(),
-        10,
     )
     .unwrap();
     let request = ThreadCreateRequest {
@@ -260,7 +252,7 @@ pub(crate) fn synthetic_svc_process_for_coordinator(process_id: u64) -> Runnable
 pub(crate) fn synthetic_memory_loop_process(process_id: u64) -> RunnableProcess {
     synthetic_native_instruction_process(
         process_id,
-        &[0x10000001, 0xf9400020, 0xd503203f, 0x17fffffd],
+        &[0x10000001, 0xf9400020, 0xd4000021, 0x17fffffd],
     )
 }
 
@@ -293,7 +285,7 @@ fn dropping_a_process_closes_its_memory_and_handles_while_stopped_native_registe
     let mut process = synthetic_svc_process_for_coordinator(1);
     let memory = std::sync::Arc::clone(process.memory());
     let handles = std::sync::Arc::clone(process.handles());
-    let report = process.run(100).unwrap();
+    let report = process.run().unwrap();
     assert!(matches!(
         report.stop,
         crate::ExecutionStop::SupervisorCall { .. }

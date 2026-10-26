@@ -44,11 +44,9 @@ pub(crate) struct Tracking {
     resource_observed: Bitmap,
     device_observed: Bitmap,
     dirty: Bitmap,
-    reserved: Bitmap,
     device: Bitmap,
     code: Bitmap,
     code_generation: AtomicU64,
-    monitors: crate::reservation::Monitors,
     observers: Mutex<Observers>,
     cpu_dirty_pending: AtomicBool,
     protection_calls: AtomicU64,
@@ -223,7 +221,6 @@ pub struct TrackingStatistics {
     pub dirty_queue_bytes: usize,
     pub protection_calls: u64,
     pub captured_bytes: u64,
-    pub reservation_metadata_bytes: usize,
 }
 struct AliasRange {
     space: usize,
@@ -290,11 +287,9 @@ impl Tracking {
             resource_observed: Bitmap::new(bytes / PAGE_SIZE, 0),
             device_observed: Bitmap::new(bytes / PAGE_SIZE, 0),
             dirty: Bitmap::new(bytes / PAGE_SIZE, 0),
-            reserved: Bitmap::new(bytes / PAGE_SIZE, 0),
             device: Bitmap::new(bytes / PAGE_SIZE, 0),
             code: Bitmap::new(bytes / PAGE_SIZE, 0),
             code_generation: AtomicU64::new(1),
-            monitors: crate::reservation::Monitors::default(),
             observers: Mutex::new(Observers::default()),
             cpu_dirty_pending: AtomicBool::new(false),
             protection_calls: AtomicU64::new(0),
@@ -319,22 +314,11 @@ impl Tracking {
     pub fn code(&self, page: u64) -> bool {
         self.code.get(page)
     }
-    pub fn native_flags(&self, page: u64) -> u64 {
-        if !self.reserved.get(page) {
-            return 1;
-        }
-        // The caller retains an admitted mapping or a captured allocation.
-        std::ptr::from_ref(
-            unsafe { self.monitors.get(page) }.expect("published physical reservation monitor"),
-        ) as u64
-    }
     pub fn retire(&self, extents: &[Extent]) {
         self.invalidate(extents);
         self.invalidate_device(extents);
         for &extent in extents {
             self.device.update_range(extent, false, |_| {});
-            self.reserved
-                .update_range(extent, false, |page| self.monitors.remove(page));
         }
     }
     pub fn kind(&self, page: u64) -> u8 {
@@ -513,7 +497,6 @@ impl Tracking {
             captured_bytes: self.captured_bytes.load(Ordering::Relaxed),
             #[cfg(not(any(test, feature = "performance-counters")))]
             captured_bytes: 0,
-            reservation_metadata_bytes: self.monitors.bytes(),
         }
     }
 }
@@ -580,7 +563,7 @@ impl Machine {
     }
     /// Retained producers already own device-affected pages. Invalidate only
     /// newly observed input pages before appending their next native write;
-    /// membership and physical reservation epochs are managed by the producer.
+    /// device membership is managed by the producer.
     pub fn invalidate_device_observations<T>(
         &self,
         ranges: &[AllocationRange],
@@ -628,7 +611,6 @@ impl Machine {
                 })
             })
         {
-            self.mark_device_reservations(ranges);
             return publish();
         }
         self.tracking_transition(ranges, |batch, extents| {
@@ -637,21 +619,8 @@ impl Machine {
                 self.tracking().device.update_range(extent, true, |_| {});
             }
             batch.refresh()?;
-            self.mark_device_reservations(ranges);
             publish()
         })
-    }
-    fn mark_device_reservations(&self, ranges: &[AllocationRange]) {
-        if let [range] = ranges {
-            range.allocation().mark_device_modified();
-        } else {
-            let mut seen = std::collections::HashSet::new();
-            for range in ranges {
-                if seen.insert(range.allocation().identity()) {
-                    range.allocation().mark_device_modified();
-                }
-            }
-        }
     }
     /// The exact authority index calls this only after its final coverage has
     /// left every supplied page. Other producers in a shared page must keep
@@ -691,262 +660,19 @@ impl Machine {
     pub fn tracking_statistics(&self) -> TrackingStatistics {
         self.tracking().statistics()
     }
-    /// Activates the physical native monitor before allowing any exclusive
-    /// access. Existing monitors require neither quiescence nor reprotection.
-    pub fn prepare_reservations(&self, ranges: &[AllocationRange]) -> Result<(), MemoryError> {
-        self.validate_ranges(ranges)?;
-        if ranges
-            .iter()
-            .flat_map(AllocationRange::physical_extents)
-            .all(|extent| pages(extent).all(|page| self.tracking().reserved.get(page)))
-        {
-            return Ok(());
-        }
-        self.tracking_transition_with_native(ranges, true, |batch, _| {
-            for range in ranges {
-                let epoch = range.allocation().device_write_epoch();
-                epoch.activate();
-                for extent in range.physical_extents() {
-                    for page in pages(extent) {
-                        let base = self
-                            .arena()
-                            .host_address(ArenaOffset::new(page * PAGE_SIZE), PAGE_SIZE)
-                            .expect("retained reservation page");
-                        self.tracking()
-                            .monitors
-                            .ensure(page, base.as_ptr() as usize, &epoch);
-                    }
-                    self.tracking().reserved.update_range(extent, true, |_| {});
-                }
-            }
-            batch.refresh()
-        })
-    }
-    fn exclusive_extent(&self, range: &AllocationRange) -> Result<Extent, MemoryError> {
+    fn atomic_extent(&self, range: &AllocationRange) -> Result<Extent, MemoryError> {
         self.validate_ranges(std::slice::from_ref(range))?;
         if !matches!(range.bytes(), 1 | 2 | 4 | 8 | 16) {
-            return Err(MemoryError::Invalid("unsupported exclusive access width"));
+            return Err(MemoryError::Invalid("unsupported atomic access width"));
         }
         let mut extents = range.physical_extents();
         let extent = extents.next().expect("nonempty retained range");
         if !extent.start.get().is_multiple_of(range.bytes()) || extents.next().is_some() {
             return Err(MemoryError::Invalid(
-                "exclusive access is misaligned or crosses physical extents",
+                "atomic access is misaligned or crosses physical extents",
             ));
         }
         Ok(extent)
-    }
-    /// Convert a stopped native instruction's copied proof against its captured
-    /// physical destination. This performs no guest access, lock or wait and may
-    /// run in a C++ callback. Apply the resulting exact operation only after Run
-    /// returns and admission has suspended. The native address is never dereferenced.
-    pub fn capture_native_reservation(
-        &self,
-        range: &AllocationRange,
-        native: crate::NativeReservation,
-    ) -> Result<Option<crate::Reservation>, MemoryError> {
-        let extent = self.exclusive_extent(range)?;
-        let canonical = self
-            .arena()
-            .host_address(extent.start, extent.bytes)
-            .expect("retained exclusive extent");
-        if native.bytes != extent.bytes || native.canonical_address != canonical.as_ptr() as u64 {
-            return Ok(None);
-        }
-        Ok(Some(crate::Reservation {
-            machine: self.identity(),
-            allocation: range.allocation().identity(),
-            physical: extent.start,
-            bytes: extent.bytes as u8,
-            monitor: native.identity,
-            version: native.version,
-            device_version: native.device_version,
-            expected: native.expected,
-        }))
-    }
-    /// Publish an owner-completed exclusive load into its stopped native core.
-    /// This copies metadata only; the reservation never retains guest RAM.
-    pub fn export_native_reservation(
-        &self,
-        reservation: crate::Reservation,
-    ) -> Result<crate::NativeReservation, MemoryError> {
-        if reservation.machine != self.identity() {
-            return Err(MemoryError::Invalid(
-                "native reservation names another machine",
-            ));
-        }
-        let address = self
-            .arena()
-            .host_address(reservation.physical, u64::from(reservation.bytes))
-            .ok_or(MemoryError::Invalid(
-                "native reservation exceeds physical RAM",
-            ))?;
-        Ok(crate::NativeReservation {
-            identity: reservation.monitor,
-            version: reservation.version,
-            device_version: reservation.device_version,
-            canonical_address: address.as_ptr() as u64,
-            bytes: u64::from(reservation.bytes),
-            expected: reservation.expected,
-        })
-    }
-    pub fn load_exclusive_resolved(
-        &self,
-        range: &AllocationRange,
-    ) -> Result<(u128, crate::Reservation), MemoryError> {
-        Ok(self
-            .load_exclusive_impl(range, false)?
-            .expect("owner-resolved exclusive load cannot defer"))
-    }
-    fn load_exclusive_impl(
-        &self,
-        range: &AllocationRange,
-        route_device: bool,
-    ) -> Result<Option<(u128, crate::Reservation)>, MemoryError> {
-        let extent = self.exclusive_extent(range)?;
-        if route_device && self.tracking().device.get(extent.start.get() / PAGE_SIZE) {
-            return Ok(None);
-        }
-        self.prepare_reservations(std::slice::from_ref(range))?;
-        let _access = self.physical_access().enter(extent);
-        if route_device && self.tracking().device.get(extent.start.get() / PAGE_SIZE) {
-            return Ok(None);
-        }
-        // The retained range pins this monitor's allocation lifetime.
-        let monitor = unsafe { self.tracking().monitors.get(extent.start.get() / PAGE_SIZE) }
-            .expect("prepared physical exclusive monitor");
-        let lock = monitor.lock((extent.start.get() % PAGE_SIZE) as usize);
-        let source = self
-            .arena()
-            .host_address(extent.start, extent.bytes)
-            .unwrap();
-        let value = unsafe { crate::raw::read_value(source.as_ptr(), extent.bytes as usize) };
-        Ok(Some((
-            value,
-            crate::Reservation {
-                machine: self.identity(),
-                allocation: range.allocation().identity(),
-                physical: extent.start,
-                bytes: extent.bytes as u8,
-                monitor: monitor.identity(),
-                version: lock.version(),
-                device_version: monitor.device_version(),
-                expected: [value as u64, (value >> 64) as u64],
-            },
-        )))
-    }
-    pub fn store_exclusive_resolved(
-        &self,
-        range: &AllocationRange,
-        reservation: crate::Reservation,
-        value: u128,
-    ) -> Result<bool, MemoryError> {
-        Ok(self
-            .store_exclusive_impl(range, reservation, value, false)?
-            .expect("owner-resolved exclusive store cannot defer"))
-    }
-    fn store_exclusive_impl(
-        &self,
-        range: &AllocationRange,
-        reservation: crate::Reservation,
-        value: u128,
-        route_device: bool,
-    ) -> Result<Option<bool>, MemoryError> {
-        let extent = self.exclusive_extent(range)?;
-        if reservation.machine != self.identity()
-            || reservation.allocation != range.allocation().identity()
-            || reservation.physical != extent.start
-            || u64::from(reservation.bytes) != extent.bytes
-        {
-            return Ok(Some(false));
-        }
-        let store = |batch: Option<&ProtectionBatch<'_>>| {
-            let monitor = unsafe { self.tracking().monitors.get(extent.start.get() / PAGE_SIZE) }
-                .expect("live reservation retains its prepared monitor");
-            let mut lock = monitor.lock((extent.start.get() % PAGE_SIZE) as usize);
-            if monitor.identity() != reservation.monitor
-                || lock.version() != reservation.version
-                || monitor.device_version() != reservation.device_version
-            {
-                return false;
-            }
-            if self.tracking().observed(extent.start.get() / PAGE_SIZE) {
-                batch
-                    .expect("observed exclusive store requires alias quiescence")
-                    .invalidate(self, &[extent]);
-            }
-            let destination = self
-                .arena()
-                .host_address(extent.start, extent.bytes)
-                .unwrap();
-            // Ordinary native stores do not take the reservation lock. Commit
-            // with the observed value, as in Eden's WriteExclusive callbacks:
-            // https://git.eden-emu.dev/eden-emu/eden/src/commit/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/memory.cpp
-            let expected =
-                u128::from(reservation.expected[0]) | (u128::from(reservation.expected[1]) << 64);
-            let previous = unsafe {
-                crate::raw::compare_exchange(
-                    destination.as_ptr(),
-                    extent.bytes as usize,
-                    expected,
-                    value,
-                )
-            };
-            let written = previous == expected;
-            if written {
-                lock.written();
-            }
-            written
-        };
-        let access = self.physical_access().enter(extent);
-        if route_device && self.tracking().device.get(extent.start.get() / PAGE_SIZE) {
-            let monitor = unsafe { self.tracking().monitors.get(extent.start.get() / PAGE_SIZE) }
-                .expect("live reservation retains its monitor");
-            let lock = monitor.lock((extent.start.get() % PAGE_SIZE) as usize);
-            if monitor.identity() != reservation.monitor
-                || lock.version() != reservation.version
-                || monitor.device_version() != reservation.device_version
-            {
-                return Ok(Some(false));
-            }
-            return Ok(None);
-        }
-        if !self.tracking().observed(extent.start.get() / PAGE_SIZE) {
-            return Ok(Some(store(None)));
-        }
-        {
-            let monitor = unsafe { self.tracking().monitors.get(extent.start.get() / PAGE_SIZE) }
-                .expect("live reservation retains its prepared monitor");
-            let lock = monitor.lock((extent.start.get() % PAGE_SIZE) as usize);
-            if monitor.identity() != reservation.monitor
-                || lock.version() != reservation.version
-                || monitor.device_version() != reservation.device_version
-            {
-                return Ok(Some(false));
-            }
-            let address = self
-                .arena()
-                .host_address(extent.start, extent.bytes)
-                .unwrap();
-            let expected =
-                u128::from(reservation.expected[0]) | (u128::from(reservation.expected[1]) << 64);
-            // A plain store can change the value without changing this monitor.
-            // Reject before disarming a subsequently established observation.
-            if unsafe { crate::raw::read_value(address.as_ptr(), extent.bytes as usize) }
-                != expected
-            {
-                return Ok(Some(false));
-            }
-        }
-        drop(access);
-        self.tracking_transition(std::slice::from_ref(range), |batch, _| {
-            if route_device && self.tracking().device.get(extent.start.get() / PAGE_SIZE) {
-                return Ok(None);
-            }
-            let written = store(Some(batch));
-            batch.refresh()?;
-            Ok(Some(written))
-        })
     }
     fn validate_ranges(&self, ranges: &[AllocationRange]) -> Result<usize, MemoryError> {
         ranges.iter().try_fold(0usize, |size, range| {
@@ -959,9 +685,8 @@ impl Machine {
                 .ok_or(MemoryError::Invalid("physical capture size overflows"))
         })
     }
-    /// Runs one naturally aligned host atomic operation on canonical RAM. The
-    /// reservation monitor orders exclusive/checked writers; host CAS also
-    /// arbitrates with direct native stores. No Rust guest reference is formed.
+    /// Runs one naturally aligned host atomic operation on canonical RAM. Host
+    /// CAS arbitrates with native writers; no Rust guest reference is formed.
     pub fn atomic_physical(
         &self,
         range: &AllocationRange,
@@ -982,40 +707,12 @@ impl Machine {
                 "atomic operation width differs from its captured physical span",
             ));
         }
-        match operation.operation {
-            crate::AtomicOperation::LoadExclusive => {
-                operation.before();
-                let result = self.load_exclusive_impl(range, route_device)?;
-                operation.after();
-                return Ok(
-                    result.map(|(value, reservation)| crate::AccessResult::ExclusiveRead {
-                        value,
-                        reservation,
-                    }),
-                );
-            }
-            crate::AtomicOperation::StoreExclusive {
-                reservation,
-                replacement,
-            } => {
-                operation.before();
-                let result =
-                    self.store_exclusive_impl(range, reservation, replacement, route_device)?;
-                operation.after();
-                return Ok(result.map(crate::AccessResult::ExclusiveWritten));
-            }
-            _ => {}
-        }
-        let extent = self.exclusive_extent(range)?;
+        let extent = self.atomic_extent(range)?;
         if route_device && self.tracking().device.get(extent.start.get() / PAGE_SIZE) {
             return Ok(None);
         }
-        self.prepare_reservations(std::slice::from_ref(range))?;
         operation.before();
         let apply = |batch: Option<&ProtectionBatch<'_>>| {
-            let monitor = unsafe { self.tracking().monitors.get(extent.start.get() / PAGE_SIZE) }
-                .expect("prepared physical atomic monitor");
-            let mut lock = monitor.lock((extent.start.get() % PAGE_SIZE) as usize);
             let address = self
                 .arena()
                 .host_address(extent.start, extent.bytes)
@@ -1044,7 +741,6 @@ impl Machine {
                     )
                 };
                 if observed == previous {
-                    lock.written();
                     return crate::AccessResult::Atomic {
                         previous,
                         written: true,
@@ -1061,10 +757,6 @@ impl Machine {
             // A failed comparison writes nothing and leaves every clean
             // observer armed, without requesting an unnecessary interruption.
             if let crate::AtomicOperation::CompareExchange { .. } = operation.operation {
-                let monitor =
-                    unsafe { self.tracking().monitors.get(extent.start.get() / PAGE_SIZE) }
-                        .expect("prepared physical atomic monitor");
-                let _lock = monitor.lock((extent.start.get() % PAGE_SIZE) as usize);
                 let address = self
                     .arena()
                     .host_address(extent.start, extent.bytes)
@@ -2931,96 +2623,7 @@ mod tests {
         assert!(invalidations(&data_context).is_empty());
         assert!(host_store(&data, 0x20010));
     }
-    #[test]
-    fn failed_atomics_preserve_code_and_successful_writers_invalidate_it_once() {
-        use crate::{AccessOrdering, AccessResult, AtomicAccess, AtomicOperation};
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        let base = GuestVirtualAddress::new(0x4000);
-        space
-            .map(base, allocation, 0, PAGE_SIZE, MemoryPermissions::ALL)
-            .unwrap();
-        let context = space.register_core(Arc::new(|| {}));
-        let ranges = space.capture(base, 4, MemoryPermissions::ALL).unwrap();
-        let range = &ranges[0];
-        let (_, old) = machine.load_exclusive_resolved(range).unwrap();
-        machine
-            .write_resolved(&ranges, &1u32.to_le_bytes())
-            .unwrap();
-        for writer in 0..3 {
-            let code = crate::Observation::default();
-            machine
-                .access_captured(&ranges, crate::AccessOperation::ReadCode(code.clone()))
-                .unwrap()
-                .into_ready()
-                .unwrap();
-            assert!(!machine.store_exclusive_resolved(range, old, 5).unwrap());
-            assert!(matches!(
-                machine
-                    .atomic_physical(
-                        range,
-                        AtomicAccess {
-                            bytes: 4,
-                            ordering: AccessOrdering::AcquireRelease,
-                            operation: AtomicOperation::CompareExchange {
-                                expected: 999,
-                                replacement: 10
-                            },
-                        }
-                    )
-                    .unwrap(),
-                AccessResult::Atomic { written: false, .. }
-            ));
-            assert!(!code.is_invalid());
-            assert!(invalidations(&context).is_empty());
-            match writer {
-                0 => {
-                    let (value, reservation) = machine.load_exclusive_resolved(range).unwrap();
-                    assert!(
-                        machine
-                            .store_exclusive_resolved(range, reservation, value + 1)
-                            .unwrap()
-                    );
-                }
-                1 => {
-                    machine
-                        .atomic_physical(
-                            range,
-                            AtomicAccess {
-                                bytes: 4,
-                                ordering: AccessOrdering::AcquireRelease,
-                                operation: AtomicOperation::ReadModifyWrite {
-                                    transform: crate::AtomicTransform::Add,
-                                    operand: 1,
-                                },
-                            },
-                        )
-                        .unwrap();
-                }
-                2 => machine
-                    .write_resolved(&ranges, &4u32.to_le_bytes())
-                    .unwrap(),
-                _ => unreachable!(),
-            }
-            assert!(code.is_invalid());
-            assert_eq!(
-                invalidations(&context),
-                [crate::CodeInvalidation {
-                    start: base,
-                    bytes: PAGE_SIZE
-                }]
-            );
-            machine
-                .write_resolved(&ranges, &4u32.to_le_bytes())
-                .unwrap();
-            assert!(invalidations(&context).is_empty());
-        }
-    }
+
     #[test]
     fn buffer_dirty_watch_survives_snapshot_invalidation_and_download() {
         let machine = Machine::new(PAGE_SIZE).unwrap();
@@ -3464,87 +3067,7 @@ mod tests {
         );
         assert_eq!(machine.tracking_statistics().observer_pages, 0);
     }
-    #[test]
-    fn exclusive_cas_covers_alias_scalar_bulk_and_physical_writes() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let first = mapping(&machine, allocation.clone(), 0x1000);
-        let second = mapping(&machine, allocation, 0x8000);
-        let range = first
-            .capture(
-                GuestVirtualAddress::new(0x1040),
-                8,
-                MemoryPermissions::READ_WRITE,
-            )
-            .unwrap()
-            .remove(0);
-        for writer in 0..3 {
-            machine
-                .write_resolved(std::slice::from_ref(&range), &0u64.to_le_bytes())
-                .unwrap();
-            let (value, reservation) = machine.load_exclusive_resolved(&range).unwrap();
-            assert_eq!(value, 0);
-            let before = machine.tracking_statistics().protection_calls;
-            match writer {
-                0 => {
-                    second
-                        .write_value(GuestVirtualAddress::new(0x8040), 8, 9)
-                        .unwrap()
-                        .into_ready()
-                        .unwrap();
-                }
-                1 => {
-                    second
-                        .write(GuestVirtualAddress::new(0x803f), &[0, 9])
-                        .unwrap()
-                        .into_ready()
-                        .unwrap();
-                }
-                2 => {
-                    machine
-                        .write_resolved(std::slice::from_ref(&range), &9u64.to_le_bytes())
-                        .unwrap();
-                }
-                _ => unreachable!(),
-            }
-            assert!(
-                !machine
-                    .store_exclusive_resolved(&range, reservation, 5)
-                    .unwrap()
-            );
-            assert_eq!(machine.tracking_statistics().protection_calls, before);
-        }
-        let (_, reservation) = machine.load_exclusive_resolved(&range).unwrap();
-        // A different granule in the same physical page does not invalidate it.
-        second
-            .write_value(GuestVirtualAddress::new(0x8000), 8, 7)
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(
-            machine
-                .store_exclusive_resolved(&range, reservation, 13)
-                .unwrap()
-        );
-        assert!(
-            !machine
-                .store_exclusive_resolved(&range, reservation, 15)
-                .unwrap()
-        );
-        assert_eq!(
-            first
-                .read_value(GuestVirtualAddress::new(0x1040), 8)
-                .unwrap()
-                .into_ready()
-                .unwrap(),
-            13
-        );
-        assert_eq!(machine.tracking_statistics().protection_calls, 0);
-    }
+
     #[test]
     fn observations_follow_exact_physical_lifetime_after_cpu_guest_release() {
         let machine = Machine::new(2 * PAGE_SIZE).unwrap();
@@ -3609,89 +3132,7 @@ mod tests {
         assert_eq!(machine.statistics().allocated_bytes, PAGE_SIZE);
         drop(recycled);
     }
-    #[test]
-    fn plain_native_value_change_rejects_checked_exclusive_without_invalidating_a_later_observer() {
-        for bytes in [1, 2, 4, 8, 16] {
-            let machine = Machine::new(PAGE_SIZE).unwrap();
-            let allocation = machine
-                .account(PAGE_SIZE)
-                .unwrap()
-                .allocate(PAGE_SIZE)
-                .unwrap();
-            let range = AllocationRange::new(allocation.pin(), 0, bytes).unwrap();
-            let (_, reservation) = machine.load_exclusive_resolved(&range).unwrap();
-            let pointer = machine
-                .arena()
-                .host_address(range.physical_extents().next().unwrap().start, bytes)
-                .unwrap();
-            // Stand in for an admitted plain native store: no checked-writer
-            // epoch update, and no racing Rust reference to the guest bytes.
-            unsafe {
-                crate::raw::write_value(pointer.as_ptr(), bytes as usize, 9);
-            }
-            let observed = crate::Observation::default();
-            machine
-                .access_captured(
-                    std::slice::from_ref(&range),
-                    crate::AccessOperation::ReadObserved(observed.clone()),
-                )
-                .unwrap()
-                .into_ready()
-                .unwrap();
-            let before = machine.tracking_statistics().protection_calls;
-            assert!(
-                !machine
-                    .store_exclusive_resolved(&range, reservation, 7)
-                    .unwrap()
-            );
-            assert!(!observed.is_invalid());
-            assert_eq!(machine.tracking_statistics().protection_calls, before);
-            let mut value = [0; 16];
-            machine
-                .capture_stream(&[range], &mut value[..bytes as usize])
-                .unwrap();
-            assert_eq!(u128::from_le_bytes(value), 9);
-        }
-    }
 
-    #[test]
-    fn failed_exclusive_keeps_clean_observers_and_recycling_rejects_old_reservations() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let account = machine.account(PAGE_SIZE).unwrap();
-        let allocation = account.allocate(PAGE_SIZE).unwrap();
-        let range = AllocationRange::new(allocation.pin(), 0, 16).unwrap();
-        let (_, old) = machine.load_exclusive_resolved(&range).unwrap();
-        machine
-            .write_resolved(std::slice::from_ref(&range), &[4; 16])
-            .unwrap();
-        let observed = crate::Observation::default();
-        machine
-            .access_captured(
-                std::slice::from_ref(&range),
-                crate::AccessOperation::ReadObserved(observed.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        assert!(!machine.store_exclusive_resolved(&range, old, 9).unwrap());
-        assert!(!observed.is_invalid());
-        let (_, current) = machine.load_exclusive_resolved(&range).unwrap();
-        assert!(
-            machine
-                .store_exclusive_resolved(&range, current, 17)
-                .unwrap()
-        );
-        assert!(observed.is_invalid());
-        drop(allocation);
-        drop(range);
-        assert_eq!(machine.tracking_statistics().reservation_metadata_bytes, 0);
-        let next = account.allocate(PAGE_SIZE).unwrap();
-        let range = AllocationRange::new(next.pin(), 0, 16).unwrap();
-        assert!(!machine.store_exclusive_resolved(&range, old, 100).unwrap());
-        let (value, current) = machine.load_exclusive_resolved(&range).unwrap();
-        assert_eq!(value, 0);
-        assert_ne!(current.monitor, old.monitor);
-    }
     #[test]
     fn atomic_transforms_use_exact_width_and_compare_failures_preserve_observers() {
         use crate::{
@@ -3782,130 +3223,6 @@ mod tests {
             let mut bytes = vec![1; width as usize];
             machine.capture_stream(&[range], &mut bytes).unwrap();
             assert_eq!(bytes, vec![0; width as usize]);
-        }
-    }
-    #[test]
-    fn concurrent_physical_atomics_have_one_modification_order() {
-        use crate::{AccessOrdering, AccessResult, AtomicAccess, AtomicOperation, AtomicTransform};
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let range = AllocationRange::new(allocation.pin(), 0, 8).unwrap();
-        machine
-            .prepare_reservations(std::slice::from_ref(&range))
-            .unwrap();
-        let operation = AtomicAccess {
-            bytes: 8,
-            ordering: AccessOrdering::Relaxed,
-            operation: AtomicOperation::ReadModifyWrite {
-                transform: AtomicTransform::Add,
-                operand: 1,
-            },
-        };
-        let cores: Vec<_> = (0..4)
-            .map(|_| {
-                let machine = machine.clone();
-                let range = range.clone();
-                thread::spawn(move || {
-                    (0..2000)
-                        .map(|_| {
-                            let AccessResult::Atomic {
-                                previous,
-                                written: true,
-                            } = machine.atomic_physical(&range, operation).unwrap()
-                            else {
-                                panic!("atomic increment failed")
-                            };
-                            previous
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        let mut previous: Vec<_> = cores
-            .into_iter()
-            .flat_map(|core| core.join().unwrap())
-            .collect();
-        previous.sort_unstable();
-        assert_eq!(previous, (0..8000).collect::<Vec<_>>());
-    }
-    #[test]
-    fn checked_atomics_and_host_cas_share_one_modification_order() {
-        use crate::{AccessOrdering, AccessResult, AtomicAccess, AtomicOperation, AtomicTransform};
-        for bytes in [8, 16] {
-            let machine = Machine::new(PAGE_SIZE).unwrap();
-            let allocation = machine
-                .account(PAGE_SIZE)
-                .unwrap()
-                .allocate(PAGE_SIZE)
-                .unwrap();
-            let range = AllocationRange::new(allocation.pin(), 0, bytes).unwrap();
-            machine
-                .prepare_reservations(std::slice::from_ref(&range))
-                .unwrap();
-            let workers: Vec<_> = (0..4)
-                .map(|index| {
-                    let machine = machine.clone();
-                    let range = range.clone();
-                    thread::spawn(move || {
-                        let pointer = machine
-                            .arena()
-                            .host_address(range.physical_extents().next().unwrap().start, bytes)
-                            .unwrap();
-                        (0..2000)
-                            .map(|_| {
-                                if index < 2 {
-                                    let operation = AtomicAccess {
-                                        bytes: bytes as u8,
-                                        ordering: AccessOrdering::Relaxed,
-                                        operation: AtomicOperation::ReadModifyWrite {
-                                            transform: AtomicTransform::Add,
-                                            operand: 1,
-                                        },
-                                    };
-                                    let AccessResult::Atomic {
-                                        previous,
-                                        written: true,
-                                    } = machine.atomic_physical(&range, operation).unwrap()
-                                    else {
-                                        panic!("increment failed")
-                                    };
-                                    previous
-                                } else {
-                                    // Exercise a host atomic that does not participate
-                                    // in the Rust reservation/version lock protocol.
-                                    let mut previous = unsafe {
-                                        crate::raw::read_value(pointer.as_ptr(), bytes as usize)
-                                    };
-                                    loop {
-                                        let observed = unsafe {
-                                            crate::raw::compare_exchange(
-                                                pointer.as_ptr(),
-                                                bytes as usize,
-                                                previous,
-                                                previous + 1,
-                                            )
-                                        };
-                                        if observed == previous {
-                                            break previous;
-                                        }
-                                        previous = observed;
-                                    }
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            let mut previous: Vec<_> = workers
-                .into_iter()
-                .flat_map(|worker| worker.join().unwrap())
-                .collect();
-            previous.sort_unstable();
-            assert_eq!(previous, (0..8000).collect::<Vec<_>>());
         }
     }
 

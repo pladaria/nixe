@@ -1001,31 +1001,6 @@ impl Footprint {
             ..other.as_ref().clone()
         }))
     }
-    pub(crate) fn device_write_epochs(
-        &self,
-    ) -> Result<Vec<nixe_memory::DeviceWriteEpoch>, MemoryError> {
-        let mut seen = vec![false; self.mapping.allocations.len()];
-        let mut epochs = Vec::new();
-        for (index, span) in self.mapping.spans.iter().enumerate() {
-            if seen[span.allocation_index] {
-                continue;
-            }
-            let mut covered = false;
-            self.visit(index, span.start, span.bytes, |_| {
-                covered = true;
-                false
-            })?;
-            if covered {
-                epochs.push(
-                    self.mapping.allocations[span.allocation_index]
-                        .device_write_epoch()
-                        .ok_or(MemoryError::Invalid("writer allocation has retired"))?,
-                );
-                seen[span.allocation_index] = true;
-            }
-        }
-        Ok(epochs)
-    }
     pub(crate) fn has_live_bytes(&self) -> Result<bool, MemoryError> {
         for (index, span) in self.mapping.spans.iter().enumerate() {
             let source = &self.mapping.allocations[span.allocation_index];

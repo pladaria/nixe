@@ -216,7 +216,7 @@ fn dispatch_next(
     process: &mut ScheduledProcess,
     dispatcher: &mut HorizonSvcDispatcher,
 ) -> ExceptionHandlingResult<HorizonSvcFault> {
-    let report = process.run_slice(1).unwrap();
+    let report = process.run_slice().unwrap();
     let result = process
         .route_supervisor_call(&report.stop, dispatcher)
         .unwrap();
@@ -236,7 +236,7 @@ fn dispatch_scheduled_next(
     process.coordinator_mut().drain_external_events().unwrap();
     let execution = process
         .coordinator_mut()
-        .run_next(1)
+        .run_next(std::time::Duration::from_secs(2))
         .unwrap()
         .expect("a test thread is runnable");
     let handling = dispatcher
@@ -6257,7 +6257,7 @@ fn process_and_last_thread_exit_drive_lifecycle_and_deterministic_teardown() {
         );
         assert_eq!(process.exit().unwrap().thread_id, 1);
         assert_eq!(process.main_thread().exit().unwrap().requested_scope, scope);
-        assert!(process.run_slice(1).is_err());
+        assert!(process.run_slice().is_err());
         assert!(!process.resume());
         assert!(!process.terminate());
 
@@ -6284,7 +6284,10 @@ fn create_thread_commits_through_a64_abi() {
     let process_id = process.scheduler_process_id();
     let mut dispatcher = support::dispatcher(&process);
     let coordinator = process.coordinator_mut();
-    let execution = coordinator.run_next(1).unwrap().unwrap();
+    let execution = coordinator
+        .run_next(std::time::Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
     let caller = execution.lease.thread;
     assert!(matches!(
         coordinator
@@ -6328,7 +6331,10 @@ fn create_thread_commits_through_a64_abi() {
         0,
         u64::from(created_handle),
     );
-    let execution = coordinator.run_next(1).unwrap().unwrap();
+    let execution = coordinator
+        .run_next(std::time::Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
     assert_eq!(execution.lease.thread, caller);
     assert!(matches!(
         coordinator

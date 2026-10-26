@@ -1,5 +1,6 @@
 use super::*;
 use crate::physical::WriteDomain;
+use nixe_memory::AtomicOperation;
 use nixe_memory::{Access, DeviceAccessEndpoint, Extent, PAGE_SIZE, PendingAccess};
 use std::sync::mpsc;
 

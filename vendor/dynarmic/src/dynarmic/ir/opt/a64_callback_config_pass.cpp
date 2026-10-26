@@ -29,7 +29,9 @@ void A64CallbackConfigPass(IR::Block& block, const A64::UserConfig& conf) {
             ir.SetInsertionPointBefore(&inst);
 
             size_t bytes = 4 << static_cast<size_t>(conf.dczid_el0 & 0b1111);
-            IR::U64 addr{inst.GetArg(2)};
+            // DC ZVA clears the naturally aligned block containing the operand.
+            // https://developer.arm.com/documentation/ddi0601/latest/AArch64-Instructions/DC-ZVA--Data-Cache-Zero-by-VA
+            IR::U64 addr = ir.And(IR::U64{inst.GetArg(2)}, ir.Imm64(~(u64(bytes) - 1)));
 
             const IR::U128 zero_u128 = ir.ZeroExtendToQuad(ir.Imm64(0));
             while (bytes >= 16) {

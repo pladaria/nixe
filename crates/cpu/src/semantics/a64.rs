@@ -222,19 +222,13 @@ pub const fn runtime_register_read(
         // CTR_EL0 reports log2(cache-line words) in DminLine and IminLine.
         // Switch 1's Cortex-A57 profile exposes 64-byte lines.
         // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CTR-EL0--Cache-Type-Register
-        0xd53b_0020 => Some(RuntimeRegisterRead::Constant((4_u64 << 16) | 4)),
-        // DCZID_EL0 derives its block size and prohibition bit from the guest
-        // profile rather than the host cache implementation.
+        0xd53b_0020 => Some(RuntimeRegisterRead::Constant(0x8444_c004)),
+        // DCZID_EL0 reports the guest zeroing block size, independently of the host.
         // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/DCZID-EL0--Data-Cache-Zero-ID-Register
         0xd53b_00e0 => {
             let bytes = platform.data_zero_block_bytes();
-            let prohibited = if platform.user_cache_maintenance_prohibited() {
-                1 << 4
-            } else {
-                0
-            };
             Some(RuntimeRegisterRead::Constant(
-                prohibited | (bytes.trailing_zeros() - 2) as u64,
+                (bytes.trailing_zeros() - 2) as u64,
             ))
         }
         // https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/CNTFRQ-EL0--Counter-timer-Frequency-register

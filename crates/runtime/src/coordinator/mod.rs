@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use nixe_cpu::execution::{SchedulerRequest, VcpuEventState};
+use nixe_cpu::execution::VcpuEventState;
 use nixe_scheduler::{
     Completion, CoreSet, GuestThreadId, Lease, MachineSchedulerProfile, ProcessId, Readiness,
     ScheduledThreadConfig, SchedulerCommand, SchedulerDecision, SchedulerError, SchedulerState,
@@ -19,7 +19,7 @@ mod execution;
 mod identity;
 mod thread;
 mod wait;
-mod worker;
+pub(crate) mod worker;
 
 use identity::{GuestThreadIdAllocator, ProcessIdAllocator};
 pub use worker::WorkerFailure;
@@ -57,45 +57,6 @@ struct PriorityDonation {
     key: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CpuWait {
-    vcpu: VirtualCpuId,
-    request: SchedulerRequest,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AdaptiveExecutionBudget {
-    baseline: u64,
-    current: u64,
-    ceiling: u64,
-}
-
-impl AdaptiveExecutionBudget {
-    const DEFAULT_CEILING: u64 = 100_000;
-
-    const fn new(baseline: u64) -> Self {
-        Self {
-            baseline,
-            current: baseline,
-            ceiling: if baseline > Self::DEFAULT_CEILING {
-                baseline
-            } else {
-                Self::DEFAULT_CEILING
-            },
-        }
-    }
-
-    fn observe(&mut self, uninterrupted: bool) {
-        self.current = if uninterrupted {
-            self.current.saturating_mul(2).min(self.ceiling)
-        } else {
-            self.baseline
-        };
-    }
-}
-
-/// System-level owner of process lookup and the pure scheduler state machine.
-/// CPU backend state remains encapsulated by its registered process runtime.
 pub struct RuntimeCoordinator {
     scheduler: SchedulerState,
     processes: BTreeMap<ProcessId, RunnableProcess>,
@@ -109,10 +70,9 @@ pub struct RuntimeCoordinator {
     next_deadline_sequence: u64,
     priority_donations: BTreeSet<PriorityDonation>,
     vcpu_events: BTreeMap<VirtualCpuId, VcpuEventState>,
-    cpu_waits: BTreeMap<GuestThreadId, CpuWait>,
-    budgets: BTreeMap<VirtualCpuId, AdaptiveExecutionBudget>,
     next_preemption_ns: Option<u64>,
     completed_executions: VecDeque<CoordinatorExecution>,
+    deferred_events: VecDeque<crate::SequencedExternalEvent>,
 }
 
 impl RuntimeCoordinator {
@@ -142,16 +102,13 @@ impl RuntimeCoordinator {
             .iter()
             .map(|descriptor| (descriptor.id(), VcpuEventState::default()))
             .collect();
-        let adaptive_budget =
-            AdaptiveExecutionBudget::new(profile.default_timeslice_instructions());
-        let budgets = profile
-            .vcpus()
-            .iter()
-            .map(|descriptor| (descriptor.id(), adaptive_budget))
-            .collect();
-        let workers =
-            VcpuWorkerPool::start(profile.vcpus().iter().map(|descriptor| descriptor.id()))
-                .map_err(|error| CoordinatorError::WorkerStartup(error.kind()))?;
+        let inbox = ExternalEventInbox::bounded(1_024, profile.vcpus().len())
+            .expect("the default event capacity is non-zero");
+        let workers = VcpuWorkerPool::start(
+            profile.vcpus().iter().map(|descriptor| descriptor.id()),
+            inbox.worker_sender(),
+        )
+        .map_err(|error| CoordinatorError::WorkerStartup(error.kind()))?;
         let next_preemption_ns = profile
             .preemption_interval_ns()
             .map(|interval| virtual_clock.scheduler_time_ns().saturating_add(interval));
@@ -161,18 +118,16 @@ impl RuntimeCoordinator {
             process_ids: ProcessIdAllocator::new(),
             workers,
             thread_ids: GuestThreadIdAllocator::new(),
-            inbox: ExternalEventInbox::bounded(1_024)
-                .expect("the default external event capacity is non-zero"),
+            inbox,
             host_stop_requested: false,
             virtual_clock,
             deadlines: BTreeMap::new(),
             next_deadline_sequence: 1,
             priority_donations: BTreeSet::new(),
             vcpu_events,
-            cpu_waits: BTreeMap::new(),
-            budgets,
             next_preemption_ns,
             completed_executions: VecDeque::new(),
+            deferred_events: VecDeque::new(),
         })
     }
 
@@ -198,7 +153,6 @@ impl RuntimeCoordinator {
         for thread in waiting_threads {
             self.release_wait_resources(thread);
         }
-        self.cpu_waits.clear();
         self.deadlines.clear();
         self.host_stop_requested = true;
         self.workers.shutdown().map_err(CoordinatorError::Worker)
@@ -292,7 +246,6 @@ impl RuntimeCoordinator {
                 && !removed_threads.contains(&donation.waiter)
         });
         for thread in threads {
-            self.cpu_waits.remove(&thread);
             self.release_wait_resources(thread);
             self.scheduler.apply(SchedulerCommand::Unregister(thread))?;
         }
@@ -325,7 +278,6 @@ impl RuntimeCoordinator {
             .terminate_from_host();
         if terminated {
             for thread in threads {
-                self.cpu_waits.remove(&thread);
                 if self.scheduler.thread(thread).is_some_and(|view| {
                     matches!(
                         view.lifecycle,
@@ -436,7 +388,6 @@ impl RuntimeCoordinator {
     /// Makes one waiting guest thread ready.
     pub fn make_thread_ready(&mut self, thread: GuestThreadId) -> Result<(), CoordinatorError> {
         self.scheduler.apply(SchedulerCommand::MakeReady(thread))?;
-        self.cpu_waits.remove(&thread);
         Ok(())
     }
 
@@ -455,46 +406,12 @@ impl RuntimeCoordinator {
             return Ok(());
         }
         events.post_interrupts(mask);
-        self.wake_cpu_waiters(vcpu, true)?;
-        Ok(())
-    }
-
-    fn send_event(&mut self) -> Result<(), CoordinatorError> {
-        let vcpus: Vec<_> = self.vcpu_events.keys().copied().collect();
-        for events in self.vcpu_events.values() {
-            events.signal_event();
-        }
-        for vcpu in vcpus {
-            self.wake_cpu_waiters(vcpu, false)?;
-        }
-        Ok(())
-    }
-
-    fn wake_cpu_waiters(
-        &mut self,
-        vcpu: VirtualCpuId,
-        interrupt: bool,
-    ) -> Result<(), CoordinatorError> {
-        let threads: Vec<_> = self
-            .cpu_waits
-            .iter()
-            .filter_map(|(thread, wait)| {
-                (wait.vcpu == vcpu
-                    && (wait.request == SchedulerRequest::WaitForEvent
-                        || (interrupt && wait.request == SchedulerRequest::WaitForInterrupt)))
-                    .then_some(*thread)
-            })
-            .collect();
-        if !interrupt && !threads.is_empty() {
-            let _ = self
-                .vcpu_events
-                .get(&vcpu)
-                .expect("a recorded CPU wait references a configured vCPU")
-                .consume_event();
-        }
-        for thread in threads {
-            self.cpu_waits.remove(&thread);
-            self.scheduler.apply(SchedulerCommand::MakeReady(thread))?;
+        if let Some(lease) = self
+            .scheduler
+            .active_leases()
+            .find(|lease| lease.vcpu == vcpu)
+        {
+            self.processes[&lease.process].request_vcpu_safepoint(vcpu);
         }
         Ok(())
     }
@@ -667,10 +584,7 @@ impl RuntimeCoordinator {
         CoordinatorResourceCounts {
             processes: self.processes.len(),
             scheduled_threads: self.scheduler.thread_count(),
-            active_waits: self
-                .scheduler
-                .active_wait_count()
-                .saturating_add(self.cpu_waits.len()),
+            active_waits: self.scheduler.active_wait_count(),
             deadlines: self.deadlines.len(),
             external_watcher_groups: self.inbox.sender().watcher_group_count(),
             priority_donations: self.priority_donations.len(),

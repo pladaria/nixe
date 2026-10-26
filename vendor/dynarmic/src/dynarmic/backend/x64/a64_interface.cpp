@@ -39,9 +39,9 @@ static RunCodeCallbacks GenRunCodeCallbacks(A64::UserCallbacks* cb, CodePtr (*Lo
 
 static std::function<void(BlockOfCode&)> GenRCP(const A64::UserConfig& conf) {
     return [conf](BlockOfCode& code) {
-        if (conf.physical_exclusive_page_table) {
+        if (conf.canonical_page_table) {
             ASSERT(!conf.page_table);
-            code.mov(code.r14, conf.physical_exclusive_page_table);
+            code.mov(code.r14, conf.canonical_page_table);
         } else if (conf.page_table) {
             code.mov(code.r14, mcl::bit_cast<u64>(conf.page_table));
         }
@@ -226,16 +226,6 @@ public:
     void ClearExclusiveState() {
         jit_state.exclusive_state = 0;
     }
-    void SetPhysicalExclusiveReservation(u64 address, u64 identity, u64 version, u64 device_version, u8 bytes, Vector expected) {
-        ASSERT(!is_executing);
-        jit_state.physical_exclusive_address = address;
-        jit_state.physical_exclusive_identity = identity;
-        jit_state.physical_exclusive_version = version;
-        jit_state.physical_exclusive_device_version = device_version;
-        jit_state.physical_exclusive_size = bytes;
-        jit_state.physical_exclusive_expected = expected;
-        jit_state.exclusive_state = 1;
-    }
 
     bool IsExecuting() const {
         return is_executing;
@@ -283,13 +273,14 @@ private:
 
         // JIT Compile
         const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
-        IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code,
-                                            {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+        A64::Translate(ir_block, A64::LocationDescriptor{current_location}, get_code,
+                       {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct,
+                        conf.hook_hint_instructions});
         Optimization::PolyfillPass(ir_block, polyfill_options);
         Optimization::A64CallbackConfigPass(ir_block, conf);
         Optimization::NamingPass(ir_block);
         if (conf.HasOptimization(OptimizationFlag::GetSetElimination)) {
-            Optimization::A64GetSetElimination(ir_block, conf.check_halt_on_memory_access);
+            Optimization::A64GetSetElimination(ir_block);
             Optimization::DeadCodeElimination(ir_block);
         }
         if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
@@ -299,7 +290,9 @@ private:
         if (conf.HasOptimization(OptimizationFlag::MiscIROpt)) {
             Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);
         }
+#ifdef DYNARMIC_VERIFY_IR
         Optimization::VerificationPass(ir_block);
+#endif
         return emitter.Emit(ir_block).entrypoint;
     }
 
@@ -331,6 +324,7 @@ private:
     A64JitState jit_state;
     BlockOfCode block_of_code;
     A64EmitX64 emitter;
+    IR::Block ir_block{IR::LocationDescriptor{0}};
     Optimization::PolyfillOptions polyfill_options;
 
     bool invalidate_entire_cache = false;
@@ -445,9 +439,6 @@ void Jit::SetPstate(u32 value) {
 
 void Jit::ClearExclusiveState() {
     impl->ClearExclusiveState();
-}
-void Jit::SetPhysicalExclusiveReservation(u64 address, u64 identity, u64 version, u64 device_version, u8 bytes, Vector expected) {
-    impl->SetPhysicalExclusiveReservation(address, identity, version, device_version, bytes, expected);
 }
 
 bool Jit::IsExecuting() const {

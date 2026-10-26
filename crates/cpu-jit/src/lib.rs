@@ -1,12 +1,10 @@
 //! A64 execution using the vendored Dynarmic recompiler.
-#[cfg(all(test, target_arch = "x86_64"))]
-mod canonical_memory_tests;
-pub mod code;
+mod code;
 #[cfg(target_arch = "x86_64")]
-pub mod execution;
+mod execution;
 mod ffi;
-#[cfg(target_arch = "x86_64")]
-pub mod instruction;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod memory_tests;
 pub mod metrics;
 #[cfg(target_arch = "x86_64")]
 pub mod process;
@@ -58,41 +56,33 @@ impl Drop for Native {
 /// capture a diagnostic context; normal exits use the resident state directly.
 pub struct JitRunRequest<'a> {
     pub state: &'a mut ThreadState,
-    pub instruction_budget: u64,
     pub timer: &'a dyn ArchitecturalTimer,
     pub events: &'a VcpuEventState,
 }
 
-fn fault(message: impl Into<Box<str>>, state: &ThreadState, progress: u64) -> CpuFault {
+fn fault(message: impl Into<Box<str>>, state: &ThreadState) -> CpuFault {
     CpuFault {
         backend: "dynarmic",
         kind: CpuFaultKind::Internal,
-        progress,
         message: message.into(),
         context: Some(Box::new(state.register_context())),
     }
 }
-fn unavailable_state_fault(message: impl Into<Box<str>>, progress: u64) -> CpuFault {
+fn unavailable_state_fault(message: impl Into<Box<str>>) -> CpuFault {
     CpuFault {
         backend: "dynarmic",
         kind: CpuFaultKind::Internal,
-        progress,
         message: message.into(),
         context: None,
     }
 }
-fn report(stop: CpuExit, progress: u64, state: &ThreadState) -> ExecutionReport {
+fn report(stop: CpuExit, state: &ThreadState) -> ExecutionReport {
     let needs_context = !matches!(
         stop,
-        CpuExit::SupervisorCall { .. }
-            | CpuExit::BudgetExhausted
-            | CpuExit::Safepoint
-            | CpuExit::PendingEvent { .. }
-            | CpuExit::Scheduled { .. }
+        CpuExit::SupervisorCall { .. } | CpuExit::Safepoint | CpuExit::PendingEvent { .. }
     );
     ExecutionReport {
         stop,
-        progress,
         context: needs_context.then(|| state.register_context()),
     }
 }

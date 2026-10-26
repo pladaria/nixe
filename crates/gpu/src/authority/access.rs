@@ -1,6 +1,6 @@
 //! Exact CPU operations retain their interval dependency until execution finishes.
 use super::*;
-use nixe_memory::{AccessOperation, AccessResult, AtomicOperation, DeviceAccessRequest, Machine};
+use nixe_memory::{AccessOperation, AccessResult, DeviceAccessRequest, Machine};
 #[cfg(test)]
 mod tests;
 
@@ -209,14 +209,7 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             ));
         }
         let pending = &self.accesses[&id];
-        let needs_read = !matches!(
-            pending.request.operation(),
-            AccessOperation::Write(_)
-                | AccessOperation::Atomic(nixe_memory::AtomicAccess {
-                    operation: AtomicOperation::StoreExclusive { .. },
-                    ..
-                })
-        );
+        let needs_read = !matches!(pending.request.operation(), AccessOperation::Write(_));
         let epoch = pending.epoch.checked_add(1).ok_or(MemoryError::Invalid(
             "exact access readback epoch exhausted",
         ))?;
@@ -402,9 +395,7 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             .and_then(|result| {
                 if matches!(
                     result,
-                    AccessResult::Written
-                        | AccessResult::Atomic { written: true, .. }
-                        | AccessResult::ExclusiveWritten(true)
+                    AccessResult::Written | AccessResult::Atomic { written: true, .. }
                 ) {
                     self.cpu_write(pending.request.ranges())?;
                 }

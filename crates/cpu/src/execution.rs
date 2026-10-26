@@ -2,13 +2,12 @@
 
 use core::fmt::{self, Display, Formatter};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::coverage::CoverageId;
 use crate::error::{InstructionFetchFault, UnallocatedEncoding};
 use crate::exception::ExceptionKind;
 use crate::location::{InstructionEncoding, LocationDescriptor};
-use crate::memory::DataAccessFault;
 use crate::state::RegisterContext;
 
 macro_rules! identity {
@@ -44,51 +43,20 @@ pub trait ArchitecturalTimer {
 
 #[derive(Clone, Default)]
 pub struct VcpuEventState {
-    state: Arc<VcpuEventStateInner>,
-}
-
-#[derive(Default)]
-struct VcpuEventStateInner {
-    event_register: AtomicBool,
-    pending_interrupts: AtomicU32,
+    pending_interrupts: Arc<AtomicU32>,
 }
 
 impl VcpuEventState {
-    pub fn signal_event(&self) {
-        self.state.event_register.store(true, Ordering::Release);
-    }
-
-    #[must_use]
-    pub fn consume_event(&self) -> bool {
-        self.state.event_register.swap(false, Ordering::AcqRel)
-    }
-
     pub fn post_interrupts(&self, mask: u32) {
         if mask != 0 {
-            self.state
-                .pending_interrupts
-                .fetch_or(mask, Ordering::Release);
-            self.signal_event();
+            self.pending_interrupts.fetch_or(mask, Ordering::Release);
         }
     }
 
     #[must_use]
-    pub fn interrupts_pending(&self) -> bool {
-        self.state.pending_interrupts.load(Ordering::Acquire) != 0
-    }
-
-    #[must_use]
     pub fn take_pending_interrupts(&self) -> u32 {
-        self.state.pending_interrupts.swap(0, Ordering::AcqRel)
+        self.pending_interrupts.swap(0, Ordering::AcqRel)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum SchedulerRequest {
-    Yield,
-    WaitForEvent,
-    WaitForInterrupt,
-    SendEvent,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,14 +73,9 @@ pub enum CpuExit {
     FetchFault {
         fault: InstructionFetchFault,
     },
-    BudgetExhausted,
     Safepoint,
     PendingEvent {
         mask: u32,
-    },
-    Scheduled {
-        source: LocationDescriptor,
-        request: SchedulerRequest,
     },
     ArchitecturalException {
         source: LocationDescriptor,
@@ -122,10 +85,6 @@ pub enum CpuExit {
     SupervisorCall {
         source: LocationDescriptor,
         immediate: u32,
-    },
-    DataFault {
-        source: LocationDescriptor,
-        fault: DataAccessFault,
     },
     /// Runtime classification of a completed loader-stub SVC. CPU backends
     /// report the ordinary SupervisorCall and do not recognize loader addresses.
@@ -184,7 +143,6 @@ impl CpuExit {
                 ExceptionKind::SupervisorCall,
                 Some(u64::from(*immediate)),
             ),
-            Self::DataFault { source, .. } => (*source, ExceptionKind::DataAbort, None),
             Self::UnallocatedEncoding { error } => (
                 error.instruction.location,
                 ExceptionKind::UndefinedInstruction,
@@ -212,12 +170,8 @@ impl Display for CpuExit {
                 write!(formatter, "unallocated-encoding {error}")
             }
             Self::FetchFault { fault } => write!(formatter, "fetch-fault {fault}"),
-            Self::BudgetExhausted => formatter.write_str("budget-exhausted"),
             Self::Safepoint => formatter.write_str("safepoint"),
             Self::PendingEvent { mask } => write!(formatter, "pending-event mask=0x{mask:08x}"),
-            Self::Scheduled { source, request } => {
-                write!(formatter, "scheduled source=[{source}] request={request:?}")
-            }
             Self::ArchitecturalException {
                 source,
                 kind,
@@ -230,9 +184,6 @@ impl Display for CpuExit {
                 formatter,
                 "supervisor-call source=[{source}] immediate={immediate:?}"
             ),
-            Self::DataFault { source, fault } => {
-                write!(formatter, "data-fault source=[{source}] fault={fault:?}")
-            }
             Self::LoaderReturn {
                 source,
                 result_code,
@@ -246,8 +197,6 @@ impl Display for CpuExit {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionReport {
-    /// Guest execution ticks charged by native execution at block boundaries.
-    pub progress: u64,
     pub stop: CpuExit,
     /// Owned compact diagnostic snapshot when required by a fault. A normal native
     /// boundary may omit it while retaining complete state with its owner.
@@ -256,11 +205,7 @@ pub struct ExecutionReport {
 
 impl Display for ExecutionReport {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "progress={} stop=[{}] registers=[",
-            self.progress, self.stop
-        )?;
+        write!(formatter, "stop=[{}] registers=[", self.stop)?;
         match &self.context {
             Some(context) => Display::fmt(context, formatter)?,
             None => formatter.write_str("not captured")?,
@@ -280,7 +225,6 @@ pub enum CpuFaultKind {
 pub struct CpuFault {
     pub backend: &'static str,
     pub kind: CpuFaultKind,
-    pub progress: u64,
     pub message: Box<str>,
     /// Compact snapshot of exact synchronized state, if available. `Some`
     /// also guarantees that the caller's full architectural state is current.
@@ -293,8 +237,8 @@ impl Display for CpuFault {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "backend={} kind={:?} progress={} message={} registers=[",
-            self.backend, self.kind, self.progress, self.message
+            "backend={} kind={:?} message={} registers=[",
+            self.backend, self.kind, self.message
         )?;
         match &self.context {
             Some(context) => Display::fmt(context, formatter)?,
@@ -306,161 +250,33 @@ impl Display for CpuFault {
 
 impl std::error::Error for CpuFault {}
 
-const CONTROL_PREEMPT: u32 = 1 << 0;
-const CONTROL_CODE_INVALIDATION: u32 = 1 << 1;
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ControlRequest {
-    Preempt,
-    CodeInvalidation,
-}
-
-impl ControlRequest {
-    const fn bit(self) -> u32 {
-        match self {
-            Self::Preempt => CONTROL_PREEMPT,
-            Self::CodeInvalidation => CONTROL_CODE_INVALIDATION,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ControlSnapshot {
-    pub requests: u32,
-    pub invalidation_epoch: u64,
-}
-
-impl ControlSnapshot {
-    #[must_use]
-    pub const fn contains(self, request: ControlRequest) -> bool {
-        self.requests & request.bit() != 0
-    }
-}
-
-struct CpuControlState {
-    requests: AtomicU32,
-    invalidation_epoch: AtomicU64,
-    acknowledged_invalidation_epoch: AtomicU64,
-    active_executions: AtomicU32,
-    interrupt: Option<Arc<dyn Fn() + Send + Sync>>,
-}
-
-impl Default for CpuControlState {
-    fn default() -> Self {
-        Self {
-            requests: AtomicU32::new(0),
-            invalidation_epoch: AtomicU64::new(0),
-            acknowledged_invalidation_epoch: AtomicU64::new(0),
-            active_executions: AtomicU32::new(0),
-            interrupt: None,
-        }
-    }
-}
-
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CpuControl {
     state: Arc<CpuControlState>,
 }
 
-pub struct ExecutionGuard {
-    state: Arc<CpuControlState>,
-}
-
-impl Drop for ExecutionGuard {
-    fn drop(&mut self) {
-        self.state.active_executions.fetch_sub(1, Ordering::AcqRel);
-    }
+struct CpuControlState {
+    requested: AtomicBool,
+    interrupt: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl CpuControl {
-    /// Connect a native backend's thread-safe halt mechanism to scheduler requests.
     pub fn with_interrupt(interrupt: Arc<dyn Fn() + Send + Sync>) -> Self {
         Self {
             state: Arc::new(CpuControlState {
-                interrupt: Some(interrupt),
-                ..Default::default()
+                requested: AtomicBool::new(false),
+                interrupt,
             }),
         }
     }
 
-    #[must_use]
-    pub fn enter_execution(&self) -> ExecutionGuard {
-        self.state.active_executions.fetch_add(1, Ordering::AcqRel);
-        ExecutionGuard {
-            state: Arc::clone(&self.state),
-        }
+    pub fn request_preemption(&self) {
+        self.state.requested.store(true, Ordering::Release);
+        (self.state.interrupt)();
     }
 
     #[must_use]
-    pub fn execution_active(&self) -> bool {
-        self.state.active_executions.load(Ordering::Acquire) != 0
-    }
-
-    pub fn request(&self, request: ControlRequest) {
-        self.state
-            .requests
-            .fetch_or(request.bit(), Ordering::Release);
-        if let Some(interrupt) = &self.state.interrupt {
-            interrupt();
-        }
-    }
-
-    pub fn request_invalidation(&self, epoch: u64) {
-        self.state
-            .invalidation_epoch
-            .fetch_max(epoch, Ordering::AcqRel);
-        self.request(ControlRequest::CodeInvalidation);
-    }
-
-    #[must_use]
-    pub fn take_pending(&self) -> Option<ControlSnapshot> {
-        let requests = self.state.requests.swap(0, Ordering::AcqRel);
-        (requests != 0).then(|| ControlSnapshot {
-            requests,
-            invalidation_epoch: self.state.invalidation_epoch.load(Ordering::Acquire),
-        })
-    }
-
-    pub fn acknowledge(&self, snapshot: ControlSnapshot) {
-        if snapshot.requests & CONTROL_CODE_INVALIDATION != 0 {
-            self.state
-                .acknowledged_invalidation_epoch
-                .fetch_max(snapshot.invalidation_epoch, Ordering::AcqRel);
-        }
-    }
-
-    pub fn acknowledge_invalidation(&self, epoch: u64) {
-        self.state
-            .acknowledged_invalidation_epoch
-            .fetch_max(epoch, Ordering::AcqRel);
-    }
-
-    #[must_use]
-    pub fn acknowledged_invalidation(&self, epoch: u64) -> bool {
-        self.state
-            .acknowledged_invalidation_epoch
-            .load(Ordering::Acquire)
-            >= epoch
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pending_requests_are_consumed_once() {
-        let control = CpuControl::default();
-        control.request(ControlRequest::CodeInvalidation);
-        let snapshot = control.take_pending().unwrap();
-        assert!(snapshot.contains(ControlRequest::CodeInvalidation));
-        assert!(control.take_pending().is_none());
-
-        control.request(ControlRequest::Preempt);
-        assert!(
-            control
-                .take_pending()
-                .is_some_and(|snapshot| snapshot.contains(ControlRequest::Preempt))
-        );
+    pub fn take_preemption(&self) -> bool {
+        self.state.requested.swap(false, Ordering::AcqRel)
     }
 }

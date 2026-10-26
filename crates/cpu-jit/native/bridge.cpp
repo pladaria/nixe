@@ -7,7 +7,9 @@ struct StateMeasurement {
   std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
   ~StateMeasurement() {
     nixe_jit_measure_native_state(std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::steady_clock::now() - start).count(), bytes);
+                                      std::chrono::steady_clock::now() - start)
+                                      .count(),
+                                  bytes);
   }
 };
 #endif
@@ -16,6 +18,7 @@ struct StateMeasurement {
 #include <cstring>
 #include <dynarmic/backend/exception_handler.h>
 #include <dynarmic/interface/A64/a64.h>
+#include <dynarmic/interface/exclusive_monitor.h>
 #include <exception>
 #include <memory>
 #include <string>
@@ -32,14 +35,13 @@ static_assert(sizeof(std::array<std::uint64_t, 31>) == sizeof(NixeState::x));
 extern "C" {
 struct NixeCallbacks {
   bool (*code)(void *, std::uint64_t, std::uint32_t *);
-  bool (*memory)(void *, std::uint64_t, std::uint32_t, std::uint32_t,
-                 std::uint64_t *, const std::uint64_t *);
+  bool (*memory)(void *, std::uint64_t, std::uint32_t, std::uint32_t, std::uint64_t *,
+                 const std::uint64_t *);
   std::uint64_t (*counter)(void *);
-  bool (*data_cache)(void *, std::uint64_t);
 };
 struct NixeExit {
   std::uint32_t kind, detail;
-  std::uint64_t pc, value, ticks;
+  std::uint64_t pc;
 };
 }
 
@@ -50,11 +52,11 @@ struct Core final : Dynarmic::A64::UserCallbacks {
   void *context = nullptr; // Borrowed only for the duration of Run.
   std::uint64_t tpidr = 0, tpidrro = 0;
   NixeExit exit{};
-  std::uint64_t ticks_left = 0, ticks_executed = 0;
+  Dynarmic::ExclusiveMonitor monitor{1};
   std::unique_ptr<Dynarmic::A64::Jit> jit;
 
-  Core(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t exclusive_table,
-       size_t address_bits, std::uint32_t frequency, std::uint32_t ctr, std::uint32_t dczid)
+  Core(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table, size_t address_bits,
+       std::uint32_t frequency, std::uint32_t ctr, std::uint32_t dczid)
       : callbacks(cb) {
     Dynarmic::A64::UserConfig conf{};
     conf.callbacks = this;
@@ -64,18 +66,23 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.ctr_el0 = ctr;
     conf.dczid_el0 = dczid;
     conf.wall_clock_cntpct = true;
-    conf.enable_cycle_counting = true;
-    conf.check_halt_on_memory_access = true;
-    conf.hook_hint_instructions = true;
-    conf.hook_data_cache_operations = true;
+    conf.enable_cycle_counting = false;
+    conf.check_halt_on_memory_access = false;
+    conf.hook_hint_instructions = false;
+    conf.hook_data_cache_operations = false;
     // Use Eden's defined choices for constrained-unpredictable encodings,
     // including overlapping status/data zero registers in STXR/STLXR.
     // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/STLXR--Store-Release-Exclusive-Register-
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/arm/dynarmic/arm_dynarmic_64.cpp
     conf.define_unpredictable_behaviour = true;
     conf.fastmem_pointer = arena;
+    conf.global_monitor = &monitor;
+    conf.processor_id = 0;
+    conf.fastmem_exclusive_access = true;
+    conf.unsafe_optimizations = true;
+    conf.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
 #if defined(__x86_64__)
-    conf.physical_exclusive_page_table = exclusive_table;
+    conf.canonical_page_table = page_table;
 #endif
     conf.fastmem_address_space_bits = address_bits;
     conf.silently_mirror_fastmem = false;
@@ -85,16 +92,14 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.recompile_on_exclusive_fastmem_failure = true;
     jit = std::make_unique<Dynarmic::A64::Jit>(conf);
   }
-  void stop(std::uint32_t kind, std::uint32_t detail, std::uint64_t pc,
-            std::uint64_t value = 0) {
+  void stop(std::uint32_t kind, std::uint32_t detail, std::uint64_t pc) {
     if (exit.kind == 0)
-      exit = {kind, detail, pc, value};
+      exit = {kind, detail, pc};
     jit->HaltExecution();
   }
   bool access(std::uint64_t addr, unsigned size, unsigned op, Vector &value,
               const std::uint64_t *expected = nullptr) {
-    if (callbacks.memory(context, addr, size, op, value.data(),
-                         expected))
+    if (callbacks.memory(context, addr, size, op, value.data(), expected))
       return true;
     jit->HaltExecution(HaltReason::MemoryAbort);
     return false;
@@ -105,106 +110,85 @@ struct Core final : Dynarmic::A64::UserCallbacks {
       return word;
     return std::nullopt;
   }
-#define READ(bits)                                                             \
-  std::uint##bits##_t MemoryRead##bits(std::uint64_t addr) override {          \
-    Vector v{};                                                                \
-    access(addr, bits / 8, 0, v);                                              \
-    return static_cast<std::uint##bits##_t>(v[0]);                             \
+#define READ(bits)                                                                                 \
+  std::uint##bits##_t MemoryRead##bits(std::uint64_t addr) override {                              \
+    Vector v{};                                                                                    \
+    access(addr, bits / 8, 0, v);                                                                  \
+    return static_cast<std::uint##bits##_t>(v[0]);                                                 \
   }
-  READ(8)
-  READ(16) READ(32) READ(64)
+  READ(8);
+  READ(16);
+  READ(32);
+  READ(64);
 #undef READ
-      Vector MemoryRead128(std::uint64_t addr) override {
+  Vector MemoryRead128(std::uint64_t addr) override {
     Vector v{};
     access(addr, 16, 0, v);
     return v;
   }
-#define WRITE(bits)                                                            \
-  void MemoryWrite##bits(std::uint64_t addr, std::uint##bits##_t value)        \
-      override {                                                               \
-    Vector v{value, 0};                                                        \
-    access(addr, bits / 8, 1, v);                                              \
+#define WRITE(bits)                                                                                \
+  void MemoryWrite##bits(std::uint64_t addr, std::uint##bits##_t value) override {                 \
+    Vector v{value, 0};                                                                            \
+    access(addr, bits / 8, 1, v);                                                                  \
   }
-  WRITE(8)
-  WRITE(16) WRITE(32) WRITE(64)
+  WRITE(8);
+  WRITE(16);
+  WRITE(32);
+  WRITE(64);
 #undef WRITE
-      void MemoryWrite128(std::uint64_t addr, Vector v) override {
-    access(addr, 16, 1, v);
+  void MemoryWrite128(std::uint64_t addr, Vector v) override { access(addr, 16, 1, v); }
+#define EXCLUSIVE(bits)                                                                            \
+  bool MemoryWriteExclusive##bits(std::uint64_t addr, std::uint##bits##_t value,                   \
+                                  std::uint##bits##_t expected) override {                         \
+    Vector v{value, 0}, e{expected, 0};                                                            \
+    return access(addr, bits / 8, 2, v, e.data()) && v[0] != 0;                                    \
   }
-#define EXCLUSIVE(bits)                                                        \
-  bool MemoryWriteExclusive##bits(std::uint64_t addr,                          \
-                                  std::uint##bits##_t value,                   \
-                                  std::uint##bits##_t expected) override {     \
-    Vector v{value, 0}, e{expected, 0};                                        \
-    return access(addr, bits / 8, 2, v, e.data()) && v[0] != 0;                 \
-  }
-  EXCLUSIVE(8)
-  EXCLUSIVE(16) EXCLUSIVE(32) EXCLUSIVE(64)
+  EXCLUSIVE(8);
+  EXCLUSIVE(16);
+  EXCLUSIVE(32);
+  EXCLUSIVE(64);
 #undef EXCLUSIVE
-      bool MemoryWriteExclusive128(std::uint64_t addr, Vector v,
-                                   Vector e) override {
+  bool MemoryWriteExclusive128(std::uint64_t addr, Vector v, Vector e) override {
     return access(addr, 16, 2, v, e.data()) && v[0] != 0;
   }
-  void PreparePhysicalExclusive(std::uint64_t address, size_t bytes, bool write,
-                                std::uint64_t *data) override {
-    Vector value{data[0], data[1]};
-    access(address, bytes, write ? 5 : 3, value, data + 2);
-    data[0] = value[0];
-  }
-  void InterpreterFallback(std::uint64_t pc, size_t) override {
-    stop(1, 0, pc);
-  }
+  void InterpreterFallback(std::uint64_t pc, size_t) override { stop(1, 0, pc); }
   void CallSVC(std::uint32_t imm) override { stop(2, imm, jit->GetPC() - 4); }
-  void ExceptionRaised(std::uint64_t pc,
-                       Dynarmic::A64::Exception exception) override {
-    // WFE is a NOP-compatible power-management hint. Userspace exclusive
-    // loops cannot depend on a SEV: hardware also wakes them when the global
-    // exclusive monitor is cleared. Like Eden, continue instead of turning
-    // this hint into a kernel wait without those hardware wake sources.
-    // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/WFE--Wait-for-event-
-    // https://github.com/eden-emulator/mirror/blob/master/src/core/arm/dynarmic/arm_dynarmic_64.cpp
-    if (exception == Dynarmic::A64::Exception::WaitForEvent)
+  void ExceptionRaised(std::uint64_t pc, Dynarmic::A64::Exception exception) override {
+    switch (exception) {
+    case Dynarmic::A64::Exception::WaitForInterrupt:
+    case Dynarmic::A64::Exception::WaitForEvent:
+    case Dynarmic::A64::Exception::SendEvent:
+    case Dynarmic::A64::Exception::SendEventLocal:
+    case Dynarmic::A64::Exception::Yield:
       return;
-    stop(3, static_cast<unsigned>(exception), pc);
-  }
-  void DataCacheOperationRaised(Dynarmic::A64::DataCacheOperation op,
-                                std::uint64_t value) override {
-    switch (op) {
-    case Dynarmic::A64::DataCacheOperation::CleanAndInvalidateByVAToPoC:
-    case Dynarmic::A64::DataCacheOperation::CleanByVAToPoC:
-    case Dynarmic::A64::DataCacheOperation::CleanByVAToPoU:
-    case Dynarmic::A64::DataCacheOperation::CleanByVAToPoP:
-    case Dynarmic::A64::DataCacheOperation::InvalidateByVAToPoC:
-      // Canonical CPU-visible RAM needs no ownership transition. The block's
-      // CheckHalt terminal still observes interrupts/preemption. Device-owned
-      // RAM and mapping faults retain the stopped, lease-free checked path.
-      if (callbacks.data_cache(context, value))
-        return;
-      break;
     default:
-      // Set/way and zeroing operations retain the platform trap checks.
       break;
     }
-    stop(4, static_cast<unsigned>(op), 0, value);
+    stop(3, static_cast<unsigned>(exception), pc);
   }
-  void
-  InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op,
-                                  std::uint64_t value) override {
-    stop(5, static_cast<unsigned>(op), 0, value);
+  void InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op,
+                                       std::uint64_t value) override {
+    switch (op) {
+    case Dynarmic::A64::InstructionCacheOperation::InvalidateByVAToPoU:
+      jit->InvalidateCacheRange(value & ~std::uint64_t{63}, 64);
+      break;
+    case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoU:
+      jit->ClearCache();
+      break;
+    default:
+      jit->HaltExecution(HaltReason::CacheInvalidation);
+      break;
+    }
   }
-  void AddTicks(std::uint64_t ticks) override {
-    ticks_executed += ticks;
-    ticks_left = ticks < ticks_left ? ticks_left - ticks : 0;
-  }
-  std::uint64_t GetTicksRemaining() override { return ticks_left; }
+  void AddTicks(std::uint64_t) override { std::terminate(); }
+  std::uint64_t GetTicksRemaining() override { std::terminate(); }
   std::uint64_t GetCNTPCT() override { return callbacks.counter(context); }
 };
 } // namespace
 extern "C" {
 bool nixe_dynarmic_resolve_fault(std::uint64_t pc, std::uint64_t *call,
                                  std::uint64_t *ret) noexcept {
-  const auto result =
-      Dynarmic::Backend::ExceptionHandler::HandleExternalFault(pc);
+  const auto result = Dynarmic::Backend::ExceptionHandler::HandleExternalFault(pc);
   if (!result)
     return false;
 #if defined(__x86_64__)
@@ -217,12 +201,11 @@ bool nixe_dynarmic_resolve_fault(std::uint64_t pc, std::uint64_t *call,
   return true;
 }
 const char *nixe_dynarmic_error() noexcept { return last_error.c_str(); }
-void *nixe_dynarmic_create(NixeCallbacks cb,
-                           std::uintptr_t arena, std::uintptr_t exclusive_table, size_t bits,
-                           std::uint32_t frequency, std::uint32_t ctr,
+void *nixe_dynarmic_create(NixeCallbacks cb, std::uintptr_t arena, std::uintptr_t page_table,
+                           size_t bits, std::uint32_t frequency, std::uint32_t ctr,
                            std::uint32_t dczid) noexcept {
   try {
-    return new Core(cb, arena, exclusive_table, bits, frequency, ctr, dczid);
+    return new Core(cb, arena, page_table, bits, frequency, ctr, dczid);
   } catch (const std::exception &e) {
     last_error = e.what();
     return nullptr;
@@ -233,18 +216,8 @@ void nixe_dynarmic_halt(Core *core) noexcept { core->jit->HaltExecution(); }
 void nixe_dynarmic_clear_halt(Core *core) noexcept {
   core->jit->ClearHalt(HaltReason::UserDefined1 | HaltReason::MemoryAbort);
 }
-void nixe_dynarmic_clear_exclusive(Core *core) noexcept {
-  core->jit->ClearExclusiveState();
-}
-void nixe_dynarmic_reserve_exclusive(Core *core, const std::uint64_t *proof) noexcept {
-#if defined(__x86_64__)
-  core->jit->SetPhysicalExclusiveReservation(proof[3], proof[0], proof[1], proof[2], static_cast<std::uint8_t>(proof[4]), Vector{proof[5], proof[6]});
-#else
-  std::terminate();
-#endif
-}
-bool nixe_dynarmic_invalidate(Core *core, std::uint64_t addr,
-                              size_t size) noexcept {
+void nixe_dynarmic_clear_exclusive(Core *core) noexcept { core->jit->ClearExclusiveState(); }
+bool nixe_dynarmic_invalidate(Core *core, std::uint64_t addr, size_t size) noexcept {
   try {
     if (size == 0)
       core->jit->ClearCache();
@@ -322,8 +295,7 @@ std::uint64_t nixe_dynarmic_read(Core *core, std::uint32_t reg) noexcept {
     std::terminate();
   }
 }
-void nixe_dynarmic_write(Core *core, std::uint32_t reg,
-                         std::uint64_t value) noexcept {
+void nixe_dynarmic_write(Core *core, std::uint32_t reg, std::uint64_t value) noexcept {
 #ifdef NIXE_PERFORMANCE_COUNTERS
   StateMeasurement measurement{reg >= 35 ? 4u : 8u};
 #endif
@@ -357,8 +329,7 @@ void nixe_dynarmic_write(Core *core, std::uint32_t reg,
     std::terminate();
   }
 }
-void nixe_dynarmic_read_vector(Core *core, std::uint32_t reg,
-                               std::uint64_t *value) noexcept {
+void nixe_dynarmic_read_vector(Core *core, std::uint32_t reg, std::uint64_t *value) noexcept {
 #ifdef NIXE_PERFORMANCE_COUNTERS
   StateMeasurement measurement{16};
 #endif
@@ -374,23 +345,18 @@ void nixe_dynarmic_write_vector(Core *core, std::uint32_t reg,
   std::memcpy(&vector, value, sizeof(vector));
   core->jit->SetVector(reg, vector);
 }
-bool nixe_dynarmic_run(Core *core, void *context, std::uint64_t budget,
-                       NixeExit *result) noexcept {
+bool nixe_dynarmic_run(Core *core, void *context, NixeExit *result) noexcept {
   try {
     core->context = context;
     core->exit = {};
-    core->ticks_left = budget;
-    core->ticks_executed = 0;
     core->jit->Run();
     // Return with the faulting/SVC instruction selected. Runtime applies the
     // service continuation once; normalize here without a second FFI call.
     if (core->exit.kind == 1 || core->exit.kind == 2 ||
         (core->exit.kind == 3 &&
-         (core->exit.detail <= 2 || core->exit.detail == 8 ||
-          core->exit.detail == 9))) {
+         (core->exit.detail <= 2 || core->exit.detail == 8 || core->exit.detail == 9))) {
       core->jit->SetPC(core->exit.pc);
     }
-    core->exit.ticks = core->ticks_executed;
     *result = core->exit;
     core->context = nullptr;
     return true;

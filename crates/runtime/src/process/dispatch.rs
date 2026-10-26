@@ -74,28 +74,23 @@ impl RunnableProcess {
     }
 
     #[cfg(test)]
-    pub(crate) fn run(
-        &mut self,
-        instruction_budget: u64,
-    ) -> Result<ExecutionReport, ProcessExecutionError> {
+    pub(crate) fn run(&mut self) -> Result<ExecutionReport, ProcessExecutionError> {
         let vcpu = nixe_scheduler::VirtualCpuId::new(0);
         let mut cpu_thread = self
             .execution
             .create_worker_cpu_thread(vcpu)
             .map_err(|fault| ProcessExecutionError::Cpu { fault })?;
-        self.run_with_cpu_thread(&mut cpu_thread, instruction_budget)
+        self.run_with_cpu_thread(&mut cpu_thread)
     }
 
     #[cfg(test)]
     pub(crate) fn run_with_cpu_thread(
         &mut self,
         thread: &mut execution::CpuThread,
-        instruction_budget: u64,
     ) -> Result<ExecutionReport, ProcessExecutionError> {
         let vcpu = nixe_scheduler::VirtualCpuId::new(0);
         let events = nixe_cpu::execution::VcpuEventState::default();
-        let mut execution =
-            self.begin_thread_execution(self.main_thread_id, vcpu, instruction_budget, events)?;
+        let mut execution = self.begin_thread_execution(self.main_thread_id, vcpu, events)?;
         let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
         let result = execution.run(&mut worker, thread);
         worker
@@ -108,7 +103,6 @@ impl RunnableProcess {
         &mut self,
         thread_id: nixe_scheduler::GuestThreadId,
         vcpu: nixe_scheduler::VirtualCpuId,
-        instruction_budget: u64,
         events: nixe_cpu::execution::VcpuEventState,
     ) -> Result<execution::VcpuExecutionState, ProcessExecutionError> {
         if self
@@ -146,7 +140,6 @@ impl RunnableProcess {
             thread: state,
             virtual_clock,
             architectural_timer_frequency,
-            instruction_budget,
             events,
         })
     }
@@ -194,7 +187,7 @@ impl RunnableProcess {
         }
         // The stub is ordinary guest code, so both backends and native chains
         // reach the same SVC boundary. Recognize the completed SVC's source,
-        // not mere arrival at that PC (which may instead stop for budget/control).
+        // not mere arrival at that PC (which may instead stop for control).
         // Preserve normal instruction accounting and the returned CPU context.
         if let ExecutionStop::SupervisorCall {
             source,
@@ -270,16 +263,6 @@ impl RunnableProcess {
                 nixe_scheduler::ProcessLifecycle::Faulted,
             )
             .expect("a running process may fault");
-        }
-    }
-
-    pub(crate) fn lose_thread_execution(&mut self) {
-        if self.lifecycle == nixe_scheduler::ProcessLifecycle::Running {
-            nixe_scheduler::transition_process(
-                &mut self.lifecycle,
-                nixe_scheduler::ProcessLifecycle::Faulted,
-            )
-            .expect("a running process may fault when its worker is lost");
         }
     }
 }

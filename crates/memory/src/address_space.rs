@@ -19,7 +19,6 @@ use std::{
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(C)]
 pub(crate) struct MappedPage {
-    pub monitor_flags: u64,
     pub physical_page: u32,
     pub permissions: MemoryPermissions,
     pub kind: u8,
@@ -29,7 +28,6 @@ impl MappedPage {
     pub(crate) const OBSERVED: u8 = 2;
     pub(crate) const DEVICE: u8 = 4;
     const EMPTY: Self = Self {
-        monitor_flags: 0,
         physical_page: 0,
         permissions: MemoryPermissions::NONE,
         kind: 0,
@@ -74,7 +72,6 @@ pub struct PageEntry(AtomicU64);
 const _: () = assert!(std::mem::size_of::<PageEntry>() == 8);
 const TRACKED: u64 = 1;
 const DEVICE: u64 = 2;
-const RESERVED: u64 = 4;
 const PERMISSION_SHIFT: u32 = 3;
 const ATTRIBUTES: u64 = 63;
 #[repr(transparent)]
@@ -436,11 +433,6 @@ impl AddressSpace {
             return MappedPage::EMPTY;
         }
         let pointer = raw & !ATTRIBUTES;
-        let canonical = if raw & RESERVED != 0 {
-            unsafe { &*(pointer as *const crate::reservation::PhysicalMonitor) }.canonical_base()
-        } else {
-            pointer as usize
-        };
         let base = self
             .machine()
             .arena()
@@ -448,8 +440,7 @@ impl AddressSpace {
             .unwrap()
             .as_ptr() as usize;
         MappedPage {
-            monitor_flags: if raw & RESERVED != 0 { pointer } else { 1 },
-            physical_page: ((canonical - base) / PAGE_SIZE as usize) as u32,
+            physical_page: ((pointer as usize - base) / PAGE_SIZE as usize) as u32,
             permissions: MemoryPermissions::from_bits(((raw >> PERMISSION_SHIFT) & 7) as u8)
                 .unwrap(),
             kind: MappedPage::RAM
@@ -469,19 +460,15 @@ impl AddressSpace {
         if !entry.present() {
             return 0;
         }
-        let reserved = entry.monitor_flags > 1;
-        let pointer = if reserved {
-            entry.monitor_flags
-        } else {
-            self.machine()
-                .arena()
-                .host_address(
-                    ArenaOffset::new(u64::from(entry.physical_page) * PAGE_SIZE),
-                    PAGE_SIZE,
-                )
-                .unwrap()
-                .as_ptr() as u64
-        };
+        let pointer = self
+            .machine()
+            .arena()
+            .host_address(
+                ArenaOffset::new(u64::from(entry.physical_page) * PAGE_SIZE),
+                PAGE_SIZE,
+            )
+            .unwrap()
+            .as_ptr() as u64;
         debug_assert_eq!(pointer & ATTRIBUTES, 0);
         pointer
             | (u64::from(entry.permissions.bits()) << PERMISSION_SHIFT)
@@ -495,7 +482,6 @@ impl AddressSpace {
             } else {
                 0
             }
-            | if reserved { RESERVED } else { 0 }
     }
     // New mappings are installed under native/host exclusion. Existing entries
     // may change tracking under the mapping writer while native cores continue.
@@ -742,7 +728,6 @@ impl AddressSpace {
                     MemoryError::Invalid("physical page exceeds translation entry capacity")
                 })?;
                 let entry = MappedPage {
-                    monitor_flags: self.machine().tracking().native_flags(u64::from(page)),
                     kind: self.machine().tracking().kind(u64::from(page)),
                     physical_page: page,
                     permissions,
@@ -1289,12 +1274,7 @@ impl AddressSpace {
                 "atomic access has invalid width or alignment",
             ));
         }
-        let required = match operation.operation {
-            crate::AtomicOperation::LoadExclusive => MemoryPermissions::READ,
-            crate::AtomicOperation::StoreExclusive { .. } => MemoryPermissions::WRITE,
-            _ => MemoryPermissions::READ_WRITE,
-        };
-        let ranges = self.capture(start, bytes, required)?;
+        let ranges = self.capture(start, bytes, MemoryPermissions::READ_WRITE)?;
         self.machine()
             .access_captured(&ranges, AccessOperation::Atomic(operation))
     }
@@ -1408,7 +1388,6 @@ impl AddressSpace {
     }
     fn tracked_entry(&self, mut entry: MappedPage) -> MappedPage {
         let tracking = self.machine().tracking();
-        entry.monitor_flags = tracking.native_flags(u64::from(entry.physical_page));
         entry.kind = tracking.kind(u64::from(entry.physical_page));
         entry
     }
@@ -1710,78 +1689,7 @@ mod tests {
             .unwrap();
         assert!(observed.is_invalid());
     }
-    #[test]
-    fn native_writes_validate_all_pages_and_defer_tracking_without_partial_stores() {
-        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
-        let allocation = machine
-            .account(2 * PAGE_SIZE)
-            .unwrap()
-            .allocate(2 * PAGE_SIZE)
-            .unwrap();
-        let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-        let base = GuestVirtualAddress::new(PAGE_SIZE);
-        let second = GuestVirtualAddress::new(2 * PAGE_SIZE);
-        space
-            .map(
-                base,
-                allocation,
-                0,
-                2 * PAGE_SIZE,
-                MemoryPermissions::READ_WRITE,
-            )
-            .unwrap();
-        space
-            .protect(second, PAGE_SIZE, MemoryPermissions::READ)
-            .unwrap();
-        let context = space.register_core(Arc::new(|| panic!("callback must not quiesce itself")));
-        let native = context.enter_native().unwrap();
-        let start = GuestVirtualAddress::new(2 * PAGE_SIZE - 8);
-        assert!(space.write_native(&native, start, &[7; 16]).is_err());
-        native.suspend();
-        assert!(matches!(
-            space.read_value(start, 8).unwrap(),
-            Access::Ready(0)
-        ));
-        space
-            .protect(second, PAGE_SIZE, MemoryPermissions::READ_WRITE)
-            .unwrap();
-        let inputs = space
-            .capture(start, 16, MemoryPermissions::READ_WRITE)
-            .unwrap();
-        let reserved = inputs[0].slice(0, 8).unwrap();
-        let (_, proof) = machine.load_exclusive_resolved(&reserved).unwrap();
-        native.resume().unwrap();
-        assert!(space.write_native(&native, start, &[7; 16]).unwrap());
-        native.suspend();
-        assert!(
-            !machine
-                .store_exclusive_resolved(&reserved, proof, 9)
-                .unwrap()
-        );
-        assert!(
-            matches!(space.read_value(start, 16).unwrap(), Access::Ready(value) if value == u128::from_le_bytes([7; 16]))
-        );
-        let observation = crate::Observation::default();
-        machine
-            .access_captured(
-                &inputs,
-                crate::AccessOperation::ReadObserved(observation.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        native.resume().unwrap();
-        assert!(!space.write_native(&native, start, &[8; 16]).unwrap());
-        assert!(!observation.is_invalid());
-        native.suspend();
-        machine.publish_device_write(&inputs, || Ok(())).unwrap();
-        native.resume().unwrap();
-        assert!(!space.write_native(&native, start, &[9; 16]).unwrap());
-        native.suspend();
-        let mut bytes = [0; 16];
-        machine.capture_stream(&inputs, &mut bytes).unwrap();
-        assert_eq!(bytes, [7; 16]);
-    }
+
     #[test]
     fn captured_scalar_keeps_its_original_rights_and_physical_word_after_remapping() {
         let machine = Machine::new(2 * PAGE_SIZE).unwrap();

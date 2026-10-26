@@ -9,10 +9,7 @@ namespace Dynarmic::A64 {
 
 static bool DataCacheInstruction(TranslatorVisitor& v, DataCacheOperation op, const Reg Rt) {
     v.ir.DataCacheOperationRaised(op, v.X(64, Rt));
-    // Nixe performs ownership transitions after releasing the execution lease.
-    v.ir.SetPC(v.ir.Imm64(v.ir.current_location->PC() + 4));
-    v.ir.SetTerm(IR::Term::CheckHalt{IR::Term::ReturnToDispatch{}});
-    return false;
+    return true;
 }
 
 bool TranslatorVisitor::DC_IVAC(Reg Rt) {

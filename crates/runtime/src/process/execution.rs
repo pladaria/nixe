@@ -2,8 +2,8 @@
 use crate::{ExceptionTerminationScope, GuestBreakPayload, GuestCpuState, VirtualClock};
 use nixe_cpu::{
     execution::{
-        ArchitecturalTimer, ControlRequest, CpuControl, CpuFault, CpuFaultKind, CpuProcessId,
-        TimerSnapshot, VcpuEventState,
+        ArchitecturalTimer, CpuControl, CpuFault, CpuFaultKind, CpuProcessId, TimerSnapshot,
+        VcpuEventState,
     },
     location::LocationDescriptor,
     profile::ProcessCpuContext,
@@ -182,7 +182,7 @@ impl ProcessExecutionControl {
     }
     pub(crate) fn request_vcpu_safepoint(&self, vcpu: nixe_scheduler::VirtualCpuId) {
         if let Some(control) = self.controls.get(&vcpu) {
-            control.request(ControlRequest::Preempt);
+            control.request_preemption();
         }
     }
     pub(crate) fn request_safepoint(&self) {
@@ -190,7 +190,7 @@ impl ProcessExecutionControl {
             self.pending_safepoint.store(true, Ordering::Release);
         }
         for control in self.controls.values() {
-            control.request(ControlRequest::Preempt);
+            control.request_preemption();
         }
     }
     pub(crate) fn request_stop(&mut self) -> Result<(), CpuFault> {
@@ -217,7 +217,6 @@ impl ProcessExecutionControl {
             return Err(CpuFault {
                 backend: "jit",
                 kind: CpuFaultKind::Unavailable,
-                progress: 0,
                 message: "CPU process is stopping".into(),
                 context: None,
             });
@@ -225,7 +224,7 @@ impl ProcessExecutionControl {
         let thread = Box::new(self.process.create_thread().map_err(jit_boundary_fault)?);
         let control = thread.control();
         if self.pending_safepoint.swap(false, Ordering::AcqRel) {
-            control.request(ControlRequest::Preempt);
+            control.request_preemption();
         }
         self.controls.insert(vcpu, control);
         Ok(thread)
@@ -251,7 +250,6 @@ fn jit_boundary_fault(message: impl ToString) -> CpuFault {
     CpuFault {
         backend: "jit",
         kind: CpuFaultKind::Internal,
-        progress: 0,
         message: message.to_string().into_boxed_str(),
         context: None,
     }
@@ -264,8 +262,6 @@ pub(crate) struct VcpuExecutionState {
     pub(crate) thread: GuestCpuState,
     pub(crate) virtual_clock: VirtualClock,
     pub(crate) architectural_timer_frequency: u64,
-    pub(crate) instruction_budget: u64,
-
     pub(crate) events: VcpuEventState,
 }
 impl VcpuExecutionState {
@@ -283,7 +279,6 @@ impl VcpuExecutionState {
                 worker,
                 JitRunRequest {
                     state: &mut self.thread,
-                    instruction_budget: self.instruction_budget,
                     timer: &timer,
                     events: &self.events,
                 },

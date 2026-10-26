@@ -26,11 +26,8 @@ impl RuntimeCoordinator {
     /// stop and device notifications remain live; no guest work is dispatched.
     pub fn wait_while_host_paused(&mut self) -> Result<(), CoordinatorError> {
         while self.host_paused() && !self.host_stop_requested {
-            if let Some(event) = self
-                .inbox
-                .recv_sequenced_timeout(std::time::Duration::from_secs(1))?
-            {
-                self.apply_external_event(event, &mut CoordinatorDrainReport::default())?;
+            if let Some(event) = self.inbox.recv_timeout(std::time::Duration::from_secs(1))? {
+                self.accept_ingress(event, &mut CoordinatorDrainReport::default())?;
             }
         }
         Ok(())
@@ -225,38 +222,29 @@ impl RuntimeCoordinator {
     /// are counted and ignored after their generation loses the race.
     pub fn drain_external_events(&mut self) -> Result<CoordinatorDrainReport, CoordinatorError> {
         let mut report = CoordinatorDrainReport::default();
-        while let Some(event) = self.inbox.try_recv_sequenced()? {
+        while let Some(event) = self.deferred_events.pop_front() {
             self.apply_external_event(event, &mut report)?;
+        }
+        while let Some(event) = self.inbox.try_recv()? {
+            self.accept_ingress(event, &mut report)?;
         }
         Ok(report)
     }
 
-    /// Waits for external ingress only until the composition root must service
-    /// another host-owned deadline. Expiry is observable as `None` and never
-    /// manufactures guest readiness or advances virtual time.
-    pub fn wait_for_external_event_for(
+    fn accept_ingress(
         &mut self,
-        timeout: std::time::Duration,
-    ) -> Result<Option<CoordinatorDrainReport>, CoordinatorError> {
-        // The host service deadline and the earliest guest timeout both bound
-        // idle sleeping. The next scheduler pass wakes expired guest waits.
-        let timeout = if self.virtual_clock.mode() == crate::VirtualClockMode::Realtime {
-            self.deadlines
-                .first_key_value()
-                .map_or(timeout, |((deadline, _), _)| {
-                    timeout.min(std::time::Duration::from_nanos(
-                        deadline.saturating_sub(self.virtual_time_ns()),
-                    ))
-                })
-        } else {
-            timeout
-        };
-        let Some(event) = self.inbox.recv_sequenced_timeout(timeout)? else {
-            return Ok(None);
-        };
-        let mut report = CoordinatorDrainReport::default();
-        self.apply_external_event(event, &mut report)?;
-        Ok(Some(report))
+        event: crate::external_event::CoordinatorEvent,
+        report: &mut CoordinatorDrainReport,
+    ) -> Result<(), CoordinatorError> {
+        match event {
+            crate::external_event::CoordinatorEvent::External(event) => {
+                self.apply_external_event(event, report)
+            }
+            crate::external_event::CoordinatorEvent::Completed(result) => {
+                self.workers.pending_results.push_back(result);
+                Ok(())
+            }
+        }
     }
 
     pub(super) fn apply_external_event(
@@ -264,6 +252,7 @@ impl RuntimeCoordinator {
         event: crate::SequencedExternalEvent,
         report: &mut CoordinatorDrainReport,
     ) -> Result<(), CoordinatorError> {
+        self.inbox.consume_external();
         report.received += 1;
         report.first_sequence.get_or_insert(event.sequence);
         report.last_sequence = Some(event.sequence);
@@ -328,7 +317,6 @@ impl RuntimeCoordinator {
     }
 
     pub(super) fn release_wait_resources(&mut self, thread: GuestThreadId) {
-        self.cpu_waits.remove(&thread);
         let Some(token) = self
             .scheduler
             .thread(thread)

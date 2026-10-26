@@ -45,11 +45,6 @@ pub enum AtomicOperation {
         transform: AtomicTransform,
         operand: u128,
     },
-    LoadExclusive,
-    StoreExclusive {
-        reservation: crate::Reservation,
-        replacement: u128,
-    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AtomicAccess {
@@ -61,9 +56,6 @@ impl AtomicAccess {
     pub(crate) fn update(self, current: u128) -> (u128, bool) {
         let mask = u128::MAX >> (128 - u32::from(self.bytes) * 8);
         match self.operation {
-            AtomicOperation::LoadExclusive | AtomicOperation::StoreExclusive { .. } => {
-                unreachable!("exclusive operations use their physical reservation monitor")
-            }
             AtomicOperation::CompareExchange {
                 expected,
                 replacement,
@@ -139,11 +131,6 @@ pub enum AccessResult {
         previous: u128,
         written: bool,
     },
-    ExclusiveRead {
-        value: u128,
-        reservation: crate::Reservation,
-    },
-    ExclusiveWritten(bool),
 }
 /// A resolved physical interval, not cached RAM contents or allocation ownership.
 /// Native admission retains the current mapping; every use checks its physical
@@ -275,29 +262,6 @@ impl DeviceAccessRequest {
     pub fn finish(mut self, result: AccessResultValue) {
         let result = result.and_then(|result| {
             let valid = match (&self.operation, &result) {
-                (
-                    AccessOperation::Atomic(AtomicAccess {
-                        bytes,
-                        operation: AtomicOperation::LoadExclusive,
-                        ..
-                    }),
-                    AccessResult::ExclusiveRead { value, reservation },
-                ) => {
-                    let range = &self.ranges[0];
-                    let physical = range.physical_extents().next().unwrap();
-                    (bytes == &16 || *value >> (u32::from(*bytes) * 8) == 0)
-                        && reservation.machine == range.allocation().machine().identity()
-                        && reservation.allocation == range.allocation().identity()
-                        && reservation.physical == physical.start
-                        && reservation.bytes == *bytes
-                }
-                (
-                    AccessOperation::Atomic(AtomicAccess {
-                        operation: AtomicOperation::StoreExclusive { .. },
-                        ..
-                    }),
-                    AccessResult::ExclusiveWritten(_),
-                ) => true,
                 (
                     AccessOperation::Read
                     | AccessOperation::ReadCode(_)
@@ -1095,108 +1059,6 @@ mod tests {
         assert_eq!(
             pending.wait().unwrap(),
             AccessResult::Read(Box::new([7, 8, 9]))
-        );
-    }
-    #[test]
-    fn device_write_invalidates_exclusive_without_page_walk_or_readback() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let (_endpoint, receiver) = owner(&machine);
-        let (allocation, range) = range(&machine, 0, 4);
-        machine
-            .publish_device_write(std::slice::from_ref(&range), || Ok(()))
-            .unwrap();
-        let load = AtomicAccess {
-            bytes: 4,
-            ordering: AccessOrdering::Acquire,
-            operation: AtomicOperation::LoadExclusive,
-        };
-        let Access::Pending(pending) = machine
-            .access_captured(std::slice::from_ref(&range), AccessOperation::Atomic(load))
-            .unwrap()
-        else {
-            panic!("exclusive read bypassed its device producer")
-        };
-        let request = next(&receiver);
-        machine
-            .write_resolved(request.ranges(), &19u32.to_le_bytes())
-            .unwrap();
-        let result = machine
-            .apply_resolved_access(request.ranges(), request.operation())
-            .unwrap();
-        request.finish(Ok(result));
-        let AccessResult::ExclusiveRead { value, reservation } = pending.wait().unwrap() else {
-            panic!("missing physical exclusive observation")
-        };
-        assert_eq!(value, 19);
-        let epoch = range.allocation().device_write_epoch();
-        // A retained writer already owns protected coverage. Its epoch handle
-        // is host metadata; it needs no physical page walk or RAM publication.
-        let before = machine.tracking_statistics();
-        epoch.mark_device_modified();
-        let store = AtomicAccess {
-            ordering: AccessOrdering::Release,
-            operation: AtomicOperation::StoreExclusive {
-                reservation,
-                replacement: 22,
-            },
-            ..load
-        };
-        assert_eq!(
-            machine
-                .access_captured(std::slice::from_ref(&range), AccessOperation::Atomic(store))
-                .unwrap()
-                .into_ready()
-                .unwrap(),
-            AccessResult::ExclusiveWritten(false)
-        );
-        assert_eq!(machine.tracking_statistics(), before);
-        assert!(receiver.try_recv().is_err());
-        let mut bytes = [0; 4];
-        machine
-            .capture_stream(std::slice::from_ref(&range), &mut bytes)
-            .unwrap();
-        assert_eq!(bytes, 19u32.to_le_bytes());
-        drop(range);
-        drop(allocation);
-        assert_eq!(machine.statistics().allocated_bytes, 0);
-        // Old retained device metadata cannot affect a recycled allocation.
-        let allocation = machine
-            .account(PAGE_SIZE)
-            .unwrap()
-            .allocate(PAGE_SIZE)
-            .unwrap();
-        let current = AllocationRange::new(allocation.pin(), 0, 4).unwrap();
-        let (_, reservation) = machine.load_exclusive_resolved(&current).unwrap();
-        epoch.mark_device_modified();
-        assert!(
-            machine
-                .store_exclusive_resolved(&current, reservation, 31)
-                .unwrap()
-        );
-    }
-    #[test]
-    fn incorrect_exclusive_result_is_rejected_instead_of_falling_through_to_rmw() {
-        let machine = Machine::new(PAGE_SIZE).unwrap();
-        let (_endpoint, receiver) = owner(&machine);
-        let (_allocation, range) = range(&machine, 0, 4);
-        let load = AtomicAccess {
-            bytes: 4,
-            ordering: AccessOrdering::Acquire,
-            operation: AtomicOperation::LoadExclusive,
-        };
-        let pending = machine
-            .request_device_access(vec![range], AccessOperation::Atomic(load))
-            .unwrap();
-        next(&receiver).finish(Ok(AccessResult::Atomic {
-            previous: 0,
-            written: false,
-        }));
-        assert!(
-            pending
-                .wait()
-                .unwrap_err()
-                .to_string()
-                .contains("incorrect result")
         );
     }
 }

@@ -97,8 +97,8 @@ fn partial_writers_ignore_retired_allocations_outside_their_exact_domain() {
                 .unwrap();
         }
         drop(written);
-        assert!(authority.create_writer(3, partial).is_err());
-        for id in [writer, new_writer] {
+        let retired_writer = authority.create_writer(3, partial).unwrap();
+        for id in [writer, new_writer, retired_writer] {
             assert!(
                 authority
                     .publish_write::<()>(&machine, id, || panic!(
@@ -214,14 +214,16 @@ fn sliced_writers_depend_only_on_the_allocations_in_their_view() {
         .unwrap();
     assert!(view.pin(0, PAGE_SIZE).is_ok());
     drop(second);
-    assert!(authority.create_writer(3, footprint).is_err());
-    assert!(
-        authority
-            .publish_write::<()>(&machine, writer, || panic!(
-                "retired input must fail before recording"
-            ))
-            .is_err()
-    );
+    let retired_writer = authority.create_writer(3, footprint).unwrap();
+    for id in [writer, retired_writer] {
+        assert!(
+            authority
+                .publish_write::<()>(&machine, id, || panic!(
+                    "retired input must fail before recording"
+                ))
+                .is_err()
+        );
+    }
 }
 
 #[test]

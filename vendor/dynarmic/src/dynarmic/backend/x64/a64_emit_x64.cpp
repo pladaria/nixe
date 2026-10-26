@@ -76,7 +76,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
 
     const std::vector<HostLoc> gpr_order = [this] {
         std::vector<HostLoc> gprs{any_gpr};
-        if (conf.page_table || conf.physical_exclusive_page_table) {
+        if (conf.page_table || conf.canonical_page_table) {
             gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R14));
         }
         if (conf.fastmem_pointer) {
@@ -628,11 +628,9 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
     }
 
     Xbyak::Label stopped;
-    // Nixe's scheduler and memory transitions must interrupt linked loops even
-    // when cycle counting is enabled.
-    code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
-    code.jne(stopped, code.T_NEAR);
     if (conf.enable_cycle_counting) {
+        code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
+        code.jne(stopped, code.T_NEAR);
         code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
 
         patch_information[terminal.next].jg.push_back(code.getCurr());

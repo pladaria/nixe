@@ -1,4 +1,4 @@
-//! ARM exclusive semantics, independently of the former expected-value model.
+//! Native exclusive accesses and the expected-value CAS policy.
 //! https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/LDXR--Load-Exclusive-Register-
 //! https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/STXR--Store-Exclusive-Register-
 
@@ -86,16 +86,13 @@ fn run(jit: &mut JitThread, state: &mut ThreadState) -> CpuExit {
                 &mut nixe_cpu_direct_memory::NativeWorker::default(),
                 JitRunRequest {
                     state,
-                    instruction_budget: 10_000_000,
                     timer: &Timer,
                     events: &VcpuEventState::default(),
                 },
             )
             .unwrap()
             .stop;
-        if !matches!(stop, CpuExit::Safepoint | CpuExit::BudgetExhausted)
-            || std::time::Instant::now() >= deadline
-        {
+        if !matches!(stop, CpuExit::Safepoint) || std::time::Instant::now() >= deadline {
             return stop;
         }
     }
@@ -157,13 +154,13 @@ fn exclusive_store_with_overlapping_zero_registers_preserves_memory_semantics() 
 }
 
 #[test]
-fn every_scalar_width_and_acquire_release_use_physical_alias_reservations() {
+fn every_scalar_width_and_acquire_release_commit_through_native_exclusives() {
     for (load, store, size) in [
-        (0x085f7c22, 0x08037c80, MemoryAccessSize::Byte),
-        (0x485f7c22, 0x48037c80, MemoryAccessSize::Halfword),
-        (0x885f7c22, 0x88037c80, MemoryAccessSize::Word),
-        (0xc85f7c22, 0xc8037c80, MemoryAccessSize::Doubleword),
-        (0xc85ffc22, 0xc803fc80, MemoryAccessSize::Doubleword),
+        (0x085f7c22, 0x08037c20, MemoryAccessSize::Byte),
+        (0x485f7c22, 0x48037c20, MemoryAccessSize::Halfword),
+        (0x885f7c22, 0x88037c20, MemoryAccessSize::Word),
+        (0xc85f7c22, 0xc8037c20, MemoryAccessSize::Doubleword),
+        (0xc85ffc22, 0xc803fc20, MemoryAccessSize::Doubleword),
     ] {
         let (memory, process) = fixture(&[load, store, 0xd4000001]);
         let mut state = state();
@@ -302,55 +299,18 @@ fn every_native_exclusive_width_rejects_a_changed_value_from_a_plain_alias_store
 }
 
 #[test]
-fn clrex_and_context_switch_clear_the_local_reservation() {
-    for (middle, scheduled, clear) in [
-        (0xd5033f5f, false, true),
-        (0xd503203f, true, true),
-        (0xd503203f, true, false),
-    ] {
+fn clrex_clears_the_local_reservation_while_hints_continue_natively() {
+    for (middle, cleared) in [(0xd5033f5f, true), (0xd503203f, false)] {
         let (memory, process) = fixture(&[0xc85f7c22, middle, 0xc8037c20, 0xd4000001]);
-        let mut jit = process.create_thread().unwrap();
-        let range = memory.capture(DATA, 16, MemoryPermissions::READ).unwrap();
-        let dependency = nixe_memory::Observation::default();
-        memory
-            .machine()
-            .access_captured(
-                &range,
-                nixe_memory::AccessOperation::ReadObserved(dependency.clone()),
-            )
-            .unwrap()
-            .into_ready()
-            .unwrap();
-        let mut state = state();
-        let stop = run(&mut jit, &mut state);
-        assert!(if scheduled {
-            matches!(stop, CpuExit::Scheduled { .. })
-        } else {
-            matches!(stop, CpuExit::SupervisorCall { .. })
-        });
-        if scheduled {
-            if clear {
-                jit.clear_local_exclusive_reservation();
-            }
-            state.set_pc(0x1008);
-            assert!(matches!(
-                run(&mut jit, &mut state),
-                CpuExit::SupervisorCall { .. }
-            ));
-        }
-        assert_eq!(state.read_x(x(3)), u64::from(clear));
+        let mut guest = state();
+        assert!(matches!(
+            run(&mut process.create_thread().unwrap(), &mut guest),
+            CpuExit::SupervisorCall { .. }
+        ));
+        assert_eq!(guest.read_x(x(3)), u64::from(cleared));
         assert_eq!(
-            !dependency.is_invalid(),
-            clear,
-            "only committed STXR may invalidate observation"
-        );
-        assert_eq!(
-            memory
-                .read_value(DATA, MemoryAccessSize::Doubleword.bytes())
-                .unwrap()
-                .into_ready()
-                .unwrap(),
-            if clear { 0 } else { 7 }
+            memory.read_value(DATA, 8).unwrap().into_ready().unwrap(),
+            if cleared { 0 } else { 7 }
         );
     }
 }
@@ -396,26 +356,6 @@ fn native_release_acquire_publishes_the_prior_payload() {
             worker.join().unwrap();
         }
     }
-}
-
-#[test]
-fn misaligned_exclusive_faults_without_partial_effects() {
-    let (memory, process) = fixture(&[0xc85f7c22, 0xc8037c20, 0xd4000001]);
-    let mut state = state();
-    state.write_x(x(1), DATA.get() + 4092);
-    state.write_x(x(2), 0x1234);
-    let stop = run(&mut process.create_thread().unwrap(), &mut state);
-    assert!(matches!(stop, CpuExit::DataFault { .. }));
-    assert_eq!(state.pc(), 0x1000);
-    assert_eq!(state.read_x(x(2)), 0x1234);
-    assert_eq!(
-        memory
-            .read_value(DATA, MemoryAccessSize::Doubleword.bytes())
-            .unwrap()
-            .into_ready()
-            .unwrap(),
-        0
-    );
 }
 
 #[test]
@@ -488,7 +428,7 @@ fn competing_native_cores_make_progress_without_lost_updates() {
 }
 
 #[test]
-fn exclusive_memory_abort_preserves_live_floating_point_registers_and_flags() {
+fn native_exclusives_preserve_live_floating_point_registers_and_flags() {
     // FADD D2,D0,D1; CMP X0,X0; LDXR X8,[X1]; ADD X8,X8,#1;
     // STXR W9,X8,[X1]; CSET W10,EQ; FADD D3,D2,D1; SVC.
     let (memory, process) = fixture(&[

@@ -34,8 +34,8 @@ pub use exception_dispatch::{
     ExceptionThreadContext, GuestBreakPayload, MAX_GUEST_BREAK_PAYLOAD_BYTES,
 };
 pub use external_event::{
-    ExternalEvent, ExternalEventInbox, ExternalEventSendError, ExternalEventSender,
-    ExternalEventSequence, ExternalEventSource, SequencedExternalEvent,
+    ExternalEvent, ExternalEventSendError, ExternalEventSender, ExternalEventSequence,
+    ExternalEventSource, SequencedExternalEvent,
 };
 pub use handle::{
     EventFuture, EventObject, EventWaitOutcome, HandleError, HandleObject, HandleReservation,
@@ -65,3 +65,5 @@ pub use virtual_time::{VirtualClock, VirtualClockMode};
 
 /// Exclusive saved/native register owner carried by guest scheduler leases.
 pub use nixe_cpu_jit::ThreadState as GuestCpuState;
+
+use external_event::ExternalEventInbox;

@@ -1,5 +1,5 @@
 //! Fixed guest workloads for native execution comparisons.
-//! Reports wall time separately from JIT ticks.
+//! Reports wall time for a fixed amount of guest work.
 use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState};
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
@@ -123,7 +123,6 @@ fn main() {
                     &mut worker,
                     JitRunRequest {
                         state: &mut states[0],
-                        instruction_budget: 1000,
                         timer: &Timer,
                         events: &events,
                     },
@@ -134,7 +133,6 @@ fn main() {
     // Two passes: deterministic warm-up, then a fixed amount of guest work.
     for (phase, count) in [("warmup", 1000), ("sample", iterations)] {
         let start = Instant::now();
-        let mut ticks = 0;
         for i in 0..count {
             let thread = if workload == "switch" {
                 (i % 2) as usize
@@ -198,14 +196,12 @@ fn main() {
                     &mut worker,
                     JitRunRequest {
                         state,
-                        instruction_budget: 1000,
                         timer: &Timer,
                         events: &events,
                     },
                 )
                 .unwrap();
             assert!(matches!(result.stop, CpuExit::SupervisorCall { .. }));
-            ticks += result.progress;
             if matches!(workload.as_str(), "mixed" | "switch" | "alias") {
                 assert_eq!(state.read_x(x(5)), 42 + thread as u64);
                 assert_eq!(state.read_x(x(4)), 0);
@@ -219,7 +215,7 @@ fn main() {
             }
         }
         println!(
-            "{{\"workload\":\"{workload}\",\"phase\":\"{phase}\",\"iterations\":{count},\"seconds\":{},\"guest_ticks\":{ticks}}}",
+            "{{\"workload\":\"{workload}\",\"phase\":\"{phase}\",\"iterations\":{count},\"seconds\":{}}}",
             start.elapsed().as_secs_f64()
         );
     }

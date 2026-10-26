@@ -49,10 +49,6 @@ impl Capture {
                     "ObserverRegistrations",
                     tracking.observer_registrations as u64,
                 ),
-                (
-                    "ReservationMetadataBytes",
-                    tracking.reservation_metadata_bytes as u64,
-                ),
                 ("ProtectionCalls", tracking.protection_calls),
                 ("CapturedPhysicalBytes", tracking.captured_bytes),
             ];

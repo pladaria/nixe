@@ -1,69 +1,66 @@
 use super::*;
 
 impl RuntimeCoordinator {
-    /// Reconciles one completed parallel slice without waiting for other cores.
-    pub fn run_next_adaptive(&mut self) -> Result<Option<CoordinatorExecution>, CoordinatorError> {
-        let execution = self.run_with_budget(None)?;
-        if let Some(execution) = &execution {
-            self.budgets
-                .get_mut(&execution.lease.vcpu)
-                .unwrap()
-                .observe(matches!(
-                    execution.report.stop,
-                    ExecutionStop::BudgetExhausted
-                ));
-        }
-        Ok(execution)
-    }
-
-    /// Dispatches idle cores and returns the first completed slice. Other
-    /// leases remain in flight and are reconciled by subsequent calls.
+    /// Dispatch ready cores and wait for a CPU completion, host service event or
+    /// the caller's next service deadline. Other native cores remain in flight.
     pub fn run_next(
         &mut self,
-        instruction_budget: u64,
+        host_wait: std::time::Duration,
     ) -> Result<Option<CoordinatorExecution>, CoordinatorError> {
-        self.run_with_budget(Some(instruction_budget))
-    }
-
-    fn run_with_budget(
-        &mut self,
-        instruction_budget: Option<u64>,
-    ) -> Result<Option<CoordinatorExecution>, CoordinatorError> {
-        if self.host_paused() {
+        if self.host_paused() || self.host_stop_requested {
             return Ok(None);
         }
         if let Some(execution) = self.completed_executions.pop_front() {
             return Ok(Some(execution));
         }
-        self.wake_due_deadlines()?;
+        let deadline = std::time::Instant::now() + host_wait;
         loop {
+            self.wake_due_deadlines()?;
             let idle: Vec<_> = self.scheduler.idle_vcpus().collect();
             for vcpu in idle {
                 let SchedulerDecision::Selected(lease) =
                     self.scheduler.apply(SchedulerCommand::Select(vcpu))?
                 else {
-                    unreachable!("select commands always produce a selected decision")
+                    unreachable!()
                 };
                 if let Some(lease) = lease {
-                    let budget = instruction_budget.unwrap_or_else(|| self.budgets[&vcpu].current);
-                    self.dispatch_worker(lease, budget)?;
+                    self.dispatch_worker(lease)?;
                 }
             }
-            if self.scheduler.active_leases().next().is_some() {
-                break;
+            self.interrupt_rescheduled_cores();
+            if let Some(result) = self.workers.pending_results.pop_front() {
+                let lease = self
+                    .scheduler
+                    .active_leases()
+                    .find(|lease| lease.vcpu == result.lease.vcpu)
+                    .ok_or(CoordinatorError::InFlightLease(result.lease))?;
+                return self.complete_worker(lease, result).map(Some);
             }
-            if !self.fast_forward_to_next_deadline()? {
+            if self.scheduler.active_leases().next().is_none()
+                && self.fast_forward_to_next_deadline()?
+            {
+                continue;
+            }
+            if let Some(event) = self.deferred_events.pop_front() {
+                self.apply_external_event(event, &mut CoordinatorDrainReport::default())?;
                 return Ok(None);
             }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let timeout = self
+                .worker_wait_timeout()
+                .map_or(remaining, |timeout| timeout.min(remaining));
+            match self.inbox.recv_timeout(timeout)? {
+                Some(crate::external_event::CoordinatorEvent::Completed(result)) => {
+                    self.workers.pending_results.push_back(result);
+                }
+                Some(crate::external_event::CoordinatorEvent::External(event)) => {
+                    self.apply_external_event(event, &mut CoordinatorDrainReport::default())?;
+                    return Ok(None);
+                }
+                None if std::time::Instant::now() >= deadline => return Ok(None),
+                None => {}
+            }
         }
-        self.interrupt_rescheduled_cores();
-        let result = self.receive_any_with_deadlines()?;
-        let lease = self
-            .scheduler
-            .active_leases()
-            .find(|lease| lease.vcpu == result.lease.vcpu)
-            .ok_or(CoordinatorError::InFlightLease(result.lease))?;
-        self.complete_worker(lease, result).map(Some)
     }
 
     /// Returns every register owner to the coordinator before migration,
@@ -122,25 +119,7 @@ impl RuntimeCoordinator {
         ))
     }
 
-    fn receive_any_with_deadlines(&mut self) -> Result<worker::WorkerResult, CoordinatorError> {
-        loop {
-            if let Some(result) = self
-                .workers
-                .receive_any(self.worker_wait_timeout())
-                .map_err(CoordinatorError::Worker)?
-            {
-                return Ok(result);
-            }
-            self.wake_due_deadlines()?;
-            self.interrupt_rescheduled_cores();
-        }
-    }
-
-    fn dispatch_worker(
-        &mut self,
-        lease: Lease,
-        instruction_budget: u64,
-    ) -> Result<(), CoordinatorError> {
+    fn dispatch_worker(&mut self, lease: Lease) -> Result<(), CoordinatorError> {
         let events = self
             .vcpu_events
             .get(&lease.vcpu)
@@ -152,7 +131,7 @@ impl RuntimeCoordinator {
             .ok_or(CoordinatorError::UnknownProcess(lease.process))
             .and_then(|process| {
                 process
-                    .begin_thread_execution(lease.thread, lease.vcpu, instruction_budget, events)
+                    .begin_thread_execution(lease.thread, lease.vcpu, events)
                     .map_err(|error| CoordinatorError::Execution {
                         process: lease.process,
                         thread: lease.thread,
@@ -193,28 +172,29 @@ impl RuntimeCoordinator {
         &mut self,
         expected: Lease,
     ) -> Result<CoordinatorExecution, CoordinatorError> {
-        let received = loop {
-            match self
+        let worker_result = loop {
+            if let Some(index) = self
                 .workers
-                .receive_for(expected.vcpu, self.worker_wait_timeout())
+                .pending_results
+                .iter()
+                .position(|result| result.lease.vcpu == expected.vcpu)
             {
-                Ok(None) => {
+                break self.workers.pending_results.remove(index).unwrap();
+            }
+            match self.inbox.recv_timeout(
+                self.worker_wait_timeout()
+                    .unwrap_or(std::time::Duration::from_secs(5)),
+            )? {
+                Some(crate::external_event::CoordinatorEvent::Completed(result)) => {
+                    self.workers.pending_results.push_back(result);
+                }
+                Some(crate::external_event::CoordinatorEvent::External(event)) => {
+                    self.deferred_events.push_back(event)
+                }
+                None => {
                     self.wake_due_deadlines()?;
                     self.interrupt_rescheduled_cores();
                 }
-                result => break result,
-            }
-        };
-        let worker_result = match received {
-            Ok(Some(result)) => result,
-            Ok(None) => unreachable!("timeouts are serviced above"),
-            Err(failure) => {
-                self.processes
-                    .get_mut(&expected.process)
-                    .expect("the dispatched process remains registered")
-                    .lose_thread_execution();
-                self.complete_failed_worker_lease(expected)?;
-                return Err(CoordinatorError::Worker(failure));
             }
         };
         self.complete_worker(expected, worker_result)
@@ -265,7 +245,7 @@ impl RuntimeCoordinator {
                 result,
             );
         let completion = match &result {
-            Ok(report) => self.completion_for_stop(expected, &report.stop)?,
+            Ok(report) => self.completion_for_stop(&report.stop)?,
             Err(ProcessExecutionError::ConcurrentProcessStop { .. }) => Completion::Ready,
             Err(_) => Completion::Faulted,
         };
@@ -297,60 +277,14 @@ impl RuntimeCoordinator {
 
     fn completion_for_stop(
         &mut self,
-        lease: Lease,
         stop: &ExecutionStop,
     ) -> Result<Completion, CoordinatorError> {
         let completion = match stop {
-            ExecutionStop::BudgetExhausted
-            | ExecutionStop::Safepoint
-            | ExecutionStop::PendingEvent { .. } => Completion::Ready,
+            ExecutionStop::Safepoint | ExecutionStop::PendingEvent { .. } => Completion::Ready,
             ExecutionStop::LoaderReturn { .. } => Completion::Exited,
             ExecutionStop::FetchFault { .. } | ExecutionStop::UnsupportedSemantics { .. } => {
                 Completion::Faulted
             }
-            ExecutionStop::Scheduled { request, .. } => match request {
-                SchedulerRequest::Yield => Completion::Preempted,
-                SchedulerRequest::WaitForEvent => {
-                    let events = self
-                        .vcpu_events
-                        .get(&lease.vcpu)
-                        .expect("a scheduler lease references a configured vCPU");
-                    if events.consume_event() {
-                        Completion::Ready
-                    } else {
-                        self.cpu_waits.insert(
-                            lease.thread,
-                            CpuWait {
-                                vcpu: lease.vcpu,
-                                request: *request,
-                            },
-                        );
-                        Completion::Waiting
-                    }
-                }
-                SchedulerRequest::WaitForInterrupt => {
-                    let events = self
-                        .vcpu_events
-                        .get(&lease.vcpu)
-                        .expect("a scheduler lease references a configured vCPU");
-                    if events.interrupts_pending() {
-                        Completion::Ready
-                    } else {
-                        self.cpu_waits.insert(
-                            lease.thread,
-                            CpuWait {
-                                vcpu: lease.vcpu,
-                                request: *request,
-                            },
-                        );
-                        Completion::Waiting
-                    }
-                }
-                SchedulerRequest::SendEvent => {
-                    self.send_event()?;
-                    Completion::Ready
-                }
-            },
             ExecutionStop::SupervisorCall { .. } => Completion::KernelCall,
             _ => Completion::Waiting,
         };

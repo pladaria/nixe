@@ -439,8 +439,7 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
-    /// Applies a topology migration and consumes its CPU-thread-local effect at
-    /// the same coordinator boundary.
+    /// Applies migration after returning any in-flight register owner.
     pub fn migrate_thread(
         &mut self,
         thread: GuestThreadId,
@@ -454,36 +453,11 @@ impl RuntimeCoordinator {
         {
             self.quiesce()?;
         }
-        let process = self
-            .scheduler
-            .thread(thread)
-            .ok_or(SchedulerError::UnknownThread(thread))?
-            .process;
-        let decision = self.scheduler.apply(SchedulerCommand::Migrate {
+        self.scheduler.apply(SchedulerCommand::Migrate {
             thread,
             ideal_vcpu,
             affinity,
         })?;
-        if let SchedulerDecision::Migrated {
-            effect: nixe_scheduler::MigrationEffect::ClearOldLocalExclusive { old_vcpu },
-            ..
-        } = decision
-        {
-            let cpu_process = self
-                .processes
-                .get(&process)
-                .expect("scheduled thread has an owning process")
-                .cpu_process_id();
-            self.workers
-                .clear_local_exclusive(
-                    old_vcpu,
-                    super::worker::WorkerCpuThreadKey {
-                        process,
-                        cpu_process,
-                    },
-                )
-                .map_err(CoordinatorError::Worker)?;
-        }
         Ok(())
     }
 }

@@ -820,22 +820,19 @@ fn execute(
                 .map_err(|error| format!("cannot publish Horizon touch-screen state: {error}"))?;
             last_input_sample = Some(sample.captured_at);
         }
+        let host_wait = host_service_wait_duration(
+            coordinator
+                .emulation_elapsed()
+                .saturating_sub(execution_started),
+            dispatcher.next_video_deadline(),
+        );
+        let host_wait = dispatcher
+            .next_service_deadline()
+            .map_or(host_wait, |deadline| deadline.min(host_wait));
         let Some(execution) = coordinator
-            .run_next_adaptive()
+            .run_next(host_wait)
             .map_err(|error| error.to_string())?
         else {
-            let host_wait = host_service_wait_duration(
-                coordinator
-                    .emulation_elapsed()
-                    .saturating_sub(execution_started),
-                dispatcher.next_video_deadline(),
-            );
-            let host_wait = dispatcher
-                .next_service_deadline()
-                .map_or(host_wait, |deadline| deadline.min(host_wait));
-            coordinator
-                .wait_for_external_event_for(host_wait)
-                .map_err(|error| error.to_string())?;
             continue;
         };
         let report = execution.report;
@@ -876,10 +873,7 @@ fn execute(
         }
 
         match &report.stop {
-            ExecutionStop::BudgetExhausted
-            | ExecutionStop::Safepoint
-            | ExecutionStop::PendingEvent { .. } => {}
-            ExecutionStop::Scheduled { .. } => {}
+            ExecutionStop::Safepoint | ExecutionStop::PendingEvent { .. } => {}
             ExecutionStop::SupervisorCall { .. } => {
                 let handling = dispatcher
                     .route_scheduled_supervisor_call(coordinator, execution.lease, &report.stop)
@@ -1101,9 +1095,6 @@ fn execution_stop_error(stop: &ExecutionStop, report: &nixe_runtime::ExecutionRe
         } => format!(
             "unhandled architectural exception: source=[{source}] kind={kind:?} syndrome={syndrome:?}"
         ),
-        ExecutionStop::DataFault { source, fault } => {
-            format!("guest memory access failed: source=[{source}] fault={fault:?}")
-        }
         _ => format!("unexpected execution stop: {stop}"),
     };
     format!("{reason}; diagnostic: {report}")

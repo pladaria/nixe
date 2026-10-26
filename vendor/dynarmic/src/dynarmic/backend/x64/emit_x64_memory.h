@@ -204,7 +204,7 @@ template<>
 // Intel SDM, Vol. 3, memory ordering and MFENCE:
 // https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
 inline bool UseNonWritingOrderedReads(const A64::UserConfig& conf) {
-    return conf.physical_exclusive_page_table != 0;
+    return conf.canonical_page_table != 0;
 }
 inline bool UseNonWritingOrderedReads(const A32::UserConfig&) { return false; }
 

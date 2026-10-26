@@ -77,7 +77,6 @@ fn run(
         worker,
         JitRunRequest {
             state,
-            instruction_budget: 1000,
             timer: &Timer,
             events: &VcpuEventState::default(),
         },
@@ -86,6 +85,7 @@ fn run(
 #[test]
 fn exclusive_wait_loop_progresses_after_a_store_without_an_explicit_sev() {
     let process = fixture(&[
+        0xb9000825, // STR W5,[X1,#8]: consumer entered native code.
         0xd50320bf, // SEVL
         0xd503205f, // loop: WFE
         0x885ffc20, // LDAXR W0,[X1]
@@ -94,39 +94,57 @@ fn exclusive_wait_loop_progresses_after_a_store_without_an_explicit_sev() {
         0x889ffc3f, // STLR WZR,[X1]
         0xd4000001, // SVC
     ]);
-    assert!(matches!(
-        process
-            .space
-            .write(GuestVirtualAddress::new(DATA), &1_u32.to_le_bytes())
-            .unwrap(),
-        Access::Ready(())
-    ));
+    process
+        .space
+        .write_value(GuestVirtualAddress::new(DATA), 4, 1)
+        .unwrap()
+        .into_ready()
+        .unwrap();
     let mut consumer = process.create_thread().unwrap();
-    let mut consumer_state = state();
-    let mut consumer_worker = NativeWorker::default();
-    assert_eq!(
-        run(&mut consumer, &mut consumer_worker, &mut consumer_state)
-            .unwrap()
-            .stop,
-        CpuExit::BudgetExhausted
-    );
-
+    let (done, completed) = mpsc::channel();
+    let executing = std::thread::spawn(move || {
+        let mut worker = NativeWorker::default();
+        let mut guest = state();
+        let result = run(&mut consumer, &mut worker, &mut guest);
+        done.send((result, guest)).unwrap();
+        worker.finish().unwrap();
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while process
+        .space
+        .read_value(GuestVirtualAddress::new(DATA + 8), 4)
+        .unwrap()
+        .into_ready()
+        .unwrap()
+        != 9
+    {
+        if std::time::Instant::now() >= deadline {
+            process.request_stop();
+            executing.join().unwrap();
+            panic!("consumer did not enter native execution");
+        }
+        std::thread::yield_now();
+    }
     let mut producer = process.create_thread().unwrap();
-    let mut producer_state = state();
-    producer_state.set_pc(CODE + 20);
+    let mut guest = state();
+    guest.set_pc(CODE + 24);
+    let mut worker = NativeWorker::default();
     assert!(matches!(
-        run(&mut producer, &mut consumer_worker, &mut producer_state)
-            .unwrap()
-            .stop,
+        run(&mut producer, &mut worker, &mut guest).unwrap().stop,
         CpuExit::SupervisorCall { .. }
     ));
+    let completed = completed.recv_timeout(Duration::from_secs(5));
+    if completed.is_err() {
+        process.request_stop();
+    }
+    executing.join().unwrap();
+    let (result, guest) = completed.unwrap();
     assert!(matches!(
-        run(&mut consumer, &mut consumer_worker, &mut consumer_state)
-            .unwrap()
-            .stop,
+        result.unwrap().stop,
         CpuExit::SupervisorCall { .. }
     ));
-    assert_eq!(consumer_state.read_x(register(0)), 0);
+    assert_eq!(guest.read_x(register(0)), 0);
+    worker.finish().unwrap();
 }
 
 #[test]
@@ -283,7 +301,7 @@ fn a_concurrent_stop_preserves_the_original_completed_device_failure() {
 }
 
 #[test]
-fn canonical_process_reports_precise_fetch_and_data_faults() {
+fn canonical_process_reports_fetch_faults_and_relaxes_invalid_guest_data() {
     for fetch in [true, false] {
         let process = fixture(&[0xb9400020, 0xd4000001]);
         let mut cpu = process.create_thread().unwrap();
@@ -295,15 +313,15 @@ fn canonical_process_reports_precise_fetch_and_data_faults() {
         }
         let mut worker = NativeWorker::default();
         let report = run(&mut cpu, &mut worker, &mut guest).unwrap();
-        assert!(report.context.is_some());
         if fetch {
+            assert!(report.context.is_some());
             assert!(
                 matches!(report.stop, CpuExit::FetchFault { fault } if fault.address.get() == 0x6000)
             );
         } else {
-            assert!(
-                matches!(report.stop, CpuExit::DataFault { source, fault } if source.pc.get() == CODE && fault.address.get() == 0x6000)
-            );
+            assert!(matches!(report.stop, CpuExit::SupervisorCall { .. }));
+            assert!(report.context.is_none());
+            assert_eq!(guest.read_x(register(0)), 0);
         }
         assert!(matches!(
             process
@@ -314,33 +332,5 @@ fn canonical_process_reports_precise_fetch_and_data_faults() {
         ));
         assert!(process.try_shutdown().unwrap());
         worker.finish().unwrap();
-    }
-}
-
-#[test]
-fn cold_code_preparation_does_not_consume_a_native_block_quantum() {
-    let process = fixture(&[0x91000400, 0x17ffffff]); // ADD X0,#1; B start.
-    let mut thread = process.create_thread().unwrap();
-    let mut guest = state();
-    let mut worker = NativeWorker::default();
-    for expected in [8, 9] {
-        let report = thread
-            .run_slice(
-                &mut worker,
-                JitRunRequest {
-                    state: &mut guest,
-                    instruction_budget: 1,
-                    timer: &Timer,
-                    events: &VcpuEventState::default(),
-                },
-            )
-            .unwrap();
-        assert_eq!(report.stop, CpuExit::BudgetExhausted);
-        assert_eq!(
-            report.progress, 2,
-            "only the two executed instructions consume the quantum"
-        );
-        assert_eq!(guest.read_x(register(0)), expected);
-        assert_eq!(guest.pc(), CODE);
     }
 }

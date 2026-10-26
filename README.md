@@ -15,15 +15,25 @@ both platforms whenever technically appropriate.
 
 ## Project Status
 
-The project is in active development. Some homebrew applications run at up to 60 FPS, and gamepad input is
-supported through the emulated HID services.
+Nixe is in an early stage of development, but it can already run a range of homebrew applications and
+commercial games; some run at native speed, depending on the title and host hardware. It supports homebrew
+NRO files and commercial NSP and XCI packages, including the compressed NSZ and XCZ formats. Gamepad input is
+available through the emulated HID services.
 
 ### Screenshots
 
 <table>
   <tr>
-    <td><img src="docs/screenshots/es2gears.png" alt="ES2Gears"></td>
-    <td><img src="docs/screenshots/textured_cube.png" alt="Textured cube"></td>
+    <td><img src="docs/screenshots/celeste-20261026T211028.075629143Z.png" alt=""></td>
+    <td><img src="docs/screenshots/celeste-20261026T211116.756847120Z.png" alt=""></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/sonic-mania-20261026T220116.389930366Z.png" alt=""></td>
+    <td><img src="docs/screenshots/sonic-mania-20261026T220158.654988850Z.png" alt=""></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/the-legend-of-zelda-link-s-awakening-20261026T211235.406668086Z.png" alt=""></td>
+    <td><img src="docs/screenshots/the-legend-of-zelda-link-s-awakening-20261026T211322.695753781Z.png" alt=""></td>
   </tr>
 </table>
 
@@ -63,7 +73,7 @@ The default configuration is in [`nixe.toml`](nixe.toml). Window size and
 position are remembered in a versioned binary `nixe.cfg` beside the selected
 `nixe.toml`; it is managed by Nixe.
 
-List available titles with:
+List available titles:
 
 ```bash
 cargo cli list

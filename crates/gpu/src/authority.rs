@@ -113,7 +113,6 @@ struct Writer<R> {
     memory: Vec<Arc<MemoryWatch>>,
     memory_prune_at: usize,
     device_protected: bool,
-    device_epochs: Vec<nixe_memory::DeviceWriteEpoch>,
     life_invalid: Arc<AtomicBool>,
     life_watches: Vec<nixe_memory::AllocationObservation>,
 }
@@ -421,7 +420,6 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             .checked_add(1)
             .ok_or(MemoryError::Invalid("writer identity exhausted"))?;
         let mut consumers = Vec::new();
-        let device_epochs = footprint.device_write_epochs()?;
         for candidate in self.candidates(&footprint) {
             let entry = self.resources.get_mut(&candidate).unwrap();
             entry.consumers.retain(|consumer| {
@@ -457,7 +455,6 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                 memory: Vec::new(),
                 memory_prune_at: 16,
                 device_protected: false,
-                device_epochs,
                 life_invalid: Arc::new(AtomicBool::new(false)),
                 life_watches: Vec::new(),
             },

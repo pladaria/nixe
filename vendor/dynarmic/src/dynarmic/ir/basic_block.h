@@ -18,10 +18,6 @@
 #include "dynarmic/ir/terminal.h"
 #include "dynarmic/ir/value.h"
 
-namespace Dynarmic::Common {
-class Pool;
-}
-
 namespace Dynarmic::IR {
 
 enum class Cond;
@@ -50,6 +46,8 @@ public:
 
     Block(Block&&);
     Block& operator=(Block&&);
+
+    void Reset(const LocationDescriptor& location);
 
     bool empty() const { return instructions.empty(); }
     size_type size() const { return instructions.size(); }
@@ -153,8 +151,8 @@ private:
 
     /// List of instructions in this block.
     InstructionList instructions;
-    /// Memory pool for instruction list
-    std::unique_ptr<Common::Pool> instruction_alloc_pool;
+    struct InstructionStorage;
+    std::unique_ptr<InstructionStorage> instruction_storage;
     /// Terminal instruction of this block.
     Terminal terminal = Term::Invalid{};
 

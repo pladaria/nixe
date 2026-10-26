@@ -24,11 +24,6 @@ impl TargetPlatform {
             Self::Switch1 | Self::Switch2 => 64,
         }
     }
-
-    #[must_use]
-    pub const fn user_cache_maintenance_prohibited(self) -> bool {
-        matches!(self, Self::Switch1)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

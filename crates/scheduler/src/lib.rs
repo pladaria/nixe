@@ -11,9 +11,8 @@ pub use lifecycle::{
     transition_thread,
 };
 pub use scheduler::{
-    Completion, Lease, LeaseGeneration, MigrationEffect, Readiness, ScheduledThreadConfig,
-    ScheduledThreadView, SchedulerCommand, SchedulerDecision, SchedulerError, SchedulerState,
-    WakeToken, YieldMigration,
+    Completion, Lease, LeaseGeneration, Readiness, ScheduledThreadConfig, ScheduledThreadView,
+    SchedulerCommand, SchedulerDecision, SchedulerError, SchedulerState, WakeToken, YieldMigration,
 };
 pub use topology::{
     CoreSet, CoreSetError, MachineSchedulerProfile, MachineSchedulerProfileError, PriorityRange,

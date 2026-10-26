@@ -63,12 +63,6 @@ pub enum Completion {
     Faulted,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum MigrationEffect {
-    None,
-    ClearOldLocalExclusive { old_vcpu: VirtualCpuId },
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SchedulerCommand {
     Register(ScheduledThreadConfig),
@@ -142,7 +136,6 @@ pub enum SchedulerDecision {
     Terminated(GuestThreadId),
     Migrated {
         thread: GuestThreadId,
-        effect: MigrationEffect,
     },
     PriorityChanged(GuestThreadId),
     ActivityChanged(GuestThreadId),
@@ -911,12 +904,6 @@ impl SchedulerState {
         if thread.active_lease.is_some() {
             return Err(SchedulerError::ThreadLeased(id));
         }
-        let effect = match thread.last_vcpu {
-            Some(old_vcpu) if !affinity.contains(old_vcpu) => {
-                MigrationEffect::ClearOldLocalExclusive { old_vcpu }
-            }
-            _ => MigrationEffect::None,
-        };
         let sequence = thread.ready_sequence;
         self.remove_queued(id);
         let thread = self.threads.get_mut(&id).unwrap();
@@ -931,7 +918,7 @@ impl SchedulerState {
         if let Some(sequence) = sequence {
             self.enqueue_existing_with_sequence(id, sequence);
         }
-        Ok(SchedulerDecision::Migrated { thread: id, effect })
+        Ok(SchedulerDecision::Migrated { thread: id })
     }
 
     fn set_priority(
@@ -1175,7 +1162,6 @@ mod tests {
                 .map(|id| VirtualCpuDescriptor::new(VirtualCpuId::new(id), 0))
                 .collect(),
             PriorityRange::new(0, 63).unwrap(),
-            100,
         )
         .unwrap()
     }
@@ -1204,7 +1190,6 @@ mod tests {
                     })
                     .collect(),
                 PriorityRange::new(0, 63).unwrap(),
-                10_000,
             )
             .unwrap()
             .with_preemption(10_000_000, 2)
@@ -1658,9 +1643,6 @@ mod tests {
                 .unwrap(),
             SchedulerDecision::Migrated {
                 thread: GuestThreadId::new(8),
-                effect: MigrationEffect::ClearOldLocalExclusive {
-                    old_vcpu: VirtualCpuId::new(0)
-                }
             }
         );
     }

@@ -77,7 +77,6 @@ impl VirtualCpuDescriptor {
 pub struct MachineSchedulerProfile {
     vcpus: Arc<[VirtualCpuDescriptor]>,
     priorities: PriorityRange,
-    default_timeslice_instructions: u64,
     preemption_interval_ns: Option<u64>,
     migration_priority: Option<i32>,
 }
@@ -86,13 +85,9 @@ impl MachineSchedulerProfile {
     pub fn new(
         mut vcpus: Vec<VirtualCpuDescriptor>,
         priorities: PriorityRange,
-        default_timeslice_instructions: u64,
     ) -> Result<Self, MachineSchedulerProfileError> {
         if vcpus.is_empty() {
             return Err(MachineSchedulerProfileError::EmptyTopology);
-        }
-        if default_timeslice_instructions == 0 {
-            return Err(MachineSchedulerProfileError::ZeroTimeslice);
         }
         vcpus.sort_by_key(VirtualCpuDescriptor::id);
         if let Some(duplicate) = vcpus
@@ -105,7 +100,6 @@ impl MachineSchedulerProfile {
         Ok(Self {
             vcpus: vcpus.into(),
             priorities,
-            default_timeslice_instructions,
             preemption_interval_ns: None,
             migration_priority: None,
         })
@@ -148,11 +142,6 @@ impl MachineSchedulerProfile {
     #[must_use]
     pub const fn priorities(&self) -> PriorityRange {
         self.priorities
-    }
-
-    #[must_use]
-    pub const fn default_timeslice_instructions(&self) -> u64 {
-        self.default_timeslice_instructions
     }
 
     #[must_use]
@@ -226,7 +215,6 @@ pub enum MachineSchedulerProfileError {
     EmptyTopology,
     DuplicateVirtualCpu(VirtualCpuId),
     InvalidPriorityRange { highest: i32, lowest: i32 },
-    ZeroTimeslice,
     InvalidPreemptionPolicy,
 }
 
@@ -244,7 +232,6 @@ impl Display for MachineSchedulerProfileError {
             Self::InvalidPreemptionPolicy => {
                 formatter.write_str("invalid periodic preemption policy")
             }
-            Self::ZeroTimeslice => formatter.write_str("scheduler timeslice must be non-zero"),
         }
     }
 }
@@ -280,7 +267,6 @@ mod tests {
                 .map(|id| VirtualCpuDescriptor::new(VirtualCpuId::new(id), 0))
                 .collect(),
             PriorityRange::new(0, 63).unwrap(),
-            10_000,
         )
         .unwrap()
     }
@@ -313,7 +299,6 @@ mod tests {
                 VirtualCpuDescriptor::new(VirtualCpuId::new(2), 0),
             ],
             PriorityRange::new(-4, 12).unwrap(),
-            1,
         )
         .unwrap();
         assert!(profile.contains(VirtualCpuId::new(9)));

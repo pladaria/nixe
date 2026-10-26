@@ -50,10 +50,10 @@ impl ScheduledProcess {
         }
     }
 
-    pub fn run_slice(&mut self, instruction_budget: u64) -> Result<ExecutionReport, String> {
+    pub fn run_slice(&mut self) -> Result<ExecutionReport, String> {
         let execution = self
             .coordinator
-            .run_next(instruction_budget)
+            .run_next(std::time::Duration::from_secs(2))
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "scheduler found no runnable test thread".to_owned())?;
         let report = execution.report.clone();

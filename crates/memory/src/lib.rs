@@ -13,7 +13,6 @@ mod intervals;
 mod machine;
 mod physical_access;
 mod raw;
-mod reservation;
 pub mod trace;
 mod tracking;
 mod transition;
@@ -36,7 +35,6 @@ pub use machine::{
     MemoryError, MemoryStatistics, WeakAllocation,
 };
 
-pub use reservation::{DeviceWriteEpoch, NativeReservation, Reservation};
 pub use tracking::{
     MappedRamReader, Observation, PhysicalCapture, TrackingStatistics, WriteSource,
 };

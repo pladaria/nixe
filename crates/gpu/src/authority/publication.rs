@@ -73,11 +73,6 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             if observe_lifetime {
                 lifetimes.push((id, pages.clone()));
             }
-            if protected {
-                for epoch in &self.writers[&id].device_epochs {
-                    epoch.mark_device_modified();
-                }
-            }
             first |= !protected;
             inputs.extend(pages);
         }

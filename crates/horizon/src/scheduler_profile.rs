@@ -73,7 +73,6 @@ pub fn switch_1_scheduler_profile() -> MachineSchedulerProfile {
             })
             .collect(),
         PriorityRange::new(0, 63).expect("the verified Switch 1 priority range is valid"),
-        10_000,
     )
     .expect("the verified Switch 1 scheduler topology is valid")
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/global_scheduler_context.cpp#L41-L55

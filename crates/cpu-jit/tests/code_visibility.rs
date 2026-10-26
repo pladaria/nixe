@@ -1,6 +1,6 @@
 //! Code invalidation and mapping lifetime on the production physical arena.
 use nixe_cpu::{
-    execution::{ArchitecturalTimer, ControlRequest, CpuExit, TimerSnapshot, VcpuEventState},
+    execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState},
     platform::TargetPlatform,
     profile::ProcessCpuContext,
     state::a64::{A64GeneralRegister, A64Register},
@@ -62,7 +62,6 @@ fn run(jit: &mut JitThread, state: &mut ThreadState) -> nixe_cpu::execution::Exe
         &mut nixe_cpu_direct_memory::NativeWorker::default(),
         JitRunRequest {
             state,
-            instruction_budget: 1000,
             timer: &Timer,
             events: &VcpuEventState::default(),
         },
@@ -103,7 +102,7 @@ fn preemption_cannot_discard_a_pending_code_invalidation() {
     let mut jit = process.create_thread().unwrap();
     assert_eq!(value_at(&mut jit, CODE), 42);
     write(&space, ALIAS, &0xd2800560_u32.to_le_bytes());
-    jit.control().request(ControlRequest::Preempt);
+    jit.control().request_preemption();
     let mut state = ThreadState::default();
     state.set_pc(CODE.get());
     assert_eq!(run(&mut jit, &mut state).stop, CpuExit::Safepoint);
@@ -321,23 +320,32 @@ fn switch_1_pointer_authentication_hints_preserve_registers() {
 }
 
 #[test]
-fn prohibited_cache_zero_traps_without_writing_ram() {
-    let (space, process) = fixture(&[0xd50b7421, 0xd4000001]); // DC ZVA,X1; SVC
-    write(&space, DATA, &[0x55; 64]);
+fn native_cache_zero_clears_the_aligned_guest_cache_line() {
+    let (space, process) = fixture(&[0xd50b7421, 0xd4000001]); // DC ZVA,X1; SVC.
+    write(&space, DATA, &[0x55; 128]);
     let mut jit = process.create_thread().unwrap();
     let mut state = ThreadState::default();
     state.set_pc(CODE.get());
-    state.write_x(x(1), DATA.get());
+    state.write_x(x(1), DATA.get() + 31);
     assert!(matches!(
         run(&mut jit, &mut state).stop,
-        CpuExit::ArchitecturalException {
-            kind: nixe_cpu::exception::ExceptionKind::SystemRegisterTrap,
-            ..
-        }
+        CpuExit::SupervisorCall { .. }
     ));
-    assert_eq!(state.pc(), CODE.get());
-    assert!(matches!(
-        space.read_value(DATA, 8).unwrap(),
-        Access::Ready(0x5555555555555555)
-    ));
+    assert_eq!(space.read_value(DATA, 16).unwrap().into_ready().unwrap(), 0);
+    assert_eq!(
+        space
+            .read_value(GuestVirtualAddress::new(DATA.get() + 48), 16)
+            .unwrap()
+            .into_ready()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        space
+            .read_value(GuestVirtualAddress::new(DATA.get() + 64), 16)
+            .unwrap()
+            .into_ready()
+            .unwrap(),
+        u128::from_le_bytes([0x55; 16])
+    );
 }

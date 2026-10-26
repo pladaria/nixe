@@ -4,6 +4,14 @@ fn main() {
     let dst = cmake::Config::new("native")
         .profile("Release")
         .define(
+            "NIXE_VERIFY_IR",
+            if std::env::var("PROFILE").as_deref() == Ok("debug") {
+                "ON"
+            } else {
+                "OFF"
+            },
+        )
+        .define(
             "NIXE_PERFORMANCE_COUNTERS",
             if std::env::var_os("CARGO_FEATURE_PERFORMANCE_COUNTERS").is_some() {
                 "ON"

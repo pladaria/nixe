@@ -117,8 +117,7 @@ protected:
     void EmitExclusiveReadMemory(A64EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>
     void EmitExclusiveWriteMemory(A64EmitContext& ctx, IR::Inst* inst);
-    template<size_t bitsize, bool write> void EmitPhysicalMemoryAccess(A64EmitContext& ctx, IR::Inst* inst);
-    template<size_t bitsize, bool write> void EmitPhysicalExclusive(A64EmitContext& ctx, IR::Inst* inst);
+    template<size_t bitsize, bool write> void EmitCanonicalMemoryAccess(A64EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>
     void EmitExclusiveReadMemoryInline(A64EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>

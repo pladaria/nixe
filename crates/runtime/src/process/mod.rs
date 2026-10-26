@@ -417,7 +417,6 @@ impl RunnableProcess {
             fault: Box::new(nixe_cpu::execution::CpuFault {
                 backend: "memory",
                 kind: nixe_cpu::execution::CpuFaultKind::Internal,
-                progress: 0,
                 message: error.to_string().into(),
                 context: None,
             }),

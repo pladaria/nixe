@@ -103,13 +103,6 @@ struct UserCallbacks {
     virtual void MemoryWrite128(VAddr vaddr, Vector value) = 0;
 
     // Writes through these callbacks may not be aligned.
-    /// Cold physical-exclusive access preparation. No memory operation is
-    /// committed by a failed reservation. Reads halt/retry after activating a
-    /// table entry. Writes validate {value[2], identity, version, device epoch,
-    /// canonical byte address, width, observed value[2]} again and replace
-    /// data[0] with the conditional-store result, including observer publication.
-    virtual void PreparePhysicalExclusive(VAddr, size_t, bool, u64*) {}
-
     virtual bool MemoryWriteExclusive8(VAddr /*vaddr*/, std::uint8_t /*value*/, std::uint8_t /*expected*/) { return false; }
     virtual bool MemoryWriteExclusive16(VAddr /*vaddr*/, std::uint16_t /*value*/, std::uint16_t /*expected*/) { return false; }
     virtual bool MemoryWriteExclusive32(VAddr /*vaddr*/, std::uint32_t /*value*/, std::uint32_t /*expected*/) { return false; }
@@ -148,14 +141,8 @@ struct UserConfig {
     size_t processor_id = 0;
     ExclusiveMonitor* global_monitor = nullptr;
 
-    /// Optional canonical page table. Each atomic64 entry stores a tagged RAM
-    /// or physical-monitor pointer. Monitors contain canonical page
-    /// address, lifetime identity and the configured version/epoch metadata.
-    /// Aliases and atomic/exclusive writers share these version words.
-    /// Ordinary native stores remain direct; exclusive commit uses value CAS.
-    /// Odd versions are locked; even versions identify completed writes.
-    /// Monitor publication must quiesce native readers of this entry.
-    uintptr_t physical_exclusive_page_table = 0;
+    /// Tagged process page table used after an ordinary fastmem protection fault.
+    uintptr_t canonical_page_table = 0;
 
     /// This selects other optimizations than can't otherwise be disabled by setting other
     /// configuration options. This includes:

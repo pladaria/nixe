@@ -162,7 +162,6 @@ struct AllocationRecord {
     live_bytes: Arc<AtomicU64>,
     references: Mutex<References>,
     retirement_observers: Mutex<crate::IntervalIndex<Weak<AtomicBool>>>,
-    device_write_epoch: crate::DeviceWriteEpoch,
 }
 struct AllocationExtent {
     end: u64,
@@ -192,7 +191,6 @@ pub struct WeakAllocation {
     allocation: AllocationId,
     record: Weak<AllocationRecord>,
     live_bytes: Arc<AtomicU64>,
-    device_write_epoch: crate::DeviceWriteEpoch,
 }
 impl WeakAllocation {
     /// A reclamation snapshot, without retaining RAM. A consuming operation
@@ -517,7 +515,6 @@ impl MemoryAccount {
                 live_bytes: Arc::new(AtomicU64::new(bytes)),
                 references: Mutex::new(References::new(bytes)),
                 retirement_observers: Mutex::new(crate::IntervalIndex::default()),
-                device_write_epoch: crate::DeviceWriteEpoch::default(),
             });
             (record, clear)
         };
@@ -614,9 +611,6 @@ impl Allocation {
     }
 }
 impl WeakAllocation {
-    pub fn device_write_epoch(&self) -> Option<crate::DeviceWriteEpoch> {
-        self.is_live().then(|| self.device_write_epoch.clone())
-    }
     pub fn upgrade_range(&self, offset: u64, bytes: u64) -> Option<AllocationPin> {
         self.record.upgrade()?.pin(offset, bytes).ok()
     }
@@ -635,19 +629,12 @@ impl AllocationPin {
         }
         self.0.record.pin(offset, bytes)
     }
-    pub fn device_write_epoch(&self) -> crate::DeviceWriteEpoch {
-        self.0.record.device_write_epoch.clone()
-    }
-    pub(crate) fn mark_device_modified(&self) {
-        self.0.record.device_write_epoch.mark_device_modified();
-    }
     pub fn downgrade(&self) -> WeakAllocation {
         WeakAllocation {
             machine: self.machine().identity(),
             allocation: self.identity(),
             record: Arc::downgrade(&self.0.record),
             live_bytes: Arc::clone(&self.0.record.live_bytes),
-            device_write_epoch: self.0.record.device_write_epoch.clone(),
         }
     }
     pub fn identity(&self) -> AllocationId {

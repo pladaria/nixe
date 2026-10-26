@@ -53,8 +53,6 @@ add_library(dynarmic
     common/lut_from_list.h
     common/math_util.cpp
     common/math_util.h
-    common/memory_pool.cpp
-    common/memory_pool.h
     common/safe_ops.h
     common/spin_lock.h
     common/string_util.h

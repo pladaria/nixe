@@ -1,9 +1,8 @@
-//! Bounded host-side measurements; guest ticks are Dynarmic budget units.
+//! Optional host-side native execution measurements.
 #[derive(Clone, Copy)]
 #[repr(usize)]
 pub enum Counter {
     NativeEntries,
-    GuestTicks,
     NativeStateBytes,
     NativeStateNanoseconds,
     NativeRunNanoseconds,
@@ -21,24 +20,10 @@ pub enum Counter {
     AdmissionNanoseconds,
 }
 #[cfg(feature = "performance-counters")]
-static COUNTERS: [std::sync::atomic::AtomicU64; 17] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 17];
-#[cfg(test)]
-std::thread_local! {
-    static TEST_COUNTERS: std::cell::Cell<[u64; 17]> = const { std::cell::Cell::new([0; 17]) };
-}
-#[cfg(test)]
-pub(crate) fn test_snapshot() -> [u64; 17] {
-    TEST_COUNTERS.get()
-}
+static COUNTERS: [std::sync::atomic::AtomicU64; 16] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 #[inline]
 pub fn record(counter: Counter, amount: u64) {
-    #[cfg(test)]
-    TEST_COUNTERS.with(|values| {
-        let mut current = values.get();
-        current[counter as usize] += amount;
-        values.set(current);
-    });
     #[cfg(feature = "performance-counters")]
     COUNTERS[counter as usize].fetch_add(amount, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(feature = "performance-counters"))]
@@ -48,7 +33,6 @@ pub fn record(counter: Counter, amount: u64) {
 pub fn snapshot() -> Vec<(&'static str, u64)> {
     const NAMES: &[&str] = &[
         "JitNativeEntries",
-        "JitGuestTicks",
         "JitNativeStateBytes",
         "JitNativeStateNanoseconds",
         "JitNativeRunNanoseconds",
@@ -65,7 +49,7 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         "JitInternalHaltResumes",
         "JitAdmissionNanoseconds",
     ];
-    let values: [u64; 17] =
+    let values: [u64; 16] =
         std::array::from_fn(|index| COUNTERS[index].load(std::sync::atomic::Ordering::Relaxed));
     let total = values[Counter::ReadCallbacks as usize]
         + values[Counter::WriteCallbacks as usize]

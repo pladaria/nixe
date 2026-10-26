@@ -13,7 +13,8 @@
 #include <fmt/format.h>
 #include <mcl/assert.hpp>
 
-#include "dynarmic/common/memory_pool.h"
+#include <boost/container/static_vector.hpp>
+#include <boost/container/stable_vector.hpp>
 #include "dynarmic/frontend/A32/a32_types.h"
 #include "dynarmic/frontend/A64/a64_types.h"
 #include "dynarmic/ir/cond.h"
@@ -21,8 +22,32 @@
 
 namespace Dynarmic::IR {
 
+// Per-core inline instructions with stable overflow slabs:
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/dynarmic/src/dynarmic/ir/basic_block.cpp
+struct Block::InstructionStorage {
+    boost::container::static_vector<Inst, 30> inlined;
+    boost::container::stable_vector<boost::container::static_vector<Inst, 32>> overflow;
+
+    Inst* Allocate(Opcode opcode) {
+        if (inlined.size() < inlined.capacity()) {
+            inlined.emplace_back(opcode);
+            return &inlined.back();
+        }
+        if (overflow.empty() || overflow.back().size() == overflow.back().capacity()) {
+            overflow.emplace_back();
+        }
+        overflow.back().emplace_back(opcode);
+        return &overflow.back().back();
+    }
+
+    void Reset() {
+        inlined.clear();
+        overflow.clear();
+    }
+};
+
 Block::Block(const LocationDescriptor& location)
-        : location{location}, end_location{location}, cond{Cond::AL}, instruction_alloc_pool{std::make_unique<Common::Pool>(sizeof(Inst), 4096)} {}
+        : location{location}, end_location{location}, cond{Cond::AL}, instruction_storage{std::make_unique<InstructionStorage>()} {}
 
 Block::~Block() = default;
 
@@ -30,12 +55,25 @@ Block::Block(Block&&) = default;
 
 Block& Block::operator=(Block&&) = default;
 
+void Block::Reset(const LocationDescriptor& next_location) {
+    InstructionList discarded;
+    instructions.swap(discarded);
+    instruction_storage->Reset();
+    location = next_location;
+    end_location = next_location;
+    cond = Cond::AL;
+    cond_failed.reset();
+    cond_failed_cycle_count = 0;
+    terminal = Term::Invalid{};
+    cycle_count = 0;
+}
+
 void Block::AppendNewInst(Opcode opcode, std::initializer_list<IR::Value> args) {
     PrependNewInst(end(), opcode, args);
 }
 
 Block::iterator Block::PrependNewInst(iterator insertion_point, Opcode opcode, std::initializer_list<Value> args) {
-    IR::Inst* inst = new (instruction_alloc_pool->Alloc()) IR::Inst(opcode);
+    IR::Inst* inst = instruction_storage->Allocate(opcode);
     ASSERT(args.size() == inst->NumArgs());
 
     std::for_each(args.begin(), args.end(), [&inst, index = size_t(0)](const auto& arg) mutable {

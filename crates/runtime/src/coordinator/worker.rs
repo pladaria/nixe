@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use nixe_cpu::execution::CpuProcessId;
-use nixe_scheduler::{GuestThreadId, Lease, ProcessId, VirtualCpuId};
+use nixe_scheduler::{Lease, ProcessId, VirtualCpuId};
 
 use crate::process::execution::{CpuThread, VcpuExecutionState};
 use crate::{ExecutionReport, ProcessExecutionError};
@@ -24,23 +24,7 @@ pub(super) struct WorkerCpuThreadKey {
     pub(super) cpu_process: CpuProcessId,
 }
 
-struct WorkerCpuThread {
-    cpu: CpuThread,
-    guest: Option<GuestThreadId>,
-}
-
-impl WorkerCpuThread {
-    fn select_guest(&mut self, guest: GuestThreadId) {
-        if self.guest != Some(guest) {
-            // Exclusive reservations belong to execution on this guest thread,
-            // not to the register snapshot or the next occupant of this core.
-            self.cpu.clear_local_exclusive_reservation();
-            self.guest = Some(guest);
-        }
-    }
-}
-
-pub(super) struct WorkerResult {
+pub(crate) struct WorkerResult {
     pub(super) lease: Lease,
     pub(super) execution: VcpuExecutionState,
     pub(super) outcome: Result<ExecutionReport, WorkerRunFailure>,
@@ -86,10 +70,6 @@ enum WorkerCommand {
         process: ProcessId,
         reply: SyncSender<usize>,
     },
-    ClearLocalExclusive {
-        key: WorkerCpuThreadKey,
-        reply: SyncSender<bool>,
-    },
     Run(WorkerRequest),
     Shutdown,
 }
@@ -103,16 +83,14 @@ struct WorkerHandle {
 pub(super) struct VcpuWorkerPool {
     workers: BTreeMap<VirtualCpuId, WorkerHandle>,
     stop_requested: bool,
-    results: Receiver<WorkerResult>,
-    pending_results: BTreeMap<VirtualCpuId, WorkerResult>,
+    pub(super) pending_results: VecDeque<WorkerResult>,
 }
 
 impl VcpuWorkerPool {
     pub(super) fn start(
         vcpus: impl IntoIterator<Item = VirtualCpuId>,
+        completion: SyncSender<crate::external_event::CoordinatorEvent>,
     ) -> Result<Self, std::io::Error> {
-        let vcpus: Vec<_> = vcpus.into_iter().collect();
-        let (completion, results) = sync_channel(vcpus.len().max(1));
         let mut workers: BTreeMap<VirtualCpuId, WorkerHandle> = BTreeMap::new();
         for vcpu in vcpus {
             let (commands, receiver) = sync_channel(1);
@@ -144,8 +122,7 @@ impl VcpuWorkerPool {
         Ok(Self {
             workers,
             stop_requested: false,
-            results,
-            pending_results: BTreeMap::new(),
+            pending_results: VecDeque::new(),
         })
     }
 
@@ -239,81 +216,6 @@ impl VcpuWorkerPool {
             })
     }
 
-    pub(super) fn clear_local_exclusive(
-        &self,
-        vcpu: VirtualCpuId,
-        key: WorkerCpuThreadKey,
-    ) -> Result<(), WorkerFailure> {
-        let worker = self.workers.get(&vcpu).ok_or(WorkerFailure::Lost(vcpu))?;
-        let (reply, result) = sync_channel(1);
-        worker
-            .commands
-            .send(WorkerCommand::ClearLocalExclusive { key, reply })
-            .map_err(|_| WorkerFailure::Lost(vcpu))?;
-        result
-            .recv()
-            .map_err(|_| WorkerFailure::Lost(vcpu))?
-            .then_some(())
-            .ok_or(WorkerFailure::CpuThreadUnavailable {
-                process: key.process,
-                vcpu,
-            })
-    }
-
-    pub(super) fn receive_for(
-        &mut self,
-        vcpu: VirtualCpuId,
-        timeout: Option<Duration>,
-    ) -> Result<Option<WorkerResult>, WorkerFailure> {
-        if !self.workers.contains_key(&vcpu) {
-            return Err(WorkerFailure::Lost(vcpu));
-        }
-        if let Some(result) = self.pending_results.remove(&vcpu) {
-            return Ok(Some(result));
-        }
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        loop {
-            let result = self.receive_result(
-                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())),
-            )?;
-            let Some(result) = result else {
-                return Ok(None);
-            };
-            if result.lease.vcpu == vcpu {
-                return Ok(Some(result));
-            }
-            self.pending_results.insert(result.lease.vcpu, result);
-        }
-    }
-
-    pub(super) fn receive_any(
-        &mut self,
-        timeout: Option<Duration>,
-    ) -> Result<Option<WorkerResult>, WorkerFailure> {
-        if let Some((_, result)) = self.pending_results.pop_first() {
-            return Ok(Some(result));
-        }
-        self.receive_result(timeout)
-    }
-
-    fn receive_result(
-        &self,
-        timeout: Option<Duration>,
-    ) -> Result<Option<WorkerResult>, WorkerFailure> {
-        match timeout {
-            Some(timeout) => match self.results.recv_timeout(timeout) {
-                Ok(result) => Ok(Some(result)),
-                Err(RecvTimeoutError::Timeout) => Ok(None),
-                Err(RecvTimeoutError::Disconnected) => Err(WorkerFailure::Stopped),
-            },
-            None => self
-                .results
-                .recv()
-                .map(Some)
-                .map_err(|_| WorkerFailure::Stopped),
-        }
-    }
-
     pub(super) fn shutdown(&mut self) -> Result<(), WorkerFailure> {
         self.shutdown_with_timeout(WORKER_SHUTDOWN_TIMEOUT)
     }
@@ -381,7 +283,7 @@ impl Drop for VcpuWorkerPool {
 
 fn worker_main(
     commands: Receiver<WorkerCommand>,
-    results: SyncSender<WorkerResult>,
+    results: SyncSender<crate::external_event::CoordinatorEvent>,
 ) -> Result<(), nixe_cpu_direct_memory::FaultRuntimeError> {
     let mut native_worker = nixe_cpu_direct_memory::NativeWorker::default();
     let mut cpu_threads = BTreeMap::new();
@@ -390,10 +292,7 @@ fn worker_main(
             WorkerCommand::Install { key, thread, reply } => {
                 let result = match cpu_threads.entry(key) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(WorkerCpuThread {
-                            cpu: thread,
-                            guest: None,
-                        });
+                        entry.insert(thread);
                         Ok(())
                     }
                     std::collections::btree_map::Entry::Occupied(_) => Err(thread),
@@ -408,20 +307,9 @@ fn worker_main(
                     .copied()
                     .collect();
                 for key in &keys {
-                    let mut thread = cpu_threads.remove(key).unwrap();
-                    thread.cpu.clear_local_exclusive_reservation();
+                    cpu_threads.remove(key);
                 }
                 let _ = reply.send(keys.len());
-                continue;
-            }
-            WorkerCommand::ClearLocalExclusive { key, reply } => {
-                let found = if let Some(thread) = cpu_threads.get_mut(&key) {
-                    thread.cpu.clear_local_exclusive_reservation();
-                    true
-                } else {
-                    false
-                };
-                let _ = reply.send(found);
                 continue;
             }
             WorkerCommand::Run(request) => request,
@@ -439,8 +327,7 @@ fn worker_main(
                     process: request.cpu_thread.cpu_process,
                 },
             )?;
-            thread.select_guest(request.lease.thread);
-            request.execution.run(&mut native_worker, &mut thread.cpu)
+            request.execution.run(&mut native_worker, thread)
         };
         let outcome = catch_worker_panic(run);
         drop(run_trace);
@@ -451,11 +338,13 @@ fn worker_main(
             u64::from(request.lease.vcpu.get()),
         );
         if results
-            .send(WorkerResult {
-                lease: request.lease,
-                execution: request.execution,
-                outcome,
-            })
+            .send(crate::external_event::CoordinatorEvent::Completed(
+                WorkerResult {
+                    lease: request.lease,
+                    execution: request.execution,
+                    outcome,
+                },
+            ))
             .is_err()
         {
             break;
@@ -471,119 +360,5 @@ fn catch_worker_panic(
     match catch_unwind(AssertUnwindSafe(run)) {
         Ok(result) => result.map_err(WorkerRunFailure::Execution),
         Err(_) => Err(WorkerRunFailure::Worker(WorkerFailure::BackendPanicked)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use nixe_cpu::{
-        execution::{ArchitecturalTimer, TimerSnapshot, VcpuEventState},
-        platform::TargetPlatform,
-        profile::ProcessCpuContext,
-        state::a64::{A64GeneralRegister, A64Register},
-    };
-    use nixe_cpu_jit::{JitProcess, JitRunRequest, ThreadState};
-    use nixe_memory::{
-        Access, AddressSpace, AddressWidth, AllocationRange, GuestVirtualAddress, Machine,
-        MemoryPermissions, PAGE_SIZE,
-    };
-
-    struct FixedTimer;
-    impl ArchitecturalTimer for FixedTimer {
-        fn snapshot(&self) -> TimerSnapshot {
-            TimerSnapshot {
-                counter: 0,
-                frequency: 19_200_000,
-            }
-        }
-    }
-    fn x(index: u8) -> A64Register {
-        A64Register::General(A64GeneralRegister::new(index).unwrap())
-    }
-
-    #[test]
-    fn guest_switch_clears_exclusives_but_same_guest_resume_preserves_them() {
-        let machine = Machine::new(2 * PAGE_SIZE).unwrap();
-        let account = machine.account(2 * PAGE_SIZE).unwrap();
-        let code = [0xc85f7c23_u32, 0x14000001, 0xc8047c23, 0xd4000001];
-        let image = account.allocate(PAGE_SIZE).unwrap();
-        machine
-            .write_resolved(
-                &[AllocationRange::new(image.pin(), 0, code.len() as u64 * 4).unwrap()],
-                &code
-                    .into_iter()
-                    .flat_map(u32::to_le_bytes)
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-        let space = AddressSpace::new(machine, AddressWidth::Bits32).unwrap();
-        space
-            .map(
-                GuestVirtualAddress::new(0x1000),
-                image,
-                0,
-                PAGE_SIZE,
-                MemoryPermissions::READ_EXECUTE,
-            )
-            .unwrap();
-        space
-            .map(
-                GuestVirtualAddress::new(0x2000),
-                account.allocate(PAGE_SIZE).unwrap(),
-                0,
-                PAGE_SIZE,
-                MemoryPermissions::READ_WRITE,
-            )
-            .unwrap();
-        let process = JitProcess::new(
-            ProcessCpuContext::for_platform(TargetPlatform::Switch1, space.identity()),
-            space.clone(),
-            19_200_000,
-        )
-        .unwrap();
-        let mut core = WorkerCpuThread {
-            cpu: Box::new(process.create_thread().unwrap()),
-            guest: None,
-        };
-        let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
-        let mut state = ThreadState::default();
-        state.write_x(x(1), 0x2000);
-        let mut run = |core: &mut WorkerCpuThread, guest, pc, value| {
-            core.select_guest(GuestThreadId::new(guest));
-            state.set_pc(pc);
-            state.write_x(x(3), value);
-            let jit = &mut core.cpu;
-            let report = jit
-                .run_slice(
-                    &mut worker,
-                    JitRunRequest {
-                        state: &mut state,
-                        instruction_budget: 2,
-                        timer: &FixedTimer,
-                        events: &VcpuEventState::default(),
-                    },
-                )
-                .unwrap();
-            if pc == 0x1000 {
-                assert_eq!(report.stop, nixe_cpu::execution::CpuExit::BudgetExhausted);
-            } else {
-                assert!(matches!(
-                    report.stop,
-                    nixe_cpu::execution::CpuExit::SupervisorCall { .. }
-                ));
-            }
-            state.read_x(x(4))
-        };
-        run(&mut core, 1, 0x1000, 0);
-        assert_eq!(run(&mut core, 2, 0x1008, 7), 1);
-        run(&mut core, 2, 0x1000, 0);
-        assert_eq!(run(&mut core, 2, 0x1008, 7), 0);
-        assert!(matches!(
-            space
-                .read_value(GuestVirtualAddress::new(0x2000), 8)
-                .unwrap(),
-            Access::Ready(7)
-        ));
     }
 }

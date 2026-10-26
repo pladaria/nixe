@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
@@ -61,33 +61,46 @@ pub struct SequencedExternalEvent {
 
 #[derive(Debug)]
 struct EventPublication {
-    sender: SyncSender<SequencedExternalEvent>,
-    next_sequence: u64,
+    sender: SyncSender<CoordinatorEvent>,
+    next_sequence: Mutex<u64>,
+    pending: AtomicUsize,
+    capacity: usize,
 }
 
 impl EventPublication {
-    fn publish(&mut self, event: ExternalEvent) -> Result<(), ExternalEventSendError> {
-        let sequence = self.next_sequence;
+    fn publish(&self, event: ExternalEvent) -> Result<(), ExternalEventSendError> {
+        let mut sequence = self
+            .next_sequence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.pending.load(Ordering::Acquire) >= self.capacity {
+            return Err(ExternalEventSendError::Full);
+        }
         let next = sequence
             .checked_add(1)
             .ok_or(ExternalEventSendError::SequenceExhausted)?;
-        self.sender
-            .try_send(SequencedExternalEvent {
-                sequence: ExternalEventSequence(sequence),
-                event,
-            })
-            .map_err(|error| match error {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        if let Err(error) =
+            self.sender
+                .try_send(CoordinatorEvent::External(SequencedExternalEvent {
+                    sequence: ExternalEventSequence(*sequence),
+                    event,
+                }))
+        {
+            self.pending.fetch_sub(1, Ordering::Release);
+            return Err(match error {
                 TrySendError::Full(_) => ExternalEventSendError::Full,
                 TrySendError::Disconnected(_) => ExternalEventSendError::Closed,
-            })?;
-        self.next_sequence = next;
+            });
+        }
+        *sequence = next;
         Ok(())
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct ExternalEventSender {
-    publication: Arc<Mutex<EventPublication>>,
+    publication: Arc<EventPublication>,
     wait_groups: Arc<Mutex<HashMap<WakeToken, Arc<ExternalWaitGroup>>>>,
     overflowed: Arc<AtomicBool>,
 }
@@ -148,10 +161,7 @@ impl ExternalEventSender {
     }
 
     pub fn submit(&self, event: ExternalEvent) -> Result<(), ExternalEventSendError> {
-        self.publication
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .publish(event)
+        self.publication.publish(event)
     }
 
     pub fn wake(
@@ -204,10 +214,7 @@ impl ExternalEventSender {
             if callback_group.won.swap(true, Ordering::AcqRel) {
                 return;
             }
-            if let Err(error) = publication
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .publish(ExternalEvent::Wake { source, token })
+            if let Err(error) = publication.publish(ExternalEvent::Wake { source, token })
                 && matches!(
                     error,
                     ExternalEventSendError::Full | ExternalEventSendError::SequenceExhausted
@@ -239,24 +246,38 @@ impl ExternalEventSender {
     }
 }
 
-#[derive(Debug)]
-pub struct ExternalEventInbox {
+#[expect(
+    clippy::large_enum_variant,
+    reason = "bounded ingress transfers CPU state inline without allocating each completion"
+)]
+pub(crate) enum CoordinatorEvent {
+    External(SequencedExternalEvent),
+    Completed(crate::coordinator::worker::WorkerResult),
+}
+
+pub(crate) struct ExternalEventInbox {
     sender: ExternalEventSender,
-    receiver: Receiver<SequencedExternalEvent>,
+    receiver: Receiver<CoordinatorEvent>,
 }
 
 impl ExternalEventInbox {
-    pub fn bounded(capacity: usize) -> Result<Self, ExternalEventSendError> {
+    pub fn bounded(capacity: usize, cpu_workers: usize) -> Result<Self, ExternalEventSendError> {
         if capacity == 0 {
             return Err(ExternalEventSendError::ZeroCapacity);
         }
-        let (sender, receiver) = sync_channel(capacity);
+        // A native completion must remain publishable when host ingress is full:
+        // synchronous core-install/retirement replies can depend on that worker.
+        // Leases limit CPU completions to one per core; host events have their
+        // own quota, retained while a drain temporarily defers their handling.
+        let (sender, receiver) = sync_channel(capacity + cpu_workers);
         Ok(Self {
             sender: ExternalEventSender {
-                publication: Arc::new(Mutex::new(EventPublication {
+                publication: Arc::new(EventPublication {
                     sender,
-                    next_sequence: 1,
-                })),
+                    next_sequence: Mutex::new(1),
+                    pending: AtomicUsize::new(0),
+                    capacity,
+                }),
                 wait_groups: Arc::new(Mutex::new(HashMap::new())),
                 overflowed: Arc::new(AtomicBool::new(false)),
             },
@@ -269,9 +290,18 @@ impl ExternalEventInbox {
         self.sender.clone()
     }
 
-    pub fn try_recv_sequenced(
-        &self,
-    ) -> Result<Option<SequencedExternalEvent>, ExternalEventSendError> {
+    pub(crate) fn worker_sender(&self) -> SyncSender<CoordinatorEvent> {
+        self.sender.publication.sender.clone()
+    }
+
+    pub(crate) fn consume_external(&self) {
+        self.sender
+            .publication
+            .pending
+            .fetch_sub(1, Ordering::Release);
+    }
+
+    pub(crate) fn try_recv(&self) -> Result<Option<CoordinatorEvent>, ExternalEventSendError> {
         if self.sender.overflowed.swap(false, Ordering::AcqRel) {
             return Err(ExternalEventSendError::Full);
         }
@@ -282,10 +312,10 @@ impl ExternalEventInbox {
         }
     }
 
-    pub(crate) fn recv_sequenced_timeout(
+    pub(crate) fn recv_timeout(
         &self,
         timeout: Duration,
-    ) -> Result<Option<SequencedExternalEvent>, ExternalEventSendError> {
+    ) -> Result<Option<CoordinatorEvent>, ExternalEventSendError> {
         match self.receiver.recv_timeout(timeout) {
             Ok(event) => Ok(Some(event)),
             Err(RecvTimeoutError::Timeout) => Ok(None),
@@ -314,27 +344,48 @@ impl Error for ExternalEventSendError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EventObject;
     use nixe_scheduler::{GuestThreadId, WakeGeneration};
+    use std::sync::Barrier;
+    use std::thread;
+
+    fn external(
+        inbox: &ExternalEventInbox,
+        event: Option<CoordinatorEvent>,
+    ) -> Option<SequencedExternalEvent> {
+        event.map(|event| match event {
+            CoordinatorEvent::External(event) => {
+                inbox.consume_external();
+                event
+            }
+            CoordinatorEvent::Completed(_) => panic!("this fixture has no CPU workers"),
+        })
+    }
 
     #[test]
     fn host_service_overflow_is_reported_to_the_consumer() {
-        let inbox = ExternalEventInbox::bounded(1).unwrap();
+        let inbox = ExternalEventInbox::bounded(1, 0).unwrap();
         let sender = inbox.sender();
         sender.notify_host_service(ExternalEventSource::Input);
         sender.notify_host_service(ExternalEventSource::Input);
         assert_eq!(
-            inbox.try_recv_sequenced(),
+            inbox.try_recv().map(|event| external(&inbox, event)),
             Err(ExternalEventSendError::Full)
         );
         assert_eq!(
-            inbox.try_recv_sequenced().unwrap().unwrap().event,
+            inbox
+                .try_recv()
+                .map(|event| external(&inbox, event))
+                .unwrap()
+                .unwrap()
+                .event,
             ExternalEvent::HostService(ExternalEventSource::Input)
         );
     }
 
     #[test]
     fn bounded_inbox_reports_backpressure_without_blocking() {
-        let inbox = ExternalEventInbox::bounded(1).unwrap();
+        let inbox = ExternalEventInbox::bounded(1, 0).unwrap();
         let sender = inbox.sender();
         sender.submit(ExternalEvent::HostStop).unwrap();
         assert_eq!(
@@ -342,15 +393,25 @@ mod tests {
             Err(ExternalEventSendError::Full)
         );
         assert_eq!(
-            inbox.try_recv_sequenced().unwrap().map(|event| event.event),
+            inbox
+                .try_recv()
+                .map(|event| external(&inbox, event))
+                .unwrap()
+                .map(|event| event.event),
             Some(ExternalEvent::HostStop)
         );
-        assert_eq!(inbox.try_recv_sequenced().unwrap(), None);
+        assert_eq!(
+            inbox
+                .try_recv()
+                .map(|event| external(&inbox, event))
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
     fn event_observers_publish_without_host_threads_and_cancel_atomically() {
-        let inbox = ExternalEventInbox::bounded(4).unwrap();
+        let inbox = ExternalEventInbox::bounded(4, 0).unwrap();
         let token = WakeToken {
             thread: GuestThreadId::new(7),
             generation: WakeGeneration::new(3),
@@ -362,7 +423,11 @@ mod tests {
             .unwrap();
         writable.signal();
         assert_eq!(
-            inbox.try_recv_sequenced().unwrap().map(|event| event.event),
+            inbox
+                .try_recv()
+                .map(|event| external(&inbox, event))
+                .unwrap()
+                .map(|event| event.event),
             Some(ExternalEvent::Wake {
                 source: ExternalEventSource::Device,
                 token,
@@ -380,21 +445,110 @@ mod tests {
             .unwrap();
         sender.cancel_watchers(cancelled);
         writable.signal();
-        assert_eq!(inbox.try_recv_sequenced().unwrap(), None);
+        assert_eq!(
+            inbox
+                .try_recv()
+                .map(|event| external(&inbox, event))
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
     fn bounded_receive_distinguishes_a_host_deadline_from_an_external_event() {
-        let inbox = ExternalEventInbox::bounded(1).unwrap();
-        assert_eq!(inbox.recv_sequenced_timeout(Duration::ZERO).unwrap(), None);
+        let inbox = ExternalEventInbox::bounded(1, 0).unwrap();
+        assert_eq!(
+            inbox
+                .recv_timeout(Duration::ZERO)
+                .map(|event| external(&inbox, event))
+                .unwrap(),
+            None
+        );
 
         inbox.sender().submit(ExternalEvent::HostStop).unwrap();
         assert_eq!(
             inbox
-                .recv_sequenced_timeout(Duration::from_secs(1))
+                .recv_timeout(Duration::from_secs(1))
+                .map(|event| external(&inbox, event))
                 .unwrap()
                 .map(|event| event.event),
             Some(ExternalEvent::HostStop)
+        );
+    }
+    #[test]
+    fn concurrent_device_producers_are_published_in_one_monotonic_order() {
+        const PRODUCERS: usize = 24;
+        let inbox = ExternalEventInbox::bounded(PRODUCERS, 0).unwrap();
+        let sender = inbox.sender();
+        let start = Arc::new(Barrier::new(PRODUCERS + 1));
+        let workers: Vec<_> = (0..PRODUCERS)
+            .map(|index| {
+                let sender = sender.clone();
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    let source = match index % 3 {
+                        0 => ExternalEventSource::GpuCompletion,
+                        1 => ExternalEventSource::Display,
+                        _ => ExternalEventSource::Input,
+                    };
+                    let token = WakeToken {
+                        thread: GuestThreadId::new(index as u64 + 1),
+                        generation: WakeGeneration::new(1),
+                    };
+                    match source {
+                        ExternalEventSource::GpuCompletion => sender.gpu_completion(token),
+                        ExternalEventSource::Display => sender.display_event(token),
+                        ExternalEventSource::Input => sender.input_event(token),
+                        _ => unreachable!(),
+                    }
+                    .unwrap();
+                })
+            })
+            .collect();
+        start.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let mut previous = 0;
+        for _ in 0..PRODUCERS {
+            let event = inbox
+                .try_recv()
+                .map(|event| external(&inbox, event))
+                .unwrap()
+                .unwrap();
+            assert!(event.sequence.get() > previous);
+            previous = event.sequence.get();
+        }
+        assert_eq!(previous, PRODUCERS as u64);
+    }
+
+    #[test]
+    fn typed_event_object_overrides_the_generic_wait_fallback_source() {
+        let inbox = ExternalEventInbox::bounded(1, 0).unwrap();
+        let token = WakeToken {
+            thread: GuestThreadId::new(1),
+            generation: WakeGeneration::new(1),
+        };
+        let (writable, readable) =
+            EventObject::create_pair_with_source(ExternalEventSource::Display);
+        inbox
+            .sender()
+            .watch_readable_event(readable, None, token, ExternalEventSource::Device)
+            .unwrap();
+        writable.signal();
+        assert_eq!(
+            inbox
+                .try_recv()
+                .map(|event| external(&inbox, event))
+                .unwrap()
+                .unwrap()
+                .event,
+            ExternalEvent::Wake {
+                source: ExternalEventSource::Display,
+                token,
+            }
         );
     }
 }

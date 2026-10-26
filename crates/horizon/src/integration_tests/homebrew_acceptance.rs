@@ -91,7 +91,7 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
     );
 
     let mut dispatcher = support::dispatcher(&process);
-    let first = process.run_slice(16).unwrap();
+    let first = process.run_slice().unwrap();
     assert!(matches!(
         first.stop,
         ExecutionStop::SupervisorCall {
@@ -106,9 +106,8 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
         ExceptionHandlingResult::Resumed
     ));
 
-    let second = process.run_slice(16).unwrap();
+    let second = process.run_slice().unwrap();
     let stub = process.main_thread().loader_return.unwrap();
-    assert_eq!(second.progress, 4); // MOV, LDP, RET, then the loader's SVC.
     assert_eq!(second.context.as_ref().unwrap().pc, stub);
     assert!(matches!(
         second.stop,
@@ -441,17 +440,10 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
     let mut process = ScheduledProcess::new(support::process_builder().build(&plan).unwrap());
     let mut dispatcher = support::dispatcher(&process);
-    let mut executed = 0_u64;
 
     loop {
-        let report = process.run_slice(512).unwrap();
-        executed += report.progress;
-        assert!(
-            executed <= 100_000,
-            "libnx startup exceeded its acceptance bound"
-        );
+        let report = process.run_slice().unwrap();
         match &report.stop {
-            ExecutionStop::BudgetExhausted => {}
             ExecutionStop::SupervisorCall { .. } => {
                 let outcome = process
                     .route_supervisor_call(&report.stop, &mut dispatcher)
@@ -472,10 +464,6 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
         }
     }
 
-    assert!(
-        executed > 10_800,
-        "libnx did not initialize the filesystem and reach video initialization: executed={executed}"
-    );
     let coverage = dispatcher.coverage();
     for immediate in [0x01, 0x02, 0x03, 0x06, 0x13, 0x29] {
         assert!(

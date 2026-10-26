@@ -1,7 +1,6 @@
 # CPU state ownership and interchange contract
 
-T02/T03 interchange with T04 whole-context residency. Linux x86-64 is the
-validated host. The model follows stopped-core register access and full scheduler
+Linux x86-64 is the validated host. The model follows stopped-core register access and full scheduler
 switch transfers in [Eden's interface](https://git.eden-emu.dev/eden-emu/eden/raw/commit/67bada77f8a43a90da2e94e89b8e7da73c256989/src/core/arm/dynarmic/arm_dynarmic_64.cpp)
 and [scheduler](https://git.eden-emu.dev/eden-emu/eden/raw/commit/67bada77f8a43a90da2e94e89b8e7da73c256989/src/core/hle/kernel/k_scheduler.cpp).
 Nixe retains coordinator service continuations instead of adopting host fibers.
@@ -26,7 +25,7 @@ execution is active. After return, the coordinator can access the stopped native
 context through the returned owner. No additional register RPC is needed.
 
 `ThreadState` never exposes a raw native handle. A native owner retains its core,
-process monitor and execution memory. Its atomic claim prevents another saved
+execution memory and local native monitor storage. Its atomic claim prevents another saved
 context from entering that core until the old owner is materialized or discarded.
 Cloning creates an independent saved snapshot; it never duplicates native
 ownership. Snapshots remain immutable when the current context later changes.
@@ -43,19 +42,19 @@ to its host TID and is still used only by that worker's captured invocations.
 | Creation | Initialize complete saved state, including SP, PC, TLS and entry arguments. |
 | Dispatch | Move the sole register owner into the request. Evict the old guest on that process/vCPU before dispatching a different guest. |
 | First entry or genuine replacement | Import complete saved state once through public bulk APIs; establish native ownership. |
-| Same guest after SVC, budget or event boundary | Keep the complete context native. Re-enter without full import/export. |
+| Same guest after SVC or event boundary | Keep the complete context native. Re-enter without full import/export. |
 | Ordinary SVC | Read only needed registers through the stopped owner; write results directly to it. Runtime validates the SVC source and applies Next/Retry/At exactly once. No eager GPR/SIMD diagnostic snapshot is required. |
 | Blocking / wake-up | Install the continuation before suspension. A blocked native context remains readable through its owner until eviction, which saves it completely. Generation-checked completion writes target that current owner, whether saved or native. |
-| Guest switch | Save the previous complete context before releasing its claim. Load the next guest on the worker; clear local exclusives for the changed guest ID. |
-| Migration | Before either worker accepts a new lease, save the source context and clear its local exclusive state. Remove source residency bookkeeping. The destination imports the current saved value. |
+| Guest switch | Save the previous complete context before releasing its claim. Load the next guest on the worker. Every native entry clears local exclusives. |
+| Migration | Before either worker accepts a new lease, save the source context. Remove source residency bookkeeping. The destination imports the current saved value and clears local exclusives on entry. |
 | Full thread query / debugger | Reject Running, absent or unavailable state. Obtain an owned complete snapshot explicitly; native residency may continue. Horizon also enforces its paused-thread query requirement. |
 | Diagnostic consumer | Read an owned snapshot explicitly from the stopped `ThreadState`. Normal returns omit `ExecutionReport.context`; omission does not imply the register owner is unavailable. |
-| Precise abort / unsupported instruction / architectural exception | Native return is synchronized; correct the source PC and capture a current compact diagnostic context. Full snapshots remain available from the owner. Unsupported instructions stop explicitly. |
-| GPU visibility demand | Return at the faulting instruction through MemoryAbort and release the execution lease before resolving the retained page. Loads/atomics retry natively with mapping/permission revalidation. Ordinary stores complete the remaining checked stores and writeback, skipping the native prefix. Translation read-ahead records unavailable code without waiting. |
-| Data-cache maintenance | Complete non-zeroing VA operations in the native callback when canonical RAM is CPU-visible. The block still checks halt requests. GPU-owned RAM, mapping faults, set/way operations and cache zeroing return through the existing checked maintenance/trap path after releasing the execution lease. Instruction-cache invalidation still returns to synchronize compiled code. |
-| MMIO memory instruction | Exit before the first device side effect. Take a complete snapshot and finish with checked semantics outside the lease, skipping any preceding native RAM stores. This prevents a later visibility demand in a pair access from replaying MMIO. |
+| Unsupported instruction / architectural exception / instruction-fetch failure | Native return is synchronized; correct the source PC and capture a current compact diagnostic context. Full snapshots remain available from the owner. Unsupported instructions stop explicitly. |
+| GPU visibility demand | Complete the access inside its native memory callback. Capture the physical range, suspend admission while resolving or waiting, then resume and queue code invalidations before returning the value. Native frames remain alive until Run returns; completed instruction prefixes are never replayed. Translation read-ahead records unavailable code without waiting. |
+| Data-cache maintenance | Native translation removes maintenance hints and lowers DC ZVA to ordinary stores to the aligned block. Instruction-cache callbacks queue native invalidations directly and halt for their application after Run returns. |
+| MMIO memory instruction | Resolve each individual access synchronously inside its callback using the captured physical range. Waiting may release admission, but never snapshots or reconstructs the instruction. A later access cannot replay an earlier side effect. |
 | SVC failure / termination / loader return | Preserve the source and capture diagnostics at the actual consumer. Loader-return reports supply their compact context explicitly. |
-| Native C++ or fault-runtime failure | Discard register authority, stop the JIT process and report `CpuFault.context = None`. The old save area cannot be read or resumed, even with a zero budget. |
+| Native C++ or fault-runtime failure | Discard register authority, stop the JIT process and report `CpuFault.context = None`. The old save area cannot be read or resumed, on any subsequent execution request. |
 | Lost/panicked worker or stale result | Do not associate unverified state with the expected lease. Discard the result and leave expected table state absent; fault the process. |
 | Dispatch rejection before execution | The returned request retains its known owner and can be restored without fabricating state. |
 | Concurrent process stop | Drain all leases. Successful late results can restore current authority; unsynchronized failures remain unavailable. |
@@ -75,33 +74,40 @@ Sources: [dispatch](../runtime/src/process/dispatch.rs),
 [thread queries and migration](../runtime/src/coordinator/thread.rs),
 [fault runtime](../cpu-direct-memory/src/lib.rs).
 
+## Native execution and memory policy
+
+Native execution uses the architectural wall clock with cycle counting disabled.
+The coordinator waits for CPU completions, host events or actual deadlines on a
+single ingress. Scheduler preemption and process stop interrupt native execution;
+there are no instruction quotas or synthetic per-block timeslices. User-mode
+wait, event and yield hints continue in native code.
+
+The normal memory policy matches the reference Auto configuration with ignored
+guest data aborts. Invalid guest data reads return zero and invalid stores have
+no effect. The native optimizer does not retain register writes for precise data
+abort reconstruction, and there are no per-access halt checks or instruction
+completion executor. Instruction-fetch failures, unsupported instructions and
+architectural exceptions remain explicit failures. Device/coherency/backend
+errors stop the process and discard unsynchronized register authority; they are
+not converted to invalid guest access defaults.
+
 ## Exclusive monitors
 
-Reservations are not serialized with architectural state. On the validated
-x86-64 host, canonical physical pages own versioned 64-byte reservation granules;
-Dynarmic owns only the core-local physical identity, address, size and captured
-version. Generated writes and checked/device publications share those physical
-versions, including aliases and intervening change-and-restore writes. Pages
-activate monitoring once under execution exclusion; warmed exclusives use no
-memory callbacks or page mutexes. Other host emitters retain their backend-specific
-monitor and require separate hardware validation. A changed worker guest ID clears
-local exclusives; re-entry of the same resident guest through an ordinary budget
-boundary preserves the existing policy. Migration explicitly clears the source.
-The vendored x86-64 SVC emission also clears local exclusives. Tests of reservation
-retention therefore stop before SVC. These rules never fabricate exclusive success.
+Reservations are not serialized with architectural state. Native execution uses
+the reference Auto policy: ignore the global monitor lock and test stores with
+the address and expected value captured by native exclusive loads. Each core has
+its own native monitor storage for that policy. There are no physical reservation
+versions, write epochs, store instrumentation or guest-switch monitor RPCs.
+Every native entry clears the local exclusive state, as does the vendored x64
+SVC emission. CLREX remains a native operation.
 
-Faulting exclusive stores release the generated monitor before checked handling.
-The handler validates the physical identity/version again and publishes observation
-changes only with a committed conditional write. Visibility waits run after the
-native slice releases admission. Transient observation/ownership faults retain
-fastmem; persistent exceptional mappings may recompile only the affected access.
-
-The JIT owns checked memory effects for cold MMIO instructions and interrupted
-ordinary store tails after native return; unsupported Dynarmic
-instructions remain errors. The store continuation matches the failed start VA
-so vector stores and element-level checked semantics agree. Completed stores
-are not revalidated or replayed after mappings or contents change during a wait.
-Resident RAM execution and load/atomic visibility retries retain native state.
+Ordinary writable RAM uses native fastmem and atomic compare-and-exchange.
+Observed, device-owned or exceptional mappings use the canonical page table
+fallback and memory callbacks. A successful callback CAS publishes observation
+changes through the same memory access path as other checked atomics. Pending
+coherency accesses suspend admission inside the callback and never replay the
+exclusive instruction. The Auto policy deliberately does not detect an
+intervening change-and-restore write when the expected value matches again.
 
 ## Complete interchange representation
 
