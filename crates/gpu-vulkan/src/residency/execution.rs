@@ -2,8 +2,7 @@
 //! callers cannot omit shader writes from canonical ownership or synchronization.
 use super::*;
 use crate::cache::{
-    BindingRecord, DescriptorCache, DescriptorResource, GraphicsState, NativePipeline, Sampler,
-    ShaderArtifact,
+    BindingRecord, DescriptorResource, GraphicsState, NativePipeline, Sampler, ShaderArtifact,
 };
 mod graphics;
 mod state;
@@ -97,7 +96,7 @@ pub(super) enum Use {
     },
 }
 /// Prepared guest state retains resources, not native descriptor sets. Sets
-/// belong to recording slots and recycle after their actual GPU use retires.
+/// belong to native layout banks and recycle after their actual GPU use retires.
 pub struct PreparedProgram {
     pub(super) pipeline: Arc<NativePipeline>,
     // Explicit host bindings are owned by the host texture cache.
@@ -641,7 +640,7 @@ impl VulkanResidency {
                 .pipeline
                 .layout
                 .split_dynamic_offsets(&mut resources, &limits, offsets)?;
-        let result = self.slot_descriptors(&program.pipeline.layout, &resources);
+        let result = self.native_descriptors(&program.pipeline.layout, &resources);
         resources.clear();
         self.descriptor_resources = resources;
         Ok(GraphicsStreams {
@@ -761,7 +760,7 @@ impl VulkanResidency {
                 *offset -= u64::from(dynamic);
             }
         }
-        let result = self.slot_descriptors(&program.pipeline.layout, &resources);
+        let result = self.native_descriptors(&program.pipeline.layout, &resources);
         resources.clear();
         self.descriptor_resources = resources;
         result.map(Some)
@@ -826,32 +825,21 @@ impl VulkanResidency {
                 _ => None,
             }));
     }
-    fn slot_descriptors(
+    fn native_descriptors(
         &mut self,
         layout: &Arc<crate::cache::PipelineLayout>,
         resources: &[DescriptorResource],
     ) -> Result<Arc<BindingRecord>, VulkanError> {
-        let limits = self.device.profile().limits;
-        let null_descriptor = self.device.profile().null_descriptor;
-        let index = self.device.begin_recording()?;
-        let descriptors = self.device.submission.slots[index]
-            .stream_descriptors
-            .get_or_insert_with(|| {
-                DescriptorCache::from_limits(
-                    Arc::clone(&self.device.owner),
-                    limits,
-                    4096,
-                    null_descriptor,
-                )
-            });
-        let before = descriptors.statistics();
+        self.device.begin_recording()?;
+        let descriptors = &mut self.descriptors;
+        let before = descriptors.hits();
         let result = descriptors.get(layout, resources);
-        let after = descriptors.statistics();
-        self.device.submission.statistics.stream_descriptor_hits += after.hits - before.hits;
+        let hits = descriptors.hits() - before;
+        self.device.submission.statistics.descriptor_payload_hits += hits;
         self.device
             .submission
             .statistics
-            .stream_descriptor_allocations += after.allocated - before.allocated;
+            .descriptor_payload_captures += u64::from(result.is_ok() && hits == 0);
         result
     }
     fn program_bind_record(
@@ -907,16 +895,8 @@ impl VulkanResidency {
         if let Dispatch::Indirect { buffer, .. } = dispatch {
             self.constructing.push(Resource::Buffer(buffer));
         }
-        let result = (|| loop {
-            let result = self.dispatch_inner(program, dispatch, push);
-            self.device.submission.release_stream_uploads();
-            match result {
-                Err(VulkanError::DescriptorPressure) => {
-                    self.flush()?;
-                }
-                result => return result,
-            }
-        })();
+        let result = self.dispatch_inner(program, dispatch, push);
+        self.device.submission.release_stream_uploads();
         self.constructing.truncate(retained);
         result
     }

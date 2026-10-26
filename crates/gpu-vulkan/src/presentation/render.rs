@@ -197,7 +197,6 @@ impl ScreenRenderer {
         &mut self,
         cache: &mut VulkanResidency,
         ui: &mut UiFrame,
-        descriptors: &mut DescriptorCache,
         samplers: &mut SamplerCache,
     ) -> Result<(), VulkanError> {
         for (id, deltas) in &ui.textures.set {
@@ -219,9 +218,6 @@ impl ScreenRenderer {
                     }
                     let native = cache.allocate_host_image(extent, vk::Format::R8G8B8A8_UNORM)?;
                     let view = native.view_2d(vk::Format::R8G8B8A8_UNORM)?;
-                    if let Some(old) = self.textures.remove(id) {
-                        descriptors.forget_image(&old.view);
-                    }
                     self.textures.insert(
                         *id,
                         Texture {
@@ -282,7 +278,7 @@ impl ScreenRenderer {
                 }
                 cache.device_mut().end_rendering();
                 let device = cache.device_mut();
-                let (slot, slice) = device
+                let slice = device
                     .submission
                     .reserve_upload(&mut device.dispatch, &bytes)?;
                 let device = cache.device_mut();
@@ -321,7 +317,7 @@ impl ScreenRenderer {
                     });
                 unsafe {
                     device.dispatch.cmd_copy_buffer_to_image(
-                        device.submission.slots[slot].upload_buffer(slice).handle,
+                        device.submission.staging_buffer(&slice).handle,
                         texture.view.image.handle,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &[copy],
@@ -346,11 +342,9 @@ impl ScreenRenderer {
         ui.textures.set.clear();
         Ok(())
     }
-    pub fn free_textures(&mut self, ui: &mut UiFrame, descriptors: &mut DescriptorCache) {
+    pub fn free_textures(&mut self, ui: &mut UiFrame) {
         for id in ui.textures.free.drain() {
-            if let Some(old) = self.textures.remove(&id) {
-                descriptors.forget_image(&old.view);
-            }
+            self.textures.remove(&id);
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -532,28 +526,28 @@ impl ScreenRenderer {
             ));
         }
         if self.indices.is_empty() {
-            self.free_textures(ui, descriptors);
+            self.free_textures(ui);
             return Ok(());
         }
         // The owner staging arena also serves vertex/index fetch directly;
         // these slices cannot recycle before this command slot completes.
         let device = cache.device_mut();
-        let (slot, vertices) = device
+        let slot = device.begin_recording()?;
+        let vertices = device
             .submission
             .reserve_upload(&mut device.dispatch, &self.vertices)?;
-        let (index_slot, indices) = device
+        let indices = device
             .submission
             .reserve_upload(&mut device.dispatch, &self.indices)?;
-        if slot != index_slot {
-            return Err(VulkanError::InvalidResource(
-                "UI upload unexpectedly changed command slots",
-            ));
-        }
-        let vertex_handle = cache.device().submission.slots[slot]
-            .upload_buffer(vertices)
+        let vertex_handle = cache
+            .device_mut()
+            .submission
+            .staging_buffer(&vertices)
             .handle;
-        let index_handle = cache.device().submission.slots[slot]
-            .upload_buffer(indices)
+        let index_handle = cache
+            .device_mut()
+            .submission
+            .staging_buffer(&indices)
             .handle;
         let mut push = [0u8; 8];
         push[..4].copy_from_slice(&(extent.width as f32 / ui.pixels_per_point).to_le_bytes());
@@ -661,7 +655,7 @@ impl ScreenRenderer {
             .clear();
         cache.device_mut().submission.slots[slot].index_binding = None;
         draw_result?;
-        self.free_textures(ui, descriptors);
+        self.free_textures(ui);
         Ok(())
     }
 }

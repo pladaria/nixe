@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ApiPreference, QueueConfiguration, queue::QueueState};
+use crate::ApiPreference;
 use nixe_memory::{Allocation, AllocationRange, Machine, PAGE_SIZE};
 use std::time::Duration;
 
@@ -235,18 +235,8 @@ mod gate {
     ));
 }
 pub(crate) fn cache(api: ApiPreference, budget: u64) -> Option<VulkanResidency> {
-    let mut device = support::device_for_test(api)?;
-    device.submission = QueueState::new(
-        Arc::clone(&device.owner),
-        device.queues().graphics_compute_family,
-        QueueConfiguration {
-            command_slots: 4,
-            arena_bytes: 16 * 1024,
-            overflow_bytes: 64 * 1024,
-        },
-        &device.dispatch,
-    )
-    .unwrap();
+    let device = support::device_for_test(api)?;
+
     Some(VulkanResidency::new(Machine::new(64 * 1024 * 1024).unwrap(), device, budget).unwrap())
 }
 pub(crate) fn backing_allocation(
@@ -454,9 +444,7 @@ pub(crate) fn cpu_write(
     Ok(())
 }
 fn write(cache: &mut VulkanResidency, id: BufferId, offset: u64, bytes: &[u8]) -> WorkTicket {
-    let progress = cache.write_buffer(id, offset, bytes).unwrap();
-    assert_eq!(progress.consumed, bytes.len());
-    progress.work
+    cache.write_buffer(id, offset, bytes).unwrap()
 }
 #[test]
 fn a_batch_of_fragmented_cpu_overwrites_preserves_native_buffer_neighbors() {
@@ -515,9 +503,9 @@ fn exercise_buffer_coherence(api: ApiPreference) {
     let a = buffer(&mut cache, whole.clone());
     assert_eq!(cache.statistics().cpu_uploaded_bytes, whole.bytes());
     assert_eq!(
-        cache.device.queue_usage().arena_capacity,
-        16 * 1024,
-        "uploads alone create no readback arena"
+        cache.device.queue_usage().staging_capacity,
+        0,
+        "stream uploads create no pooled readback buffers"
     );
     let old = cache.statistics();
     for _ in 0..100 {
@@ -879,57 +867,6 @@ fn budget_retirement_generation_reuse_and_authority_pinning() {
     drop(cache);
     validation.check().unwrap();
 }
-#[test]
-fn large_cpu_uploads_progress_with_bounded_staging_and_preserve_gpu_prefixes() {
-    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
-        return;
-    };
-    let validation = cache.device.validation_monitor();
-    cache.device.submission = QueueState::new(
-        Arc::clone(&cache.device.owner),
-        cache.device.queues().graphics_compute_family,
-        QueueConfiguration {
-            command_slots: 2,
-            arena_bytes: 512,
-            overflow_bytes: 0,
-        },
-        &cache.device.dispatch,
-    )
-    .unwrap();
-    let (allocation, range) = backing_allocation(&cache, 4096, 4096, 0x34);
-    let id = cache
-        .buffer_for(range.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
-        .unwrap()
-        .buffer;
-    assert!(cache.device.queue_usage().submitted_tick >= 7);
-    assert_eq!(cache.device.queue_usage().overflow_capacity, 0);
-    assert_eq!(cache.statistics().cpu_uploaded_bytes, 4096);
-    assert_eq!(cache.read_buffer(id, 0, 4096).unwrap(), vec![0x34; 4096]);
-    crate::residency::tests::cpu_write(&mut cache, &allocation, 100, &[0x56; 3]).unwrap();
-    cache.ensure_buffer(id).unwrap();
-    assert_eq!(cache.read_buffer(id, 100, 3).unwrap(), vec![0x56; 3]);
-    let before = cache.statistics().canonical_readback_bytes;
-    let bytes = vec![0x99; 2048];
-    let mut consumed = 0;
-    while consumed < bytes.len() {
-        let progress = cache
-            .write_buffer(id, consumed as u64, &bytes[consumed..])
-            .unwrap();
-        assert_eq!(progress.consumed, 512);
-        consumed += progress.consumed;
-        let flushed = cache.flush().unwrap().unwrap();
-        assert!(flushed.tick() >= progress.work.tick());
-        cache
-            .device
-            .wait_for_work(flushed, Duration::from_secs(5))
-            .unwrap();
-    }
-    assert_eq!(&cpu_read(&mut cache, &range)[..2048], &bytes);
-    assert_eq!(cache.statistics().canonical_readback_bytes - before, 2048);
-    assert!(cache.evict_one().unwrap());
-    drop(cache);
-    validation.check().unwrap();
-}
 
 #[test]
 fn dense_cpu_images_upload_once_without_buffers_and_preserve_later_gpu_writes() {
@@ -937,17 +874,7 @@ fn dense_cpu_images_upload_once_without_buffers_and_preserve_later_gpu_writes() 
         return;
     };
     let validation = cache.device.validation_monitor();
-    cache.device.submission = QueueState::new(
-        Arc::clone(&cache.device.owner),
-        cache.device.queues().graphics_compute_family,
-        QueueConfiguration {
-            command_slots: 2,
-            arena_bytes: 512,
-            overflow_bytes: 0,
-        },
-        &cache.device.dispatch,
-    )
-    .unwrap();
+
     let (allocation, physical) = backing_allocation(&cache, 16384, 256, 0x73);
     let backing = Footprint::new(
         physical.clone(),
@@ -1059,8 +986,6 @@ fn dense_cpu_images_upload_once_without_buffers_and_preserve_later_gpu_writes() 
         actual[4..].iter().all(|&byte| byte == 0x31),
         "CPU replacements must retire previous GPU authority before a partial GPU writer"
     );
-    assert!(cache.device.queue_usage().command_slots <= 2);
-    assert_eq!(cache.device.queue_usage().overflow_capacity, 0);
     drop(cache);
     validation.check().unwrap();
 }
@@ -1077,43 +1002,35 @@ fn large_uploads_retain_streams_until_their_actual_consumer() {
         return;
     };
     let validation = cache.device.validation_monitor();
-    cache.device.submission = QueueState::new(
-        Arc::clone(&cache.device.owner),
-        cache.device.queues().graphics_compute_family,
-        QueueConfiguration {
-            command_slots: 2,
-            arena_bytes: 512,
-            overflow_bytes: 0,
-        },
-        &cache.device.dispatch,
-    )
-    .unwrap();
-    let (stream_slot, stream) = cache
+
+    let stream = cache
         .device
         .submission
         .reserve_upload(&mut cache.device.dispatch, &[0x42; 64])
         .unwrap();
-    cache.device.submission.retain_stream_upload(stream_slot);
-    let source = cache.device.submission.slots[stream_slot].upload_lease(stream);
+    cache.device.submission.retain_stream_upload(&stream);
+    let source = Arc::clone(cache.device.submission.staging_buffer(&stream));
     // Texture imports can flush repeatedly between preparing a uniform/vertex
-    // stream and recording the draw that consumes it. Two slots and no overflow
-    // force reuse; the stream's slot must remain unavailable throughout.
+    // stream and recording the draw that consumes it. Native contexts may
+    // recycle while the actual consumer still retains these upload bytes.
     let (_allocation_12, range) = backing_allocation(&cache, 4096, 4096, 0x34);
     let image_bytes = cache
         .buffer_for(range, vk::BufferUsageFlags::TRANSFER_SRC)
         .unwrap()
         .buffer;
     assert_eq!(cache.statistics().cpu_uploaded_bytes, 4096);
-    assert!(cache.device.queue_usage().submitted_tick >= 8);
-    let (slot, destination, readback) = cache
+    let uploaded = cache.flush().unwrap().unwrap();
+    cache
+        .device
+        .wait_for_work(uploaded, Duration::from_secs(5))
+        .unwrap();
+    let (destination, readback) = cache
         .device
         .submission
         .reserve_readback(&mut cache.device.dispatch, 64)
         .unwrap();
 
-    let target = cache.device.submission.slots[slot]
-        .readback_buffer(destination)
-        .handle;
+    let target = cache.device.submission.staging_buffer(&destination).handle;
     unsafe {
         cache.device.dispatch.cmd_copy_buffer(
             source.handle,
@@ -1139,21 +1056,36 @@ fn large_uploads_retain_streams_until_their_actual_consumer() {
             .wait_for_work(consumer, Duration::ZERO)
             .unwrap()
     );
-    assert!(
-        matches!(
-            cache.device.submission.begin(&mut cache.device.dispatch),
-            Err(VulkanError::QueuePressure { pending: Some(work), .. }) if work == consumer
-        ),
-        "the stream's upload submission has completed, but its actual consumer still owns the arena"
-    );
+    // Grow/reuse native contexts without touching the still-active mapped
+    // stream region. Wrapping must fall back instead of overwriting it.
+    cache.device.begin_recording().unwrap();
+    let mut last = None;
+    for _ in 0..16 {
+        last = Some(
+            cache
+                .device
+                .submission
+                .reserve_slice(
+                    &mut cache.device.dispatch,
+                    crate::queue::staging::REGION_BYTES,
+                    true,
+                    256,
+                )
+                .unwrap(),
+        );
+    }
+    let last = last.unwrap();
+    assert!(!cache.device.submission.staging.is_stream(&last));
+    let buffer = cache.device.submission.staging_buffer(&last);
+    unsafe {
+        buffer.write_range(last.offset, &[0x99; 64]).unwrap();
+    }
     gate.signal();
     assert_eq!(cache.device.readback(readback).unwrap(), [0x42; 64]);
     assert_eq!(
         cache.read_buffer(image_bytes, 0, 4096).unwrap(),
         [0x34; 4096]
     );
-    assert_eq!(cache.device.queue_usage().command_slots, 2);
-    assert_eq!(cache.device.queue_usage().overflow_capacity, 0);
     drop(gate);
     drop(source);
     drop(cache);
@@ -2289,22 +2221,12 @@ fn bounded_lru_reaches_idle_tail_after_pinned_prefix() {
 }
 
 #[test]
-fn fragmented_uploads_cross_staging_chunks_without_losing_or_reordering_bytes() {
+fn fragmented_uploads_capture_one_transfer_without_reordering_bytes() {
     let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
         return;
     };
     let validation = cache.device.validation_monitor();
-    cache.device.submission = QueueState::new(
-        Arc::clone(&cache.device.owner),
-        cache.device.queues().graphics_compute_family,
-        QueueConfiguration {
-            command_slots: 2,
-            arena_bytes: 512,
-            overflow_bytes: 0,
-        },
-        &cache.device.dispatch,
-    )
-    .unwrap();
+
     let backings: Vec<_> = (0..17)
         .map(|byte| backing_allocation(&cache, 4096, 4096, byte))
         .collect();
@@ -2321,7 +2243,6 @@ fn fragmented_uploads_cross_staging_chunks_without_losing_or_reordering_bytes() 
         .collect();
     let id = buffer(&mut cache, mapping);
     assert_eq!(cache.statistics().cpu_uploaded_bytes, expected.len() as u64);
-    assert!(cache.statistics().staging_pressure_waits > 0);
     assert_eq!(
         cache.read_buffer(id, 0, expected.len() as u64).unwrap(),
         expected
@@ -2374,6 +2295,44 @@ fn owner_inline_overwrites_keep_gpu_neighbors_without_payload_retention_or_readb
         "full overwrite retires obsolete device protection"
     );
     assert_eq!(cache.read_buffer(id, 0, 64).unwrap(), [0x54; 64]);
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
+fn uploads_preserve_reads_recorded_before_a_cpu_overwrite() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (allocation, mapping) = backing_allocation(&cache, 8192, 4096, 0x11);
+    let id = buffer(&mut cache, Arc::clone(&mapping));
+    let first = cache.download_buffer(id, 0, 64).unwrap();
+    cpu_write(&mut cache, &allocation, 0, &[0x22; 64]).unwrap();
+    cache.ensure_buffer_range(id, 0, 64).unwrap();
+    let second = cache.download_buffer(id, 0, 64).unwrap();
+    cache.flush().unwrap();
+    assert_eq!(cache.device.readback(first).unwrap(), [0x11; 64]);
+    assert_eq!(cache.device.readback(second).unwrap(), [0x22; 64]);
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
+fn overlapping_uploads_before_the_first_use_keep_the_last_bytes() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (allocation, mapping) = backing_allocation(&cache, 8192, 4096, 0x11);
+    let id = buffer(&mut cache, mapping);
+    cpu_write(&mut cache, &allocation, 13, &[0x22; 37]).unwrap();
+    cache.ensure_buffer_range(id, 0, 64).unwrap();
+    let read = cache.download_buffer(id, 0, 64).unwrap();
+    cache.flush().unwrap();
+    let mut expected = [0x11; 64];
+    expected[13..50].fill(0x22);
+    assert_eq!(cache.device.readback(read).unwrap(), expected);
     drop(cache);
     validation.check().unwrap();
 }

@@ -2,6 +2,39 @@
 //! https://docs.vulkan.org/guide/latest/synchronization_examples.html
 use super::*;
 
+/// One bit per 64 bytes, as the native buffer cache's usage tracker.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/usage_tracker.h
+pub(super) struct UsageTracker {
+    pages: Vec<u64>,
+}
+impl UsageTracker {
+    pub fn new(size: u64) -> Self {
+        Self {
+            pages: vec![0; size.div_ceil(4096) as usize],
+        }
+    }
+    fn masks(offset: u64, size: u64) -> impl Iterator<Item = (usize, u64)> {
+        let first = offset / 64;
+        let last = (offset + size - 1) / 64;
+        (first / 64..=last / 64).map(move |page| {
+            let lo = first.saturating_sub(page * 64);
+            let hi = (last - page * 64).min(63);
+            (page as usize, (u64::MAX << lo) & (u64::MAX >> (63 - hi)))
+        })
+    }
+    pub fn used(&self, offset: u64, size: u64) -> bool {
+        Self::masks(offset, size).any(|(page, mask)| self.pages[page] & mask != 0)
+    }
+    pub fn mark(&mut self, offset: u64, size: u64) {
+        for (page, mask) in Self::masks(offset, size) {
+            self.pages[page] |= mask;
+        }
+    }
+    pub fn reset(&mut self) {
+        self.pages.fill(0);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AccessScope {
     pub stages: vk::PipelineStageFlags2,
@@ -46,6 +79,7 @@ pub(super) struct AccessState {
     writer: AccessScope,
     readers: AccessScope,
     visible: Vec<AccessScope>,
+    uploaded: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Dependency {
@@ -60,7 +94,11 @@ impl AccessState {
     }
     pub fn access(&mut self, next: AccessScope) -> Option<Dependency> {
         if next.writes() {
-            let mut source = self.writer;
+            let mut source = if self.uploaded {
+                AccessScope::default()
+            } else {
+                self.writer
+            };
             // WAR needs execution ordering, not visibility of previous reads.
             source.stages |= self.readers.stages;
             *self = Self {
@@ -73,7 +111,8 @@ impl AccessState {
             })
         } else {
             self.readers.union(next);
-            if self.writer.stages.is_empty()
+            if self.uploaded
+                || self.writer.stages.is_empty()
                 || self.visible.iter().any(|scope| {
                     scope.stages.contains(next.stages) && scope.access.contains(next.access)
                 })
@@ -86,6 +125,20 @@ impl AccessState {
                 destination: next,
             })
         }
+    }
+    fn upload(&mut self, next: AccessScope) -> Option<Dependency> {
+        let source = self.preceding();
+        // The upload buffer's final barrier makes this writer visible to all
+        // main-buffer work. Overlapping uploads still need their own ordering.
+        *self = Self {
+            writer: next,
+            uploaded: true,
+            ..Self::default()
+        };
+        (!source.stages.is_empty()).then_some(Dependency {
+            source,
+            destination: next,
+        })
     }
 }
 #[derive(Clone, Debug)]
@@ -112,7 +165,7 @@ impl BufferAccess {
         offset: u64,
         size: u64,
         next: AccessScope,
-        mut emit: impl FnMut(u64, u64, Dependency),
+        emit: impl FnMut(u64, u64, Dependency),
     ) {
         let end = offset + size;
         let first = self.spans.partition_point(|span| span.end <= offset);
@@ -123,7 +176,8 @@ impl BufferAccess {
                 let state = &span.state;
                 state.readers.stages.contains(next.stages)
                     && state.readers.access.contains(next.access)
-                    && (state.writer.stages.is_empty()
+                    && (state.uploaded
+                        || state.writer.stages.is_empty()
                         || state.visible.iter().any(|scope| {
                             scope.stages.contains(next.stages) && scope.access.contains(next.access)
                         }))
@@ -131,6 +185,25 @@ impl BufferAccess {
         {
             return;
         }
+        self.transition(offset, size, |state| state.access(next), emit);
+    }
+    pub fn upload(
+        &mut self,
+        offset: u64,
+        size: u64,
+        scope: AccessScope,
+        emit: impl FnMut(u64, u64, Dependency),
+    ) {
+        self.transition(offset, size, |state| state.upload(scope), emit);
+    }
+    fn transition(
+        &mut self,
+        offset: u64,
+        size: u64,
+        mut transition: impl FnMut(&mut AccessState) -> Option<Dependency>,
+        mut emit: impl FnMut(u64, u64, Dependency),
+    ) {
+        let end = offset + size;
         for boundary in [offset, end] {
             let index = self.spans.partition_point(|span| span.end <= boundary);
             if let Some(span) = self.spans.get_mut(index)
@@ -149,7 +222,7 @@ impl BufferAccess {
         let first = self.spans.partition_point(|span| span.end <= offset);
         let last = self.spans.partition_point(|span| span.start < end);
         for span in &mut self.spans[first..last] {
-            if let Some(dependency) = span.state.access(next) {
+            if let Some(dependency) = transition(&mut span.state) {
                 emit(span.start, span.end - span.start, dependency);
             }
         }
@@ -170,28 +243,10 @@ impl BufferAccess {
         self.spans.drain(write + 1..stop);
     }
 }
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum LayoutPolicy {
-    #[default]
-    Automatic,
-    Conventional,
-}
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum BarrierPolicy {
-    #[default]
-    ScopedMemory,
-    PerResource,
-}
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RecordingPolicy {
-    pub layouts: LayoutPolicy,
-    pub barriers: BarrierPolicy,
-}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BarrierStatistics {
     pub calls: u64,
     pub memory: u64,
-    pub buffers: u64,
     pub images: u64,
 }
 #[derive(Clone, Debug)]
@@ -234,36 +289,10 @@ pub(super) fn image_states(
 #[derive(Default)]
 pub(super) struct Barriers {
     memory: Vec<vk::MemoryBarrier2<'static>>,
-    buffers: Vec<vk::BufferMemoryBarrier2<'static>>,
     images: Vec<vk::ImageMemoryBarrier2<'static>>,
     pub statistics: BarrierStatistics,
 }
 impl Barriers {
-    fn dependency(
-        &mut self,
-        policy: BarrierPolicy,
-        buffer: vk::Buffer,
-        offset: u64,
-        size: u64,
-        d: Dependency,
-    ) {
-        if policy == BarrierPolicy::ScopedMemory {
-            self.memory_dependency(d);
-        } else {
-            self.buffers.push(
-                vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(d.source.stages)
-                    .src_access_mask(d.source.access)
-                    .dst_stage_mask(d.destination.stages)
-                    .dst_access_mask(d.destination.access)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(buffer)
-                    .offset(offset)
-                    .size(size),
-            );
-        }
-    }
     fn memory_dependency(&mut self, d: Dependency) {
         if let Some(last) = self.memory.last_mut()
             && last.src_stage_mask == d.source.stages
@@ -285,7 +314,7 @@ impl Barriers {
         self.images.push(barrier);
     }
     pub(super) fn is_empty(&self) -> bool {
-        self.memory.is_empty() && self.buffers.is_empty() && self.images.is_empty()
+        self.memory.is_empty() && self.images.is_empty()
     }
     pub fn emit(&mut self, device: &mut VulkanDevice) {
         // Transfers, compute, and barriers are recorded outside dynamic rendering.
@@ -298,16 +327,13 @@ impl Barriers {
             device.dispatch.barrier(
                 &vk::DependencyInfo::default()
                     .memory_barriers(&self.memory)
-                    .buffer_memory_barriers(&self.buffers)
                     .image_memory_barriers(&self.images),
             );
         }
         self.statistics.calls += 1;
         self.statistics.memory += self.memory.len() as u64;
-        self.statistics.buffers += self.buffers.len() as u64;
         self.statistics.images += self.images.len() as u64;
         self.memory.clear();
-        self.buffers.clear();
         self.images.clear();
     }
 }
@@ -330,18 +356,6 @@ impl VulkanResidency {
             self.barriers.emit(&mut self.device);
         }
         Ok(())
-    }
-    pub fn with_recording_policy(
-        memory: Machine,
-        device: VulkanDevice,
-        bytes: u64,
-        policy: RecordingPolicy,
-    ) -> Result<Self, VulkanError> {
-        let mut cache = Self::new(memory, device, bytes)?;
-        cache.unified_layouts = cache.device.profile().unified_image_layouts
-            && policy.layouts == LayoutPolicy::Automatic;
-        cache.barrier_policy = policy.barriers;
-        Ok(cache)
     }
     pub fn barrier_statistics(&self) -> BarrierStatistics {
         self.barriers.statistics
@@ -385,11 +399,11 @@ impl VulkanResidency {
             .as_mut()
             .expect("validated buffer");
         let handle = entry.native.handle;
+        entry.used.mark(offset, size);
         entry
             .access
-            .access(offset, size, scope, |offset, size, dependency| {
-                self.barriers
-                    .dependency(self.barrier_policy, handle, offset, size, dependency)
+            .access(offset, size, scope, |_, _, dependency| {
+                self.barriers.memory_dependency(dependency)
             });
         entry.contents.last_use = Some(work);
         self.touch(Resource::Buffer(id));
@@ -452,7 +466,7 @@ impl VulkanResidency {
             }
             let preceding = cell.state.preceding();
             let dependency = cell.state.access(scope);
-            if cell.layout == layout && self.barrier_policy == BarrierPolicy::ScopedMemory {
+            if cell.layout == layout {
                 if let Some(dependency) = dependency {
                     self.barriers.memory_dependency(dependency);
                 }
@@ -633,5 +647,71 @@ mod tests {
                 .is_some(),
             "union of unrelated stage/access pairs cannot fabricate visibility"
         );
+    }
+}
+
+#[cfg(test)]
+mod upload_visibility_tests {
+    use super::*;
+    fn copy_write() -> AccessScope {
+        AccessScope::new(
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_WRITE,
+        )
+    }
+    fn vertex_read() -> AccessScope {
+        AccessScope::new(
+            vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT,
+            vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
+        )
+    }
+    #[test]
+    fn upload_visibility_avoids_main_barriers_but_preserves_later_read_write_order() {
+        let mut access = BufferAccess::new(128);
+        access.upload(0, 128, copy_write(), |_, _, _| {
+            panic!("first upload has no preceding use")
+        });
+        access.access(0, 128, vertex_read(), |_, _, _| {
+            panic!("upload's global barrier covers this read")
+        });
+        access.access(0, 128, vertex_read(), |_, _, _| {
+            panic!("unchanged read needs no barrier")
+        });
+        let mut dependencies = Vec::new();
+        access.access(0, 128, copy_write(), |_, _, dependency| {
+            dependencies.push(dependency)
+        });
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(
+            dependencies[0].source.stages,
+            vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT
+        );
+        assert!(dependencies[0].source.access.is_empty());
+    }
+    #[test]
+    fn overlapping_uploads_keep_their_transfer_dependency() {
+        let mut access = BufferAccess::new(128);
+        access.upload(0, 64, copy_write(), |_, _, _| panic!("first upload"));
+        let mut dependencies = Vec::new();
+        access.upload(32, 64, copy_write(), |start, size, dependency| {
+            dependencies.push((start, size, dependency))
+        });
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!((dependencies[0].0, dependencies[0].1), (32, 32));
+        assert_eq!(dependencies[0].2.source, copy_write());
+        access.access(0, 96, vertex_read(), |_, _, _| {
+            panic!("main read is globally synchronized")
+        });
+    }
+    #[test]
+    fn upload_visibility_does_not_cover_a_disjoint_main_writer() {
+        let mut access = BufferAccess::new(128);
+        access.access(0, 32, copy_write(), |_, _, _| {});
+        access.upload(64, 64, copy_write(), |_, _, _| panic!("disjoint upload"));
+        let mut dependencies = Vec::new();
+        access.access(0, 128, vertex_read(), |start, size, _| {
+            dependencies.push((start, size))
+        });
+        assert_eq!(dependencies, [(0, 32)]);
     }
 }

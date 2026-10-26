@@ -22,16 +22,11 @@ pub enum VulkanError {
     NoSuitableDevice(Vec<String>),
     InvalidResource(&'static str),
     Validation(Vec<String>),
-    QueuePressure {
-        pending: Option<crate::WorkTicket>,
-        retained_readbacks: usize,
-    },
     QueueStopped,
     SubmissionFailed {
         tick: u64,
         cause: Box<VulkanError>,
     },
-    DescriptorPressure,
     Memory(std::sync::Arc<nixe_memory::MemoryError>),
     ResidencyPressure {
         requested: u64,
@@ -65,10 +60,8 @@ impl Display for VulkanError {
             Self::NoSuitableDevice(reasons) => write!(f, "no device meets the Vulkan profile: {}", reasons.join("; ")),
             Self::InvalidResource(e) => write!(f, "invalid Vulkan resource: {e}"),
             Self::Validation(e) => write!(f, "Vulkan validation reported errors: {}", e.join("; ")),
-            Self::QueuePressure { pending, retained_readbacks } => write!(f, "Vulkan staging/command budget is full; pending work: {pending:?}, unread readbacks: {retained_readbacks}"),
             Self::Memory(error) => write!(f, "Vulkan physical memory: {error}"),
             Self::ResidencyPressure { requested, allocated, budget } => write!(f, "Vulkan residency budget exhausted: requested {requested}, live/in-flight allocations {allocated}, budget {budget}; authoritative or leased contents cannot be discarded"),
-            Self::DescriptorPressure => f.write_str("Vulkan descriptor slot budget is full; flush and continue in a recycled command slot"),
             Self::QueueStopped => f.write_str("Vulkan queue is stopped after shutdown or a terminal device error"),
             Self::SubmissionFailed { tick, cause } => write!(f, "Vulkan submission tick {tick} failed: {cause}"),
         }

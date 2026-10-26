@@ -149,20 +149,7 @@ fn read_only_attachment(a: &Attachment, state: &GraphicsState) -> bool {
             false
         }
 }
-enum InlineIndex {
-    Stream(Arc<[u8]>),
-    // A payload larger than one ring arena needs one contiguous binding. Give
-    // it dedicated mapped storage rather than repeatedly exhausting the ring.
-    Buffer(Arc<AllocatedBuffer>),
-}
-impl InlineIndex {
-    fn size(&self) -> u64 {
-        match self {
-            Self::Stream(bytes) => bytes.len() as u64,
-            Self::Buffer(buffer) => buffer.size(),
-        }
-    }
-}
+
 pub struct PreparedDraw {
     native_vertices: Box<[(vk::Buffer, u64)]>,
     native_index: Option<(vk::Buffer, u64, vk::IndexType)>,
@@ -171,7 +158,7 @@ pub struct PreparedDraw {
     targets: Arc<PreparedTargets>,
     vertices: Box<[VertexBuffer]>,
     index: Option<IndexBuffer>,
-    inline_index: Option<InlineIndex>,
+    inline_index: Option<Arc<[u8]>>,
     feedback_aspects: vk::ImageAspectFlags,
 }
 impl PreparedDraw {
@@ -406,23 +393,7 @@ impl VulkanResidency {
             ));
         }
         let mut draw = self.prepare_draw(graphics, targets, vertices, None)?;
-        draw.inline_index = Some(
-            if bytes.len() as u64 <= self.device.submission.configuration.arena_bytes {
-                InlineIndex::Stream(bytes)
-            } else {
-                let buffer = crate::memory::allocate_buffer(
-                    &self.device.owner,
-                    bytes.len() as u64,
-                    vk::BufferUsageFlags::INDEX_BUFFER,
-                    crate::MemoryLocation::CpuToGpu,
-                    crate::AllocationMode::Managed,
-                    "nixe large inline index stream",
-                )?;
-                unsafe { buffer.write_range(0, &bytes) }?;
-                self.statistics.cpu_streamed_bytes += bytes.len() as u64;
-                InlineIndex::Buffer(Arc::new(buffer))
-            },
-        );
+        draw.inline_index = Some(bytes);
         Ok(draw)
     }
 
@@ -659,18 +630,8 @@ impl VulkanResidency {
                 Draw::Indirect { buffer, .. } => Some(Resource::Buffer(*buffer)),
                 _ => None,
             }));
-        let result = (|| loop {
-            let result = self.record_draw_inner(prepared, draw, push);
-            self.device.submission.release_stream_uploads();
-            if matches!(result, Err(VulkanError::DescriptorPressure)) {
-                // Descriptor allocation precedes draw emission. Submit the
-                // full slot and retry this draw in a fresh bounded slot; no
-                // guest draw or side effect has been emitted by the failed try.
-                self.flush()?;
-                continue;
-            }
-            return result;
-        })();
+        let result = self.record_draw_inner(prepared, draw, push);
+        self.device.submission.release_stream_uploads();
         self.constructing.truncate(retained);
         result
     }
@@ -711,7 +672,7 @@ impl VulkanResidency {
                             },
                             i.size,
                         ),
-                        (None, Some(index)) => (4, index.size()),
+                        (None, Some(index)) => (4, index.len() as u64),
                         _ => {
                             return Err(VulkanError::InvalidResource(
                                 "indexed draw has no unique index stream",
@@ -727,24 +688,22 @@ impl VulkanResidency {
                 _ => {}
             }
         }
-        // Inline command bytes use the command slot's existing INDEX_BUFFER
-        // upload arena. No canonical-memory import, resource object or readback.
-        // Slot retirement keeps the mapped bytes alive until GPU completion.
+        // Inline command bytes use the shared streaming/staging pool directly.
+        // The actual consumer tick keeps their bytes alive through GPU completion.
         let inline_binding = if empty {
             None
         } else {
             match &prepared.inline_index {
-                Some(InlineIndex::Stream(bytes)) => {
-                    // Each stream fits a fresh base arena, so bounded pressure can
-                    // flush/wait for a real reusable slot and make forward progress.
-                    let (slot, slice) = self.reserve_upload(bytes, 4)?;
-                    self.device.submission.retain_stream_upload(slot);
-                    let buffer = self.device.submission.slots[slot].upload_lease(slice);
+                Some(bytes) => {
+                    let slice = self.device.submission.reserve_upload_aligned(
+                        &mut self.device.dispatch,
+                        bytes,
+                        4,
+                    )?;
+                    self.device.submission.retain_stream_upload(&slice);
+                    let buffer = Arc::clone(self.device.submission.staging_buffer(&slice));
                     self.statistics.cpu_streamed_bytes += bytes.len() as u64;
                     Some((buffer, slice.offset, vk::IndexType::UINT32))
-                }
-                Some(InlineIndex::Buffer(buffer)) => {
-                    Some((Arc::clone(buffer), 0, vk::IndexType::UINT32))
                 }
                 None => None,
             }
@@ -1009,11 +968,6 @@ impl VulkanResidency {
         self.publish_effect(&writers, |device| {
             let index = device.submission.recording.unwrap();
             let slot = &mut device.submission.slots[index];
-            if let Some(InlineIndex::Buffer(buffer)) = &prepared.inline_index {
-                // The frontend/prepared cache may drop this draw before submission.
-                // Its actual command slot retains the dedicated buffer through retirement.
-                slot.retired_buffers.push(Arc::clone(buffer));
-            }
             if slot
                 .target_handles
                 .insert(Arc::as_ptr(&prepared.targets) as usize)

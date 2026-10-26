@@ -48,7 +48,7 @@ fn read_in_layout(
     layout: vk::ImageLayout,
 ) -> Vec<u8> {
     let device = cache.device_mut();
-    let (slot, slice, ticket) = device
+    let (slice, ticket) = device
         .submission
         .reserve_readback(
             &mut device.dispatch,
@@ -74,7 +74,7 @@ fn read_in_layout(
         device.dispatch.cmd_copy_image_to_buffer(
             view.image.handle,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            device.submission.slots[slot].readback_buffer(slice).handle,
+            device.submission.staging_buffer(&slice).handle,
             &[vk::BufferImageCopy::default()
                 .buffer_offset(slice.offset)
                 .image_subresource(subresource)
@@ -100,7 +100,7 @@ fn fragmented_cpu_scanout_refreshes_dirty_pages_and_preserves_old_snapshots() {
         16 * 1024 * 1024,
     )
     .unwrap();
-    let mut descriptors = DescriptorCache::new(cache.device(), 64);
+
     let mut frames = Frames::new();
     let (allocation, physical) = backing_allocation(&cache, 8192, 4096, 7);
     // Reverse 16-byte fragments within each physical page: logical texels
@@ -130,15 +130,11 @@ fn fragmented_cpu_scanout_refreshes_dirty_pages_and_preserves_old_snapshots() {
         format: F::Rgba8,
         allow_canonical_import: true,
     };
-    let original = frames
-        .capture(&mut cache, request.clone(), &mut descriptors)
-        .unwrap();
+    let original = frames.capture(&mut cache, request.clone()).unwrap();
     let mut bytes: Vec<_> = (0..8192).map(|i| (i % 251) as u8).collect();
     crate::residency::tests::cpu_write(&mut cache, &allocation, 0, &bytes).unwrap();
     let before = cache.statistics().cpu_uploaded_bytes;
-    let changed = frames
-        .capture(&mut cache, request.clone(), &mut descriptors)
-        .unwrap();
+    let changed = frames.capture(&mut cache, request.clone()).unwrap();
     assert_eq!(cache.statistics().cpu_uploaded_bytes - before, 8192);
     let expected: Vec<_> = offsets
         .iter()
@@ -148,12 +144,10 @@ fn fragmented_cpu_scanout_refreshes_dirty_pages_and_preserves_old_snapshots() {
     // first refresh must not hide it or change the older immutable versions.
     bytes[4096..].fill(23);
     crate::residency::tests::cpu_write(&mut cache, &allocation, 4096, &bytes[4096..]).unwrap();
-    let partial = frames
-        .capture(&mut cache, request, &mut descriptors)
-        .unwrap();
-    assert_eq!(cache.device().scheduled_tick(), 0);
-    assert_eq!(original.lease().producer(), changed.lease().producer());
-    assert_eq!(changed.lease().producer(), partial.lease().producer());
+    let partial = frames.capture(&mut cache, request).unwrap();
+    assert_eq!(cache.device().scheduled_tick(), 3);
+    assert_ne!(original.lease().producer(), changed.lease().producer());
+    assert_ne!(changed.lease().producer(), partial.lease().producer());
     let partial_expected: Vec<_> = offsets
         .iter()
         .flat_map(|&offset| bytes[offset..offset + 16].iter().copied())
@@ -177,7 +171,7 @@ fn fragmented_cpu_scanout_refreshes_dirty_pages_and_preserves_old_snapshots() {
     drop((original, changed, partial));
     drop(frames);
     drop(cache);
-    drop(descriptors);
+
     monitor.check().unwrap();
 }
 
@@ -194,7 +188,7 @@ fn native_frame_snapshots_preserve_versions_crop_formats_and_every_transform() {
         ..Default::default()
     };
     let compiler = PipelineCompiler::new(&device, Arc::clone(&pool), &config).unwrap();
-    let mut descriptors = DescriptorCache::new(&device, 64);
+    let mut descriptors = DescriptorCache::new(&device);
     let mut renderer = ScreenRenderer::new(&device).unwrap();
     let p = pipeline(&mut renderer, &compiler, 0);
     let packed = pipeline(&mut renderer, &compiler, 1);
@@ -288,15 +282,11 @@ fn native_frame_snapshots_preserve_versions_crop_formats_and_every_transform() {
             format,
             allow_canonical_import: true,
         };
-        let image = frames
-            .capture(&mut cache, request.clone(), &mut descriptors)
-            .unwrap();
+        let image = frames.capture(&mut cache, request.clone()).unwrap();
         // Later CPU contents create a new version; they cannot change this lease.
         crate::residency::tests::cpu_write(&mut cache, &allocation, 0, &vec![0; bytes.len()])
             .unwrap();
-        let changed = frames
-            .capture(&mut cache, request, &mut descriptors)
-            .unwrap();
+        let changed = frames.capture(&mut cache, request).unwrap();
         assert_ne!(image.lease().image(), changed.lease().image());
         for (bits, order) in ORDER.iter().enumerate() {
             let source = Source {
@@ -382,7 +372,7 @@ fn native_ui_texture_updates_blending_clipping_and_free() {
         ..Default::default()
     };
     let compiler = PipelineCompiler::new(&device, pool, &config).unwrap();
-    let mut descriptors = DescriptorCache::new(&device, 64);
+    let mut descriptors = DescriptorCache::new(&device);
     let mut samplers = SamplerCache::new(&device, 64);
     let mut renderer = ScreenRenderer::new(&device).unwrap();
     let p = pipeline(&mut renderer, &compiler, 2);
@@ -429,7 +419,7 @@ fn native_ui_texture_updates_blending_clipping_and_free() {
             ui.textures.free.insert(id);
         }
         renderer
-            .update_textures(&mut cache, &mut ui, &mut descriptors, &mut samplers)
+            .update_textures(&mut cache, &mut ui, &mut samplers)
             .unwrap();
         let image = cache
             .allocate_host_image([8, 8], vk::Format::R8G8B8A8_UNORM)
@@ -526,9 +516,9 @@ fn native_ui_texture_updates_blending_clipping_and_free() {
         ));
     skipped.textures.free.insert(id);
     renderer
-        .update_textures(&mut cache, &mut skipped, &mut descriptors, &mut samplers)
+        .update_textures(&mut cache, &mut skipped, &mut samplers)
         .unwrap();
-    renderer.free_textures(&mut skipped, &mut descriptors);
+    renderer.free_textures(&mut skipped);
     assert!(skipped.textures.free.is_empty());
     skipped
         .textures
@@ -542,7 +532,7 @@ fn native_ui_texture_updates_blending_clipping_and_free() {
         ));
     assert!(
         renderer
-            .update_textures(&mut cache, &mut skipped, &mut descriptors, &mut samplers)
+            .update_textures(&mut cache, &mut skipped, &mut samplers)
             .is_err()
     );
     skipped.textures.clear(); // The rejected delta is deliberately canceled.
@@ -567,7 +557,7 @@ fn opaque_scanout_requires_a_current_resident_producer() {
         16 * 1024 * 1024,
     )
     .unwrap();
-    let mut descriptors = DescriptorCache::new(cache.device(), 64);
+
     let mut frames = Frames::new();
     let (allocation, backing) = backing_allocation(&cache, 64, 128, 199);
     let request = NativePresentationImage {
@@ -585,11 +575,7 @@ fn opaque_scanout_requires_a_current_resident_producer() {
         format: F::Rgba8,
         allow_canonical_import: false,
     };
-    assert!(
-        frames
-            .capture(&mut cache, request.clone(), &mut descriptors)
-            .is_err()
-    );
+    assert!(frames.capture(&mut cache, request.clone()).is_err());
     assert_eq!(cache.statistics().cpu_uploaded_bytes, 0);
     let extent = vk::Extent3D {
         width: 4,
@@ -665,33 +651,25 @@ fn opaque_scanout_requires_a_current_resident_producer() {
         )
         .unwrap();
     let uploaded = cache.statistics().cpu_uploaded_bytes;
-    let snapshot = frames
-        .capture(&mut cache, request.clone(), &mut descriptors)
-        .unwrap();
+    let snapshot = frames.capture(&mut cache, request.clone()).unwrap();
     assert_eq!(cache.statistics().cpu_uploaded_bytes, uploaded);
     assert_eq!(cache.statistics().native_readback_bytes, 0);
     // A CPU store outside the texels can share their tracking page. It must
     // neither invalidate exact scanout authority nor cause an opaque import.
     crate::residency::tests::cpu_write(&mut cache, &allocation, 128, &[0x5a]).unwrap();
-    let unchanged = frames
-        .capture(&mut cache, request.clone(), &mut descriptors)
-        .unwrap();
+    let unchanged = frames.capture(&mut cache, request.clone()).unwrap();
     assert_eq!(cache.statistics().cpu_uploaded_bytes, uploaded);
     drop(unchanged);
     // A real CPU demand first resolves the producer through the owner-local
     // visibility path; the later write then invalidates resident scanout.
     crate::residency::tests::cpu_read(&mut cache, request.planes[0].footprint.mapping());
     crate::residency::tests::cpu_write(&mut cache, &allocation, 0, &[0; 64]).unwrap();
-    assert!(
-        frames
-            .capture(&mut cache, request, &mut descriptors)
-            .is_err()
-    );
+    assert!(frames.capture(&mut cache, request).is_err());
     assert!(frames.get(&snapshot).is_ok());
     drop(snapshot);
     drop(frames);
     drop(cache);
-    drop(descriptors);
+
     monitor.check().unwrap();
 }
 
@@ -708,7 +686,7 @@ fn scanout_retargets_a_new_producer_and_ignores_undefined_padding() {
         32 * 1024 * 1024,
     )
     .unwrap();
-    let mut descriptors = DescriptorCache::new(cache.device(), 64);
+    let mut descriptors = DescriptorCache::new(cache.device());
     let mut frames = Frames::new();
     let (_allocation, whole) = backing_allocation(&cache, 96, 128, 199);
     let prefix = whole.slice(0, 64).unwrap();
@@ -727,9 +705,7 @@ fn scanout_retargets_a_new_producer_and_ignores_undefined_padding() {
         format: F::Rgba8,
         allow_canonical_import: true,
     };
-    let initial = frames
-        .capture(&mut cache, request.clone(), &mut descriptors)
-        .unwrap();
+    let initial = frames.capture(&mut cache, request.clone()).unwrap();
     let extent = vk::Extent3D {
         width: 4,
         height: 6,
@@ -809,15 +785,11 @@ fn scanout_retargets_a_new_producer_and_ignores_undefined_padding() {
     let before = cache.statistics();
     // Same request/planes, new authoritative producer. Its uninitialized two
     // padding rows are neither consumed nor reconstructed through a buffer.
-    let canonical = frames
-        .capture(&mut cache, request.clone(), &mut descriptors)
-        .unwrap();
+    let canonical = frames.capture(&mut cache, request.clone()).unwrap();
     assert_eq!(before.gpu_copied_bytes, cache.statistics().gpu_copied_bytes);
     drop(canonical);
     request.allow_canonical_import = false;
-    let snapshot = frames
-        .capture(&mut cache, request, &mut descriptors)
-        .unwrap();
+    let snapshot = frames.capture(&mut cache, request).unwrap();
     let after = cache.statistics();
     assert_eq!(before.cpu_uploaded_bytes, after.cpu_uploaded_bytes);
     assert_eq!(before.gpu_copied_bytes, after.gpu_copied_bytes);
@@ -904,7 +876,7 @@ fn dropping_a_frame_pool_retains_an_in_flight_snapshot_destination() {
         return;
     };
     let monitor = device.validation_monitor();
-    let mut descriptors = DescriptorCache::new(&device, 64);
+
     let mut cache = VulkanResidency::new(
         nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
         device,
@@ -945,12 +917,10 @@ fn dropping_a_frame_pool_retains_an_in_flight_snapshot_destination() {
         format: F::Rgba8,
         allow_canonical_import: true,
     };
-    let snapshot = frames
-        .capture(&mut cache, request, &mut descriptors)
-        .unwrap();
+    let snapshot = frames.capture(&mut cache, request).unwrap();
     let work = frames.get(&snapshot).unwrap().work;
     assert!(work.tick() > cache.device().queue_usage().completed_tick);
-    assert!(work.tick() > cache.device().scheduled_tick());
+    assert_eq!(work.tick(), cache.device().scheduled_tick());
     drop(snapshot);
     drop(frames);
     monitor.check().unwrap();
@@ -961,7 +931,7 @@ fn dropping_a_frame_pool_retains_an_in_flight_snapshot_destination() {
         .wait_for_work(work, Duration::from_secs(5))
         .unwrap();
     drop(gate);
-    drop(descriptors);
+
     drop(cache);
     monitor.check().unwrap();
 }
@@ -1111,7 +1081,7 @@ mod snapshot_replacement {
         };
         let mut cache = cache(2 * charge).unwrap();
         let validation = cache.device().validation_monitor();
-        let mut descriptors = DescriptorCache::new(cache.device(), 64);
+
         let mut frames = Frames::new();
         let (_allocation, mapping) = backing_allocation(&cache, 16384, 4096, 0x51);
         let mut previous = None;
@@ -1122,11 +1092,7 @@ mod snapshot_replacement {
             ([64, 64], F::Rgba8),
         ] {
             let frame = frames
-                .capture(
-                    &mut cache,
-                    request(&mapping, extent, format),
-                    &mut descriptors,
-                )
+                .capture(&mut cache, request(&mapping, extent, format))
                 .unwrap();
             let id = frame.lease().image();
             if let Some(old) = previous {
@@ -1143,7 +1109,7 @@ mod snapshot_replacement {
             drop(frame);
         }
         drop(frames);
-        drop(descriptors);
+
         drop(cache);
         validation.check().unwrap();
     }
@@ -1155,23 +1121,15 @@ mod snapshot_replacement {
         };
         let mut cache = cache(3 * charge).unwrap();
         let validation = cache.device().validation_monitor();
-        let mut descriptors = DescriptorCache::new(cache.device(), 64);
+
         let mut frames = Frames::new();
         let (_allocation, mapping) = backing_allocation(&cache, 65536, 4096, 0x51);
         let first = frames
-            .capture(
-                &mut cache,
-                request(&mapping, [64, 64], F::Rgba8),
-                &mut descriptors,
-            )
+            .capture(&mut cache, request(&mapping, [64, 64], F::Rgba8))
             .unwrap();
         finish(&mut cache, &frames, &first);
         let second = frames
-            .capture(
-                &mut cache,
-                request(&mapping, [64, 64], F::Rgba8),
-                &mut descriptors,
-            )
+            .capture(&mut cache, request(&mapping, [64, 64], F::Rgba8))
             .unwrap();
         finish(&mut cache, &frames, &second);
         let old_id = second.lease().image();
@@ -1182,11 +1140,7 @@ mod snapshot_replacement {
         let height = (3 * charge / 256 + 1) as u32;
         let (_large_allocation, large_mapping) =
             backing_allocation(&cache, height as usize * 256, 4096, 0x51);
-        let failure = frames.capture(
-            &mut cache,
-            request(&large_mapping, [64, height], F::Bgra8),
-            &mut descriptors,
-        );
+        let failure = frames.capture(&mut cache, request(&large_mapping, [64, height], F::Bgra8));
         assert!(matches!(
             failure,
             Err(VulkanError::ResidencyPressure { .. })
@@ -1200,11 +1154,7 @@ mod snapshot_replacement {
             "an active lease keeps its stable slot"
         );
         let replacement = frames
-            .capture(
-                &mut cache,
-                request(&mapping, [64, 64], F::Bgra8),
-                &mut descriptors,
-            )
+            .capture(&mut cache, request(&mapping, [64, 64], F::Bgra8))
             .unwrap();
         assert_eq!(replacement.lease().image().slot, old_id.slot);
         assert_ne!(replacement.lease().image().generation, old_id.generation);
@@ -1214,7 +1164,7 @@ mod snapshot_replacement {
         drop(first);
         drop(replacement);
         drop(frames);
-        drop(descriptors);
+
         drop(cache);
         validation.check().unwrap();
     }
@@ -1225,26 +1175,18 @@ mod snapshot_replacement {
             return;
         };
         let validation = cache.device().validation_monitor();
-        let mut descriptors = DescriptorCache::new(cache.device(), 64);
+
         let mut frames = Frames::new();
         let (_allocation, mapping) = backing_allocation(&cache, 16384, 4096, 0x51);
         let mut gate = hold_gpu(&mut cache);
         let first = frames
-            .capture(
-                &mut cache,
-                request(&mapping, [64, 64], F::Rgba8),
-                &mut descriptors,
-            )
+            .capture(&mut cache, request(&mapping, [64, 64], F::Rgba8))
             .unwrap();
         let old_id = first.lease().image();
         let old_view = Arc::downgrade(&frames.get(&first).unwrap().view);
         drop(first);
         let second = frames
-            .capture(
-                &mut cache,
-                request(&mapping, [64, 64], F::Rgba8),
-                &mut descriptors,
-            )
+            .capture(&mut cache, request(&mapping, [64, 64], F::Rgba8))
             .unwrap();
         assert_ne!(second.lease().image().slot, old_id.slot);
         assert!(
@@ -1256,11 +1198,7 @@ mod snapshot_replacement {
         pixels(&mut cache, &frames, &second);
         drop(second);
         let third = frames
-            .capture(
-                &mut cache,
-                request(&mapping, [64, 64], F::Rgba8),
-                &mut descriptors,
-            )
+            .capture(&mut cache, request(&mapping, [64, 64], F::Rgba8))
             .unwrap();
         assert_eq!(
             third.lease().image(),
@@ -1272,7 +1210,7 @@ mod snapshot_replacement {
         drop(third);
         drop(gate);
         drop(frames);
-        drop(descriptors);
+
         drop(cache);
         validation.check().unwrap();
     }
@@ -1285,16 +1223,12 @@ mod snapshot_replacement {
         for (extent, format) in [([64, 64], F::Bgra8), ([128, 32], F::Rgba8)] {
             let mut cache = cache(2 * charge).unwrap();
             let validation = cache.device().validation_monitor();
-            let mut descriptors = DescriptorCache::new(cache.device(), 64);
+
             let mut frames = Frames::new();
             let (_allocation, mapping) = backing_allocation(&cache, 16384, 4096, 0x51);
             let mut gate = hold_gpu(&mut cache);
             let first = frames
-                .capture(
-                    &mut cache,
-                    request(&mapping, [64, 64], F::Rgba8),
-                    &mut descriptors,
-                )
+                .capture(&mut cache, request(&mapping, [64, 64], F::Rgba8))
                 .unwrap();
             let old_id = first.lease().image();
             let old_view = Arc::downgrade(&frames.get(&first).unwrap().view);
@@ -1315,11 +1249,7 @@ mod snapshot_replacement {
                 );
                 gate.signal();
             });
-            let replacement = frames.capture(
-                &mut cache,
-                request(&mapping, extent, format),
-                &mut descriptors,
-            );
+            let replacement = frames.capture(&mut cache, request(&mapping, extent, format));
             signal.join().unwrap();
             let replacement = replacement.unwrap();
             assert!(cache.device().completed_tick() >= last_use.tick());
@@ -1331,7 +1261,7 @@ mod snapshot_replacement {
             assert!(cache.allocated_bytes() <= 2 * charge);
             drop(replacement);
             drop(frames);
-            drop(descriptors);
+
             drop(cache);
             validation.check().unwrap();
         }
@@ -1343,23 +1273,15 @@ mod snapshot_replacement {
             return;
         };
         let validation = cache.device().validation_monitor();
-        let mut descriptors = DescriptorCache::new(cache.device(), 64);
+
         let mut frames = Frames::new();
         let (_allocation, mapping) = backing_allocation(&cache, 16384, 4096, 0x51);
         let mut gate = hold_gpu(&mut cache);
         let first = frames
-            .capture(
-                &mut cache,
-                request(&mapping, [64, 64], F::Rgba8),
-                &mut descriptors,
-            )
+            .capture(&mut cache, request(&mapping, [64, 64], F::Rgba8))
             .unwrap();
         let second = frames
-            .capture(
-                &mut cache,
-                request(&mapping, [64, 64], F::Bgra8),
-                &mut descriptors,
-            )
+            .capture(&mut cache, request(&mapping, [64, 64], F::Bgra8))
             .unwrap();
         assert_ne!(first.lease().image().slot, second.lease().image().slot);
         assert!(frames.get(&first).unwrap().work.tick() > cache.device().completed_tick());
@@ -1371,8 +1293,126 @@ mod snapshot_replacement {
         drop(second);
         drop(gate);
         drop(frames);
-        drop(descriptors);
+
         drop(cache);
         validation.check().unwrap();
     }
+    #[test]
+    fn pressure_wait_reuses_compatible_storage_in_the_same_capture() {
+        let Some(charge) = allocation_charge() else {
+            return;
+        };
+        let mut cache = cache(2 * charge).unwrap();
+        let validation = cache.device().validation_monitor();
+        let (_allocation, mapping) = backing_allocation(&cache, 16384, 4096, 0x51);
+        let mut frames = Frames::new();
+        let mut gate = hold_gpu(&mut cache);
+        let frame = frames
+            .capture(&mut cache, request(&mapping, [64, 64], F::Rgba8))
+            .unwrap();
+        let work = frames.get(&frame).unwrap().work;
+        let original = frame.lease().image();
+        assert!(work.tick() > cache.device().completed_tick());
+        drop(frame);
+        let progress = Arc::clone(&cache.device().submission.progress);
+        let pressure_tick = cache.device().scheduled_tick() + 1;
+        let result = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                // Allocation pressure must submit the new source context before
+                // the gate releases the old snapshot. No timing guess is needed.
+                let submitted = progress.wait_submitted(
+                    pressure_tick,
+                    Some(std::time::Instant::now() + Duration::from_secs(5)),
+                );
+                gate.signal();
+                assert!(
+                    submitted.unwrap(),
+                    "allocation pressure submits its pending work"
+                );
+            });
+            frames.capture(&mut cache, request(&mapping, [64, 64], F::Rgba8))
+        });
+        let reused =
+            result.expect("completion under pressure makes the released snapshot reusable");
+        assert_eq!(reused.lease().image(), original);
+        finish(&mut cache, &frames, &reused);
+        pixels(&mut cache, &frames, &reused);
+        assert_eq!(cache.allocated_bytes(), 2 * charge);
+        drop(reused);
+        drop(frames);
+        drop(cache);
+        validation.check().unwrap();
+    }
+}
+
+#[test]
+fn snapshots_progress_without_a_surface_and_recycle_after_completion() {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let monitor = device.validation_monitor();
+
+    let mut cache = VulkanResidency::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+        device,
+        16 * 1024 * 1024,
+    )
+    .unwrap();
+    let (_allocation, mapping) = backing_allocation(&cache, 4096, 4096, 0x51);
+    let mut frames = Frames::new();
+    let request = || NativePresentationImage {
+        inputs: mapping.pin(0, mapping.bytes()).unwrap(),
+        planes: Arc::from([GuestImagePlane {
+            depth_slice: 0,
+            mip_level: 0,
+            array_layer: 0,
+            aspect: GuestImageAspect::Color,
+            footprint: crate::residency::tests::plane_geometry(Arc::clone(&mapping), [4, 4], 16, 4),
+            row_pitch: 16,
+            bytes_per_block: 4,
+        }]),
+        extent: [4, 4],
+        format: F::Rgba8,
+        allow_canonical_import: true,
+    };
+    let mut held = Vec::new();
+    for _ in 0..16 {
+        let frame = frames.capture(&mut cache, request()).unwrap();
+        let work = frames.get(&frame).unwrap().work;
+        assert_eq!(
+            cache.device().scheduled_tick(),
+            work.tick(),
+            "offscreen production is submitted without WSI"
+        );
+        held.push(frame);
+    }
+    let work = frames.get(held.last().unwrap()).unwrap().work;
+    let allocated = cache.allocated_bytes();
+    assert!(
+        cache
+            .device_mut()
+            .wait_for_work(work, Duration::from_secs(10))
+            .unwrap()
+    );
+    drop(held);
+    for _ in 0..64 {
+        let frame = frames.capture(&mut cache, request()).unwrap();
+        let work = frames.get(&frame).unwrap().work;
+        assert!(
+            cache
+                .device_mut()
+                .wait_for_work(work, Duration::from_secs(10))
+                .unwrap()
+        );
+        drop(frame);
+        assert_eq!(
+            cache.allocated_bytes(),
+            allocated,
+            "completed snapshots recycle without allocation"
+        );
+    }
+    drop(frames);
+    drop(cache);
+
+    monitor.check().unwrap();
 }

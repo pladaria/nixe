@@ -25,13 +25,13 @@ share native pipelines. Stage code IDs also let pipeline libraries reuse unchang
 shaders when another stage changes. Source cache identities and physical descriptor
 binding identities remain separate responsibilities.
 
-A ready `Arc<NativePipeline>` and `Arc<BindingRecord>` are the resolved prepared
-references. Repeated draws bypass full key hashing, normalization, lookup,
-descriptor allocation/update and reference-count increments. The recorder retains
-each used reference once per command-buffer batch and emits a bind only when it
-changes. Bound-state knowledge resets at command-buffer boundaries. Content
-synchronization/hazards still belong to the residency recorder on every consumed
-access; descriptor reuse is not permission to omit those effects.
+Ready pipeline references and immutable binding leases are consumed directly.
+Unchanged native descriptor payloads reuse their last set without hashing a
+historical cache key or updating descriptors. The recorder retains each used
+reference once per command-buffer batch and emits a bind only when it changes.
+Bound-state knowledge resets at command-buffer boundaries. Content synchronization
+and hazards still belong to the residency recorder on every consumed access;
+descriptor reuse is not permission to omit those effects.
 
 ## Bounded asynchronous work
 
@@ -93,19 +93,32 @@ Constant buffers use uniform descriptors and storage buffers use storage descrip
 Reflection retains combined image/sampler arrays and uniform/storage texel buffers.
 Descriptor resource origins remain independent of shared Vulkan layout identity.
 
-Descriptor records key resource/view/sampler identities, offsets/ranges and layout
-signatures. Leases keep the actual Vulkan allocations/views/samplers alive, so raw
-handle reuse cannot alias a live record. Residency IDs still check their original
-generations when resolving a changed binding. Image views now independently retain
-their parent allocation. A cached record survives content uploads unchanged.
+The command owner captures resolved resources and compact template entries. Its
+weak lookup reuses live CPU captures without owning their storage. The Vulkan
+recording worker selects the physical set, updates it with the layout-owned
+update template, and binds it in command order. CPU captures carry complete
+reconstructible data and never retain a physical descriptor set.
 
-Pools allocate immutable sets in geometrically growing pages (4–64 sets per
-page/layout, constrained by the total configured capacity). Sparse interfaces
-therefore do not reserve 64 sets before another layout can bind. No individual
-set free/update is needed. A page resets only after every cache/prepared/batch
-reference is released, which includes real GPU completion. Under pressure, idle
-LRU records can be dropped; if live references prevent reuse, explicit pressure
-lets recording flush and resume. Resource leases remain charged until released.
+Layout allocators share native pools by per-type capacity and grow sets in groups
+of sixteen. Sets recycle by their actual last GPU tick, independently of retained
+CPU preparations. Before growing, the worker refreshes actual GPU completion and
+searches again. Pool exhaustion allocates another pool without submitting or
+restarting a draw. Rebinding an old capture after recycling restores its data.
+The worker compares its last payload using weak resource identities, so unchanged
+bindings reuse their set after GPU completion without pinning staging storage or
+matching a destroyed object's recycled handle. Payload metadata reuses its array.
+
+Each native command context retains the descriptor pools it actually uses until
+GPU completion, including if the worker unwinds. Retention is deduplicated once
+per pool/context; there is no per-command producer lock. Cold layout retirement
+can release metadata without destroying a pool still used by the GPU.
+
+Binding captures retain actual buffers, views, samplers and layouts through their
+CPU and GPU use. Texel views belong to their buffer and are reused by offset,
+range and format. Immutable format capabilities are cached rather than queried
+again after an unrelated binding changes. There is no descriptor admission budget,
+page-reset loop, historical payload LRU or resource-free invalidation scan.
+Resource contents are not a binding identity.
 Sampler keys normalize inactive compare/anisotropy fields and include explicit
 custom border components/format and reduction state with enabled feature checks.
 

@@ -45,10 +45,7 @@ impl Queries {
         }))
     }
     pub fn begin(&mut self, dispatch: &mut crate::dispatch::Dispatch) {
-        unsafe {
-            dispatch.cmd_reset_query_pool(self.pool, 0, 2);
-            dispatch.cmd_write_timestamp(vk::PipelineStageFlags::TOP_OF_PIPE, self.pool, 0);
-        }
+        dispatch.begin_submission_timing(self.pool);
     }
     pub fn end(&mut self, dispatch: &mut crate::dispatch::Dispatch) {
         unsafe {

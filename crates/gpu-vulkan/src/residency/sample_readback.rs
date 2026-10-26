@@ -49,7 +49,7 @@ impl VulkanResidency {
     pub fn enable_sample_conversion(&mut self, compiler: Arc<PipelineCompiler>) {
         self.sample_conversion = Some(SampleConversion {
             compiler,
-            descriptors: DescriptorCache::new(&self.device, 32),
+            descriptors: DescriptorCache::new(&self.device),
             pipelines: [None, None],
         });
     }

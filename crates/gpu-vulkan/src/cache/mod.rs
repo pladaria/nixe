@@ -23,6 +23,7 @@ pub use descriptors::{
     BindingRecord, CustomBorderColor, DescriptorCache, DescriptorResource, DescriptorStatistics,
     Sampler, SamplerCache, SamplerExtensions,
 };
+pub(crate) use descriptors::{DescriptorAllocator, DescriptorPool};
 
 #[derive(Clone, Debug)]
 pub struct CacheConfiguration {
@@ -33,7 +34,6 @@ pub struct CacheConfiguration {
     pub shader_bytes: usize,
     pub pipeline_entries: usize,
     pub layout_entries: usize,
-    pub descriptor_sets: usize,
     pub sampler_entries: usize,
     pub persistent_bytes: u64,
     pub directory: Option<std::path::PathBuf>,
@@ -47,7 +47,6 @@ impl Default for CacheConfiguration {
             shader_bytes: 64 * 1024 * 1024,
             pipeline_entries: 8192,
             layout_entries: 1024,
-            descriptor_sets: 4096,
             sampler_entries: 512,
             persistent_bytes: 128 * 1024 * 1024,
             directory: None,
@@ -57,5 +56,3 @@ impl Default for CacheConfiguration {
 
 #[cfg(test)]
 mod tests;
-
-mod fingerprint;

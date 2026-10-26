@@ -78,7 +78,6 @@ impl Frames {
         &mut self,
         cache: &mut VulkanResidency,
         source: NativePresentationImage,
-        descriptors: &mut crate::cache::DescriptorCache,
     ) -> Result<ResidentImage, VulkanError> {
         self.drain();
         let format = match source.format {
@@ -103,8 +102,7 @@ impl Frames {
                         .device_mut()
                         .wait_for_work(last_use, std::time::Duration::MAX)?;
                 }
-                let old = entry.take().expect("completed snapshot");
-                descriptors.forget_image(&old.view);
+                entry.take();
             }
         }
         let image = cache.presentation_source(&source, format)?;
@@ -123,45 +121,71 @@ impl Frames {
         let slot = if let Some(slot) = slot {
             slot
         } else {
-            let slot = self
-                .snapshots
-                .iter()
-                .position(Option::is_none)
-                .unwrap_or(self.snapshots.len());
-            if slot == 12 {
-                return Err(VulkanError::InvalidResource(
-                    "presentation snapshot budget is saturated",
-                ));
+            match cache.allocate_host_image(source.extent, format) {
+                Ok(native) => {
+                    let slot = self
+                        .snapshots
+                        .iter()
+                        .position(Option::is_none)
+                        .unwrap_or(self.snapshots.len());
+                    let generation =
+                        self.generation
+                            .checked_add(1)
+                            .ok_or(VulkanError::InvalidResource(
+                                "presentation generation exhausted",
+                            ))?;
+                    let view = native.view_2d(format)?;
+                    let work = cache.device_mut().work_ticket()?;
+                    let snapshot = Snapshot {
+                        view,
+                        format,
+                        extent: source.extent,
+                        encoding: source.format,
+                        work,
+                        last_use: work,
+                        version: 0,
+                        generation,
+                        leases: 0,
+                    };
+                    self.generation = generation;
+                    if slot == self.snapshots.len() {
+                        self.snapshots.push(Some(snapshot));
+                    } else {
+                        self.snapshots[slot] = Some(snapshot);
+                    }
+                    slot
+                }
+                Err(error @ VulkanError::ResidencyPressure { .. }) => {
+                    // Real allocation pressure may already have completed a
+                    // reusable frame. Select released storage and wait for its
+                    // actual last use, rather than requiring another allocation.
+                    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_present_manager.cpp
+                    self.drain();
+                    let Some((slot, frame)) = self
+                        .snapshots
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, entry)| entry.as_ref().map(|frame| (slot, frame)))
+                        .filter(|(_, frame)| {
+                            frame.leases == 0
+                                && frame.extent == source.extent
+                                && frame.format == format
+                        })
+                        .min_by_key(|(_, frame)| frame.last_use.tick())
+                    else {
+                        return Err(error);
+                    };
+                    let last_use = frame.last_use;
+                    if last_use.tick() > cache.device().completed_tick() {
+                        cache.flush()?;
+                        cache
+                            .device_mut()
+                            .wait_for_work(last_use, std::time::Duration::MAX)?;
+                    }
+                    slot
+                }
+                Err(error) => return Err(error),
             }
-            let generation = self
-                .generation
-                .checked_add(1)
-                .ok_or(VulkanError::InvalidResource(
-                    "presentation generation exhausted",
-                ))?;
-            let native = cache.allocate_host_image(source.extent, format)?;
-            let view = native.view_2d(format)?;
-            let work = cache.device_mut().work_ticket()?;
-            let snapshot = Snapshot {
-                view,
-                format,
-                extent: source.extent,
-                encoding: source.format,
-                work,
-                last_use: work,
-                version: 0,
-                generation,
-                leases: 0,
-            };
-            // Vacant slots survive allocation failure. Every replacement gets a
-            // fresh generation, even after a failed allocation or a slot change.
-            self.generation = generation;
-            if slot == self.snapshots.len() {
-                self.snapshots.push(Some(snapshot));
-            } else {
-                self.snapshots[slot] = Some(snapshot);
-            }
-            slot
         };
         let snapshot = self.snapshots[slot].as_mut().expect("allocated snapshot");
         cache.device_mut().end_rendering();
@@ -221,6 +245,10 @@ impl Frames {
         cache
             .device_mut()
             .retire_image(Arc::clone(&snapshot.view.image), work)?;
+        // Submit the offscreen producer independently of swapchain acquisition.
+        // Completed unleased storage then recycles even while WSI is unavailable.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+        cache.flush()?;
         let description = ImageDescription::new(
             ImageDimension::Two,
             ImageExtent::new(source.extent[0], source.extent[1], 1)

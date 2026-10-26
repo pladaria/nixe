@@ -34,8 +34,9 @@ impl Dispatch {
         slot: std::sync::Arc<CommandSlot>,
         tick: u64,
         progress: std::sync::Arc<crate::queue::progress::SubmissionProgress>,
+        timeline: vk::Semaphore,
     ) -> Result<(), VulkanError> {
-        self.recorder.begin(slot, tick, progress)
+        self.recorder.begin(slot, tick, progress, timeline)
     }
     pub(crate) fn submit(&mut self, work: QueueSubmission) -> Result<(), VulkanError> {
         self.recorder.submit(work)
@@ -181,6 +182,24 @@ impl Dispatch {
             + 'static,
     {
         self.recorder.record(function);
+    }
+    pub fn dispatch_work(&mut self) -> Result<(), VulkanError> {
+        self.recorder.flush_chunks()
+    }
+    #[cfg(feature = "performance-counters")]
+    pub fn begin_submission_timing(&mut self, pool: vk::QueryPool) {
+        self.recorder.record(move |ctx| {
+            unsafe {
+                ctx.device.cmd_reset_query_pool(ctx.upload, pool, 0, 2);
+                ctx.device.cmd_write_timestamp(
+                    ctx.upload,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    pool,
+                    0,
+                );
+            }
+            Ok(())
+        });
     }
     pub fn recording_handle(&self) -> RecordingHandle {
         self.recorder.handle.clone()

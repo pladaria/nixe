@@ -75,11 +75,10 @@ impl Host {
             // Its texture uploads already ran on this owner, and any submitted
             // draw retains its view through the ordinary graphics timeline.
             if let Some(mut old_ui) = self.ui.take() {
-                self.renderer.free_textures(&mut old_ui, descriptors);
+                self.renderer.free_textures(&mut old_ui);
             }
             if let Some(ui) = &mut packet.ui {
-                self.renderer
-                    .update_textures(cache, ui, descriptors, samplers)?;
+                self.renderer.update_textures(cache, ui, samplers)?;
             }
             self.ui = packet.ui.take();
             if packet.screenshot.is_some() {
@@ -267,9 +266,11 @@ impl Host {
             return Ok(());
         };
         cache.device_mut().poll_progress()?;
-        while capture.pending.front().is_some_and(|(ticket, _)| {
-            ticket.work().tick() <= cache.device().queue_usage().completed_tick
-        }) {
+        while capture
+            .pending
+            .front()
+            .is_some_and(|(ticket, _)| ticket.work().tick() <= cache.device().completed_tick())
+        {
             let (ticket, _) = capture.pending.pop_front().unwrap();
             capture.bytes.extend(cache.device_mut().readback(ticket)?);
         }
@@ -280,17 +281,9 @@ impl Host {
             let size = u64::from(rows) * u64::from(capture.extent[0]) * 4;
             cache.device_mut().end_rendering();
             let device = cache.device_mut();
-            let (slot, slice, ticket) = match device
+            let (slice, ticket) = device
                 .submission
-                .reserve_readback(&mut device.dispatch, size)
-            {
-                Ok(value) => value,
-                Err(VulkanError::QueuePressure { .. }) => {
-                    cache.flush()?;
-                    break;
-                }
-                Err(error) => return Err(error),
-            };
+                .reserve_readback(&mut device.dispatch, size)?;
             let device = cache.device_mut();
 
             let copy = vk::BufferImageCopy::default()
@@ -314,7 +307,7 @@ impl Host {
                 device.dispatch.cmd_copy_image_to_buffer(
                     capture.view.image.handle,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    device.submission.slots[slot].readback_buffer(slice).handle,
+                    device.submission.staging_buffer(&slice).handle,
                     &[copy],
                 );
             }

@@ -5,7 +5,7 @@ use gpu_allocator::{
     MemoryLocation,
     vulkan::{Allocation, AllocationCreateDesc, AllocationScheme},
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AllocationMode {
@@ -21,6 +21,13 @@ pub struct AllocatedBuffer {
     size: u64,
     pub(crate) usage: vk::BufferUsageFlags,
     pub(crate) charge: Option<AllocationCharge>,
+    texel_views: Mutex<Vec<BufferView>>,
+}
+struct BufferView {
+    offset: u64,
+    range: u64,
+    format: vk::Format,
+    handle: vk::BufferView,
 }
 pub struct AllocatedImage {
     pub(crate) owner: Arc<DeviceOwner>,
@@ -152,6 +159,7 @@ pub(crate) fn allocate_buffer_charged(
         size,
         usage,
         charge: None,
+        texel_views: Mutex::new(Vec::new()),
     };
     let mut dedicated = vk::MemoryDedicatedRequirements::default();
     let mut requirements = vk::MemoryRequirements2::default().push_next(&mut dedicated);
@@ -217,6 +225,41 @@ pub(crate) fn allocate_buffer_charged(
     Ok(buffer)
 }
 impl AllocatedBuffer {
+    pub(crate) fn texel_view(
+        &self,
+        offset: u64,
+        range: u64,
+        format: vk::Format,
+    ) -> Result<vk::BufferView, VulkanError> {
+        // Buffer ownership also owns its views; no descriptor-record ownership
+        // or back-reference may keep this allocation artificially reserved.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+        let mut views = self.texel_views.lock().unwrap();
+        if let Some(view) = views
+            .iter()
+            .find(|v| v.offset == offset && v.range == range && v.format == format)
+        {
+            return Ok(view.handle);
+        }
+        let handle = unsafe {
+            self.owner.device.create_buffer_view(
+                &vk::BufferViewCreateInfo::default()
+                    .buffer(self.handle)
+                    .offset(offset)
+                    .range(range)
+                    .format(format),
+                None,
+            )
+        }
+        .map_err(|e| VulkanError::vk("native texel buffer view", e))?;
+        views.push(BufferView {
+            offset,
+            range,
+            format,
+            handle,
+        });
+        Ok(handle)
+    }
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -345,6 +388,9 @@ impl Drop for AllocatedBuffer {
         // SAFETY: only internal recording sees the handle, retaining it until
         // completion. Destroy the bound object before returning its allocation.
         unsafe {
+            for view in self.texel_views.get_mut().unwrap().drain(..) {
+                self.owner.device.destroy_buffer_view(view.handle, None);
+            }
             self.owner.device.destroy_buffer(self.handle, None);
         }
         if let Some(allocation) = self.allocation.as_ref()

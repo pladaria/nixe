@@ -279,9 +279,8 @@ fn recorded_literal_publishes_after_native_completion_without_a_frontend_token()
             break;
         }
         execution.arm_completion_wakeup().unwrap();
-        let wake_at = execution.pending_submit_deadline().unwrap_or(deadline);
         match notifications
-            .recv_timeout(wake_at.saturating_duration_since(std::time::Instant::now()))
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
         {
             Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -459,21 +458,11 @@ fn buffer_fence_downloads_publish_current_ranges_before_later_cpu_scalar_reads()
         )
         .unwrap()
         .buffer;
-    assert_eq!(
-        residency
-            .write_buffer(id, 0, &vec![7; PAGE_SIZE as usize])
-            .unwrap()
-            .consumed,
-        PAGE_SIZE as usize
-    );
+    residency
+        .write_buffer(id, 0, &vec![7; PAGE_SIZE as usize])
+        .unwrap();
     residency.flush().unwrap();
-    assert_eq!(
-        residency
-            .write_buffer(id, 3, &[44, 55, 66])
-            .unwrap()
-            .consumed,
-        3
-    );
+    residency.write_buffer(id, 3, &[44, 55, 66]).unwrap();
     residency.flush().unwrap();
     // Wait through an ordinary small native read, then poll publication using
     // the public flush boundary. No CPU request asks to download the full page.

@@ -33,9 +33,13 @@ impl Download {
     }
 }
 impl VulkanResidency {
+    pub(crate) fn buffer_publications_pending(&self) -> bool {
+        self.buffer_downloads
+            .back()
+            .is_some_and(|job| job.work().tick() > self.device.scheduled_tick())
+    }
     pub(crate) fn commit_buffer_downloads(&mut self) -> Result<(), VulkanError> {
         let mut pending = std::mem::take(&mut self.buffer_writes);
-        let limit = self.device.submission.configuration.arena_bytes;
         for (&id, writes) in &mut pending {
             let Ok(buffer) = self.buffer(id) else {
                 continue;
@@ -57,16 +61,7 @@ impl VulkanResidency {
                     };
                     let mut offset = 0;
                     while offset < snapshot.bytes {
-                        while self.buffer_downloads.len() >= 256 {
-                            self.flush()?;
-                            let Some(download) = self.buffer_downloads.front() else {
-                                break;
-                            };
-                            let work = download.work();
-                            self.device.wait_for_work(work, std::time::Duration::MAX)?;
-                            self.progress_readbacks()?;
-                        }
-                        let bytes = (snapshot.bytes - offset).min(limit);
+                        let bytes = snapshot.bytes - offset;
                         let mut part = snapshot;
                         part.start = nixe_memory::ArenaOffset::new(part.start.get() + offset);
                         part.logical += offset;

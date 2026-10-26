@@ -1,4 +1,4 @@
-//! Recycled bounded native jobs, containing no guest-memory references.
+//! Recycled native jobs, containing no guest-memory references.
 use super::*;
 use super::{arena::Arena, slot::CommandSlot};
 use crate::queue::progress::{NativeFailure, SubmissionProgress};
@@ -6,8 +6,6 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
-const CHUNK_COMMANDS: usize = 128;
-const QUEUED_CHUNKS: usize = 8;
 pub(crate) struct QueueSubmission {
     pub queue: vk::Queue,
     pub waits: smallvec::SmallVec<[vk::SemaphoreSubmitInfo<'static>; 1]>,
@@ -61,6 +59,7 @@ struct Begin {
     slot: Arc<CommandSlot>,
     tick: u64,
     progress: Arc<SubmissionProgress>,
+    timeline: vk::Semaphore,
 }
 #[derive(Default)]
 struct Chunk {
@@ -95,7 +94,7 @@ pub(crate) struct RecordingHandle {
     inner: Arc<RecordingState>,
 }
 struct RecordingState {
-    sender: mpsc::SyncSender<Work>,
+    sender: mpsc::Sender<Work>,
     failure: Arc<OnceLock<NativeFailure>>,
 }
 pub(super) struct Recorder {
@@ -110,7 +109,7 @@ impl Recorder {
         functions: Functions,
         queue_mutex: Arc<Mutex<()>>,
     ) -> Result<Self, VulkanError> {
-        let (sender, receiver) = mpsc::sync_channel(QUEUED_CHUNKS);
+        let (sender, receiver) = mpsc::channel();
         let (recycle, recycled) = mpsc::channel();
         let failure = Arc::new(OnceLock::new());
         let worker_failure = Arc::clone(&failure);
@@ -125,8 +124,13 @@ impl Recorder {
                     device,
                     functions,
                     command: vk::CommandBuffer::null(),
+                    upload: vk::CommandBuffer::null(),
                     slot: None,
                     draw: None,
+                    descriptors: crate::cache::DescriptorAllocator::default(),
+                    descriptor_pools: Default::default(),
+                    progress: None,
+                    timeline: vk::Semaphore::null(),
                 };
                 while let Ok(work) = receiver.recv() {
                     match work {
@@ -177,6 +181,7 @@ impl Recorder {
         slot: Arc<CommandSlot>,
         tick: u64,
         progress: Arc<SubmissionProgress>,
+        timeline: vk::Semaphore,
     ) -> Result<(), VulkanError> {
         self.handle.check_failure()?;
         let chunk = self
@@ -188,6 +193,7 @@ impl Recorder {
             slot,
             tick,
             progress,
+            timeline,
         });
         Ok(())
     }
@@ -258,9 +264,6 @@ impl Recorder {
             return;
         };
         unsafe { chunk.commands.push((first, second, third), function, plan) };
-        if chunk.len() == CHUNK_COMMANDS {
-            self.dispatch();
-        }
     }
     fn dispatch(&mut self) {
         if self.chunk.as_ref().is_none_or(|chunk| chunk.len() == 0) {
@@ -276,7 +279,7 @@ impl Recorder {
             chunk.len() as u64,
         );
         let _trace = nixe_gpu::trace::span(
-            "native_chunk_admission",
+            "native_chunk_enqueue",
             chunk.commands.identity(),
             chunk.len() as u64,
             0,
@@ -290,14 +293,13 @@ impl Recorder {
         });
         #[cfg(feature = "performance-counters")]
         nixe_gpu::metrics::record(
-            nixe_gpu::metrics::Counter::NativeChunkAdmissionNanoseconds,
+            nixe_gpu::metrics::Counter::NativeChunkEnqueueNanoseconds,
             queued_at.elapsed().as_nanos() as u64,
         );
         if result.is_err() {
             return;
         }
-        // Acquire the next chunk after admission: a full queue can recycle one
-        // while the producer waits, avoiding another speculative allocation.
+        // Reuse the worker's finished storage, or grow without waiting for it.
         self.chunk = Some(self.recycled.try_recv().unwrap_or_else(|_| Chunk::new()));
     }
     pub(crate) fn flush_chunks(&mut self) -> Result<(), VulkanError> {
@@ -368,8 +370,13 @@ pub(crate) struct Context {
     pub device: Device,
     pub(super) functions: Functions,
     pub command: vk::CommandBuffer,
-    slot: Option<Arc<CommandSlot>>,
+    pub upload: vk::CommandBuffer,
+    pub(super) slot: Option<Arc<CommandSlot>>,
     draw: Option<PendingDraw>,
+    pub(super) descriptors: crate::cache::DescriptorAllocator,
+    pub(super) descriptor_pools: rustc_hash::FxHashSet<usize>,
+    pub(super) progress: Option<(Arc<SubmissionProgress>, u64)>,
+    pub(super) timeline: vk::Semaphore,
 }
 fn record_chunk(
     scope: &mut WorkerScope,
@@ -397,9 +404,15 @@ fn record_chunk(
         && let Some(begin) = begin
     {
         context.flush_draw();
+        context.progress = Some((begin.progress, begin.tick));
+        context.timeline = begin.timeline;
         context.slot = Some(begin.slot);
+        context.descriptor_pools.clear();
         match context.slot.as_ref().unwrap().begin(&context.device) {
-            Ok(command) => context.command = command,
+            Ok([command, upload]) => {
+                context.command = command;
+                context.upload = upload;
+            }
             Err(error) => scope.fail(error),
         }
     }
@@ -431,13 +444,25 @@ fn submit_native(
     context.flush_draw();
     let device = &context.device;
     let functions = &context.functions;
-    unsafe { device.end_command_buffer(context.command) }.map_err(|result| {
-        NativeFailure::Vulkan {
+    let visibility = [vk::MemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)];
+    unsafe {
+        (functions.barrier)(
+            context.upload,
+            &vk::DependencyInfo::default().memory_barriers(&visibility),
+        )
+    };
+    for command in [context.upload, context.command] {
+        unsafe { device.end_command_buffer(command) }.map_err(|result| NativeFailure::Vulkan {
             operation: "vkEndCommandBuffer",
             result,
-        }
-    })?;
-    let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(context.command)];
+        })?;
+    }
+    let commands = [context.upload, context.command]
+        .map(|command| vk::CommandBufferSubmitInfo::default().command_buffer(command));
     let info = vk::SubmitInfo2::default()
         .command_buffer_infos(&commands)
         .wait_semaphore_infos(&work.waits)
@@ -609,31 +634,24 @@ mod tests {
     }
     static CALLS_AFTER_FAILED_BEGIN: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
-    unsafe extern "system" fn reset(
-        _: vk::Device,
-        _: vk::CommandPool,
-        _: vk::CommandPoolResetFlags,
-    ) -> vk::Result {
-        vk::Result::ERROR_OUT_OF_HOST_MEMORY
-    }
     unsafe extern "system" fn begin(
         _: vk::CommandBuffer,
         _: *const vk::CommandBufferBeginInfo<'_>,
     ) -> vk::Result {
-        CALLS_AFTER_FAILED_BEGIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        vk::Result::SUCCESS
+        vk::Result::ERROR_OUT_OF_HOST_MEMORY
     }
     unsafe extern "system" fn end_rendering(_: vk::CommandBuffer) {
         CALLS_AFTER_FAILED_BEGIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    unsafe extern "system" fn barrier(_: vk::CommandBuffer, _: *const vk::DependencyInfo<'_>) {}
     fn recorder(queue_mutex: Arc<Mutex<()>>) -> Recorder {
         // Inject failures at native call boundaries in the actual worker.
         let device = unsafe {
             Device::load_with(
                 |name| match name.to_bytes() {
                     b"vkEndCommandBuffer" => end as *const () as *const std::ffi::c_void,
-                    b"vkResetCommandPool" => reset as *const () as *const std::ffi::c_void,
                     b"vkBeginCommandBuffer" => begin as *const () as *const std::ffi::c_void,
+                    b"vkCmdPipelineBarrier2" => barrier as *const () as *const std::ffi::c_void,
                     b"vkCmdEndRendering" => end_rendering as *const () as *const std::ffi::c_void,
                     _ => std::ptr::null(),
                 },
@@ -665,13 +683,15 @@ mod tests {
     fn failed_begin_cancels_commands_and_submit_in_the_same_chunk() {
         CALLS_AFTER_FAILED_BEGIN.store(0, std::sync::atomic::Ordering::Relaxed);
         let device = crate::VulkanDevice::new(crate::DeviceOptions::default(), None).unwrap();
-        let slot = CommandSlot::new(
+        let [slot, _] = CommandSlot::allocate(
             Arc::clone(&device.owner),
             device.queues().graphics_compute_family,
         );
         let mut recorder = recorder(Arc::new(Mutex::new(())));
         let progress = Arc::new(SubmissionProgress::default());
-        recorder.begin(slot, 1, Arc::clone(&progress)).unwrap();
+        recorder
+            .begin(slot, 1, Arc::clone(&progress), device.submission.timeline)
+            .unwrap();
         recorder.record(|ctx| {
             ctx.flush_draw();
             unsafe { (ctx.functions.end)(ctx.command) };
@@ -681,7 +701,7 @@ mod tests {
         assert!(matches!(
             recorder.finish(),
             Err(VulkanError::Vulkan {
-                operation: "vkResetCommandPool",
+                operation: "vkBeginCommandBuffer",
                 result: vk::Result::ERROR_OUT_OF_HOST_MEMORY
             })
         ));
@@ -819,51 +839,156 @@ mod tests {
     }
 
     #[test]
-    fn submission_failure_drains_a_full_queue_and_releases_the_blocked_producer() {
-        let queue_mutex = Arc::new(Mutex::new(()));
-        let mut recorder = recorder(Arc::clone(&queue_mutex));
+    fn queued_chunks_grow_without_admission_waits_and_failure_cancels_the_suffix() {
+        let mutex = Arc::new(Mutex::new(()));
+        let mut recorder = recorder(Arc::clone(&mutex));
         let progress = Arc::new(SubmissionProgress::default());
         recorder.submit(submission(1, 1, &progress)).unwrap();
         recorder.finish().unwrap();
-        let gate = queue_mutex.lock().unwrap();
-        recorder.submit(submission(2, 2, &progress)).unwrap();
-        let mut tick = 3;
-        loop {
-            let work = Work::Commands {
-                chunk: Box::new(Chunk {
-                    submit: Some(submission(1, tick, &progress)),
-                    ..Chunk::default()
-                }),
-                #[cfg(feature = "performance-counters")]
-                queued_at: std::time::Instant::now(),
-            };
-            match recorder.handle.inner.sender.try_send(work) {
-                Ok(()) => tick += 1,
-                Err(mpsc::TrySendError::Full(_)) => break,
-                Err(mpsc::TrySendError::Disconnected(_)) => panic!("worker disconnected"),
-            }
-        }
-        let (started, waiting) = mpsc::sync_channel(1);
-        thread::scope(|scope| {
-            let producer = scope.spawn(|| {
-                started.send(()).unwrap();
-                let _ = recorder.submit(submission(1, tick, &progress));
-                recorder.finish()
+        let (held, ready) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let holder = scope.spawn(move || {
+                let _guard = mutex.lock().unwrap();
+                held.send(()).unwrap();
+                wait.recv_timeout(std::time::Duration::from_secs(3)).is_ok()
             });
-            waiting.recv().unwrap();
-            drop(gate);
-            assert!(matches!(
-                producer.join().unwrap(),
-                Err(VulkanError::Vulkan {
-                    operation: "vkQueueSubmit2",
-                    result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
-                })
-            ));
+            ready.recv().unwrap();
+            recorder.submit(submission(2, 2, &progress)).unwrap();
+            for tick in 3..64 {
+                recorder.submit(submission(1, tick, &progress)).unwrap();
+            }
+            release.send(()).unwrap();
+            assert!(
+                holder.join().unwrap(),
+                "enqueue must not wait for the recording worker"
+            );
         });
+        assert!(recorder.finish().is_err());
         assert_eq!(progress.submitted(), 1);
+        assert_eq!(progress.failure().unwrap().tick, 2);
+    }
+
+    #[test]
+    fn recording_panic_keeps_descriptor_pools_alive_for_the_submitted_gpu_prefix() {
+        use crate::cache::*;
+        use crate::{AllocatedBuffer, AllocationMode, MemoryLocation};
+        use std::time::Duration;
+        mod gate {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/support/gate.rs"
+            ));
+        }
+        let Some(mut device) = crate::test_device::device_for_test(crate::ApiPreference::Auto)
+        else {
+            return;
+        };
+        let validation = device.validation_monitor();
+        let workers = Arc::new(CompilePool::new(1, 8).unwrap());
+        let pipelines = PipelineCompiler::new(
+            &device,
+            Arc::clone(&workers),
+            &CacheConfiguration {
+                workers: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let shader = crate::test_shaders::compile(
+            &device.profile().shader_compiler.profile,
+            [crate::test_shaders::increment(7, 4)],
+        );
+        let pipeline = pipelines.request(PipelineRecipe::Compute(shader)).unwrap();
+        let buffer: Arc<AllocatedBuffer> = Arc::new(
+            device
+                .allocate_buffer(
+                    8,
+                    vk::BufferUsageFlags::STORAGE_BUFFER,
+                    MemoryLocation::GpuToCpu,
+                    AllocationMode::Managed,
+                    "descriptor pool panic prefix",
+                )
+                .unwrap(),
+        );
+        unsafe {
+            buffer.write_range(0, &[0; 8]).unwrap();
+        }
+        let mut descriptors = DescriptorCache::new(&device);
+        let record = descriptors
+            .get(
+                &pipeline.layout,
+                &[DescriptorResource::Buffer {
+                    buffer: Arc::clone(&buffer),
+                    offset: 0,
+                    range: 8,
+                }],
+            )
+            .unwrap();
+        device.bind_native_pipeline(&pipeline).unwrap();
+        device
+            .bind_native_descriptors(
+                &pipeline,
+                &record,
+                &vec![0; pipeline.layout.dynamic_bindings.len()],
+            )
+            .unwrap();
+        unsafe {
+            device.dispatch.cmd_dispatch(1, 1, 1);
+            let barriers = [vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                .dst_access_mask(vk::AccessFlags2::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(buffer.handle)
+                .size(8)];
+            device
+                .dispatch
+                .barrier(&vk::DependencyInfo::default().buffer_memory_barriers(&barriers));
+        }
+        let mut gate = gate::Gate::new(&device);
+        let waits = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(gate.handle)
+            .value(1)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let work = unsafe {
+            device
+                .submission
+                .flush(device.queue, &mut device.dispatch, &waits, &[])
+        }
+        .unwrap()
+        .unwrap();
+        gate.last_use = work.tick();
+        device.dispatch.recording_handle().finish().unwrap();
+        drop(record);
+        drop(descriptors);
+        device.begin_recording().unwrap();
+        device
+            .dispatch
+            .recorder
+            .record(|_| panic!("injected recording panic after native descriptor use"));
+        let _ = device.flush();
+        assert!(device.dispatch.recording_handle().finish().is_err());
         assert!(matches!(
-            progress.wait_submitted(tick, None),
-            Err(VulkanError::SubmissionFailed { tick: 2, .. })
+            device.dispatch.recording_handle().native_failure(),
+            Some(NativeFailure::Panicked)
         ));
+        // The worker's allocator has unwound, but actual GPU pool use is pending.
+        validation.check().unwrap();
+        gate.signal();
+        assert!(device.wait_for_work(work, Duration::from_secs(10)).unwrap());
+        assert_eq!(
+            unsafe { buffer.read_range(4, 4) }.unwrap(),
+            7u32.to_le_bytes()
+        );
+        drop(gate);
+        drop(buffer);
+        drop(pipeline);
+        drop(pipelines);
+        drop(workers);
+        drop(device);
+        validation.check().unwrap();
     }
 }

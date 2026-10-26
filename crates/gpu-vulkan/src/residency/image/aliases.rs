@@ -156,38 +156,30 @@ impl VulkanResidency {
             let mut captured = vec![0; packed];
             self.memory
                 .capture_resource_scattered(&inputs, &captures, &mut captured)?;
-            let limit = self.device.submission.configuration.arena_bytes as usize;
-            for (chunk, data) in captured.chunks(limit).enumerate() {
-                let begin = chunk * limit;
-                let end = begin + data.len();
-                let (slot, slice) = self.reserve_upload(data, 4)?;
-                let first = windows.partition_point(|&(_, offset, bytes)| offset + bytes <= begin);
-                let copies: Vec<_> = windows[first..]
-                    .iter()
-                    .take_while(|&&(_, offset, _)| offset < end)
-                    .map(|&(to, offset, bytes)| {
-                        let low = offset.max(begin);
-                        let high = (offset + bytes).min(end);
-                        vk::BufferCopy::default()
-                            .src_offset(slice.offset + (low - begin) as u64)
-                            .dst_offset(to + (low - offset) as u64)
-                            .size((high - low) as u64)
-                    })
-                    .collect();
-                let work = self.device.work_ticket()?;
-                self.device.retire_buffer(Arc::clone(&scratch), work)?;
-                self.barriers.emit(&mut self.device);
-                unsafe {
-                    self.device.dispatch.cmd_copy_buffer(
-                        self.device.submission.slots[slot]
-                            .upload_buffer(slice)
-                            .handle,
-                        scratch.handle,
-                        &copies,
-                    );
-                }
-                self.statistics.cpu_uploaded_bytes += data.len() as u64;
+            let slice = self.device.submission.reserve_upload_aligned(
+                &mut self.device.dispatch,
+                &captured,
+                4,
+            )?;
+            let copies: Vec<_> = windows
+                .iter()
+                .map(|&(to, offset, bytes)| {
+                    vk::BufferCopy::default()
+                        .src_offset(slice.offset + offset as u64)
+                        .dst_offset(to)
+                        .size(bytes as u64)
+                })
+                .collect();
+            let work = self.device.work_ticket()?;
+            self.device.retire_buffer(Arc::clone(&scratch), work)?;
+            self.barriers.emit(&mut self.device);
+            let source = self.device.submission.staging_buffer(&slice).handle;
+            unsafe {
+                self.device
+                    .dispatch
+                    .cmd_copy_buffer(source, scratch.handle, &copies);
             }
+            self.statistics.cpu_uploaded_bytes += captured.len() as u64;
         }
         for (source, copies) in buffers {
             for copy in &copies {

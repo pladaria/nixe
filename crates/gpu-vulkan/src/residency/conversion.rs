@@ -71,11 +71,6 @@ impl Nv12Inputs {
             initialized: false,
         })
     }
-    pub(crate) fn forget(self, descriptors: &mut DescriptorCache) {
-        for view in &self.views {
-            descriptors.forget_image(view);
-        }
-    }
     pub(crate) fn upload(
         &mut self,
         cache: &mut VulkanResidency,
@@ -116,46 +111,37 @@ impl Nv12Inputs {
             cache.barriers.emit(&mut cache.device);
             let width = source.widths[index];
             let pitch = u64::from(width) * (index as u64 + 1);
-            let chunk_bytes = cache.device.submission.configuration.arena_bytes / pitch * pitch;
-            if chunk_bytes == 0 {
-                return Err(VulkanError::InvalidResource(
-                    "video row exceeds upload arena",
-                ));
+            let bytes = &source.bytes[index];
+            let slice = cache.device.submission.reserve_upload_aligned(
+                &mut cache.device.dispatch,
+                bytes,
+                4,
+            )?;
+            let buffer = cache.device.submission.staging_buffer(&slice).handle;
+            let work = cache.device.work_ticket()?;
+            cache.device.retire_image(Arc::clone(&view.image), work)?;
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(slice.offset)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height: (bytes.len() as u64 / pitch) as u32,
+                    depth: 1,
+                });
+            unsafe {
+                cache.device.dispatch.cmd_copy_buffer_to_image(
+                    buffer,
+                    view.image.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
             }
-            for (chunk, bytes) in source.bytes[index].chunks(chunk_bytes as usize).enumerate() {
-                let (slot, slice) = cache.reserve_upload(bytes, 4)?;
-                let buffer = cache.device.submission.slots[slot]
-                    .upload_buffer(slice)
-                    .handle;
-                let work = cache.device.work_ticket()?;
-                cache.device.retire_image(Arc::clone(&view.image), work)?;
-                let region = vk::BufferImageCopy::default()
-                    .buffer_offset(slice.offset)
-                    .image_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .layer_count(1),
-                    )
-                    .image_offset(vk::Offset3D {
-                        x: 0,
-                        y: ((chunk as u64 * chunk_bytes) / pitch) as i32,
-                        z: 0,
-                    })
-                    .image_extent(vk::Extent3D {
-                        width,
-                        height: (bytes.len() as u64 / pitch) as u32,
-                        depth: 1,
-                    });
-                unsafe {
-                    cache.device.dispatch.cmd_copy_buffer_to_image(
-                        buffer,
-                        view.image.handle,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        &[region],
-                    );
-                }
-                cache.statistics.cpu_uploaded_bytes += bytes.len() as u64;
-            }
+            cache.statistics.cpu_uploaded_bytes += bytes.len() as u64;
             cache.barriers.queue_image(
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::COPY)

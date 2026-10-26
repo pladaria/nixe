@@ -196,12 +196,6 @@ where
         }
         Ok(())
     }
-    fn pending_submit_deadline(&self) -> Option<std::time::Instant> {
-        self.backend
-            .borrow()
-            .as_ref()
-            .and_then(GpuExecution::pending_submit_deadline)
-    }
     fn runtime_failure(
         &self,
         frontend: FrontendSubmissionId,
@@ -274,12 +268,6 @@ where
         result.map_err(|error| self.runtime_failure(FrontendSubmissionId::new(0), error))
     }
     fn service_ready_control(&mut self) -> Result<(), GpuExecutorFailure> {
-        if self
-            .pending_submit_deadline()
-            .is_some_and(|deadline| deadline <= std::time::Instant::now())
-        {
-            self.poll()?;
-        }
         // Eden ticks CPU coherency requests after PrepareDraw has consumed its
         // resources, including when native compilation had to wait. A request
         // must not resolve against authority missing that pending effect.
@@ -359,20 +347,7 @@ where
                 continue;
             }
             owner.borrow_mut().arm_progress()?;
-            let deadline = owner.borrow().pending_submit_deadline();
-            let message = if let Some(deadline) = deadline {
-                match owner
-                    .borrow()
-                    .receiver
-                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                {
-                    Ok(message) => Ok(message),
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::RecvError),
-                }
-            } else {
-                owner.borrow().receiver.recv()
-            };
+            let message = owner.borrow().receiver.recv();
             match message {
                 Ok(message) => owner.borrow_mut().service_control(message)?,
                 Err(_) if running.is_empty() => return Ok(()),

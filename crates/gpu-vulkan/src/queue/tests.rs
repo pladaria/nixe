@@ -1,21 +1,6 @@
 use super::*;
 use crate::test_device as support;
 
-fn small_device(
-    api: crate::ApiPreference,
-    configuration: QueueConfiguration,
-) -> Option<VulkanDevice> {
-    let mut device = support::device_for_test(api)?;
-    device.submission = QueueState::new(
-        Arc::clone(&device.owner),
-        device.queues().graphics_compute_family,
-        configuration,
-        &device.dispatch,
-    )
-    .unwrap();
-    Some(device)
-}
-
 mod gate {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -170,118 +155,24 @@ fn profile_native_transfer_roundtrip() {
 }
 
 fn exercise_reuse(api: crate::ApiPreference) {
-    let configuration = QueueConfiguration {
-        command_slots: 2,
-        arena_bytes: 1024,
-        overflow_bytes: 2048,
-    };
-    let Some(mut device) = small_device(api, configuration) else {
+    let Some(mut device) = support::device_for_test(api) else {
         return;
     };
     let validation = device.validation_monitor();
-    let mut gate = Gate::new(&device);
-    let bytes: Vec<_> = (0..256).map(|i| (i * 19 + 3) as u8).collect();
-    let first = device.enqueue_buffer_readback(&bytes).unwrap();
-    let first_work = first.work();
-    assert_eq!(device.queue_usage().submitted_tick, 0);
-    let waits = [vk::SemaphoreSubmitInfo::default()
-        .semaphore(gate.handle)
-        .value(1)
-        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-    let accepted = unsafe {
-        device
-            .submission
-            .flush(device.queue, &mut device.dispatch, &waits, &[])
+    let mut pending = Vec::new();
+    for byte in 0..16u8 {
+        let read = device.enqueue_buffer_readback(&[byte; 128]).unwrap();
+        device.flush().unwrap();
+        pending.push((byte, read));
     }
-    .unwrap()
-    .unwrap();
-    gate.last_use = accepted.tick();
-    assert_eq!(accepted, first_work);
-    assert_eq!(accepted.submission().slot(), accepted.tick());
-    let second = device
-        .enqueue_image_readback(8, 8, &bytes, AllocationMode::Dedicated)
-        .unwrap();
-    let second_work = device.flush().unwrap().unwrap();
-    gate.last_use = second_work.tick();
-    assert!(!device.wait_for_work(second_work, Duration::ZERO).unwrap());
-    assert_eq!(device.poll_progress().unwrap(), 0);
-    let usage = device.queue_usage();
-    assert_eq!(
-        (
-            usage.command_slots,
-            usage.retired_buffers,
-            usage.retired_images
-        ),
-        (2, 1, 1)
-    );
-    assert!(
-        matches!(device.enqueue_buffer_readback(&bytes), Err(VulkanError::QueuePressure { pending: Some(ticket), .. }) if ticket == first_work)
-    );
-    let slots: Vec<_> = device
-        .submission
-        .slots
-        .iter()
-        .map(|slot| Arc::as_ptr(&slot.native))
-        .collect();
-    gate.signal();
-    assert!(
-        device
-            .wait_for_work(second_work, Duration::from_secs(5))
-            .unwrap()
-    );
-    let usage = device.queue_usage();
-    assert_eq!(
-        (
-            usage.retired_buffers,
-            usage.retired_images,
-            usage.retained_readbacks
-        ),
-        (0, 0, 2)
-    );
-    assert!(matches!(
-        device.enqueue_buffer_readback(&bytes),
-        Err(VulkanError::QueuePressure { pending: None, .. })
-    ));
-    let stale = ReadbackTicket {
-        work: first.work,
-        slot: first.slot,
-        entry: first.entry,
-    };
-    assert_eq!(device.readback(first).unwrap(), bytes);
-    assert_eq!(device.readback(second).unwrap(), bytes);
-    for cycle in 0..12 {
-        let pattern: Vec<_> = bytes.iter().map(|byte| byte.wrapping_add(cycle)).collect();
-        let readback = device.enqueue_buffer_readback(&pattern).unwrap();
-        assert_eq!(device.readback(readback).unwrap(), pattern);
-        assert_eq!(device.queue_usage().command_slots, 2);
-        assert_eq!(device.queue_usage().arena_capacity, 4096);
-        assert_eq!(
-            device
-                .submission
-                .slots
-                .iter()
-                .map(|slot| Arc::as_ptr(&slot.native))
-                .collect::<Vec<_>>(),
-            slots
-        );
+    let last = device.preceding_work().unwrap();
+    assert!(device.wait_for_work(last, Duration::from_secs(5)).unwrap());
+    for (byte, read) in pending {
+        assert_eq!(device.readback(read).unwrap(), [byte; 128]);
     }
-    assert!(device.readback(stale).is_err());
-    // Seal a final signal explicitly; waiting only observes its real completion.
-    let final_work = device.work_ticket().unwrap();
-    assert!(!device.wait_for_work(final_work, Duration::ZERO).unwrap());
-    assert_eq!(device.flush().unwrap(), Some(final_work));
-    assert!(
-        device
-            .wait_for_work(final_work, Duration::from_secs(5))
-            .unwrap()
-    );
-    assert_eq!(device.queue_usage().completed_tick, final_work.tick());
-    drop(gate);
-    device.shutdown().unwrap();
-    assert!(matches!(
-        device.work_ticket(),
-        Err(VulkanError::QueueStopped)
-    ));
+    let read = device.enqueue_buffer_readback(&[0x37; 128]).unwrap();
+    device.flush().unwrap();
+    assert_eq!(device.readback(read).unwrap(), [0x37; 128]);
     drop(device);
     validation.check().unwrap();
 }
@@ -293,113 +184,6 @@ fn core_timeline_drives_retirement_reuse_and_a_final_fence() {
 #[test]
 fn khr_timeline_drives_retirement_reuse_and_a_final_fence() {
     exercise_reuse(crate::ApiPreference::Compatibility12);
-}
-
-#[test]
-fn native_recording_waits_for_actual_slot_capacity_without_growing_the_budget() {
-    let Some(mut device) = small_device(
-        crate::ApiPreference::Auto,
-        QueueConfiguration {
-            command_slots: 1,
-            arena_bytes: 512,
-            overflow_bytes: 1024,
-        },
-    ) else {
-        return;
-    };
-    let validation = device.validation_monitor();
-    let mut gate = Gate::new(&device);
-    let first = device.work_ticket().unwrap();
-    unsafe {
-        device.submission.flush(
-            device.queue,
-            &mut device.dispatch,
-            &[vk::SemaphoreSubmitInfo::default()
-                .semaphore(gate.handle)
-                .value(1)
-                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)],
-            &[],
-        )
-    }
-    .unwrap()
-    .unwrap();
-    gate.last_use = first.tick();
-    assert!(
-        matches!(device.submission.begin(&mut device.dispatch), Err(VulkanError::QueuePressure { pending: Some(work), .. }) if work == first)
-    );
-    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let signal = Arc::clone(&released);
-    let producer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(25));
-        signal.store(true, std::sync::atomic::Ordering::Release);
-        gate.signal();
-    });
-    let _slot = device.begin_recording().unwrap();
-    assert!(
-        released.load(std::sync::atomic::Ordering::Acquire),
-        "capacity cannot recycle before the actual GPU dependency"
-    );
-    assert_eq!(device.queue_usage().command_slots, 1);
-    let next = device.work_ticket().unwrap();
-    assert!(next.tick() > first.tick());
-    device.flush().unwrap();
-    device.wait_for_work(next, Duration::from_secs(5)).unwrap();
-    producer.join().unwrap();
-    drop(device);
-    validation.check().unwrap();
-}
-
-#[test]
-fn staging_pressure_is_bounded_and_unread_bytes_survive_completion() {
-    let Some(mut device) = small_device(
-        crate::ApiPreference::Auto,
-        QueueConfiguration {
-            command_slots: 1,
-            arena_bytes: 512,
-            overflow_bytes: 1024,
-        },
-    ) else {
-        return;
-    };
-    let validation = device.validation_monitor();
-    let first = device.enqueue_buffer_readback(&[0x19; 512]).unwrap();
-    let second = device.enqueue_buffer_readback(&[0xa7; 512]).unwrap();
-    assert_eq!(device.queue_usage().overflow_capacity, 1024);
-    assert!(matches!(
-        device.enqueue_buffer_readback(&[0x00; 512]),
-        Err(VulkanError::QueuePressure { .. })
-    ));
-    let work = device.flush().unwrap().unwrap();
-    assert!(device.wait_for_work(work, Duration::from_secs(5)).unwrap());
-    assert_eq!(device.queue_usage().overflow_capacity, 512);
-    assert!(
-        matches!(
-            device.begin_recording(),
-            Err(VulkanError::QueuePressure {
-                pending: None,
-                retained_readbacks: 2
-            })
-        ),
-        "a GPU wait cannot release unread CPU bytes"
-    );
-    assert_eq!(device.readback(first).unwrap(), [0x19; 512]);
-    assert!(matches!(
-        device.enqueue_buffer_readback(&[0x00; 512]),
-        Err(VulkanError::QueuePressure { .. })
-    ));
-    assert_eq!(device.readback(second).unwrap(), [0xa7; 512]);
-    assert_eq!(device.queue_usage().overflow_capacity, 0);
-    let large = device.enqueue_buffer_readback(&[0x49; 2048]).unwrap();
-    assert_eq!(device.queue_usage().overflow_capacity, 0);
-    assert_eq!(device.queue_usage().oversized_capacity, 4096);
-    assert_eq!(device.readback(large).unwrap(), [0x49; 2048]);
-    assert_eq!(device.queue_usage().oversized_capacity, 0);
-    assert_eq!(
-        device.transfer_round_trip(&[0x5c; 257]).unwrap(),
-        [0x5c; 257]
-    );
-    drop(device);
-    validation.check().unwrap();
 }
 
 #[test]
@@ -458,64 +242,6 @@ fn foreign_tickets_and_terminal_device_errors_never_publish_completion() {
 }
 
 #[test]
-fn staging_overflow_suballocates_small_transfers_and_preserves_unread_slices() {
-    let Some(mut device) = small_device(
-        crate::ApiPreference::Auto,
-        QueueConfiguration {
-            command_slots: 1,
-            arena_bytes: 4096,
-            overflow_bytes: 16384,
-        },
-    ) else {
-        return;
-    };
-    let validation = device.validation_monitor();
-    // Fill the primary arenas; subsequent small requests must share overflow
-    // arenas rather than allocating one native buffer and memory per request.
-    device
-        .submission
-        .reserve_upload(&mut device.dispatch, &[0; 4096])
-        .unwrap();
-    let (_, _, unused) = device
-        .submission
-        .reserve_readback(&mut device.dispatch, 4096)
-        .unwrap();
-    let mut tickets = Vec::new();
-    for value in 0..128u8 {
-        let (index, source) = device
-            .submission
-            .reserve_upload(&mut device.dispatch, &[value; 64])
-            .unwrap();
-        let (_, destination, ticket) = device
-            .submission
-            .reserve_readback(&mut device.dispatch, 64)
-            .unwrap();
-        let slot = &device.submission.slots[index];
-        unsafe {
-            device.dispatch.cmd_copy_buffer(
-                slot.upload_buffer(source).handle,
-                slot.readback_buffer(destination).handle,
-                &[vk::BufferCopy::default()
-                    .src_offset(source.offset)
-                    .dst_offset(destination.offset)
-                    .size(64)],
-            );
-        }
-        tickets.push(ticket);
-    }
-    assert_eq!(device.submission.slots[0].upload_overflow.len(), 2);
-    assert_eq!(device.submission.slots[0].readback_overflow.len(), 2);
-    assert_eq!(device.queue_usage().overflow_capacity, 16384);
-    device.discard_readback(unused).unwrap();
-    for (value, ticket) in tickets.into_iter().enumerate() {
-        assert_eq!(device.readback(ticket).unwrap(), [value as u8; 64]);
-    }
-    assert_eq!(device.queue_usage().overflow_capacity, 0);
-    drop(device);
-    validation.check().unwrap();
-}
-
-#[test]
 fn prior_native_use_retires_after_a_later_failure_without_submitting_dependent_ticks() {
     use crate::queue::progress::NativeFailure;
     let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
@@ -557,67 +283,9 @@ fn prior_native_use_retires_after_a_later_failure_without_submitting_dependent_t
     validation.check().unwrap();
 }
 
-#[test]
-fn each_in_flight_slot_has_its_own_staging_budget() {
-    let Some(mut device) = small_device(
-        crate::ApiPreference::Auto,
-        QueueConfiguration {
-            command_slots: 2,
-            arena_bytes: 512,
-            overflow_bytes: 1024,
-        },
-    ) else {
-        return;
-    };
-    let validation = device.validation_monitor();
-    let mut gate = Gate::new(&device);
-    let mut reads = Vec::new();
-    for value in [0x19, 0x37] {
-        reads.push((
-            value,
-            device.enqueue_buffer_readback(&[value; 512]).unwrap(),
-        ));
-    }
-    let first = unsafe {
-        device.submission.flush(
-            device.queue,
-            &mut device.dispatch,
-            &[vk::SemaphoreSubmitInfo::default()
-                .semaphore(gate.handle)
-                .value(1)
-                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)],
-            &[],
-        )
-    }
-    .unwrap()
-    .unwrap();
-    gate.last_use = first.tick();
-    for value in [0x51, 0xa7] {
-        reads.push((
-            value,
-            device.enqueue_buffer_readback(&[value; 512]).unwrap(),
-        ));
-    }
-    assert_eq!(device.queue_usage().command_slots, 2);
-    assert_eq!(device.queue_usage().overflow_capacity, 2048);
-    assert!(matches!(
-        device.enqueue_buffer_readback(&[0; 512]),
-        Err(VulkanError::QueuePressure { .. })
-    ));
-    device.flush().unwrap();
-    gate.signal();
-    for (value, read) in reads {
-        assert_eq!(device.readback(read).unwrap(), [value; 512]);
-    }
-    assert_eq!(device.queue_usage().overflow_capacity, 0);
-    drop(gate);
-    drop(device);
-    validation.check().unwrap();
-}
-
 #[cfg(feature = "performance-counters")]
 #[test]
-fn full_chunks_record_without_submitting_and_queue_pressure_needs_no_owner_callback() {
+fn full_chunks_record_without_submitting() {
     let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
         return;
     };
@@ -639,8 +307,8 @@ fn full_chunks_record_without_submitting_and_queue_pressure_needs_no_owner_callb
             let _lock = mutex.lock().unwrap();
             held.send(()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
-            // One active submit, eight queued chunks, and a pending handoff.
-            while queued_chunks() < initial_chunks + 10 {
+            // The native submit is held while recording chunks continue to queue.
+            while queued_chunks() < initial_chunks + 2 {
                 if Instant::now() >= deadline {
                     return false;
                 }
@@ -659,11 +327,11 @@ fn full_chunks_record_without_submitting_and_queue_pressure_needs_no_owner_callb
             first.tick(),
             "full recording chunks must not seal a batch"
         );
-        assert_eq!(device.queue_usage().command_slots, 2);
+        assert!(device.queue_usage().command_slots >= 2);
         device.flush().unwrap();
         assert!(
             blocked_worker.join().unwrap(),
-            "the worker gate must fill the bounded chunk queue"
+            "the worker gate must observe queued recording chunks"
         );
     });
     for (value, read) in reads {
@@ -693,6 +361,70 @@ fn recording_chunk_fullness_does_not_seal_a_native_batch() {
     for (value, ticket) in reads {
         assert_eq!(device.readback(ticket).unwrap(), [value; 16]);
     }
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+fn command_contexts_grow_while_the_gpu_is_busy() {
+    let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let mut gate = gate::Gate::new(&device);
+    let first = device.work_ticket().unwrap();
+    let waits = [vk::SemaphoreSubmitInfo::default()
+        .semaphore(gate.handle)
+        .value(1)
+        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+    unsafe {
+        device
+            .submission
+            .flush(device.queue, &mut device.dispatch, &waits, &[])
+            .unwrap();
+    }
+    let mut last = first;
+    for _ in 0..24 {
+        last = device.work_ticket().unwrap();
+        device.flush().unwrap();
+    }
+    assert_eq!(device.completed_tick(), 0);
+    assert!(device.queue_usage().command_slots >= 25);
+    assert!(!device.wait_for_work(last, Duration::ZERO).unwrap());
+    gate.signal();
+    assert!(device.wait_for_work(last, Duration::from_secs(5)).unwrap());
+    let capacity = device.queue_usage().command_slots;
+    device.work_ticket().unwrap();
+    device.flush().unwrap();
+    assert_eq!(device.queue_usage().command_slots, capacity);
+    drop(gate);
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+fn deferred_cpu_readbacks_do_not_pin_completed_command_contexts() {
+    let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let mut pending = Vec::new();
+    for byte in 0..24u8 {
+        let read = device.enqueue_buffer_readback(&[byte; 64]).unwrap();
+        device.flush().unwrap();
+        assert!(
+            device
+                .wait_for_work(read.work(), Duration::from_secs(5))
+                .unwrap()
+        );
+        pending.push((byte, read));
+    }
+    assert_eq!(device.queue_usage().retained_readbacks, pending.len());
+    assert_eq!(device.queue_usage().command_slots, 2);
+    for (byte, read) in pending {
+        assert_eq!(device.readback(read).unwrap(), [byte; 64]);
+    }
+    assert_eq!(device.queue_usage().retained_readbacks, 0);
     drop(device);
     validation.check().unwrap();
 }

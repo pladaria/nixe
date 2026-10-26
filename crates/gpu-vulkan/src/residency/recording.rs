@@ -3,8 +3,8 @@
 use super::*;
 use crate::ReadbackTicket;
 impl VulkanResidency {
-    /// Capture dirty RAM directly into one mapped upload batch, bounded by the
-    /// arena capacity. Region offsets retain their order across chunk boundaries.
+    /// Capture dirty RAM directly into one mapped upload, retaining the packed
+    /// region offsets without splitting to fit a command-slot budget.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
     pub(super) fn upload_buffer_captures(
         &mut self,
@@ -14,104 +14,95 @@ impl VulkanResidency {
         windows: &[(u64, usize, usize)],
         packed: usize,
     ) -> Result<(), VulkanError> {
-        let limit = self.device.submission.configuration.arena_bytes as usize;
-        let mut captures = Vec::new();
-        let mut regions = Vec::new();
-        let mut retained = Vec::new();
-        let mut input_index = 0;
-        let mut input_offset = 0;
-        for begin in (0..packed).step_by(limit) {
-            let end = (begin + limit).min(packed);
-            retained.clear();
-            let mut remaining = (end - begin) as u64;
-            while remaining != 0 {
-                let input = inputs.get(input_index).ok_or(VulkanError::InvalidResource(
-                    "buffer upload capture exceeds retained inputs",
-                ))?;
-                let bytes = remaining.min(input.bytes() - input_offset);
-                retained.push(input.slice(input_offset, bytes)?);
-                remaining -= bytes;
-                input_offset += bytes;
-                if input_offset == input.bytes() {
-                    input_index += 1;
-                    input_offset = 0;
-                }
-            }
-            captures.clear();
-            let first = copies
-                .partition_point(|copy| copy.destination + copy.source.bytes as usize <= begin);
-            for copy in &copies[first..] {
-                if copy.destination >= end {
-                    break;
-                }
-                let start = copy.destination.max(begin);
-                let stop = (copy.destination + copy.source.bytes as usize).min(end);
-                captures.push(nixe_memory::PhysicalCapture {
-                    source: nixe_memory::Extent {
-                        start: nixe_memory::ArenaOffset::new(
-                            copy.source.start.get() + (start - copy.destination) as u64,
-                        ),
-                        bytes: (stop - start) as u64,
-                    },
-                    destination: start - begin,
-                });
-            }
-            // Resolve lazy literals/hazards before reserving the capture's slot:
-            // those operations may consume staging or submit earlier commands.
-            regions.clear();
-            let first = windows.partition_point(|&(_, start, bytes)| start + bytes <= begin);
-            for &(offset, start, bytes) in &windows[first..] {
-                if start >= end {
-                    break;
-                }
-                let low = start.max(begin);
-                let high = (start + bytes).min(end);
-                let destination = offset + (low - start) as u64;
-                self.buffer_access_range(
-                    id,
-                    destination,
-                    (high - low) as u64,
-                    AccessScope::new(
-                        vk::PipelineStageFlags2::COPY,
-                        vk::AccessFlags2::TRANSFER_WRITE,
-                    ),
-                )?;
-                regions.push(
-                    vk::BufferCopy::default()
-                        .src_offset((low - begin) as u64)
-                        .dst_offset(destination)
-                        .size((high - low) as u64),
-                );
-            }
-            let (slot, slice) = self.reserve_upload_space((end - begin) as u64, 4)?;
-            let upload = self.device.submission.slots[slot].upload_buffer(slice);
-            unsafe {
-                upload.write_with(slice.offset, slice.size, |destination| {
+        if packed == 0 {
+            return Ok(());
+        }
+        let regions: smallvec::SmallVec<[vk::BufferCopy; 8]> = windows
+            .iter()
+            .map(|&(offset, start, bytes)| {
+                vk::BufferCopy::default()
+                    .src_offset(start as u64)
+                    .dst_offset(offset)
+                    .size(bytes as u64)
+            })
+            .collect();
+        let slice = self.device.submission.reserve_slice(
+            &mut self.device.dispatch,
+            packed as u64,
+            true,
+            4,
+        )?;
+        unsafe {
+            self.device.submission.staging_buffer(&slice).write_with(
+                slice.offset,
+                slice.size,
+                |destination| {
                     self.memory
-                        .capture_resource_scattered(&retained, &captures, destination)
+                        .capture_resource_scattered(inputs, copies, destination)
                         .map_err(memory_error)
-                })?;
-            }
-            let source = upload.handle;
-            for region in &mut regions {
-                region.src_offset += slice.offset;
-            }
+                },
+            )?;
+        }
+        self.record_buffer_upload(id, slice, &[], regions)?;
+        self.invalidate_cpu_resources(&[])?;
+        self.statistics.cpu_uploaded_bytes += packed as u64;
+        Ok(())
+    }
+    pub(super) fn record_buffer_upload(
+        &mut self,
+        id: BufferId,
+        slice: crate::queue::Slice,
+        writers: &[WriterId],
+        mut regions: smallvec::SmallVec<[vk::BufferCopy; 8]>,
+    ) -> Result<(), VulkanError> {
+        let entry = self.buffer(id)?;
+        let reorder = self.device.submission.staging.is_stream(&slice)
+            && regions
+                .iter()
+                .all(|r| !entry.used.used(r.dst_offset, r.size));
+        let scope = AccessScope::new(
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_WRITE,
+        );
+        let mut preceding = AccessScope::default();
+        if reorder {
             let work = self.device.work_ticket()?;
-            self.contents_mut(Resource::Buffer(id)).last_use = Some(work);
-            self.barriers.emit(&mut self.device);
-            unsafe {
-                self.device.dispatch.cmd_copy_buffer(
-                    source,
-                    self.buffer(id)?.native.handle,
-                    &regions,
-                );
-            }
+            let entry = self.buffer_mut(id);
             for region in &regions {
-                self.buffer_mut(id)
-                    .validate_interval(region.dst_offset, region.size);
+                entry
+                    .access
+                    .upload(region.dst_offset, region.size, scope, |_, _, dep| {
+                        preceding.stages |= dep.source.stages;
+                        preceding.access |= dep.source.access;
+                    });
             }
-            self.invalidate_cpu_resources(&[])?;
-            self.statistics.cpu_uploaded_bytes += (end - begin) as u64;
+            entry.contents.last_use = Some(work);
+            self.touch(Resource::Buffer(id));
+        } else {
+            for region in &regions {
+                self.buffer_access_range(id, region.dst_offset, region.size, scope)?;
+            }
+            self.barriers.emit(&mut self.device);
+        }
+        let source = self.device.submission.staging_buffer(&slice).handle;
+        let destination = self.buffer(id)?.native.handle;
+        for region in &mut regions {
+            region.src_offset += slice.offset;
+        }
+        self.publish_effect(writers, |device| unsafe {
+            if reorder {
+                device
+                    .dispatch
+                    .cmd_upload_buffer(source, destination, &regions, preceding);
+            } else {
+                device
+                    .dispatch
+                    .cmd_copy_buffer(source, destination, &regions);
+            }
+        })?;
+        for region in regions {
+            self.buffer_mut(id)
+                .validate_interval(region.dst_offset, region.size);
         }
         Ok(())
     }
@@ -135,45 +126,6 @@ impl VulkanResidency {
         }
         Ok(())
     }
-    pub(super) fn reserve_upload(
-        &mut self,
-        bytes: &[u8],
-        alignment: u64,
-    ) -> Result<(usize, crate::queue::Slice), VulkanError> {
-        let (slot, slice) = self.reserve_upload_space(bytes.len() as u64, alignment)?;
-        let buffer = self.device.submission.slots[slot].upload_buffer(slice);
-        unsafe {
-            buffer.write_range(slice.offset, bytes)?;
-        }
-        Ok((slot, slice))
-    }
-    pub(super) fn reserve_upload_space(
-        &mut self,
-        size: u64,
-        alignment: u64,
-    ) -> Result<(usize, crate::queue::Slice), VulkanError> {
-        loop {
-            match self.device.submission.reserve_slice(
-                &mut self.device.dispatch,
-                size,
-                true,
-                alignment,
-            ) {
-                Ok(reservation) => return Ok(reservation),
-                Err(error @ VulkanError::QueuePressure { pending, .. }) => {
-                    let flushed = self.flush()?;
-                    let Some(work) = pending.or(flushed) else {
-                        return Err(error);
-                    };
-                    self.statistics.staging_pressure_waits += 1;
-                    let _wait =
-                        nixe_gpu::trace::span("staging_pressure_wait", work.tick(), size, 0);
-                    self.device.wait_for_work(work, std::time::Duration::MAX)?;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
     pub(super) fn upload_buffer(
         &mut self,
         id: BufferId,
@@ -181,36 +133,21 @@ impl VulkanResidency {
         bytes: &[u8],
     ) -> Result<(), VulkanError> {
         self.check_buffer_range(id, offset, bytes.len() as u64)?;
-        // Chunking is a staging policy, never a guest buffer-size restriction.
-        let limit = self.device.submission.configuration.arena_bytes as usize;
-        for (part, bytes) in bytes.chunks(limit).enumerate() {
-            let (index, slice) = self.reserve_upload(bytes, 4)?;
-            let target = self.buffer_access_range(
-                id,
-                offset + (part * limit) as u64,
-                bytes.len() as u64,
-                AccessScope::new(
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                ),
-            )?;
-            let upload = self.device.submission.slots[index]
-                .upload_buffer(slice)
-                .handle;
-            let regions = [vk::BufferCopy::default()
-                .src_offset(slice.offset)
-                .dst_offset(offset + (part * limit) as u64)
-                .size(bytes.len() as u64)];
-            self.barriers.emit(&mut self.device);
-            unsafe {
-                self.device
-                    .dispatch
-                    .cmd_copy_buffer(upload, target, &regions);
-            }
-            self.buffer_mut(id)
-                .validate_interval(offset + (part * limit) as u64, bytes.len() as u64);
-            self.statistics.cpu_uploaded_bytes += bytes.len() as u64;
-        }
+        let slice =
+            self.device
+                .submission
+                .reserve_upload_aligned(&mut self.device.dispatch, bytes, 4)?;
+        self.record_buffer_upload(
+            id,
+            slice,
+            &[],
+            smallvec::smallvec![
+                vk::BufferCopy::default()
+                    .dst_offset(offset)
+                    .size(bytes.len() as u64),
+            ],
+        )?;
+        self.statistics.cpu_uploaded_bytes += bytes.len() as u64;
         Ok(())
     }
     pub(super) fn copy_source(
@@ -420,21 +357,11 @@ impl VulkanResidency {
         size: u64,
     ) -> Result<Vec<u8>, VulkanError> {
         self.check_buffer_range(id, offset, size)?;
-        let mut result =
-            Vec::with_capacity(usize::try_from(size).map_err(|_| {
-                VulkanError::InvalidResource("readback exceeds host address space")
-            })?);
-        let limit = self.device.submission.configuration.arena_bytes;
-        let mut copied = 0;
-        while copied < size {
-            let length = (size - copied).min(limit);
-            let ticket = self.download_buffer(id, offset + copied, length)?;
-            self.flush()?;
-            result.extend(self.device.readback(ticket)?);
-            self.statistics.native_readback_bytes += length;
-            copied += length;
-        }
-        Ok(result)
+        let ticket = self.download_buffer(id, offset, size)?;
+        self.flush()?;
+        let bytes = self.device.readback(ticket)?;
+        self.statistics.native_readback_bytes += size;
+        Ok(bytes)
     }
     /// Native transfer batches name exact owned requests. Source fragments are
     /// gathered into one request buffer; publication keeps the original tokens.
@@ -446,7 +373,7 @@ impl VulkanResidency {
         use super::cpu_readback::{Scatter, Transfer};
         let mut images = rustc_hash::FxHashMap::<ImageId, Vec<_>>::default();
         let mut buffers = Vec::new();
-        let limit = self.device.submission.configuration.arena_bytes;
+        let limit = crate::queue::staging::READBACK_WINDOW_BYTES * 4;
         for &write in writes {
             let producer = write.producer.ok_or(VulkanError::InvalidResource(
                 "native readback has no device producer",
@@ -500,11 +427,13 @@ impl VulkanResidency {
                 bytes += length;
                 next += 1;
             }
-            let (index, slice, ticket) = self.reserve_readback(bytes, 4)?;
+            let (slice, ticket) = self.device.submission.reserve_readback_aligned(
+                &mut self.device.dispatch,
+                bytes,
+                4,
+            )?;
 
-            let target = self.device.submission.slots[index]
-                .readback_buffer(slice)
-                .handle;
+            let target = self.device.submission.staging_buffer(&slice).handle;
             let mut copies = Vec::new();
             let mut packed = 0;
             for &(id, offset, destination, length) in &buffers[first..next] {
@@ -602,7 +531,7 @@ impl VulkanResidency {
         )>,
     ) -> Result<(), VulkanError> {
         use super::cpu_readback::Transfer;
-        let limit = self.device.submission.configuration.arena_bytes;
+        let limit = crate::queue::staging::READBACK_WINDOW_BYTES * 4;
         let multisample = self.image(id)?.description.samples != vk::SampleCountFlags::TYPE_1;
         let mut reads = reads.into_iter().peekable();
         while reads.peek().is_some() {
@@ -632,11 +561,13 @@ impl VulkanResidency {
                     converted.push(self.sample_readback_window(id, *piece)?);
                 }
             }
-            let (index, slice, ticket) = self.reserve_readback(bytes, alignment)?;
+            let (slice, ticket) = self.device.submission.reserve_readback_aligned(
+                &mut self.device.dispatch,
+                bytes,
+                alignment,
+            )?;
 
-            let buffer = self.device.submission.slots[index]
-                .readback_buffer(slice)
-                .handle;
+            let buffer = self.device.submission.staging_buffer(&slice).handle;
             if multisample {
                 for ((offset, (_, piece, _)), attachment) in batch.iter().zip(converted) {
                     let image = self.attachment_access(
@@ -715,7 +646,10 @@ impl VulkanResidency {
         offset: u64,
         size: u64,
     ) -> Result<ReadbackTicket, VulkanError> {
-        let (index, slice, ticket) = self.reserve_readback(size, 4)?;
+        let (slice, ticket) =
+            self.device
+                .submission
+                .reserve_readback_aligned(&mut self.device.dispatch, size, 4)?;
         let source = self.buffer_access_range(
             id,
             offset,
@@ -726,9 +660,7 @@ impl VulkanResidency {
             ),
         )?;
 
-        let target = self.device.submission.slots[index]
-            .readback_buffer(slice)
-            .handle;
+        let target = self.device.submission.staging_buffer(&slice).handle;
         self.barriers.emit(&mut self.device);
         unsafe {
             self.device.dispatch.cmd_copy_buffer(

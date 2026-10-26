@@ -26,7 +26,10 @@ impl CacheMonitor {
             if index != 0 {
                 line.push_str("; ");
             }
-            write!(line, "{name}: {}/{}", now.entries, now.entry_limit).unwrap();
+            write!(line, "{name}: {}", now.entries).unwrap();
+            if now.entry_limit != 0 {
+                write!(line, "/{}", now.entry_limit).unwrap();
+            }
             if now.byte_limit != 0 {
                 write!(
                     line,

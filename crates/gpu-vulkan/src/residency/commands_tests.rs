@@ -346,13 +346,10 @@ fn image_alias_invalidation_preserves_unrelated_buffer_pages() {
     drop(cache);
     validation.check().unwrap();
 }
-fn exercise(api: ApiPreference, recording: RecordingPolicy) {
+fn exercise(api: ApiPreference) {
     let Some(mut cache) = cache(api, 16 * 1024 * 1024) else {
         return;
     };
-    cache.unified_layouts = cache.device.profile().unified_image_layouts
-        && recording.layouts == LayoutPolicy::Automatic;
-    cache.barrier_policy = recording.barriers;
     let validation = cache.device.validation_monitor();
     let (_allocation_4, bytes) = backing_allocation(&cache, 4096, 4096, 0x1b);
     let id = buffer(&mut cache, bytes.clone());
@@ -446,28 +443,12 @@ fn exercise(api: ApiPreference, recording: RecordingPolicy) {
     validation.check().unwrap();
 }
 #[test]
-fn ordered_compute_raster_aliases_core_unified_memory() {
-    exercise(ApiPreference::Auto, RecordingPolicy::default());
+fn ordered_compute_raster_aliases_core() {
+    exercise(ApiPreference::Auto);
 }
 #[test]
-fn ordered_compute_raster_aliases_core_conventional_resource() {
-    exercise(
-        ApiPreference::Auto,
-        RecordingPolicy {
-            layouts: LayoutPolicy::Conventional,
-            barriers: BarrierPolicy::PerResource,
-        },
-    );
-}
-#[test]
-fn ordered_compute_raster_aliases_khr_conventional_memory() {
-    exercise(
-        ApiPreference::Compatibility12,
-        RecordingPolicy {
-            layouts: LayoutPolicy::Conventional,
-            barriers: BarrierPolicy::ScopedMemory,
-        },
-    );
+fn ordered_compute_raster_aliases_khr() {
+    exercise(ApiPreference::Compatibility12);
 }
 #[cfg(feature = "binding-probe")]
 #[test]

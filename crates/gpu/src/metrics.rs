@@ -42,14 +42,14 @@ pub enum Counter {
     NativeQueuedChunks,
     NativeChunkCommands,
     NativeChunkHandoffNanoseconds,
-    NativeChunkAdmissionNanoseconds,
+    NativeChunkEnqueueNanoseconds,
 }
 
 #[cfg(feature = "performance-counters")]
 static COUNTERS: [std::sync::atomic::AtomicU64;
-    Counter::NativeChunkAdmissionNanoseconds as usize + 1] =
+    Counter::NativeChunkEnqueueNanoseconds as usize + 1] =
     [const { std::sync::atomic::AtomicU64::new(0) };
-        Counter::NativeChunkAdmissionNanoseconds as usize + 1];
+        Counter::NativeChunkEnqueueNanoseconds as usize + 1];
 
 #[inline]
 pub fn record(counter: Counter, amount: u64) {
@@ -102,7 +102,7 @@ pub fn snapshot() -> Vec<(&'static str, u64)> {
         "NativeQueuedChunks",
         "NativeChunkCommands",
         "NativeChunkHandoffNanoseconds",
-        "NativeChunkAdmissionNanoseconds",
+        "NativeChunkEnqueueNanoseconds",
     ];
     NAMES
         .iter()

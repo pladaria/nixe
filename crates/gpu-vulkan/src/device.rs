@@ -4,7 +4,7 @@ use crate::{
     dispatch::Dispatch,
     instance::InstanceOwner,
     profile::{self, ExtensionSet, FeatureSet},
-    queue::{QueueConfiguration, QueueState},
+    queue::QueueState,
 };
 use ash::{vk, vk::Handle};
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
@@ -25,8 +25,6 @@ pub struct DeviceOptions {
 pub struct QueueSelection {
     pub graphics_compute_family: u32,
     pub present_family: Option<u32>,
-    /// A distinct queue keeps blocking WSI calls off the guest queue owner.
-    pub present_queue_index: u32,
 }
 #[derive(Debug)]
 pub struct SurfaceProfile {
@@ -145,14 +143,6 @@ impl VulkanDevice {
     }
 
     pub fn new(options: DeviceOptions, target: Option<SurfaceTarget>) -> Result<Self, VulkanError> {
-        Self::with_queue_configuration(options, target, QueueConfiguration::default())
-    }
-    pub fn with_queue_configuration(
-        options: DeviceOptions,
-        target: Option<SurfaceTarget>,
-        configuration: QueueConfiguration,
-    ) -> Result<Self, VulkanError> {
-        configuration.validate()?;
         let instance = InstanceOwner::new(options.validation, options.api, target)?;
         // SAFETY: instance stays alive through physical device selection.
         let physical_devices = unsafe { instance.instance.enumerate_physical_devices() }
@@ -185,17 +175,13 @@ impl VulkanDevice {
             }
             return Err(VulkanError::NoSuitableDevice(failures));
         };
-        let priority = [1_f32, 1_f32];
-        let graphics_count =
-            if selected.queues.present_family == Some(selected.queues.graphics_compute_family) {
-                2
-            } else {
-                1
-            };
+        // One queue per selected family; presentation may share graphics.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/vulkan_common/vulkan_device.cpp
+        let priority = [1_f32];
         let mut queue_infos = vec![
             vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(selected.queues.graphics_compute_family)
-                .queue_priorities(&priority[..graphics_count]),
+                .queue_priorities(&priority),
         ];
         if let Some(present) = selected.queues.present_family
             && present != selected.queues.graphics_compute_family
@@ -271,17 +257,12 @@ impl VulkanDevice {
         };
         owner.name(queue, "nixe graphics/compute queue")?;
         if let Some(family) = selected.queues.present_family {
-            let queue = unsafe {
-                owner
-                    .device
-                    .get_device_queue(family, selected.queues.present_queue_index)
-            };
+            let queue = unsafe { owner.device.get_device_queue(family, 0) };
             owner.name(queue, "nixe presentation queue")?;
         }
         let submission = QueueState::new(
             Arc::clone(&owner),
             selected.queues.graphics_compute_family,
-            configuration,
             &dispatch,
         )?;
         Ok(Self {
@@ -399,34 +380,13 @@ impl VulkanDevice {
         } else {
             None
         };
-        let (graphics_compute_family, mut present_family) = profile::choose_queues(
+        let (graphics_compute_family, present_family) = profile::choose_queues(
             &families,
             surface.as_ref().map(|_| present_support.as_slice()),
         )
         .ok_or_else(|| {
             "no graphics+compute family and compatible presentation family".to_string()
         })?;
-        let present_queue_index = if present_family == Some(graphics_compute_family) {
-            if families[graphics_compute_family as usize].queue_count >= 2 {
-                1
-            } else {
-                present_family = present_support
-                    .iter()
-                    .enumerate()
-                    .find(|(i, supported)| {
-                        **supported
-                            && *i != graphics_compute_family as usize
-                            && families[*i].queue_count != 0
-                    })
-                    .map(|(i, _)| i as u32);
-                if present_family.is_none() {
-                    return Err("windowed execution requires a distinct presentation queue so WSI cannot block guest progress; use headless on this device".into());
-                }
-                0
-            }
-        } else {
-            0
-        };
         features.finish_enabling(&ext, version, maintenance);
         let profile =
             unsafe { features.profile(&instance.instance, physical, version, maintenance) };
@@ -443,7 +403,6 @@ impl VulkanDevice {
             queues: QueueSelection {
                 graphics_compute_family,
                 present_family,
-                present_queue_index,
             },
             surface,
             score,

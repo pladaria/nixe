@@ -55,7 +55,7 @@ impl VulkanResidency {
         writes: &[nixe_gpu::authority::ResolvedBytes<Resource>],
     ) -> Result<bool, VulkanError> {
         let entry = self.image(id)?;
-        let limit = self.device.submission.configuration.arena_bytes;
+        let limit = crate::queue::staging::READBACK_WINDOW_BYTES * 4;
         // Exact regions remain necessary for partial images and rows wider than
         // staging. Prefetch never consumes undefined texels.
         if !entry.discarded.is_empty()

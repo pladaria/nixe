@@ -26,7 +26,6 @@ pub const CONFIG_VERSION: u32 = 2;
 pub struct GpuConfig {
     pub shader_entries: usize,
     pub pipeline_entries: usize,
-    pub descriptor_sets: usize,
     pub persistent_bytes: u64,
 }
 impl Default for GpuConfig {
@@ -34,7 +33,6 @@ impl Default for GpuConfig {
         Self {
             shader_entries: 2048,
             pipeline_entries: 8192,
-            descriptor_sets: 4096,
             persistent_bytes: 128 * 1024 * 1024,
         }
     }
@@ -459,8 +457,6 @@ struct RawGpuConfig {
     shader_cache_entries: usize,
     #[serde(default = "default_pipeline_cache_entries")]
     pipeline_cache_entries: usize,
-    #[serde(default = "default_descriptor_sets")]
-    descriptor_sets: usize,
     #[serde(default = "default_persistent_pipeline_cache_mib")]
     persistent_pipeline_cache_mib: u64,
 }
@@ -470,7 +466,6 @@ impl Default for RawGpuConfig {
         Self {
             shader_cache_entries: default_shader_cache_entries(),
             pipeline_cache_entries: default_pipeline_cache_entries(),
-            descriptor_sets: default_descriptor_sets(),
             persistent_pipeline_cache_mib: default_persistent_pipeline_cache_mib(),
         }
     }
@@ -591,9 +586,6 @@ fn default_shader_cache_entries() -> usize {
 fn default_pipeline_cache_entries() -> usize {
     GpuConfig::default().pipeline_entries
 }
-fn default_descriptor_sets() -> usize {
-    GpuConfig::default().descriptor_sets
-}
 fn default_persistent_pipeline_cache_mib() -> u64 {
     GpuConfig::default().persistent_bytes / (1024 * 1024)
 }
@@ -609,7 +601,6 @@ fn gpu_cache_configuration(path: &Path, raw: RawGpuConfig) -> Result<GpuConfig, 
     for (name, count) in [
         ("shader_cache_entries", raw.shader_cache_entries as u64),
         ("pipeline_cache_entries", raw.pipeline_cache_entries as u64),
-        ("descriptor_sets", raw.descriptor_sets as u64),
         ("persistent_pipeline_cache_mib", persistent_bytes),
     ] {
         if count == 0 {
@@ -622,7 +613,6 @@ fn gpu_cache_configuration(path: &Path, raw: RawGpuConfig) -> Result<GpuConfig, 
     Ok(GpuConfig {
         shader_entries: raw.shader_cache_entries,
         pipeline_entries: raw.pipeline_cache_entries,
-        descriptor_sets: raw.descriptor_sets,
         persistent_bytes,
     })
 }
@@ -1090,20 +1080,17 @@ mod tests {
                 [gpu]
                 shader_cache_entries = 512
                 pipeline_cache_entries = 2048
-                descriptor_sets = 12
                 persistent_pipeline_cache_mib = 96
             "#,
         );
         let config = NixeConfig::load(&explicit.path).unwrap();
         assert_eq!(config.gpu.shader_entries, 512);
         assert_eq!(config.gpu.pipeline_entries, 2_048);
-        assert_eq!(config.gpu.descriptor_sets, 12);
         assert_eq!(config.gpu.persistent_bytes, 96 * 1024 * 1024);
 
         for setting in [
             "shader_cache_entries = 0",
             "pipeline_cache_entries = 0",
-            "descriptor_sets = 0",
             "persistent_pipeline_cache_mib = 0",
         ] {
             let invalid = TemporaryConfig::new(&format!(

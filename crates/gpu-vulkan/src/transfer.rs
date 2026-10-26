@@ -15,14 +15,13 @@ impl VulkanDevice {
             AllocationMode::Managed,
             "transfer device buffer",
         )?;
-        let (index, source_slice) = self.submission.reserve_upload(&mut self.dispatch, bytes)?;
-        let (_, destination_slice, ticket) = self
+        let source_slice = self.submission.reserve_upload(&mut self.dispatch, bytes)?;
+        let (destination_slice, ticket) = self
             .submission
             .reserve_readback(&mut self.dispatch, bytes.len() as u64)?;
 
-        let slot = &self.submission.slots[index];
-        let upload = slot.upload_buffer(source_slice).handle;
-        let download = slot.readback_buffer(destination_slice).handle;
+        let upload = self.submission.staging_buffer(&source_slice).handle;
+        let download = self.submission.staging_buffer(&destination_slice).handle;
         let middle = device_buffer.handle;
         let region = [vk::BufferCopy::default()
             .src_offset(source_slice.offset)
@@ -81,14 +80,13 @@ impl VulkanDevice {
             mode,
             "transfer image",
         )?;
-        let (index, source_slice) = self.submission.reserve_upload(&mut self.dispatch, bytes)?;
-        let (_, destination_slice, ticket) = self
+        let source_slice = self.submission.reserve_upload(&mut self.dispatch, bytes)?;
+        let (destination_slice, ticket) = self
             .submission
             .reserve_readback(&mut self.dispatch, bytes.len() as u64)?;
 
-        let slot = &self.submission.slots[index];
-        let upload = slot.upload_buffer(source_slice).handle;
-        let download = slot.readback_buffer(destination_slice).handle;
+        let upload = self.submission.staging_buffer(&source_slice).handle;
+        let download = self.submission.staging_buffer(&destination_slice).handle;
         let image_handle = image.handle;
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)

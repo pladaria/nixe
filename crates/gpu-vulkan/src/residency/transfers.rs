@@ -16,15 +16,7 @@ impl VulkanResidency {
         let pattern = value.to_le_bytes();
         let prefix = ((4 - offset % 4) % 4).min(size);
         if prefix != 0 {
-            let mut copied = 0;
-            while copied < prefix {
-                let upload = self.write_buffer(
-                    id,
-                    offset + copied,
-                    &pattern[copied as usize..prefix as usize],
-                )?;
-                copied += upload.consumed as u64;
-            }
+            self.write_buffer(id, offset, &pattern[..prefix as usize])?;
         }
         let middle = (size - prefix) / 4 * 4;
         if middle != 0 {
@@ -40,15 +32,7 @@ impl VulkanResidency {
             let bytes: Vec<_> = (0..tail)
                 .map(|i| pattern[((prefix + middle + i) % 4) as usize])
                 .collect();
-            let mut copied = 0;
-            while copied < tail {
-                let upload = self.write_buffer(
-                    id,
-                    offset + prefix + middle + copied,
-                    &bytes[copied as usize..],
-                )?;
-                copied += upload.consumed as u64;
-            }
+            self.write_buffer(id, offset + prefix + middle, &bytes)?;
         }
         self.device.work_ticket()
     }

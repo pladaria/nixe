@@ -1,7 +1,7 @@
 use super::super::tests::{backing_allocation, cache, cpu_read};
 use super::*;
 use crate::test_shaders::{self, Shader};
-use crate::{ApiPreference, QueueConfiguration, cache::*, queue::QueueState};
+use crate::{ApiPreference, cache::*};
 use nixe_gpu::{ShaderStage, shader_module as spirv, shader_module::ResourceId};
 use nixe_shader_recompiler::{
     Stage,
@@ -480,10 +480,10 @@ fn consecutive_draws_synchronize_inputs_and_observe_intervening_gpu_writes() {
         }
     }
     let replacement = vertex_bytes([1., 1., 0.]);
-    let upload = cache
+    cache
         .write_buffer(vertex.buffer, vertex.offset, &replacement)
         .unwrap();
-    assert_eq!(upload.consumed, replacement.len());
+
     cache
         .draw(
             &draw,
@@ -519,19 +519,6 @@ fn raster(api: ApiPreference, inline: bool, large: bool) {
         return;
     };
     let validation = cache.device.validation_monitor();
-    if inline {
-        cache.device.submission = QueueState::new(
-            Arc::clone(&cache.device.owner),
-            cache.device.queues().graphics_compute_family,
-            QueueConfiguration {
-                command_slots: 2,
-                arena_bytes: 512,
-                overflow_bytes: 0,
-            },
-            &cache.device.dispatch,
-        )
-        .unwrap();
-    }
     let compilers = Compilers::new(&cache);
     let shader = compilers.shader(&cache, vertex_fragment());
     let (color, backing, _image_allocation) = image(
@@ -637,11 +624,6 @@ fn raster(api: ApiPreference, inline: bool, large: bool) {
         .unwrap();
     drop(prepared);
     cache.flush().unwrap();
-    if inline {
-        assert!(cache.device.queue_usage().command_slots <= 2);
-        assert!(cache.device.queue_usage().overflow_capacity == 0);
-        assert!(cache.device.queue_usage().submitted_tick >= 3);
-    }
     let result = cpu_read(&mut cache, &backing);
     for y in 0..8 {
         for x in 0..8 {
@@ -744,14 +726,6 @@ fn compute(api: ApiPreference) {
     let result = cpu_read(&mut cache, &backing);
     assert_eq!(&result[..4], &8u32.to_le_bytes());
     assert!(result[4..].iter().all(|v| *v == 0));
-    // Descriptors belong to recording slots, including the fence publication
-    // slot. Repeated dispatches must reuse those bounded arenas.
-    let allocations = cache
-        .device()
-        .recording_statistics()
-        .stream_descriptor_allocations;
-    assert!(allocations <= cache.device().queue_usage().command_slots as u64);
-    assert!(allocations < 8);
     drop(program);
     drop(compilers);
     drop(cache);
@@ -3693,8 +3667,8 @@ fn affine_fixed_point_sampling_reverses_crops_and_preserves_destination_padding(
         .buffer_for(source_bytes.clone(), vk::BufferUsageFlags::TRANSFER_SRC)
         .unwrap()
         .buffer;
-    let uploaded = cache.write_buffer(buffer, 0, &pixels).unwrap();
-    assert_eq!(uploaded.consumed, pixels.len());
+    cache.write_buffer(buffer, 0, &pixels).unwrap();
+
     cache.ensure_image(source).unwrap();
     let view = cache
         .image_view(
@@ -4433,10 +4407,10 @@ fn uniform_visibility(unaligned: bool, size: u64) {
         &16u32.to_le_bytes(),
     )
     .unwrap();
-    let upload = cache
+    cache
         .write_buffer(input, alignment + 16, &expected.to_le_bytes())
         .unwrap();
-    assert_eq!(upload.consumed, 4);
+
     cache
         .dispatch(&program, Dispatch::Direct([1, 1, 1]), &[])
         .unwrap();

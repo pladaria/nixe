@@ -603,10 +603,7 @@ impl VulkanResidency {
         // RAM-only textures need an unswizzle, not a byte-wise competition
         // between native producers. Keep full resolution for actual aliases.
         // https://github.com/eden-emulator/mirror/blob/master/src/video_core/texture_cache/texture_cache.h
-        let dense_rows = planes.iter().all(|p| {
-            p.row_pitch == p.row_bytes()
-                && p.row_pitch <= self.device.submission.configuration.arena_bytes
-        });
+        let dense_rows = planes.iter().all(|p| p.row_pitch == p.row_bytes());
         let cpu_only = canonical_import
             && dense_rows
             && geometry.iter().all(|f| !self.authority.has_writers(f));
@@ -764,67 +761,64 @@ impl VulkanResidency {
     ) -> Result<(), VulkanError> {
         debug_assert!(offset.is_multiple_of(plane.row_pitch));
         debug_assert!((bytes.len() as u64).is_multiple_of(plane.row_pitch));
-        let rows = self.device.submission.configuration.arena_bytes / plane.row_pitch;
-        let chunk_bytes = (rows * plane.row_pitch) as usize;
-        for (chunk, bytes) in bytes.chunks(chunk_bytes).enumerate() {
-            let row = (offset + (chunk * chunk_bytes) as u64) / plane.row_pitch;
-            let y = row as u32 * plane.block_extent.height;
-            let height = (bytes.len() as u64 / plane.row_pitch) as u32 * plane.block_extent.height;
-            let height = height.min(plane.extent.height - y);
-            let (slot, slice) =
-                self.reserve_upload(bytes, u64::from(plane.bytes_per_block).max(4))?;
-            let (image, layout) = self.image_access_subresources(
-                id,
-                commands::plane_range(plane),
-                AccessScope::new(
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                ),
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            )?;
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(slice.offset)
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(plane.aspect)
-                        .mip_level(plane.mip_level)
-                        .base_array_layer(plane.array_layer)
-                        .layer_count(1),
-                )
-                .image_offset(vk::Offset3D {
-                    x: 0,
-                    y: y as i32,
-                    z: plane.depth_slice as i32,
-                })
-                .image_extent(vk::Extent3D {
+        let row = offset / plane.row_pitch;
+        let y = row as u32 * plane.block_extent.height;
+        let height = (bytes.len() as u64 / plane.row_pitch) as u32 * plane.block_extent.height;
+        let height = height.min(plane.extent.height - y);
+        let slice = self.device.submission.reserve_upload_aligned(
+            &mut self.device.dispatch,
+            bytes,
+            u64::from(plane.bytes_per_block).max(4),
+        )?;
+        let (image, layout) = self.image_access_subresources(
+            id,
+            commands::plane_range(plane),
+            AccessScope::new(
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            ),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        )?;
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(slice.offset)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(plane.aspect)
+                    .mip_level(plane.mip_level)
+                    .base_array_layer(plane.array_layer)
+                    .layer_count(1),
+            )
+            .image_offset(vk::Offset3D {
+                x: 0,
+                y: y as i32,
+                z: plane.depth_slice as i32,
+            })
+            .image_extent(vk::Extent3D {
+                width: plane.extent.width,
+                height,
+                depth: 1,
+            });
+        self.barriers.emit(&mut self.device);
+        unsafe {
+            self.device.dispatch.cmd_copy_buffer_to_image(
+                self.device.submission.staging_buffer(&slice).handle,
+                image,
+                layout,
+                &[region],
+            );
+        }
+        self.define_image_rect(
+            id,
+            plane,
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: y as i32 },
+                extent: vk::Extent2D {
                     width: plane.extent.width,
                     height,
-                    depth: 1,
-                });
-            self.barriers.emit(&mut self.device);
-            unsafe {
-                self.device.dispatch.cmd_copy_buffer_to_image(
-                    self.device.submission.slots[slot]
-                        .upload_buffer(slice)
-                        .handle,
-                    image,
-                    layout,
-                    &[region],
-                );
-            }
-            self.define_image_rect(
-                id,
-                plane,
-                vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: y as i32 },
-                    extent: vk::Extent2D {
-                        width: plane.extent.width,
-                        height,
-                    },
                 },
-            );
-            self.statistics.cpu_uploaded_bytes += bytes.len() as u64;
-        }
+            },
+        );
+        self.statistics.cpu_uploaded_bytes += bytes.len() as u64;
         Ok(())
     }
     pub(super) fn copy_rows_to_image(

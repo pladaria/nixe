@@ -4,6 +4,22 @@ use crate::{BufferBinding, device::DeviceOwner};
 use std::collections::HashMap;
 
 const DESCRIPTOR_CAPACITY: usize = 256;
+struct DescriptorArena {
+    buffer: Arc<AllocatedBuffer>,
+    cursor: u64,
+}
+impl DescriptorArena {
+    fn reserve_aligned(&mut self, size: u64, alignment: u64) -> Option<u64> {
+        let start =
+            crate::queue::align_up(self.cursor, self.buffer.host_alignment().max(alignment))?;
+        let end = start.checked_add(size)?;
+        if end > self.buffer.size() {
+            return None;
+        }
+        self.cursor = crate::queue::align_up(end, self.buffer.host_alignment())?;
+        Some(start)
+    }
+}
 #[derive(Clone, Copy)]
 enum BindingData {
     Set(vk::DescriptorSet),
@@ -12,7 +28,7 @@ enum BindingData {
 pub(crate) struct Descriptors {
     pool: vk::DescriptorPool,
     cache: HashMap<(vk::DescriptorSetLayout, vk::Buffer, u64), BindingData>,
-    arena: Option<crate::queue::Arena>,
+    arena: Option<DescriptorArena>,
     address: vk::DeviceAddress,
     last: Option<((vk::DescriptorSetLayout, vk::Buffer, u64), BindingData)>,
 }
@@ -137,7 +153,9 @@ impl VulkanResidency {
         };
         if binding != BufferBinding::DeviceAddress && data.is_none() {
             if self.device.submission.slots[index].descriptors.cache.len() == DESCRIPTOR_CAPACITY {
-                return Err(VulkanError::DescriptorPressure);
+                return Err(VulkanError::InvalidResource(
+                    "binding probe descriptor storage exhausted",
+                ));
             }
             if binding == BufferBinding::DescriptorSet {
                 let descriptors = &mut self.device.submission.slots[index].descriptors;
@@ -235,16 +253,19 @@ impl VulkanResidency {
                     }
                     let descriptors = &mut self.device.submission.slots[index].descriptors;
                     descriptors.address = address;
-                    descriptors.arena = Some(crate::queue::Arena {
+                    descriptors.arena = Some(DescriptorArena {
                         buffer: Arc::new(allocated),
                         cursor: 0,
                     });
                 }
                 let descriptors = &mut self.device.submission.slots[index].descriptors;
                 let arena = descriptors.arena.as_mut().expect("descriptor arena");
-                let offset = arena
-                    .reserve_aligned(size, alignment)
-                    .ok_or(VulkanError::DescriptorPressure)?;
+                let offset =
+                    arena
+                        .reserve_aligned(size, alignment)
+                        .ok_or(VulkanError::InvalidResource(
+                            "binding probe descriptor storage exhausted",
+                        ))?;
                 // Atom-isolated descriptor bytes are immutable until this slot completes.
                 unsafe {
                     arena
@@ -275,18 +296,8 @@ impl VulkanResidency {
         let slot = &mut self.device.submission.slots[index];
 
         slot.bound_compute = 0;
-        slot.bound_set = vk::DescriptorSet::null();
-        slot.bound_descriptor_buffer = 0;
-        slot.bound_descriptor_offset = u64::MAX;
-        if let Some(binding) = data {
-            match binding {
-                BindingData::Set(set) => slot.bound_set = set,
-                BindingData::Buffer(address, offset) => {
-                    slot.bound_descriptor_buffer = address;
-                    slot.bound_descriptor_offset = offset;
-                }
-            }
-        }
+        // This explicit diagnostic bind invalidates the producer's prepared binding.
+        slot.bound_compute_binding = 0;
         let extension = self.descriptor_dispatch.clone();
         // The probe uses the same typed command arena and worker context as
         // guest graphics; no drain or owner-thread command recording is needed.

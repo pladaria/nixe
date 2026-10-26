@@ -233,72 +233,48 @@ impl VulkanResidency {
         let mut decoder = std::mem::take(&mut self.decoder);
         let result = (|| {
             let format = codec(encoded.format).unwrap();
-            // Decode into bounded upload rectangles, as Eden's conversion path
-            // does for staging copies, rather than issuing a copy per block.
-            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
-            let limit = self.device.submission.configuration.arena_bytes;
+            // Decode and upload each plane as one request; staging can grow
+            // instead of splitting the image to fit a command-slot arena.
             let mut pixels = Vec::new();
             for (source, target) in encoded.planes.iter().zip(native.iter().copied()) {
                 let (bw, bh) = (source.block_extent.width, source.block_extent.height);
-                let pixel_bytes = u64::from(target.bytes_per_block);
-                let block_bytes = u64::from(bw) * u64::from(bh) * pixel_bytes;
-                if limit < block_bytes {
-                    return Err(VulkanError::InvalidResource(
-                        "upload arena cannot hold a decoded block",
-                    ));
-                }
-                let columns = source.extent.width.div_ceil(bw);
-                let tile_columns = columns.min((limit / block_bytes) as u32);
-                let tile_width = (tile_columns * bw).min(source.extent.width);
-                let tile_rows = (limit / (u64::from(tile_width) * pixel_bytes * u64::from(bh)))
-                    .max(1)
-                    .min(u64::from(source.rows())) as u32;
-                for first_row in (0..source.rows()).step_by(tile_rows as usize) {
-                    let rows = tile_rows.min(source.rows() - first_row);
-                    let height = (rows * bh).min(source.extent.height - first_row * bh);
-                    for first_column in (0..columns).step_by(tile_columns as usize) {
-                        let count = tile_columns.min(columns - first_column);
-                        let width = (count * bw).min(source.extent.width - first_column * bw);
-                        let pitch = width as usize * pixel_bytes as usize;
-                        pixels.resize(pitch * height as usize, 0);
-                        for row in first_row..first_row + rows {
-                            for column in first_column..first_column + count {
-                                let offset = source.offset
-                                    + u64::from(row) * source.row_pitch
-                                    + u64::from(column) * u64::from(source.bytes_per_block);
-                                let block = &captured[offset as usize
-                                    ..offset as usize + source.bytes_per_block as usize];
-                                let w = bw.min(source.extent.width - column * bw);
-                                let h = bh.min(source.extent.height - row * bh);
-                                let decoded = decoder.decode(format, w, h, block).map_err(|e| {
-                                    VulkanError::TextureDecode(e.to_string().into())
-                                })?;
-                                let row_bytes = w as usize * pixel_bytes as usize;
-                                for y in 0..h as usize {
-                                    let to = ((row - first_row) * bh) as usize * pitch
-                                        + y * pitch
-                                        + ((column - first_column) * bw) as usize
-                                            * pixel_bytes as usize;
-                                    pixels[to..to + row_bytes].copy_from_slice(
-                                        &decoded[y * row_bytes..(y + 1) * row_bytes],
-                                    );
-                                }
-                            }
+                let pixel_bytes = target.bytes_per_block as usize;
+                let pitch = source.extent.width as usize * pixel_bytes;
+                pixels.resize(pitch * source.extent.height as usize, 0);
+                for row in 0..source.rows() {
+                    for column in 0..source.extent.width.div_ceil(bw) {
+                        let offset = source.offset
+                            + u64::from(row) * source.row_pitch
+                            + u64::from(column) * u64::from(source.bytes_per_block);
+                        let block = &captured
+                            [offset as usize..offset as usize + source.bytes_per_block as usize];
+                        let width = bw.min(source.extent.width - column * bw);
+                        let height = bh.min(source.extent.height - row * bh);
+                        let decoded = decoder
+                            .decode(format, width, height, block)
+                            .map_err(|e| VulkanError::TextureDecode(e.to_string().into()))?;
+                        let row_bytes = width as usize * pixel_bytes;
+                        for y in 0..height as usize {
+                            let to = (row * bh) as usize * pitch
+                                + y * pitch
+                                + (column * bw) as usize * pixel_bytes;
+                            pixels[to..to + row_bytes]
+                                .copy_from_slice(&decoded[y * row_bytes..(y + 1) * row_bytes]);
                         }
-                        self.upload_decoded_rect(
-                            id,
-                            target,
-                            vk::Rect2D {
-                                offset: vk::Offset2D {
-                                    x: (first_column * bw) as i32,
-                                    y: (first_row * bh) as i32,
-                                },
-                                extent: vk::Extent2D { width, height },
-                            },
-                            &pixels,
-                        )?;
                     }
                 }
+                self.upload_decoded_rect(
+                    id,
+                    target,
+                    vk::Rect2D {
+                        offset: vk::Offset2D::default(),
+                        extent: vk::Extent2D {
+                            width: source.extent.width,
+                            height: source.extent.height,
+                        },
+                    },
+                    &pixels,
+                )?;
             }
             let work = self.device.work_ticket()?;
             let image = self.images[id.slot].entry.as_mut().unwrap();
@@ -324,7 +300,10 @@ impl VulkanResidency {
         rect: vk::Rect2D,
         pixels: &[u8],
     ) -> Result<(), VulkanError> {
-        let (slot, slice) = self.reserve_upload(pixels, 4)?;
+        let slice =
+            self.device
+                .submission
+                .reserve_upload_aligned(&mut self.device.dispatch, pixels, 4)?;
         let (image, layout) = self.image_access_subresources(
             id,
             commands::plane_range(p),
@@ -350,9 +329,7 @@ impl VulkanResidency {
         self.barriers.emit(&mut self.device);
         unsafe {
             self.device.dispatch.cmd_copy_buffer_to_image(
-                self.device.submission.slots[slot]
-                    .upload_buffer(slice)
-                    .handle,
+                self.device.submission.staging_buffer(&slice).handle,
                 image,
                 layout,
                 &[region],

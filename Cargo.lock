@@ -1417,7 +1417,7 @@ dependencies = [
  "rustc-hash",
  "smallvec",
  "tempfile",
- "twox-hash",
+ "x11-dl",
 ]
 
 [[package]]

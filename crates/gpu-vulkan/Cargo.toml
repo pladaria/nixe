@@ -8,7 +8,6 @@ license.workspace = true
 nixe-memory.workspace = true
 smallvec = "1"
 rustc-hash.workspace = true
-twox-hash.workspace = true
 ash.workspace = true
 ash-window.workspace = true
 gpu-allocator.workspace = true
@@ -30,3 +29,6 @@ required-features = ["binding-probe"]
 [dev-dependencies]
 rspirv = "0.13"
 tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11-dl = "2.21"

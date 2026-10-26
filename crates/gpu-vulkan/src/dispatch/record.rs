@@ -22,22 +22,42 @@ impl Dispatch {
             Ok(())
         });
     }
-    pub unsafe fn cmd_bind_descriptor_sets(
+    pub(crate) unsafe fn bind_descriptors(
         &mut self,
         point: vk::PipelineBindPoint,
-        layout: vk::PipelineLayout,
-        first: u32,
-        sets: &[vk::DescriptorSet],
+        record: std::sync::Arc<crate::cache::BindingRecord>,
         offsets: &[u32],
     ) {
         unsafe {
             self.recorder
-                .record_pair(sets, offsets, move |context, sets, offsets| {
+                .record_array(offsets, move |context, offsets| {
                     context.flush_draw();
-                    let command = context.command;
-                    let device = &context.device;
-
-                    device.cmd_bind_descriptor_sets(command, point, layout, first, sets, offsets);
+                    let (progress, tick) =
+                        context.progress.as_ref().expect("active native context");
+                    let native =
+                        context
+                            .descriptors
+                            .resolve(&record, *tick, progress, context.timeline)?;
+                    if context
+                        .descriptor_pools
+                        .insert(std::sync::Arc::as_ptr(&native.pool) as usize)
+                    {
+                        // Retain each actual pool once per command context, even
+                        // if the worker unwinds before an older GPU use finishes.
+                        context
+                            .slot
+                            .as_ref()
+                            .expect("active native context")
+                            .retain_descriptor_pool(std::sync::Arc::clone(&native.pool));
+                    }
+                    context.device.cmd_bind_descriptor_sets(
+                        context.command,
+                        point,
+                        record.layout.handle,
+                        0,
+                        &[native.handle],
+                        offsets,
+                    );
                     Ok(())
                 });
         }
@@ -259,6 +279,35 @@ impl Dispatch {
             unsafe { device.cmd_set_depth_bounds(command, minimum, maximum) };
             Ok(())
         });
+    }
+    /// Only copies whose destination has no preceding native use may move here.
+    pub unsafe fn cmd_upload_buffer(
+        &mut self,
+        source: vk::Buffer,
+        destination: vk::Buffer,
+        regions: &[vk::BufferCopy],
+        preceding: crate::AccessScope,
+    ) {
+        unsafe {
+            self.recorder
+                .record_array(regions, move |context, regions| {
+                    if !preceding.stages.is_empty() {
+                        let barriers = [vk::MemoryBarrier2::default()
+                            .src_stage_mask(preceding.stages)
+                            .src_access_mask(preceding.access)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
+                        (context.functions.barrier)(
+                            context.upload,
+                            &vk::DependencyInfo::default().memory_barriers(&barriers),
+                        );
+                    }
+                    context
+                        .device
+                        .cmd_copy_buffer(context.upload, source, destination, regions);
+                    Ok(())
+                });
+        }
     }
     pub unsafe fn cmd_copy_buffer(
         &mut self,

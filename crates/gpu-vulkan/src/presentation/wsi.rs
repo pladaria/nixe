@@ -34,7 +34,6 @@ struct Context {
     timeline: vk::Semaphore,
     mutable_format: bool,
     vsync: bool,
-    acquire_count: usize,
 }
 impl Context {
     fn completed(&self) -> Result<u64, VulkanError> {
@@ -143,13 +142,8 @@ struct Swapchains {
 impl Swapchains {
     pub fn new(device: &Context) -> Result<Self, VulkanError> {
         let family = device.queues.present_family.unwrap();
-        let present_queue = unsafe {
-            device
-                .owner
-                .device
-                .get_device_queue(family, device.queues.present_queue_index)
-        };
-        let mut result = Self {
+        let present_queue = unsafe { device.owner.device.get_device_queue(family, 0) };
+        let result = Self {
             owner: Arc::clone(&device.owner),
             current: None,
             retired: Vec::new(),
@@ -161,30 +155,31 @@ impl Swapchains {
             safe_to_drop: true,
             vsync: device.vsync,
         };
-        for _ in 0..device.acquire_count {
+        Ok(result)
+    }
+    fn reserve_acquires(&mut self, count: usize) -> Result<(), VulkanError> {
+        while self.acquires.len() < count {
             let semaphore = unsafe {
-                result
-                    .owner
+                self.owner
                     .device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
             }
             .map_err(|e| VulkanError::vk("acquire semaphore", e))?;
-            result.acquires.push(Acquire {
+            self.acquires.push(Acquire {
                 semaphore,
                 fence: vk::Fence::null(),
                 work: None,
                 issued: false,
             });
             let fence = unsafe {
-                result
-                    .owner
+                self.owner
                     .device
                     .create_fence(&vk::FenceCreateInfo::default(), None)
             }
             .map_err(|e| VulkanError::vk("acquire fence", e))?;
-            result.acquires.last_mut().unwrap().fence = fence;
+            self.acquires.last_mut().unwrap().fence = fence;
         }
-        Ok(result)
+        Ok(())
     }
     pub fn resize(&mut self, size: [u32; 2]) {
         if size != self.requested {
@@ -396,6 +391,7 @@ impl Swapchains {
             }
             .map_err(|e| VulkanError::vk("present release fence", e))?;
         }
+        self.reserve_acquires(chain.images.len())?;
         if let Some(old) = self.current.replace(chain) {
             self.retired.push(old);
         }
@@ -607,8 +603,8 @@ impl Drop for Swapchains {
 }
 
 /// All operations externally synchronized against a swapchain stay on this
-/// worker, including acquire/recreate/release. Its VkQueue is distinct from
-/// the graphics queue; a blocked driver present cannot stop guest execution.
+/// worker, including acquire/recreate/release. Submit and present synchronize
+/// their native queue calls with the scheduler, including a shared VkQueue.
 pub(crate) struct Presenter {
     sender: mpsc::SyncSender<Command>,
     receiver: mpsc::Receiver<Event>,
@@ -653,13 +649,10 @@ impl Presenter {
             queues: crate::device::QueueSelection {
                 graphics_compute_family: device.queues().graphics_compute_family,
                 present_family: device.queues().present_family,
-                present_queue_index: device.queues().present_queue_index,
             },
             timeline: device.submission.timeline,
             mutable_format: device.profile().swapchain_mutable_format,
             vsync,
-            // Pools are allocated lazily; use configured capacity at startup.
-            acquire_count: device.submission.configuration.command_slots,
         };
         let mut chains = Swapchains::new(&context)?;
         let (sender, commands) = mpsc::sync_channel(2);
@@ -713,6 +706,7 @@ impl Presenter {
                                 events
                                     .send(Event::Idle)
                                     .map_err(|_| VulkanError::QueueStopped)?;
+                                client.wake_owner();
                             }
                             None => {}
                         }
@@ -724,6 +718,10 @@ impl Presenter {
                             events
                                 .send(Event::Acquired(frame))
                                 .map_err(|_| VulkanError::QueueStopped)?;
+                            // Publish availability before waking the owner that
+                            // consumes it; no unrelated packet is needed to advance.
+                            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_present_manager.cpp
+                            client.wake_owner();
                             handed_off = true;
                         }
                     }
@@ -806,3 +804,6 @@ impl Drop for Presenter {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests;

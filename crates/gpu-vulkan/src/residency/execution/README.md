@@ -7,7 +7,8 @@ and tested offscreen.
 
 Prepare a pipeline on the compilation pool, then prepare its program, graphics
 parameters, attachments and vertex/index streams when those inputs change.
-`prepare_program` resolves resident IDs and gets an immutable descriptor record.
+`prepare_program` resolves resident IDs and access metadata. Consumption resolves
+native descriptor payloads through the growing layout banks.
 SPIR-V reflection determines buffer/image read and write scopes, including actual
 shader stages. Simultaneous overlapping bindings are unioned before recording.
 A caller cannot omit shader writes from native hazards or canonical publication.
@@ -28,7 +29,7 @@ Read-only draws with compatible LOAD/STORE targets retain a dynamic-rendering
 instance across frontend deliveries, including changed pipeline parameters,
 descriptors and physical vertex bindings. Vertex/index/shader reads cannot alias
 attachment writes. Small CPU-authored shader/vertex inputs can consume immutable
-mapped arena snapshots without a transfer; GPU-authored inputs retain native
+mapped stream slices without a transfer; GPU-authored inputs retain native
 imports. Transfers, real hazards, shader writes, changed targets and explicit
 ordering terminate rendering. Push, vertex/index, pipeline, descriptor and
 graphics-state caches reset on every new command buffer. Compatible parameters
@@ -145,8 +146,8 @@ Native BC uses real compressed storage even for non-block-aligned base dimension
 eliminating the WebGPU size workaround. Unsupported host ASTC/BC formats use the
 shared exact `texture_decode` implementation. Decoded images observe encoded
 canonical bytes and are read-only representations; they never claim to write back
-encoded data. Modified images are decoded into bounded staging rectangles and
-uploaded in batches; unchanged reads do no work. Linear ASTC retains FP16 output; sRGB retains the specified UNORM8 decode.
+encoded data. Modified planes are decoded and uploaded through shared staging
+without splitting them to fit a command-context budget; unchanged reads do no work. Linear ASTC retains FP16 output; sRGB retains the specified UNORM8 decode.
 GPU-written encoded bytes require real CPU visibility for this CPU decoder.
 A future GPU decoder is a measured optimization, not a reason to approximate ASTC.
 

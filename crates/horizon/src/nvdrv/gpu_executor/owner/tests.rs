@@ -793,7 +793,7 @@ fn stopping_with_suspended_channels_releases_admission_without_emitting_effects(
 }
 
 #[test]
-fn idle_owner_submits_pending_native_work_at_its_deadline_without_new_commands() {
+fn idle_owner_publishes_explicit_fences_without_new_commands() {
     use super::super::super::super::{
         NvDrvDescriptorOwner, NvDrvDeviceKind, NvDrvFileDescriptor, NvDrvPermissionProfile,
         NvDrvSessionId,
@@ -839,7 +839,7 @@ fn idle_owner_submits_pending_native_work_at_its_deadline_without_new_commands()
     };
     assert!(native.consume(&work).unwrap());
     let token = native.submit(work.frontend).unwrap();
-    assert!(native.pending_submit_deadline().is_some());
+
     let backend = Rc::new(RefCell::new(Some(native)));
     let owner = Rc::new(RefCell::new(Owner::new(
         &receiver,

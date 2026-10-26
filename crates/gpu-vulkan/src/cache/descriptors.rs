@@ -1,12 +1,12 @@
-//! Immutable descriptor records. Content uploads are not binding identities.
-//! Pooled sets are never individually freed or updated while in flight.
+//! Owned descriptor captures; native allocation/update runs on the recording worker.
+//! Native set history contains handles and completion ticks, never resource payloads.
 use super::*;
 use crate::{AllocatedBuffer, AllocatedImageView, VulkanDevice, VulkanError, device::DeviceOwner};
 use ash::{vk, vk::Handle};
 use rustc_hash::FxHashMap as HashMap;
-use std::{
-    hash::{Hash, Hasher},
-    sync::Arc,
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicU64, Ordering},
 };
 
 pub struct Sampler {
@@ -120,119 +120,196 @@ impl DescriptorResource {
         })
     }
 }
-// Borrowed lookups allocate and retain resources only on a real miss.
-struct Key<'a> {
-    layout: &'a LayoutKey,
-    resources: &'a [DescriptorResource],
+// A cached descriptor identity keeps weak object identities, not CPU reservations.
+// The weak control blocks prevent handle/address reuse from matching dead objects.
+struct CachedResource {
+    key: ResourceKey,
+    references: ResourceReferences,
 }
-impl Hash for Key<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.layout.hash(state);
-        self.resources.len().hash(state);
-        for resource in self.resources {
-            resource.key().hash(state);
+enum ResourceReferences {
+    Null,
+    Buffer(Weak<AllocatedBuffer>),
+    Image(Weak<AllocatedImageView>),
+    Combined(Weak<AllocatedImageView>, Weak<Sampler>),
+    Sampler(Weak<Sampler>),
+}
+impl CachedResource {
+    fn new(resource: &DescriptorResource) -> Self {
+        let references = match resource {
+            DescriptorResource::NullBuffer => ResourceReferences::Null,
+            DescriptorResource::Buffer { buffer, .. }
+            | DescriptorResource::TexelBuffer { buffer, .. } => {
+                ResourceReferences::Buffer(Arc::downgrade(buffer))
+            }
+            DescriptorResource::Image { view, .. } => {
+                ResourceReferences::Image(Arc::downgrade(view))
+            }
+            DescriptorResource::CombinedImageSampler { view, sampler, .. } => {
+                ResourceReferences::Combined(Arc::downgrade(view), Arc::downgrade(sampler))
+            }
+            DescriptorResource::Sampler(sampler) => {
+                ResourceReferences::Sampler(Arc::downgrade(sampler))
+            }
+        };
+        Self {
+            key: resource.key(),
+            references,
         }
     }
+    fn matches(&self, resource: &DescriptorResource) -> bool {
+        self.key == resource.key()
+            && match (&self.references, resource) {
+                (ResourceReferences::Null, DescriptorResource::NullBuffer) => true,
+                (
+                    ResourceReferences::Buffer(weak),
+                    DescriptorResource::Buffer { buffer, .. }
+                    | DescriptorResource::TexelBuffer { buffer, .. },
+                ) => weak.as_ptr() == Arc::as_ptr(buffer),
+                (ResourceReferences::Image(weak), DescriptorResource::Image { view, .. }) => {
+                    weak.as_ptr() == Arc::as_ptr(view)
+                }
+                (
+                    ResourceReferences::Combined(weak_view, weak_sampler),
+                    DescriptorResource::CombinedImageSampler { view, sampler, .. },
+                ) => {
+                    weak_view.as_ptr() == Arc::as_ptr(view)
+                        && weak_sampler.as_ptr() == Arc::as_ptr(sampler)
+                }
+                (ResourceReferences::Sampler(weak), DescriptorResource::Sampler(sampler)) => {
+                    weak.as_ptr() == Arc::as_ptr(sampler)
+                }
+                _ => false,
+            }
+    }
 }
-struct Page {
+struct LastSet {
+    resources: Vec<CachedResource>,
+    index: usize,
+}
+// Native sets grow in layout banks and recycle only after their real GPU use.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_descriptor_pool.cpp
+const SETS_GROW: usize = 16;
+pub(crate) struct DescriptorPool {
     owner: Arc<DeviceOwner>,
     handle: vk::DescriptorPool,
-    key: LayoutKey,
-    capacity: u32,
 }
-impl Drop for Page {
+impl Drop for DescriptorPool {
     fn drop(&mut self) {
-        unsafe {
-            self.owner.device.destroy_descriptor_pool(self.handle, None);
-        }
+        unsafe { self.owner.device.destroy_descriptor_pool(self.handle, None) };
     }
 }
 struct PageSlot {
-    page: Arc<Page>,
-    allocated: u32,
+    page: Arc<DescriptorPool>,
+    allocated: usize,
+}
+struct LayoutSets {
+    layout: Weak<PipelineLayout>,
+    bank: usize,
+    sets: Vec<NativeSet>,
+    next: usize,
+    last: Option<LastSet>,
+}
+struct Bank {
+    sizes: Vec<vk::DescriptorPoolSize>,
+    score: u32,
+    pages: Vec<PageSlot>,
+}
+impl Bank {
+    fn supports(&self, requested: &[vk::DescriptorPoolSize], score: u32) -> bool {
+        self.score.abs_diff(score) < 3
+            && requested.iter().all(|size| {
+                self.sizes.iter().any(|available| {
+                    available.ty == size.ty && available.descriptor_count >= size.descriptor_count
+                })
+            })
+    }
+}
+pub(crate) struct NativeSet {
+    pub handle: vk::DescriptorSet,
+    pub pool: Arc<DescriptorPool>,
+    tick: u64,
+    counters: nixe_gpu::cache_counters::CacheCounters,
+}
+impl Drop for NativeSet {
+    fn drop(&mut self) {
+        self.counters.remove_entries(1);
+    }
+}
+/// Compact native data consumed by the layout's cold update template.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) union DescriptorEntry {
+    buffer: vk::DescriptorBufferInfo,
+    image: vk::DescriptorImageInfo,
+    texel: vk::BufferView,
 }
 pub struct BindingRecord {
-    pub(crate) set: vk::DescriptorSet,
     pub layout: Arc<PipelineLayout>,
-    _page: Arc<Page>,
-    pub(crate) resources: Box<[DescriptorResource]>,
-    _texel_views: Vec<BufferView>,
+    pub(crate) resources: Vec<DescriptorResource>,
+    entries: Vec<DescriptorEntry>,
+    metrics: Arc<NativeMetrics>,
+    counters: nixe_gpu::cache_counters::CacheCounters,
+    sets_per_pool: usize,
 }
-struct BufferView {
-    owner: Arc<DeviceOwner>,
-    handle: vk::BufferView,
-    _buffer: Arc<AllocatedBuffer>,
-}
-impl Drop for BufferView {
-    fn drop(&mut self) {
-        unsafe {
-            self.owner.device.destroy_buffer_view(self.handle, None);
-        }
-    }
+#[derive(Default)]
+struct NativeMetrics {
+    allocated: AtomicU64,
+    updates: AtomicU64,
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DescriptorStatistics {
     pub hits: u64,
     pub allocated: u64,
     pub updates: u64,
-    pub resets: u64,
-}
-struct Entry {
-    record: Arc<BindingRecord>,
-    touched: u64,
 }
 pub struct DescriptorCache {
     owner: Arc<DeviceOwner>,
     null_descriptor: bool,
     limits: vk::PhysicalDeviceLimits,
-    maximum: usize,
-    pages: Vec<PageSlot>,
-    records: HashMap<u128, Entry>,
-    clock: u64,
-    statistics: DescriptorStatistics,
+    sets_per_pool: usize,
+    last: HashMap<vk::DescriptorSetLayout, Weak<BindingRecord>>,
+    formats: HashMap<vk::Format, vk::FormatFeatureFlags>,
+    hits: u64,
+    metrics: Arc<NativeMetrics>,
     counters: nixe_gpu::cache_counters::CacheCounters,
 }
+/// Mutated exclusively by the Vulkan recording worker.
+#[derive(Default)]
+pub(crate) struct DescriptorAllocator {
+    layouts: HashMap<vk::DescriptorSetLayout, LayoutSets>,
+    banks: Vec<Bank>,
+}
 impl DescriptorCache {
-    pub fn new(device: &VulkanDevice, maximum: usize) -> Self {
-        Self::from_limits(
-            Arc::clone(&device.owner),
-            device.profile().limits,
-            maximum,
-            device.profile().null_descriptor,
-        )
-    }
-    pub(crate) fn from_limits(
-        owner: Arc<DeviceOwner>,
-        limits: vk::PhysicalDeviceLimits,
-        maximum: usize,
-        null_descriptor: bool,
-    ) -> Self {
+    pub fn new(device: &VulkanDevice) -> Self {
         Self {
-            owner,
-            null_descriptor,
-            limits,
-            maximum,
-            pages: Vec::new(),
-            records: HashMap::default(),
-            clock: 0,
-            statistics: Default::default(),
-            counters: nixe_gpu::cache_counters::CacheCounters::new(maximum, 0),
+            owner: Arc::clone(&device.owner),
+            null_descriptor: device.profile().null_descriptor,
+            limits: device.profile().limits,
+            // Match the reference pool sizes, including AMD's larger banks.
+            sets_per_pool: if device.profile().vendor_id == 0x1002 {
+                96
+            } else {
+                64
+            },
+            last: HashMap::default(),
+            formats: HashMap::default(),
+            hits: 0,
+            metrics: Arc::new(NativeMetrics::default()),
+            counters: nixe_gpu::cache_counters::CacheCounters::new(0, 0),
         }
     }
+    pub(crate) fn hits(&self) -> u64 {
+        self.hits
+    }
     pub fn statistics(&self) -> DescriptorStatistics {
-        self.statistics
+        DescriptorStatistics {
+            hits: self.hits,
+            allocated: self.metrics.allocated.load(Ordering::Relaxed),
+            updates: self.metrics.updates.load(Ordering::Relaxed),
+        }
     }
     pub(crate) fn cache_counters(&self) -> nixe_gpu::cache_counters::CacheCounters {
         self.counters.clone()
-    }
-    /// A host texture's allocation has ended. Pending command slots retain
-    /// their binding records; remove only the obsolete future-lookup entries.
-    pub(crate) fn forget_image(&mut self, view: &AllocatedImageView) {
-        self.records.retain(|_, entry| {
-            !entry.record.resources.iter().any(
-                |r| matches!(r.key(), ResourceKey::Image(handle, _) | ResourceKey::CombinedImageSampler(handle, _, _) if handle == view.handle.as_raw()),
-            )
-        });
     }
     pub fn get(
         &mut self,
@@ -254,25 +331,17 @@ impl DescriptorCache {
         {
             return Err(VulkanError::InvalidResource("foreign descriptor resource"));
         }
-        let key = super::fingerprint::cache_fingerprint(&Key {
-            layout: &layout.key,
-            resources,
-        });
-        self.clock = self.clock.wrapping_add(1);
-        if let Some(entry) = self.records.get_mut(&key) {
-            debug_assert!(
-                entry.record.layout.key == layout.key
-                    && entry
-                        .record
-                        .resources
-                        .iter()
-                        .map(DescriptorResource::key)
-                        .eq(resources.iter().map(DescriptorResource::key)),
-                "XXH3-128 collision or incomplete descriptor key"
-            );
-            entry.touched = self.clock;
-            self.statistics.hits += 1;
-            return Ok(Arc::clone(&entry.record));
+        if let Some(record) = self.last.get(&layout.set).and_then(Weak::upgrade)
+            && Arc::ptr_eq(&record.layout, layout)
+            && record.resources.len() == resources.len()
+            && record
+                .resources
+                .iter()
+                .map(DescriptorResource::key)
+                .eq(resources.iter().map(DescriptorResource::key))
+        {
+            self.hits += 1;
+            return Ok(record);
         }
         for (b, r) in layout.key.bindings.iter().zip(resources) {
             match (b.kind, r) {
@@ -305,14 +374,15 @@ impl DescriptorCache {
                             vk::FormatFeatureFlags::STORAGE_TEXEL_BUFFER,
                         )
                     };
-                    let properties = unsafe {
+                    let features = *self.formats.entry(*format).or_insert_with(|| unsafe {
                         self.owner
                             .instance
                             .instance
                             .get_physical_device_format_properties(self.owner.physical, *format)
-                    };
+                            .buffer_features
+                    });
                     if !buffer.usage.contains(usage)
-                        || !properties.buffer_features.contains(feature)
+                        || !features.contains(feature)
                         || *element_bytes == 0
                         || *range == 0
                         || !range.is_multiple_of(u64::from(*element_bytes))
@@ -419,225 +489,293 @@ impl DescriptorCache {
                 }
             }
         }
-        let page = self.page_for(layout)?;
-        let layouts = [layout.set];
-        let set = unsafe {
-            self.owner.device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(self.pages[page].page.handle)
-                    .set_layouts(&layouts),
-            )
-        }
-        .map_err(|e| VulkanError::vk("native descriptor allocation", e))?[0];
-        self.pages[page].allocated += 1;
-        self.counters.add_entries(1);
         self.counters.miss();
-        let buffers: Vec<_> = resources
-            .iter()
-            .map(|r| match r {
+        let mut entries = Vec::with_capacity(resources.len());
+        for resource in resources {
+            let mut entry = DescriptorEntry {
+                buffer: vk::DescriptorBufferInfo::default(),
+            };
+            match resource {
                 DescriptorResource::NullBuffer => {
-                    vk::DescriptorBufferInfo::default().range(vk::WHOLE_SIZE)
+                    entry.buffer = vk::DescriptorBufferInfo::default().range(vk::WHOLE_SIZE);
                 }
                 DescriptorResource::Buffer {
                     buffer,
                     offset,
                     range,
-                } => vk::DescriptorBufferInfo::default()
-                    .buffer(buffer.handle)
-                    .offset(*offset)
-                    .range(*range),
-                _ => Default::default(),
-            })
-            .collect();
-        let images: Vec<_> = resources
-            .iter()
-            .map(|r| match r {
-                DescriptorResource::Image { view, layout } => vk::DescriptorImageInfo::default()
-                    .image_view(view.handle)
-                    .image_layout(*layout),
-                DescriptorResource::Sampler(s) => {
-                    vk::DescriptorImageInfo::default().sampler(s.handle)
+                } => {
+                    entry.buffer = vk::DescriptorBufferInfo::default()
+                        .buffer(buffer.handle)
+                        .offset(*offset)
+                        .range(*range);
+                }
+                DescriptorResource::Image { view, layout } => {
+                    entry.image = vk::DescriptorImageInfo::default()
+                        .image_view(view.handle)
+                        .image_layout(*layout);
                 }
                 DescriptorResource::CombinedImageSampler {
                     view,
                     layout,
                     sampler,
-                } => vk::DescriptorImageInfo::default()
-                    .image_view(view.handle)
-                    .image_layout(*layout)
-                    .sampler(sampler.handle),
-                _ => Default::default(),
-            })
-            .collect();
-        let mut texel_views = Vec::new();
-        let mut texels = vec![vk::BufferView::null(); resources.len()];
-        for (index, resource) in resources.iter().enumerate() {
-            if let DescriptorResource::TexelBuffer {
-                buffer,
-                offset,
-                range,
-                format,
-                ..
-            } = resource
-            {
-                let handle = unsafe {
-                    self.owner.device.create_buffer_view(
-                        &vk::BufferViewCreateInfo::default()
-                            .buffer(buffer.handle)
-                            .format(*format)
-                            .offset(*offset)
-                            .range(*range),
-                        None,
-                    )
+                } => {
+                    entry.image = vk::DescriptorImageInfo::default()
+                        .image_view(view.handle)
+                        .image_layout(*layout)
+                        .sampler(sampler.handle);
                 }
-                .map_err(|e| VulkanError::vk("native texel buffer view", e))?;
-                texel_views.push(BufferView {
-                    owner: Arc::clone(&self.owner),
-                    handle,
-                    _buffer: Arc::clone(buffer),
-                });
-                texels[index] = handle;
+                DescriptorResource::Sampler(sampler) => {
+                    entry.image = vk::DescriptorImageInfo::default().sampler(sampler.handle);
+                }
+                DescriptorResource::TexelBuffer {
+                    buffer,
+                    offset,
+                    range,
+                    format,
+                    ..
+                } => {
+                    entry.texel = buffer.texel_view(*offset, *range, *format)?;
+                }
             }
+            entries.push(entry);
         }
-        let writes: Vec<_> = layout
-            .key
-            .bindings
-            .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                let write = vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(b.binding)
-                    .dst_array_element(b.element)
-                    .descriptor_type(b.kind);
-                if matches!(
-                    resources[i],
-                    DescriptorResource::Buffer { .. } | DescriptorResource::NullBuffer
-                ) {
-                    write.buffer_info(&buffers[i..i + 1])
-                } else if matches!(resources[i], DescriptorResource::TexelBuffer { .. }) {
-                    write.texel_buffer_view(&texels[i..i + 1])
-                } else {
-                    write.image_info(&images[i..i + 1])
-                }
-            })
-            .collect();
-        unsafe {
-            self.owner.device.update_descriptor_sets(&writes, &[]);
-        }
-        self.statistics.allocated += 1;
-        self.statistics.updates += 1;
         let record = Arc::new(BindingRecord {
-            set,
             layout: Arc::clone(layout),
-            _page: Arc::clone(&self.pages[page].page),
-            resources: resources.into(),
-            _texel_views: texel_views,
+            resources: resources.to_vec(),
+            entries,
+            metrics: Arc::clone(&self.metrics),
+            counters: self.counters.clone(),
+            sets_per_pool: self.sets_per_pool,
         });
-        self.records.insert(
-            key,
-            Entry {
-                record: Arc::clone(&record),
-                touched: self.clock,
-            },
-        );
+        // Prune dead weak keys on insertion rather than retaining obsolete layouts.
+        if !self.last.contains_key(&layout.set) {
+            self.last.retain(|_, last| last.strong_count() != 0);
+        }
+        self.last.insert(layout.set, Arc::downgrade(&record));
         Ok(record)
     }
-    fn page_for(&mut self, layout: &PipelineLayout) -> Result<usize, VulkanError> {
-        if let Some(i) = self
-            .pages
-            .iter()
-            .position(|p| p.page.key == layout.key && p.allocated < p.page.capacity)
-        {
-            return Ok(i);
-        }
-        loop {
-            if let Some(i) = self.pages.iter().position(|p| {
-                Arc::strong_count(&p.page) == 1 && (p.allocated != 0 || p.page.key != layout.key)
-            }) {
-                // Every record and GPU batch has released this page. The reset
-                // never depends on a guessed frame count or an idle wait.
-                unsafe {
-                    self.owner.device.reset_descriptor_pool(
-                        self.pages[i].page.handle,
-                        vk::DescriptorPoolResetFlags::empty(),
-                    )
-                }
-                .map_err(|e| VulkanError::vk("recycle descriptor page", e))?;
-                self.statistics.resets += 1;
-                self.counters
-                    .remove_entries(self.pages[i].allocated as usize);
-                self.pages[i].allocated = 0;
-                if self.pages[i].page.key == layout.key {
-                    return Ok(i);
-                }
-                self.pages.remove(i);
-                continue;
-            }
-            let capacity: usize = self.pages.iter().map(|p| p.page.capacity as usize).sum();
-            if capacity < self.maximum {
-                // Sparse interfaces do not reserve 64 sets before a second
-                // layout can bind. Hot layouts grow geometrically; total native
-                // pool capacity still obeys the configured hard budget.
-                let growth = self
-                    .pages
-                    .iter()
-                    .filter(|p| p.page.key == layout.key)
-                    .map(|p| p.page.capacity)
-                    .max()
-                    .map_or(4, |count| count.saturating_mul(2).min(64));
-                let count = (self.maximum - capacity).min(growth as usize) as u32;
-                let mut counts = HashMap::<vk::DescriptorType, u32>::default();
-                for b in &layout.key.bindings {
-                    *counts.entry(b.kind).or_default() += count;
-                }
-                let sizes: Vec<_> = counts
-                    .into_iter()
-                    .map(|(kind, count)| {
-                        vk::DescriptorPoolSize::default()
-                            .ty(kind)
-                            .descriptor_count(count)
-                    })
-                    .collect();
-                let handle = unsafe {
-                    self.owner.device.create_descriptor_pool(
-                        &vk::DescriptorPoolCreateInfo::default()
-                            .max_sets(count)
-                            .pool_sizes(&sizes),
-                        None,
-                    )
-                }
-                .map_err(|e| VulkanError::vk("native descriptor page", e))?;
-                self.pages.push(PageSlot {
-                    page: Arc::new(Page {
-                        owner: Arc::clone(&self.owner),
-                        handle,
-                        key: layout.key.clone(),
-                        capacity: count,
-                    }),
-                    allocated: 0,
-                });
-                return Ok(self.pages.len() - 1);
-            }
-            let Some(key) = self
-                .records
+}
+impl DescriptorAllocator {
+    pub(crate) fn resolve(
+        &mut self,
+        record: &BindingRecord,
+        tick: u64,
+        progress: &crate::queue::progress::SubmissionProgress,
+        timeline: vk::Semaphore,
+    ) -> Result<&NativeSet, crate::queue::progress::NativeFailure> {
+        let layout = record.layout.set;
+        if let Some(sets) = self.layouts.get(&layout)
+            && sets.layout.as_ptr() == Arc::as_ptr(&record.layout)
+            && let Some(last) = &sets.last
+            && last.resources.len() == record.resources.len()
+            && last
+                .resources
                 .iter()
-                .filter(|(_, e)| Arc::strong_count(&e.record) == 1)
-                .min_by_key(|(_, e)| e.touched)
-                .map(|(&k, _)| k)
-            else {
-                return Err(VulkanError::DescriptorPressure);
-            };
-            self.records.remove(&key);
-            self.counters.evict(1);
+                .zip(&record.resources)
+                .all(|(cached, resource)| cached.matches(resource))
+        {
+            let index = last.index;
+            let native = &mut self.layouts.get_mut(&layout).unwrap().sets[index];
+            native.tick = tick;
+            return Ok(native);
         }
+        let index = self.commit(record, progress, timeline)?;
+        let sets = self.layouts.get_mut(&layout).unwrap();
+        let native = &mut sets.sets[index];
+        // CPU captures own descriptor data, not physical sets. The worker
+        // recycles by actual tick and updates again when an old capture returns.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+        unsafe {
+            record
+                .layout
+                .owner
+                .device
+                .update_descriptor_set_with_template(
+                    native.handle,
+                    record.layout.update_template,
+                    record.entries.as_ptr().cast(),
+                );
+        }
+        native.tick = tick;
+        record.metrics.updates.fetch_add(1, Ordering::Relaxed);
+        let last = sets.last.get_or_insert_with(|| LastSet {
+            resources: Vec::new(),
+            index,
+        });
+        last.index = index;
+        last.resources.clear();
+        last.resources
+            .extend(record.resources.iter().map(CachedResource::new));
+        Ok(&sets.sets[index])
     }
-    /// Drop only reconstructible index ownership under residency pressure.
-    /// Prepared and in-flight records keep their resource/pool leases alive.
-    pub fn trim(&mut self) {
-        let previous = self.records.len();
-        self.records.retain(|_, e| Arc::strong_count(&e.record) > 1);
-        self.counters.evict((previous - self.records.len()) as u64);
+    fn commit(
+        &mut self,
+        record: &BindingRecord,
+        progress: &crate::queue::progress::SubmissionProgress,
+        timeline: vk::Semaphore,
+    ) -> Result<usize, crate::queue::progress::NativeFailure> {
+        let layout = &record.layout;
+        let owner = &layout.owner;
+        let sets_per_pool = record.sets_per_pool;
+        if self
+            .layouts
+            .get(&layout.set)
+            .is_none_or(|sets| sets.layout.strong_count() == 0)
+        {
+            self.layouts
+                .retain(|_, sets| sets.layout.strong_count() != 0);
+            for bank in &mut self.banks {
+                bank.pages.retain(|page| Arc::strong_count(&page.page) > 1);
+            }
+        }
+        if !self.layouts.contains_key(&layout.set) {
+            let mut counts = HashMap::<vk::DescriptorType, u32>::default();
+            for binding in &layout.key.bindings {
+                *counts.entry(binding.kind).or_default() += 1;
+            }
+            let sizes: Vec<_> = counts
+                .into_iter()
+                .map(|(ty, descriptor_count)| vk::DescriptorPoolSize {
+                    ty,
+                    descriptor_count,
+                })
+                .collect();
+            let score = sizes.iter().map(|size| size.descriptor_count).sum();
+            let bank = self
+                .banks
+                .iter()
+                .position(|bank| bank.supports(&sizes, score))
+                .unwrap_or_else(|| {
+                    self.banks.push(Bank {
+                        sizes,
+                        score,
+                        pages: Vec::new(),
+                    });
+                    self.banks.len() - 1
+                });
+            self.layouts.insert(
+                layout.set,
+                LayoutSets {
+                    bank,
+                    layout: Arc::downgrade(layout),
+                    sets: Vec::new(),
+                    next: 0,
+                    last: None,
+                },
+            );
+        }
+        let allocator = self.layouts.get_mut(&layout.set).unwrap();
+        let find = |sets: &LayoutSets, completed: u64| {
+            (sets.next..sets.sets.len())
+                .chain(0..sets.next)
+                .find(|&i| sets.sets[i].tick <= completed)
+        };
+        let completed = progress.completed();
+        let mut available = find(allocator, completed);
+        if available.is_none() && completed < progress.submitted() {
+            // Refresh only on pool overflow, then search again before growing.
+            // The worker can recycle actual completed sets before owner retirement.
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_resource_pool.cpp
+            let actual = unsafe { owner.device.get_semaphore_counter_value(timeline) }.map_err(
+                |result| crate::queue::progress::NativeFailure::Vulkan {
+                    operation: "descriptor pool timeline refresh",
+                    result,
+                },
+            )?;
+            progress.observe_completed(actual.min(progress.submitted()));
+            available = find(allocator, progress.completed());
+        }
+        if let Some(index) = available {
+            allocator.next = (index + 1) % allocator.sets.len();
+            return Ok(index);
+        }
+        let bank = &mut self.banks[allocator.bank];
+        if bank
+            .pages
+            .last()
+            .is_none_or(|page| page.allocated + SETS_GROW > sets_per_pool)
+        {
+            Self::grow_pool(owner, bank, sets_per_pool)?;
+        }
+        let layouts = [layout.set; SETS_GROW];
+        let allocate = |page: &DescriptorPool| unsafe {
+            owner.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(page.handle)
+                    .set_layouts(&layouts),
+            )
+        };
+        let sets = match allocate(&bank.pages.last().unwrap().page) {
+            Ok(sets) => sets,
+            Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => {
+                Self::grow_pool(owner, bank, sets_per_pool)?;
+                allocate(&bank.pages.last().unwrap().page).map_err(|e| {
+                    crate::queue::progress::NativeFailure::Vulkan {
+                        operation: "vkAllocateDescriptorSets",
+                        result: e,
+                    }
+                })?
+            }
+            Err(e) => {
+                return Err(crate::queue::progress::NativeFailure::Vulkan {
+                    operation: "vkAllocateDescriptorSets",
+                    result: e,
+                });
+            }
+        };
+        let first = allocator.sets.len();
+        let page = bank.pages.last_mut().unwrap();
+        page.allocated += sets.len();
+        for set in sets {
+            allocator.sets.push(NativeSet {
+                handle: set,
+                pool: Arc::clone(&page.page),
+                tick: 0,
+                counters: record.counters.clone(),
+            });
+        }
+        allocator.next = first + 1;
+        record
+            .metrics
+            .allocated
+            .fetch_add(SETS_GROW as u64, Ordering::Relaxed);
+        record.counters.add_entries(SETS_GROW);
+        Ok(first)
+    }
+    fn grow_pool(
+        owner: &Arc<DeviceOwner>,
+        bank: &mut Bank,
+        count: usize,
+    ) -> Result<(), crate::queue::progress::NativeFailure> {
+        let sizes: Vec<_> = bank
+            .sizes
+            .iter()
+            .map(|size| {
+                vk::DescriptorPoolSize::default()
+                    .ty(size.ty)
+                    .descriptor_count(size.descriptor_count * count as u32)
+            })
+            .collect();
+        let handle = unsafe {
+            owner.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(count as u32)
+                    .pool_sizes(&sizes),
+                None,
+            )
+        }
+        .map_err(|e| crate::queue::progress::NativeFailure::Vulkan {
+            operation: "vkCreateDescriptorPool",
+            result: e,
+        })?;
+        bank.pages.push(PageSlot {
+            page: Arc::new(DescriptorPool {
+                owner: Arc::clone(owner),
+                handle,
+            }),
+            allocated: 0,
+        });
+        Ok(())
     }
 }
 
@@ -690,9 +828,9 @@ impl VulkanDevice {
         let index = self.begin_recording()?;
         let slot = &mut self.submission.slots[index];
         let bound = if pipeline.bind_point == vk::PipelineBindPoint::COMPUTE {
-            &mut slot.bound_set
+            &mut slot.bound_compute_binding
         } else {
-            &mut slot.bound_graphics_set
+            &mut slot.bound_graphics_binding
         };
         let bound_layout = if pipeline.bind_point == vk::PipelineBindPoint::COMPUTE {
             &mut slot.bound_compute_layout
@@ -704,7 +842,8 @@ impl VulkanDevice {
         } else {
             &mut slot.bound_graphics_offsets
         };
-        if *bound == record.set
+        let identity = Arc::as_ptr(record) as usize;
+        if *bound == identity
             && *bound_layout == pipeline.layout.handle
             && *bound_offsets == dynamic_offsets
         {
@@ -746,20 +885,18 @@ impl VulkanDevice {
             }
         }
         unsafe {
-            self.dispatch.cmd_bind_descriptor_sets(
+            self.dispatch.bind_descriptors(
                 pipeline.bind_point,
-                pipeline.layout.handle,
-                0,
-                &[record.set],
+                Arc::clone(record),
                 dynamic_offsets,
             );
         }
         self.submission.statistics.descriptor_binds += 1;
         bound_offsets.clear();
         bound_offsets.extend_from_slice(dynamic_offsets);
-        *bound = record.set;
+        *bound = identity;
         *bound_layout = pipeline.layout.handle;
-        if slot.binding_handles.insert(record.set) {
+        if slot.binding_handles.insert(identity) {
             slot.native_bindings.push(Arc::clone(record));
         }
         Ok(())
@@ -976,5 +1113,118 @@ impl SamplerCache {
     }
     pub fn usage(&self) -> usize {
         self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn sampler_changes_reuse_texel_views_owned_by_the_buffer() {
+        let Some(mut device) = crate::test_device::device_for_test(crate::ApiPreference::Auto)
+        else {
+            return;
+        };
+        let monitor = device.validation_monitor();
+        let layouts = crate::cache::layout::LayoutCache::new(&device, 8);
+        let layout = layouts
+            .get(LayoutKey {
+                bindings: vec![
+                    LayoutBinding {
+                        binding: 0,
+                        element: 0,
+                        kind: vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+                        stages: vk::ShaderStageFlags::COMPUTE,
+                    },
+                    LayoutBinding {
+                        binding: 1,
+                        element: 0,
+                        kind: vk::DescriptorType::SAMPLER,
+                        stages: vk::ShaderStageFlags::COMPUTE,
+                    },
+                ]
+                .into(),
+                push_bytes: 0,
+                push_stages: vk::ShaderStageFlags::empty(),
+            })
+            .unwrap();
+        let buffer = Arc::new(
+            device
+                .allocate_buffer(
+                    16,
+                    vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER,
+                    crate::MemoryLocation::CpuToGpu,
+                    crate::AllocationMode::Managed,
+                    "cached texel view",
+                )
+                .unwrap(),
+        );
+        let first_sampler = Sampler::new(&device, &vk::SamplerCreateInfo::default()).unwrap();
+        let second_sampler = Sampler::new(
+            &device,
+            &vk::SamplerCreateInfo::default().mag_filter(vk::Filter::LINEAR),
+        )
+        .unwrap();
+        let resources = |sampler: Arc<Sampler>| {
+            [
+                DescriptorResource::TexelBuffer {
+                    buffer: Arc::clone(&buffer),
+                    offset: 0,
+                    range: 16,
+                    format: vk::Format::R32_UINT,
+                    element_bytes: 4,
+                },
+                DescriptorResource::Sampler(sampler),
+            ]
+        };
+        let mut cache = DescriptorCache::new(&device);
+        let a = cache.get(&layout, &resources(first_sampler)).unwrap();
+        let b = cache.get(&layout, &resources(second_sampler)).unwrap();
+        // Both prepared records use the exact same buffer-owned native view.
+        assert_eq!(unsafe { a.entries[0].texel }, unsafe { b.entries[0].texel });
+        assert_eq!(
+            cache.statistics().updates,
+            0,
+            "preparation does not update native descriptors"
+        );
+        assert_eq!(
+            cache.formats.len(),
+            1,
+            "immutable capabilities are cached per format"
+        );
+        device.begin_recording().unwrap();
+        unsafe {
+            device
+                .dispatch
+                .bind_descriptors(vk::PipelineBindPoint::COMPUTE, Arc::clone(&a), &[]);
+            device
+                .dispatch
+                .bind_descriptors(vk::PipelineBindPoint::COMPUTE, Arc::clone(&b), &[]);
+        }
+        let work = device.flush().unwrap().unwrap();
+        assert!(
+            device
+                .wait_for_work(work, std::time::Duration::from_secs(10))
+                .unwrap()
+        );
+        assert_eq!(
+            cache.statistics().updates,
+            2,
+            "the worker updates both changed sampler payloads"
+        );
+        drop(a);
+        // Destruction of one descriptor payload must not destroy the cached view.
+        let retained = unsafe { b.entries[0].texel };
+        assert_eq!(
+            buffer.texel_view(0, 16, vk::Format::R32_UINT).unwrap(),
+            retained
+        );
+        drop(b);
+        drop(cache);
+        drop(buffer);
+        drop(layout);
+        drop(layouts);
+        drop(device);
+        monitor.check().unwrap();
     }
 }

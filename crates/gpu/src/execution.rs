@@ -69,16 +69,12 @@ pub trait GpuExecution: Send + 'static {
     ) -> Result<(), BackendRuntimeError> {
         Ok(())
     }
-    /// Register the earliest completion wakeup without sealing pending work.
-    /// The owner polls before registration. If native work completes in that
+    /// Queue pending publication fences and register the earliest completion.
+    /// Ordinary recording is not a publication dependency. If work completes in that
     /// interval, invoke the bound wakeup immediately rather than losing it.
     /// The queue owner retains all submission, retirement and publication authority.
     fn arm_completion_wakeup(&mut self) -> Result<(), BackendRuntimeError> {
         Ok(())
-    }
-    /// Earliest deadline for native work not yet submitted. No deadline when idle.
-    fn pending_submit_deadline(&self) -> Option<std::time::Instant> {
-        None
     }
     /// Seal pending native work for a real dependency, explicit flush or shutdown.
     fn flush(&mut self) -> Result<(), BackendRuntimeError>;

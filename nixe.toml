@@ -75,10 +75,9 @@ parallel_vcpus = true
 vsync = false
 
 [gpu]
-# Nonzero limits for native shader, pipeline and immutable descriptor caches.
+# Nonzero limits for native shader and pipeline caches.
 shader_cache_entries = 4096
 pipeline_cache_entries = 8192
-descriptor_sets = 4096
 # Maximum size of a persisted native cache when disk persistence is configured.
 persistent_pipeline_cache_mib = 256
 

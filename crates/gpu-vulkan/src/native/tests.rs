@@ -156,14 +156,7 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
         .buffer_for(backing.clone(), vk::BufferUsageFlags::TRANSFER_DST)
         .unwrap()
         .buffer;
-    assert_eq!(
-        execution
-            .residency
-            .write_buffer(id, 9, &[0x43; 4])
-            .unwrap()
-            .consumed,
-        4
-    );
+    execution.residency.write_buffer(id, 9, &[0x43; 4]).unwrap();
     let mut kind =
         vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
     let gate = unsafe {
@@ -471,9 +464,7 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         .unwrap();
     let first = submission(1, 0x37);
 
-    consume(&mut execution, &first)
-        .and_then(|()| execution.submit(first.frontend))
-        .unwrap();
+    consume(&mut execution, &first).unwrap();
     execution
         .residency
         .flush_with_sync(
@@ -484,6 +475,7 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
             &[],
         )
         .unwrap();
+    execution.submit(first.frontend).unwrap();
     execution.arm_completion_wakeup().unwrap();
     assert!(execution.poll_completion().unwrap().is_none());
 
@@ -574,11 +566,11 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     );
     // A different native producer invalidates the known payload. Its bytes must
     // be read from the GPU rather than replaying the preceding host value.
-    let written = execution
+    execution
         .residency
         .write_buffer(id.buffer, id.offset, &[0xa7; 16])
         .unwrap();
-    assert_eq!(written.consumed, 16);
+
     assert_eq!(
         &cpu_read(&mut execution.residency, &whole)[64..80],
         &[0xa7; 16]
@@ -647,14 +639,10 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         uploaded,
         "repeated native consumers reuse the materialized payload and page baseline"
     );
-    assert_eq!(
-        execution
-            .residency
-            .write_buffer(source.buffer, source.offset + 4, &[0xd5; 4])
-            .unwrap()
-            .consumed,
-        4
-    );
+    execution
+        .residency
+        .write_buffer(source.buffer, source.offset + 4, &[0xd5; 4])
+        .unwrap();
     let bytes = cpu_read(&mut execution.residency, &whole);
     assert_eq!(&bytes[64..68], &[0xb3; 4]);
     assert_eq!(&bytes[68..72], &[0xd5; 4]);
@@ -685,7 +673,6 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             isa: 1,
         },
         CacheConfiguration {
-            descriptor_sets: 1,
             ..CacheConfiguration::default()
         },
         4 * 1024 * 1024,
@@ -1176,7 +1163,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             token
         );
     }
-    // Reusing immutable preparations must not pin temporary arena descriptors
+    // Reusing immutable preparations must not pin temporary descriptor payloads
     // into the persistent pool. Completed slots recycle them repeatedly.
     let updates = execution.descriptors.statistics().updates;
     let repeated = &inputs[2].0;
@@ -1188,12 +1175,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     }
     assert_eq!(execution.descriptors.statistics().updates, updates);
     assert_eq!(execution.pipelines.usage().0, pipeline_count);
-    assert!(
-        execution
-            .recording_statistics()
-            .stream_descriptor_allocations
-            > 0
-    );
+    assert!(execution.recording_statistics().descriptor_payload_captures > 0);
     // Streaming has not acknowledged the persistent buffer's dirty observer.
     let native_uniform = execution
         .residency
@@ -1208,11 +1190,11 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         encode([0., 0., 1., 1.])
     );
     // A following GPU writer replaces CPU authority and must bypass CPU streams.
-    let upload = execution
+    execution
         .residency
         .write_buffer(native_uniform, 0, &encode([1., 1., 0., 1.]))
         .unwrap();
-    assert_eq!(upload.consumed, 16);
+
     let submission = NativeWork {
         frontend: FrontendSubmissionId::new(30),
         command: NativeCommand::Draw {
@@ -1268,17 +1250,8 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
             .chunks_exact(4)
             .all(|pixel| pixel == [255, 255, 0, 255])
     );
-    // Retained guest preparations must not pin the persistent host descriptor
-    // budget. Force a two-set recording slot and retain many different binding
-    // templates, proving pressure splits recording without dropping any draw.
-    let device = execution.residency.device_mut();
-    let slot = device.begin_recording().unwrap();
-    device.submission.slots[slot].stream_descriptors = Some(DescriptorCache::from_limits(
-        Arc::clone(&device.owner),
-        device.profile().limits,
-        2,
-        device.profile().null_descriptor,
-    ));
+    // Retained guest preparations do not pin native descriptor sets; changing
+    // payloads use the growing bank without splitting or repeating any draw.
     let mut retained = Vec::new();
     let before = execution.statistics.draws;
     for index in 0..32 {
@@ -1487,11 +1460,11 @@ fn overlapping_graphics_buffers_preserve_shader_bindings(
             .into_iter()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
-        let upload = execution
+        execution
             .residency
             .write_buffer(initial.buffer, initial.offset, &color)
             .unwrap();
-        assert_eq!(upload.consumed, color.len());
+
         let merges = execution.residency.statistics().buffer_merges;
         let work = NativeWork {
             frontend: FrontendSubmissionId::new(10000 + case),
@@ -2086,14 +2059,10 @@ fn recorder_prefixes_retain_gpu_versions_without_allocating_completion_records()
             .buffer_for(backing.clone(), vk::BufferUsageFlags::STORAGE_BUFFER)
             .unwrap()
             .buffer;
-        assert_eq!(
-            execution
-                .residency
-                .write_buffer(buffer, 0, &[0x37; 16])
-                .unwrap()
-                .consumed,
-            16
-        );
+        execution
+            .residency
+            .write_buffer(buffer, 0, &[0x37; 16])
+            .unwrap();
         for value in 1..=128u8 {
             let prefix = NativeWork {
                 frontend: FrontendSubmissionId::new(1),
@@ -2242,68 +2211,43 @@ fn blit_keeps_selected_source_while_allocating_destination() {
 }
 
 #[test]
-fn completion_registration_preserves_shared_batch_until_its_deadline() {
-    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+fn observer_proven_gpu_completion_retires_resources_on_the_owner() {
+    let Some(mut device) = support::device_for_test(ApiPreference::Auto) else {
         return;
     };
     let validation = device.validation_monitor();
-    let mut execution = NativeGpuExecution::new(
-        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
-        device,
-        ShaderNamespace {
-            guest: *b"deadline-batches",
-            isa: 1,
-        },
-        CacheConfiguration::default(),
-        4 * 1024 * 1024,
+    let work = device.work_ticket().unwrap();
+    let buffer = Arc::new(
+        device
+            .allocate_buffer(
+                1024,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                crate::MemoryLocation::GpuOnly,
+                crate::AllocationMode::Managed,
+                "observer retired buffer",
+            )
+            .unwrap(),
+    );
+    let released = Arc::downgrade(&buffer);
+    device.retire_buffer(buffer, work).unwrap();
+    let (notify, notifications) = std::sync::mpsc::channel();
+    let observer = completion::CompletionWakeup::new(
+        &device,
+        Arc::new(move || {
+            let _ = notify.send(());
+        }),
     )
     .unwrap();
-    let (_allocation, backing) = backing_allocation(&execution.residency, 4096, 4096, 0x19);
-    let (woken, wakes) = std::sync::mpsc::channel();
-    execution
-        .bind_host_wakeup(Arc::new(move || {
-            let _ = woken.send(());
-        }))
-        .unwrap();
-    let mut tokens = Vec::new();
-    for id in 1..=2 {
-        let work = NativeWork {
-            frontend: FrontendSubmissionId::new(id),
-            command: NativeCommand::ReportMemory {
-                fence: true,
-                target: backing.pin(0, backing.bytes()).unwrap(),
-                offset: 64,
-                bytes: Arc::from([id as u8; 16]),
-            },
-        };
-        consume(&mut execution, &work).unwrap();
-        tokens.push(execution.submit(work.frontend).unwrap());
-        execution.arm_completion_wakeup().unwrap();
-        assert_eq!(
-            execution.residency.device().scheduled_tick(),
-            0,
-            "registration is not an explicit submit dependency"
-        );
-    }
-    let a = execution.completions[0].work.unwrap();
-    assert_eq!(execution.completions[1].work.unwrap(), a);
-    let deadline = execution.pending_submit_deadline().unwrap();
-    std::thread::sleep(
-        deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
-    );
-    execution.progress().unwrap();
-    assert!(execution.pending_submit_deadline().is_none());
-    assert_eq!(execution.residency.device().scheduled_tick(), a.tick());
-    wakes.recv_timeout(Duration::from_secs(3)).unwrap();
-    for token in tokens {
-        assert_eq!(
-            execution.poll_completion().unwrap().unwrap().submission(),
-            token
-        );
-    }
-    let bytes = cpu_read(&mut execution.residency, &backing);
-    assert_eq!(&bytes[64..80], &[2; 16]);
-    execution.teardown().unwrap();
-    drop(execution);
+    observer.arm(work.tick()).unwrap();
+    device.flush().unwrap();
+    notifications.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(device.submission.completed, 0);
+    assert_eq!(device.submission.progress.completed(), work.tick());
+    assert!(released.upgrade().is_some());
+    assert_eq!(device.poll_work(work).unwrap(), crate::WorkStatus::Complete);
+    assert_eq!(device.completed_tick(), work.tick());
+    assert!(released.upgrade().is_none());
+    drop(observer);
+    drop(device);
     validation.check().unwrap();
 }

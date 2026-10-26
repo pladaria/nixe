@@ -111,6 +111,12 @@ impl PresentationClient {
     pub(crate) fn bind_wakeup(&self, wake: Arc<dyn Fn() + Send + Sync>) {
         self.0.lock().unwrap().wake = Some(wake);
     }
+    pub(crate) fn wake_owner(&self) {
+        let wake = self.0.lock().unwrap().wake.clone();
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
     pub(crate) fn take(&self) -> Option<HostFrame> {
         self.0.lock().unwrap().pending.take()
     }

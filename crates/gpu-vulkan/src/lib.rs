@@ -22,9 +22,9 @@ pub(crate) mod residency;
 mod transfer;
 pub use memory::NativeImageDescription;
 pub use residency::{
-    AccessScope, AttachmentId, AttachmentLoad, AttachmentStore, BarrierPolicy, BarrierStatistics,
-    BufferId, BufferRange, BufferUpload, ImageId, ImagePlane, ImageViewDescription, ImageViewId,
-    LayoutPolicy, RecordingPolicy, ResidencyStatistics, VulkanResidency,
+    AccessScope, AttachmentId, AttachmentLoad, AttachmentStore, BarrierStatistics, BufferId,
+    BufferRange, ImageId, ImagePlane, ImageViewDescription, ImageViewId, ResidencyStatistics,
+    VulkanResidency,
 };
 mod validation;
 pub use gpu_allocator::MemoryLocation;
@@ -37,9 +37,7 @@ pub use profile::{
     ApiPath, ApiPreference, DeviceProfile, DynamicStateSupport, FloatControls, PortabilitySupport,
     SubgroupSupport, SwapchainMaintenance,
 };
-pub use queue::{
-    QueueConfiguration, QueueUsage, ReadbackTicket, RecordingStatistics, WorkStatus, WorkTicket,
-};
+pub use queue::{QueueUsage, ReadbackTicket, RecordingStatistics, WorkStatus, WorkTicket};
 pub use validation::{ValidationMode, ValidationMonitor};
 
 pub use residency::execution::{

@@ -205,6 +205,7 @@ pub struct PipelineLayout {
     pub(crate) owner: Arc<DeviceOwner>,
     pub(crate) handle: vk::PipelineLayout,
     pub(crate) set: vk::DescriptorSetLayout,
+    pub(crate) update_template: vk::DescriptorUpdateTemplate,
     pub key: LayoutKey,
     pub(crate) dynamic_bindings: Box<[usize]>,
 }
@@ -254,6 +255,9 @@ impl PipelineLayout {
 impl Drop for PipelineLayout {
     fn drop(&mut self) {
         unsafe {
+            self.owner
+                .device
+                .destroy_descriptor_update_template(self.update_template, None);
             self.owner.device.destroy_pipeline_layout(self.handle, None);
             self.owner
                 .device
@@ -380,6 +384,7 @@ impl LayoutCache {
             owner: Arc::clone(&self.owner),
             handle: vk::PipelineLayout::null(),
             set,
+            update_template: vk::DescriptorUpdateTemplate::null(),
             dynamic_bindings: key.dynamic_bindings(),
             key,
         };
@@ -401,6 +406,34 @@ impl LayoutCache {
             )
         }
         .map_err(|e| VulkanError::vk("native pipeline layout", e))?;
+        if !layout.key.bindings.is_empty() {
+            let stride = std::mem::size_of::<super::descriptors::DescriptorEntry>();
+            let entries: Vec<_> = layout
+                .key
+                .bindings
+                .iter()
+                .enumerate()
+                .map(|(i, binding)| {
+                    vk::DescriptorUpdateTemplateEntry::default()
+                        .dst_binding(binding.binding)
+                        .dst_array_element(binding.element)
+                        .descriptor_count(1)
+                        .descriptor_type(binding.kind)
+                        .offset(i * stride)
+                        .stride(stride)
+                })
+                .collect();
+            layout.update_template = unsafe {
+                self.owner.device.create_descriptor_update_template(
+                    &vk::DescriptorUpdateTemplateCreateInfo::default()
+                        .template_type(vk::DescriptorUpdateTemplateType::DESCRIPTOR_SET)
+                        .descriptor_set_layout(set)
+                        .descriptor_update_entries(&entries),
+                    None,
+                )
+            }
+            .map_err(|e| VulkanError::vk("native descriptor update template", e))?;
+        }
         // Eviction drops only cache ownership; actual pipelines/batches retain
         // their layouts. One LRU victim avoids whole-cache churn under pressure.
         let layout = Arc::new(layout);

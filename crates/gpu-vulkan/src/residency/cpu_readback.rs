@@ -109,11 +109,7 @@ impl VulkanResidency {
             self.image_readbacks.install(
                 key,
                 bytes,
-                self.device
-                    .submission
-                    .configuration
-                    .arena_bytes
-                    .saturating_mul(2) as usize,
+                (crate::queue::staging::READBACK_WINDOW_BYTES * 8) as usize,
             );
         }
         let ready: Vec<_> = self
@@ -165,37 +161,6 @@ impl VulkanResidency {
             }
         }
         Ok(())
-    }
-
-    /// Full staging is actual backpressure. Retire completed demands first;
-    /// wait only for actual work required to free the bounded arena.
-    pub(super) fn reserve_readback(
-        &mut self,
-        bytes: u64,
-        alignment: u64,
-    ) -> Result<(usize, crate::queue::Slice, ReadbackTicket), VulkanError> {
-        loop {
-            self.progress_readbacks()?;
-            match self.device.submission.reserve_readback_aligned(
-                &mut self.device.dispatch,
-                bytes,
-                alignment,
-            ) {
-                Ok(reservation) => return Ok(reservation),
-                Err(error @ VulkanError::QueuePressure { pending, .. }) => {
-                    let submitted = self.flush()?;
-                    let demand = self
-                        .readback_point()
-                        .map(|t| self.device.submission.ticket(t));
-                    let Some(work) = pending.or(submitted).or(demand) else {
-                        return Err(error);
-                    };
-                    let _trace = nixe_gpu::trace::span("resource_pressure_wait", work.tick(), 1, 0);
-                    self.device.wait_for_work(work, std::time::Duration::MAX)?;
-                }
-                Err(error) => return Err(error),
-            }
-        }
     }
 
     pub(super) fn enqueue_cpu_transfer(&mut self, request: AccessRequestId, transfer: Transfer) {

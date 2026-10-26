@@ -40,7 +40,7 @@ use nixe_gpu::authority::{ResourceObservation, WriterId};
 use nixe_gpu::physical::{Footprint, PhysicalMapping};
 use nixe_memory::Machine;
 use std::sync::Arc;
-pub use sync::{AccessScope, BarrierPolicy, BarrierStatistics, LayoutPolicy, RecordingPolicy};
+pub use sync::{AccessScope, BarrierStatistics};
 
 fn shader_attachment_layout(usage: vk::ImageUsageFlags) -> vk::ImageLayout {
     if usage.contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT) {
@@ -97,14 +97,6 @@ impl Contents {
             .all(|observation| !observation.is_invalid())
     }
 }
-/// A recorder consumes a bounded prefix; the execution owner retains the rest
-/// under its original admission permit and continues after staging pressure.
-#[must_use]
-#[derive(Clone, Copy, Debug)]
-pub struct BufferUpload {
-    pub work: WorkTicket,
-    pub consumed: usize,
-}
 struct KnownBufferBytes {
     offset: u64,
     bytes: Arc<[u8]>,
@@ -126,6 +118,7 @@ struct BufferEntry {
     #[cfg(feature = "binding-probe")]
     address: vk::DeviceAddress,
     access: sync::BufferAccess,
+    used: sync::UsageTracker,
 }
 impl BufferEntry {
     fn validate_interval(&mut self, start: u64, size: u64) {
@@ -280,7 +273,6 @@ pub struct ResidencyStatistics {
     pub image_layout_plans: u64,
     pub image_view_allocations: u64,
     pub buffer_merges: u64,
-    pub staging_pressure_waits: u64,
     pub evictions: u64,
 }
 /// Concrete single-owner storage, selected once at startup. No generic backend
@@ -316,10 +308,10 @@ pub struct VulkanResidency {
     helpers: crate::helpers::Helpers,
     #[cfg(feature = "binding-probe")]
     descriptor_dispatch: Option<ash::ext::descriptor_buffer::Device>,
-    barrier_policy: BarrierPolicy,
     unified_layouts: bool,
     /// Entries needed by a cold reconstruction cannot be evicted by its allocations.
     pub(crate) constructing: Vec<Resource>,
+    descriptors: crate::cache::DescriptorCache,
     descriptor_resources: Vec<crate::cache::DescriptorResource>,
     descriptor_offsets: Vec<u32>,
     streamed_uses: Vec<usize>,
@@ -329,6 +321,9 @@ pub struct VulkanResidency {
     uniform_stream_limit: u64,
 }
 impl VulkanResidency {
+    pub(crate) fn descriptor_counters(&self) -> nixe_gpu::cache_counters::CacheCounters {
+        self.descriptors.cache_counters()
+    }
     pub(crate) fn memory(&self) -> &Machine {
         &self.memory
     }
@@ -439,8 +434,10 @@ impl VulkanResidency {
                 &device.owner.device,
             )
         });
+        let descriptors = crate::cache::DescriptorCache::new(&device);
         let mut cache = Self {
             device,
+            descriptors,
             instance,
             buffers: Vec::new(),
             free_buffers: Vec::new(),
@@ -470,7 +467,6 @@ impl VulkanResidency {
             helpers: crate::helpers::Helpers::default(),
             #[cfg(feature = "binding-probe")]
             descriptor_dispatch,
-            barrier_policy: BarrierPolicy::default(),
             unified_layouts,
             constructing: Vec::new(),
             descriptor_resources: Vec::new(),
@@ -559,14 +555,6 @@ impl VulkanResidency {
             return Ok(Some(charge));
         }
         self.device.poll_progress()?;
-        // Descriptor lookups are reconstructible; completed slot caches must
-        // not pin otherwise evictable resources under residency pressure.
-        // In-flight records retain their leases until actual GPU completion.
-        for slot in &mut self.device.submission.slots {
-            if let Some(descriptors) = &mut slot.stream_descriptors {
-                descriptors.trim();
-            }
-        }
         while self
             .budget
             .used()
@@ -590,11 +578,6 @@ impl VulkanResidency {
                         std::time::Duration::MAX,
                     )?;
                     self.progress_readbacks()?;
-                    for slot in &mut self.device.submission.slots {
-                        if let Some(descriptors) = &mut slot.stream_descriptors {
-                            descriptors.trim();
-                        }
-                    }
                     continue;
                 }
                 return Err(VulkanError::ResidencyPressure {
@@ -890,43 +873,24 @@ impl VulkanResidency {
         id: BufferId,
         offset: u64,
         bytes: &[u8],
-    ) -> Result<BufferUpload, VulkanError> {
-        let consumed = bytes
-            .len()
-            .min(self.device.submission.configuration.arena_bytes as usize);
-        let bytes = &bytes[..consumed];
-        let (slot, slice) = self.reserve_upload(bytes, 4)?;
-        let upload = self.device.submission.slots[slot]
-            .upload_buffer(slice)
-            .handle;
-        let writer = self.prepare_write(Resource::Buffer(id), offset, consumed as u64)?;
-        let target = self.buffer_access_range(
+    ) -> Result<WorkTicket, VulkanError> {
+        let size = bytes.len() as u64;
+        self.check_buffer_range(id, offset, size)?;
+        let writer = self.prepare_write(Resource::Buffer(id), offset, size)?;
+        let slice =
+            self.device
+                .submission
+                .reserve_upload_aligned(&mut self.device.dispatch, bytes, 4)?;
+        self.record_buffer_upload(
             id,
-            offset,
-            consumed as u64,
-            AccessScope::new(
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            ),
+            slice,
+            &[writer],
+            smallvec::smallvec![vk::BufferCopy::default().dst_offset(offset).size(size)],
         )?;
-
-        self.barriers.emit(&mut self.device);
-        self.publish_effect(&[writer], |device| unsafe {
-            device.dispatch.cmd_copy_buffer(
-                upload,
-                target,
-                &[vk::BufferCopy::default()
-                    .src_offset(slice.offset)
-                    .dst_offset(offset)
-                    .size(consumed as u64)],
-            );
-        })?;
-        self.finish_buffer_write(id, offset, consumed as u64)?;
-        Ok(BufferUpload {
-            work: self.device.work_ticket()?,
-            consumed,
-        })
+        self.finish_buffer_write(id, offset, size)?;
+        self.device.work_ticket()
     }
+
     pub(crate) fn report_memory(
         &mut self,
         target: Vec<nixe_memory::AllocationRange>,

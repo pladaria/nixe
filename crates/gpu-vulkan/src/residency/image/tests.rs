@@ -528,7 +528,7 @@ fn tiled_alias_batches_a_partial_rectangle() {
 }
 
 #[test]
-fn decoded_image_uploads_bounded_rectangles() {
+fn decoded_image_uploads_one_rectangle_per_plane() {
     let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
         return;
     };
@@ -567,7 +567,7 @@ fn decoded_image_uploads_bounded_rectangles() {
     );
     assert_eq!(
         cache.statistics().decoded_upload_commands - before.decoded_upload_commands,
-        2
+        1
     );
     let after = cache.statistics();
     cache.ensure_image(image).unwrap();

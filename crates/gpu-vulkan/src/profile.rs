@@ -159,10 +159,7 @@ pub(crate) fn choose_queues(
                 .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
     };
     if let Some(present) = present {
-        if let Some(i) = (0..families.len())
-            .find(|&i| graphics(i) && present[i] && families[i].queue_count >= 2)
-            .or_else(|| (0..families.len()).find(|&i| graphics(i) && present[i]))
-        {
+        if let Some(i) = (0..families.len()).find(|&i| graphics(i) && present[i]) {
             return Some((i as u32, Some(i as u32)));
         }
         let graphics = (0..families.len()).find(|&i| graphics(i))?;
@@ -637,7 +634,7 @@ mod tests {
         queues[1].queue_count = 2;
         assert_eq!(
             choose_queues(&queues, Some(&[true, true])),
-            Some((1, Some(1)))
+            Some((0, Some(0)))
         );
         assert_eq!(choose_queues(&queues, None), Some((0, None)));
     }

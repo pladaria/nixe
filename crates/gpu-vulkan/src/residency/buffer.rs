@@ -302,6 +302,7 @@ impl VulkanResidency {
                 #[cfg(feature = "binding-probe")]
                 address,
                 access: sync::BufferAccess::new(bytes),
+                used: sync::UsageTracker::new(bytes),
             }),
         };
         self.authority
@@ -326,6 +327,18 @@ impl VulkanResidency {
     /// of host presentation frequency. Alignment copies remain mandatory.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
     pub(crate) fn tick_uniform_cache(&mut self) {
+        let completed = self.device.completed_tick();
+        self.device.submission.staging.tick_frame(completed);
+        for slot in &mut self.buffers {
+            if let Some(entry) = &mut slot.entry
+                && entry
+                    .contents
+                    .last_use
+                    .is_none_or(|work| work.tick() <= completed)
+            {
+                entry.used.reset();
+            }
+        }
         let hits: u64 = self.uniform_cache_hits.iter().sum();
         let shots: u64 = self.uniform_cache_shots.iter().sum();
         self.uniform_stream_limit = if hits * 256 < shots * 251 { 4096 } else { 0 };
@@ -341,9 +354,7 @@ impl VulkanResidency {
         request: BufferStreamRequest,
     ) -> Result<BufferStream, VulkanError> {
         self.check_buffer_range(request.id, request.offset, request.size)?;
-        if request.size > 64 * 1024
-            || request.size > self.device.submission.configuration.arena_bytes
-        {
+        if request.size > 64 * 1024 {
             return Ok(None);
         }
         let entry = self.buffer(request.id)?;
@@ -362,9 +373,13 @@ impl VulkanResidency {
         let mapping = Arc::clone(full.mapping());
         let result = (|| {
             mapping.pin_into(request.offset, request.size, &mut self.stream_inputs)?;
-            let (slot, slice) =
-                self.reserve_upload_space(request.size, request.alignment.max(4))?;
-            let upload = self.device.submission.slots[slot].upload_buffer(slice);
+            let slice = self.device.submission.reserve_slice(
+                &mut self.device.dispatch,
+                request.size,
+                true,
+                request.alignment.max(4),
+            )?;
+            let upload = self.device.submission.staging_buffer(&slice);
             unsafe {
                 upload.write_with(slice.offset, request.size, |bytes| {
                     self.memory
@@ -372,8 +387,8 @@ impl VulkanResidency {
                         .map_err(memory_error)
                 })?;
             }
-            self.device.submission.retain_stream_upload(slot);
-            let native = self.device.submission.slots[slot].upload_lease(slice);
+            self.device.submission.retain_stream_upload(&slice);
+            let native = Arc::clone(self.device.submission.staging_buffer(&slice));
             self.touch(Resource::Buffer(request.id));
             self.statistics.cpu_streamed_bytes += request.size;
             Ok(Some((native, slice.offset)))

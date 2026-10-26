@@ -321,7 +321,6 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
             nixe_gpu_vulkan::cache::CacheConfiguration {
                 shader_entries: config.gpu.shader_entries,
                 pipeline_entries: config.gpu.pipeline_entries,
-                descriptor_sets: config.gpu.descriptor_sets,
                 persistent_bytes: config.gpu.persistent_bytes,
                 ..Default::default()
             },

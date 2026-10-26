@@ -113,7 +113,7 @@ fn native_graphics_cache_normalizes_dynamic_state_and_reuses_library_parts() {
 
 mod probe;
 
-fn descriptor_pressure(api: ApiPreference) {
+fn descriptor_bank_lifetimes(api: ApiPreference) {
     let Some(mut device) = support::device_for_test(api) else {
         return;
     };
@@ -123,7 +123,6 @@ fn descriptor_pressure(api: ApiPreference) {
         ..Default::default()
     };
     let pool = Arc::new(CompilePool::new(1, 8).unwrap());
-    let shaders = ShaderCompiler::new(NS, Arc::clone(&pool), &config);
     let pipelines = PipelineCompiler::new(&device, Arc::clone(&pool), &config).unwrap();
     let shader = crate::test_shaders::compile(
         &device.profile().shader_compiler.profile,
@@ -138,42 +137,37 @@ fn descriptor_pressure(api: ApiPreference) {
     let buffer = Arc::new(
         device
             .allocate_buffer(
-                alignment * 3,
+                alignment * 128,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 MemoryLocation::GpuToCpu,
                 AllocationMode::Managed,
-                "descriptor pressure slices",
+                "descriptor bank slices",
             )
             .unwrap(),
     );
-    let mut cache = DescriptorCache::new(&device, 2);
-    let resources = |offset| {
-        Box::new([DescriptorResource::Buffer {
+    let mut cache = DescriptorCache::new(&device);
+    let resources = |index| {
+        [DescriptorResource::Buffer {
             buffer: Arc::clone(&buffer),
-            offset,
+            offset: index * alignment,
             range: 8,
-        }]) as Box<[DescriptorResource]>
+        }]
     };
-    let first = cache.get(&pipeline.layout, &resources(0)).unwrap();
-    let second = cache.get(&pipeline.layout, &resources(alignment)).unwrap();
-    let counters = cache.cache_counters().snapshot();
-    assert_eq!((counters.entries, counters.entry_limit), (2, 2));
-    assert_eq!((counters.misses, counters.evictions), (2, 0));
     device.bind_native_pipeline(&pipeline).unwrap();
-    device
-        .bind_native_descriptors(
-            &pipeline,
-            &first,
-            &vec![0; pipeline.layout.dynamic_bindings.len()],
-        )
-        .unwrap();
-    device
-        .bind_native_descriptors(
-            &pipeline,
-            &second,
-            &vec![0; pipeline.layout.dynamic_bindings.len()],
-        )
-        .unwrap();
+    let mut weak_first = None;
+    for i in 0..64 {
+        let record = cache.get(&pipeline.layout, &resources(i)).unwrap();
+        if i == 0 {
+            weak_first = Some(Arc::downgrade(&record));
+        }
+        device
+            .bind_native_descriptors(
+                &pipeline,
+                &record,
+                &vec![0; pipeline.layout.dynamic_bindings.len()],
+            )
+            .unwrap();
+    }
     let mut gate = gate::Gate::new(&device);
     let waits = [vk::SemaphoreSubmitInfo::default()
         .semaphore(gate.handle)
@@ -187,49 +181,86 @@ fn descriptor_pressure(api: ApiPreference) {
     .unwrap()
     .unwrap();
     gate.last_use = work.tick();
-    drop(first);
-    drop(second);
-    assert!(matches!(
-        cache.get(&pipeline.layout, &resources(alignment * 2)),
-        Err(VulkanError::DescriptorPressure)
-    ));
-    gate.signal();
-    assert!(device.wait_for_work(work, Duration::from_secs(10)).unwrap());
-    let third = cache
-        .get(&pipeline.layout, &resources(alignment * 2))
-        .unwrap();
-    assert_eq!(cache.statistics().resets, 1);
-    let counters = cache.cache_counters().snapshot();
-    assert_eq!(counters.entries, 1);
-    assert_eq!((counters.misses, counters.evictions), (3, 2));
-    device.bind_native_pipeline(&pipeline).unwrap();
+    device.dispatch.recording_handle().finish().unwrap();
+    assert_eq!(cache.statistics().allocated, 64);
+    assert_eq!(cache.statistics().updates, 64);
+    let next = cache.get(&pipeline.layout, &resources(64)).unwrap();
+    assert_eq!(
+        cache.statistics().allocated,
+        64,
+        "capture never allocates native sets"
+    );
     device
         .bind_native_descriptors(
             &pipeline,
-            &third,
+            &next,
             &vec![0; pipeline.layout.dynamic_bindings.len()],
         )
         .unwrap();
-    let next = device.flush().unwrap().unwrap();
-    assert!(device.wait_for_work(next, Duration::from_secs(10)).unwrap());
-    drop(third);
+    assert_eq!(
+        device.scheduled_tick(),
+        work.tick(),
+        "descriptor growth does not submit"
+    );
+    assert!(Arc::ptr_eq(
+        &next,
+        &cache.get(&pipeline.layout, &resources(64)).unwrap()
+    ));
+    let second = device.flush().unwrap().unwrap();
+    device.dispatch.recording_handle().finish().unwrap();
+    let capacity = cache.statistics().allocated;
+    assert_eq!(
+        capacity, 80,
+        "in-flight sets grow without overwriting live descriptors"
+    );
+    gate.signal();
+    assert!(
+        device
+            .wait_for_work(second, Duration::from_secs(10))
+            .unwrap()
+    );
+    assert!(
+        weak_first.unwrap().upgrade().is_none(),
+        "history owns no resource payloads"
+    );
+    drop(next);
+    for i in 65..=80 {
+        let record = cache.get(&pipeline.layout, &resources(i)).unwrap();
+        device
+            .bind_native_descriptors(
+                &pipeline,
+                &record,
+                &vec![0; pipeline.layout.dynamic_bindings.len()],
+            )
+            .unwrap();
+    }
+    let third = device.flush().unwrap().unwrap();
+    assert!(
+        device
+            .wait_for_work(third, Duration::from_secs(10))
+            .unwrap()
+    );
+    assert_eq!(
+        cache.statistics().allocated,
+        capacity,
+        "completed native sets recycle"
+    );
     drop(cache);
     drop(buffer);
     drop(pipeline);
     drop(pipelines);
-    drop(shaders);
     drop(pool);
     drop(gate);
     drop(device);
     validation.check().unwrap();
 }
 #[test]
-fn native_descriptor_pressure_recycles_only_after_real_completion() {
-    descriptor_pressure(ApiPreference::Auto);
+fn descriptor_banks_grow_and_recycle_only_after_gpu_completion() {
+    descriptor_bank_lifetimes(ApiPreference::Auto);
 }
 #[test]
-fn native_cache_and_descriptor_retirement_support_vulkan12_aliases() {
-    descriptor_pressure(ApiPreference::Compatibility12);
+fn descriptor_bank_retirement_supports_vulkan12_aliases() {
+    descriptor_bank_lifetimes(ApiPreference::Compatibility12);
 }
 
 #[test]
@@ -302,7 +333,7 @@ fn dynamic_offsets_reuse_one_set_and_preserve_bounds_and_gpu_leases() {
         buffer.write_range(0, &17u32.to_le_bytes()).unwrap();
         buffer.write_range(alignment, &29u32.to_le_bytes()).unwrap();
     }
-    let mut descriptors = DescriptorCache::new(&device, 64);
+    let mut descriptors = DescriptorCache::new(&device);
     let mut resources = [DescriptorResource::Buffer {
         buffer: Arc::clone(&buffer),
         offset: 0,
@@ -325,7 +356,11 @@ fn dynamic_offsets_reuse_one_set_and_preserve_bounds_and_gpu_leases() {
         &record,
         &descriptors.get(&pipeline.layout, &resources).unwrap()
     ));
-    assert_eq!(descriptors.statistics().updates, 1);
+    assert_eq!(
+        descriptors.statistics().updates,
+        0,
+        "capture performs no native updates"
+    );
     device.bind_native_pipeline(&pipeline).unwrap();
     device
         .bind_native_descriptors(&pipeline, &record, &first_offsets)
@@ -634,7 +669,7 @@ fn guest_compilation_artifact_creates_native_compute_pipeline() {
 
 #[test]
 fn combined_arrays_and_texel_views_keep_descriptor_resources_alive() {
-    let Some(device) = support::device_for_test(ApiPreference::Compatibility12) else {
+    let Some(mut device) = support::device_for_test(ApiPreference::Compatibility12) else {
         return;
     };
     let monitor = device.validation_monitor();
@@ -741,17 +776,25 @@ fn combined_arrays_and_texel_views_keep_descriptor_resources_alive() {
             element_bytes: 4,
         },
     ];
-    let mut descriptors = DescriptorCache::new(&device, 8);
+    let mut descriptors = DescriptorCache::new(&device);
     let record = descriptors.get(&layout, &resources).unwrap();
     assert!(Arc::ptr_eq(
         &record,
         &descriptors.get(&layout, &resources).unwrap()
     ));
-    descriptors.forget_image(&view);
-    assert!(!Arc::ptr_eq(
-        &record,
-        &descriptors.get(&layout, &resources).unwrap()
-    ));
+    device.begin_recording().unwrap();
+    unsafe {
+        device
+            .dispatch
+            .bind_descriptors(vk::PipelineBindPoint::COMPUTE, Arc::clone(&record), &[]);
+    }
+    let work = device.flush().unwrap().unwrap();
+    assert!(device.wait_for_work(work, Duration::from_secs(10)).unwrap());
+    assert_eq!(
+        descriptors.statistics().updates,
+        1,
+        "mixed arrays and texel descriptors use the native update template"
+    );
     drop(resources);
     drop(buffer);
     drop(sampler);
@@ -841,4 +884,312 @@ fn host_topology_stages_use_owned_interfaces_and_validate() {
         nixe_gpu::shader_encoding::decode_artifacts(&bytes).unwrap(),
         artifacts
     );
+}
+
+#[test]
+fn completed_descriptor_history_does_not_reserve_staging_buffers() {
+    let Some(mut device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let config = CacheConfiguration {
+        workers: 1,
+        ..Default::default()
+    };
+    let workers = Arc::new(CompilePool::new(1, 8).unwrap());
+    let pipelines = PipelineCompiler::new(&device, Arc::clone(&workers), &config).unwrap();
+    let shader = crate::test_shaders::compile(
+        &device.profile().shader_compiler.profile,
+        [crate::test_shaders::increment(7, 4)],
+    );
+    let pipeline = pipelines.request(PipelineRecipe::Compute(shader)).unwrap();
+    let mut descriptors = DescriptorCache::new(&device);
+    let mut staging = crate::queue::staging::StagingPool::new(Arc::clone(&device.owner));
+    // Model genuinely busy stream regions, so small uploads take the real fallback pool.
+    staging.defer_regions(u16::MAX);
+    let mut capacities = Vec::new();
+    for _ in 0..4 {
+        {
+            let tick = device.work_ticket().unwrap();
+            let slice = staging
+                .reserve(64, 4, true, tick.tick(), device.completed_tick())
+                .unwrap();
+            assert!(!staging.is_stream(&slice));
+            let buffer = Arc::clone(staging.buffer(&slice));
+            let record = descriptors
+                .get(
+                    &pipeline.layout,
+                    &[DescriptorResource::Buffer {
+                        buffer,
+                        offset: 0,
+                        range: 8,
+                    }],
+                )
+                .unwrap();
+            device.bind_native_pipeline(&pipeline).unwrap();
+            device
+                .bind_native_descriptors(
+                    &pipeline,
+                    &record,
+                    &vec![0; pipeline.layout.dynamic_bindings.len()],
+                )
+                .unwrap();
+            device.flush().unwrap();
+            assert!(device.wait_for_work(tick, Duration::from_secs(10)).unwrap());
+        }
+        capacities.push(staging.pooled_capacity());
+    }
+    assert_eq!(
+        capacities,
+        [64, 64, 64, 64],
+        "completed descriptor history cannot pin staging"
+    );
+    assert_eq!(
+        descriptors.statistics().updates,
+        1,
+        "the resource-free last payload survives GPU retirement"
+    );
+    drop(staging);
+    drop(descriptors);
+    drop(pipeline);
+    drop(pipelines);
+    drop(workers);
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+fn prepared_captures_recycle_native_sets_and_rebind_old_data_after_completion() {
+    let Some(mut device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let workers = Arc::new(CompilePool::new(1, 8).unwrap());
+    let pipelines = PipelineCompiler::new(
+        &device,
+        Arc::clone(&workers),
+        &CacheConfiguration {
+            workers: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let shader = crate::test_shaders::compile(
+        &device.profile().shader_compiler.profile,
+        [crate::test_shaders::increment(7, 4)],
+    );
+    let pipeline = pipelines.request(PipelineRecipe::Compute(shader)).unwrap();
+    let alignment = device
+        .profile()
+        .limits
+        .min_storage_buffer_offset_alignment
+        .max(8);
+    let buffer = Arc::new(
+        device
+            .allocate_buffer(
+                alignment * 64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::GpuToCpu,
+                AllocationMode::Managed,
+                "retained descriptor captures",
+            )
+            .unwrap(),
+    );
+    for i in 0..64 {
+        unsafe {
+            buffer
+                .write_range(i * alignment, &(i as u32).to_le_bytes())
+                .unwrap();
+        }
+    }
+    let mut descriptors = DescriptorCache::new(&device);
+    let mut captures = Vec::new();
+    let dispatch = |device: &mut VulkanDevice, record: &Arc<BindingRecord>| {
+        device.bind_native_pipeline(&pipeline).unwrap();
+        device
+            .bind_native_descriptors(
+                &pipeline,
+                record,
+                &vec![0; pipeline.layout.dynamic_bindings.len()],
+            )
+            .unwrap();
+        unsafe {
+            device.dispatch.cmd_dispatch(1, 1, 1);
+            let barrier = [vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                .dst_access_mask(vk::AccessFlags2::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(buffer.handle)
+                .size(buffer.size())];
+            device
+                .dispatch
+                .barrier(&vk::DependencyInfo::default().buffer_memory_barriers(&barrier));
+        }
+        let work = device.flush().unwrap().unwrap();
+        assert!(device.wait_for_work(work, Duration::from_secs(10)).unwrap());
+    };
+    for i in 0..64 {
+        let record = descriptors
+            .get(
+                &pipeline.layout,
+                &[DescriptorResource::Buffer {
+                    buffer: Arc::clone(&buffer),
+                    offset: i * alignment,
+                    range: 8,
+                }],
+            )
+            .unwrap();
+        dispatch(&mut device, &record);
+        assert_eq!(
+            unsafe { buffer.read_range(i * alignment + 4, 4) }.unwrap(),
+            (i as u32 + 7).to_le_bytes()
+        );
+        captures.push(record);
+    }
+    assert_eq!(
+        descriptors.statistics().allocated,
+        16,
+        "retained CPU data cannot pin completed physical descriptor sets"
+    );
+    assert_eq!(descriptors.statistics().updates, 64);
+    unsafe {
+        buffer.write_range(0, &101u32.to_le_bytes()).unwrap();
+    }
+    dispatch(&mut device, &captures[0]);
+    assert_eq!(
+        unsafe { buffer.read_range(4, 4) }.unwrap(),
+        108u32.to_le_bytes(),
+        "an old capture must restore its own data after the native set was recycled"
+    );
+    assert_eq!(descriptors.statistics().allocated, 16);
+    drop(captures);
+    drop(descriptors);
+    drop(buffer);
+    drop(pipeline);
+    drop(pipelines);
+    drop(workers);
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+fn descriptor_pool_refreshes_completed_gpu_work_before_growing_with_stale_owner_progress() {
+    let Some(mut device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let workers = Arc::new(CompilePool::new(1, 8).unwrap());
+    let pipelines = PipelineCompiler::new(
+        &device,
+        Arc::clone(&workers),
+        &CacheConfiguration {
+            workers: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let shader = crate::test_shaders::compile(
+        &device.profile().shader_compiler.profile,
+        [crate::test_shaders::increment(7, 4)],
+    );
+    let pipeline = pipelines.request(PipelineRecipe::Compute(shader)).unwrap();
+    let alignment = device
+        .profile()
+        .limits
+        .min_storage_buffer_offset_alignment
+        .max(8);
+    let buffer = Arc::new(
+        device
+            .allocate_buffer(
+                alignment * 17,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::CpuToGpu,
+                AllocationMode::Managed,
+                "descriptor refresh windows",
+            )
+            .unwrap(),
+    );
+    let mut descriptors = DescriptorCache::new(&device);
+    let resources = |i| {
+        [DescriptorResource::Buffer {
+            buffer: Arc::clone(&buffer),
+            offset: i * alignment,
+            range: 8,
+        }]
+    };
+    device.bind_native_pipeline(&pipeline).unwrap();
+    for i in 0..16 {
+        let capture = descriptors.get(&pipeline.layout, &resources(i)).unwrap();
+        device
+            .bind_native_descriptors(
+                &pipeline,
+                &capture,
+                &vec![0; pipeline.layout.dynamic_bindings.len()],
+            )
+            .unwrap();
+    }
+    let mut gate = gate::Gate::new(&device);
+    let waits = [vk::SemaphoreSubmitInfo::default()
+        .semaphore(gate.handle)
+        .value(1)
+        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+    let first = unsafe {
+        device
+            .submission
+            .flush(device.queue, &mut device.dispatch, &waits, &[])
+    }
+    .unwrap()
+    .unwrap();
+    gate.last_use = first.tick();
+    device.dispatch.recording_handle().finish().unwrap();
+    assert_eq!(descriptors.statistics().allocated, 16);
+    gate.signal();
+    // Complete the GPU independently of owner polling/retirement. The worker
+    // must refresh its known progress instead of allocating another bank group.
+    unsafe {
+        device.owner.device.wait_semaphores(
+            &vk::SemaphoreWaitInfo::default()
+                .semaphores(&[device.submission.timeline])
+                .values(&[first.tick()]),
+            10_000_000_000,
+        )
+    }
+    .unwrap();
+    assert_eq!(device.completed_tick(), 0);
+    assert_eq!(device.submission.progress.completed(), 0);
+    let capture = descriptors.get(&pipeline.layout, &resources(16)).unwrap();
+    device
+        .bind_native_descriptors(
+            &pipeline,
+            &capture,
+            &vec![0; pipeline.layout.dynamic_bindings.len()],
+        )
+        .unwrap();
+    assert_eq!(
+        device.completed_tick(),
+        0,
+        "the spare command context needs no owner query"
+    );
+    let second = device.flush().unwrap().unwrap();
+    device.dispatch.recording_handle().finish().unwrap();
+    assert_eq!(descriptors.statistics().allocated, 16);
+    assert_eq!(descriptors.statistics().updates, 17);
+    assert!(device.submission.progress.completed() >= first.tick());
+    assert!(
+        device
+            .wait_for_work(second, Duration::from_secs(10))
+            .unwrap()
+    );
+    drop(capture);
+    drop(gate);
+    drop(descriptors);
+    drop(buffer);
+    drop(pipeline);
+    drop(pipelines);
+    drop(workers);
+    drop(device);
+    validation.check().unwrap();
 }
