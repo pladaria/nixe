@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -111,19 +110,16 @@ pub(super) struct VcpuWorkerPool {
 impl VcpuWorkerPool {
     pub(super) fn start(
         vcpus: impl IntoIterator<Item = VirtualCpuId>,
-        serialize_execution: bool,
     ) -> Result<Self, std::io::Error> {
         let vcpus: Vec<_> = vcpus.into_iter().collect();
         let (completion, results) = sync_channel(vcpus.len().max(1));
-        let global_permit = serialize_execution.then(|| Arc::new(Mutex::new(())));
         let mut workers: BTreeMap<VirtualCpuId, WorkerHandle> = BTreeMap::new();
         for vcpu in vcpus {
             let (commands, receiver) = sync_channel(1);
             let completion = completion.clone();
-            let permit = global_permit.clone();
             let thread = match std::thread::Builder::new()
                 .name(format!("nixe-vcpu-{}", vcpu.get()))
-                .spawn(move || worker_main(receiver, completion, permit))
+                .spawn(move || worker_main(receiver, completion))
             {
                 Ok(thread) => thread,
                 Err(error) => {
@@ -386,7 +382,6 @@ impl Drop for VcpuWorkerPool {
 fn worker_main(
     commands: Receiver<WorkerCommand>,
     results: SyncSender<WorkerResult>,
-    global_permit: Option<Arc<Mutex<()>>>,
 ) -> Result<(), nixe_cpu_direct_memory::FaultRuntimeError> {
     let mut native_worker = nixe_cpu_direct_memory::NativeWorker::default();
     let mut cpu_threads = BTreeMap::new();
@@ -447,14 +442,7 @@ fn worker_main(
             thread.select_guest(request.lease.thread);
             request.execution.run(&mut native_worker, &mut thread.cpu)
         };
-        let outcome = if let Some(permit) = &global_permit {
-            let _permit = permit
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            catch_worker_panic(run)
-        } else {
-            catch_worker_panic(run)
-        };
+        let outcome = catch_worker_panic(run);
         drop(run_trace);
         nixe_memory::trace::detail_event(
             "cpu_result",
@@ -574,7 +562,6 @@ mod tests {
                         instruction_budget: 2,
                         timer: &FixedTimer,
                         events: &VcpuEventState::default(),
-                        capture_context: true,
                     },
                 )
                 .unwrap();

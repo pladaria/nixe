@@ -8,7 +8,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use nixe_config::{CpuBackendSelection, GuestLogsLevel};
+use nixe_config::GuestLogsLevel;
 
 // The graphics workers allocate and release captured resources across threads.
 // Use a sharded heap for Rust allocations; native libraries keep their own ABI.
@@ -82,7 +82,6 @@ fn parse_arguments(
 ) -> Result<Option<Invocation>, String> {
     let mut config_path = None;
     let mut log_level = None;
-    let mut cpu_backend = None;
     let mut guest_logs_level = None;
     let mut file_system_access_log = None;
     let mut headless = false;
@@ -182,27 +181,7 @@ fn parse_arguments(
             file_system_access_log = Some(argument == "--file-system-access-log");
             continue;
         }
-        if argument == "--cpu-backend" {
-            if cpu_backend.is_some() {
-                return Err("--cpu-backend may only be specified once".to_owned());
-            }
-            let value = arguments
-                .next()
-                .ok_or_else(|| "--cpu-backend requires jit or interpreter".to_owned())?;
-            let value = value
-                .to_str()
-                .ok_or_else(|| "CPU backend must be valid UTF-8".to_owned())?;
-            cpu_backend = Some(match value {
-                "jit" => CpuBackendSelection::Jit,
-                "interpreter" => CpuBackendSelection::Interpreter,
-                _ => {
-                    return Err(format!(
-                        "invalid CPU backend {value:?}; expected jit or interpreter"
-                    ));
-                }
-            });
-            continue;
-        }
+
         if argument.to_string_lossy().starts_with('-') {
             return Err(format!("unknown option: {}", argument.to_string_lossy()));
         }
@@ -219,7 +198,6 @@ fn parse_arguments(
     match positionals.as_slice() {
         [command] if command == "vulkan-check" => {
             if config_path.is_some()
-                || cpu_backend.is_some()
                 || guest_logs_level.is_some()
                 || file_system_access_log.is_some()
             {
@@ -247,9 +225,7 @@ fn parse_arguments(
             if headless {
                 return Err("--headless is only valid with run or vulkan-check".to_owned());
             }
-            if cpu_backend.is_some() {
-                return Err("--cpu-backend is only valid with run".to_owned());
-            }
+
             if guest_logs_level.is_some() || file_system_access_log.is_some() {
                 return Err("guest diagnostic options are only valid with run".to_owned());
             }
@@ -262,9 +238,7 @@ fn parse_arguments(
             if headless {
                 return Err("--headless is only valid with run or vulkan-check".to_owned());
             }
-            if cpu_backend.is_some() {
-                return Err("--cpu-backend is only valid with run".to_owned());
-            }
+
             if guest_logs_level.is_some() || file_system_access_log.is_some() {
                 return Err("guest diagnostic options are only valid with run".to_owned());
             }
@@ -296,7 +270,6 @@ fn parse_arguments(
                         },
                         adapter,
                     },
-                    cpu_backend_override: cpu_backend,
                     guest_logs_level_override: guest_logs_level,
                     file_system_access_log_override: file_system_access_log,
                 }),
@@ -347,7 +320,6 @@ fn print_usage(program: &OsStr) {
            --adapter <substring>   Select an adapter by name\n\n\
          Run options:\n  \
            --headless              Run without creating a host window\n  \
-           --cpu-backend <backend> Override CPU backend: jit or interpreter\n  \
            --guest-logs-level <level> Override diagnostics.guest_logs_level\n  \
            --file-system-access-log Enable guest filesystem access logs\n  \
            --no-file-system-access-log Disable guest filesystem access logs\n\n\
@@ -397,7 +369,6 @@ mod tests {
         for args in [
             &["list", "--validation"][..],
             &["vulkan-check", "--vulkan-api", "1.1"][..],
-            &["vulkan-check", "--cpu-backend", "jit"][..],
             &["vulkan-check", "extra"][..],
         ] {
             assert!(parse_arguments(arguments(args)).is_err());
@@ -493,30 +464,9 @@ mod tests {
             assert_eq!(arguments.log_level_override, None);
             assert_eq!(arguments.identifier, identifier);
             assert!(!arguments.headless);
-            assert_eq!(arguments.cpu_backend_override, None);
             assert_eq!(arguments.guest_logs_level_override, None);
             assert_eq!(arguments.file_system_access_log_override, None);
             assert_eq!(invocation.log_level, logging::LogLevel::Info);
-        }
-    }
-
-    #[test]
-    fn parses_every_cpu_backend_before_or_after_run() {
-        for (value, expected) in [
-            ("jit", CpuBackendSelection::Jit),
-            ("interpreter", CpuBackendSelection::Interpreter),
-        ] {
-            for values in [
-                vec!["--cpu-backend", value, "run", "hello-world"],
-                vec!["run", "--cpu-backend", value, "hello-world"],
-                vec!["run", "hello-world", "--cpu-backend", value],
-            ] {
-                let invocation = parse_arguments(arguments(&values)).unwrap().unwrap();
-                let Command::Run(arguments) = invocation.command else {
-                    panic!("expected run command");
-                };
-                assert_eq!(arguments.cpu_backend_override, Some(expected));
-            }
         }
     }
 
@@ -624,18 +574,6 @@ mod tests {
             &["list", "--headless"][..],
             &["input", "--headless"][..],
             &["run", "--headless", "--headless", "hello-world"][..],
-            &["--cpu-backend", "jit", "list"][..],
-            &["input", "--cpu-backend", "interpreter"][..],
-            &["run", "hello-world", "--cpu-backend", "native"][..],
-            &["run", "hello-world", "--cpu-backend"][..],
-            &[
-                "run",
-                "hello-world",
-                "--cpu-backend",
-                "jit",
-                "--cpu-backend",
-                "interpreter",
-            ][..],
             &["--unknown", "list"][..],
             &["--config", "list"][..],
         ] {

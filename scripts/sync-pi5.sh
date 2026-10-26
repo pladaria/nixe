@@ -50,7 +50,6 @@ rsync "${common[@]}" "${dry_run[@]}" \
     --exclude=/cache/ --exclude=/storage/ --exclude=/dump/ \
     --exclude='/perf.*' --exclude='/perf-*' \
     --exclude='/docker/reference-*' \
-    --exclude=/fuzz/artifacts/ --exclude=/fuzz/corpus/ \
     "$nixe_root/" pi5:projects/nixe/
 
 # Explicitly requested private data: no deletion or filename/content logging.

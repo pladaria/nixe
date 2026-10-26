@@ -18,5 +18,4 @@ nixe-loader-title.workspace = true
 nixe-scheduler.workspace = true
 
 [dev-dependencies]
-sha2.workspace = true
 tempfile.workspace = true

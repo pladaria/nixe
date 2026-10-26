@@ -8,7 +8,7 @@ use crate::{
     metrics::{Counter, Timer, record},
 };
 use nixe_cpu::{
-    execution::{ArchitecturalTimer, ControlSnapshot, CpuControl, VcpuEventState},
+    execution::{ArchitecturalTimer, ControlSnapshot, CpuControl, CpuExit},
     state::a64::A64State,
 };
 use nixe_cpu_direct_memory::{CapturedFault, FaultDisposition, NativeInvocation, NativeWorker};
@@ -201,7 +201,7 @@ impl Core {
     pub fn complete(
         &mut self,
         completed: CompletedInstruction,
-    ) -> Result<(nixe_cpu_interpreter::InstructionStep, u64), MemoryError> {
+    ) -> Result<(Option<CpuExit>, u64), MemoryError> {
         if completed.space != self.space().identity() {
             return Err(MemoryError::Invalid(
                 "instruction belongs to another address space",
@@ -240,7 +240,6 @@ impl Core {
         worker: &mut NativeWorker,
         budget: u64,
         timer: &dyn ArchitecturalTimer,
-        events: &VcpuEventState,
     ) -> Result<Boundary, JitError> {
         if budget == 0 || budget > i64::MAX as u64 {
             return Err(JitError("native budget must be in 1..=i64::MAX".into()));
@@ -341,10 +340,10 @@ impl Core {
             )
         })?;
         drop(measurement);
-        // Dynarmic charges its synthetic missing-fetch/interpret terminal as
+        // Dynarmic charges its synthetic missing-fetch/unsupported terminal as
         // one cycle. Neither terminal executes the selected guest instruction.
-        // Code preparation must not consume the caller's quantum; the owned
-        // instruction continuation charges the architectural fallback itself.
+        // Code preparation must not consume the caller's quantum; memory
+        // completion charges the architectural operation itself.
         if call.exit.kind == 1 || (call.exit.kind == 3 && call.exit.detail == 9) {
             call.exit.ticks = call.exit.ticks.saturating_sub(1);
         }
@@ -475,8 +474,6 @@ impl Core {
                 (captured, instruction),
                 space,
                 &admission,
-                timer,
-                events,
             )?)
         } else {
             None

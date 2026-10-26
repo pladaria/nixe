@@ -6,7 +6,19 @@ const WAITERS: u32 = 1 << 30;
 fn add_thread(process: &mut ScheduledProcess, entry: u64, priority: i32) -> (GuestThreadId, u32) {
     let process_id = process.scheduler_process_id();
     let stack_top = process.main_thread().stack_top;
-    let affinity = process.coordinator_mut().scheduler().profile().all_cores();
+    // Arbitration order is a per-core contract. Keep these contenders on core
+    // zero while using the same parallel coordinator as normal execution.
+    let affinity = process
+        .coordinator_mut()
+        .scheduler()
+        .profile()
+        .core_set([VirtualCpuId::new(0)])
+        .unwrap();
+    let main = process.main_thread_id();
+    process
+        .coordinator_mut()
+        .migrate_thread(main, Some(VirtualCpuId::new(0)), affinity.clone())
+        .unwrap();
     let child = process
         .coordinator_mut()
         .create_thread(

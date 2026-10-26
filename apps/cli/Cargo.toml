@@ -15,7 +15,6 @@ mimalloc.workspace = true
 sha2.workspace = true
 nixe-config.workspace = true
 nixe-cpu.workspace = true
-nixe-cpu-interpreter.workspace = true
 nixe-cpu-jit.workspace = true
 nixe-horizon.workspace = true
 nixe-gpu.workspace = true

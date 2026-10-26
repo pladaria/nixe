@@ -4,8 +4,9 @@
 //! https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions
 use crate::{JitError, execution::CapturedAccess};
 use nixe_cpu::{
-    exclusive::ExclusiveMonitorState,
-    execution::{ArchitecturalTimer, CpuExit, VcpuEventState},
+    decode::{self, DecodeResult, DecodedOpcode, a64::A64Instruction},
+    execution::CpuExit,
+    location::{DecodedInstruction, LocationDescriptor},
     memory::{
         AtomicMemoryResult, AtomicRmwKind, CacheMaintenanceKind, DataAccessFault,
         DataAccessFaultReason, DataAccessKind, DataReadResult, DataWriteResult,
@@ -13,10 +14,8 @@ use nixe_cpu::{
         MemoryRegionKind, MemoryValue,
     },
     profile::ProcessCpuContext,
-    state::a64::A64State,
-};
-use nixe_cpu_interpreter::{
-    InstructionStep, InterpreterContext, InterpreterError, execute_one_with_context,
+    semantics::a64::signed_immediate as sign_extend,
+    state::a64::{A64GeneralRegister, A64Register, A64State},
 };
 use nixe_memory::{
     Access, AccessOperation, AccessOrdering, AccessResult, AddressSpace, AddressSpaceId,
@@ -125,6 +124,8 @@ enum Stage<'a> {
     },
 }
 struct Effects<'a> {
+    space: AddressSpaceId,
+    monitor: Cell<Option<Reservation>>,
     stage: Stage<'a>,
 }
 enum Outcome<'a> {
@@ -147,7 +148,6 @@ pub struct InstructionContinuation {
     finished: bool,
     ready: Option<CompletedInstruction>,
     read_area: Option<NativeReadArea>,
-    events: VcpuEventState,
 }
 pub(crate) enum ExclusiveUpdate {
     Keep,
@@ -159,7 +159,7 @@ pub struct CompletedInstruction {
     pub(crate) state: A64State,
     pub(crate) exclusive: ExclusiveUpdate,
     pub(crate) read_area: Option<NativeReadArea>,
-    pub stop: InstructionStep,
+    pub stop: Option<CpuExit>,
     pub ticks: u64,
 }
 impl InstructionContinuation {
@@ -178,8 +178,6 @@ impl InstructionContinuation {
         (mut first, word): (Option<CapturedAccess>, u32),
         space: &AddressSpace,
         admission: &NativeAdmission<'_>,
-        timer: &dyn ArchitecturalTimer,
-        events: &VcpuEventState,
     ) -> Result<Self, JitError> {
         let reservation = match first.as_ref().map(|first| &first.operation) {
             Some(AccessOperation::Atomic(AtomicAccess {
@@ -193,6 +191,8 @@ impl InstructionContinuation {
             .map(|first| std::mem::take(&mut first.ranges))
             .filter(|ranges| !ranges.is_empty());
         let effects = Effects {
+            space: space.identity(),
+            monitor: Cell::new(reservation),
             stage: Stage::Capture {
                 first: first.as_ref().map(|first| first.address),
                 reached: Cell::new(
@@ -203,46 +203,12 @@ impl InstructionContinuation {
                 records: RefCell::new(Vec::new()),
             },
         };
-        let mut monitor = ExclusiveMonitorState::default();
-        if let Some(reservation) = reservation {
-            monitor.reserve(Some(reservation));
-        }
-        let monitor = RefCell::new(monitor);
         let mut planned = state.clone();
-        let result = execute_one_with_context(
-            InterpreterContext::new(cpu, &effects, &monitor, timer, events),
-            &mut planned,
-            word,
+        let stop = resolve_memory(&effects, cpu, &mut planned, word);
+        let semantic_failure = matches!(
+            stop,
+            Some(CpuExit::UnsupportedSemantics { .. } | CpuExit::UnallocatedEncoding { .. })
         );
-        let (stop, semantic_failure) = match result {
-            Ok(stop) => (stop, false),
-            Err(error) => {
-                let stop = match error {
-                    InterpreterError::UnsupportedInstruction {
-                        source,
-                        encoding,
-                        disassembly,
-                        coverage_id,
-                    } => CpuExit::UnsupportedSemantics {
-                        source,
-                        encoding,
-                        disassembly,
-                        coverage_id,
-                    },
-                    InterpreterError::InvalidInstructionStream {
-                        source,
-                        encoding,
-                        reason,
-                    } => CpuExit::UnallocatedEncoding {
-                        error: nixe_cpu::error::UnallocatedEncoding::new(
-                            nixe_cpu::error::InstructionDiagnostic::new(source, encoding),
-                            reason,
-                        ),
-                    },
-                };
-                (InstructionStep::Exit(stop), true)
-            }
-        };
         let Stage::Capture {
             reached, records, ..
         } = effects.stage
@@ -275,7 +241,7 @@ impl InstructionContinuation {
             },
             exclusive: ExclusiveUpdate::Keep,
             read_area: None,
-            ticks: u64::from(matches!(stop, InstructionStep::Continue)),
+            ticks: u64::from(stop.is_none()),
             stop,
         });
         Ok(Self {
@@ -291,7 +257,6 @@ impl InstructionContinuation {
             finished: false,
             ready,
             read_area: None,
-            events: events.clone(),
         })
     }
     pub fn set_waker(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
@@ -303,7 +268,6 @@ impl InstructionContinuation {
     pub fn poll(
         &mut self,
         machine: &Machine,
-        timer: &dyn ArchitecturalTimer,
     ) -> Option<Result<CompletedInstruction, Arc<MemoryError>>> {
         assert!(!self.finished, "instruction completion already consumed");
         if let Some(ready) = self.ready.take() {
@@ -356,28 +320,14 @@ impl InstructionContinuation {
         }
         self.finished = true;
         let effects = Effects {
+            space: self.space,
+            monitor: Cell::new(self.reservation),
             stage: Stage::Complete {
                 records: &self.records,
                 next: Cell::new(0),
             },
         };
-        let mut monitor = ExclusiveMonitorState::default();
-        if let Some(reservation) = self.reservation {
-            monitor.reserve(Some(reservation));
-        }
-        let monitor = RefCell::new(monitor);
-        let stop = match execute_one_with_context(
-            InterpreterContext::new(self.cpu, &effects, &monitor, timer, &self.events),
-            &mut self.state,
-            self.word,
-        ) {
-            Ok(stop) => stop,
-            Err(error) => {
-                return Some(Err(Arc::new(MemoryError::Execution(
-                    error.to_string().into(),
-                ))));
-            }
-        };
+        let stop = resolve_memory(&effects, self.cpu, &mut self.state, self.word);
         let Stage::Complete { next, .. } = effects.stage else {
             unreachable!()
         };
@@ -391,7 +341,7 @@ impl InstructionContinuation {
             .iter()
             .any(|record| record.kind == Kind::ExclusiveRead)
         {
-            match monitor.borrow().reservation().flatten() {
+            match effects.monitor.get() {
                 Some(reservation) => match machine.export_native_reservation(reservation) {
                     Ok(proof) => ExclusiveUpdate::Set(proof),
                     Err(error) => return Some(Err(Arc::new(error))),
@@ -412,7 +362,7 @@ impl InstructionContinuation {
             state: std::mem::take(&mut self.state),
             exclusive,
             read_area: self.read_area.take(),
-            ticks: u64::from(matches!(stop, InstructionStep::Continue)),
+            ticks: u64::from(stop.is_none()),
             stop,
         }))
     }
@@ -816,4 +766,124 @@ impl Effects<'_> {
             region: MemoryRegionKind::Ram,
         })
     }
+}
+
+mod memory;
+mod simd;
+
+/// Complete only a captured memory instruction; native CPU execution has no
+/// reference-engine fallback for arithmetic, control flow or system operations.
+fn resolve_memory(
+    effects: &Effects<'_>,
+    cpu: ProcessCpuContext,
+    state: &mut A64State,
+    word: u32,
+) -> Option<CpuExit> {
+    let source = LocationDescriptor::new(GuestVirtualAddress::new(state.pc()), cpu.profile_id());
+    let decoded = match decode::decode(cpu.decoder(), source, word.into()) {
+        DecodeResult::Decoded(decoded) => decoded,
+        DecodeResult::RecognizedUnimplemented(decoded) => return Some(unsupported(&decoded)),
+        DecodeResult::Unallocated {
+            instruction,
+            reason,
+        }
+        | DecodeResult::Reserved {
+            instruction,
+            reason,
+            ..
+        } => {
+            return Some(CpuExit::UnallocatedEncoding {
+                error: nixe_cpu::error::UnallocatedEncoding::new(instruction, reason),
+            });
+        }
+    };
+    let result = match decode::a64::normalize(&decoded.instruction, decoded.encoding) {
+        A64Instruction::Memory(instruction) => {
+            memory::execute(effects, state, &decoded, instruction)
+        }
+        A64Instruction::FpSimd(instruction) => simd::execute(effects, state, instruction),
+        _ => return Some(unsupported(&decoded)),
+    };
+    match result {
+        Ok(Some(())) => {
+            state.set_pc(state.pc().wrapping_add(4));
+            None
+        }
+        Ok(None) => Some(unsupported(&decoded)),
+        Err(fault) => Some(CpuExit::DataFault { source, fault }),
+    }
+}
+fn unsupported(decoded: &DecodedInstruction<DecodedOpcode>) -> CpuExit {
+    CpuExit::UnsupportedSemantics {
+        source: decoded.location,
+        encoding: decoded.encoding,
+        disassembly: decode::disassemble(&decoded.instruction).to_string().into(),
+        coverage_id: decoded.instruction.coverage_id(),
+    }
+}
+fn zero_register(index: u8) -> A64Register {
+    A64GeneralRegister::new(index).map_or(A64Register::Zero, A64Register::General)
+}
+
+fn stack_pointer_register(index: u8) -> A64Register {
+    A64GeneralRegister::new(index).map_or(A64Register::StackPointer, A64Register::General)
+}
+
+fn read(state: &A64State, index: u8, width: u8, register31_is_sp: bool) -> u64 {
+    let register = if register31_is_sp {
+        stack_pointer_register(index)
+    } else {
+        zero_register(index)
+    };
+    if width == 64 {
+        state.read_x(register)
+    } else {
+        u64::from(state.read_w(register))
+    }
+}
+
+fn write(state: &mut A64State, index: u8, width: u8, register31_is_sp: bool, value: u64) {
+    let register = if register31_is_sp {
+        stack_pointer_register(index)
+    } else {
+        zero_register(index)
+    };
+    if width == 64 {
+        state.write_x(register, value);
+    } else {
+        state.write_w(register, value as u32);
+    }
+}
+
+// A64 register-offset address generation is shared by integer and SIMD&FP
+// loads/stores. See Arm ARM DDI 0602 (2025-12), "Load/store register
+// (register offset)":
+// https://developer.arm.com/documentation/ddi0602/2025-12/
+fn register_offset_address(
+    state: &A64State,
+    base_register: u8,
+    offset_register: u8,
+    option: u8,
+    scaled: bool,
+    scale: u32,
+) -> Option<GuestVirtualAddress> {
+    if option & 2 == 0 {
+        return None;
+    }
+    let raw = read(state, offset_register, 64, false);
+    let source_width = if option & 1 == 0 { 32 } else { 64 };
+    let mut offset = if source_width == 32 {
+        u64::from(raw as u32)
+    } else {
+        raw
+    };
+    if option & 4 != 0 {
+        offset = sign_extend(offset, source_width) as u64;
+    }
+    if scaled {
+        offset = offset.wrapping_shl(scale);
+    }
+    Some(GuestVirtualAddress::new(
+        read(state, base_register, 64, true).wrapping_add(offset),
+    ))
 }

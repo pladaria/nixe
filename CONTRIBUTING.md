@@ -51,7 +51,7 @@ production compatibility paths solely to keep obsolete tests passing.
 ## References and implementation notes
 
 When implementation relies on external technical references, link them in a nearby comment. For CPU instructions
-implemented by the interpreter or JIT, consult the official Arm documentation and include a nearby link to the
+implemented by the JIT, consult the official Arm documentation and include a nearby link to the
 relevant page.
 
 ## Language and contents

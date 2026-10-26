@@ -7,12 +7,6 @@ impl RunnableProcess {
         self.process_exit.as_ref()
     }
 
-    /// Returns the selected concrete CPU backend name.
-    #[must_use]
-    pub const fn cpu_backend_name(&self) -> &'static str {
-        self.execution.backend_name()
-    }
-
     pub(crate) const fn cpu_process_id(&self) -> nixe_cpu::execution::CpuProcessId {
         self.execution.process_id()
     }
@@ -100,13 +94,8 @@ impl RunnableProcess {
     ) -> Result<ExecutionReport, ProcessExecutionError> {
         let vcpu = nixe_scheduler::VirtualCpuId::new(0);
         let events = nixe_cpu::execution::VcpuEventState::default();
-        let mut execution = self.begin_thread_execution(
-            self.main_thread_id,
-            vcpu,
-            instruction_budget,
-            events,
-            true,
-        )?;
+        let mut execution =
+            self.begin_thread_execution(self.main_thread_id, vcpu, instruction_budget, events)?;
         let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
         let result = execution.run(&mut worker, thread);
         worker
@@ -121,7 +110,6 @@ impl RunnableProcess {
         vcpu: nixe_scheduler::VirtualCpuId,
         instruction_budget: u64,
         events: nixe_cpu::execution::VcpuEventState,
-        capture_context: bool,
     ) -> Result<execution::VcpuExecutionState, ProcessExecutionError> {
         if self
             .execution
@@ -159,7 +147,6 @@ impl RunnableProcess {
             virtual_clock,
             architectural_timer_frequency,
             instruction_budget,
-            capture_context,
             events,
         })
     }

@@ -8,7 +8,6 @@ license.workspace = true
 nixe-memory.workspace = true
 nixe-cpu.workspace = true
 nixe-cpu-direct-memory.workspace = true
-nixe-cpu-interpreter.workspace = true
 
 [features]
 performance-counters = ["nixe-memory/performance-counters"]

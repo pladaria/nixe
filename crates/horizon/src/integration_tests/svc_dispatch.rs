@@ -17,17 +17,13 @@ use nixe_input::{
 };
 use nixe_memory::GuestVirtualAddress;
 use nixe_runtime::{
-    CpuBackendConfig, EventObject, ExceptionHandlingResult, ExceptionTerminationReason,
-    ExceptionTerminationScope, Launcher, LauncherInput, ProcessBuildConfig, ProcessBuilder,
-    ProcessExitCause, ProcessLifecycle, ProcessObject, ReadableEventObject, RunnableProcess,
-    SessionMessage, SessionObject, SessionRequestOwner, SessionRequestResult, SharedMemoryObject,
-    ThreadLifecycle, WritableEventObject,
+    EventObject, ExceptionHandlingResult, ExceptionTerminationReason, ExceptionTerminationScope,
+    Launcher, LauncherInput, ProcessBuildConfig, ProcessBuilder, ProcessExitCause,
+    ProcessLifecycle, ProcessObject, ReadableEventObject, RunnableProcess, SessionMessage,
+    SessionObject, SessionRequestOwner, SessionRequestResult, SharedMemoryObject, ThreadLifecycle,
+    WritableEventObject,
 };
 use support::ScheduledProcess;
-
-fn reference_process_builder() -> ProcessBuilder {
-    support::process_builder().with_cpu_backend(CpuBackendConfig::Jit)
-}
 
 // Tests that advance scheduler deadlines explicitly must not sample host time.
 fn fixed_time_dispatcher(process: &RunnableProcess) -> HorizonSvcDispatcher {
@@ -130,7 +126,7 @@ fn fixture_process_with_config(
     instructions: &[u32],
     config: ProcessBuildConfig,
 ) -> (tempfile::TempDir, ScheduledProcess) {
-    fixture_process_with_builder(instructions, config, reference_process_builder())
+    fixture_process_with_builder(instructions, config, support::process_builder())
 }
 fn fixture_process_with_builder(
     instructions: &[u32],
@@ -159,7 +155,7 @@ fn fixture_process_with_romfs(
     let romfs = support::synthetic_packages::build_romfs(files);
     fs::write(&path, synthetic_nro_with_romfs(instructions, &romfs)).unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = reference_process_builder()
+    let mut process = support::process_builder()
         .build(&plan)
         .expect("synthetic asset NRO builds");
     let test_entry = process.entry_module().entry_address() + 0x80;
@@ -178,7 +174,7 @@ fn fixture_process_with_svcs(immediates: &[u8]) -> (tempfile::TempDir, Scheduled
     let path = directory.path().join("svc-state.nro");
     fs::write(&path, image).unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = reference_process_builder()
+    let mut process = support::process_builder()
         .build(&plan)
         .expect("synthetic NRO builds");
     let test_entry = process.entry_module().entry_address() + entry_offset as u64;
@@ -664,7 +660,18 @@ fn address_signals_wake_guest_threads_using_their_updated_effective_priorities()
     let entry = state(&mut process).pc() + 12;
     let stack_top = process.main_thread().stack_top;
     let process_id = process.scheduler_process_id();
-    let affinity = process.coordinator_mut().scheduler().profile().all_cores();
+    let core = nixe_scheduler::VirtualCpuId::new(0);
+    let affinity = process
+        .coordinator_mut()
+        .scheduler()
+        .profile()
+        .core_set([core])
+        .unwrap();
+    let main = process.main_thread_id();
+    process
+        .coordinator_mut()
+        .migrate_thread(main, Some(core), affinity.clone())
+        .unwrap();
     let mut children = Vec::new();
     for priority in [30, 40] {
         let child = process
@@ -687,10 +694,10 @@ fn address_signals_wake_guest_threads_using_their_updated_effective_priorities()
         process.coordinator_mut().start_thread(object_id).unwrap();
         children.push((child.id, object_id));
     }
-    for &(_thread, _) in &children {
+    for &(expected, _) in &children {
         {
             let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
-            assert_eq!(thread, thread);
+            assert_eq!(thread, expected);
             assert!(matches!(handling, ExceptionHandlingResult::Suspended));
         };
     }
@@ -5705,7 +5712,7 @@ fn filesystem_wire_reports_attributes_and_deletes_files_in_plain_and_domain_sess
         fs::create_dir(&sd).unwrap();
         fs::write(sd.join("progress"), b"save").unwrap();
         let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-        let mut process = reference_process_builder()
+        let mut process = support::process_builder()
             .with_sd_card_root(sd.clone())
             .build(&plan)
             .unwrap();
@@ -6818,7 +6825,18 @@ fn break_captures_frames_on_a_guest_created_thread_stack() {
     write_guest_bytes(&process, caller_frame_pointer, &frame);
 
     let process_id = process.scheduler_process_id();
-    let affinity = process.coordinator_mut().scheduler().profile().all_cores();
+    let core = nixe_scheduler::VirtualCpuId::new(0);
+    let affinity = process
+        .coordinator_mut()
+        .scheduler()
+        .profile()
+        .core_set([core])
+        .unwrap();
+    let main = process.main_thread_id();
+    process
+        .coordinator_mut()
+        .migrate_thread(main, Some(core), affinity.clone())
+        .unwrap();
     let child = process
         .coordinator_mut()
         .create_thread(

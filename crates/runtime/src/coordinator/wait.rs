@@ -264,7 +264,6 @@ impl RuntimeCoordinator {
         event: crate::SequencedExternalEvent,
         report: &mut CoordinatorDrainReport,
     ) -> Result<(), CoordinatorError> {
-        self.record_external_event(event);
         report.received += 1;
         report.first_sequence.get_or_insert(event.sequence);
         report.last_sequence = Some(event.sequence);

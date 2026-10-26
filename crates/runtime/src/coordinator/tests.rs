@@ -37,48 +37,34 @@ fn registration(coordinator: &RuntimeCoordinator) -> ProcessRegistration {
 
 #[test]
 fn host_pause_preserves_ready_threads_and_resume_and_stop_wake_the_waiter() {
-    for mode in [
-        VcpuExecutionMode::Deterministic,
-        VcpuExecutionMode::Parallel,
-    ] {
-        let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
-            profile(),
-            crate::VirtualClock::default(),
-            mode,
-        )
-        .unwrap();
-        let process = synthetic_process_for_coordinator(1);
-        let id = coordinator
-            .register_process(process, registration(&coordinator))
+    let mut coordinator =
+        RuntimeCoordinator::try_with_virtual_clock(profile(), crate::VirtualClock::default())
             .unwrap();
-        let sender = coordinator.event_sender();
-        sender.submit(ExternalEvent::HostPause(true)).unwrap();
-        coordinator.drain_external_events().unwrap();
-        assert!(coordinator.host_paused());
-        assert_eq!(coordinator.scheduler.active_leases().count(), 0);
-        assert!(coordinator.run_next_adaptive().unwrap().is_none());
-        if mode == VcpuExecutionMode::Parallel {
-            assert!(coordinator.run_parallel_adaptive().unwrap().is_none());
-        }
-        let resume = sender.clone();
-        let worker =
-            std::thread::spawn(move || resume.submit(ExternalEvent::HostPause(false)).unwrap());
-        coordinator.wait_while_host_paused().unwrap();
-        worker.join().unwrap();
-        assert!(!coordinator.host_paused());
-        let execution = if mode == VcpuExecutionMode::Parallel {
-            coordinator.run_parallel(1).unwrap()
-        } else {
-            coordinator.run_next(1).unwrap()
-        };
-        assert!(execution.is_some());
-        sender.submit(ExternalEvent::HostPause(true)).unwrap();
-        coordinator.drain_external_events().unwrap();
-        sender.submit(ExternalEvent::HostStop).unwrap();
-        coordinator.wait_while_host_paused().unwrap();
-        assert!(coordinator.host_stop_requested());
-        coordinator.remove_process(id).unwrap();
-    }
+    let process = synthetic_process_for_coordinator(1);
+    let id = coordinator
+        .register_process(process, registration(&coordinator))
+        .unwrap();
+    let sender = coordinator.event_sender();
+    sender.submit(ExternalEvent::HostPause(true)).unwrap();
+    coordinator.drain_external_events().unwrap();
+    assert!(coordinator.host_paused());
+    assert_eq!(coordinator.scheduler.active_leases().count(), 0);
+    assert!(coordinator.run_next_adaptive().unwrap().is_none());
+
+    let resume = sender.clone();
+    let worker =
+        std::thread::spawn(move || resume.submit(ExternalEvent::HostPause(false)).unwrap());
+    coordinator.wait_while_host_paused().unwrap();
+    worker.join().unwrap();
+    assert!(!coordinator.host_paused());
+    let execution = coordinator.run_next(1).unwrap();
+    assert!(execution.is_some());
+    sender.submit(ExternalEvent::HostPause(true)).unwrap();
+    coordinator.drain_external_events().unwrap();
+    sender.submit(ExternalEvent::HostStop).unwrap();
+    coordinator.wait_while_host_paused().unwrap();
+    assert!(coordinator.host_stop_requested());
+    coordinator.remove_process(id).unwrap();
 }
 
 #[test]
@@ -204,7 +190,7 @@ fn one_host_worker_preserves_independent_native_processes_and_retires_either_fir
             .map(|id| {
                 coordinator
                     .register_process(
-                        synthetic_memory_loop_process(id, crate::CpuBackendConfig::Jit),
+                        synthetic_memory_loop_process(id),
                         registration(&coordinator),
                     )
                     .unwrap()
@@ -456,29 +442,18 @@ struct ResumeDispatcher;
 
 #[test]
 fn immediate_svcs_do_not_time_slice_equal_priority_threads() {
-    check_immediate_svc_turn(VcpuExecutionMode::Deterministic);
-}
-
-#[test]
-fn parallel_immediate_svcs_do_not_time_slice_equal_priority_threads() {
-    check_immediate_svc_turn(VcpuExecutionMode::Parallel);
-}
-
-fn check_immediate_svc_turn(mode: VcpuExecutionMode) {
-    use crate::process::tests::synthetic_backend_instruction_process;
-    let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
+    use crate::process::tests::synthetic_native_instruction_process;
+    let mut coordinator = RuntimeCoordinator::try_with_virtual_clock(
         two_core_profile(),
         crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 }),
-        mode,
     )
     .unwrap();
     let mut threads = Vec::new();
     for id in 1..=2 {
         let process = coordinator
             .register_process(
-                synthetic_backend_instruction_process(
+                synthetic_native_instruction_process(
                     id,
-                    crate::CpuBackendConfig::Jit,
                     &[0xd4000021, 0x17ffffff], // SVC #1; B back to SVC
                 ),
                 ProcessRegistration {
@@ -495,12 +470,7 @@ fn check_immediate_svc_turn(mode: VcpuExecutionMode) {
         threads.push(coordinator.process(process).unwrap().main_thread_id());
     }
     for _ in 0..32 {
-        let execution = match mode {
-            VcpuExecutionMode::Deterministic => coordinator.run_next(1),
-            VcpuExecutionMode::Parallel => coordinator.run_parallel(1),
-        }
-        .unwrap()
-        .unwrap();
+        let execution = coordinator.run_next(1).unwrap().unwrap();
         assert_eq!(execution.lease.thread, threads[0]);
         match execution.report.stop {
             ExecutionStop::SupervisorCall { .. } => {
@@ -524,28 +494,19 @@ fn check_immediate_svc_turn(mode: VcpuExecutionMode) {
             migration: nixe_scheduler::YieldMigration::None,
         })
         .unwrap();
-    let execution = match mode {
-        VcpuExecutionMode::Deterministic => coordinator.run_next(1),
-        VcpuExecutionMode::Parallel => coordinator.run_parallel(1),
-    }
-    .unwrap()
-    .unwrap();
+    let execution = coordinator.run_next(1).unwrap().unwrap();
     assert_eq!(execution.lease.thread, threads[1]);
 }
 
 #[test]
 fn native_residency_preserves_real_worker_switches_blocking_results_and_migration() {
-    use crate::process::tests::synthetic_backend_instruction_process;
+    use crate::process::tests::synthetic_native_instruction_process;
     use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
     let x0 = A64Register::General(A64GeneralRegister::new(0).unwrap());
     let mut coordinator = RuntimeCoordinator::new(two_core_profile());
     let process = coordinator
         .register_process(
-            synthetic_backend_instruction_process(
-                1,
-                crate::CpuBackendConfig::Jit,
-                &[0xd4000021, 0x17ffffff],
-            ), // SVC #1; B back to SVC
+            synthetic_native_instruction_process(1, &[0xd4000021, 0x17ffffff]), // SVC #1; B back to SVC
             ProcessRegistration {
                 priority: 44,
                 ideal_vcpu: Some(VirtualCpuId::new(7)),
@@ -1282,95 +1243,73 @@ fn virtual_deadlines_are_deterministic_and_do_not_sleep_the_host() {
 }
 
 #[test]
-fn realtime_device_waits_allow_completion_before_timeout_in_both_execution_modes() {
-    for mode in [
-        VcpuExecutionMode::Deterministic,
-        VcpuExecutionMode::Parallel,
-    ] {
-        let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
-            profile(),
-            crate::VirtualClock::default(),
-            mode,
+fn realtime_device_waits_allow_completion_before_timeout() {
+    let mut coordinator =
+        RuntimeCoordinator::try_with_virtual_clock(profile(), crate::VirtualClock::default())
+            .unwrap();
+    coordinator
+        .register_process(
+            synthetic_process_for_coordinator(1),
+            registration(&coordinator),
         )
         .unwrap();
-        coordinator
-            .register_process(
-                synthetic_process_for_coordinator(1),
-                registration(&coordinator),
-            )
-            .unwrap();
-        let execution = coordinator.run_next(2).unwrap().unwrap();
-        let thread = execution.lease.thread;
-        let (signal, event) = crate::EventObject::create_pair();
-        coordinator
-            .register_event_wait(
-                thread,
-                [event],
-                Some(60_000_000_000),
-                crate::ExternalEventSource::Device,
-            )
-            .unwrap();
-        let deadline = coordinator.deadlines.first_key_value().unwrap().0.0;
-        let idle = match mode {
-            VcpuExecutionMode::Deterministic => coordinator.run_next(1).unwrap().is_none(),
-            VcpuExecutionMode::Parallel => coordinator.run_parallel(1).unwrap().is_none(),
-        };
-        assert!(idle, "a device timeout must not be fast-forwarded");
-        assert!(coordinator.virtual_time_ns() < deadline);
-        std::thread::spawn(move || signal.signal()).join().unwrap();
-        let report = coordinator
-            .wait_for_external_event_for(std::time::Duration::from_secs(1))
-            .unwrap()
-            .unwrap();
-        assert_eq!(report.woken, 1);
-        assert!(coordinator.deadlines.is_empty());
-        assert_eq!(
-            coordinator.scheduler().thread(thread).unwrap().lifecycle,
-            nixe_scheduler::ThreadLifecycle::Ready
-        );
-    }
+    let execution = coordinator.run_next(2).unwrap().unwrap();
+    let thread = execution.lease.thread;
+    let (signal, event) = crate::EventObject::create_pair();
+    coordinator
+        .register_event_wait(
+            thread,
+            [event],
+            Some(60_000_000_000),
+            crate::ExternalEventSource::Device,
+        )
+        .unwrap();
+    let deadline = coordinator.deadlines.first_key_value().unwrap().0.0;
+    let idle = coordinator.run_next(1).unwrap().is_none();
+    assert!(idle, "a device timeout must not be fast-forwarded");
+    assert!(coordinator.virtual_time_ns() < deadline);
+    std::thread::spawn(move || signal.signal()).join().unwrap();
+    let report = coordinator
+        .wait_for_external_event_for(std::time::Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.woken, 1);
+    assert!(coordinator.deadlines.is_empty());
+    assert_eq!(
+        coordinator.scheduler().thread(thread).unwrap().lifecycle,
+        nixe_scheduler::ThreadLifecycle::Ready
+    );
 }
 
 #[test]
 fn realtime_idle_sleep_is_bounded_by_guest_timeout_and_expiry_resumes_the_thread() {
-    for mode in [
-        VcpuExecutionMode::Deterministic,
-        VcpuExecutionMode::Parallel,
-    ] {
-        let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
-            profile(),
-            crate::VirtualClock::default(),
-            mode,
+    let mut coordinator =
+        RuntimeCoordinator::try_with_virtual_clock(profile(), crate::VirtualClock::default())
+            .unwrap();
+    coordinator
+        .register_process(
+            synthetic_process_for_coordinator(1),
+            registration(&coordinator),
         )
         .unwrap();
+    let execution = coordinator.run_next(2).unwrap().unwrap();
+    let thread = execution.lease.thread;
+    coordinator
+        .register_timed_wait(thread, Some(20_000_000))
+        .unwrap();
+    let deadline = coordinator.deadlines.first_key_value().unwrap().0.0;
+    let started = std::time::Instant::now();
+    assert!(
         coordinator
-            .register_process(
-                synthetic_process_for_coordinator(1),
-                registration(&coordinator),
-            )
-            .unwrap();
-        let execution = coordinator.run_next(2).unwrap().unwrap();
-        let thread = execution.lease.thread;
-        coordinator
-            .register_timed_wait(thread, Some(20_000_000))
-            .unwrap();
-        let deadline = coordinator.deadlines.first_key_value().unwrap().0.0;
-        let started = std::time::Instant::now();
-        assert!(
-            coordinator
-                .wait_for_external_event_for(std::time::Duration::from_secs(1))
-                .unwrap()
-                .is_none()
-        );
-        assert!(started.elapsed() < std::time::Duration::from_millis(900));
-        assert!(coordinator.virtual_time_ns() >= deadline);
-        let execution = match mode {
-            VcpuExecutionMode::Deterministic => coordinator.run_next(1).unwrap().unwrap(),
-            VcpuExecutionMode::Parallel => coordinator.run_parallel(1).unwrap().unwrap(),
-        };
-        assert_eq!(execution.lease.thread, thread);
-        assert!(coordinator.deadlines.is_empty());
-    }
+            .wait_for_external_event_for(std::time::Duration::from_secs(1))
+            .unwrap()
+            .is_none()
+    );
+    assert!(started.elapsed() < std::time::Duration::from_millis(900));
+    assert!(coordinator.virtual_time_ns() >= deadline);
+    let execution = coordinator.run_next(1).unwrap().unwrap();
+    assert_eq!(execution.lease.thread, thread);
+    assert!(coordinator.deadlines.is_empty());
 }
 
 #[test]
@@ -1490,12 +1429,8 @@ fn equal_virtual_deadlines_wake_in_registration_order() {
 #[test]
 fn parallel_execution_assigns_at_most_one_thread_to_each_vcpu() {
     let clock = crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 });
-    let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
-        two_core_profile(),
-        clock,
-        VcpuExecutionMode::Parallel,
-    )
-    .unwrap();
+    let mut coordinator =
+        RuntimeCoordinator::try_with_virtual_clock(two_core_profile(), clock).unwrap();
     for (process_id, ideal_vcpu) in [(1, 3), (2, 7)] {
         let affinity = coordinator.scheduler().profile().all_cores();
         coordinator
@@ -1509,7 +1444,7 @@ fn parallel_execution_assigns_at_most_one_thread_to_each_vcpu() {
             )
             .unwrap();
     }
-    let first = coordinator.run_parallel(1).unwrap().unwrap();
+    let first = coordinator.run_next(1).unwrap().unwrap();
     let remaining = coordinator.scheduler.active_leases().next().unwrap();
     let second = coordinator.receive_worker(remaining).unwrap();
     let executions = [first, second];
@@ -1521,12 +1456,8 @@ fn parallel_execution_assigns_at_most_one_thread_to_each_vcpu() {
 #[test]
 fn parallel_execution_runs_distinct_threads_from_one_process() {
     let clock = crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 });
-    let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
-        two_core_profile(),
-        clock,
-        VcpuExecutionMode::Parallel,
-    )
-    .unwrap();
+    let mut coordinator =
+        RuntimeCoordinator::try_with_virtual_clock(two_core_profile(), clock).unwrap();
     let process_id = coordinator
         .register_process(
             synthetic_process_for_coordinator(1),
@@ -1556,7 +1487,7 @@ fn parallel_execution_runs_distinct_threads_from_one_process() {
         .thread_id();
     coordinator.start_thread(object_id).unwrap();
 
-    let first = coordinator.run_parallel(1).unwrap().unwrap();
+    let first = coordinator.run_next(1).unwrap().unwrap();
     let remaining = coordinator.scheduler.active_leases().next().unwrap();
     let second = coordinator.receive_worker(remaining).unwrap();
     let executions = [first, second];
@@ -1571,12 +1502,8 @@ fn parallel_execution_runs_distinct_threads_from_one_process() {
 #[test]
 fn parallel_execution_fast_forwards_virtual_deadlines_before_reporting_idle() {
     let clock = crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 });
-    let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
-        two_core_profile(),
-        clock,
-        VcpuExecutionMode::Parallel,
-    )
-    .unwrap();
+    let mut coordinator =
+        RuntimeCoordinator::try_with_virtual_clock(two_core_profile(), clock).unwrap();
     coordinator
         .register_process(
             synthetic_process_for_coordinator(1),
@@ -1588,7 +1515,7 @@ fn parallel_execution_fast_forwards_virtual_deadlines_before_reporting_idle() {
         )
         .unwrap();
 
-    let execution = coordinator.run_parallel(2).unwrap().unwrap();
+    let execution = coordinator.run_next(2).unwrap().unwrap();
     let thread = execution.lease.thread;
     assert_eq!(
         coordinator.scheduler().thread(thread).unwrap().lifecycle,
@@ -1597,68 +1524,9 @@ fn parallel_execution_fast_forwards_virtual_deadlines_before_reporting_idle() {
     assert!(coordinator.sleep_thread(thread, 100).unwrap().is_some());
     assert_eq!(coordinator.virtual_time_ns(), 0);
 
-    let execution = coordinator.run_parallel(1).unwrap().unwrap();
+    let execution = coordinator.run_next(1).unwrap().unwrap();
     assert_eq!(coordinator.virtual_time_ns(), 100);
     assert_eq!(execution.lease.thread, thread);
-}
-
-#[test]
-fn deterministic_records_reproduce_architectural_observations() {
-    fn recorded_run() -> crate::ExecutionRecord {
-        let mut coordinator = RuntimeCoordinator::new(profile());
-        coordinator.enable_execution_recording(std::num::NonZeroUsize::new(16).unwrap());
-        let registration = registration(&coordinator);
-        coordinator
-            .register_process(synthetic_process_for_coordinator(1), registration)
-            .unwrap();
-        coordinator.run_next(1).unwrap().unwrap();
-        coordinator.take_execution_record().unwrap()
-    }
-
-    let expected = recorded_run();
-    let observed = recorded_run();
-    expected.compare(&observed).unwrap();
-    assert_eq!(expected.observations().len(), 2);
-}
-
-#[test]
-fn parallel_observations_replay_through_deterministic_workers() {
-    fn register_pair(coordinator: &mut RuntimeCoordinator) {
-        for (process_id, ideal_vcpu) in [(1, 3), (2, 7)] {
-            let affinity = coordinator.scheduler().profile().all_cores();
-            coordinator
-                .register_process(
-                    synthetic_process_for_coordinator(process_id),
-                    ProcessRegistration {
-                        priority: 44,
-                        ideal_vcpu: Some(VirtualCpuId::new(ideal_vcpu)),
-                        affinity,
-                    },
-                )
-                .unwrap();
-        }
-    }
-
-    let clock = crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 });
-    let mut parallel = RuntimeCoordinator::try_with_execution_mode(
-        two_core_profile(),
-        clock.clone(),
-        VcpuExecutionMode::Parallel,
-    )
-    .unwrap();
-    parallel.enable_execution_recording(std::num::NonZeroUsize::new(16).unwrap());
-    register_pair(&mut parallel);
-    parallel.run_parallel(1).unwrap().unwrap();
-    let remaining = parallel.scheduler.active_leases().next().unwrap();
-    parallel.receive_worker(remaining).unwrap();
-    let expected = parallel.take_execution_record().unwrap();
-
-    let mut replay = RuntimeCoordinator::with_virtual_clock(two_core_profile(), clock);
-    register_pair(&mut replay);
-    replay.begin_differential_replay(expected).unwrap();
-    replay.run_next(999).unwrap().unwrap();
-    replay.run_next(999).unwrap().unwrap();
-    replay.finish_differential_replay().unwrap();
 }
 
 #[test]
@@ -1680,10 +1548,9 @@ fn coordinator_worker_shutdown_is_idempotent() {
 
 #[test]
 fn parallel_adaptive_quanta_do_not_reset_compute_cores_on_another_cores_svc() {
-    let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
+    let mut coordinator = RuntimeCoordinator::try_with_virtual_clock(
         two_core_profile(),
         crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 }),
-        VcpuExecutionMode::Parallel,
     )
     .unwrap();
     for (process_id, core, code) in [(1, 3, 0xd400_0021), (2, 7, 0x1400_0000)] {
@@ -1705,7 +1572,7 @@ fn parallel_adaptive_quanta_do_not_reset_compute_cores_on_another_cores_svc() {
     let mut svc = false;
     let mut computed = None;
     while !svc || computed.is_none() {
-        let execution = coordinator.run_parallel_adaptive().unwrap().unwrap();
+        let execution = coordinator.run_next_adaptive().unwrap().unwrap();
         if execution.lease.vcpu == VirtualCpuId::new(3) {
             assert!(matches!(
                 execution.report.stop,
@@ -1720,21 +1587,18 @@ fn parallel_adaptive_quanta_do_not_reset_compute_cores_on_another_cores_svc() {
             computed = Some(execution.report.progress);
         }
     }
+    assert_eq!(coordinator.budgets[&VirtualCpuId::new(3)].current, 10);
     assert_eq!(
-        coordinator.parallel_budgets[&VirtualCpuId::new(3)].current,
-        10
-    );
-    assert_eq!(
-        coordinator.parallel_budgets[&VirtualCpuId::new(7)].current,
+        coordinator.budgets[&VirtualCpuId::new(7)].current,
         computed.unwrap().saturating_mul(2).min(100_000)
     );
-    let execution = coordinator.run_parallel_adaptive().unwrap().unwrap();
+    let execution = coordinator.run_next_adaptive().unwrap().unwrap();
     assert_eq!(
         execution.report.progress,
         computed.unwrap().saturating_mul(2).min(100_000)
     );
     assert_eq!(
-        coordinator.parallel_budgets[&VirtualCpuId::new(7)].current,
+        coordinator.budgets[&VirtualCpuId::new(7)].current,
         computed.unwrap().saturating_mul(4).min(100_000)
     );
 }
@@ -1773,60 +1637,53 @@ fn host_termination_keeps_already_exited_guest_threads_terminal() {
 
 #[test]
 fn parallel_completion_returns_before_a_busy_core_and_host_pause_restores_its_state() {
-    for backend in [crate::CpuBackendConfig::Jit] {
-        let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
-            two_core_profile(),
-            crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 }),
-            VcpuExecutionMode::Parallel,
-        )
-        .unwrap();
-        for (id, core, code) in [(1, 3, 0xd400_0021), (2, 7, 0x1400_0000)] {
-            coordinator
-                .register_process(
-                    crate::process::tests::synthetic_backend_instruction_process(
-                        id,
-                        backend.clone(),
-                        &[code],
-                    ),
-                    ProcessRegistration {
-                        priority: 44,
-                        ideal_vcpu: Some(VirtualCpuId::new(core)),
-                        affinity: coordinator
-                            .scheduler()
-                            .profile()
-                            .core_set([VirtualCpuId::new(core)])
-                            .unwrap(),
-                    },
-                )
-                .unwrap();
-        }
-        let completed = coordinator.run_parallel(1_000_000_000).unwrap().unwrap();
-        assert_eq!(completed.lease.vcpu, VirtualCpuId::new(3));
-        assert!(matches!(
-            completed.report.stop,
-            ExecutionStop::SupervisorCall { .. }
-        ));
-        let busy = coordinator.scheduler.active_leases().next().unwrap();
-        assert_eq!(busy.vcpu, VirtualCpuId::new(7));
-        assert_eq!(
-            coordinator.thread_cpu_state(busy.thread.get()),
-            Err(ThreadOperationError::InvalidState)
-        );
-        let events = coordinator.event_sender();
-        events.submit(ExternalEvent::HostPause(true)).unwrap();
-        coordinator.drain_external_events().unwrap();
-        assert!(coordinator.scheduler.active_leases().next().is_none());
-        assert!(coordinator.thread_cpu_state(busy.thread.get()).is_ok());
-        assert!(coordinator.run_parallel(1).unwrap().is_none());
-        events.submit(ExternalEvent::HostPause(false)).unwrap();
-        coordinator.drain_external_events().unwrap();
-        let stopped = coordinator.run_parallel(1).unwrap().unwrap();
-        assert_eq!(stopped.lease, busy);
-        assert!(matches!(
-            stopped.report.stop,
-            ExecutionStop::Safepoint | ExecutionStop::BudgetExhausted
-        ));
+    let mut coordinator = RuntimeCoordinator::try_with_virtual_clock(
+        two_core_profile(),
+        crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 }),
+    )
+    .unwrap();
+    for (id, core, code) in [(1, 3, 0xd400_0021), (2, 7, 0x1400_0000)] {
+        coordinator
+            .register_process(
+                crate::process::tests::synthetic_native_instruction_process(id, &[code]),
+                ProcessRegistration {
+                    priority: 44,
+                    ideal_vcpu: Some(VirtualCpuId::new(core)),
+                    affinity: coordinator
+                        .scheduler()
+                        .profile()
+                        .core_set([VirtualCpuId::new(core)])
+                        .unwrap(),
+                },
+            )
+            .unwrap();
     }
+    let completed = coordinator.run_next(1_000_000_000).unwrap().unwrap();
+    assert_eq!(completed.lease.vcpu, VirtualCpuId::new(3));
+    assert!(matches!(
+        completed.report.stop,
+        ExecutionStop::SupervisorCall { .. }
+    ));
+    let busy = coordinator.scheduler.active_leases().next().unwrap();
+    assert_eq!(busy.vcpu, VirtualCpuId::new(7));
+    assert_eq!(
+        coordinator.thread_cpu_state(busy.thread.get()),
+        Err(ThreadOperationError::InvalidState)
+    );
+    let events = coordinator.event_sender();
+    events.submit(ExternalEvent::HostPause(true)).unwrap();
+    coordinator.drain_external_events().unwrap();
+    assert!(coordinator.scheduler.active_leases().next().is_none());
+    assert!(coordinator.thread_cpu_state(busy.thread.get()).is_ok());
+    assert!(coordinator.run_next(1).unwrap().is_none());
+    events.submit(ExternalEvent::HostPause(false)).unwrap();
+    coordinator.drain_external_events().unwrap();
+    let stopped = coordinator.run_next(1).unwrap().unwrap();
+    assert_eq!(stopped.lease, busy);
+    assert!(matches!(
+        stopped.report.stop,
+        ExecutionStop::Safepoint | ExecutionStop::BudgetExhausted
+    ));
 }
 
 #[test]
@@ -1968,55 +1825,40 @@ fn an_accepted_mutex_handoff_keeps_the_waiter_blocked_until_its_word_is_publishe
 
 #[test]
 fn periodic_preemption_interrupts_a_compute_only_native_loop() {
-    use crate::process::tests::synthetic_backend_instruction_process;
-    for mode in [
-        VcpuExecutionMode::Deterministic,
-        VcpuExecutionMode::Parallel,
-    ] {
-        let profile = MachineSchedulerProfile::new(
-            vec![VirtualCpuDescriptor::new(VirtualCpuId::new(7), 0).with_rotation_priority(59)],
-            PriorityRange::new(0, 63).unwrap(),
-            10_000,
-        )
-        .unwrap()
-        .with_preemption(10_000_000, 2)
-        .unwrap();
-        let mut coordinator = RuntimeCoordinator::try_with_execution_mode(
-            profile,
-            crate::VirtualClock::new(crate::VirtualClockMode::Realtime),
-            mode,
-        )
-        .unwrap();
-        for id in 1..=2 {
-            let mut registration = registration(&coordinator);
-            registration.priority = 59;
-            coordinator
-                .register_process(
-                    synthetic_backend_instruction_process(
-                        id,
-                        crate::CpuBackendConfig::Jit,
-                        &[0x14000000],
-                    ),
-                    registration,
-                )
-                .unwrap();
-        }
-        let run = |coordinator: &mut RuntimeCoordinator| {
-            match mode {
-                VcpuExecutionMode::Deterministic => coordinator.run_next(1_000_000_000),
-                VcpuExecutionMode::Parallel => coordinator.run_parallel(1_000_000_000),
-            }
-            .unwrap()
-            .unwrap()
-        };
-        let started = std::time::Instant::now();
-        let first = run(&mut coordinator);
-        let second = run(&mut coordinator);
-        assert_ne!(first.lease.thread, second.lease.thread);
-        assert!(matches!(first.report.stop, ExecutionStop::Safepoint));
-        assert!(matches!(second.report.stop, ExecutionStop::Safepoint));
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    use crate::process::tests::synthetic_native_instruction_process;
+    let profile = MachineSchedulerProfile::new(
+        vec![VirtualCpuDescriptor::new(VirtualCpuId::new(7), 0).with_rotation_priority(59)],
+        PriorityRange::new(0, 63).unwrap(),
+        10_000,
+    )
+    .unwrap()
+    .with_preemption(10_000_000, 2)
+    .unwrap();
+    let mut coordinator = RuntimeCoordinator::try_with_virtual_clock(
+        profile,
+        crate::VirtualClock::new(crate::VirtualClockMode::Realtime),
+    )
+    .unwrap();
+    for id in 1..=2 {
+        let mut registration = registration(&coordinator);
+        registration.priority = 59;
+        coordinator
+            .register_process(
+                synthetic_native_instruction_process(id, &[0x14000000]),
+                registration,
+            )
+            .unwrap();
     }
+    let run = |coordinator: &mut RuntimeCoordinator| {
+        coordinator.run_next(1_000_000_000).unwrap().unwrap()
+    };
+    let started = std::time::Instant::now();
+    let first = run(&mut coordinator);
+    let second = run(&mut coordinator);
+    assert_ne!(first.lease.thread, second.lease.thread);
+    assert!(matches!(first.report.stop, ExecutionStop::Safepoint));
+    assert!(matches!(second.report.stop, ExecutionStop::Safepoint));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }
 
 #[test]

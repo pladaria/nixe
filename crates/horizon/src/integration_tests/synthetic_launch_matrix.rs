@@ -5,13 +5,8 @@ use std::fs;
 use nixe_cpu::state::a64::A64Register;
 use nixe_horizon::{DirectoryEntryKind, IpcRequest, IpcResponse, IpcResultCode, IpcService};
 use nixe_runtime::{
-    CpuBackendConfig, LaunchKind, Launcher, LauncherInput, ModuleRole, MountProvenance,
-    ProcessBuilder, RelocationState,
+    LaunchKind, Launcher, LauncherInput, ModuleRole, MountProvenance, RelocationState,
 };
-
-fn reference_process_builder() -> ProcessBuilder {
-    support::process_builder().with_cpu_backend(CpuBackendConfig::Jit)
-}
 
 use support::synthetic_packages::{
     APPLICATION_ID, FIRST_DLC_ID, MetaKind, PATCH_ID, Package, SECOND_DLC_ID, bktr_data_content,
@@ -38,7 +33,7 @@ fn effective_npdm_service_policy_denies_unlisted_runtime_services() {
     };
     fs::write(directory.path().join("restricted.nsp"), build_nsp(&package)).unwrap();
     let plan = Launcher::build(LauncherInput::new(directory.path())).unwrap();
-    let process = reference_process_builder().build(&plan).unwrap();
+    let process = support::process_builder().build(&plan).unwrap();
     for service in [IpcService::FileSystem, IpcService::AddOnContent] {
         let session = crate::IpcSession::new(service);
         assert!(matches!(
@@ -64,7 +59,7 @@ fn effective_npdm_service_policy_denies_unlisted_runtime_services() {
     )
     .unwrap();
     let permitted_plan = Launcher::build(LauncherInput::new(permitted_directory.path())).unwrap();
-    let permitted = reference_process_builder().build(&permitted_plan).unwrap();
+    let permitted = support::process_builder().build(&permitted_plan).unwrap();
     let session = permitted
         .handles()
         .insert(crate::HorizonIpcObject::SemanticService(
@@ -119,7 +114,7 @@ fn current_process_content_does_not_require_general_mount_permission() {
         };
         fs::write(directory.path().join("title.nsp"), build_nsp(&package)).unwrap();
         let plan = Launcher::build(LauncherInput::new(directory.path())).unwrap();
-        reference_process_builder().build(&plan).unwrap()
+        support::process_builder().build(&plan).unwrap()
     }
 
     let directory = tempfile::tempdir().unwrap();
@@ -202,7 +197,7 @@ fn public_add_ons_remain_visible_and_readable_without_content_owner_permissions(
         fs::write(directory.path().join("base.nsp"), build_nsp(&base)).unwrap();
         fs::write(directory.path().join("addon.nsp"), build_nsp(&addon)).unwrap();
         let plan = Launcher::build(LauncherInput::new(directory.path())).unwrap();
-        let process = reference_process_builder().build(&plan).unwrap();
+        let process = support::process_builder().build(&plan).unwrap();
         let policy = process.mounts().effective_policy().unwrap().filesystem();
         assert!(policy.content_owner_ids().is_empty());
         assert_eq!(policy.permissions().raw(), permissions);
@@ -446,7 +441,7 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
         .unwrap();
     assert_eq!(&second_content_bytes, b"second");
 
-    let mut process = reference_process_builder().build(&plan).unwrap();
+    let mut process = support::process_builder().build(&plan).unwrap();
     assert_eq!(process.handles().capacity_limit(), 0x40);
     assert_eq!(process.mounts().add_ons().len(), 2);
     assert_eq!(process.modules().len(), 4);

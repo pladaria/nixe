@@ -5,7 +5,6 @@ members = [
     "crates/audio",
     "crates/applets",
     "crates/cpu",
-    "crates/cpu-interpreter",
     "crates/cpu-jit",
     "crates/cpu-direct-memory",
     "crates/gpu",
@@ -23,9 +22,8 @@ members = [
     "crates/scheduler",
     "crates/video",
     "crates/video-winit",
-    "tools/xtask",
 ]
-exclude = ["crates/vendor/zstd-sys-zbic", "fuzz"]
+exclude = ["crates/vendor/zstd-sys-zbic"]
 resolver = "3"
 
 [workspace.package]
@@ -67,7 +65,6 @@ nixe-config = { path = "crates/config" }
 nixe-audio = { path = "crates/audio" }
 nixe-applets = { path = "crates/applets" }
 nixe-cpu = { path = "crates/cpu" }
-nixe-cpu-interpreter = { path = "crates/cpu-interpreter" }
 nixe-cpu-jit = { path = "crates/cpu-jit" }
 nixe-cpu-direct-memory = { path = "crates/cpu-direct-memory" }
 nixe-gpu = { path = "crates/gpu" }

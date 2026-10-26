@@ -19,7 +19,7 @@ The tested Pi 5 `kernel8.img` has 4 KiB pages and only 39-bit virtual addresses;
 it cannot launch guests with the current backend. Switching from the default
 16 KiB kernel therefore does not suffice. ARM host development/validation is
 deferred; current validation targets Linux x86-64. The direct-memory virtual
-address and page-size requirements also apply to the new CPU backend.
+address and page-size requirements apply to all CPU execution.
 
 ## Native compiler
 

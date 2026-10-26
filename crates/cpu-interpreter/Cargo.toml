@@ -1,9 +1,0 @@
-[package]
-name = "nixe-cpu-interpreter"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-nixe-memory.workspace = true
-nixe-cpu.workspace = true

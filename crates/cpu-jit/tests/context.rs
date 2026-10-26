@@ -99,7 +99,6 @@ fn run(jit: &mut JitThread, state: &mut ThreadState) -> nixe_cpu::execution::Exe
             instruction_budget: 1000,
             timer: &FixedTimer,
             events: &VcpuEventState::default(),
-            capture_context: true,
         },
     )
     .unwrap()
@@ -182,7 +181,6 @@ fn data_observation_preserves_the_quantum_until_scheduler_preemption() {
                 instruction_budget: i64::MAX as u64,
                 timer: &FixedTimer,
                 events: &VcpuEventState::default(),
-                capture_context: true,
             },
         );
         send.send((report, state)).unwrap();
@@ -243,7 +241,6 @@ fn scheduler_interrupt_exits_a_linked_infinite_loop() {
                     instruction_budget: i64::MAX as u64,
                     timer: &FixedTimer,
                     events: &VcpuEventState::default(),
-                    capture_context: true,
                 },
             )
             .unwrap();
@@ -260,7 +257,7 @@ fn scheduler_interrupt_exits_a_linked_infinite_loop() {
     expected.write_x(x(0), state.read_x(x(0)));
     expected.set_pc(state.pc());
     assert_eq!(state, expected);
-    assert_eq!(report.context, Some(state.register_context()));
+    assert!(report.context.is_none());
     worker.join().unwrap();
 }
 
@@ -280,7 +277,6 @@ fn indirect_branches_observe_the_block_budget() {
                 instruction_budget: 20,
                 timer: &FixedTimer,
                 events: &VcpuEventState::default(),
-                capture_context: true,
             },
         )
         .unwrap();
@@ -325,13 +321,12 @@ fn complete_context_survives_alternating_guests_and_migrating_between_cores() {
                     instruction_budget: 1,
                     timer: &FixedTimer,
                     events: &VcpuEventState::default(),
-                    capture_context: true,
                 },
             )
             .unwrap();
         assert!(matches!(report.stop, CpuExit::SupervisorCall { .. }));
         assert_eq!(states[guest], expected[guest]);
-        assert_eq!(report.context, Some(expected[guest].register_context()));
+        assert!(report.context.is_none());
     }
 }
 
@@ -347,7 +342,6 @@ fn failed_native_invocation_has_no_fabricated_context_and_cannot_resume() {
             instruction_budget: 1,
             timer: &FixedTimer,
             events: &VcpuEventState::default(),
-            capture_context: true,
         },
     )
     .unwrap();
@@ -360,7 +354,6 @@ fn failed_native_invocation_has_no_fabricated_context_and_cannot_resume() {
                 instruction_budget: 1,
                 timer: &FixedTimer,
                 events: &VcpuEventState::default(),
-                capture_context: true,
             },
         )
         .unwrap_err();
@@ -375,7 +368,6 @@ fn failed_native_invocation_has_no_fabricated_context_and_cannot_resume() {
                 instruction_budget: 1,
                 timer: &FixedTimer,
                 events: &VcpuEventState::default(),
-                capture_context: true,
             },
         )
         .unwrap_err();
@@ -403,7 +395,6 @@ fn ordinary_svc_keeps_complete_context_native_and_snapshots_are_owned() {
                     instruction_budget: 2,
                     timer: &FixedTimer,
                     events: &events,
-                    capture_context: false,
                 },
             )
             .unwrap();
@@ -442,7 +433,6 @@ fn replacing_an_unexported_owner_is_rejected_without_corrupting_either_guest() {
                 instruction_budget: 1,
                 timer: &FixedTimer,
                 events: &events,
-                capture_context: false,
             },
         )
     };
@@ -471,7 +461,6 @@ fn stopped_native_owner_retains_core_monitor_and_backing_until_materialized() {
             instruction_budget: 1,
             timer: &FixedTimer,
             events: &VcpuEventState::default(),
-            capture_context: false,
         },
     )
     .unwrap();

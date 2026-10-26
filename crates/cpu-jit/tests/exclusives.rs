@@ -89,7 +89,6 @@ fn run(jit: &mut JitThread, state: &mut ThreadState) -> CpuExit {
                     instruction_budget: 10_000_000,
                     timer: &Timer,
                     events: &VcpuEventState::default(),
-                    capture_context: true,
                 },
             )
             .unwrap()

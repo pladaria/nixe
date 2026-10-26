@@ -6,10 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nixe_cli::library::{Library, LibraryTitleSource};
-use nixe_config::{
-    CpuBackendSelection, CpuConfig, DiagnosticsConfig, GuestLogsLevel, InitialOperationMode,
-    TimeMode, WindowState,
-};
+use nixe_config::{DiagnosticsConfig, GuestLogsLevel, InitialOperationMode, TimeMode, WindowState};
 use nixe_horizon::{
     GuestLogLevel, HorizonDiagnostics, HorizonSvcDispatcher, OperationMode, SaveDataSystem,
     SettingsEnvironment, SystemLanguage, TimeEnvironment, VideoSystem, switch_1_machine_profile,
@@ -20,9 +17,9 @@ use nixe_input::{
 };
 use nixe_loader_title::{NacpLanguage, SupportedLanguages, UserAccountSwitchLock};
 use nixe_runtime::{
-    CpuBackendConfig, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
-    ProcessBuilder, ProcessExit, ProcessExitCause, ProcessRegistration, ProcessTeardownReport,
-    RunnableProcess, RuntimeCoordinator, VcpuExecutionMode, VirtualClock, VirtualClockMode,
+    ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput, ProcessBuilder, ProcessExit,
+    ProcessExitCause, ProcessRegistration, ProcessTeardownReport, RunnableProcess,
+    RuntimeCoordinator, VirtualClock, VirtualClockMode,
 };
 use nixe_scheduler::ProcessId;
 use nixe_video_winit::{FrontendControl, WindowFrontend};
@@ -40,7 +37,6 @@ pub struct Arguments {
     pub identifier: String,
     pub headless: bool,
     pub vulkan: nixe_gpu_vulkan::DeviceOptions,
-    pub cpu_backend_override: Option<CpuBackendSelection>,
     pub guest_logs_level_override: Option<GuestLogsLevel>,
     pub file_system_access_log_override: Option<bool>,
 }
@@ -64,7 +60,6 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         identifier,
         headless,
         vulkan,
-        cpu_backend_override,
         guest_logs_level_override,
         file_system_access_log_override,
     } = arguments;
@@ -88,15 +83,11 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
     let machine_profile = switch_1_machine_profile();
     let scheduler_profile = machine_profile.scheduler().clone();
     let config = load_config(config_path, log_level_override)?;
-    let cpu_configuration = effective_cpu_configuration(config.cpu.clone(), cpu_backend_override);
     let diagnostics_configuration = effective_diagnostics_configuration(
         config.diagnostics,
         guest_logs_level_override,
         file_system_access_log_override,
     );
-    if let Some(backend) = cpu_backend_override {
-        log::info!("CPU backend selection overridden by CLI: {backend:?}");
-    }
     log::info!("scanning configured title library");
     std::fs::create_dir_all(&config.filesystem.sd_card).map_err(|error| {
         format!(
@@ -169,17 +160,9 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         },
     };
     let virtual_clock = VirtualClock::new(clock_mode);
-    let execution_mode = if cpu_configuration.parallel_vcpus {
-        VcpuExecutionMode::Parallel
-    } else {
-        VcpuExecutionMode::Deterministic
-    };
-    let coordinator = RuntimeCoordinator::try_with_execution_mode(
-        scheduler_profile,
-        virtual_clock.clone(),
-        execution_mode,
-    )
-    .map_err(|error| error.to_string())?;
+    let coordinator =
+        RuntimeCoordinator::try_with_virtual_clock(scheduler_profile, virtual_clock.clone())
+            .map_err(|error| error.to_string())?;
     let external_events = coordinator.event_sender();
     install_interrupt_handler(frontend_control.clone(), external_events.clone())?;
     frontend = frontend.map(|frontend| {
@@ -191,17 +174,13 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         })
     });
     let process_started = Instant::now();
-    let cpu_backend = select_cpu_backend(cpu_configuration)?;
-    let trace_interpreter = matches!(cpu_backend, CpuBackendConfig::Interpreter)
-        && log::log_enabled!(log::Level::Trace);
     let system_memory = memory
         .account(nixe_memory::DEFAULT_RAM_BYTES)
         .map_err(|error| error.to_string())?;
     let process_builder = ProcessBuilder::new(memory, system_memory)
         .with_virtual_clock(virtual_clock.clone())
         .with_sd_card_root(sd_card_root)
-        .with_config(machine_profile.process_build_config())
-        .with_cpu_backend(cpu_backend);
+        .with_config(machine_profile.process_build_config());
     let process = process_builder
         .build(&plan)
         .map_err(|error| error.to_string())?;
@@ -211,7 +190,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         process.entry_module().entry_address(),
         process.modules().len()
     );
-    log::info!("starting CPU backend {}", process.cpu_backend_name());
+    log::info!("starting JIT CPU execution");
 
     let initial_operation_mode = match config.system.initial_operation_mode {
         InitialOperationMode::Handheld => OperationMode::Handheld,
@@ -344,10 +323,6 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         );
         (video, gpu_caches)
     };
-    let diagnostics = ExecutionDiagnostics {
-        trace_interpreter,
-        gpu_caches,
-    };
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
     // SDL initialization and final subsystem shutdown remain on the main thread.
     // The owners outlive guest execution in both windowed and headless modes.
@@ -378,7 +353,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
             video_system,
             host_input,
             audio_backend,
-            diagnostics,
+            gpu_caches,
         ));
     };
     let frontend =
@@ -397,7 +372,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
                 video_system,
                 host_input,
                 audio_backend,
-                diagnostics,
+                gpu_caches,
             )
         })
         .map_err(|error| format!("cannot start guest execution worker: {error}"))?;
@@ -458,19 +433,6 @@ const fn system_language(language: NacpLanguage) -> SystemLanguage {
     }
 }
 
-fn effective_cpu_configuration(
-    configuration: CpuConfig,
-    backend_override: Option<CpuBackendSelection>,
-) -> CpuConfig {
-    CpuConfig {
-        backend: match backend_override {
-            Some(backend) => backend,
-            None => configuration.backend,
-        },
-        ..configuration
-    }
-}
-
 const fn effective_diagnostics_configuration(
     configuration: DiagnosticsConfig,
     guest_logs_level_override: Option<GuestLogsLevel>,
@@ -502,49 +464,9 @@ const fn horizon_diagnostics(configuration: DiagnosticsConfig) -> HorizonDiagnos
     HorizonDiagnostics::new(guest_logs_level, configuration.file_system_access_log)
 }
 
-fn select_cpu_backend(configuration: CpuConfig) -> Result<CpuBackendConfig, String> {
-    Ok(match configuration.backend {
-        CpuBackendSelection::Jit => CpuBackendConfig::Jit,
-        CpuBackendSelection::Interpreter => CpuBackendConfig::Interpreter,
-    })
-}
-
 #[cfg(test)]
-mod backend_selection_tests {
+mod diagnostics_tests {
     use super::*;
-
-    #[test]
-    fn cli_backend_override_has_priority_without_replacing_other_cpu_policy() {
-        let configured = CpuConfig {
-            backend: CpuBackendSelection::Interpreter,
-            parallel_vcpus: true,
-        };
-
-        assert_eq!(
-            effective_cpu_configuration(configured.clone(), None),
-            configured
-        );
-        assert_eq!(
-            effective_cpu_configuration(configured.clone(), Some(CpuBackendSelection::Jit)),
-            CpuConfig {
-                backend: CpuBackendSelection::Jit,
-                ..configured.clone()
-            }
-        );
-    }
-
-    #[test]
-    fn application_composition_selects_one_concrete_backend() {
-        let interpreter = select_cpu_backend(CpuConfig {
-            backend: CpuBackendSelection::Interpreter,
-            parallel_vcpus: true,
-        })
-        .unwrap();
-        assert!(matches!(interpreter, CpuBackendConfig::Interpreter));
-
-        let jit = select_cpu_backend(CpuConfig::default()).unwrap();
-        assert!(matches!(jit, CpuBackendConfig::Jit));
-    }
 
     #[test]
     fn cli_guest_diagnostics_override_only_the_selected_policy() {
@@ -619,11 +541,6 @@ struct HostInputReaders {
     vibration: nixe_input::VibrationOutput,
 }
 
-struct ExecutionDiagnostics {
-    trace_interpreter: bool,
-    gpu_caches: nixe_gpu_vulkan::cache::CacheMonitor,
-}
-
 fn execute_worker(
     mut coordinator: RuntimeCoordinator,
     process: RunnableProcess,
@@ -631,7 +548,7 @@ fn execute_worker(
     video_system: VideoSystem,
     mut host_input: HostInputReaders,
     audio_backend: Arc<nixe_audio::HostAudioBackend>,
-    mut diagnostics: ExecutionDiagnostics,
+    mut gpu_caches: nixe_gpu_vulkan::cache::CacheMonitor,
 ) -> WorkerResult {
     let registration = ProcessRegistration {
         priority: process.initial_thread_priority(),
@@ -653,7 +570,7 @@ fn execute_worker(
         execution_video,
         &mut host_input,
         audio_backend,
-        &mut diagnostics,
+        &mut gpu_caches,
     );
     log::debug!(
         "guest execution stopped after {:?}",
@@ -760,9 +677,8 @@ fn execute(
     video_system: VideoSystem,
     host_input: &mut HostInputReaders,
     audio_backend: Arc<nixe_audio::HostAudioBackend>,
-    diagnostics: &mut ExecutionDiagnostics,
+    gpu_caches: &mut nixe_gpu_vulkan::cache::CacheMonitor,
 ) -> Result<ExecutionSummary, String> {
-    let trace_interpreter = diagnostics.trace_interpreter;
     let coordinator = &mut *scheduled.coordinator;
     let process_id = scheduled.process_id;
     let mut dispatcher = HorizonSvcDispatcher::new_with_video_and_settings(
@@ -904,16 +820,10 @@ fn execute(
                 .map_err(|error| format!("cannot publish Horizon touch-screen state: {error}"))?;
             last_input_sample = Some(sample.captured_at);
         }
-        let executions: Vec<_> = match coordinator.execution_mode() {
-            VcpuExecutionMode::Deterministic => coordinator
-                .run_next_adaptive()
-                .map(|execution| execution.into_iter().collect()),
-            VcpuExecutionMode::Parallel => coordinator
-                .run_parallel_adaptive()
-                .map(|execution| execution.into_iter().collect()),
-        }
-        .map_err(|error| error.to_string())?;
-        if executions.is_empty() {
+        let Some(execution) = coordinator
+            .run_next_adaptive()
+            .map_err(|error| error.to_string())?
+        else {
             let host_wait = host_service_wait_duration(
                 coordinator
                     .emulation_elapsed()
@@ -927,116 +837,81 @@ fn execute(
                 .wait_for_external_event_for(host_wait)
                 .map_err(|error| error.to_string())?;
             continue;
-        }
-        for execution in executions {
-            let report = execution.report;
-            if execution_rate_enabled {
-                execution_completions = execution_completions.wrapping_add(1);
-                if execution_completions.is_multiple_of(EXECUTION_RATE_COMPLETIONS) {
-                    let elapsed = coordinator
-                        .emulation_elapsed()
-                        .saturating_sub(execution_started);
-                    let interval = elapsed.saturating_sub(last_rate_elapsed);
-                    if interval >= EXECUTION_RATE_LOG_INTERVAL {
-                        let interval_completions =
-                            execution_completions.wrapping_sub(last_rate_completions);
-                        let completions_per_second =
-                            interval_completions as f64 / interval.as_secs_f64();
-                        log::info!(
-                            "guest CPU completion rate: completions_per_second={completions_per_second:.0}, completions={execution_completions}, elapsed={elapsed:?}"
-                        );
-                        log::info!("{}", diagnostics.gpu_caches.sample());
-                        if log::log_enabled!(log::Level::Trace)
-                            && let Some(process) = coordinator.process(process_id)
-                        {
-                            for (thread, _) in process.threads().iter() {
-                                if let Ok(cpu) = coordinator.thread_cpu_state(thread.get()) {
-                                    log::trace!(
-                                        "guest thread snapshot: id={} scheduler={:?} registers=[{}]",
-                                        thread.get(),
-                                        coordinator.thread_scheduling_info(thread.get()),
-                                        cpu.register_context(),
-                                    );
-                                }
-                            }
-                        }
-                        last_rate_completions = execution_completions;
-                        last_rate_elapsed = elapsed;
-                    }
-                }
-            }
-            if trace_interpreter {
-                log::trace!(
-                    "interpreter slice completed: process={:?} thread={:?} vcpu={:?} generation={:?} {report}",
-                    execution.lease.process,
-                    execution.lease.thread,
-                    execution.lease.vcpu,
-                    execution.lease.generation,
-                );
-            }
-            match &report.stop {
-                ExecutionStop::BudgetExhausted
-                | ExecutionStop::Safepoint
-                | ExecutionStop::PendingEvent { .. } => {}
-                ExecutionStop::Scheduled { .. } => {}
-                ExecutionStop::SupervisorCall { .. } => {
-                    if trace_interpreter {
-                        log::trace!(
-                            "interpreter SVC dispatch started: process={:?} thread={:?} vcpu={:?} stop=[{}]",
-                            execution.lease.process,
-                            execution.lease.thread,
-                            execution.lease.vcpu,
-                            report.stop,
-                        );
-                    }
-                    let handling = dispatcher
-                        .route_scheduled_supervisor_call(coordinator, execution.lease, &report.stop)
-                        .map_err(|error| error.to_string())?;
-                    if trace_interpreter {
-                        let outcome = match &handling {
-                            ExceptionHandlingResult::Resumed => "resumed",
-                            ExceptionHandlingResult::Suspended => "suspended",
-                            ExceptionHandlingResult::Rejected(_) => "rejected",
-                            ExceptionHandlingResult::Terminated { .. } => "terminated",
-                            ExceptionHandlingResult::Fault(_) => "fault",
-                        };
-                        log::trace!(
-                            "interpreter SVC dispatch completed: process={:?} thread={:?} vcpu={:?} outcome={outcome}",
-                            execution.lease.process,
-                            execution.lease.thread,
-                            execution.lease.vcpu,
-                        );
-                    }
-                    match handling {
-                        ExceptionHandlingResult::Resumed => {}
-                        ExceptionHandlingResult::Rejected(error) => {
-                            let diagnostic = error.to_string();
-                            if rejected.insert(diagnostic.clone()) {
-                                log::debug!(
-                                    "guest operation returned a Horizon error: {diagnostic}"
+        };
+        let report = execution.report;
+        if execution_rate_enabled {
+            execution_completions = execution_completions.wrapping_add(1);
+            if execution_completions.is_multiple_of(EXECUTION_RATE_COMPLETIONS) {
+                let elapsed = coordinator
+                    .emulation_elapsed()
+                    .saturating_sub(execution_started);
+                let interval = elapsed.saturating_sub(last_rate_elapsed);
+                if interval >= EXECUTION_RATE_LOG_INTERVAL {
+                    let interval_completions =
+                        execution_completions.wrapping_sub(last_rate_completions);
+                    let completions_per_second =
+                        interval_completions as f64 / interval.as_secs_f64();
+                    log::info!(
+                        "guest CPU completion rate: completions_per_second={completions_per_second:.0}, completions={execution_completions}, elapsed={elapsed:?}"
+                    );
+                    log::info!("{}", gpu_caches.sample());
+                    if log::log_enabled!(log::Level::Trace)
+                        && let Some(process) = coordinator.process(process_id)
+                    {
+                        for (thread, _) in process.threads().iter() {
+                            if let Ok(cpu) = coordinator.thread_cpu_state(thread.get()) {
+                                log::trace!(
+                                    "guest thread snapshot: id={} scheduler={:?} registers=[{}]",
+                                    thread.get(),
+                                    coordinator.thread_scheduling_info(thread.get()),
+                                    cpu.register_context(),
                                 );
                             }
                         }
-                        ExceptionHandlingResult::Terminated { .. } => {
-                            // ExitThread can leave the rest of the process runnable.
-                            // Only the runtime's process lifecycle ends this launch.
-                            if coordinator.process(process_id).is_some_and(|process| {
-                                process.lifecycle() == nixe_scheduler::ProcessLifecycle::Exited
-                            }) {
-                                return Ok(execution_summary(&dispatcher, rejected.len()));
-                            }
-                        }
-                        ExceptionHandlingResult::Suspended => {}
-                        ExceptionHandlingResult::Fault(error) => {
-                            return Err(format!("Horizon SVC dispatch failed: {error}; {report}"));
+                    }
+                    last_rate_completions = execution_completions;
+                    last_rate_elapsed = elapsed;
+                }
+            }
+        }
+
+        match &report.stop {
+            ExecutionStop::BudgetExhausted
+            | ExecutionStop::Safepoint
+            | ExecutionStop::PendingEvent { .. } => {}
+            ExecutionStop::Scheduled { .. } => {}
+            ExecutionStop::SupervisorCall { .. } => {
+                let handling = dispatcher
+                    .route_scheduled_supervisor_call(coordinator, execution.lease, &report.stop)
+                    .map_err(|error| error.to_string())?;
+
+                match handling {
+                    ExceptionHandlingResult::Resumed => {}
+                    ExceptionHandlingResult::Rejected(error) => {
+                        let diagnostic = error.to_string();
+                        if rejected.insert(diagnostic.clone()) {
+                            log::debug!("guest operation returned a Horizon error: {diagnostic}");
                         }
                     }
+                    ExceptionHandlingResult::Terminated { .. } => {
+                        // ExitThread can leave the rest of the process runnable.
+                        // Only the runtime's process lifecycle ends this launch.
+                        if coordinator.process(process_id).is_some_and(|process| {
+                            process.lifecycle() == nixe_scheduler::ProcessLifecycle::Exited
+                        }) {
+                            return Ok(execution_summary(&dispatcher, rejected.len()));
+                        }
+                    }
+                    ExceptionHandlingResult::Suspended => {}
+                    ExceptionHandlingResult::Fault(error) => {
+                        return Err(format!("Horizon SVC dispatch failed: {error}; {report}"));
+                    }
                 }
-                ExecutionStop::LoaderReturn { .. } => {
-                    return Ok(execution_summary(&dispatcher, rejected.len()));
-                }
-                stop => return Err(execution_stop_error(stop, &report)),
             }
+            ExecutionStop::LoaderReturn { .. } => {
+                return Ok(execution_summary(&dispatcher, rejected.len()));
+            }
+            stop => return Err(execution_stop_error(stop, &report)),
         }
     }
 }

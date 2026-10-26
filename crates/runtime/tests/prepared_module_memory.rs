@@ -405,7 +405,6 @@ fn a_loader_prepared_image_executes_on_the_canonical_native_process() {
                 instruction_budget: 1000,
                 timer: &Timer,
                 events: &VcpuEventState::default(),
-                capture_context: false,
             },
         )
         .unwrap();

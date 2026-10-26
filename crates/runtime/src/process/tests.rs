@@ -72,7 +72,6 @@ fn worker_slice_moves_thread_state_out_of_the_process_until_reconciliation() {
             vcpu,
             1,
             nixe_cpu::execution::VcpuEventState::default(),
-            true,
         )
         .unwrap();
     assert!(process.main_thread().state.is_none());
@@ -92,7 +91,7 @@ fn unsynchronized_cpu_failure_discards_state_and_allows_retirement() {
     let vcpu = nixe_scheduler::VirtualCpuId::new(0);
     let mut cpu = process.create_worker_cpu_thread(vcpu).unwrap();
     let execution = process
-        .begin_thread_execution(thread, vcpu, 1, Default::default(), true)
+        .begin_thread_execution(thread, vcpu, 1, Default::default())
         .unwrap();
     let failure = ProcessExecutionError::Cpu {
         fault: nixe_cpu::execution::CpuFault {
@@ -123,7 +122,7 @@ fn concurrent_stop_does_not_hide_an_unsynchronized_native_failure() {
     let thread = process.main_thread_id();
     let vcpu = nixe_scheduler::VirtualCpuId::new(0);
     let execution = process
-        .begin_thread_execution(thread, vcpu, 1, Default::default(), true)
+        .begin_thread_execution(thread, vcpu, 1, Default::default())
         .unwrap();
     assert!(process.terminate_from_host());
     let failure = ProcessExecutionError::Cpu {
@@ -148,7 +147,7 @@ fn panicked_worker_does_not_restore_an_incoming_snapshot() {
     let thread = process.main_thread_id();
     let vcpu = nixe_scheduler::VirtualCpuId::new(0);
     let execution = process
-        .begin_thread_execution(thread, vcpu, 1, Default::default(), true)
+        .begin_thread_execution(thread, vcpu, 1, Default::default())
         .unwrap();
     drop(execution);
     process.abort_thread_execution(thread, vcpu, None);
@@ -258,20 +257,15 @@ pub(crate) fn synthetic_svc_process_for_coordinator(process_id: u64) -> Runnable
     process
 }
 
-pub(crate) fn synthetic_memory_loop_process(
-    process_id: u64,
-    backend: crate::CpuBackendConfig,
-) -> RunnableProcess {
-    synthetic_backend_instruction_process(
+pub(crate) fn synthetic_memory_loop_process(process_id: u64) -> RunnableProcess {
+    synthetic_native_instruction_process(
         process_id,
-        backend,
         &[0x10000001, 0xf9400020, 0xd503203f, 0x17fffffd],
     )
 }
 
-pub(crate) fn synthetic_backend_instruction_process(
+pub(crate) fn synthetic_native_instruction_process(
     process_id: u64,
-    backend: crate::CpuBackendConfig,
     code: &[u32],
 ) -> RunnableProcess {
     let mut bytes = synthetic_nro();
@@ -283,7 +277,6 @@ pub(crate) fn synthetic_backend_instruction_process(
     fs::write(&path, bytes).unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
     reference_process_builder()
-        .with_cpu_backend(backend)
         .with_config(ProcessBuildConfig {
             process_id,
 
@@ -307,6 +300,7 @@ fn dropping_a_process_closes_its_memory_and_handles_while_stopped_native_registe
     ));
     let state = process.main_thread_mut().take_state().unwrap();
     assert!(state.is_resident());
+    let expected = state.register_context();
     assert!(memory.account().used_bytes() != 0);
     drop(process);
     assert_eq!(memory.account().used_bytes(), 0);
@@ -316,5 +310,5 @@ fn dropping_a_process_closes_its_memory_and_handles_while_stopped_native_registe
         handles.insert(crate::EventObject::new()),
         Err(crate::HandleError::Closed)
     );
-    assert_eq!(state.register_context(), report.context.unwrap());
+    assert_eq!(state.register_context(), expected);
 }

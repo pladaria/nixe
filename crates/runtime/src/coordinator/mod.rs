@@ -25,13 +25,6 @@ use identity::{GuestThreadIdAllocator, ProcessIdAllocator};
 pub use worker::WorkerFailure;
 use worker::{VcpuWorkerPool, WorkerCpuThreadKey, WorkerRequest, WorkerRunFailure};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum VcpuExecutionMode {
-    #[default]
-    Deterministic,
-    Parallel,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessRegistration {
     pub priority: i32,
@@ -108,12 +101,6 @@ pub struct RuntimeCoordinator {
     processes: BTreeMap<ProcessId, RunnableProcess>,
     process_ids: ProcessIdAllocator,
     workers: VcpuWorkerPool,
-    execution_mode: VcpuExecutionMode,
-    execution_record: Option<crate::ExecutionRecord>,
-    next_record_sequence: u64,
-    record_dispatch_sequences: BTreeMap<VirtualCpuId, u64>,
-    replay_expected: Option<crate::ExecutionRecord>,
-    replay_dispatches: VecDeque<(u64, Lease, u64)>,
     thread_ids: GuestThreadIdAllocator,
     inbox: ExternalEventInbox,
     host_stop_requested: bool,
@@ -123,8 +110,7 @@ pub struct RuntimeCoordinator {
     priority_donations: BTreeSet<PriorityDonation>,
     vcpu_events: BTreeMap<VirtualCpuId, VcpuEventState>,
     cpu_waits: BTreeMap<GuestThreadId, CpuWait>,
-    adaptive_budget: AdaptiveExecutionBudget,
-    parallel_budgets: BTreeMap<VirtualCpuId, AdaptiveExecutionBudget>,
+    budgets: BTreeMap<VirtualCpuId, AdaptiveExecutionBudget>,
     next_preemption_ns: Option<u64>,
     completed_executions: VecDeque<CoordinatorExecution>,
 }
@@ -143,14 +129,13 @@ impl RuntimeCoordinator {
         profile: MachineSchedulerProfile,
         virtual_clock: crate::VirtualClock,
     ) -> Self {
-        Self::try_with_execution_mode(profile, virtual_clock, VcpuExecutionMode::Deterministic)
+        Self::try_with_virtual_clock(profile, virtual_clock)
             .expect("vCPU worker construction failed")
     }
 
-    pub fn try_with_execution_mode(
+    pub fn try_with_virtual_clock(
         profile: MachineSchedulerProfile,
         virtual_clock: crate::VirtualClock,
-        execution_mode: VcpuExecutionMode,
     ) -> Result<Self, CoordinatorError> {
         let vcpu_events = profile
             .vcpus()
@@ -159,16 +144,14 @@ impl RuntimeCoordinator {
             .collect();
         let adaptive_budget =
             AdaptiveExecutionBudget::new(profile.default_timeslice_instructions());
-        let parallel_budgets = profile
+        let budgets = profile
             .vcpus()
             .iter()
             .map(|descriptor| (descriptor.id(), adaptive_budget))
             .collect();
-        let workers = VcpuWorkerPool::start(
-            profile.vcpus().iter().map(|descriptor| descriptor.id()),
-            execution_mode == VcpuExecutionMode::Deterministic,
-        )
-        .map_err(|error| CoordinatorError::WorkerStartup(error.kind()))?;
+        let workers =
+            VcpuWorkerPool::start(profile.vcpus().iter().map(|descriptor| descriptor.id()))
+                .map_err(|error| CoordinatorError::WorkerStartup(error.kind()))?;
         let next_preemption_ns = profile
             .preemption_interval_ns()
             .map(|interval| virtual_clock.scheduler_time_ns().saturating_add(interval));
@@ -177,12 +160,6 @@ impl RuntimeCoordinator {
             processes: BTreeMap::new(),
             process_ids: ProcessIdAllocator::new(),
             workers,
-            execution_mode,
-            execution_record: None,
-            next_record_sequence: 1,
-            record_dispatch_sequences: BTreeMap::new(),
-            replay_expected: None,
-            replay_dispatches: VecDeque::new(),
             thread_ids: GuestThreadIdAllocator::new(),
             inbox: ExternalEventInbox::bounded(1_024)
                 .expect("the default external event capacity is non-zero"),
@@ -193,81 +170,10 @@ impl RuntimeCoordinator {
             priority_donations: BTreeSet::new(),
             vcpu_events,
             cpu_waits: BTreeMap::new(),
-            adaptive_budget,
-            parallel_budgets,
+            budgets,
             next_preemption_ns,
             completed_executions: VecDeque::new(),
         })
-    }
-
-    #[must_use]
-    pub const fn execution_mode(&self) -> VcpuExecutionMode {
-        self.execution_mode
-    }
-
-    pub fn enable_execution_recording(&mut self, capacity: std::num::NonZeroUsize) {
-        self.execution_record = Some(crate::ExecutionRecord::new(capacity));
-        self.next_record_sequence = 1;
-        self.record_dispatch_sequences.clear();
-    }
-
-    pub fn enable_sanitized_execution_recording(&mut self, capacity: std::num::NonZeroUsize) {
-        self.execution_record = Some(crate::ExecutionRecord::sanitized(capacity));
-        self.next_record_sequence = 1;
-        self.record_dispatch_sequences.clear();
-    }
-
-    #[must_use]
-    pub fn execution_record(&self) -> Option<&crate::ExecutionRecord> {
-        self.execution_record.as_ref()
-    }
-
-    pub fn take_execution_record(&mut self) -> Option<crate::ExecutionRecord> {
-        self.record_dispatch_sequences.clear();
-        self.execution_record.take()
-    }
-
-    /// Installs a parallel observation record as deterministic dispatch input.
-    /// The scheduler must independently reproduce every recorded thread lease.
-    pub fn begin_differential_replay(
-        &mut self,
-        expected: crate::ExecutionRecord,
-    ) -> Result<(), CoordinatorError> {
-        if self.execution_mode != VcpuExecutionMode::Deterministic {
-            return Err(CoordinatorError::ReplayRequiresDeterministicMode);
-        }
-        let observed = if expected.retains_architectural_context() {
-            crate::ExecutionRecord::new(expected.capacity())
-        } else {
-            crate::ExecutionRecord::sanitized(expected.capacity())
-        };
-        self.replay_dispatches = expected.dispatches().into();
-        self.replay_expected = Some(expected);
-        self.execution_record = Some(observed);
-        self.next_record_sequence = 1;
-        self.record_dispatch_sequences.clear();
-        Ok(())
-    }
-
-    pub fn finish_differential_replay(
-        &mut self,
-    ) -> Result<crate::ExecutionRecord, CoordinatorError> {
-        if !self.replay_dispatches.is_empty() {
-            return Err(CoordinatorError::ReplayIncomplete {
-                remaining_dispatches: self.replay_dispatches.len(),
-            });
-        }
-        let expected = self
-            .replay_expected
-            .take()
-            .ok_or(CoordinatorError::ReplayNotActive)?;
-        let observed = self
-            .take_execution_record()
-            .ok_or(CoordinatorError::ReplayNotActive)?;
-        expected
-            .compare(&observed)
-            .map_err(CoordinatorError::ReplayMismatch)?;
-        Ok(observed)
     }
 
     /// Quiesces workers and releases every process, CPU backend, wait, and
@@ -296,48 +202,6 @@ impl RuntimeCoordinator {
         self.deadlines.clear();
         self.host_stop_requested = true;
         self.workers.shutdown().map_err(CoordinatorError::Worker)
-    }
-
-    fn record_dispatch(&mut self, lease: Lease, instruction_budget: u64) {
-        let sequence = self.next_record_sequence;
-        self.next_record_sequence = self.next_record_sequence.saturating_add(1);
-        self.record_dispatch_sequences.insert(lease.vcpu, sequence);
-        if let Some(record) = &mut self.execution_record {
-            record.push(crate::ExecutionObservation::Dispatch {
-                sequence,
-                lease,
-                instruction_budget,
-            });
-        }
-    }
-
-    fn record_completion(&mut self, lease: Lease, report: &ExecutionReport) {
-        let sequence = self
-            .record_dispatch_sequences
-            .remove(&lease.vcpu)
-            .unwrap_or_default();
-        if let Some(record) = &mut self.execution_record {
-            record.push(crate::ExecutionObservation::Completion {
-                sequence,
-                lease,
-                progress: report.progress,
-                stop: recorded_stop(&report.stop),
-                context: if record.retains_architectural_context() {
-                    report.context.clone().map(Box::new)
-                } else {
-                    None
-                },
-            });
-        }
-    }
-
-    pub(super) fn record_external_event(&mut self, event: crate::SequencedExternalEvent) {
-        if let Some(record) = &mut self.execution_record {
-            record.push(crate::ExecutionObservation::External {
-                sequence: event.sequence,
-                event: event.event,
-            });
-        }
     }
 
     #[must_use]
@@ -840,22 +704,10 @@ pub enum CoordinatorError {
     ExternalEvent(ExternalEventSendError),
     WorkerStartup(std::io::ErrorKind),
     Worker(WorkerFailure),
-    ParallelModeRequired,
     ProcessTeardown {
         process: ProcessId,
         failure: crate::ProcessTeardownFailure,
     },
-    ReplayRequiresDeterministicMode,
-    ReplayIncomplete {
-        remaining_dispatches: usize,
-    },
-    ReplayNotActive,
-    ReplayLeaseMismatch {
-        sequence: u64,
-        expected: Lease,
-        observed: Lease,
-    },
-    ReplayMismatch(crate::ReplayMismatch),
 }
 
 impl From<crate::ThreadTableError> for CoordinatorError {
@@ -931,22 +783,6 @@ pub struct CoordinatorDrainReport {
     pub stale: usize,
     pub first_sequence: Option<crate::ExternalEventSequence>,
     pub last_sequence: Option<crate::ExternalEventSequence>,
-}
-
-fn recorded_stop(stop: &ExecutionStop) -> crate::RecordedStop {
-    match stop {
-        ExecutionStop::BudgetExhausted => crate::RecordedStop::BudgetExhausted,
-        ExecutionStop::Safepoint => crate::RecordedStop::Safepoint,
-        ExecutionStop::PendingEvent { .. } => crate::RecordedStop::PendingEvent,
-        ExecutionStop::Scheduled { .. } => crate::RecordedStop::Scheduled,
-        ExecutionStop::ArchitecturalException { .. } => crate::RecordedStop::ArchitecturalException,
-        ExecutionStop::SupervisorCall { .. } => crate::RecordedStop::SupervisorCall,
-        ExecutionStop::DataFault { .. } => crate::RecordedStop::DataFault,
-        ExecutionStop::LoaderReturn { .. } => crate::RecordedStop::LoaderReturn,
-        ExecutionStop::FetchFault { .. } => crate::RecordedStop::FetchFault,
-        ExecutionStop::UnsupportedSemantics { .. } => crate::RecordedStop::UnsupportedSemantics,
-        ExecutionStop::UnallocatedEncoding { .. } => crate::RecordedStop::UnallocatedEncoding,
-    }
 }
 
 #[cfg(test)]

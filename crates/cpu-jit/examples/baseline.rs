@@ -1,5 +1,5 @@
-//! Fixed guest workloads for architecture comparisons, using encodings already
-//! covered by tests/differential.rs. Reports wall time separately from JIT ticks.
+//! Fixed guest workloads for native execution comparisons.
+//! Reports wall time separately from JIT ticks.
 use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState};
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
@@ -126,7 +126,6 @@ fn main() {
                         instruction_budget: 1000,
                         timer: &Timer,
                         events: &events,
-                        capture_context: false,
                     },
                 )
                 .unwrap();
@@ -202,7 +201,6 @@ fn main() {
                         instruction_budget: 1000,
                         timer: &Timer,
                         events: &events,
-                        capture_context: false,
                     },
                 )
                 .unwrap();

@@ -97,7 +97,7 @@ pub enum BarrierAccess {
     ReadsAndWrites,
 }
 
-/// Engine-neutral barrier semantics shared by interpreters, JITs, and future
+/// Architectural barrier semantics shared by native execution and future
 /// native-code execution providers.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BarrierOperation {
@@ -541,7 +541,7 @@ impl From<&nixe_memory::MemoryError> for DataAccessFaultReason {
     }
 }
 
-/// Precise failure of an interpreter-visible data access.
+/// Precise failure of a guest data access.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct DataAccessFault {
     /// Process address-space identity.

@@ -29,13 +29,6 @@ pub(super) fn allocate_cpu_process_id() -> Option<CpuProcessId> {
         .map(CpuProcessId::new)
 }
 pub use nixe_cpu::execution::{CpuExit as ExecutionStop, ExecutionReport};
-#[derive(Clone, Debug, Default)]
-pub enum CpuBackendConfig {
-    /// The standalone interpreter is excluded from the machine-memory runtime.
-    Interpreter,
-    #[default]
-    Jit,
-}
 pub(crate) type CpuThread = Box<JitThread>;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ProcessExitCause {
@@ -169,13 +162,7 @@ impl ProcessExecutionControl {
         configuration: ProcessExecutionConfiguration,
         space: Arc<AddressSpace>,
         process_id: CpuProcessId,
-        selection: &CpuBackendConfig,
     ) -> Result<Self, CpuFault> {
-        if matches!(selection, CpuBackendConfig::Interpreter) {
-            return Err(jit_boundary_fault(
-                "the legacy interpreter is excluded from this runtime",
-            ));
-        }
         let process = JitProcess::new(configuration.cpu, space, configuration.timer_frequency)
             .map_err(jit_boundary_fault)?;
         Ok(Self {
@@ -189,9 +176,6 @@ impl ProcessExecutionControl {
             stopping: false,
             pending_safepoint: AtomicBool::new(false),
         })
-    }
-    pub(crate) const fn backend_name(&self) -> &'static str {
-        "jit"
     }
     pub(crate) const fn process_id(&self) -> CpuProcessId {
         self.process_id
@@ -281,7 +265,7 @@ pub(crate) struct VcpuExecutionState {
     pub(crate) virtual_clock: VirtualClock,
     pub(crate) architectural_timer_frequency: u64,
     pub(crate) instruction_budget: u64,
-    pub(crate) capture_context: bool,
+
     pub(crate) events: VcpuEventState,
 }
 impl VcpuExecutionState {
@@ -302,7 +286,6 @@ impl VcpuExecutionState {
                     instruction_budget: self.instruction_budget,
                     timer: &timer,
                     events: &self.events,
-                    capture_context: self.capture_context,
                 },
             )
             .map_err(|fault| ProcessExecutionError::Cpu { fault })

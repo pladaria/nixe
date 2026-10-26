@@ -6,17 +6,13 @@ use nixe_horizon::{
     DirectoryEntryKind, HorizonSvcSupport, IpcRequest, IpcResponse, IpcResultCode, IpcService,
 };
 use nixe_runtime::{
-    CpuBackendConfig, ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput,
-    ProcessBuilder, ProcessExitCause, ProcessLifecycle,
+    ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput, ProcessExitCause,
+    ProcessLifecycle,
 };
 
 use support::ScheduledProcess;
 
 use crate::integration_test_support as support;
-
-fn reference_process_builder() -> ProcessBuilder {
-    support::process_builder().with_cpu_backend(CpuBackendConfig::Jit)
-}
 
 fn asset(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -70,11 +66,7 @@ fn materialize_fixture(path: &Path) -> Vec<u8> {
 }
 
 #[test]
-fn jit_minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
-    minimal_nro_loader_return(CpuBackendConfig::Jit);
-}
-
-fn minimal_nro_loader_return(backend: CpuBackendConfig) {
+fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("minimal-a64.nro");
     fs::write(
@@ -83,12 +75,7 @@ fn minimal_nro_loader_return(backend: CpuBackendConfig) {
     )
     .unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = ScheduledProcess::new(
-        support::process_builder()
-            .with_cpu_backend(backend)
-            .build(&plan)
-            .unwrap(),
-    );
+    let mut process = ScheduledProcess::new(support::process_builder().build(&plan).unwrap());
     let state = process.main_thread().state();
     assert_ne!(
         state.read_x(A64Register::General(A64GeneralRegister::new(0).unwrap())),
@@ -158,7 +145,7 @@ fn configured_sd_card_exposes_bounded_host_files_without_following_symlinks() {
 
     let plan = Launcher::build(LauncherInput::new(&nro_path)).unwrap();
     let process = ScheduledProcess::new(
-        reference_process_builder()
+        support::process_builder()
             .with_sd_card_root(fs::canonicalize(&sd_card).unwrap())
             .build(&plan)
             .unwrap(),
@@ -410,7 +397,7 @@ fn launched_nro_overlay_does_not_require_a_host_sd_card_directory() {
     fs::write(&nro_path, &nro).unwrap();
 
     let plan = Launcher::build(LauncherInput::new(&nro_path)).unwrap();
-    let process = ScheduledProcess::new(reference_process_builder().build(&plan).unwrap());
+    let process = ScheduledProcess::new(support::process_builder().build(&plan).unwrap());
     let fsp = crate::IpcSession::new(IpcService::FileSystem);
     let IpcResponse::Object(filesystem) = crate::ipc::dispatch_session(
         process.mounts(),
@@ -452,7 +439,7 @@ fn launched_nro_overlay_does_not_require_a_host_sd_card_directory() {
 fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initialization() {
     let path = asset("templates/application/application.nro");
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = ScheduledProcess::new(reference_process_builder().build(&plan).unwrap());
+    let mut process = ScheduledProcess::new(support::process_builder().build(&plan).unwrap());
     let mut dispatcher = support::dispatcher(&process);
     let mut executed = 0_u64;
 

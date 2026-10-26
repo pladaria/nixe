@@ -14,7 +14,6 @@ use nixe_cpu::{
     profile::ProcessCpuContext,
 };
 use nixe_cpu_direct_memory::NativeWorker;
-use nixe_cpu_interpreter::InstructionStep;
 use nixe_memory::{AddressSpace, GuestVirtualAddress, MemoryError};
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock, Weak,
@@ -183,7 +182,6 @@ impl Thread {
             instruction_budget,
             timer,
             events,
-            capture_context,
         } = request;
         let process = &self.process;
         process.active.fetch_add(1, Ordering::AcqRel);
@@ -204,12 +202,7 @@ impl Thread {
             ));
         }
         if instruction_budget == 0 {
-            return Ok(crate::report(
-                CpuExit::BudgetExhausted,
-                progress,
-                state,
-                capture_context,
-            ));
+            return Ok(crate::report(CpuExit::BudgetExhausted, progress, state));
         }
         self.core
             .select_state(state)
@@ -228,21 +221,12 @@ impl Thread {
                     CpuExit::PendingEvent { mask: interrupts },
                     progress,
                     state,
-                    capture_context,
                 ));
             }
             if progress >= instruction_budget {
-                return Ok(crate::report(
-                    CpuExit::BudgetExhausted,
-                    progress,
-                    state,
-                    capture_context,
-                ));
+                return Ok(crate::report(CpuExit::BudgetExhausted, progress, state));
             }
-            let boundary = match self
-                .core
-                .run(worker, instruction_budget - progress, timer, events)
-            {
+            let boundary = match self.core.run(worker, instruction_budget - progress, timer) {
                 Ok(boundary) => boundary,
                 Err(error) => {
                     let error =
@@ -254,12 +238,7 @@ impl Thread {
             progress = progress.saturating_add(boundary.ticks);
             if let Some(control) = boundary.control {
                 if control.contains(ControlRequest::Preempt) {
-                    return Ok(crate::report(
-                        CpuExit::Safepoint,
-                        progress,
-                        state,
-                        capture_context,
-                    ));
+                    return Ok(crate::report(CpuExit::Safepoint, progress, state));
                 }
                 continue;
             }
@@ -300,14 +279,12 @@ impl Thread {
                 continue;
             }
             if let Some(mut pending) = boundary.memory {
-                let completed = if let Some(result) = pending.poll(process.space.machine(), timer) {
+                let completed = if let Some(result) = pending.poll(process.space.machine()) {
                     result
                 } else {
                     let notification = process.notification();
                     pending.set_waker(notification.waker());
-                    process.wait(&notification, || {
-                        pending.poll(process.space.machine(), timer)
-                    })
+                    process.wait(&notification, || pending.poll(process.space.machine()))
                 };
                 let completed = match completed {
                     Ok(completed) => completed,
@@ -330,9 +307,9 @@ impl Thread {
                     .map_err(|error| crate::fault(error.to_string(), state, progress))?;
                 progress = progress.saturating_add(ticks);
                 match step {
-                    InstructionStep::Continue => continue,
-                    InstructionStep::Exit(stop) => {
-                        return Ok(crate::report(stop, progress, state, capture_context));
+                    None => continue,
+                    Some(stop) => {
+                        return Ok(crate::report(stop, progress, state));
                     }
                 }
             }
@@ -358,7 +335,6 @@ impl Thread {
                     },
                     progress,
                     state,
-                    true,
                 ));
             }
             if let Some(fault) = boundary.fetch_fault {
@@ -366,7 +342,6 @@ impl Thread {
                     CpuExit::FetchFault { fault },
                     progress,
                     state,
-                    true,
                 ));
             }
             if let Some(start) = boundary.invalidate_code {
@@ -450,7 +425,7 @@ impl Thread {
                     ));
                 }
             };
-            return Ok(crate::report(stop, progress, state, capture_context));
+            return Ok(crate::report(stop, progress, state));
         }
     }
 }

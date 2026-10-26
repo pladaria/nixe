@@ -80,7 +80,6 @@ fn run(
             instruction_budget: 1000,
             timer: &Timer,
             events: &VcpuEventState::default(),
-            capture_context: false,
         },
     )
 }
@@ -333,7 +332,6 @@ fn cold_code_preparation_does_not_consume_a_native_block_quantum() {
                     instruction_budget: 1,
                     timer: &Timer,
                     events: &VcpuEventState::default(),
-                    capture_context: false,
                 },
             )
             .unwrap();

@@ -5,7 +5,6 @@ pub struct ProcessBuilder {
     config: ProcessBuildConfig,
     virtual_clock: crate::VirtualClock,
     sd_card_root: Option<PathBuf>,
-    cpu_backend: execution::CpuBackendConfig,
     machine: nixe_memory::Machine,
     system: nixe_memory::MemoryAccount,
 }
@@ -17,7 +16,6 @@ impl std::fmt::Debug for ProcessBuilder {
             .field("config", &self.config)
             .field("virtual_clock", &self.virtual_clock)
             .field("sd_card_root", &self.sd_card_root)
-            .field("cpu_backend", &self.cpu_backend)
             .field("machine", &self.machine.identity())
             .finish()
     }
@@ -32,7 +30,6 @@ impl ProcessBuilder {
             config: ProcessBuildConfig::default(),
             virtual_clock: crate::VirtualClock::default(),
             sd_card_root: None,
-            cpu_backend: execution::CpuBackendConfig::default(),
             machine,
             system,
         }
@@ -55,13 +52,6 @@ impl ProcessBuilder {
     #[must_use]
     pub fn with_sd_card_root(mut self, root: PathBuf) -> Self {
         self.sd_card_root = Some(root);
-        self
-    }
-
-    /// Selects the concrete CPU backend used by this process.
-    #[must_use]
-    pub fn with_cpu_backend(mut self, backend: execution::CpuBackendConfig) -> Self {
-        self.cpu_backend = backend;
         self
     }
 
@@ -274,7 +264,6 @@ impl ProcessBuilder {
             },
             std::sync::Arc::clone(memory.space()),
             cpu_process_id,
-            &self.cpu_backend,
         )
         .map_err(|error| ProcessBuildError::new(ProcessBuildStage::CpuInitialization, error))?;
         let process = RunnableProcess {

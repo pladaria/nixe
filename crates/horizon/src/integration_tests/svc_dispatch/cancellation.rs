@@ -43,7 +43,18 @@ fn cancellation_wakes_another_waiting_thread_and_releases_its_deadline() {
     let entry = GuestVirtualAddress::new(state(&mut process).pc() + 8);
     let stack_top = process.main_thread().stack_top;
     let process_id = process.scheduler_process_id();
-    let affinity = process.coordinator_mut().scheduler().profile().all_cores();
+    let core = nixe_scheduler::VirtualCpuId::new(0);
+    let affinity = process
+        .coordinator_mut()
+        .scheduler()
+        .profile()
+        .core_set([core])
+        .unwrap();
+    let main = process.main_thread_id();
+    process
+        .coordinator_mut()
+        .migrate_thread(main, Some(core), affinity.clone())
+        .unwrap();
     let child = process
         .coordinator_mut()
         .create_thread(

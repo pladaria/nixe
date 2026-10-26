@@ -15,8 +15,8 @@ pub(crate) use builder::ThreadPolicy;
 use builder::a64_register;
 use builder::{align_up, error, initialize_created_thread};
 pub use execution::{
-    CpuBackendConfig, ExecutionReport, ExecutionStop, GuestStackFrame, ProcessExecutionError,
-    ProcessExit, ProcessExitCause, ProcessTeardownFailure, ProcessTeardownReport, ThreadExit,
+    ExecutionReport, ExecutionStop, GuestStackFrame, ProcessExecutionError, ProcessExit,
+    ProcessExitCause, ProcessTeardownFailure, ProcessTeardownReport, ThreadExit,
 };
 pub use layout::{
     ProcessAddressSpace, ProcessBuildConfig, ProcessMemoryLayout, ProcessMemoryLayoutProfile,

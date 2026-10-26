@@ -63,12 +63,6 @@ file_system_access_log = true
 [audio]
 output = "stereo"
 
-[cpu]
-# CPU backend: "jit" or "interpreter". Neither backend falls back to the other.
-backend = "jit"
-# Opt-in host-parallel vCPU execution. False keeps deterministic serialization.
-parallel_vcpus = true
-
 [video]
 # Synchronize host presentation to the monitor. Defaults to true when omitted.
 # Disabling this allows tearing; guest-requested frame intervals are preserved.

@@ -5,7 +5,6 @@ pub use nixe_loader_executable::RelocationState;
 mod address_wait;
 mod coordinator;
 mod exception_dispatch;
-mod execution_record;
 mod external_event;
 mod handle;
 mod launch_plan;
@@ -26,17 +25,13 @@ pub use address_wait::{
 pub use coordinator::{
     CoordinatorDrainReport, CoordinatorError, CoordinatorExecution, CoordinatorResourceCounts,
     CoordinatorRouteError, ProcessRegistration, RuntimeCoordinator, ThreadOperationError,
-    VcpuExecutionMode, WorkerFailure,
+    WorkerFailure,
 };
 pub use exception_dispatch::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatchRequest,
     ExceptionDispatcher, ExceptionHandlingResult, ExceptionProcessContext, ExceptionResume,
     ExceptionRouteError, ExceptionTerminationReason, ExceptionTerminationScope,
     ExceptionThreadContext, GuestBreakPayload, MAX_GUEST_BREAK_PAYLOAD_BYTES,
-};
-pub use execution_record::{
-    ExecutionObservation, ExecutionRecord, MAX_EXECUTION_RECORD_OBSERVATIONS, RecordedStop,
-    ReplayMismatch, ReplayMismatchKind,
 };
 pub use external_event::{
     ExternalEvent, ExternalEventInbox, ExternalEventSendError, ExternalEventSender,
@@ -58,8 +53,8 @@ pub use launcher::{LaunchError, LaunchStage, Launcher, LauncherInput};
 pub use module_memory::{InstallStage, ModuleInstallError, install_prepared_module};
 pub use nixe_scheduler::{ProcessLifecycle, ThreadLifecycle};
 pub use process::{
-    CpuBackendConfig, ExecutionReport, ExecutionStop, GuestStackFrame, GuestThread,
-    ProcessAddressSpace, ProcessBuildConfig, ProcessBuildError, ProcessBuildStage, ProcessBuilder,
+    ExecutionReport, ExecutionStop, GuestStackFrame, GuestThread, ProcessAddressSpace,
+    ProcessBuildConfig, ProcessBuildError, ProcessBuildStage, ProcessBuilder,
     ProcessExecutionError, ProcessExit, ProcessExitCause, ProcessMemoryAccounting,
     ProcessMemoryLayout, ProcessMemoryLayoutProfile, ProcessTeardownFailure, ProcessTeardownReport,
     ProcessVirtualRegion, RunnableProcess, ThreadCreateError, ThreadCreateRequest, ThreadCreation,

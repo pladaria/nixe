@@ -1,3 +1,5 @@
+//! Scalar, pair and exclusive effects for owned JIT memory completion.
+//! https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions
 use nixe_cpu::{
     decode::{
         DecodedOpcode,
@@ -16,29 +18,24 @@ use nixe_cpu::{
 };
 use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
 
-use super::{advance, read, register_offset_address, sign_extend, write};
-use crate::interpreter::{InstructionStep, InterpreterContext, InterpreterError};
+use super::{Effects, read, register_offset_address, sign_extend, write};
 
-pub(super) type MemoryStepError = DataAccessFault;
-
-type MemoryStep = Result<Option<()>, MemoryStepError>;
+type MemoryStep = Result<Option<()>, DataAccessFault>;
 
 pub(super) fn execute(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
     instruction: Instruction,
-) -> Result<InstructionStep, InterpreterError> {
-    // Prefetch hints have implementation-defined cache effects. As in the JIT,
-    // they produce no memory access or fault. See Instruction::is_prefetch.
+) -> MemoryStep {
+    // Prefetch hints produce no memory access or fault.
+    // See Instruction::is_prefetch.
     if instruction.is_prefetch() {
-        advance(state);
-        return Ok(InstructionStep::Continue);
+        return Ok(Some(()));
     }
-    let memory = context.memory();
-    let address_space = context.process().address_space_id();
+    let address_space = context.space;
     let fields = instruction.operands();
-    let result = match instruction {
+    match instruction {
         Instruction::Literal(_) => literal(context, address_space, state, decoded, fields),
         Instruction::Unsigned(_) => unsigned(context, address_space, state, fields),
         Instruction::Unscaled(_) | Instruction::PostIndex(_) | Instruction::PreIndex(_) => {
@@ -47,27 +44,19 @@ pub(super) fn execute(
         Instruction::Register(_) => register_offset(context, address_space, state, fields),
         Instruction::Pair(_) => pair(context, state, fields),
         Instruction::LoadAcquire(_) | Instruction::StoreRelease(_) => {
-            acquire_release(memory, address_space, state, fields, instruction)
+            acquire_release(context, address_space, state, fields, instruction)
         }
         Instruction::LoadExclusive(_)
         | Instruction::StoreExclusive(_)
         | Instruction::LoadExclusivePair(_)
         | Instruction::StoreExclusivePair(_) => {
-            exclusive(context, memory, address_space, state, fields, instruction)
+            exclusive(context, address_space, state, fields, instruction)
         }
         Instruction::AtomicReadModifyWrite(_)
         | Instruction::CompareAndSwap(_)
         | Instruction::CompareAndSwapPair(_) => {
-            atomic(memory, address_space, state, fields, instruction)
+            atomic(context, address_space, state, fields, instruction)
         }
-    };
-    match result {
-        Ok(Some(())) => {
-            advance(state);
-            Ok(InstructionStep::Continue)
-        }
-        Ok(None) => Err(super::super::unsupported(decoded)),
-        Err(fault) => Ok(InstructionStep::data_fault(decoded.location, fault)),
     }
 }
 
@@ -177,15 +166,14 @@ fn atomic(
     Ok(Some(()))
 }
 
-fn exclusive<M: InstructionMemoryAccess + ?Sized>(
-    context: InterpreterContext<'_, M>,
-    memory: &M,
+fn exclusive(
+    memory: &Effects<'_>,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
     instruction: Instruction,
 ) -> MemoryStep {
-    let monitor = context.exclusive_monitor();
+    let monitor = &memory.monitor;
     let pair = matches!(
         instruction,
         Instruction::LoadExclusivePair(_) | Instruction::StoreExclusivePair(_)
@@ -211,7 +199,7 @@ fn exclusive<M: InstructionMemoryAccess + ?Sized>(
     );
     if load {
         let (value, reservation) = memory.load_exclusive(address_space, address, descriptor)?;
-        monitor.borrow_mut().reserve(reservation);
+        monitor.set(reservation);
         if pair {
             let bits = value.value.bits();
             write(
@@ -238,8 +226,7 @@ fn exclusive<M: InstructionMemoryAccess + ?Sized>(
             );
         }
     } else {
-        let reservation = monitor.borrow().reservation();
-        monitor.borrow_mut().clear();
+        let reservation = monitor.take();
         let value = if pair {
             let low = register_value(state, fields.rt, element_size).bits();
             let high = register_value(state, fields.rt2, element_size).bits();
@@ -249,7 +236,7 @@ fn exclusive<M: InstructionMemoryAccess + ?Sized>(
         };
         let succeeded = if let Some(reservation) = reservation {
             memory
-                .store_exclusive(address_space, address, descriptor, value, reservation)?
+                .store_exclusive(address_space, address, descriptor, value, Some(reservation))?
                 .1
         } else {
             false
@@ -273,7 +260,7 @@ fn access(size: MemoryAccessSize, ordering: MemoryOrdering, aligned: bool) -> Me
 }
 
 fn literal(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     _address_space: AddressSpaceId,
     state: &mut A64State,
     decoded: &DecodedInstruction<DecodedOpcode>,
@@ -296,7 +283,7 @@ fn literal(
 }
 
 fn unsigned(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -318,7 +305,7 @@ fn unsigned(
 }
 
 fn indexed(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -359,7 +346,7 @@ fn indexed(
 }
 
 fn register_offset(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -386,11 +373,7 @@ fn register_offset(
     )
 }
 
-fn pair(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
-    state: &mut A64State,
-    fields: Operands,
-) -> MemoryStep {
+fn pair(context: &Effects<'_>, state: &mut A64State, fields: Operands) -> MemoryStep {
     let Some((size, load_spec)) = pair_transfer(fields.size, fields.load) else {
         return Ok(None);
     };
@@ -415,7 +398,7 @@ fn pair(
     let descriptor = access(size, MemoryOrdering::Relaxed, false);
     if fields.load {
         // Delay register writes until both reads succeed, preserving precise
-        // state for synthetic faults in the reference engine.
+        // state if a later access faults during native memory completion.
         let first_value = ordinary_read(context, first, descriptor)?;
         let second_value = ordinary_read(context, second, descriptor)?;
         write_loaded(state, fields.rt, size, load_spec, first_value);
@@ -471,7 +454,7 @@ fn acquire_release(
 }
 
 fn transfer(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     _address_space: AddressSpaceId,
     state: &mut A64State,
     fields: Operands,
@@ -498,28 +481,20 @@ fn transfer(
 }
 
 pub(super) fn ordinary_read(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     address: GuestVirtualAddress,
     descriptor: MemoryAccess,
-) -> Result<MemoryValue, MemoryStepError> {
-    Ok(context
-        .memory()
-        .read(context.process().address_space_id(), address, descriptor)?
-        .value)
+) -> Result<MemoryValue, DataAccessFault> {
+    Ok(context.read(context.space, address, descriptor)?.value)
 }
 
 pub(super) fn ordinary_write(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     address: GuestVirtualAddress,
     value: MemoryValue,
     descriptor: MemoryAccess,
-) -> Result<(), MemoryStepError> {
-    context.memory().write(
-        context.process().address_space_id(),
-        address,
-        descriptor,
-        value,
-    )?;
+) -> Result<(), DataAccessFault> {
+    context.write(context.space, address, descriptor, value)?;
     Ok(())
 }
 

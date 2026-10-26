@@ -51,8 +51,6 @@ pub struct NixeConfig {
     pub system: SystemConfig,
     /// Cross-cutting diagnostic preferences consumed by application runtimes.
     pub diagnostics: DiagnosticsConfig,
-    /// CPU backend selection and resource policy.
-    pub cpu: CpuConfig,
     /// GPU shader, pipeline, and backend-derived cache policy.
     pub gpu: GpuConfig,
     /// Host presentation preferences.
@@ -91,7 +89,6 @@ impl NixeConfig {
         let base_directory = source_path
             .parent()
             .expect("an absolute file path must have a parent");
-        let cpu = cpu_configuration(raw.cpu);
         let gpu = gpu_cache_configuration(path, raw.gpu)?;
 
         Ok(Self {
@@ -136,7 +133,6 @@ impl NixeConfig {
                 guest_logs_level: raw.diagnostics.guest_logs_level,
                 file_system_access_log: raw.diagnostics.file_system_access_log,
             },
-            cpu,
             gpu,
             video: raw.video,
             input: raw.input,
@@ -297,22 +293,6 @@ pub struct DiagnosticsConfig {
     pub file_system_access_log: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CpuConfig {
-    pub backend: CpuBackendSelection,
-    /// Enables host-parallel execution. Deterministic serialized workers
-    /// remain the default.
-    pub parallel_vcpus: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CpuBackendSelection {
-    #[default]
-    Jit,
-    Interpreter,
-}
-
 /// Named mappings from host gamepads to the emulated controller.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -430,8 +410,6 @@ struct RawConfig {
     #[serde(default)]
     diagnostics: RawDiagnosticsConfig,
     #[serde(default)]
-    cpu: RawCpuConfig,
-    #[serde(default)]
     gpu: RawGpuConfig,
     #[serde(default)]
     video: VideoConfig,
@@ -439,15 +417,6 @@ struct RawConfig {
     input: InputConfig,
     #[serde(default)]
     audio: AudioConfig,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawCpuConfig {
-    #[serde(default)]
-    backend: CpuBackendSelection,
-    #[serde(default)]
-    parallel_vcpus: bool,
 }
 
 #[derive(Deserialize)]
@@ -615,13 +584,6 @@ fn gpu_cache_configuration(path: &Path, raw: RawGpuConfig) -> Result<GpuConfig, 
         pipeline_entries: raw.pipeline_cache_entries,
         persistent_bytes,
     })
-}
-
-fn cpu_configuration(raw: RawCpuConfig) -> CpuConfig {
-    CpuConfig {
-        backend: raw.backend,
-        parallel_vcpus: raw.parallel_vcpus,
-    }
 }
 
 fn validate_time_config(path: &Path, time: &RawTimeConfig) -> Result<(), ConfigError> {
@@ -997,73 +959,6 @@ mod tests {
             config.filesystem.sd_card,
             file.path.parent().unwrap().join("./storage/sdmc")
         );
-    }
-
-    #[test]
-    fn cpu_backend_selection_is_typed() {
-        let default_file = TemporaryConfig::new(
-            r#"
-                version = 2
-                [library]
-                paths = []
-                [system]
-                preferred_languages = []
-                keys = "keys"
-                initial_operation_mode = "handheld"
-            "#,
-        );
-        assert_eq!(
-            NixeConfig::load(&default_file.path).unwrap().cpu.backend,
-            CpuBackendSelection::Jit
-        );
-        assert!(
-            !NixeConfig::load(&default_file.path)
-                .unwrap()
-                .cpu
-                .parallel_vcpus
-        );
-        let explicit_file = TemporaryConfig::new(
-            r#"
-                version = 2
-                [library]
-                paths = []
-                [system]
-                preferred_languages = []
-                keys = "keys"
-                initial_operation_mode = "handheld"
-                [cpu]
-                backend = "interpreter"
-                parallel_vcpus = true
-            "#,
-        );
-        assert_eq!(
-            NixeConfig::load(&explicit_file.path).unwrap().cpu.backend,
-            CpuBackendSelection::Interpreter
-        );
-        assert!(
-            NixeConfig::load(&explicit_file.path)
-                .unwrap()
-                .cpu
-                .parallel_vcpus
-        );
-
-        let invalid_backend = TemporaryConfig::new(
-            r#"
-                version = 2
-                [library]
-                paths = []
-                [system]
-                preferred_languages = []
-                keys = "keys"
-                initial_operation_mode = "handheld"
-                [cpu]
-                backend = "native"
-            "#,
-        );
-        assert!(matches!(
-            NixeConfig::load(&invalid_backend.path),
-            Err(ConfigError::Parse { .. })
-        ));
     }
 
     #[test]

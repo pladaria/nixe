@@ -49,8 +49,8 @@ to its host TID and is still used only by that worker's captured invocations.
 | Guest switch | Save the previous complete context before releasing its claim. Load the next guest on the worker; clear local exclusives for the changed guest ID. |
 | Migration | Before either worker accepts a new lease, save the source context and clear its local exclusive state. Remove source residency bookkeeping. The destination imports the current saved value. |
 | Full thread query / debugger | Reject Running, absent or unavailable state. Obtain an owned complete snapshot explicitly; native residency may continue. Horizon also enforces its paused-thread query requirement. |
-| Diagnostic / replay consumer | Request compact context in `JitRunRequest`. Normal returns may omit `ExecutionReport.context`; omission does not imply the register owner is unavailable. |
-| Precise abort / unsupported instruction / architectural exception | Native return is synchronized; correct the source PC and capture a current compact diagnostic context. Full snapshots remain available from the owner. No interpreter fallback. |
+| Diagnostic consumer | Read an owned snapshot explicitly from the stopped `ThreadState`. Normal returns omit `ExecutionReport.context`; omission does not imply the register owner is unavailable. |
+| Precise abort / unsupported instruction / architectural exception | Native return is synchronized; correct the source PC and capture a current compact diagnostic context. Full snapshots remain available from the owner. Unsupported instructions stop explicitly. |
 | GPU visibility demand | Return at the faulting instruction through MemoryAbort and release the execution lease before resolving the retained page. Loads/atomics retry natively with mapping/permission revalidation. Ordinary stores complete the remaining checked stores and writeback, skipping the native prefix. Translation read-ahead records unavailable code without waiting. |
 | Data-cache maintenance | Complete non-zeroing VA operations in the native callback when canonical RAM is CPU-visible. The block still checks halt requests. GPU-owned RAM, mapping faults, set/way operations and cache zeroing return through the existing checked maintenance/trap path after releasing the execution lease. Instruction-cache invalidation still returns to synchronize compiled code. |
 | MMIO memory instruction | Exit before the first device side effect. Take a complete snapshot and finish with checked semantics outside the lease, skipping any preceding native RAM stores. This prevents a later visibility demand in a pair access from replaying MMIO. |
@@ -96,10 +96,8 @@ changes only with a committed conditional write. Visibility waits run after the
 native slice releases admission. Transient observation/ownership faults retain
 fastmem; persistent exceptional mappings may recompile only the affected access.
 
-The interpreter keeps its independent local-monitor state and differential role,
-using the same physical write-version contract.
-Its checked instruction executor also completes cold MMIO memory instructions
-and interrupted ordinary store tails after native return; unsupported Dynarmic
+The JIT owns checked memory effects for cold MMIO instructions and interrupted
+ordinary store tails after native return; unsupported Dynarmic
 instructions remain errors. The store continuation matches the failed start VA
 so vector stores and element-level checked semantics agree. Completed stores
 are not revalidated or replayed after mappings or contents change during a wait.

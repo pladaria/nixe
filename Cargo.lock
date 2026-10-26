@@ -1307,7 +1307,6 @@ dependencies = [
  "nixe-audio",
  "nixe-config",
  "nixe-cpu",
- "nixe-cpu-interpreter",
  "nixe-cpu-jit",
  "nixe-gpu",
  "nixe-gpu-maxwell",
@@ -1355,21 +1354,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "nixe-cpu-interpreter"
-version = "0.1.0"
-dependencies = [
- "nixe-cpu",
- "nixe-memory",
-]
-
-[[package]]
 name = "nixe-cpu-jit"
 version = "0.1.0"
 dependencies = [
  "cmake",
  "nixe-cpu",
  "nixe-cpu-direct-memory",
- "nixe-cpu-interpreter",
  "nixe-memory",
 ]
 
@@ -1480,7 +1470,6 @@ version = "0.1.0"
 dependencies = [
  "log",
  "lz4_flex",
- "nixe-loader-content",
  "nixe-loader-storage",
  "zstd",
 ]
@@ -1524,7 +1513,6 @@ dependencies = [
  "nixe-loader-title",
  "nixe-memory",
  "nixe-scheduler",
- "sha2",
  "tempfile",
 ]
 
@@ -1565,10 +1553,6 @@ dependencies = [
  "tempfile",
  "winit",
 ]
-
-[[package]]
-name = "nixe-xtask"
-version = "0.1.0"
 
 [[package]]
 name = "nohash-hasher"

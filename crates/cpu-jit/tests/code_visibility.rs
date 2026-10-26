@@ -65,7 +65,6 @@ fn run(jit: &mut JitThread, state: &mut ThreadState) -> nixe_cpu::execution::Exe
             instruction_budget: 1000,
             timer: &Timer,
             events: &VcpuEventState::default(),
-            capture_context: true,
         },
     )
     .unwrap()

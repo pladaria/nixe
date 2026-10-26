@@ -101,10 +101,7 @@ fn loader_stub_recognition_requires_the_thread_address_and_exit_svc() {
                     if source.pc == pc && observed == immediate));
         assert_eq!(report.progress, 1);
         assert_eq!(process.main_thread().state().pc(), pc.get());
-        assert_eq!(
-            report.context,
-            Some(process.main_thread().state().register_context())
-        );
+        assert!(report.context.is_none());
         assert!(process.exit().is_none());
         assert_eq!(
             process.lifecycle(),
@@ -175,7 +172,7 @@ fn production_jit_uses_block_budgets_recompiles_mutated_code_and_retires() {
 }
 
 #[test]
-fn reference_execution_honors_budget_and_preserves_dispatch_pc() {
+fn native_execution_honors_budget_and_preserves_dispatch_pc() {
     let (_directory, plan) = plan();
     let mut process = reference_process_builder().build(&plan).unwrap();
     let entry = process.entry_module().entry_address();
@@ -184,9 +181,10 @@ fn reference_execution_honors_budget_and_preserves_dispatch_pc() {
     assert_eq!(report.progress, 1);
     assert_eq!(report.stop, crate::ExecutionStop::BudgetExhausted);
     assert!(report.stop.exception_dispatch_request().is_none());
-    let context = report.context.as_ref().unwrap();
+    assert!(report.context.is_none());
+    let context = process.main_thread().state().register_context();
     assert_eq!(context.pc.get(), entry + 0x80);
-    assert!(report.to_string().contains("flags=N0Z0C0V0"));
+    assert_eq!(context.nzcv.bits(), 0);
     let state = process.main_thread().state();
     assert_eq!(state.pc(), entry + 0x80);
 }

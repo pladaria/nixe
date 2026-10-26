@@ -2,7 +2,7 @@
 //!
 //! CPU backends report an [`ExceptionDispatchRequest`]. Runtime policy
 //! handles it and returns an [`ExceptionDispatchOutcome`] which an outer
-//! execution loop applies. Neither side assumes the interpreter or JIT backend.
+//! execution loop applies. Dispatch does not access native CPU internals.
 
 use crate::GuestCpuState;
 use crate::memory::ProcessMemory;
@@ -165,7 +165,7 @@ pub enum ExceptionHandlingResult<F> {
 ///
 /// This is a borrowed runtime view rather than a backend-owned object. It
 /// exposes guest-domain identities and service boundaries without leaking raw
-/// host pointers or coupling dispatch to the reference interpreter.
+/// host pointers or coupling dispatch to native CPU internals.
 pub struct ExceptionProcessContext<'a> {
     process_id: u64,
     cpu: ProcessCpuContext,

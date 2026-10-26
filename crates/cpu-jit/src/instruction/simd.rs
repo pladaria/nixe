@@ -1,9 +1,10 @@
+//! Vector memory effects for owned JIT instruction completion.
+//! https://developer.arm.com/documentation/ddi0602/latest/SIMD-FP-Instructions
 use nixe_cpu::{
-    decode::{DecodedOpcode, a64::fp_simd::Instruction},
-    location::DecodedInstruction,
+    decode::a64::fp_simd::Instruction,
     memory::{
-        MemoryAccess, MemoryAccessClass, MemoryAccessSize, MemoryAlignment, MemoryOrdering,
-        MemoryValue,
+        DataAccessFault, MemoryAccess, MemoryAccessClass, MemoryAccessSize, MemoryAlignment,
+        MemoryOrdering, MemoryValue,
     },
     semantics::a64::{
         SimdMemoryMode, SimdMemoryShape, simd_memory_access_size, simd_multiple_structure_shape,
@@ -14,36 +15,19 @@ use nixe_cpu::{
 use nixe_memory::GuestVirtualAddress;
 
 use super::{
-    advance,
-    memory::{MemoryStepError, ordinary_read, ordinary_write},
+    Effects,
+    memory::{ordinary_read, ordinary_write},
     read, register_offset_address, sign_extend,
 };
-use crate::interpreter::{InstructionStep, InterpreterContext, InterpreterError};
 
-type MemoryStep = Result<(), MemoryStepError>;
+type MemoryStep = Result<(), DataAccessFault>;
 
 pub(super) fn execute(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     state: &mut A64State,
-    decoded: &DecodedInstruction<DecodedOpcode>,
     instruction: Instruction,
-) -> Result<InstructionStep, InterpreterError> {
+) -> Result<Option<()>, DataAccessFault> {
     let fields = instruction.operands();
-    match nixe_cpu::semantics::a64_fp_simd::execute(state, instruction) {
-        Ok(()) => {
-            advance(state);
-            return Ok(InstructionStep::Continue);
-        }
-        Err(nixe_cpu::semantics::a64_fp_simd::A64FpSimdError::Trap) => {
-            return Ok(InstructionStep::architectural_exception(
-                decoded.location,
-                nixe_cpu::exception::ExceptionKind::FloatingPoint,
-                None,
-            ));
-        }
-        Err(nixe_cpu::semantics::a64_fp_simd::A64FpSimdError::Unsupported) => {}
-    }
-
     let result = match instruction {
         Instruction::MemoryUnsigned(_)
         | Instruction::MemoryUnscaled(_)
@@ -97,14 +81,14 @@ pub(super) fn execute(
                 fields.scaled,
                 size.bytes().trailing_zeros(),
             ) else {
-                return Err(super::super::unsupported(decoded));
+                return Ok(None);
             };
             Some(vector_transfer(context, state, fields, address, size))
         }
         Instruction::MemoryMultipleStructures(_)
         | Instruction::MemoryMultipleStructuresPostIndex(_) => {
             let Some(shape) = simd_multiple_structure_shape(fields) else {
-                return Err(super::super::unsupported(decoded));
+                return Ok(None);
             };
             Some(vector_multiple_structures(
                 context,
@@ -119,7 +103,7 @@ pub(super) fn execute(
         }
         Instruction::MemorySingleStructure(_) | Instruction::MemorySingleStructurePostIndex(_) => {
             let Some(shape) = simd_single_structure_shape(fields) else {
-                return Err(super::super::unsupported(decoded));
+                return Ok(None);
             };
             Some(vector_single_structure(
                 context,
@@ -129,22 +113,16 @@ pub(super) fn execute(
                 matches!(instruction, Instruction::MemorySingleStructurePostIndex(_)),
             ))
         }
-        _ => return Err(super::super::unsupported(decoded)),
+        _ => return Ok(None),
     };
     if let Some(Err(error)) = result {
-        return Ok(InstructionStep::data_fault(decoded.location, error));
+        return Err(error);
     }
-    advance(state);
-    Ok(InstructionStep::Continue)
+    Ok(Some(()))
 }
 
-// FMOV (register) copies the scalar bit pattern without floating-point
-// processing. This preserves every NaN payload, subnormal, and signed zero,
-// clears the remaining destination bits, and leaves FPCR/FPSR unchanged. Arm
-// ARM DDI 0602 (2025-12):
-// https://developer.arm.com/documentation/ddi0602/2025-12/SIMD-FP-Instructions/FMOV--register---Floating-point-Move-register--
 fn vector_pair(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
 ) -> MemoryStep {
@@ -177,7 +155,7 @@ fn vector_pair(
 }
 
 fn vector_multiple_structures(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
     shape: SimdMemoryShape,
@@ -224,7 +202,7 @@ fn vector_multiple_structures(
 }
 
 fn vector_single_structure(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
     shape: SimdMemoryShape,
@@ -288,7 +266,7 @@ fn insert_lane(state: &mut A64State, register: u8, lane: u8, lane_bits: u32, val
 }
 
 fn write_lane(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
     value: u128,
@@ -304,7 +282,7 @@ fn write_lane(
 }
 
 fn vector_transfer(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     state: &mut A64State,
     fields: nixe_cpu::decode::a64::fp_simd::Operands,
     address: GuestVirtualAddress,
@@ -320,10 +298,10 @@ fn vector_transfer(
 }
 
 fn read_vector(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
-) -> Result<u128, MemoryStepError> {
+) -> Result<u128, DataAccessFault> {
     let value = ordinary_read(context, address, vector_access(size))?;
     Ok(match value {
         MemoryValue::U8(value) => u128::from(value),
@@ -335,12 +313,12 @@ fn read_vector(
 }
 
 fn write_vector(
-    context: InterpreterContext<'_, impl nixe_cpu::memory::InstructionMemoryAccess + ?Sized>,
+    context: &Effects<'_>,
     address: GuestVirtualAddress,
     size: MemoryAccessSize,
     state: &A64State,
     register: u8,
-) -> Result<(), MemoryStepError> {
+) -> Result<(), DataAccessFault> {
     let value = state.vector(register).expect("normalized vector register");
     let value = match size {
         MemoryAccessSize::Byte => MemoryValue::U8(value as u8),

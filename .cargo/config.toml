@@ -2,33 +2,9 @@
 cli-dev = ["run", "--package", "nixe-cli", "--"]
 cli = ["run", "--release", "--package", "nixe-cli", "--"]
 build-profile = ["build", "--profile", "profiling", "--package", "nixe-cli"]
-profile = ["run", "--quiet", "--package", "nixe-xtask", "--", "profile"]
 fmt-check = ["fmt", "--all", "--", "--check"]
 lint = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
 test-all = ["test", "--workspace"]
-test-diff = [
-    "test",
-    "--package",
-    "nixe-cpu-interpreter",
-    "--test",
-    "qemu_differential",
-    "--",
-    "--include-ignored",
-    "--nocapture",
-]
-test-diff-a64 = [
-    "test",
-    "--package",
-    "nixe-cpu-interpreter",
-    "--test",
-    "qemu_differential",
-    "qemu_a64_matches_every_register_semantic_family",
-    "--",
-    "--ignored",
-    "--nocapture",
-]
-fuzz-all = ["run", "--quiet", "--package", "nixe-xtask", "--", "fuzz"]
-
 # https://doc.rust-lang.org/cargo/reference/config.html#targettriplerunner
 [target.'cfg(target_os = "linux")']
 runner = "scripts/with-vulkan-loader.sh"

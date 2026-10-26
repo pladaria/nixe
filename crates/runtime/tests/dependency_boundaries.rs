@@ -22,7 +22,6 @@ fn runtime_owns_the_cpu_and_executable_loader_dependency_direction() {
     let dependencies = dependency_names(&manifest);
 
     assert!(dependencies.contains(&"nixe-cpu"));
-    assert!(!dependencies.contains(&"nixe-cpu-interpreter"));
     assert!(!dependencies.contains(&"nixe-memory-legacy"));
     assert!(dependencies.contains(&"nixe-cpu-jit"));
     assert!(dependencies.contains(&"nixe-loader-executable"));

@@ -54,14 +54,13 @@ impl Drop for Native {
     }
 }
 
-/// Only diagnostic/replay consumers request an eager compact context. SVC
-/// arguments/results use the retained ThreadState directly on the stopped core.
+/// Native slices retain register ownership in ThreadState. Fault reports
+/// capture a diagnostic context; normal exits use the resident state directly.
 pub struct JitRunRequest<'a> {
     pub state: &'a mut ThreadState,
     pub instruction_budget: u64,
     pub timer: &'a dyn ArchitecturalTimer,
     pub events: &'a VcpuEventState,
-    pub capture_context: bool,
 }
 
 fn fault(message: impl Into<Box<str>>, state: &ThreadState, progress: u64) -> CpuFault {
@@ -82,24 +81,18 @@ fn unavailable_state_fault(message: impl Into<Box<str>>, progress: u64) -> CpuFa
         context: None,
     }
 }
-fn report(
-    stop: CpuExit,
-    progress: u64,
-    state: &ThreadState,
-    capture_context: bool,
-) -> ExecutionReport {
-    let capture_context = capture_context
-        || !matches!(
-            stop,
-            CpuExit::SupervisorCall { .. }
-                | CpuExit::BudgetExhausted
-                | CpuExit::Safepoint
-                | CpuExit::PendingEvent { .. }
-                | CpuExit::Scheduled { .. }
-        );
+fn report(stop: CpuExit, progress: u64, state: &ThreadState) -> ExecutionReport {
+    let needs_context = !matches!(
+        stop,
+        CpuExit::SupervisorCall { .. }
+            | CpuExit::BudgetExhausted
+            | CpuExit::Safepoint
+            | CpuExit::PendingEvent { .. }
+            | CpuExit::Scheduled { .. }
+    );
     ExecutionReport {
         stop,
         progress,
-        context: capture_context.then(|| state.register_context()),
+        context: needs_context.then(|| state.register_context()),
     }
 }

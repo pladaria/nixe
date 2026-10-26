@@ -246,13 +246,10 @@ impl Display for CpuExit {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionReport {
-    /// Completed guest instructions. The interpreter checks its budget after
-    /// each instruction; the JIT accounts at block/observation boundaries and
-    /// may overshoot a slice budget by the remaining work in a bounded block.
+    /// Guest execution ticks charged by native execution at block boundaries.
     pub progress: u64,
     pub stop: CpuExit,
-    /// Owned compact snapshot at the reported stop, when requested by a
-    /// diagnostic/replay consumer or required by a fault. A normal native
+    /// Owned compact diagnostic snapshot when required by a fault. A normal native
     /// boundary may omit it while retaining complete state with its owner.
     pub context: Option<RegisterContext>,
 }

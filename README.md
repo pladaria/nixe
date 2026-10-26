@@ -39,15 +39,14 @@ Each virtual CPU owns a native code cache, block links, register allocator and
 return prediction. The process shares memory and the exclusive monitor. Fastmem
 uses nixe's direct arena and signal capture; memory ownership, invalidation,
 scheduler interrupts, SVCs and architectural state remain connected to the
-runtime. Unsupported instructions stop explicitly rather than falling back to
-the interpreter. The interpreter remains available as a separate CPU backend.
+runtime. Unsupported instructions stop explicitly.
 
 Building requires a C++20 compiler, CMake and Boost headers, in addition to the
 Rust toolchain and graphics/audio dependencies. The NVDEC VP9 decoder links
 FFmpeg libraries through `pkg-config`. On Debian/Ubuntu the native build packages
 are `build-essential cmake libboost-dev pkg-config libavcodec-dev libavutil-dev`.
-Dynarmic dependencies are built from the vendored tree; no CMake download step is required. The small
-upstream adaptations are listed in [UPSTREAM.txt](vendor/dynarmic/UPSTREAM.txt).
+Dynarmic dependencies are built from the vendored tree; no CMake download step is required.
+Upstream adaptations are listed in [UPSTREAM.txt](vendor/dynarmic/UPSTREAM.txt).
 
 ## Running
 
@@ -76,14 +75,10 @@ Run a title by its ID or name:
 cargo cli run <id | name>
 ```
 
-With the game window focused, press **S** to save a PNG to
-`dump/screenshots/nixe/<title>-<UTC timestamp>.png` (relative to the working
-directory). Captures copy the next presented framebuffer at its native cropped
-resolution, applying its display orientation without filtering or window scaling.
-RGB bytes are preserved; internal framebuffer alpha is omitted, as in window
-presentation. GPU readback and background PNG writing happen only on request;
-holding S does not produce repeated captures. The log reports the saved path or
-an error. Press **1** to resize the window to the frame's native resolution.
+Hotkeys:
+
+- <kbd>S</kbd>: save a screenshot as a PNG file (see `nixe.toml` for the screenshots directory)
+- <kbd>1</kbd>: resize the window to the frame's native resolution.
 
 ## Testing
 
@@ -102,53 +97,16 @@ not be counted as hardware validation. Errors after GPU initialization remain
 test failures. Opt-in native tests and their additional requirements are described
 in [the native Vulkan guide](crates/gpu-vulkan/README.md).
 
-### Integration tests against real titles
+### CPU profiling
 
-To run integration tests against caller-owned titles, copy `.env.integration.example` to
-`.env.integration`, configure the paths, and run `./scripts/test-integration.sh`.
-
-### Differential tests
-
-Optional CPU differential tests require QEMU user-mode (`qemu-aarch64`), the Rust
-`aarch64-unknown-linux-gnu` target, and its cross-linker.
+Build the profiling binary, then capture a 30-second headless execution:
 
 ```bash
-sudo apt update && sudo apt install qemu-user gcc-aarch64-linux-gnu
-rustup target add aarch64-unknown-linux-gnu
+cargo build-profile
+./scripts/profile.sh <id | name>
 ```
 
-Verify with
-
-```bash
-qemu-aarch64 --version
-aarch64-linux-gnu-gcc --version
-```
-
-Then run
-
-```bash
-cargo test-diff
-```
-
-To run a fast, focused A64 differential test for one instruction family or coverage ID, use:
-
-```bash
-NIXE_DIFF_FAMILY=simd-duplicate-element cargo test-diff-a64
-NIXE_DIFF_COVERAGE_ID=0x8c cargo test-diff-a64
-```
-
-### Fuzz tests
-
-CPU decoder and memory fuzz targets require a nightly Rust toolchain
-and `cargo-fuzz`:
-
-```bash
-rustup toolchain install nightly
-cargo install cargo-fuzz
-cargo fuzz-all
-```
-
-See [fuzz/README.md](fuzz/README.md) for target-specific commands and configuration.
+The script writes `perf.data` in the repository root.
 
 ## Contributing
 

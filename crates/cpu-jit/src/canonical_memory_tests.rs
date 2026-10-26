@@ -43,13 +43,10 @@ impl Runner {
     }
     fn complete_ram(&mut self, mut pending: InstructionContinuation) {
         let completed = pending
-            .poll(self.space.machine(), &Timer)
+            .poll(self.space.machine())
             .expect("RAM completion cannot park")
             .unwrap();
-        assert!(matches!(
-            self.core.complete(completed).unwrap().0,
-            nixe_cpu_interpreter::InstructionStep::Continue
-        ));
+        assert!(self.core.complete(completed).unwrap().0.is_none());
     }
     fn load_exclusive(&mut self) {
         assert!(self.invoke(1, false).is_none());
@@ -57,10 +54,7 @@ impl Runner {
     }
     fn invoke(&mut self, budget: u64, svc: bool) -> Option<InstructionContinuation> {
         let mut worker = NativeWorker::default();
-        let boundary = self
-            .core
-            .run(&mut worker, budget, &Timer, &Default::default())
-            .unwrap();
+        let boundary = self.core.run(&mut worker, budget, &Timer).unwrap();
         assert!(boundary.code.is_empty());
         if boundary.memory.is_some() {
             assert!(matches!(boundary.event.kind, 0 | 1));
@@ -167,10 +161,7 @@ fn data_capture_stops_only_the_conflicting_native_store_and_replays_it_once() {
         let executing = std::thread::spawn(move || {
             let mut runner = runner;
             let mut worker = NativeWorker::default();
-            let boundary = runner
-                .core
-                .run(&mut worker, 100_000_000, &Timer, &Default::default())
-                .unwrap();
+            let boundary = runner.core.run(&mut worker, 100_000_000, &Timer).unwrap();
             worker.finish().unwrap();
             (runner, boundary)
         });
@@ -332,10 +323,7 @@ fn plain_cross_page_simd_store_faults_without_publishing_a_writable_prefix() {
         assert!(state.set_vector(0, 0x112233445566778899aabbccddeeff00));
         runner.core.load(&state);
         let mut worker = NativeWorker::default();
-        let boundary = runner
-            .core
-            .run(&mut worker, 1000, &Timer, &Default::default())
-            .unwrap();
+        let boundary = runner.core.run(&mut worker, 1000, &Timer).unwrap();
         assert!(boundary.memory.is_none());
         let fault = boundary
             .fault
@@ -566,7 +554,7 @@ fn data_cache_clean_does_not_download_device_data_before_an_actual_load() {
     assert!(runner.invoke(1000, true).is_none());
     assert!(receive.try_recv().is_err());
     let mut pending = runner.invoke(1000, true).unwrap();
-    assert!(pending.poll(&machine, &Timer).is_none());
+    assert!(pending.poll(&machine).is_none());
     let request = receive
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
@@ -577,7 +565,7 @@ fn data_cache_clean_does_not_download_device_data_before_an_actual_load() {
     request.finish(Ok(result));
     runner
         .core
-        .complete(pending.poll(&machine, &Timer).unwrap().unwrap())
+        .complete(pending.poll(&machine).unwrap().unwrap())
         .unwrap();
     assert_eq!(runner.register(2), 0x2222222222222222);
     assert!(runner.invoke(1000, true).is_none());
@@ -591,12 +579,7 @@ fn data_cache_clean_reports_an_unmapped_operand_at_the_original_instruction() {
     runner.core.write_register(1, 0x6000);
     let boundary = runner
         .core
-        .run(
-            &mut NativeWorker::default(),
-            1000,
-            &Timer,
-            &Default::default(),
-        )
+        .run(&mut NativeWorker::default(), 1000, &Timer)
         .unwrap();
     let fault = boundary.fault.unwrap();
     assert_eq!(fault.pc.get(), CODE);
@@ -650,7 +633,7 @@ fn unaligned_simd_load_waits_for_device_bytes_on_its_second_page() {
     machine.set_device_endpoint(&endpoint);
     runner.core.write_register(1, DATA + PAGE_SIZE - 8);
     let mut pending = runner.invoke(1000, true).unwrap();
-    assert!(pending.poll(&machine, &Timer).is_none());
+    assert!(pending.poll(&machine).is_none());
     let request = receive
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
@@ -661,7 +644,7 @@ fn unaligned_simd_load_waits_for_device_bytes_on_its_second_page() {
     request.finish(Ok(result));
     runner
         .core
-        .complete(pending.poll(&machine, &Timer).unwrap().unwrap())
+        .complete(pending.poll(&machine).unwrap().unwrap())
         .unwrap();
     let mut state = A64State::default();
     runner.core.save(&mut state);
@@ -696,7 +679,7 @@ fn device_exclusive_load_and_store_complete_once_outside_cpp() {
             let mut pending = runner
                 .invoke(1000, false)
                 .expect("exclusive operation captures before leaving native execution");
-            assert!(pending.poll(&machine, &Timer).is_none());
+            assert!(pending.poll(&machine).is_none());
             let request = receiver
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
@@ -709,11 +692,8 @@ fn device_exclusive_load_and_store_complete_once_outside_cpp() {
                 .apply_resolved_access(request.ranges(), request.operation())
                 .unwrap();
             request.finish(Ok(result));
-            let completed = pending.poll(&machine, &Timer).unwrap().unwrap();
-            assert!(matches!(
-                runner.core.complete(completed).unwrap().0,
-                nixe_cpu_interpreter::InstructionStep::Continue
-            ));
+            let completed = pending.poll(&machine).unwrap().unwrap();
+            assert!(runner.core.complete(completed).unwrap().0.is_none());
             if load {
                 assert_eq!(runner.register(2), 0);
                 assert!(runner.invoke(1, false).is_none());
@@ -732,7 +712,7 @@ fn device_exclusive_load_and_store_complete_once_outside_cpp() {
 
 fn finish_ram_code(core: &mut Core, worker: &mut NativeWorker) -> crate::execution::Boundary {
     for _ in 0..8 {
-        let boundary = core.run(worker, 1000, &Timer, &Default::default()).unwrap();
+        let boundary = core.run(worker, 1000, &Timer).unwrap();
         if boundary.code.is_empty() {
             return boundary;
         }
@@ -797,10 +777,7 @@ fn pending_code_uses_original_physical_input_and_cannot_populate_a_remapped_va()
         .unwrap();
     machine.publish_device_write(&old, || Ok(())).unwrap();
     let mut worker = NativeWorker::default();
-    let boundary = runner
-        .core
-        .run(&mut worker, 1000, &Timer, &Default::default())
-        .unwrap();
+    let boundary = runner.core.run(&mut worker, 1000, &Timer).unwrap();
     assert_eq!(boundary.code.len(), 1);
     let mut read = boundary
         .code
@@ -1041,7 +1018,7 @@ fn pair_and_simd_suffixes_survive_remapping_without_replaying_committed_stores()
                 .unwrap(),
             Access::Ready(())
         ));
-        let completed = pending.poll(&machine, &Timer).unwrap().unwrap();
+        let completed = pending.poll(&machine).unwrap().unwrap();
         runner.core.complete(completed).unwrap();
         assert!(matches!(
             runner
@@ -1102,7 +1079,7 @@ fn device_rmw_is_one_architectural_operation_and_resumes_without_native_retry() 
         .publish_device_write(&destination, || Ok(()))
         .unwrap();
     let mut pending = runner.invoke(1000, false).unwrap();
-    assert!(pending.poll(&machine, &Timer).is_none());
+    assert!(pending.poll(&machine).is_none());
     let request = receiver
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
@@ -1122,7 +1099,7 @@ fn device_rmw_is_one_architectural_operation_and_resumes_without_native_retry() 
     request.finish(Ok(result));
     runner
         .core
-        .complete(pending.poll(&machine, &Timer).unwrap().unwrap())
+        .complete(pending.poll(&machine).unwrap().unwrap())
         .unwrap();
     assert_eq!(runner.register(2), 10);
     machine.retire_device_pages(&destination).unwrap();
@@ -1145,10 +1122,7 @@ fn preemption_before_native_entry_is_consumed_without_running_guest_code() {
         .control()
         .request(nixe_cpu::execution::ControlRequest::Preempt);
     let mut worker = NativeWorker::default();
-    let boundary = runner
-        .core
-        .run(&mut worker, 1000, &Timer, &Default::default())
-        .unwrap();
+    let boundary = runner.core.run(&mut worker, 1000, &Timer).unwrap();
     assert!(
         boundary
             .control
@@ -1187,10 +1161,7 @@ fn tracking_faults_restore_direct_ram_access_after_completion() {
     runner.core.write_register(32, CODE);
     runner.core.write_register(0, 19);
     let mut worker = NativeWorker::default();
-    let boundary = runner
-        .core
-        .run(&mut worker, 1000, &Timer, &Default::default())
-        .unwrap();
+    let boundary = runner.core.run(&mut worker, 1000, &Timer).unwrap();
     assert_eq!(boundary.event.kind, 2);
     assert!(
         boundary.memory.is_none(),
@@ -1212,10 +1183,7 @@ fn native_guest_data_fault_preserves_location_and_does_not_poison_memory() {
     let (mut runner, _) = fixture(&[0xb9400020, 0xd4000001]); // LDR W0, [X1].
     runner.core.write_register(1, 0x6000);
     let mut worker = NativeWorker::default();
-    let boundary = runner
-        .core
-        .run(&mut worker, 1000, &Timer, &Default::default())
-        .unwrap();
+    let boundary = runner.core.run(&mut worker, 1000, &Timer).unwrap();
     assert!(boundary.memory.is_none());
     let fault = boundary
         .fault
@@ -1240,10 +1208,7 @@ fn native_guest_data_fault_preserves_location_and_does_not_poison_memory() {
             .unwrap(),
         Access::Ready(())
     ));
-    let boundary = runner
-        .core
-        .run(&mut worker, 1000, &Timer, &Default::default())
-        .unwrap();
+    let boundary = runner.core.run(&mut worker, 1000, &Timer).unwrap();
     assert_eq!(boundary.event.kind, 2);
     assert!(boundary.memory.is_none());
     assert!(boundary.fault.is_none());
@@ -1279,7 +1244,7 @@ fn contiguous_simd_lanes_use_one_owned_operation_for_the_instruction() {
         machine.set_device_endpoint(&endpoint);
         machine.publish_device_write(&target, || Ok(())).unwrap();
         let mut pending = runner.invoke(1000, false).unwrap();
-        assert!(pending.poll(&machine, &Timer).is_none());
+        assert!(pending.poll(&machine).is_none());
         let request = receiver
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -1296,7 +1261,7 @@ fn contiguous_simd_lanes_use_one_owned_operation_for_the_instruction() {
         request.finish(Ok(result));
         runner
             .core
-            .complete(pending.poll(&machine, &Timer).unwrap().unwrap())
+            .complete(pending.poll(&machine).unwrap().unwrap())
             .unwrap();
         assert_eq!(runner.register(1), DATA + 32);
         if load {
@@ -1361,7 +1326,7 @@ fn mixed_page_reads_reuse_coherent_ram_without_repeated_instruction_continuation
             let mut pending = runner
                 .invoke(100_000, false)
                 .expect("cold read needs its owner");
-            assert!(pending.poll(&machine, &Timer).is_none());
+            assert!(pending.poll(&machine).is_none());
             let request = receiver
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .unwrap();
@@ -1375,14 +1340,11 @@ fn mixed_page_reads_reuse_coherent_ram_without_repeated_instruction_continuation
             request.finish(Ok(result));
             runner
                 .core
-                .complete(pending.poll(&machine, &Timer).unwrap().unwrap())
+                .complete(pending.poll(&machine).unwrap().unwrap())
                 .unwrap();
         }
         let mut worker = NativeWorker::default();
-        let boundary = runner
-            .core
-            .run(&mut worker, 100_000, &Timer, &Default::default())
-            .unwrap();
+        let boundary = runner.core.run(&mut worker, 100_000, &Timer).unwrap();
         assert!(
             boundary.memory.is_none(),
             "warm reads must stay inside native execution"
@@ -1408,10 +1370,7 @@ fn mixed_page_reads_reuse_coherent_ram_without_repeated_instruction_continuation
     runner.core.write_register(2, 1000);
     runner.core.write_register(3, 0);
     let mut worker = NativeWorker::default();
-    let boundary = runner
-        .core
-        .run(&mut worker, 100_000, &Timer, &Default::default())
-        .unwrap();
+    let boundary = runner.core.run(&mut worker, 100_000, &Timer).unwrap();
     assert!(
         boundary.memory.is_none(),
         "physical read proof also covers a current alias"

@@ -9,6 +9,3 @@ log.workspace = true
 lz4_flex.workspace = true
 zstd.workspace = true
 nixe-loader-storage.workspace = true
-
-[dev-dependencies]
-nixe-loader-content.workspace = true

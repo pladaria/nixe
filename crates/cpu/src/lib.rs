@@ -8,7 +8,6 @@ pub mod coverage;
 pub mod decode;
 pub mod error;
 pub mod exception;
-pub mod exclusive;
 pub mod execution;
 pub mod location;
 pub mod memory;
