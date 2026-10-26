@@ -74,7 +74,7 @@ impl VulkanResidency {
             .iter()
             .position(|p| {
                 p.mip_level == view.base_mip
-                    && p.array_layer == view.base_layer
+                    && p.array_layer + p.depth_slice == view.base_layer
                     && p.aspect == view.aspects
             })
             .ok_or(VulkanError::InvalidResource(

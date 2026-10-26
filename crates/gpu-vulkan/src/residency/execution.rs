@@ -92,7 +92,7 @@ pub(super) enum Use {
     },
     Image {
         id: ImageId,
-        plane: ImagePlane,
+        range: vk::ImageSubresourceRange,
         scope: AccessScope,
     },
 }
@@ -164,7 +164,25 @@ impl VulkanResidency {
     ) -> Result<(), VulkanError> {
         self.device.end_rendering();
         self.graphics_state(graphics)?;
+        self.set_feedback_loop(vk::ImageAspectFlags::empty());
         self.program_bind(&graphics.program, push).map(|_| ())
+    }
+    fn set_feedback_loop(&mut self, aspects: vk::ImageAspectFlags) {
+        if !self.device.profile().attachment_feedback_loop {
+            return;
+        }
+        let slot = &mut self.device.submission.slots[self
+            .device
+            .submission
+            .recording
+            .expect("active graphics recording")];
+        if slot.feedback_aspects == Some(aspects) {
+            return;
+        }
+        unsafe {
+            self.device.dispatch.cmd_set_feedback_loop(aspects);
+        }
+        slot.feedback_aspects = Some(aspects);
     }
     pub(crate) fn program_current(&self, program: &PreparedProgram) -> bool {
         self.bindings_current(&program.bindings)
@@ -332,36 +350,55 @@ impl VulkanResidency {
                             "shader image requires sampled/storage usage",
                         ));
                     }
-                    // GENERAL is valid for sampled and storage descriptors. Selecting
-                    // it here keeps a prepared descriptor immutable across hazards.
+                    // The chosen layout remains fixed for this image's lifetime,
+                    // including when it is used as a rendering attachment.
+                    let layout = shader_attachment_layout(image.description.usage);
                     let view_lease = self.image_view_lease(*view)?;
                     resources.push(match binding {
                         Binding::CombinedImageSampler { sampler, .. } => {
                             DescriptorResource::CombinedImageSampler {
                                 view: view_lease,
-                                layout: vk::ImageLayout::GENERAL,
+                                layout,
                                 sampler: Arc::clone(sampler),
                             }
                         }
                         _ => DescriptorResource::Image {
                             view: view_lease,
-                            layout: vk::ImageLayout::GENERAL,
+                            layout,
                         },
                     });
-                    for &plane in image.planes.iter() {
-                        if description.aspects.intersects(plane.aspect)
+                    // Vulkan subresources are mip/layer/aspect ranges. Z slices
+                    // belong to texel transfer/ownership, not repeated shader uses.
+                    // https://github.com/eden-emulator/mirror/blob/master/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+                    for cell in &image.access {
+                        let aspects = description.aspects & cell.aspect;
+                        if !aspects.is_empty()
                             && (description.base_mip..description.base_mip + description.mip_count)
-                                .contains(&plane.mip_level)
+                                .contains(&cell.mip)
                             && (description.base_layer
                                 ..description.base_layer + description.layer_count)
-                                .contains(&plane.array_layer)
+                                .contains(&cell.layer)
                             && !stages.is_empty()
                         {
-                            uses.push(Use::Image {
-                                id: view.image,
-                                plane,
-                                scope,
-                            });
+                            for aspect in [
+                                vk::ImageAspectFlags::COLOR,
+                                vk::ImageAspectFlags::DEPTH,
+                                vk::ImageAspectFlags::STENCIL,
+                            ]
+                            .into_iter()
+                            .filter(|aspect| aspects.contains(*aspect))
+                            {
+                                uses.push(Use::Image {
+                                    id: view.image,
+                                    range: vk::ImageSubresourceRange::default()
+                                        .aspect_mask(aspect)
+                                        .base_mip_level(cell.mip)
+                                        .level_count(1)
+                                        .base_array_layer(cell.layer)
+                                        .layer_count(1),
+                                    scope,
+                                });
+                            }
                         }
                     }
                 }
@@ -407,18 +444,22 @@ impl VulkanResidency {
                     (
                         Use::Image {
                             id,
-                            plane,
+                            range,
                             mut scope,
                         },
                         Use::Image {
                             id: old,
-                            plane: p,
+                            range: previous_range,
                             scope: previous,
                         },
-                    ) if id == old && plane == p => {
+                    ) if id == old
+                        && range.aspect_mask == previous_range.aspect_mask
+                        && range.base_mip_level == previous_range.base_mip_level
+                        && range.base_array_layer == previous_range.base_array_layer =>
+                    {
                         scope.stages |= previous.stages;
                         scope.access |= previous.access;
-                        next = Use::Image { id, plane, scope };
+                        next = Use::Image { id, range, scope };
                         merged.swap_remove(i);
                         i = 0;
                     }
@@ -427,6 +468,7 @@ impl VulkanResidency {
             }
             merged.push(next);
         }
+        coalesce_image_uses(&mut merged);
         let binding_uses: Box<[_]> = bindings.iter().map(|binding| match binding {
             Binding::Buffer { buffer, offset, size } | Binding::TexelBuffer { buffer, offset, size, .. } => merged.iter().position(|usage| matches!(usage,
                 Use::Buffer { id, offset: start, size: length, .. } if id == buffer && *start <= *offset && *offset + *size <= *start + *length
@@ -612,6 +654,7 @@ impl VulkanResidency {
         program: &PreparedProgram,
     ) -> Result<smallvec::SmallVec<[WriterId; 16]>, VulkanError> {
         let mut writers = smallvec::SmallVec::new();
+        let mut prepared_image = None;
         for (index, &resource) in program.uses.iter().enumerate() {
             if self.streamed_uses.binary_search(&index).is_ok() {
                 continue;
@@ -638,26 +681,28 @@ impl VulkanResidency {
                     }
                     self.buffer_access_range(id, offset, size, scope)?;
                 }
-                Use::Image { id, plane, scope } => {
-                    // A sampled view can include an unwritten native border.
-                    // Refresh actual producers without claiming that every texel
-                    // in the view was consumed or importing undefined padding.
-                    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
-                    if scope.writes() {
-                        self.ensure_image_initialized(id, plane, transfers::full_rect(plane))?;
-                        writers.push(self.prepare_image_rect(
-                            id,
-                            plane,
-                            transfers::full_rect(plane),
-                        )?);
-                    } else {
+                Use::Image { id, range, scope } => {
+                    // Image uses are grouped by ID in the prepared program.
+                    if prepared_image != Some(id) {
                         self.ensure_image(id)?;
+                        prepared_image = Some(id);
+                    }
+                    if scope.writes() {
+                        let planes = self.image(id)?.planes.clone();
+                        for &plane in planes.iter().filter(|plane| plane_in_range(**plane, range)) {
+                            self.require_image_initialized(id, plane, transfers::full_rect(plane))?;
+                            writers.push(self.prepare_image_rect(
+                                id,
+                                plane,
+                                transfers::full_rect(plane),
+                            )?);
+                        }
                     }
                     self.image_access_subresources(
                         id,
-                        commands::plane_range(plane),
+                        range,
                         scope,
-                        vk::ImageLayout::GENERAL,
+                        shader_attachment_layout(self.image(id)?.description.usage),
                     )?;
                 }
             }
@@ -673,8 +718,11 @@ impl VulkanResidency {
                     size,
                     scope,
                 } if scope.writes() => self.finish_buffer_write(id, offset, size)?,
-                Use::Image { id, plane, scope } if scope.writes() => {
-                    self.finish_image_rect(id, plane, transfers::full_rect(plane))?
+                Use::Image { id, range, scope } if scope.writes() => {
+                    let planes = self.image(id)?.planes.clone();
+                    for &plane in planes.iter().filter(|plane| plane_in_range(**plane, range)) {
+                        self.finish_image_rect(id, plane, transfers::full_rect(plane))?;
+                    }
                 }
                 _ => {}
             }
@@ -685,7 +733,7 @@ impl VulkanResidency {
         &mut self,
         program: &PreparedProgram,
         push: &[u8],
-    ) -> Result<vk::CommandBuffer, VulkanError> {
+    ) -> Result<(), VulkanError> {
         let record = self.program_record(program)?;
         self.program_bind_record(program, push, record.as_ref(), &program.dynamic_offsets)
     }
@@ -750,12 +798,14 @@ impl VulkanResidency {
                 },
                 Binding::Image(image) => DescriptorResource::Image {
                     view: self.image_view_lease(*image)?,
-                    layout: vk::ImageLayout::GENERAL,
+                    layout: shader_attachment_layout(self.image(image.image)?.description.usage),
                 },
                 Binding::CombinedImageSampler { image, sampler } => {
                     DescriptorResource::CombinedImageSampler {
                         view: self.image_view_lease(*image)?,
-                        layout: vk::ImageLayout::GENERAL,
+                        layout: shader_attachment_layout(
+                            self.image(image.image)?.description.usage,
+                        ),
                         sampler: Arc::clone(sampler),
                     }
                 }
@@ -810,7 +860,7 @@ impl VulkanResidency {
         push: &[u8],
         record: Option<&Arc<BindingRecord>>,
         dynamic_offsets: &[u32],
-    ) -> Result<vk::CommandBuffer, VulkanError> {
+    ) -> Result<(), VulkanError> {
         if push.len() < program.pipeline.layout.key.push_bytes as usize
             || !push.len().is_multiple_of(4)
             || push.len() > self.device.profile().limits.max_push_constants_size as usize
@@ -825,7 +875,7 @@ impl VulkanResidency {
                 .bind_native_descriptors(&program.pipeline, record, dynamic_offsets)?;
         }
         let index = self.device.begin_recording()?;
-        let command = self.device.submission.slots[index].command;
+
         let slot = &mut self.device.submission.slots[index];
         let layout = program.pipeline.layout.handle;
         let stages = program.pipeline.layout.key.push_stages;
@@ -836,7 +886,7 @@ impl VulkanResidency {
             unsafe {
                 self.device
                     .dispatch
-                    .cmd_push_constants(command, layout, stages, 0, push);
+                    .cmd_push_constants(layout, stages, 0, push);
             }
             self.device.submission.statistics.push_updates += 1;
             slot.push_layout = layout;
@@ -844,7 +894,7 @@ impl VulkanResidency {
             slot.push_bytes.clear();
             slot.push_bytes.extend_from_slice(push);
         }
-        Ok(command)
+        Ok(())
     }
     pub fn dispatch(
         &mut self,
@@ -908,7 +958,7 @@ impl VulkanResidency {
             Some(record) => Some(record),
             None => self.program_record(program)?,
         };
-        let command = self.program_bind_record(
+        self.program_bind_record(
             program,
             push,
             record.as_ref(),
@@ -922,12 +972,10 @@ impl VulkanResidency {
         }
         self.publish_effect(&writers, |device| unsafe {
             match dispatch {
-                Dispatch::Direct([x, y, z]) => device.dispatch.cmd_dispatch(command, x, y, z),
-                Dispatch::Indirect { offset, .. } => {
-                    device
-                        .dispatch
-                        .cmd_dispatch_indirect(command, indirect.unwrap(), offset)
-                }
+                Dispatch::Direct([x, y, z]) => device.dispatch.cmd_dispatch(x, y, z),
+                Dispatch::Indirect { offset, .. } => device
+                    .dispatch
+                    .cmd_dispatch_indirect(indirect.unwrap(), offset),
             }
         })?;
         self.program_written(program)?;
@@ -963,3 +1011,100 @@ impl VulkanResidency {
 }
 #[cfg(test)]
 pub(crate) mod tests;
+
+fn plane_in_range(plane: ImagePlane, range: vk::ImageSubresourceRange) -> bool {
+    range.aspect_mask.intersects(plane.aspect)
+        && (range.base_mip_level..range.base_mip_level + range.level_count)
+            .contains(&plane.mip_level)
+        && (range.base_array_layer..range.base_array_layer + range.layer_count)
+            .contains(&plane.array_layer)
+}
+
+// Prepare compact native ranges once. The input cells already merge scopes
+// across overlapping shader bindings, so coalescing never invents written mips.
+fn coalesce_image_uses(uses: &mut Vec<Use>) {
+    for layers in [true, false] {
+        uses.sort_unstable_by_key(|usage| match *usage {
+            Use::Buffer {
+                id, offset, size, ..
+            } => [
+                0,
+                id.slot as u64,
+                u64::from(id.generation),
+                0,
+                0,
+                0,
+                0,
+                0,
+                offset,
+                size,
+            ],
+            Use::Image { id, range, scope } => {
+                let (base, count, next, length) = if layers {
+                    (
+                        range.base_mip_level,
+                        range.level_count,
+                        range.base_array_layer,
+                        range.layer_count,
+                    )
+                } else {
+                    (
+                        range.base_array_layer,
+                        range.layer_count,
+                        range.base_mip_level,
+                        range.level_count,
+                    )
+                };
+                [
+                    1,
+                    id.slot as u64,
+                    u64::from(id.generation),
+                    scope.stages.as_raw(),
+                    scope.access.as_raw(),
+                    u64::from(range.aspect_mask.as_raw()),
+                    u64::from(base),
+                    u64::from(count),
+                    u64::from(next),
+                    u64::from(length),
+                ]
+            }
+        });
+        let mut count = 0;
+        for index in 0..uses.len() {
+            let next = uses[index];
+            if count != 0
+                && let (
+                    Use::Image { id, range, scope },
+                    Use::Image {
+                        id: other,
+                        range: b,
+                        scope: previous,
+                    },
+                ) = (&mut uses[count - 1], next)
+                && *id == other
+                && *scope == previous
+                && range.aspect_mask == b.aspect_mask
+            {
+                if layers
+                    && range.base_mip_level == b.base_mip_level
+                    && range.level_count == b.level_count
+                    && range.base_array_layer + range.layer_count == b.base_array_layer
+                {
+                    range.layer_count += b.layer_count;
+                    continue;
+                }
+                if !layers
+                    && range.base_array_layer == b.base_array_layer
+                    && range.layer_count == b.layer_count
+                    && range.base_mip_level + range.level_count == b.base_mip_level
+                {
+                    range.level_count += b.level_count;
+                    continue;
+                }
+            }
+            uses[count] = next;
+            count += 1;
+        }
+        uses.truncate(count);
+    }
+}

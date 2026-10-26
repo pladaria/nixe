@@ -18,6 +18,7 @@ pub(crate) enum IpcWireError {
     GraphicsBackend(Box<str>),
     AudioBackend(Box<str>),
     AudioRenderer(Box<str>),
+    PlayReport(Box<str>),
     InputBackend(Box<str>),
     SharedFont(Box<str>),
     SystemArchive(Box<str>),
@@ -101,6 +102,9 @@ impl std::fmt::Display for HorizonIpcFault {
             }
             IpcWireError::AudioRenderer(reason) => {
                 write!(formatter, "audio renderer failed: {reason}")
+            }
+            IpcWireError::PlayReport(reason) => {
+                write!(formatter, "play-report storage failed: {reason}")
             }
             IpcWireError::InputBackend(reason) => {
                 write!(formatter, "controller output failed: {reason}")

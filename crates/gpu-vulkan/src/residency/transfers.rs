@@ -75,16 +75,10 @@ impl VulkanResidency {
                 vk::AccessFlags2::TRANSFER_WRITE,
             ),
         )?;
-        let index = self.device.begin_recording()?;
+        self.device.begin_recording()?;
         self.barriers.emit(&mut self.device);
         self.publish_effect(&[writer], |device| unsafe {
-            device.dispatch.cmd_fill_buffer(
-                device.submission.slots[index].command,
-                buffer,
-                offset,
-                size,
-                value,
-            );
+            device.dispatch.cmd_fill_buffer(buffer, offset, size, value);
         })?;
         self.finish_buffer_write(id, offset, size)?;
         self.device.work_ticket()
@@ -306,6 +300,11 @@ impl VulkanResidency {
                 "native color clear requires an uncompressed color plane",
             ));
         }
+        if self.image(id)?.description.image_type == vk::ImageType::TYPE_3D
+            && self.image(id)?.description.extent.depth > 1
+        {
+            return self.clear_image_rect(id, plane, full_rect(p), vk::ClearValue { color: value });
+        }
         let rect = full_rect(p);
         let writer = self.prepare_image_rect(id, p, rect)?;
         let (image, layout) = self.image_access_subresources(
@@ -318,15 +317,11 @@ impl VulkanResidency {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         )?;
         self.barriers.emit(&mut self.device);
-        let index = self.device.begin_recording()?;
+        self.device.begin_recording()?;
         self.publish_effect(&[writer], |device| unsafe {
-            device.dispatch.cmd_clear_color_image(
-                device.submission.slots[index].command,
-                image,
-                layout,
-                &value,
-                &[plane_range(p)],
-            );
+            device
+                .dispatch
+                .cmd_clear_color_image(image, layout, &value, &[plane_range(p)]);
         })?;
         self.finish_image_rect(id, p, rect)?;
         self.device.work_ticket()
@@ -370,10 +365,9 @@ impl VulkanResidency {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         )?;
         self.barriers.emit(&mut self.device);
-        let index = self.device.begin_recording()?;
+        self.device.begin_recording()?;
         self.publish_effect(&[writer], |device| unsafe {
             device.dispatch.cmd_clear_depth_stencil_image(
-                device.submission.slots[index].command,
                 image,
                 layout,
                 // Vulkan validates depth even when only stencil is selected.
@@ -448,12 +442,12 @@ impl VulkanResidency {
             .src_offset(vk::Offset3D {
                 x: source_rect.offset.x,
                 y: source_rect.offset.y,
-                z: 0,
+                z: src.depth_slice as i32,
             })
             .dst_offset(vk::Offset3D {
                 x: rect.offset.x,
                 y: rect.offset.y,
-                z: 0,
+                z: dst.depth_slice as i32,
             })
             .extent(vk::Extent3D {
                 width: rect.extent.width,
@@ -461,10 +455,9 @@ impl VulkanResidency {
                 depth: 1,
             });
         self.barriers.emit(&mut self.device);
-        let slot = self.device.begin_recording()?;
+        self.device.begin_recording()?;
         self.publish_effect(&[writer], |device| unsafe {
             device.dispatch.cmd_resolve_image(
-                device.submission.slots[slot].command,
                 source,
                 source_layout,
                 destination_handle,
@@ -509,6 +502,7 @@ impl VulkanResidency {
         if source == destination
             && src.mip_level == dst.mip_level
             && src.array_layer == dst.array_layer
+            && src.depth_slice == dst.depth_slice
         {
             if self.image(source)?.description.samples != vk::SampleCountFlags::TYPE_1 {
                 return Err(VulkanError::InvalidResource(
@@ -531,8 +525,8 @@ impl VulkanResidency {
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             )?;
             self.barriers.emit(&mut self.device);
-            let index = self.device.begin_recording()?;
-            let command = self.device.submission.slots[index].command;
+            self.device.begin_recording()?;
+
             let work = self.device.work_ticket()?;
             self.device.retire_buffer(Arc::clone(&scratch), work)?;
             let extent = vk::Extent3D {
@@ -545,19 +539,18 @@ impl VulkanResidency {
                 .image_offset(vk::Offset3D {
                     x: source_rect.offset.x,
                     y: source_rect.offset.y,
-                    z: 0,
+                    z: src.depth_slice as i32,
                 })
                 .image_extent(extent);
             unsafe {
                 self.device.dispatch.cmd_copy_image_to_buffer(
-                    command,
                     handle,
                     read_layout,
                     scratch.handle,
                     &[region],
                 );
             }
-            super::recording::scratch_read_barrier(&mut self.device, command, scratch.handle, size);
+            super::recording::scratch_read_barrier(&mut self.device, scratch.handle, size);
             let (_, write_layout) = self.image_access_subresources(
                 destination,
                 plane_range(dst),
@@ -573,12 +566,11 @@ impl VulkanResidency {
                 .image_offset(vk::Offset3D {
                     x: rect.offset.x,
                     y: rect.offset.y,
-                    z: 0,
+                    z: dst.depth_slice as i32,
                 })
                 .image_extent(extent);
             self.publish_effect(&[writer], |device| unsafe {
                 device.dispatch.cmd_copy_buffer_to_image(
-                    command,
                     scratch.handle,
                     handle,
                     write_layout,
@@ -615,12 +607,12 @@ impl VulkanResidency {
             .src_offset(vk::Offset3D {
                 x: source_rect.offset.x,
                 y: source_rect.offset.y,
-                z: 0,
+                z: src.depth_slice as i32,
             })
             .dst_offset(vk::Offset3D {
                 x: rect.offset.x,
                 y: rect.offset.y,
-                z: 0,
+                z: dst.depth_slice as i32,
             })
             .extent(vk::Extent3D {
                 width: rect.extent.width,
@@ -628,10 +620,9 @@ impl VulkanResidency {
                 depth: 1,
             });
         self.barriers.emit(&mut self.device);
-        let index = self.device.begin_recording()?;
+        self.device.begin_recording()?;
         self.publish_effect(&[writer], |device| unsafe {
             device.dispatch.cmd_copy_image(
-                device.submission.slots[index].command,
                 source_handle,
                 source_layout,
                 destination_handle,

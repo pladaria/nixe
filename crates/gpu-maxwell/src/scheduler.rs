@@ -431,7 +431,8 @@ impl MaxwellScheduler {
             (false, Some(_)) => return Err(MaxwellScheduleError::UnexpectedWaitDependency),
             _ => {}
         }
-        let produces_completion = mode.fence_get() || mode.fence_increment_value();
+        let produces_completion = mode.fence_get()
+            || (mode.fence_increment_value() && submission.decoded().fence_value() != 0);
         match (produces_completion, has_completion) {
             (true, false) => return Err(MaxwellScheduleError::MissingFenceReservation),
             (false, true) => return Err(MaxwellScheduleError::UnexpectedFenceReservation),

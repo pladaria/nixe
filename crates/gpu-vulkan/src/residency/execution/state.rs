@@ -209,20 +209,20 @@ impl VulkanResidency {
         self.device.submission.statistics.graphics_updates += 1;
         let p = &graphics.parameters;
         let raw = &mut self.device.dispatch;
-        let command = slot.command;
+
         unsafe {
-            raw.cmd_set_viewport(command, 0, &p.viewports);
-            raw.cmd_set_scissor(command, 0, &p.scissors);
-            raw.cmd_set_line_width(command, p.line_width);
-            raw.cmd_set_depth_bias(command, p.depth_bias[0], p.depth_bias[1], p.depth_bias[2]);
-            raw.cmd_set_blend_constants(command, &p.blend_constants);
+            raw.cmd_set_viewport(0, &p.viewports);
+            raw.cmd_set_scissor(0, &p.scissors);
+            raw.cmd_set_line_width(p.line_width);
+            raw.cmd_set_depth_bias(p.depth_bias[0], p.depth_bias[1], p.depth_bias[2]);
+            raw.cmd_set_blend_constants(&p.blend_constants);
             for (index, face) in [vk::StencilFaceFlags::FRONT, vk::StencilFaceFlags::BACK]
                 .into_iter()
                 .enumerate()
             {
-                raw.cmd_set_stencil_compare_mask(command, face, p.stencil_compare_mask[index]);
-                raw.cmd_set_stencil_write_mask(command, face, p.stencil_write_mask[index]);
-                raw.cmd_set_stencil_reference(command, face, p.stencil_reference[index]);
+                raw.cmd_set_stencil_compare_mask(face, p.stencil_compare_mask[index]);
+                raw.cmd_set_stencil_write_mask(face, p.stencil_write_mask[index]);
+                raw.cmd_set_stencil_reference(face, p.stencil_reference[index]);
             }
             if graphics
                 .program
@@ -230,10 +230,10 @@ impl VulkanResidency {
                 .dynamic_states
                 .contains(&vk::DynamicState::DEPTH_BOUNDS)
             {
-                raw.cmd_set_depth_bounds(command, p.depth_bounds[0], p.depth_bounds[1]);
+                raw.cmd_set_depth_bounds(p.depth_bounds[0], p.depth_bounds[1]);
             }
             if self.device.dispatch.state.is_some() {
-                self.device.dispatch.dynamic_state(command, &p.state);
+                self.device.dispatch.dynamic_state(&p.state);
             }
         }
         slot.graphics_parameters = Some(Arc::clone(&graphics.parameters));

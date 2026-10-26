@@ -64,7 +64,7 @@ fn decodes_every_descriptor_and_switch_mode_without_retaining_guest_memory() {
         request(
             2,
             SUBMIT_HARDWARE_FORMAT
-                | SUBMIT_FENCE_WAIT
+                | SUBMIT_FENCE_GET
                 | SUBMIT_SUPPRESS_WFI
                 | SUBMIT_FENCE_INCREMENT_VALUE,
         ),
@@ -74,7 +74,7 @@ fn decodes_every_descriptor_and_switch_mode_without_retaining_guest_memory() {
 
     assert_eq!(decoded.fence_id(), 7);
     assert_eq!(decoded.fence_value(), 11);
-    assert!(decoded.mode().fence_wait());
+    assert!(decoded.mode().fence_get());
     assert!(decoded.mode().suppress_wfi());
     assert!(decoded.mode().fence_increment_value());
     assert_eq!(decoded.entries()[0].address().get(), 0x12_3456_7000);
@@ -159,32 +159,40 @@ fn rejects_unsupported_modes_before_returning_any_prefix() {
             0,
             MaxwellGpfifoSubmitRequest {
                 entry_count: 0,
-                flags: SUBMIT_HARDWARE_FORMAT | SUBMIT_FENCE_GET | SUBMIT_FENCE_INCREMENT_VALUE,
+                flags: SUBMIT_HARDWARE_FORMAT | SUBMIT_FENCE_WAIT | SUBMIT_FENCE_INCREMENT_VALUE,
                 fence_id: 0,
                 fence_value: 1,
             },
             &[],
         ),
-        Err(MaxwellGpfifoDecodeError::Unsupported(
-            MaxwellUnsupportedGpfifoSubmission::ConflictingFenceCompletionModes
+        Err(MaxwellGpfifoDecodeError::Invalid(
+            MaxwellInvalidGpfifoSubmission::FenceWaitWithIncrementValue
         ))
     );
-    assert_eq!(
-        decode_gpfifo_submission(
+}
+
+#[test]
+fn zero_command_stream_increments_and_driver_fence_get_are_valid() {
+    for flags in [
+        SUBMIT_HARDWARE_FORMAT | SUBMIT_FENCE_INCREMENT_VALUE,
+        SUBMIT_HARDWARE_FORMAT | SUBMIT_FENCE_INCREMENT_VALUE | SUBMIT_FENCE_GET,
+    ] {
+        let decoded = decode_gpfifo_submission(
             SWITCH_1_GM20B_PROFILE,
             0,
             MaxwellGpfifoSubmitRequest {
                 entry_count: 0,
-                flags: SUBMIT_HARDWARE_FORMAT | SUBMIT_FENCE_INCREMENT_VALUE,
+                flags,
                 fence_id: 0,
                 fence_value: 0,
             },
             &[],
-        ),
-        Err(MaxwellGpfifoDecodeError::Unsupported(
-            MaxwellUnsupportedGpfifoSubmission::ZeroFenceIncrementValue
-        ))
-    );
+        )
+        .unwrap();
+        assert!(decoded.mode().fence_increment_value());
+        assert_eq!(decoded.mode().fence_get(), flags & SUBMIT_FENCE_GET != 0);
+        assert_eq!(decoded.fence_value(), 0);
+    }
 }
 
 #[test]

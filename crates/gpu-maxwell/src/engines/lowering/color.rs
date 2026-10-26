@@ -68,7 +68,9 @@ pub(super) fn draw_color_outputs(
                     | nixe_gpu::ImageFormat::Rgba8Srgb
                     | nixe_gpu::ImageFormat::Bgra8Srgb
                     | nixe_gpu::ImageFormat::Rgba16Float
+                    | nixe_gpu::ImageFormat::R16Float
                     | nixe_gpu::ImageFormat::Rg11b10Ufloat
+                    | nixe_gpu::ImageFormat::Rgb10a2Unorm
             ) {
                 return Err(MaxwellLoweringError::UnsupportedBlendFormat { target, format });
             }
@@ -203,6 +205,11 @@ fn factor(value: V, target: Option<u8>) -> Result<F, MaxwellLoweringError> {
         9 | 0x4306 => F::DestinationColor,
         10 | 0x4307 => F::OneMinusDestinationColor,
         11 | 0x4308 => F::SourceAlphaSaturated,
+        // https://github.com/eden-emulator/mirror/blob/master/src/video_core/renderer_vulkan/maxwell_to_vk.cpp
+        14 | 0xc001 => F::ConstantColor,
+        15 | 0xc002 => F::OneMinusConstantColor,
+        12 | 0xc003 => F::ConstantAlpha,
+        13 | 0xc004 => F::OneMinusConstantAlpha,
         value => return Err(MaxwellLoweringError::UnsupportedBlendFactor { target, value }),
     })
 }
@@ -226,6 +233,10 @@ mod tests {
             (9, 0x4306, F::DestinationColor),
             (10, 0x4307, F::OneMinusDestinationColor),
             (11, 0x4308, F::SourceAlphaSaturated),
+            (14, 0xc001, F::ConstantColor),
+            (15, 0xc002, F::OneMinusConstantColor),
+            (12, 0xc003, F::ConstantAlpha),
+            (13, 0xc004, F::OneMinusConstantAlpha),
         ] {
             for raw in [d3d, ogl] {
                 assert_eq!(

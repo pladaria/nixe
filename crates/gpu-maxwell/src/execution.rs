@@ -243,6 +243,7 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellCommandEffects<'a, L,
             PendingEngineOperation::ComputeLaunch(request) => request.source(),
             PendingEngineOperation::ThreeDInlineConstantBuffer(request) => request.source(),
             PendingEngineOperation::ThreeD(request) => request.source(),
+            PendingEngineOperation::ThreeDRenderCondition(source) => *source,
             PendingEngineOperation::ThreeDSynchronization(request) => request.source(),
         };
         self.cache.borrow_mut().bind_channel(source.channel());
@@ -380,6 +381,7 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellCommandEffects<'a, L,
                         upload.address().get(),
                         upload.offset(),
                         words,
+                        words.len() * 4,
                         upload.source(),
                     )?;
                 } else {
@@ -393,20 +395,19 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellCommandEffects<'a, L,
             }
             PendingEngineOperation::InlineToMemory(upload) => {
                 if let Some(words) = inline_words {
-                    {
-                        self.push_inline_words(
-                            upload.address().get(),
-                            upload.offset(),
-                            words,
-                            upload.source(),
-                        )?;
-                    }
+                    self.push_inline_words(
+                        upload.address().get(),
+                        upload.offset(),
+                        words,
+                        (words.len() * 4).min(upload.remaining_bytes() as usize),
+                        upload.source(),
+                    )?;
                     return Ok(());
                 }
-                self.push_inline_write(
+                self.write(
                     upload.address().get(),
                     upload.offset(),
-                    upload.value(),
+                    &upload.value().to_le_bytes()[..upload.remaining_bytes().min(4) as usize],
                     upload.source(),
                 )?;
             }
@@ -494,6 +495,7 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellCommandEffects<'a, L,
                         upload.address().get(),
                         upload.offset(),
                         words,
+                        words.len() * 4,
                         upload.source(),
                     )?;
                 } else {
@@ -505,7 +507,17 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellCommandEffects<'a, L,
                     )?;
                 }
             }
+            PendingEngineOperation::ThreeDRenderCondition(_) => {
+                self.cache.borrow_mut().update_render_condition(
+                    three_d,
+                    self.address_space,
+                    &mut |ranges, operation| self.host.access(ranges, operation),
+                )?;
+            }
             PendingEngineOperation::ThreeD(trigger) => {
+                if !self.cache.borrow().render_enabled() {
+                    return Ok(());
+                }
                 let work = self.cache.borrow_mut().lower_three_d(
                     three_d,
                     trigger,
@@ -595,11 +607,12 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellCommandEffects<'a, L,
         base: u64,
         offset: u32,
         words: crate::MaxwellMethodSpan<'_>,
+        byte_count: usize,
         source: MaxwellMethodSource,
     ) -> Result<(), MaxwellSubmissionExecutionError> {
         let address = self.write_address(base, offset, source)?;
         self.address_space
-            .write_words(address, words, &mut |extents| {
+            .write_words(address, words, byte_count, &mut |extents| {
                 // The upload holds its mapping guard through this callback.
                 unsafe {
                     self.host
@@ -672,7 +685,9 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellCommandEffects<'a, L,
             bytes[..8].copy_from_slice(&self.host.timestamp().to_le_bytes());
         } else {
             bytes[..4].copy_from_slice(&payload.to_le_bytes());
-            bytes[8..].copy_from_slice(&self.host.timestamp().to_le_bytes());
+            if !short {
+                bytes[8..].copy_from_slice(&self.host.timestamp().to_le_bytes());
+            }
         }
         let bytes = &bytes[..if short { 4 } else { 16 }];
         let target = physical_subrange(target, 0, bytes.len()).map_err(|error| {
@@ -692,7 +707,44 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellCommandEffects<'a, L,
         source: &MaxwellResolvedRange,
         destination: &MaxwellResolvedRange,
     ) -> Result<(), MaxwellSubmissionExecutionError> {
-        if operation.has_remap() {
+        // A RAM-current tiled image uses the CPU swizzle. Native producers
+        // retain GPU execution instead of forcing a readback for conversion.
+        // https://github.com/eden-emulator/mirror/blob/master/src/video_core/texture_cache/texture_cache.h
+        let mut ram_layout = operation.has_block_layout();
+        if ram_layout && !operation.has_remap() {
+            for (layout, range) in [
+                (operation.source_layout, source),
+                (operation.destination_layout, destination),
+            ] {
+                if !matches!(
+                    layout,
+                    crate::engines::MaxwellMemoryCopyLayout::BlockLinear { .. }
+                ) {
+                    continue;
+                }
+                let ranges =
+                    physical_subrange(range, 0, range.size() as usize).map_err(|error| {
+                        canonical(MaxwellCanonicalExecutionError::MemoryCopyTransaction {
+                            source: operation.source(),
+                            error,
+                        })
+                    })?;
+                ram_layout = !ranges[0]
+                    .allocation()
+                    .machine()
+                    .device_modified(&ranges)
+                    .map_err(|error| {
+                        canonical(MaxwellCanonicalExecutionError::MemoryCopyTransaction {
+                            source: operation.source(),
+                            error: Arc::new(error),
+                        })
+                    })?;
+                if !ram_layout {
+                    break;
+                }
+            }
+        }
+        if operation.has_remap() || ram_layout {
             return stage_memory_copy(operation, source, destination, &mut |ranges, operation| {
                 self.host.access(ranges, operation)
             })
@@ -839,6 +891,44 @@ fn stage_memory_copy(
     else {
         unreachable!("read operation returns bytes")
     };
+    if !operation.has_remap() {
+        // The CPU swizzle preserves allocation padding in place, as the cached
+        // read/write span used by the DMA engine does on the original path.
+        // One destination access avoids sorting and publishing 16-byte pieces.
+        let ranges =
+            physical_subrange(destination, 0, destination.size() as usize).map_err(|error| {
+                MaxwellCanonicalExecutionError::MemoryCopyTransaction {
+                    source: operation.source(),
+                    error,
+                }
+            })?;
+        let AccessResult::Read(mut bytes) =
+            access(ranges.clone(), AccessOperation::Read).map_err(|error| {
+                MaxwellCanonicalExecutionError::MemoryCopyTransaction {
+                    source: operation.source(),
+                    error,
+                }
+            })?
+        else {
+            unreachable!("read operation returns bytes")
+        };
+        operation
+            .copy_bytes(&source_bytes, &mut bytes)
+            .map_err(
+                |error| MaxwellCanonicalExecutionError::MemoryCopyTransform {
+                    source: operation.source(),
+                    error,
+                },
+            )?;
+        let written = access(ranges, AccessOperation::Write(bytes)).map_err(|error| {
+            MaxwellCanonicalExecutionError::MemoryCopyTransaction {
+                source: operation.source(),
+                error,
+            }
+        })?;
+        assert!(matches!(written, AccessResult::Written));
+        return Ok(());
+    }
     let mut bytes = memory_copy_buffer(operation.destination_range_size(), operation.source())?;
     operation
         .copy_bytes(&source_bytes, &mut bytes)

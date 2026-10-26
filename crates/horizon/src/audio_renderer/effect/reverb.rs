@@ -5,7 +5,7 @@
 //! Stereo early-tap attenuation is also confirmed by Ryujinx's ReverbState.
 #![allow(clippy::excessive_precision)] // Preserve the reference Q14 coefficient tables.
 use super::super::update::{UpdateError, word};
-use std::ops::{Add, Div, Mul, Neg, Sub};
+use super::fixed::Q14 as Q;
 const FDN_MAX: [f32; 4] = [
     53.9532470703125,
     79.19256591796875,
@@ -71,50 +71,6 @@ const DECAY_TIMES: [[f32; 4]; 5] = [
     [7.000000, 7.000000, 13.000000, 9.000000],
     [7.000000, 9.000000, 13.000000, 17.000000],
 ];
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-struct Q(i64);
-impl Q {
-    const ONE: Self = Self(1 << 14);
-    fn float(value: f32) -> Self {
-        Self((value * 16384.0) as i64)
-    }
-    fn value(self) -> f32 {
-        self.0 as f32 / 16384.0
-    }
-    fn int(self) -> i32 {
-        ((self.0 + ((self.0 & 16383) >> 1)) >> 14) as i32
-    }
-}
-impl Add for Q {
-    type Output = Self;
-    fn add(self, b: Self) -> Self {
-        Self(self.0.wrapping_add(b.0))
-    }
-}
-impl Sub for Q {
-    type Output = Self;
-    fn sub(self, b: Self) -> Self {
-        Self(self.0.wrapping_sub(b.0))
-    }
-}
-impl Neg for Q {
-    type Output = Self;
-    fn neg(self) -> Self {
-        Self(self.0.wrapping_neg())
-    }
-}
-impl Mul for Q {
-    type Output = Self;
-    fn mul(self, b: Self) -> Self {
-        Self(((self.0 as i128 * b.0 as i128) >> 14) as i64)
-    }
-}
-impl Div for Q {
-    type Output = Self;
-    fn div(self, b: Self) -> Self {
-        Self((((self.0 as i128) << 14) / b.0 as i128) as i64)
-    }
-}
 #[derive(Clone, Debug)]
 pub(super) struct Parameters {
     inputs: [usize; 6],
@@ -155,7 +111,7 @@ impl Parameters {
         if channels > max {
             return Err(UpdateError::Invalid);
         }
-        let q = |offset| Q(i64::from(word(raw, offset) as i32));
+        let q = |offset| Q::raw(i64::from(word(raw, offset) as i32));
         let mut params = Self {
             inputs: std::array::from_fn(|i| raw[i] as usize),
             outputs: std::array::from_fn(|i| raw[6 + i] as usize),
@@ -185,7 +141,7 @@ impl Parameters {
                 || params.pre_delay.0 < 0
                 || params.decay_time.0 <= 0
                 || params.hf_ratio.0 < 0
-                || !(Q(0)..=Q::ONE).contains(&params.colouration)
+                || !(Q::raw(0)..=Q::ONE).contains(&params.colouration)
             {
                 return Err(UpdateError::Invalid);
             }
@@ -235,12 +191,12 @@ struct Delay {
 impl Delay {
     fn new(count: usize) -> Self {
         Self {
-            buffer: vec![Q(0); count + 1],
+            buffer: vec![Q::raw(0); count + 1],
             input: 0,
             output: 0,
             count,
             maximum: count,
-            decay: Q(0),
+            decay: Q::raw(0),
         }
     }
     fn read(&self) -> Q {
@@ -289,13 +245,13 @@ impl State {
             pre: Delay::new(count(if p.long_pre { 350.0 } else { 150.0 })),
             center: Delay::new(count(5.0)),
             early_times: [0; 10],
-            early_gains: [Q(0); 10],
+            early_gains: [Q::raw(0); 10],
             pre_time: 0,
             decay: std::array::from_fn(|i| Delay::new(count(DECAY_MAX[i]))),
             fdn: std::array::from_fn(|i| Delay::new(count(FDN_MAX[i]))),
-            hf_gain: [Q(0); 4],
-            hf_previous: [Q(0); 4],
-            feedback: [Q(0); 4],
+            hf_gain: [Q::raw(0); 4],
+            hf_previous: [Q::raw(0); 4],
+            feedback: [Q::raw(0); 4],
         };
         state.update(p);
         state
@@ -331,12 +287,12 @@ impl State {
             self.fdn[i].set((Q::float(FDN_TIMES[p.late_mode][i]) * p.rate).int() as usize);
             self.decay[i].set((Q::float(DECAY_TIMES[p.late_mode][i]) * p.rate).int() as usize);
             self.decay[i].decay = Q::float(0.5999755859375) * (Q::ONE - p.colouration);
-            let a = Q(-3 * ((self.fdn[i].maximum + self.decay[i].maximum) as i64) * 16384);
+            let a = Q::raw(-3 * ((self.fdn[i].maximum + self.decay[i].maximum) as i64) * 16384);
             let b = a / (p.decay_time * p.rate);
             let (c, d) = if p.hf_ratio > Q::float(0.99493408203125) {
-                (Q(0), Q::ONE)
+                (Q::raw(0), Q::ONE)
             } else if p.hf_ratio.0 == 0 {
-                (Q::ONE, Q(0))
+                (Q::ONE, Q::raw(0))
             } else {
                 let e = pow10(
                     ((Q::ONE / p.hf_ratio - Q::ONE) * Q::float(2.0) / Q::float(100.0)
@@ -345,7 +301,7 @@ impl State {
                 );
                 let f = 1.0 - e;
                 if f == 0.0 {
-                    (Q(0), Q::ONE)
+                    (Q::raw(0), Q::ONE)
                 } else {
                     let g = Q::float(2.0) - cosine * Q::float(e) * Q::float(2.0);
                     let h = (g.value().powi(2) - f.powi(2) * 4.0).max(0.0).sqrt();
@@ -356,7 +312,7 @@ impl State {
             self.hf_previous[i] = c;
             self.hf_gain[i] =
                 Q::float(pow10((b / Q::float(1000.0)).value())) * d * Q::float(0.70709228515625);
-            self.feedback[i] = Q(0);
+            self.feedback[i] = Q::raw(0);
         }
     }
     pub(super) fn process(&mut self, p: &Parameters, buffers: &mut [i32], samples: usize) {
@@ -370,12 +326,12 @@ impl State {
         for sample in 0..samples {
             let input: [Q; 6] = std::array::from_fn(|c| {
                 if c < p.channels {
-                    Q(i64::from(buffers[p.inputs[c] * samples + sample]) << 14)
+                    Q::raw(i64::from(buffers[p.inputs[c] * samples + sample]) << 14)
                 } else {
-                    Q(0)
+                    Q::raw(0)
                 }
             });
-            let mut output = [Q(0); 6];
+            let mut output = [Q::raw(0); 6];
             for (i, &channel) in taps.iter().enumerate() {
                 let early = self.pre.tap(self.early_times[i]) * self.early_gains[i];
                 output[channel] = output[channel] + early;
@@ -386,8 +342,11 @@ impl State {
             if p.channels == 6 {
                 output[3] = output[3] * Q::float(0.2);
             }
-            let sum = input[..p.channels].iter().copied().fold(Q(0), |a, b| a + b);
-            self.pre.write(Q(sum.0.wrapping_mul(64)) * p.base);
+            let sum = input[..p.channels]
+                .iter()
+                .copied()
+                .fold(Q::raw(0), |a, b| a + b);
+            self.pre.write(Q::raw(sum.0.wrapping_mul(64)) * p.base);
             for i in 0..4 {
                 self.feedback[i] =
                     self.feedback[i] * self.hf_previous[i] + self.fdn[i].read() * self.hf_gain[i];
@@ -399,7 +358,7 @@ impl State {
                 self.feedback[0] - self.feedback[3] + late,
                 self.feedback[1] - self.feedback[2] + late,
             ];
-            let mut all = [Q(0); 4];
+            let mut all = [Q::raw(0); 4];
             for i in 0..4 {
                 let mixed = matrix[i] - self.decay[i].read() * self.decay[i].decay;
                 all[i] = self.decay[i].tick(mixed) + mixed * self.decay[i].decay;
@@ -419,7 +378,7 @@ impl State {
                     all[c]
                 };
                 let wet = (output[c] + allpass) * p.wet;
-                let value = input[c] * p.dry + Q(wet.0 / 64);
+                let value = input[c] * p.dry + Q::raw(wet.0 / 64);
                 buffers[p.outputs[c] * samples + sample] = value.int();
             }
         }

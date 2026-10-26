@@ -892,99 +892,93 @@ impl MaxwellThreeDVertexInputState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDVertexInputWrite) {
         let raw = write.raw();
-        let source = write.source();
         match write {
             MaxwellThreeDVertexInputWrite::AttributeSkipMask { index, value, .. } => {
                 self.attribute_skip_masks[index as usize] =
-                    MaxwellThreeDRegister::programmed(raw, value, source);
+                    MaxwellThreeDRegister::decoded(raw, value);
             }
             MaxwellThreeDVertexInputWrite::BalancedPrimitiveWorkload { value, .. } => {
-                self.primitive.balanced_workload =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.primitive.balanced_workload = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::PrimitiveCircularBufferThrottle { value, .. } => {
-                self.primitive.circular_buffer_throttle =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.primitive.circular_buffer_throttle = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::PatchSize { value, .. } => {
-                self.primitive.patch_size = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.primitive.patch_size = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::StreamFormat { stream, value, .. } => {
                 Arc::make_mut(&mut self.streams)[stream as usize].format =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::StreamAddressUpper { stream, value, .. } => {
                 Arc::make_mut(&mut self.streams)[stream as usize].address_upper =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::StreamAddressLower { stream, value, .. } => {
                 Arc::make_mut(&mut self.streams)[stream as usize].address_lower =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::StreamLimitUpper { stream, value, .. } => {
                 Arc::make_mut(&mut self.streams)[stream as usize].limit_upper =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::StreamLimitLower { stream, value, .. } => {
                 Arc::make_mut(&mut self.streams)[stream as usize].limit_lower =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::StreamFrequency { stream, value, .. } => {
                 Arc::make_mut(&mut self.streams)[stream as usize].frequency =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::StreamInstanced { stream, value, .. } => {
                 Arc::make_mut(&mut self.streams)[stream as usize].instanced =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::Attribute {
                 attribute, value, ..
             } => {
                 Arc::make_mut(&mut self.attributes)[attribute as usize] =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::IndexAddressUpper { value, .. } => {
-                self.index.address_upper = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.index.address_upper = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::IndexAddressLower { value, .. } => {
-                self.index.address_lower = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.index.address_lower = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::IndexLimitUpper { value, .. } => {
-                self.index.limit_upper = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.index.limit_upper = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::IndexLimitLower { value, .. } => {
-                self.index.limit_lower = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.index.limit_lower = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::IndexElementSize { value, .. } => {
-                self.index.element_size = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.index.element_size = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::IndexFirst { value, .. } => {
-                self.index.first = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.index.first = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::IndexCount { value, .. } => {
-                self.index.count = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.index.count = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::TopologyOverride { value, .. } => {
-                self.primitive.topology_override =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.primitive.topology_override = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::Topology { value, .. } => {
-                self.primitive.topology = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.primitive.topology = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::VertexArrayPrimitiveRestartEnable { value, .. } => {
                 self.primitive.vertex_array_restart_enabled =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::PrimitiveRestartEnable { value, .. } => {
-                self.primitive.restart_enabled =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.primitive.restart_enabled = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::PrimitiveRestartIndex { value, .. } => {
-                self.primitive.restart_index = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.primitive.restart_index = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::VertexArrayStart { value, .. } => {
-                self.primitive.vertex_array_start =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.primitive.vertex_array_start = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::Begin { value, .. } => {
                 // deko3d emits FIRST followed by SUBSEQUENT BEGIN writes for
@@ -997,39 +991,35 @@ impl MaxwellThreeDVertexInputState {
                     }
                     MaxwellThreeDBeginInstance::Unchanged => self.primitive.instance_index,
                 };
-                self.primitive.begin = MaxwellThreeDRegister::programmed(raw, value, source);
+                self.primitive.begin = MaxwellThreeDRegister::decoded(raw, value);
                 self.primitive.open = true;
             }
             MaxwellThreeDVertexInputWrite::End { value, .. } => {
-                self.primitive.end = MaxwellThreeDRegister::programmed(raw, value, source);
+                self.primitive.end = MaxwellThreeDRegister::decoded(raw, value);
                 self.primitive.open = false;
             }
             MaxwellThreeDVertexInputWrite::AttributeDefaults { value, .. } => {
-                self.assembly.attribute_defaults =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.assembly.attribute_defaults = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::VertexIdUsesArrayStart { value, .. } => {
                 self.assembly.vertex_id_uses_array_start =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::GlobalBaseVertexIndex { value, .. } => {
-                self.assembly.global_base_vertex_index =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.assembly.global_base_vertex_index = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::VertexIdBase { value, .. } => {
-                self.assembly.vertex_id_base = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.assembly.vertex_id_base = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::GlobalBaseInstanceIndex { value, .. } => {
                 self.assembly.global_base_instance_index =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::StreamSubstituteAddressUpper { value, .. } => {
-                self.stream_substitute.address_upper =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.stream_substitute.address_upper = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDVertexInputWrite::StreamSubstituteAddressLower { value, .. } => {
-                self.stream_substitute.address_lower =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.stream_substitute.address_lower = MaxwellThreeDRegister::decoded(raw, value)
             }
         }
     }

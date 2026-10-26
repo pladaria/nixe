@@ -1,15 +1,10 @@
 //! Focused pipeline construction/GPU comparison, outside production paths.
 use super::*;
 use std::time::Instant;
-fn set_dynamic_defaults(
-    device: &mut VulkanDevice,
-    pipeline: &NativePipeline,
-    command: vk::CommandBuffer,
-) {
+fn set_dynamic_defaults(device: &mut VulkanDevice, pipeline: &NativePipeline) {
     unsafe {
         let raw = &mut device.dispatch;
         raw.cmd_set_viewport(
-            command,
             0,
             &[vk::Viewport {
                 x: 0.,
@@ -21,7 +16,6 @@ fn set_dynamic_defaults(
             }],
         );
         raw.cmd_set_scissor(
-            command,
             0,
             &[vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -31,23 +25,23 @@ fn set_dynamic_defaults(
                 },
             }],
         );
-        raw.cmd_set_line_width(command, 1.);
-        raw.cmd_set_depth_bias(command, 0., 0., 0.);
-        raw.cmd_set_blend_constants(command, &[0.; 4]);
-        raw.cmd_set_stencil_compare_mask(command, vk::StencilFaceFlags::FRONT_AND_BACK, u32::MAX);
-        raw.cmd_set_stencil_write_mask(command, vk::StencilFaceFlags::FRONT_AND_BACK, u32::MAX);
-        raw.cmd_set_stencil_reference(command, vk::StencilFaceFlags::FRONT_AND_BACK, 0);
+        raw.cmd_set_line_width(1.);
+        raw.cmd_set_depth_bias(0., 0., 0.);
+        raw.cmd_set_blend_constants(&[0.; 4]);
+        raw.cmd_set_stencil_compare_mask(vk::StencilFaceFlags::FRONT_AND_BACK, u32::MAX);
+        raw.cmd_set_stencil_write_mask(vk::StencilFaceFlags::FRONT_AND_BACK, u32::MAX);
+        raw.cmd_set_stencil_reference(vk::StencilFaceFlags::FRONT_AND_BACK, 0);
         if pipeline
             .dynamic_states
             .contains(&vk::DynamicState::DEPTH_BOUNDS)
         {
-            raw.cmd_set_depth_bounds(command, 0., 1.);
+            raw.cmd_set_depth_bounds(0., 1.);
         }
         if pipeline
             .dynamic_states
             .contains(&vk::DynamicState::CULL_MODE)
         {
-            raw.dynamic_state(command, &GraphicsState::color(vk::Format::R8G8B8A8_UNORM));
+            raw.dynamic_state(&GraphicsState::color(vk::Format::R8G8B8A8_UNORM));
         }
     }
 }
@@ -103,10 +97,10 @@ fn raster_sample(
         )
     }
     .unwrap();
-    let slot = device.submission.begin(&mut device.dispatch).unwrap();
-    let command = device.submission.slots[slot].command;
+    device.submission.begin(&mut device.dispatch).unwrap();
+
     unsafe {
-        device.dispatch.cmd_reset_query_pool(command, query, 0, 2);
+        device.dispatch.cmd_reset_query_pool(query, 0, 2);
         let barrier = [vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::NONE)
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -117,16 +111,12 @@ fn raster_sample(
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(view.image.handle)
             .subresource_range(range)];
-        device.dispatch.barrier(
-            command,
-            &vk::DependencyInfo::default().image_memory_barriers(&barrier),
-        );
-        device.dispatch.cmd_write_timestamp(
-            command,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            query,
-            0,
-        );
+        device
+            .dispatch
+            .barrier(&vk::DependencyInfo::default().image_memory_barriers(&barrier));
+        device
+            .dispatch
+            .cmd_write_timestamp(vk::PipelineStageFlags::ALL_COMMANDS, query, 0);
         let attachments = [vk::RenderingAttachmentInfo::default()
             .image_view(view.handle)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -138,7 +128,6 @@ fn raster_sample(
                 },
             })];
         device.dispatch.begin_rendering(
-            command,
             &vk::RenderingInfo::default()
                 .render_area(vk::Rect2D {
                     offset: Default::default(),
@@ -152,23 +141,20 @@ fn raster_sample(
         );
     }
     device.bind_native_pipeline(pipeline).unwrap();
-    set_dynamic_defaults(device, pipeline, command);
+    set_dynamic_defaults(device, pipeline);
     let start = Instant::now();
     for _ in 0..draws {
         device.bind_native_pipeline(pipeline).unwrap();
         unsafe {
-            device.dispatch.cmd_draw(command, 3, 1, 0, 0);
+            device.dispatch.cmd_draw(3, 1, 0, 0);
         }
     }
     let cpu = start.elapsed().as_nanos() as f64 / draws as f64;
     unsafe {
-        device.dispatch.end_rendering(command);
-        device.dispatch.cmd_write_timestamp(
-            command,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            query,
-            1,
-        );
+        device.dispatch.end_rendering();
+        device
+            .dispatch
+            .cmd_write_timestamp(vk::PipelineStageFlags::ALL_COMMANDS, query, 1);
         let barrier = [vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -180,10 +166,9 @@ fn raster_sample(
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(view.image.handle)
             .subresource_range(range)];
-        device.dispatch.barrier(
-            command,
-            &vk::DependencyInfo::default().image_memory_barriers(&barrier),
-        );
+        device
+            .dispatch
+            .barrier(&vk::DependencyInfo::default().image_memory_barriers(&barrier));
         let copies = [vk::BufferImageCopy::default()
             .image_subresource(
                 vk::ImageSubresourceLayers::default()
@@ -196,7 +181,6 @@ fn raster_sample(
                 depth: 1,
             })];
         device.dispatch.cmd_copy_image_to_buffer(
-            command,
             view.image.handle,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             buffer.handle,
@@ -211,10 +195,9 @@ fn raster_sample(
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .buffer(buffer.handle)
             .size(buffer.size())];
-        device.dispatch.barrier(
-            command,
-            &vk::DependencyInfo::default().buffer_memory_barriers(&barrier),
-        );
+        device
+            .dispatch
+            .barrier(&vk::DependencyInfo::default().buffer_memory_barriers(&barrier));
     }
     let work = device.flush().unwrap().unwrap();
     assert!(device.wait_for_work(work, Duration::from_secs(10)).unwrap());

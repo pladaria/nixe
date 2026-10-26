@@ -477,7 +477,7 @@ pub(in crate::engines) fn data_words(
     let source = MaxwellMethodSource::decoded(words.first().unwrap(), subchannel);
     let pending = candidate.inline_to_memory().pending();
     let applied = preflight(
-        MaxwellMethodDispatch::emitted_by_mme(source, class),
+        MaxwellMethodDispatch::class_method(source, class),
         candidate,
     )?;
     let pending = pending.expect("validated inline data has an armed transfer");

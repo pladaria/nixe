@@ -54,6 +54,45 @@ pub(super) async fn dispatch_control(
     match (control_command, target) {
         (
             CmifControlCommand::ConvertCurrentObjectToDomain,
+            HorizonIpcObject::PlayReport(session),
+        ) => {
+            write_domain_conversion(
+                process,
+                address,
+                size,
+                request.token,
+                session.domain.convert(),
+            )
+            .await?;
+        }
+        (
+            CmifControlCommand::ConvertCurrentObjectToDomain,
+            HorizonIpcObject::OpusManager(session),
+        ) => {
+            write_domain_conversion(
+                process,
+                address,
+                size,
+                request.token,
+                session.domain.convert(),
+            )
+            .await?;
+        }
+        (
+            CmifControlCommand::ConvertCurrentObjectToDomain,
+            HorizonIpcObject::OpusDecoder(session),
+        ) => {
+            write_domain_conversion(
+                process,
+                address,
+                size,
+                request.token,
+                session.domain.convert(),
+            )
+            .await?;
+        }
+        (
+            CmifControlCommand::ConvertCurrentObjectToDomain,
             HorizonIpcObject::ErrorContextWriter(session),
         ) => {
             write_domain_conversion(
@@ -254,6 +293,9 @@ pub(super) async fn dispatch_control(
             | HorizonIpcObject::AudioOut(_)
             | HorizonIpcObject::AudioRendererManager(_)
             | HorizonIpcObject::AudioRenderer(_)
+            | HorizonIpcObject::OpusManager(_)
+            | HorizonIpcObject::OpusDecoder(_)
+            | HorizonIpcObject::PlayReport(_)
             | HorizonIpcObject::AudioDevice(_),
         ) => {
             install_clone(process, address, size, request.token, target.clone()).await?;
@@ -272,6 +314,8 @@ pub(super) async fn dispatch_control(
                 // A zero budget rejects enumeration in nn::sf before dispatch.
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/acc.c#L77-L81
                 HorizonIpcObject::Hid(_) | HorizonIpcObject::Account(_) => 0x100,
+                HorizonIpcObject::OpusManager(_) => 0x120,
+                HorizonIpcObject::PlayReport(_) => 0x1000,
                 HorizonIpcObject::SemanticService(session)
                     if session.service() == crate::IpcService::FileSystem =>
                 {

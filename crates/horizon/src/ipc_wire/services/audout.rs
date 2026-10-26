@@ -174,7 +174,7 @@ pub(in crate::ipc_wire) async fn dispatch_audio_out(
     hipc: &HipcRequest<'_>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let cmd = request.command_id;
-    if !matches!(cmd, 0..=10) {
+    if !matches!(cmd, 0..=10 | 12 | 13) {
         return unsupported_service_command("IAudioOut", cmd);
     }
     if hipc.pid.is_some()
@@ -188,12 +188,45 @@ pub(in crate::ipc_wire) async fn dispatch_audio_out(
     {
         return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
     }
-    let size = if matches!(cmd, 3 | 6 | 7) { 8 } else { 0 };
+    let size = if matches!(cmd, 3 | 6 | 7) {
+        8
+    } else if cmd == 12 {
+        4
+    } else {
+        0
+    };
     if request.data.len() < size {
         return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
     }
     let mut data = Vec::new();
     match cmd {
+        // Per-output volume affects the real playback queue, including PCM
+        // already submitted. Device gain remains shared by console routes.
+        // https://switchbrew.org/wiki/Audio_services#IAudioOut
+        12 => {
+            if !request.has_payload_size(4) {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let volume = request_f32(request.data, 0).unwrap();
+            if !volume.is_finite() {
+                return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_ARGUMENT);
+            }
+            session
+                .output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_volume(volume)
+                .map_err(audio_error)?;
+        }
+        13 => data.extend_from_slice(
+            &session
+                .output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .volume()
+                .map_err(audio_error)?
+                .to_le_bytes(),
+        ),
         0 => data.extend_from_slice(
             &u32::from(
                 !session

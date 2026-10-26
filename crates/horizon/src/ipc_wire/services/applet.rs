@@ -185,7 +185,7 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                     applet_data(request.token, &[session.operation_mode().as_raw()])
                 }
                 CommonStateGetterCommand::GetPerformanceMode => {
-                    applet_data(request.token, &PERFORMANCE_MODE_NORMAL.to_le_bytes())
+                    applet_data(request.token, &session.operation_mode().performance_mode().to_le_bytes())
                 }
                 CommonStateGetterCommand::GetCurrentFocusState => {
                     applet_data(request.token, &[session.current_focus_state()])
@@ -603,6 +603,26 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                     }
                     session.set_termination_result(result);
                     applet_data(request.token, &[])
+                }
+                // The NACP version is returned inline as a NUL-terminated 16-byte string.
+                // https://switchbrew.org/wiki/AM_services#GetDisplayVersion
+                ApplicationFunctionsCommand::GetDisplayVersion => {
+                    if !request.data.is_empty() || has_ipc_descriptors(hipc) {
+                        return applet_error(
+                            request.token,
+                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
+                        );
+                    }
+                    let version = host_systems.application_display_version.as_ref().ok_or(
+                        IpcWireError::UnsupportedService(
+                            UnsupportedServiceOperation::CommandVariant {
+                                service: "IApplicationFunctions",
+                                command_id: request.command_id,
+                                detail: "application display version is unavailable: supply control.nacp metadata",
+                            },
+                        ),
+                    )?;
+                    applet_data(request.token, version)
                 }
                 ApplicationFunctionsCommand::NotifyRunning => {
                     if !request.data.is_empty() || has_ipc_descriptors(hipc) {

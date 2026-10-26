@@ -20,7 +20,6 @@ fn alpha_to_coverage_dither_is_typed_validated_and_source_preserving() {
         ),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x12e0 / 4, raw).unwrap();
-        let source = dispatch.methods()[0].method().source();
         assert_eq!(
             dispatch.methods()[0].metadata().method_name(),
             "SET_ALPHA_TO_COVERAGE_DITHER_CONTROL"
@@ -29,13 +28,12 @@ fn alpha_to_coverage_dither_is_typed_validated_and_source_preserving() {
         let register = channel.three_d().coverage().alpha_to_coverage_dither();
         assert_eq!(register.value(), Some(&expected));
         assert_eq!(register.raw(), Some(raw));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(
             channel
                 .three_d_mut()
-                .raw_register(GpuMethodId(0x12e0))
-                .unwrap()
-                .value(),
+                .raw_register_value(GpuMethodId(0x12e0))
+                .as_ref(),
             Some(&raw)
         );
     }
@@ -72,9 +70,8 @@ fn dither_shadow_replay_and_new_channel_do_not_leak_state() {
     assert_eq!(
         channel
             .three_d_mut()
-            .raw_register(GpuMethodId(0x12e0))
-            .unwrap()
-            .value(),
+            .raw_register_value(GpuMethodId(0x12e0))
+            .as_ref(),
         Some(&1)
     );
     assert!(

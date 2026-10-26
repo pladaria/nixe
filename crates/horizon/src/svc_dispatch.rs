@@ -263,6 +263,7 @@ pub struct HorizonSvcDispatcher {
     time_environment: crate::TimeEnvironment,
     settings_environment: crate::SettingsEnvironment,
     application_language: Option<crate::SystemLanguage>,
+    application_display_version: Option<[u8; 16]>,
     user_account_switch_locked: Option<bool>,
     save_data: Option<crate::SaveDataSystem>,
     shared_fonts: crate::SharedFontSession,
@@ -273,6 +274,7 @@ pub struct HorizonSvcDispatcher {
     hid_system: crate::HidSystem,
     audio_backend: Option<std::sync::Arc<dyn nixe_audio::AudioBackend>>,
     audio_renderers: crate::AudioRendererManagerSession,
+    opus: crate::OpusManagerSession,
     named_ports: BTreeMap<Vec<u8>, PortObject>,
     reply_sent: BTreeSet<u64>,
     wait_deadlines: BTreeMap<(u64, u32), u64>,
@@ -440,6 +442,7 @@ impl HorizonSvcDispatcher {
             time_environment,
             settings_environment,
             application_language: None,
+            application_display_version: None,
             user_account_switch_locked: None,
             save_data: None,
             shared_fonts,
@@ -450,6 +453,7 @@ impl HorizonSvcDispatcher {
             hid_system,
             audio_backend: None,
             audio_renderers: crate::AudioRendererManagerSession::default(),
+            opus: crate::OpusManagerSession::default(),
             named_ports: BTreeMap::new(),
             reply_sent: BTreeSet::new(),
             wait_deadlines: BTreeMap::new(),
@@ -481,6 +485,16 @@ impl HorizonSvcDispatcher {
     #[must_use]
     pub fn with_application_language(mut self, language: crate::SystemLanguage) -> Self {
         self.application_language = Some(language);
+        self
+    }
+
+    /// Installs the NACP display version, including its required terminating NUL.
+    #[must_use]
+    pub fn with_application_display_version(mut self, version: &str) -> Self {
+        let mut display_version = [0; 16];
+        let len = version.len().min(display_version.len() - 1);
+        display_version[..len].copy_from_slice(&version.as_bytes()[..len]);
+        self.application_display_version = Some(display_version);
         self
     }
 

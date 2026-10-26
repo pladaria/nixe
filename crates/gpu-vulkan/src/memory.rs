@@ -611,6 +611,30 @@ pub(crate) fn allocate_image_charged(
     Ok(image)
 }
 
+impl AllocatedImage {
+    pub(crate) fn view_2d(
+        self: Arc<Self>,
+        format: vk::Format,
+    ) -> Result<Arc<AllocatedImageView>, VulkanError> {
+        let handle = unsafe {
+            self.owner.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(self.handle)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    ),
+                None,
+            )
+        }
+        .map_err(|e| VulkanError::vk("host image view", e))?;
+        Ok(Arc::new(AllocatedImageView::from_handle(self, handle)))
+    }
+}
 /// Independently leased view; its image remains alive until the last view/batch.
 pub struct AllocatedImageView {
     pub(crate) image: Arc<AllocatedImage>,

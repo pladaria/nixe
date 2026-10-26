@@ -10,6 +10,7 @@ pub(super) struct WindowKey {
     version: u64,
     mip: u32,
     layer: u32,
+    depth_slice: u32,
     aspect: u32,
     row: u32,
 }
@@ -185,6 +186,7 @@ fn image_chunks(
             version,
             mip: p.mip_level,
             layer: p.array_layer,
+            depth_slice: p.depth_slice,
             aspect: p.aspect.as_raw(),
             row: first,
         };

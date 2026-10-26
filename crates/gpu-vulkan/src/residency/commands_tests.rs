@@ -26,6 +26,7 @@ fn color_image() -> (NativeImageDescription, Vec<ImagePlane>) {
             flags: vk::ImageCreateFlags::empty(),
         },
         vec![ImagePlane {
+            depth_slice: 0,
             offset: 32,
             row_pitch: 40,
             mip_level: 0,
@@ -41,6 +42,46 @@ fn color_image() -> (NativeImageDescription, Vec<ImagePlane>) {
     )
 }
 #[test]
+fn packed_rgb10a2_clear_preserves_native_bits_and_guest_row_padding() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let (_allocation, storage) = backing_allocation(&cache, 4096, 4096, 0x31);
+    let (mut description, planes) = color_image();
+    description.format = vk::Format::A2B10G10R10_UNORM_PACK32;
+    let image = cache
+        .image_for(
+            crate::residency::tests::image_geometry(storage.clone(), description, &planes),
+            description,
+            planes,
+        )
+        .unwrap();
+    cache
+        .clear_color_image(
+            image,
+            0,
+            vk::ClearColorValue {
+                float32: [1.0, 0.0, 0.0, 1.0],
+            },
+        )
+        .unwrap();
+    cache.flush().unwrap();
+    let bytes = cpu_read(&mut cache, &storage);
+    assert_eq!(&bytes[..32], &[0x31; 32]);
+    for row in 0..6 {
+        let start = 32 + row * 40;
+        assert_eq!(
+            &bytes[start..start + 32],
+            0xc00003ff_u32.to_le_bytes().repeat(8)
+        );
+        assert_eq!(&bytes[start + 32..start + 40], &[0x31; 8]);
+    }
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
 fn cropped_native_alias_skips_buffer_reconstruction_and_preserves_undefined_padding() {
     let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
         return;
@@ -51,6 +92,7 @@ fn cropped_native_alias_skips_buffer_reconstruction_and_preserves_undefined_padd
         let backing = Footprint::new(
             storage.clone(),
             nixe_gpu::physical::WriteDomain::Image(nixe_gpu::physical::ImageFootprint {
+                depth_slice: 0,
                 base: 0,
                 columns: width,
                 rows: height,
@@ -59,6 +101,7 @@ fn cropped_native_alias_skips_buffer_reconstruction_and_preserves_undefined_padd
                 aspect_bytes: 4,
                 storage: nixe_gpu::physical::ImageStorage::BlockLinear {
                     block_height_log2: 0,
+                    block_depth_log2: 0,
                 },
                 native_base: 0,
                 native_element_bytes: 4,
@@ -137,6 +180,7 @@ fn dense_image_buffer_alias_preserves_compact_authority_and_rejects_stale_images
     let backing = Footprint::new(
         physical.clone(),
         nixe_gpu::physical::WriteDomain::Image(nixe_gpu::physical::ImageFootprint {
+            depth_slice: 0,
             base: 0,
             columns: 64,
             rows: 64,
@@ -145,6 +189,7 @@ fn dense_image_buffer_alias_preserves_compact_authority_and_rejects_stale_images
             aspect_bytes: 4,
             storage: nixe_gpu::physical::ImageStorage::BlockLinear {
                 block_height_log2: 0,
+                block_depth_log2: 0,
             },
             native_base: 0,
             native_element_bytes: 4,
@@ -161,6 +206,7 @@ fn dense_image_buffer_alias_preserves_compact_authority_and_rejects_stale_images
     let reshaped = Footprint::new(
         physical.clone(),
         nixe_gpu::physical::WriteDomain::Image(nixe_gpu::physical::ImageFootprint {
+            depth_slice: 0,
             base: 0,
             columns: 32,
             rows: 128,
@@ -169,6 +215,7 @@ fn dense_image_buffer_alias_preserves_compact_authority_and_rejects_stale_images
             aspect_bytes: 4,
             storage: nixe_gpu::physical::ImageStorage::BlockLinear {
                 block_height_log2: 0,
+                block_depth_log2: 0,
             },
             native_base: 0,
             native_element_bytes: 4,
@@ -266,6 +313,24 @@ fn image_alias_invalidation_preserves_unrelated_buffer_pages() {
             .iter()
             .any(ResourceObservation::is_invalid)
     );
+    let copied = cache.statistics().gpu_copied_bytes;
+    let uploaded = cache.statistics().cpu_uploaded_bytes;
+    // The middle page consumes neither image. Their writes must stay pending
+    // until their own ranges are requested, even after the observation resets.
+    assert_eq!(cache.read_buffer(alias, 4096, 32).unwrap(), [0x19; 32]);
+    assert_eq!(cache.statistics().gpu_copied_bytes, copied);
+    assert_eq!(cache.statistics().cpu_uploaded_bytes - uploaded, 4096);
+    let first = cache.read_buffer(alias, 0, 4096).unwrap();
+    assert!(cache.statistics().gpu_copied_bytes > copied);
+    assert!(
+        cache
+            .buffer(alias)
+            .unwrap()
+            .invalid
+            .iter()
+            .any(|&(start, bytes)| start <= 8192 && start + bytes > 8192)
+    );
+    assert_eq!(cache.read_buffer(alias, 0, 4096).unwrap(), first);
     let bytes = cache.read_buffer(alias, 0, 3 * 4096).unwrap();
     assert_eq!(&bytes[4096..8192], &[0x19; 4096]);
     for offset in [0, 8192] {
@@ -708,6 +773,7 @@ fn independent_depth_stencil_clear_preserves_the_other_aspect() {
         flags: vk::ImageCreateFlags::empty(),
     };
     let depth = ImagePlane {
+        depth_slice: 0,
         offset: 0,
         row_pitch: 16,
         mip_level: 0,
@@ -777,6 +843,7 @@ fn packed_depth_stencil_authority_preserves_both_aspects_and_padding() {
     let geometry = {
         use nixe_gpu::physical::{ByteRect, ImageFootprint, ImageStorage, WriteDomain};
         let depth = ImageFootprint {
+            depth_slice: 0,
             base: 0,
             columns: 64,
             rows: 64,
@@ -816,6 +883,7 @@ fn packed_depth_stencil_authority_preserves_both_aspects_and_padding() {
         depth: 1,
     };
     let depth = ImagePlane {
+        depth_slice: 0,
         offset: 0,
         row_pitch: 256,
         mip_level: 0,
@@ -983,6 +1051,7 @@ fn interleaved_scanout_rows_batch_and_scatter_multiple_versioned_windows() {
     let backing = Footprint::new(
         PhysicalMapping::join(&segments).unwrap(),
         nixe_gpu::physical::WriteDomain::Image(nixe_gpu::physical::ImageFootprint {
+            depth_slice: 0,
             base: 0,
             columns: 32,
             rows: 128,
@@ -991,6 +1060,7 @@ fn interleaved_scanout_rows_batch_and_scatter_multiple_versioned_windows() {
             aspect_bytes: 4,
             storage: nixe_gpu::physical::ImageStorage::BlockLinear {
                 block_height_log2: 0,
+                block_depth_log2: 0,
             },
             native_base: 0,
             native_element_bytes: 4,

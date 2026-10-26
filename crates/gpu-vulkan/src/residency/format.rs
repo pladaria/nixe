@@ -61,6 +61,7 @@ pub(super) fn copy_block(
             | vk::Format::R32_SINT
             | vk::Format::R32_SFLOAT
             | vk::Format::B10G11R11_UFLOAT_PACK32
+            | vk::Format::A2B10G10R10_UNORM_PACK32
             | vk::Format::E5B9G9R9_UFLOAT_PACK32 => (1, 1, 4),
             vk::Format::R16G16B16A16_UNORM
             | vk::Format::R16G16B16A16_SNORM

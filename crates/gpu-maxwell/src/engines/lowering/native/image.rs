@@ -16,13 +16,14 @@ pub(super) fn presentation_planes(
         _ => 4,
     };
     Ok(Arc::from([GuestImagePlane {
+        depth_slice: 0,
         mip_level: 0,
         array_layer: 0,
         aspect: GuestImageAspect::Color,
         footprint: plane_footprint(
             request.backing.mapping().clone(),
             request.layout,
-            0,
+            [0, 0],
             [request.width, request.height],
             bytes,
             bytes,
@@ -47,10 +48,7 @@ pub(super) fn conversion(image: &nixe_gpu::ConversionImage) -> Result<GuestImage
         || description.array_layers() != 1
         || !matches!(
             description.format(),
-            ImageFormat::R8Unorm
-                | ImageFormat::Rg8Unorm
-                | ImageFormat::Rgba8Unorm
-                | ImageFormat::Bgra8Unorm
+            ImageFormat::Rgba8Unorm | ImageFormat::Bgra8Unorm
         )
     {
         return Err(compilation(
@@ -66,13 +64,14 @@ pub(super) fn conversion(image: &nixe_gpu::ConversionImage) -> Result<GuestImage
         sample_grid: [1, 1],
         canonical_texels: image.view.has_canonical_texels(),
         planes: Arc::from([GuestImagePlane {
+            depth_slice: 0,
             mip_level: 0,
             array_layer: 0,
             aspect: GuestImageAspect::Color,
             footprint: plane_footprint(
                 binding.backing().mapping().clone(),
                 binding.layout(),
-                0,
+                [0, 0],
                 [extent.width, extent.height],
                 bytes,
                 bytes,
@@ -120,38 +119,35 @@ pub(super) fn planes(
         let mip = description
             .mip_extent(binding.subresources().mip_level)
             .unwrap();
-        if mip.depth != 1 {
-            return Err(compilation(
-                "native Maxwell image address legalization requires a 2D plane",
-            ));
-        }
         let [sx, sy] = sample_grid(description.samples())?;
         let columns = (mip.width * sx).div_ceil(bw);
         let rows = (mip.height * sy).div_ceil(bh);
         for layer in 0..binding.subresources().layer_count {
-            for &aspect in aspects {
-                let (bytes, offset) = match aspect {
-                    GuestImageAspect::Stencil => (
-                        1,
-                        if format == ImageFormat::Depth32FloatStencil8Uint {
-                            4
-                        } else if high_depth {
-                            0
-                        } else {
-                            3
-                        },
-                    ),
-                    GuestImageAspect::Depth if stencil => (4, u32::from(high_depth)),
-                    _ => (packed, 0),
-                };
-                result.push(GuestImagePlane {
+            for depth_slice in 0..mip.depth {
+                for &aspect in aspects {
+                    let (bytes, offset) = match aspect {
+                        GuestImageAspect::Stencil => (
+                            1,
+                            if format == ImageFormat::Depth32FloatStencil8Uint {
+                                4
+                            } else if high_depth {
+                                0
+                            } else {
+                                3
+                            },
+                        ),
+                        GuestImageAspect::Depth if stencil => (4, u32::from(high_depth)),
+                        _ => (packed, 0),
+                    };
+                    result.push(GuestImagePlane {
+ depth_slice,
                     mip_level: u32::from(binding.subresources().mip_level),
                     array_layer: u32::from(binding.subresources().base_layer + layer),
                     aspect,
                     footprint: plane_footprint(
                         binding.backing().mapping().clone(),
                         binding.layout(),
-                        u32::from(layer),
+                        [u32::from(layer), depth_slice],
                         [columns, rows],
                         bytes,
                         packed,
@@ -164,10 +160,15 @@ pub(super) fn planes(
                             },
                         ),
                     )
-                    .map_err(compilation)?,
+                    .map_err(|error| compilation(format!(
+                        "image {:?} mip={} layer={} layout={:?} extent={columns}x{rows}: {error}",
+                        image.role(), binding.subresources().mip_level,
+                        binding.subresources().base_layer + layer, binding.layout(),
+                    )))?,
                     row_pitch: u64::from(columns) * u64::from(bytes),
                     bytes_per_block: bytes,
                 });
+                }
             }
         }
     }

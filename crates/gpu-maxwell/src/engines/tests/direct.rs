@@ -3,6 +3,50 @@ use crate::pushbuffer::packet::PacketView;
 use std::convert::Infallible;
 
 #[test]
+fn repeated_condition_commands_flush_prior_instances_and_execute_in_order() {
+    let mut channel = three_d_channel();
+    let mut mme = None;
+    let mut parameters = Vec::new();
+    let mut observed = Vec::new();
+    let mut consume = async |event: MaxwellEngineEvent<'_>| {
+        match event.operation {
+            PendingEngineOperation::ThreeD(_) => observed.push((1, event.instances.unwrap().1)),
+            PendingEngineOperation::ThreeDRenderCondition(source) => {
+                observed.push((source.method().0, source.argument()))
+            }
+            _ => panic!("unexpected operation"),
+        }
+        Ok::<_, Infallible>(())
+    };
+    for (method, value) in [
+        (0x1558, 1),
+        (0x1618, 4),
+        (0xd78, 3),
+        (0x1614, 0),
+        (0x1558, 1),
+        (0x1558, 1),
+        (0x1944, 2),
+    ] {
+        let packet = packet(method / 4, value);
+        crate::test_memory::ready(stream_maxwell_engine_packet(
+            &mut channel,
+            FrontendSubmissionId::new(3),
+            packet.packets()[0].view(),
+            None,
+            &mut mme,
+            &mut parameters,
+            &mut consume,
+        ))
+        .unwrap_or_else(|_| panic!("dispatch"));
+    }
+    crate::test_memory::ready(finish_maxwell_engine_stream(&mut channel, &mut consume)).unwrap();
+    assert_eq!(
+        observed,
+        [(0x1558, 1), (1, 1), (0x1558, 1), (0x1558, 1), (0x1944, 2)]
+    );
+}
+
+#[test]
 fn instance_runs_cross_packets_and_flush_before_state_and_waits() {
     let mut channel = three_d_channel();
     let mut mme = None;

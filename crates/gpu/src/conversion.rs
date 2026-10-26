@@ -1,12 +1,18 @@
 //! Exact integer conversion of an 8-bit, 4:2:0 semiplanar image.
-use crate::{GpuAllocationDescription, ImageDescription, ImageView};
+use crate::{ImageDescription, ImageView};
 
 /// A canonical image interpretation supplied by a non-raster producer.
 #[derive(Clone, Debug)]
 pub struct ConversionImage {
     pub description: ImageDescription,
-    pub allocation: GpuAllocationDescription,
     pub view: ImageView,
+}
+
+/// Owned, tightly packed host pixels retained until their native upload.
+#[derive(Clone, Debug)]
+pub struct Nv12Planes {
+    pub bytes: [std::sync::Arc<[u8]>; 2],
+    pub widths: [u32; 2],
 }
 
 /// Signed fixed-point transform: ((sum(component * 4 * coefficient) >> shift)

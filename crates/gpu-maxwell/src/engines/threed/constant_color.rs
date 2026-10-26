@@ -3,7 +3,7 @@
 use super::MaxwellThreeDRegister;
 use crate::MaxwellMethodSource;
 
-/// One component of the color that replaces shader color output when enabled.
+/// One component of the retained constant-color register family.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum MaxwellThreeDConstantColorComponent {
@@ -36,11 +36,11 @@ impl MaxwellThreeDConstantColorValue {
     }
 }
 
-/// Constant-color rendering registers published by NVIDIA.
+/// Constant-color rendering registers retained independently of shader outputs.
 ///
-/// The enable and four full-width component fields are defined together in
-/// the public class header:
-/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1229-L1244>
+/// The reference renderer records these five words but does not replace
+/// translated fragment outputs with their values:
+/// <https://github.com/eden-emulator/mirror/blob/master/src/video_core/engines/maxwell_3d.h>
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDConstantColorRenderingState {
     enabled: MaxwellThreeDRegister<bool>,
@@ -63,16 +63,16 @@ impl MaxwellThreeDConstantColorRenderingState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDConstantColorRenderingStateWrite) {
         match write {
-            MaxwellThreeDConstantColorRenderingStateWrite::Enable { value, source } => {
-                self.enabled = MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            MaxwellThreeDConstantColorRenderingStateWrite::Enable { value, source: _ } => {
+                self.enabled = MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
             MaxwellThreeDConstantColorRenderingStateWrite::Component {
                 component,
                 value,
-                source,
+                source: _,
             } => {
                 self.components[component.index()] =
-                    MaxwellThreeDRegister::programmed(value.bits(), value, source);
+                    MaxwellThreeDRegister::decoded(value.bits(), value);
             }
         }
     }

@@ -36,6 +36,35 @@ fn decorated(inst: &[(Op, &[u32])], id: Id, decoration: D, value: u32) -> bool {
         .any(|(op, args)| *op == Op::Decorate && *args == [id.0, decoration as u32, value])
 }
 #[test]
+fn cubemap_array_declarations_include_the_required_capability() {
+    for (texture_type, arrayed) in [
+        (TextureType::ColorCube, false),
+        (TextureType::ColorArrayCube, true),
+    ] {
+        let mut p = Program::new(Stage::Fragment);
+        p.info.texture_descriptors.push(TextureDescriptor {
+            texture_type,
+            count: 1,
+            ..Default::default()
+        });
+        let profile = profile();
+        let runtime = RuntimeInfo::default();
+        let mut bindings = Bindings::default();
+        let ctx = EmitContext::new(&profile, &runtime, &p, &mut bindings).unwrap();
+        let words = ctx.builder.assemble().unwrap();
+        let inst = instructions(&words);
+        assert!(inst.iter().any(|(op, args)| *op == Op::TypeImage
+            && args[2] == spirv::Dim::DimCube as u32
+            && args[4] == u32::from(arrayed)));
+        assert_eq!(
+            inst.iter().any(|(op, args)| *op == Op::Capability
+                && args[0] == spirv::Capability::SampledCubeArray as u32),
+            arrayed
+        );
+    }
+}
+
+#[test]
 fn declarations_use_pipeline_binding_counters_and_keep_array_binding_count() {
     let mut p = Program::new(Stage::Compute);
     p.info.used_constant_buffer_types = Type::U32;

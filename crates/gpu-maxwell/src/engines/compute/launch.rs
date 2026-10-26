@@ -51,6 +51,10 @@ impl MaxwellComputeLaunch {
 /// Failure while consuming a scheduled QMD. No completion is emitted on failure.
 #[derive(Clone, Debug)]
 pub enum MaxwellComputeLaunchError {
+    Resource {
+        source: Box<MaxwellMethodSource>,
+        error: Box<crate::MaxwellThreeDResourceError>,
+    },
     Execution {
         source: Box<MaxwellMethodSource>,
         reason: &'static str,
@@ -104,6 +108,10 @@ pub enum MaxwellComputeLaunchError {
 impl Display for MaxwellComputeLaunchError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Resource { source, error } => write!(
+                f,
+                "compute resource resolution failed: {error}; source=[{source}]"
+            ),
             Self::Execution { source, reason } => {
                 write!(f, "unsupported compute launch: {reason}; source=[{source}]")
             }
@@ -183,7 +191,8 @@ pub struct MaxwellResolvedComputeLaunch {
     source: MaxwellMethodSource,
     program_address: u64,
     qmd: MaxwellComputeQmd,
-    texture_pool: Option<crate::recompiler::TexturePool>,
+    pub(crate) texture_pool: Option<crate::recompiler::TexturePool>,
+    pub(crate) sampler_pool: Option<crate::recompiler::TexturePool>,
     texture_cbuf: u32,
 }
 
@@ -192,6 +201,7 @@ pub(crate) struct ComputeResources {
         nixe_gpu::shader_module::ResourceId,
         Option<crate::MaxwellResolvedRange>,
     )>,
+    pub textures: Option<super::super::threed::ComputeTextures>,
     inputs: [Option<(u64, u64)>; 8],
     descriptors: Vec<crate::shader::memory::MaxwellShaderRead>,
     address_space: crate::MaxwellAddressSpaceId,
@@ -204,6 +214,7 @@ impl ComputeResources {
         space: &MaxwellGpuMemory,
         memory: &mut crate::recompiler::MemoryCache,
         access: &mut nixe_gpu::MemoryAccess<'_>,
+        textures: &mut super::super::threed::MaxwellThreeDResolvedResourceCache,
     ) -> Result<bool, MaxwellComputeLaunchError> {
         if self.address_space != space.id()
             || self.inputs.iter().enumerate().any(|(slot, input)| {
@@ -252,11 +263,22 @@ impl ComputeResources {
             }
             *previous = current;
         }
+        if let Some(current) = &mut self.textures {
+            return current
+                .refresh(launch, space, textures, access)
+                .map_err(|error| MaxwellComputeLaunchError::Resource {
+                    source: Box::new(launch.source),
+                    error: Box::new(error),
+                });
+        }
         Ok(true)
     }
 }
 
 impl MaxwellResolvedComputeLaunch {
+    pub(crate) fn constant_buffer(&self, slot: u8) -> Result<(u64, u64), &'static str> {
+        self.qmd.constant_buffer(slot)
+    }
     pub(crate) fn validate_execution(&self) -> Result<(), MaxwellComputeLaunchError> {
         self.qmd
             .validate_execution()
@@ -338,6 +360,19 @@ pub(crate) fn resolve_compute_launch(
             .bindless_texture_constant_buffer_slot()
             .value()
             .map_or(0, |slot| u32::from(slot.get())),
+        sampler_pool: state
+            .samplers()
+            .address()
+            .zip(if qmd.linked_samplers() {
+                state.texture_headers().maximum_index().value().copied()
+            } else {
+                state.samplers().maximum_index().value().copied()
+            })
+            .map(|(address, maximum_index)| crate::recompiler::TexturePool {
+                address: address.get(),
+                maximum_index,
+                via_header_index: qmd.linked_samplers(),
+            }),
         qmd,
     })
 }
@@ -509,19 +544,34 @@ impl MaxwellResolvedComputeLaunch {
                 Some(range),
             ));
         }
-        if !info.texture_descriptors.is_empty()
-            || !info.image_descriptors.is_empty()
-            || !info.texture_buffer_descriptors.is_empty()
-            || !info.image_buffer_descriptors.is_empty()
-        {
-            return Err(fail(
-                0,
-                "compute image and texel-buffer resource resolution is not implemented",
-            ));
+        // Handle constant buffers are consumed on the command owner, even when
+        // texture lowering removed the corresponding loads from the shader.
+        // https://github.com/eden-emulator/mirror/blob/master/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+        for descriptor in &info.texture_descriptors {
+            for index in [
+                Some(descriptor.cbuf_index),
+                descriptor
+                    .has_secondary
+                    .then_some(descriptor.secondary_cbuf_index),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let slot = u8::try_from(index.0)
+                    .ok()
+                    .filter(|&slot| slot < 8)
+                    .ok_or_else(|| fail(0, "texture cbuf index exceeds QMD limits"))?;
+                inputs[usize::from(slot)] = Some(
+                    self.qmd
+                        .constant_buffer(slot)
+                        .map_err(|reason| fail(slot, reason))?,
+                );
+            }
         }
         result.sort_unstable_by_key(|(resource, _)| *resource);
         Ok(ComputeResources {
             bindings: result,
+            textures: None,
             inputs,
             descriptors,
             address_space: space.id(),
@@ -539,14 +589,7 @@ mod native_tests {
 
     fn source() -> MaxwellMethodSource {
         let mut channel = crate::engines::tests::three_d_channel();
-        crate::engines::tests::program_three_d(&mut channel, 0x19d0, 0x3c);
-        channel
-            .three_d()
-            .render_targets()
-            .clear()
-            .last_surface()
-            .source()
-            .unwrap()
+        crate::engines::tests::program_three_d(&mut channel, 0x19d0, 0x3c)
     }
     fn qmd(words: [u32; 64]) -> MaxwellComputeQmd {
         MaxwellComputeQmd::decode(
@@ -573,6 +616,7 @@ mod native_tests {
             program_address: base,
             qmd: qmd(words),
             texture_pool: None,
+            sampler_pool: None,
             texture_cbuf: 0,
         };
         let config = nixe_gpu::shader_compilation::Configuration {
@@ -641,6 +685,183 @@ mod native_tests {
     }
 
     #[test]
+    fn compute_texture_arrays_consume_qmd_handles_and_refresh_changed_descriptors() {
+        use crate::engines::threed::{
+            MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResourceCache,
+            MaxwellThreeDResourceRole,
+        };
+        use nixe_shader_recompiler::{
+            artifact::{ShaderInfo, TextureDescriptor},
+            types::{ByteOffset, CbufIndex, TextureType},
+        };
+        let (allocation, space, base) = crate::shader::test_support::mapped_memory();
+        let write_words = |offset, words: &[u32]| {
+            crate::test_memory::write(
+                &allocation,
+                offset,
+                &words
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let mut words = [0; 64];
+        words[0x48 / 4] = 0x17;
+        words[0x50 / 4] = 1;
+        words[0x74 / 4] = base as u32 + 0x100;
+        words[0x78 / 4] = (base >> 32) as u32 | (64 << 15);
+        let format = 0x08
+            | (2 << 7)
+            | (2 << 10)
+            | (2 << 13)
+            | (2 << 16)
+            | (2 << 19)
+            | (3 << 22)
+            | (4 << 25)
+            | (5 << 28);
+        let mut info = ShaderInfo::default();
+        info.texture_descriptors.push(TextureDescriptor {
+            texture_type: TextureType::Color2D,
+            cbuf_index: CbufIndex(0),
+            cbuf_offset: ByteOffset(0),
+            count: 2,
+            size_shift: 2,
+            ..Default::default()
+        });
+        for linked in [false, true] {
+            words[0x2c / 4] = u32::from(linked) << 30;
+            let pool = |offset| {
+                Some(crate::recompiler::TexturePool {
+                    address: base + offset,
+                    maximum_index: 0xfffff,
+                    via_header_index: linked,
+                })
+            };
+            let launch = MaxwellResolvedComputeLaunch {
+                source: source(),
+                program_address: base,
+                qmd: qmd(words),
+                texture_pool: pool(0x200),
+                sampler_pool: pool(0x300),
+                texture_cbuf: 0,
+            };
+            for index in 0..2 {
+                write_words(
+                    0x200 + index * 32,
+                    &[
+                        format,
+                        (base + 0x400 + index * 0x200) as u32,
+                        (base >> 32) as u32 | (2 << 21),
+                        2,
+                        7 | (1 << 23),
+                        7 | (1 << 31),
+                        0,
+                        0,
+                    ],
+                );
+                write_words(
+                    0x300 + index * 32,
+                    &[0, 2 | (2 << 4) | (3 << 6), 0, 0, 0, 0, 0, 0],
+                );
+            }
+            write_words(0x100, &[1, if linked { 0 } else { 1 << 20 }]);
+            let mut cache = MaxwellThreeDResolvedResourceCache::new(256);
+            let mut reads = crate::recompiler::MemoryCache::default();
+            let mut resources = launch
+                .native_resources(
+                    &info,
+                    256,
+                    space.memory(),
+                    &mut reads,
+                    &mut crate::test_memory::access(space.memory().machine()),
+                )
+                .unwrap();
+            resources.textures = cache
+                .resolve_compute_textures(
+                    &launch,
+                    &info,
+                    space.memory(),
+                    &mut crate::test_memory::access(space.memory().machine()),
+                )
+                .unwrap();
+            let textures = resources.textures.as_ref().unwrap();
+            assert_eq!(textures.bindings.len(), 4);
+            let images = textures
+                .bindings
+                .iter()
+                .filter_map(|(_, role)| {
+                    let MaxwellThreeDResourceRole::SampledImage { .. } = role else {
+                        return None;
+                    };
+                    let Some(MaxwellThreeDResolvedResource::Image(image)) =
+                        textures.resources.resource(*role)
+                    else {
+                        panic!("sampled image expected")
+                    };
+                    Some(image.source().offset().get())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(images, [base + 0x600, base + 0x400]);
+            let refresh = |resources: &mut ComputeResources,
+                           cache: &mut MaxwellThreeDResolvedResourceCache,
+                           reads: &mut crate::recompiler::MemoryCache| {
+                resources
+                    .refresh(
+                        &launch,
+                        space.memory(),
+                        reads,
+                        &mut crate::test_memory::access(space.memory().machine()),
+                        cache,
+                    )
+                    .unwrap()
+            };
+            assert!(refresh(&mut resources, &mut cache, &mut reads));
+            write_words(0x110, &[42]);
+            assert!(
+                refresh(&mut resources, &mut cache, &mut reads),
+                "ordinary uniform contents are not handle dependencies"
+            );
+            write_words(
+                0x300 + if linked { 32 } else { 0 } + 4,
+                &[1 | (1 << 4) | (2 << 6)],
+            );
+            assert!(
+                !refresh(&mut resources, &mut cache, &mut reads),
+                "sampler RAM changes must invalidate without QMD writes"
+            );
+            resources.textures = cache
+                .resolve_compute_textures(
+                    &launch,
+                    &info,
+                    space.memory(),
+                    &mut crate::test_memory::access(space.memory().machine()),
+                )
+                .unwrap();
+            assert!(refresh(&mut resources, &mut cache, &mut reads));
+            write_words(0x200 + 32 + 16, &[6 | (1 << 23)]);
+            assert!(
+                !refresh(&mut resources, &mut cache, &mut reads),
+                "TIC RAM changes must invalidate without QMD writes"
+            );
+            resources.textures = cache
+                .resolve_compute_textures(
+                    &launch,
+                    &info,
+                    space.memory(),
+                    &mut crate::test_memory::access(space.memory().machine()),
+                )
+                .unwrap();
+            assert!(refresh(&mut resources, &mut cache, &mut reads));
+            write_words(0x100, &[0]);
+            assert!(
+                !refresh(&mut resources, &mut cache, &mut reads),
+                "handle RAM changes must invalidate without QMD writes"
+            );
+        }
+    }
+
+    #[test]
     fn native_storage_resources_use_descriptor_metadata_and_committed_runtime_extent() {
         use nixe_shader_recompiler::{
             artifact::{ConstantBufferDescriptor, ShaderInfo, StorageBufferDescriptor},
@@ -657,6 +878,7 @@ mod native_tests {
             program_address: base,
             qmd: qmd(words),
             texture_pool: None,
+            sampler_pool: None,
             texture_cbuf: 0,
         };
         let info = &mut ShaderInfo::default();
@@ -683,6 +905,8 @@ mod native_tests {
             ],
         );
         let mut cache = crate::recompiler::MemoryCache::default();
+        let mut textures =
+            super::super::super::threed::MaxwellThreeDResolvedResourceCache::default();
         let mut resources = launch
             .native_resources(
                 info,
@@ -722,7 +946,13 @@ mod native_tests {
         for _ in 0..10000 {
             assert!(
                 resources
-                    .refresh(&launch, space.memory(), &mut cache, &mut no_read)
+                    .refresh(
+                        &launch,
+                        space.memory(),
+                        &mut cache,
+                        &mut no_read,
+                        &mut textures
+                    )
                     .unwrap()
             );
         }
@@ -753,7 +983,13 @@ mod native_tests {
         );
         assert!(
             resources
-                .refresh(&launch, space.memory(), &mut cache, &mut no_read)
+                .refresh(
+                    &launch,
+                    space.memory(),
+                    &mut cache,
+                    &mut no_read,
+                    &mut textures
+                )
                 .unwrap()
         );
         assert_eq!(
@@ -769,13 +1005,20 @@ mod native_tests {
                     &launch,
                     space.memory(),
                     &mut cache,
-                    &mut crate::test_memory::access(space.memory().machine())
+                    &mut crate::test_memory::access(space.memory().machine()),
+                    &mut textures
                 )
                 .unwrap()
         );
         assert!(
             resources
-                .refresh(&launch, space.memory(), &mut cache, &mut no_read)
+                .refresh(
+                    &launch,
+                    space.memory(),
+                    &mut cache,
+                    &mut no_read,
+                    &mut textures
+                )
                 .unwrap()
         );
         // A descriptor-only change must invalidate, including retries before a
@@ -791,7 +1034,8 @@ mod native_tests {
                         &launch,
                         space.memory(),
                         &mut cache,
-                        &mut crate::test_memory::access(space.memory().machine())
+                        &mut crate::test_memory::access(space.memory().machine()),
+                        &mut textures
                     )
                     .unwrap()
             );

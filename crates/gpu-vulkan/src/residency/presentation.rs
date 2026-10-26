@@ -29,6 +29,7 @@ impl VulkanResidency {
             flags: vk::ImageCreateFlags::empty(),
         };
         let native_plane = ImagePlane {
+            depth_slice: 0,
             offset: 0,
             row_pitch: plane.row_pitch,
             mip_level: 0,
@@ -203,7 +204,7 @@ impl VulkanResidency {
             &owner,
             description,
             AllocationMode::Managed,
-            "host presentation image",
+            "host image",
             |bytes| self.reserve(bytes),
         )?))
     }

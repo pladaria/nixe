@@ -18,6 +18,60 @@ fn increment() -> Shader {
 }
 
 #[test]
+fn native_image_range_coalescing_preserves_mixed_scopes_and_subresource_holes() {
+    use std::collections::BTreeMap;
+    let id = ImageId {
+        instance: nixe_gpu::BackendInstanceId::new(1),
+        slot: 0,
+        generation: 1,
+    };
+    let read = AccessScope::new(
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    );
+    let write = AccessScope::new(
+        vk::PipelineStageFlags2::COMPUTE_SHADER,
+        vk::AccessFlags2::SHADER_STORAGE_WRITE,
+    );
+    let mut uses = Vec::new();
+    let mut expected = BTreeMap::new();
+    for mip in 0..4 {
+        for layer in 0..3 {
+            if mip == 3 && layer == 2 {
+                continue;
+            }
+            let scope = if mip == 1 && layer == 1 { write } else { read };
+            expected.insert((mip, layer), scope);
+            uses.push(Use::Image {
+                id,
+                scope,
+                range: vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(mip)
+                    .level_count(1)
+                    .base_array_layer(layer)
+                    .layer_count(1),
+            });
+        }
+    }
+    uses.reverse();
+    coalesce_image_uses(&mut uses);
+    assert!(uses.len() < expected.len());
+    let mut actual = BTreeMap::new();
+    for usage in uses {
+        let Use::Image { range, scope, .. } = usage else {
+            unreachable!()
+        };
+        for mip in range.base_mip_level..range.base_mip_level + range.level_count {
+            for layer in range.base_array_layer..range.base_array_layer + range.layer_count {
+                assert!(actual.insert((mip, layer), scope).is_none());
+            }
+        }
+    }
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn null_storage_buffers_read_zero_and_discard_writes_and_atomics() {
     let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
         return;
@@ -197,6 +251,7 @@ fn image(
         depth: 1,
     };
     let plane = ImagePlane {
+        depth_slice: 0,
         offset: 32,
         row_pitch: u64::from(bytes) * 8 + 16,
         mip_level: 0,
@@ -583,7 +638,7 @@ fn raster(api: ApiPreference, inline: bool, large: bool) {
     drop(prepared);
     cache.flush().unwrap();
     if inline {
-        assert!(cache.device.queue_usage().command_pools <= 2);
+        assert!(cache.device.queue_usage().command_slots <= 2);
         assert!(cache.device.queue_usage().overflow_capacity == 0);
         assert!(cache.device.queue_usage().submitted_tick >= 3);
     }
@@ -695,7 +750,7 @@ fn compute(api: ApiPreference) {
         .device()
         .recording_statistics()
         .stream_descriptor_allocations;
-    assert!(allocations <= cache.device().queue_usage().command_pools as u64);
+    assert!(allocations <= cache.device().queue_usage().command_slots as u64);
     assert!(allocations < 8);
     drop(program);
     drop(compilers);
@@ -1011,6 +1066,7 @@ fn blend_masks_depth_stencil_and_dynamic_pipeline_reuse() {
         depth: 1,
     };
     let depth = ImagePlane {
+        depth_slice: 0,
         offset: 32,
         row_pitch: 48,
         mip_level: 0,
@@ -1219,6 +1275,7 @@ fn canonical_multisample_authority_and_native_resolve_preserve_padding() {
                     backing,
                     description,
                     &[ImagePlane {
+                        depth_slice: 0,
                         offset: 0,
                         row_pitch: 80,
                         mip_level: 0,
@@ -1234,6 +1291,7 @@ fn canonical_multisample_authority_and_native_resolve_preserve_padding() {
                 ),
                 description,
                 vec![ImagePlane {
+                    depth_slice: 0,
                     offset: 0,
                     row_pitch: 80,
                     mip_level: 0,
@@ -1594,6 +1652,7 @@ fn native_bc_extent_astc_decode_dirty_blocks_and_custom_sampler_border() {
         depth: 1,
     };
     let source = ImagePlane {
+        depth_slice: 0,
         offset: 32,
         row_pitch: 16,
         mip_level: 0,
@@ -1936,150 +1995,6 @@ fn compute_produced_indexed_indirect_draw_scaled32_and_first_instance() {
     drop(compute);
     drop(draw);
     drop(compilers);
-    drop(cache);
-    validation.check().unwrap();
-}
-#[test]
-fn native_nv12_fixed_point_bgra_crop_and_alpha_match_integer_reference() {
-    let Some(mut cache) = cache(ApiPreference::Auto, 32 * 1024 * 1024) else {
-        return;
-    };
-    let validation = cache.device.validation_monitor();
-    let (yalloc, ybytes) = backing_allocation(&cache, 4096, 4096, 0);
-    let (uvalloc, uvbytes) = backing_allocation(&cache, 4096, 4096, 0);
-    let ys: Vec<_> = (0..100).map(|i| (i * 3 + 7) as u8).collect();
-    crate::residency::tests::cpu_write(&mut cache, &yalloc, 0, &ys).unwrap();
-    let uvs: Vec<_> = (0..50).map(|i| (i * 5 + 13) as u8).collect();
-    crate::residency::tests::cpu_write(&mut cache, &uvalloc, 0, &uvs).unwrap();
-    let make = |cache: &mut VulkanResidency,
-                bytes: Arc<PhysicalMapping>,
-                format: vk::Format,
-                width: u32,
-                height: u32,
-                bpp: u32| {
-        let extent = vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        };
-        let image = cache
-            .image_for(
-                crate::residency::tests::image_geometry(
-                    bytes,
-                    NativeImageDescription {
-                        image_type: vk::ImageType::TYPE_2D,
-                        format,
-                        extent,
-                        mip_levels: 1,
-                        array_layers: 1,
-                        samples: vk::SampleCountFlags::TYPE_1,
-                        usage: vk::ImageUsageFlags::SAMPLED,
-                        flags: vk::ImageCreateFlags::empty(),
-                    },
-                    &[ImagePlane {
-                        offset: 0,
-                        row_pitch: u64::from(width * bpp),
-                        mip_level: 0,
-                        array_layer: 0,
-                        aspect: vk::ImageAspectFlags::COLOR,
-                        extent,
-                        block_extent: vk::Extent2D {
-                            width: 1,
-                            height: 1,
-                        },
-                        bytes_per_block: bpp,
-                    }],
-                ),
-                NativeImageDescription {
-                    image_type: vk::ImageType::TYPE_2D,
-                    format,
-                    extent,
-                    mip_levels: 1,
-                    array_layers: 1,
-                    samples: vk::SampleCountFlags::TYPE_1,
-                    usage: vk::ImageUsageFlags::SAMPLED,
-                    flags: vk::ImageCreateFlags::empty(),
-                },
-                vec![ImagePlane {
-                    offset: 0,
-                    row_pitch: u64::from(width * bpp),
-                    mip_level: 0,
-                    array_layer: 0,
-                    aspect: vk::ImageAspectFlags::COLOR,
-                    extent,
-                    block_extent: vk::Extent2D {
-                        width: 1,
-                        height: 1,
-                    },
-                    bytes_per_block: bpp,
-                }],
-            )
-            .unwrap();
-        cache
-            .image_view(
-                image,
-                ImageViewDescription {
-                    format,
-                    view_type: vk::ImageViewType::TYPE_2D,
-                    aspects: vk::ImageAspectFlags::COLOR,
-                    base_mip: 0,
-                    mip_count: 1,
-                    base_layer: 0,
-                    layer_count: 1,
-                    swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
-                },
-            )
-            .unwrap()
-    };
-    let y = make(&mut cache, ybytes, vk::Format::R8_UNORM, 10, 10, 1);
-    let uv = make(&mut cache, uvbytes, vk::Format::R8G8_UNORM, 5, 5, 2);
-    let (target, bytes, _image_allocation) = image(
-        &mut cache,
-        vk::Format::B8G8R8A8_UNORM,
-        vk::ImageAspectFlags::COLOR,
-        4,
-    );
-    let compiler = compiler(&cache);
-    let pipeline = crate::nv12_pipeline(&compiler, vk::Format::B8G8R8A8_UNORM).unwrap();
-    let t = nixe_gpu::Nv12ColorTransform {
-        coefficients: [
-            [256, 0, 128, -4096],
-            [256, -64, -64, 8192],
-            [256, 256, 0, -16384],
-        ],
-        shift: 0,
-        enabled: true,
-        clamp: [0, 1023],
-        alpha: 37,
-        source_origin: [1, 1],
-    };
-    let conversion = cache.prepare_nv12(pipeline, [y, uv], target, 0, t).unwrap();
-    cache.convert_nv12(&conversion).unwrap();
-    cache.flush().unwrap();
-    let output = cpu_read(&mut cache, &bytes);
-    for y in 0..8 {
-        for x in 0..8 {
-            let sx = x + 1;
-            let sy = y + 1;
-            let value = [
-                i32::from(ys[sy * 10 + sx]) * 4,
-                i32::from(uvs[(sy / 2 * 5 + sx / 2) * 2]) * 4,
-                i32::from(uvs[(sy / 2 * 5 + sx / 2) * 2 + 1]) * 4,
-            ];
-            let rgb = t.coefficients.map(|c| {
-                ((((value[0] * c[0] + value[1] * c[1] + value[2] * c[2]) >> t.shift) + c[3]) >> 8)
-                    .clamp(0, 1023)
-                    >> 2
-            });
-            assert_eq!(
-                &output[32 + y * 48 + x * 4..36 + y * 48 + x * 4],
-                &[rgb[2] as u8, rgb[1] as u8, rgb[0] as u8, 37]
-            );
-        }
-        assert_eq!(&output[64 + y * 48..80 + y * 48], &[0x7b; 16]);
-    }
-    drop(conversion);
-    drop(compiler);
     drop(cache);
     validation.check().unwrap();
 }
@@ -2554,6 +2469,7 @@ fn partial_image_write_does_not_take_ownership_of_untouched_pages() {
                     flags: vk::ImageCreateFlags::empty(),
                 },
                 &[ImagePlane {
+                    depth_slice: 0,
                     offset: 0,
                     row_pitch: 256,
                     mip_level: 0,
@@ -2578,6 +2494,7 @@ fn partial_image_write_does_not_take_ownership_of_untouched_pages() {
                 flags: vk::ImageCreateFlags::empty(),
             },
             vec![ImagePlane {
+                depth_slice: 0,
                 offset: 0,
                 row_pitch: 256,
                 mip_level: 0,
@@ -2673,7 +2590,7 @@ fn partial_image_write_does_not_take_ownership_of_untouched_pages() {
     validation.check().unwrap();
 }
 #[test]
-fn opaque_image_shape_alias_imports_only_proven_device_bytes() {
+fn incompatible_image_layouts_keep_native_lifetimes_and_latest_cpu_visibility() {
     let Some(mut cache) = cache(ApiPreference::Auto, 32 * 1024 * 1024) else {
         return;
     };
@@ -2704,6 +2621,7 @@ fn opaque_image_shape_alias_imports_only_proven_device_bytes() {
                     flags: vk::ImageCreateFlags::empty(),
                 },
                 vec![ImagePlane {
+                    depth_slice: 0,
                     offset: 0,
                     row_pitch: u64::from(width) * 4,
                     mip_level: 0,
@@ -2720,7 +2638,7 @@ fn opaque_image_shape_alias_imports_only_proven_device_bytes() {
             .unwrap()
     };
     let source = make(&mut cache, storage.clone(), 64, 64);
-    let alias = make(&mut cache, storage, 32, 128);
+    let alias = make(&mut cache, storage.clone(), 32, 128);
     cache.ensure_image(alias).unwrap();
     let p = cache.image(alias).unwrap().planes[0];
     assert!(
@@ -2755,18 +2673,31 @@ fn opaque_image_shape_alias_imports_only_proven_device_bytes() {
             },
         )
         .unwrap();
+    // Different pitches reuse the heap; they are not native copy aliases.
     cache.ensure_image(alias).unwrap();
+    assert!(
+        cache
+            .require_image_initialized(alias, p, transfers::full_rect(p))
+            .is_err()
+    );
     cache
-        .ensure_image_initialized(alias, p, transfers::full_rect(p))
+        .clear_color_image(
+            alias,
+            0,
+            vk::ClearColorValue {
+                float32: [0., 1., 0., 1.],
+            },
+        )
         .unwrap();
     assert_eq!(cache.statistics.native_readback_bytes, 0);
     let (_allocation_11, result) = backing_allocation(&cache, 16384, 4096, 0x91);
-    let destination = make(&mut cache, result.clone(), 32, 128);
+    let destination = make(&mut cache, result.clone(), 64, 64);
+    let source_plane = cache.image(source).unwrap().planes[0];
     cache
         .copy_image_region(
-            alias,
+            source,
             0,
-            transfers::full_rect(p),
+            transfers::full_rect(source_plane),
             destination,
             0,
             Default::default(),
@@ -2774,14 +2705,15 @@ fn opaque_image_shape_alias_imports_only_proven_device_bytes() {
         .unwrap();
     cache.flush().unwrap();
     let actual = cpu_read(&mut cache, &result);
-    for row in 0..128 {
-        let color = if row % 2 == 0 {
-            [255, 0, 0, 255]
-        } else {
-            [0, 0, 255, 255]
-        };
-        assert_eq!(&actual[row * 128..(row + 1) * 128], color.repeat(32));
+    for row in actual.chunks_exact(256) {
+        assert_eq!(&row[..128], [255, 0, 0, 255].repeat(32));
+        assert_eq!(&row[128..], [0, 0, 255, 255].repeat(32));
     }
+    // CPU access still resolves the newest physical producer across both layouts.
+    assert_eq!(
+        cpu_read(&mut cache, &storage),
+        [0, 255, 0, 255].repeat(4096)
+    );
     drop(cache);
     validation.check().unwrap();
 }
@@ -2812,6 +2744,7 @@ fn gpu_image_buffer_reconstruction_coalesces_page_boundaries() {
                     flags: vk::ImageCreateFlags::empty(),
                 },
                 &[ImagePlane {
+                    depth_slice: 0,
                     offset: 0,
                     row_pitch: 256,
                     mip_level: 0,
@@ -2836,6 +2769,7 @@ fn gpu_image_buffer_reconstruction_coalesces_page_boundaries() {
                 flags: vk::ImageCreateFlags::empty(),
             },
             vec![ImagePlane {
+                depth_slice: 0,
                 offset: 0,
                 row_pitch: 256,
                 mip_level: 0,
@@ -2994,6 +2928,7 @@ fn multisample_readback_keeps_other_gpu_pages_after_cpu_reuses_a_page() {
                     flags: vk::ImageCreateFlags::empty(),
                 },
                 &[ImagePlane {
+                    depth_slice: 0,
                     offset: 0,
                     row_pitch: 512,
                     mip_level: 0,
@@ -3018,6 +2953,7 @@ fn multisample_readback_keeps_other_gpu_pages_after_cpu_reuses_a_page() {
                 flags: vk::ImageCreateFlags::empty(),
             },
             vec![ImagePlane {
+                depth_slice: 0,
                 offset: 0,
                 row_pitch: 512,
                 mip_level: 0,
@@ -3077,6 +3013,7 @@ fn multisample_srgb_readback_preserves_encoded_bits() {
         depth: 1,
     };
     let plane = ImagePlane {
+        depth_slice: 0,
         offset: 0,
         row_pitch: 64,
         mip_level: 0,
@@ -3186,6 +3123,7 @@ fn multisample_depth_stencil_readback_preserves_exact_samples_and_padding() {
         depth: 1,
     };
     let depth = ImagePlane {
+        depth_slice: 0,
         offset: 0,
         row_pitch: 80,
         mip_level: 0,
@@ -3724,6 +3662,7 @@ fn affine_fixed_point_sampling_reverses_crops_and_preserves_destination_padding(
             flags: vk::ImageCreateFlags::empty(),
         };
         let plane = ImagePlane {
+            depth_slice: 0,
             offset: 0,
             row_pitch: 16,
             mip_level: 0,
@@ -3849,6 +3788,7 @@ fn exercise_read_only_depth(api: ApiPreference) {
                     flags: vk::ImageCreateFlags::empty(),
                 },
                 &[ImagePlane {
+                    depth_slice: 0,
                     offset: 32,
                     row_pitch: 48,
                     mip_level: 0,
@@ -3873,6 +3813,7 @@ fn exercise_read_only_depth(api: ApiPreference) {
                 flags: vk::ImageCreateFlags::empty(),
             },
             vec![ImagePlane {
+                depth_slice: 0,
                 offset: 32,
                 row_pitch: 48,
                 mip_level: 0,
@@ -3986,6 +3927,136 @@ fn exercise_read_only_depth(api: ApiPreference) {
 }
 
 #[test]
+fn sampled_color_attachment_uses_native_feedback_layout() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
+        return;
+    };
+    if !cache.device.profile().attachment_feedback_loop {
+        return;
+    }
+    let validation = cache.device.validation_monitor();
+    let (original, bytes, _allocation) = image(
+        &mut cache,
+        vk::Format::R8G8B8A8_UNORM,
+        vk::ImageAspectFlags::COLOR,
+        4,
+    );
+    let original_image = cache.image(original).unwrap();
+    let description = NativeImageDescription {
+        usage: original_image.description.usage | vk::ImageUsageFlags::SAMPLED,
+        ..original_image.description
+    };
+    let planes = original_image.planes.to_vec();
+    let target = cache
+        .image_for_device_write(
+            crate::residency::tests::image_geometry(bytes.clone(), description, &planes),
+            description,
+            planes,
+        )
+        .unwrap();
+    assert!(
+        cache
+            .image(target)
+            .unwrap()
+            .description
+            .usage
+            .contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT)
+    );
+    let pixel = vk::Rect2D {
+        offset: Default::default(),
+        extent: vk::Extent2D {
+            width: 1,
+            height: 1,
+        },
+    };
+    cache
+        .clear_image_rect(
+            target,
+            0,
+            pixel,
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [1., 0., 0., 1.],
+                },
+            },
+        )
+        .unwrap();
+    let view = cache
+        .image_view(
+            target,
+            ImageViewDescription {
+                format: description.format,
+                view_type: vk::ImageViewType::TYPE_2D,
+                aspects: vk::ImageAspectFlags::COLOR,
+                base_mip: 0,
+                mip_count: 1,
+                base_layer: 0,
+                layer_count: 1,
+                swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
+            },
+        )
+        .unwrap();
+    let mut samplers = SamplerCache::new(cache.device(), 4);
+    let sampler = samplers.get(&vk::SamplerCreateInfo::default()).unwrap();
+    let compiler = compiler(&cache);
+    let state = GraphicsState::color(description.format);
+    let pipeline = compiler
+        .request(PipelineRecipe::Graphics {
+            shader: sampled_shader(&cache, [0.0625, 0.0625]),
+            state: state.clone(),
+        })
+        .unwrap();
+    let program = cache
+        .prepare_program(
+            pipeline,
+            &[Binding::CombinedImageSampler {
+                image: view,
+                sampler,
+            }],
+        )
+        .unwrap();
+    let graphics = cache
+        .prepare_graphics(program, GraphicsParameters::new(state, pixel.extent))
+        .unwrap();
+    let targets = cache
+        .prepare_targets(RenderingTargets {
+            area: pixel,
+            colors: Box::new([Some(RenderAttachment::color(
+                target,
+                0,
+                AttachmentLoad::Load,
+                AttachmentStore::Store,
+            ))]),
+            depth: None,
+            stencil: None,
+        })
+        .unwrap();
+    let draw = cache
+        .prepare_draw(graphics, targets, Box::new([]), None)
+        .unwrap();
+    cache
+        .draw(
+            &draw,
+            Draw::Direct {
+                vertices: 3,
+                instances: 1,
+                first_vertex: 0,
+                first_instance: 0,
+            },
+            &[],
+        )
+        .unwrap();
+    cache.flush().unwrap();
+    let result = cpu_read(&mut cache, &bytes);
+    assert_eq!(&result[32..36], &[255, 0, 0, 255]);
+    drop(draw);
+    drop(compiler);
+    drop(samplers);
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
 fn replacement_draw_into_undefined_color_needs_no_load_and_preserves_unwritten_bytes() {
     let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
         return;
@@ -3998,6 +4069,7 @@ fn replacement_draw_into_undefined_color_needs_no_load_and_preserves_unwritten_b
         depth: 1,
     };
     let plane = ImagePlane {
+        depth_slice: 0,
         offset: 32,
         row_pitch: 48,
         mip_level: 0,

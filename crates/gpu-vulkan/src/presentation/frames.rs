@@ -140,7 +140,7 @@ impl Frames {
                     "presentation generation exhausted",
                 ))?;
             let native = cache.allocate_host_image(source.extent, format)?;
-            let view = super::render::view(cache.device(), native, format)?;
+            let view = native.view_2d(format)?;
             let work = cache.device_mut().work_ticket()?;
             let snapshot = Snapshot {
                 view,
@@ -165,12 +165,11 @@ impl Frames {
         };
         let snapshot = self.snapshots[slot].as_mut().expect("allocated snapshot");
         cache.device_mut().end_rendering();
-        let index = cache.device_mut().begin_recording()?;
+        cache.device_mut().begin_recording()?;
         let device = cache.device_mut();
-        let command = device.submission.slots[index].command;
+
         super::render::transition(
             device,
-            command,
             snapshot.view.image.handle,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -184,7 +183,6 @@ impl Frames {
             .layer_count(1);
         unsafe {
             device.dispatch.cmd_copy_image(
-                command,
                 native.handle,
                 layout,
                 snapshot.view.image.handle,
@@ -201,7 +199,6 @@ impl Frames {
         }
         super::render::transition(
             device,
-            command,
             snapshot.view.image.handle,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -224,7 +221,6 @@ impl Frames {
         cache
             .device_mut()
             .retire_image(Arc::clone(&snapshot.view.image), work)?;
-        cache.flush()?;
         let description = ImageDescription::new(
             ImageDimension::Two,
             ImageExtent::new(source.extent[0], source.extent[1], 1)

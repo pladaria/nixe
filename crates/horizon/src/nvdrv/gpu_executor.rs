@@ -101,30 +101,19 @@ struct GpuQueuedSubmission {
     submission: GpuSubmission,
     clock: nixe_runtime::VirtualClock,
 }
-enum DecodedPlaneData {
-    Linear {
-        bytes: [Arc<[u8]>; 2],
-        visible_widths: [u32; 2],
-    },
-    Device(nixe_gpu::DeviceImageFrame),
-}
-
 #[allow(
     clippy::large_enum_variant,
     reason = "retained deliveries are bounded by shared permits"
 )]
 enum GpuMessage {
     CloseChannel(nixe_gpu_maxwell::MaxwellChannelId),
-    DecodedPlanes {
-        images: Box<[nixe_gpu::ConversionImage; 2]>,
-        data: DecodedPlaneData,
-        reply: mpsc::SyncSender<Result<(), Box<str>>>,
-    },
     ConvertNv12 {
-        images: Box<[nixe_gpu::ConversionImage; 3]>,
+        destination: Box<nixe_gpu::ConversionImage>,
         transform: nixe_gpu::Nv12ColorTransform,
+        source: nixe_gpu::Nv12Planes,
         reply: mpsc::SyncSender<Result<(), Box<str>>>,
     },
+
     Submission(GpuQueuedSubmission),
     PresentImage {
         request: PresentationImageRequest,
@@ -323,7 +312,7 @@ impl DeviceAccessEndpoint for GpuMemoryEndpoint {
 /// Guest deliveries, CPU visibility and presentation share one GPU owner inbox.
 pub(super) struct NvDrvGpuExecutor {
     sender: Mutex<Option<mpsc::Sender<GpuMessage>>>,
-    image_device: Option<[u8; 16]>,
+    device_uuid: Option<[u8; 16]>,
     failure: Arc<Mutex<Option<GpuExecutorFailure>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     budget: Arc<GpuWorkBudget>,
@@ -353,9 +342,7 @@ impl NvDrvGpuExecutor {
                 ImageRequest = nixe_gpu::native::NativePresentationImage,
             >,
     {
-        let image_device = backend
-            .as_ref()
-            .and_then(GpuExecution::external_image_device);
+        let device_uuid = backend.as_ref().and_then(GpuExecution::device_uuid);
         let (sender, receiver) = mpsc::channel();
         let failure = Arc::new(Mutex::new(None));
         let budget = Arc::new(GpuWorkBudget::default());
@@ -442,7 +429,7 @@ impl NvDrvGpuExecutor {
             .expect("failed to create the GPU command owner");
         Self {
             sender: Mutex::new(Some(sender)),
-            image_device,
+            device_uuid,
             failure,
             worker: Mutex::new(Some(worker)),
             budget,
@@ -531,7 +518,8 @@ impl NvDrvGpuExecutor {
     /// result remains device-owned; this acknowledgement never reads pixels.
     pub(super) fn convert_nv12(
         &self,
-        images: [nixe_gpu::ConversionImage; 3],
+        destination: nixe_gpu::ConversionImage,
+        source: nixe_gpu::Nv12Planes,
         transform: nixe_gpu::Nv12ColorTransform,
     ) -> Result<(), String> {
         self.require_healthy().map_err(|e| e.to_string())?;
@@ -544,8 +532,9 @@ impl NvDrvGpuExecutor {
         let (reply, result) = mpsc::sync_channel(1);
         sender
             .send(GpuMessage::ConvertNv12 {
-                images: Box::new(images),
+                destination: Box::new(destination),
                 transform,
+                source,
                 reply,
             })
             .map_err(|_| "GPU frontend stopped before conversion")?;
@@ -555,65 +544,9 @@ impl NvDrvGpuExecutor {
             .map_err(|e| e.to_string())
     }
 
-    pub(super) fn upload_decoded_planes(
-        &self,
-        images: [nixe_gpu::ConversionImage; 2],
-        bytes: [Arc<[u8]>; 2],
-        visible_widths: [u32; 2],
-    ) -> Result<(), String> {
-        self.require_healthy().map_err(|e| e.to_string())?;
-        let sender = self
-            .sender
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .ok_or("GPU frontend is torn down")?;
-        let (reply, result) = mpsc::sync_channel(1);
-        sender
-            .send(GpuMessage::DecodedPlanes {
-                images: Box::new(images),
-                data: DecodedPlaneData::Linear {
-                    bytes,
-                    visible_widths,
-                },
-                reply,
-            })
-            .map_err(|_| "GPU frontend stopped before decoded plane upload")?;
-        result
-            .recv()
-            .map_err(|_| "GPU decoded plane upload reply was lost")?
-            .map_err(|e| e.to_string())
+    pub(super) fn device_uuid(&self) -> Option<[u8; 16]> {
+        self.device_uuid
     }
-
-    pub(super) fn image_device(&self) -> Option<[u8; 16]> {
-        self.image_device
-    }
-    pub(super) fn upload_device_planes(
-        &self,
-        images: [nixe_gpu::ConversionImage; 2],
-        frame: nixe_gpu::DeviceImageFrame,
-    ) -> Result<(), String> {
-        self.require_healthy().map_err(|e| e.to_string())?;
-        let sender = self
-            .sender
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or("GPU frontend is torn down")?;
-        let (reply, result) = mpsc::sync_channel(1);
-        sender
-            .send(GpuMessage::DecodedPlanes {
-                images: Box::new(images),
-                data: DecodedPlaneData::Device(frame),
-                reply,
-            })
-            .map_err(|_| "GPU frontend stopped before device plane transfer")?;
-        result
-            .recv()
-            .map_err(|_| "GPU device plane transfer reply lost")?
-            .map_err(|e| e.to_string())
-    }
-
     pub(super) fn request_progress(&self) -> Result<(), GpuExecutorFailure> {
         self.require_healthy()?;
         let Some(wake) = self.budget.request_progress() else {

@@ -1203,6 +1203,7 @@ fn resolved_image(
 /// Typed failure before any cache or backend effect is published.
 #[derive(Clone, Debug)]
 pub enum MaxwellLoweringError {
+    TriggerStateMismatch,
     ComputeLaunch(crate::MaxwellComputeLaunchError),
     BufferBacking(String),
     ImageBacking(String),
@@ -1215,8 +1216,6 @@ pub enum MaxwellLoweringError {
     ContradictoryState {
         reason: &'static str,
     },
-    TriggerStateMismatch,
-    UnsupportedRenderEnableMode(MaxwellThreeDRenderEnableMode),
     UnsupportedConditionalLoadConstantBufferSemantics,
     UnsupportedStreamOutputSemantics,
     VisibleCallLimitExceeded {
@@ -1225,8 +1224,6 @@ pub enum MaxwellLoweringError {
         limit: u16,
     },
     UnsupportedColorReductionSemantics,
-    UnsupportedConstantColorRenderingSemantics,
-    UnsupportedApiMandatedEarlyZSemantics,
     UnsupportedPostPsInitialCoverageSemantics,
     UnsupportedViewportPixelDepthBounds,
     UnsupportedWindowOriginFragmentPosition,
@@ -1294,7 +1291,6 @@ pub enum MaxwellLoweringError {
     TessellationStageTopology,
     TessellationMode {
         value: super::threed::MaxwellThreeDTessellationMode,
-        source: Option<MaxwellMethodSource>,
         reason: super::threed::MaxwellTessellationModeError,
     },
     UnsupportedPointSpriteCoordinatesSemantics(MaxwellThreeDPointSpriteSelect),
@@ -1429,13 +1425,7 @@ impl Display for MaxwellLoweringError {
             Self::ContradictoryState { reason } => {
                 write!(formatter, "contradictory Maxwell 3D state: {reason}")
             }
-            Self::TriggerStateMismatch => {
-                formatter.write_str("3D trigger does not match its immutable state snapshot")
-            }
-            Self::UnsupportedRenderEnableMode(mode) => write!(
-                formatter,
-                "MAXWELL_B render-enable mode has no verified neutral execution: mode={mode:?}"
-            ),
+            Self::TriggerStateMismatch => formatter.write_str("3D trigger does not match its consumed state"),
             Self::UnsupportedStreamOutputSemantics => formatter.write_str(
                 "MAXWELL_B enabled stream output requires vertex capture to guest memory",
             ),
@@ -1452,12 +1442,6 @@ impl Display for MaxwellLoweringError {
             ),
             Self::UnsupportedColorReductionSemantics => formatter.write_str(
                 "MAXWELL_B enabled color reduction has no verified neutral threshold evaluation or color-output semantics",
-            ),
-            Self::UnsupportedConstantColorRenderingSemantics => formatter.write_str(
-                "MAXWELL_B enabled constant-color rendering is not represented by the neutral pipeline",
-            ),
-            Self::UnsupportedApiMandatedEarlyZSemantics => formatter.write_str(
-                "MAXWELL_B API-mandated early depth/stencil ordering is not represented by the neutral pipeline",
             ),
             Self::UnsupportedPostPsInitialCoverageSemantics => formatter.write_str("MAXWELL_B pre-shader initial coverage for post-shader tests is not represented by the neutral pipeline"),
             Self::UnsupportedViewportPixelDepthBounds => formatter.write_str("MAXWELL_B pixel depth bounds narrow the affine viewport range and require explicit clip/clamp lowering"),
@@ -1588,7 +1572,7 @@ impl Display for MaxwellLoweringError {
                 size.control_points()
             ),
             Self::TessellationStageTopology => formatter.write_str("MAXWELL_B tessellation shaders require patch topology"),
-            Self::TessellationMode { value, source, reason } => write!(formatter, "MAXWELL_B tessellation mode cannot be consumed: value={:#x} reason={reason:?} source={source:?}", value.raw()),
+            Self::TessellationMode { value, reason } => write!(formatter, "MAXWELL_B tessellation mode cannot be consumed: value={:#x} reason={reason:?}", value.raw()),
             Self::UnsupportedPointSpriteCoordinatesSemantics(select) => write!(
                 formatter,
                 "MAXWELL_B generated point-sprite coordinates are not represented by shader translation or the neutral pipeline contract: texture-mask=0x{:03x} r-mode={:?} origin={:?}",
@@ -1647,7 +1631,7 @@ impl Display for MaxwellLoweringError {
                 "MAXWELL_B pixel-shader output saturation is not represented by shader or neutral backend lowering: output={output} range={range:?}"
             ),
             Self::UnsupportedBlendFactor { target, value } => write!(formatter,
-                "MAXWELL_B blend factor requires unsupported coupled/constant/dual-source semantics: target={target:?} value=0x{value:04x}"),
+                "MAXWELL_B blend factor requires unsupported dual-source semantics: target={target:?} value=0x{value:04x}"),
             Self::UnsupportedBlendFormat { target, format } => write!(formatter,
                 "MAXWELL_B blend attachment format is not implemented: target={target} format={format:?}"),
             Self::UnsupportedIteratedBlendSemantics { value, pass_count } => write!(
@@ -1911,15 +1895,6 @@ fn validate_consumed_state(
         // enabled, however, the current neutral pipeline cannot represent the
         // reduction decision and must stop before cache/backend effects.
         return Err(MaxwellLoweringError::UnsupportedColorReductionSemantics);
-    }
-    if trigger.is_draw() && state.constant_color_rendering().enabled().value() == Some(&true) {
-        return Err(MaxwellLoweringError::UnsupportedConstantColorRenderingSemantics);
-    }
-    if trigger.is_draw()
-        && state.shader_execution().api_mandated_early_z().value()
-            == Some(&MaxwellThreeDApiMandatedEarlyZ::Enabled)
-    {
-        return Err(MaxwellLoweringError::UnsupportedApiMandatedEarlyZSemantics);
     }
     if trigger.is_draw()
         && state.coverage().post_ps_initial_coverage().value() == Some(&true)
@@ -2255,10 +2230,7 @@ mod tests {
         assert!(super::draw_viewport_transform(channel.three_d()).is_ok());
         let register = channel.three_d().fixed_function().viewport()[15].snap_grid_precision();
         assert_eq!(register.value(), Some(&[31, 31]));
-        assert_eq!(
-            register.source().unwrap().method(),
-            nixe_gpu::GpuMethodId(0x0bfc)
-        );
+
         program_three_d(&mut channel, 0x0a1c, 0x0302);
         assert!(matches!(
             super::draw_viewport_transform(channel.three_d()),

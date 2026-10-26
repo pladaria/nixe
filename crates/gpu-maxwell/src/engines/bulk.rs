@@ -2,29 +2,36 @@
 //! only the backend's final byte payload is retained. Exceptional shadow replay
 //! uses scalar semantics, while ordinary transfers scale with physical spans.
 use super::*;
-use crate::pushbuffer::dispatch::class_packet_methods;
+use crate::{MaxwellDecodedMethod, MaxwellPushbufferSubchannel};
+
+#[derive(Clone, Copy)]
+pub(super) enum Port {
+    ConstantBuffer,
+    Embedded,
+    Indices,
+}
+
+pub(super) const fn port(method: GpuMethodId) -> Option<Port> {
+    match method.0 {
+        0x238c..=0x23fc => Some(Port::ConstantBuffer),
+        0x1b4 => Some(Port::Embedded),
+        0x1300 | 0x15e8 | 0x15ec => Some(Port::Indices),
+        _ => None,
+    }
+}
 
 pub(super) async fn stream_packet<E>(
     channel: &mut MaxwellGpuChannel,
-    submission: FrontendSubmissionId,
-    packet: crate::pushbuffer::packet::PacketView<'_>,
+    class: GpuClassId,
+    subchannel: MaxwellPushbufferSubchannel,
+    decoded: crate::MaxwellMethodSpan<'_>,
+    first: MaxwellDecodedMethod,
+    port: Port,
     consume: &mut impl for<'a> AsyncFnMut(MaxwellEngineEvent<'a>) -> Result<(), E>,
 ) -> Result<bool, MaxwellEngineStreamError<E>> {
-    let crate::pushbuffer::packet::PacketView::Methods {
-        methods: decoded, ..
-    } = packet
-    else {
-        return Ok(false);
-    };
-    let Some(first) = decoded.first() else {
-        return Ok(false);
-    };
-    let cb = first.method().0 == 0x238c || (0x2390..=0x23fc).contains(&first.method().0);
-    let inline = first.method().0 == 0x1b4;
-    let indices = matches!(first.method().0, 0x1300 | 0x15e8 | 0x15ec);
-    if decoded.len() < 2 || (!cb && !inline && !indices) {
-        return Ok(false);
-    }
+    let cb = matches!(port, Port::ConstantBuffer);
+    let inline = matches!(port, Port::Embedded);
+    let indices = matches!(port, Port::Indices);
     let data = if cb && first.method().0 == 0x238c {
         decoded.slice(1..)
     } else {
@@ -42,11 +49,6 @@ pub(super) async fn stream_packet<E>(
     {
         return Ok(false);
     }
-    let Some((class, subchannel)) = class_packet_methods(channel, submission, packet)
-        .map_err(|error| MaxwellEngineStreamError::dispatch(error.into()))?
-    else {
-        return Ok(false);
-    };
     if class == threed::CLASS {
         let state = channel.three_d_mut();
         if state.pending_notification.is_some()
@@ -75,7 +77,7 @@ pub(super) async fn stream_packet<E>(
             if first.method().0 == 0x238c {
                 threed::preflight(
                     profile,
-                    MaxwellMethodDispatch::emitted_by_mme(
+                    MaxwellMethodDispatch::class_method(
                         MaxwellMethodSource::decoded(first, subchannel),
                         class,
                     ),
@@ -97,7 +99,7 @@ pub(super) async fn stream_packet<E>(
             if count < data.len() {
                 threed::preflight(
                     profile,
-                    MaxwellMethodDispatch::emitted_by_mme(
+                    MaxwellMethodDispatch::class_method(
                         MaxwellMethodSource::decoded(data.get(count).unwrap(), subchannel),
                         class,
                     ),

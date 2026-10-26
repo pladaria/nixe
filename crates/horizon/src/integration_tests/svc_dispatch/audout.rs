@@ -123,6 +123,74 @@ pub(super) fn handle(process: &ScheduledProcess) -> u32 {
 }
 
 #[test]
+fn output_volume_ipc_controls_already_queued_pcm_and_preserves_invalid_input_errors() {
+    let (_directory, mut process) = fixture_process_with_svcs(&[0x21; 4]);
+    let backend = Arc::new(Backend::default());
+    let mut dispatcher = support::dispatcher(&process).with_audio_backend(backend.clone());
+    let session = crate::AudioOutSession::open(
+        backend.as_ref(),
+        nixe_audio::PcmFormat::STEREO_48KHZ,
+        Default::default(),
+    )
+    .unwrap();
+    let feed = backend.feed.lock().unwrap().take().unwrap();
+    let handle = process
+        .handles()
+        .insert(HorizonIpcObject::AudioOut(session.clone()))
+        .unwrap();
+    session
+        .output
+        .lock()
+        .unwrap()
+        .append(11, vec![1000, -1000, 1000, -1000])
+        .unwrap();
+    session.output.lock().unwrap().start().unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut dispatcher,
+            handle,
+            &command(13, &[], None, None, false, false)
+        ),
+        0
+    );
+    assert_eq!(f32::from_bits(data32(&process)), 1.0);
+    assert_eq!(
+        call(
+            &mut process,
+            &mut dispatcher,
+            handle,
+            &command(12, &0.7_f32.to_le_bytes(), None, None, false, false)
+        ),
+        0
+    );
+    let mut pcm = [0; 2];
+    feed.render(&mut pcm);
+    assert_eq!(pcm, [700, -700]);
+    assert_eq!(
+        call(
+            &mut process,
+            &mut dispatcher,
+            handle,
+            &command(13, &[], None, None, false, false)
+        ),
+        0
+    );
+    assert_eq!(f32::from_bits(data32(&process)), 0.7);
+    assert_eq!(
+        call(
+            &mut process,
+            &mut dispatcher,
+            handle,
+            &command(12, &f32::NAN.to_le_bytes(), None, None, false, false)
+        ),
+        HorizonIpcResult::AUDIO_INVALID_ARGUMENT.raw()
+    );
+    feed.render(&mut pcm);
+    assert_eq!(pcm, [700, -700]);
+}
+
+#[test]
 fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
     'variants: for (auto, invalid_release, channel_count, device_gain) in [
         (false, false, 2, false),

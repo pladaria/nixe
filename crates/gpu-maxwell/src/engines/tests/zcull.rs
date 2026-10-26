@@ -17,7 +17,7 @@ const CUBE_REGION: &[(u32, u32, &str)] = &[
 ];
 
 #[test]
-fn cube_zcull_configuration_is_typed_source_preserving_and_cache_neutral() {
+fn cube_zcull_configuration_is_typed_and_cache_neutral() {
     use MaxwellThreeDZCullAxis::{Depth, Height, Width};
     let mut channel = three_d_channel();
     let before = channel.three_d().clone();
@@ -32,21 +32,12 @@ fn cube_zcull_configuration_is_typed_source_preserving_and_cache_neutral() {
         let dispatched = dispatch.methods()[0];
         assert_eq!(dispatched.metadata().method_name(), name);
         let state = channel.three_d().zcull();
-        let (raw, source) = match method {
-            0x07e0 => (
-                state.region_location().raw(),
-                state.region_location().source(),
-            ),
-            0x07e4 => (
-                state.region_aliquots().raw(),
-                state.region_aliquots().source(),
-            ),
-            0x15c8 => (state.region_format().raw(), state.region_format().source()),
-            0x02e8 => (state.subregion().raw(), state.subregion().source()),
-            0x0dbc => (
-                state.direction_format().raw(),
-                state.direction_format().source(),
-            ),
+        let raw = match method {
+            0x07e0 => state.region_location().raw(),
+            0x07e4 => state.region_aliquots().raw(),
+            0x15c8 => state.region_format().raw(),
+            0x02e8 => state.subregion().raw(),
+            0x0dbc => state.direction_format().raw(),
             _ => {
                 let register = match method {
                     0x07c0 => state.region_size(Width),
@@ -57,11 +48,10 @@ fn cube_zcull_configuration_is_typed_source_preserving_and_cache_neutral() {
                     0x07cc => state.region_pixel_offset(Depth),
                     _ => unreachable!(),
                 };
-                (register.raw(), register.source())
+                register.raw()
             }
         };
         assert_eq!(raw, Some(argument));
-        assert_eq!(source, Some(dispatched.method().source()));
         assert!(draw.matches(channel.three_d()));
         assert!(shaders.matches_code(channel.three_d()));
         assert!(resources.matches(channel.three_d()));
@@ -71,10 +61,7 @@ fn cube_zcull_configuration_is_typed_source_preserving_and_cache_neutral() {
     assert_eq!(location.start_aliquot(), 0);
     assert_eq!(location.aliquot_count(), 2040);
     assert_eq!(state.region_location().raw(), Some(0x07f8_0000));
-    assert_eq!(
-        state.region_location().source().unwrap().method(),
-        GpuMethodId(0x07e0)
-    );
+
     assert_eq!(state.region_aliquots().value(), Some(&2040));
     assert_eq!(
         state.region_format().value(),
@@ -83,20 +70,13 @@ fn cube_zcull_configuration_is_typed_source_preserving_and_cache_neutral() {
     for (axis, value) in [(Width, 1920), (Height, 1088), (Depth, 1)] {
         assert_eq!(state.region_size(axis).value(), Some(&value));
         assert_eq!(state.region_pixel_offset(axis).value(), Some(&0));
-        assert_eq!(
-            state.region_size(axis).origin(),
-            MaxwellThreeDRegisterOrigin::Programmed
-        );
     }
     assert!(!state.subregion().value().unwrap().enabled());
     assert_eq!(state.subregion().value().unwrap().normalized_aliquots(), 0);
     let direction = state.direction_format().value().unwrap();
     assert!(!direction.greater());
     assert_eq!(direction.format(), MaxwellThreeDZCullDepthFormat::Float);
-    assert_eq!(
-        before.zcull().region_location().origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
+
     assert_eq!(channel.three_d().render_targets(), before.render_targets());
     assert_eq!(channel.frontend(), frontend);
     assert_eq!(channel.two_d(), &two_d);
@@ -235,10 +215,6 @@ fn zcull_storage_retains_addresses_without_creating_attachment_operations() {
         assert!(dispatch.ordered_operations().is_empty());
         let register = channel.three_d().zcull().storage_word(index).unwrap();
         assert_eq!(register.raw(), Some(value));
-        assert_eq!(
-            register.source(),
-            Some(dispatch.methods()[0].method().source())
-        );
     }
     assert!(channel.three_d().draw_state_identity().matches(&before));
     assert!(

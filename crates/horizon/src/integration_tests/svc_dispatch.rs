@@ -2952,9 +2952,63 @@ fn shared_font_service_publishes_caller_bytes_and_returns_a_read_only_copy_handl
 }
 
 #[test]
+fn hid_disconnect_validates_the_npad_id_and_the_pid_payload() {
+    let (_directory, mut process) = fixture_process_with_svcs(&[0x21; 4]);
+    let account = process.memory().system_account();
+    let hid = crate::HidSystem::new(account).unwrap();
+    let event = hid.acquire_style_event(0x20).unwrap();
+    event.clear();
+    let session = process
+        .handles()
+        .insert(HorizonIpcObject::Hid(crate::HidSession::new(
+            hid.shared_memory(),
+        )))
+        .unwrap();
+    let mut dispatcher = HorizonSvcDispatcher::new(
+        process.memory().space().machine().clone(),
+        OperationMode::default(),
+        crate::TimeEnvironment::new(account, nixe_runtime::VirtualClock::default(), "UTC").unwrap(),
+        hid,
+        crate::SharedFontSession::new(account, Default::default()).unwrap(),
+    );
+    let mut request = [0; 256];
+    put_u32(&mut request, 0, 4);
+    put_u32(&mut request, 4, 12 | (1 << 31));
+    put_u32(&mut request, 8, 1);
+    put_u32(&mut request, 32, 0x4943_4653);
+    put_u32(&mut request, 40, 107);
+    put_u32(&mut request, 48, 0x20);
+    put_u64(&mut request, 56, 1);
+    assert_eq!(
+        audout::call(&mut process, &mut dispatcher, session, &request),
+        0
+    );
+    assert!(event.is_signalled());
+    event.clear();
+    put_u32(&mut request, 48, 8);
+    assert_eq!(
+        audout::call(&mut process, &mut dispatcher, session, &request),
+        HorizonIpcResult::HID_INVALID_NPAD_ID.raw()
+    );
+    assert!(!event.is_signalled());
+    put_u32(&mut request, 48, 0);
+    assert_eq!(
+        audout::call(&mut process, &mut dispatcher, session, &request),
+        0
+    );
+    put_u32(&mut request, 4, 10);
+    put_u32(&mut request, 16, 0x4943_4653);
+    put_u32(&mut request, 24, 107);
+    assert_eq!(
+        audout::call(&mut process, &mut dispatcher, session, &request),
+        HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()
+    );
+}
+
+#[test]
 fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut instructions = vec![svc(0x1f)];
-    instructions.extend(std::iter::repeat_n(svc(0x21), 65));
+    instructions.extend(std::iter::repeat_n(svc(0x21), 71));
     instructions.extend([svc(0x13), svc(0x14), svc(0x21)]);
     let (_directory, mut process) = fixture_process(&instructions);
     let mut dispatcher = support::dispatcher_with_clock(
@@ -3072,6 +3126,20 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
             .as_deref(),
         Some(HorizonIpcObject::PerformanceManager(_))
     ));
+
+    let mut get_performance_mode = [0_u8; 0x100];
+    put_u32(&mut get_performance_mode, 0, 4);
+    put_u32(&mut get_performance_mode, 4, 8);
+    put_u32(&mut get_performance_mode, 16, 0x4943_4653);
+    put_u32(&mut get_performance_mode, 24, 1);
+    write_guest_bytes(&process, tls, &get_performance_mode);
+    state(&mut process).write_w(x(0), apm_handle);
+    assert!(matches!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    ));
+    assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
+    assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
 
     get_service[32..40].copy_from_slice(b"appletOE");
     write_guest_bytes(&process, tls, &get_service);
@@ -3562,6 +3630,17 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         u32::from(OperationMode::Console as u8)
     );
 
+    let mut get_common_performance_mode = get_operation_mode;
+    put_u32(&mut get_common_performance_mode, 40, 6);
+    write_guest_bytes(&process, tls, &get_common_performance_mode);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert!(matches!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    ));
+    assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+    assert_eq!(read_guest_u32(&process, tls.checked_add(48).unwrap()), 1);
+
     let mut get_resolution = get_operation_mode;
     put_u32(&mut get_resolution, 40, 60);
     write_guest_bytes(&process, tls, &get_resolution);
@@ -3624,6 +3703,44 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut unexpected_language_input, 4, 12);
     unexpected_language_input[18..20].copy_from_slice(&24_u16.to_le_bytes());
     write_guest_bytes(&process, tls, &unexpected_language_input);
+    state(&mut process).write_w(x(0), applet_handle);
+    assert!(matches!(
+        dispatch_next(&mut process, &mut dispatcher),
+        ExceptionHandlingResult::Resumed
+    ));
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(40).unwrap()),
+        HorizonIpcResult::CMIF_INVALID_IN_HEADER.raw()
+    );
+
+    let mut get_display_version = get_desired_language;
+    put_u32(&mut get_display_version, 40, 23);
+    for (version, expected) in [
+        ("2.3.4", *b"2.3.4\0\0\0\0\0\0\0\0\0\0\0"),
+        ("1234567890abcdef", *b"1234567890abcde\0"),
+        ("", [0; 16]),
+    ] {
+        dispatcher = dispatcher.with_application_display_version(version);
+        write_guest_bytes(&process, tls, &get_display_version);
+        state(&mut process).write_w(x(0), applet_handle);
+        assert!(matches!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        ));
+        assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
+        assert_eq!(
+            read_guest_u32(&process, tls.checked_add(44).unwrap()),
+            0x1234
+        );
+        assert_eq!(
+            read_guest_bytes(&process, tls.checked_add(48).unwrap(), 16),
+            expected
+        );
+        assert_eq!(read_guest_u32(&process, tls.checked_add(16).unwrap()), 0);
+    }
+    let mut unexpected_version_input = unexpected_language_input;
+    put_u32(&mut unexpected_version_input, 40, 23);
+    write_guest_bytes(&process, tls, &unexpected_version_input);
     state(&mut process).write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
@@ -6501,6 +6618,46 @@ fn random_entropy_get_info_uses_the_invalid_handle_and_process_stable_words() {
 }
 
 #[test]
+fn user_exception_context_get_info_returns_process_owned_memory_separate_from_thread_tls() {
+    let (_directory, mut process) = fixture_process(&[svc(0x29); 4]);
+    let mut dispatcher = support::dispatcher(&process);
+    let address = GuestVirtualAddress::new(query_process_info(&mut process, &mut dispatcher, 20));
+    let tls = process.main_thread().tls_base;
+    assert_eq!(address, process.user_exception_context_address());
+    assert_eq!(address.get() % 0x200, 0);
+    assert_eq!(address.get() / 4096, tls.get() / 4096);
+    assert!(address.get() + 0x200 <= tls.get() || tls.get() + 0x200 <= address.get());
+    assert_eq!(read_guest_bytes(&process, address, 0x200), vec![0; 0x200]);
+    write_guest_bytes(&process, address, &[0x5a; 0x200]);
+    write_guest_bytes(&process, tls, &[0xa5; 0x200]);
+    assert_eq!(
+        query_process_info(&mut process, &mut dispatcher, 20),
+        address.get()
+    );
+    assert_eq!(
+        read_guest_bytes(&process, address, 0x200),
+        vec![0x5a; 0x200]
+    );
+    for (handle, subtype, expected) in [
+        (0, 0, HorizonKernelResult::INVALID_HANDLE),
+        (
+            CURRENT_PROCESS_HANDLE,
+            1,
+            HorizonKernelResult::INVALID_COMBINATION,
+        ),
+    ] {
+        state(&mut process).write_w(x(1), 20);
+        state(&mut process).write_w(x(2), handle);
+        state(&mut process).write_x(x(3), subtype);
+        assert!(matches!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Resumed
+        ));
+        assert_eq!(state(&mut process).read_w(x(0)), expected.raw());
+    }
+}
+
+#[test]
 fn physical_memory_get_info_views_share_incremental_process_accounting() {
     let mut instructions = vec![svc(0x29); 6];
     instructions.push(svc(0x01));
@@ -6897,6 +7054,11 @@ mod auddev;
 mod audout;
 #[path = "svc_dispatch/audren.rs"]
 mod audren;
+
+#[path = "svc_dispatch/hwopus.rs"]
+mod hwopus;
+#[path = "svc_dispatch/prepo.rs"]
+mod prepo;
 
 #[path = "svc_dispatch/tipc.rs"]
 mod tipc;

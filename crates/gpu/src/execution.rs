@@ -69,20 +69,28 @@ pub trait GpuExecution: Send + 'static {
     ) -> Result<(), BackendRuntimeError> {
         Ok(())
     }
-    /// Submit a required progress point and arrange a wakeup on completion.
+    /// Register the earliest completion wakeup without sealing pending work.
     /// The owner polls before registration. If native work completes in that
     /// interval, invoke the bound wakeup immediately rather than losing it.
     /// The queue owner retains all submission, retirement and publication authority.
-    fn request_completion_wakeup(&mut self) -> Result<(), BackendRuntimeError> {
+    fn arm_completion_wakeup(&mut self) -> Result<(), BackendRuntimeError> {
         Ok(())
     }
-    fn external_image_device(&self) -> Option<[u8; 16]> {
+    /// Earliest deadline for native work not yet submitted. No deadline when idle.
+    fn pending_submit_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+    /// Seal pending native work for a real dependency, explicit flush or shutdown.
+    fn flush(&mut self) -> Result<(), BackendRuntimeError>;
+    fn device_uuid(&self) -> Option<[u8; 16]> {
         None
     }
     /// Consume one ordered effect. False means a compiler dependency is pending:
     /// no guest effect has executed, and the caller may retry after a wake.
     /// True means resources were consumed and native work was recorded once.
     fn consume(&mut self, command: &Self::Commands) -> Result<bool, BackendRuntimeError>;
+    /// Register this delivery's ordered completion on the current native tick.
+    /// This does not force an otherwise unnecessary native submission.
     fn submit(
         &mut self,
         frontend: crate::FrontendSubmissionId,
@@ -145,6 +153,9 @@ pub trait GpuExecution: Send + 'static {
 impl GpuExecution for std::convert::Infallible {
     type Commands = crate::native::NativeWork;
     type ImageRequest = crate::native::NativePresentationImage;
+    fn flush(&mut self) -> Result<(), BackendRuntimeError> {
+        match *self {}
+    }
     fn consume(&mut self, _batch: &Self::Commands) -> Result<bool, BackendRuntimeError> {
         match *self {}
     }

@@ -401,12 +401,11 @@ impl VulkanResidency {
                 vk::AccessFlags2::TRANSFER_READ,
             ),
         )?;
-        let slot = self.device.begin_recording()?;
+        self.device.begin_recording()?;
         self.barriers.emit(&mut self.device);
-        let command = self.device.submission.slots[slot].command;
+
         unsafe {
             self.device.dispatch.cmd_copy_buffer(
-                command,
                 source,
                 copy.handle,
                 &[vk::BufferCopy::default().src_offset(offset).size(size)],
@@ -420,10 +419,9 @@ impl VulkanResidency {
                 .dst_access_mask(vk::AccessFlags2::UNIFORM_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)];
-            self.device.dispatch.barrier(
-                command,
-                &vk::DependencyInfo::default().buffer_memory_barriers(&barrier),
-            );
+            self.device
+                .dispatch
+                .barrier(&vk::DependencyInfo::default().buffer_memory_barriers(&barrier));
         }
         // The recording slot owns the transfer; its descriptor record extends
         // the allocation through the actual shader consumer if preparation submits.
@@ -527,21 +525,25 @@ impl VulkanResidency {
                         .observe_native(Resource::Buffer(id), Arc::clone(f))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let contents = self.contents_mut(Resource::Buffer(id));
-            contents.device = device;
+            let entry = self.buffer_mut(id);
+            entry.contents.device = device;
+            // Retain unresolved regions as dirty instead of reconstructing the
+            // entire allocation when a different native interpretation writes.
+            // Consumption synchronizes only the pages used by this binding.
+            // https://github.com/eden-emulator/mirror/blob/master/src/video_core/buffer_cache/buffer_cache.h
+            entry.invalid.clear();
+            entry.invalid.push((0, size));
         }
         let page = nixe_memory::PAGE_SIZE;
         let begin = offset / page * page;
         let end = ((offset + requested_size).div_ceil(page) * page).min(size);
-        if !changed {
-            geometry[0] = Footprint::new(
-                Arc::clone(geometry[0].mapping()),
-                nixe_gpu::physical::WriteDomain::Buffer {
-                    start: begin,
-                    bytes: end - begin,
-                },
-            )?;
-        }
+        geometry[0] = Footprint::new(
+            Arc::clone(geometry[0].mapping()),
+            nixe_gpu::physical::WriteDomain::Buffer {
+                start: begin,
+                bytes: end - begin,
+            },
+        )?;
         let mut parts = Vec::new();
         for footprint in &geometry {
             parts.extend(self.authority.resolve_footprint(footprint)?);
@@ -607,24 +609,17 @@ impl VulkanResidency {
                     vk::AccessFlags2::TRANSFER_READ,
                 ),
             )?;
-            let slot = self.device.begin_recording()?;
+            self.device.begin_recording()?;
             let work = self.device.work_ticket()?;
             self.device.retire_buffer(Arc::clone(&scratch), work)?;
             self.barriers.emit(&mut self.device);
             unsafe {
-                let command = self.device.submission.slots[slot].command;
                 self.device.dispatch.cmd_copy_buffer(
-                    command,
                     source,
                     scratch.handle,
                     &[vk::BufferCopy::default().size(bytes)],
                 );
-                super::recording::scratch_read_barrier(
-                    &mut self.device,
-                    command,
-                    scratch.handle,
-                    bytes,
-                );
+                super::recording::scratch_read_barrier(&mut self.device, scratch.handle, bytes);
             }
             Some(scratch)
         } else {
@@ -677,13 +672,12 @@ impl VulkanResidency {
                         vk::AccessFlags2::TRANSFER_WRITE,
                     ),
                 )?;
-                let slot = self.device.begin_recording()?;
+                self.device.begin_recording()?;
                 let work = self.device.work_ticket()?;
                 self.device.retire_buffer(Arc::clone(scratch), work)?;
                 self.barriers.emit(&mut self.device);
                 unsafe {
                     self.device.dispatch.cmd_copy_buffer(
-                        self.device.submission.slots[slot].command,
                         scratch.handle,
                         target,
                         &[vk::BufferCopy::default()

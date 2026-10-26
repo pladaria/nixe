@@ -49,6 +49,9 @@ pub enum HorizonIpcObject {
     AudioRendererManager(crate::AudioRendererManagerSession),
     AudioRenderer(crate::AudioRendererSession),
     AudioDevice(crate::AudioDeviceSession),
+    OpusManager(crate::OpusManagerSession),
+    OpusDecoder(crate::OpusDecoderSession),
+    PlayReport(crate::PlayReportSession),
     Hid(HidSession),
     SharedFont(crate::SharedFontSession),
     Irs(IrsSession),
@@ -1545,6 +1548,15 @@ pub enum OperationMode {
 impl OperationMode {
     pub(crate) const fn as_raw(self) -> u8 {
         self as u8
+    }
+
+    // APM reports Normal when handheld and Boost when docked.
+    // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/core/hle/service/apm/apm_controller.cpp
+    pub(crate) const fn performance_mode(self) -> u32 {
+        match self {
+            Self::Handheld => 0,
+            Self::Console => 1,
+        }
     }
 
     // AM's output resolution follows the selected operation mode. It is
@@ -3180,7 +3192,9 @@ pub struct PerformanceManagerSession {
 impl PerformanceManagerSession {
     pub(crate) fn new() -> Self {
         Self {
-            configurations: Arc::new(Mutex::new([0; 2])),
+            // Default APM clock configuration (1020 MHz CPU), for both modes.
+            // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/core/hle/service/apm/apm_controller.cpp
+            configurations: Arc::new(Mutex::new([0x0002_0003; 2])),
         }
     }
 
@@ -3229,9 +3243,10 @@ mod performance_tests {
         let first = manager.open_session();
         let second = manager.open_session();
 
-        assert_eq!(first.configuration(0), Some(0));
-        assert!(first.set_configuration(0, 0x1234));
-        assert_eq!(second.configuration(0), Some(0x1234));
+        assert_eq!(first.configuration(0), Some(0x0002_0003));
+        assert_eq!(first.configuration(1), Some(0x0002_0003));
+        assert!(first.set_configuration(0, 0x0002_0004));
+        assert_eq!(second.configuration(0), Some(0x0002_0004));
         assert!((second.configuration(2)).is_none());
         assert!(!second.set_configuration(2, 1));
     }

@@ -21,6 +21,9 @@ pub(super) mod content;
 mod ectx;
 pub(super) mod fsp;
 mod hid;
+mod hwopus;
+mod prepo;
+pub(super) use prepo::dispatch_play_report;
 mod irs;
 mod lm;
 mod mm;
@@ -51,6 +54,7 @@ pub(super) use ectx::dispatch_error_context_writer;
 pub(super) use hid::{
     dispatch_hid, dispatch_hid_active_vibration_device_list, dispatch_hid_applet_resource,
 };
+pub(super) use hwopus::{dispatch_opus_decoder, dispatch_opus_manager};
 pub(super) use irs::dispatch_irs;
 pub(super) use lm::{dispatch_log_manager, dispatch_logger};
 pub(super) use nifm::{

@@ -77,7 +77,9 @@ impl ShaderInterface {
                         MaxwellThreeDTextureDimension::Two
                     }
                     TextureType::ColorArray2D => MaxwellThreeDTextureDimension::TwoArray,
+                    TextureType::Color3D => MaxwellThreeDTextureDimension::Three,
                     TextureType::ColorCube => MaxwellThreeDTextureDimension::Cube,
+                    TextureType::ColorArrayCube => MaxwellThreeDTextureDimension::CubeArray,
                     other => {
                         return Err(compilation(format!(
                             "native sampled-image dimension {other:?} is not implemented"

@@ -206,6 +206,8 @@ pub enum ImageFormat {
     /// https://learn.microsoft.com/en-us/windows/win32/direct3d11/bc7-format
     Bc7RgbaUnorm,
     Bc7RgbaSrgb,
+    /// Packed UNORM: R in bits 9:0, G in 19:10, B in 29:20, A in 31:30.
+    Rgb10a2Unorm,
 }
 
 impl ImageFormat {
@@ -400,6 +402,7 @@ impl ImageFormat {
             | Self::Bgra8Srgb
             | Self::Rg16Float
             | Self::Rg11b10Ufloat
+            | Self::Rgb10a2Unorm
             | Self::R32Float
             | Self::Depth24UnormStencil8Uint
             | Self::Depth32Float => 4,

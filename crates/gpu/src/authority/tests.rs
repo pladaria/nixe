@@ -119,6 +119,7 @@ fn image_writer_canonicalization_preserves_partial_geometry_and_native_layout() 
     let small = PhysicalMapping::new(&[range.slice(0, PAGE_SIZE).unwrap()]).unwrap();
     let large = PhysicalMapping::new(std::slice::from_ref(&range)).unwrap();
     let geometry = ImageFootprint {
+        depth_slice: 0,
         base: 0,
         columns: 1,
         rows: 1,
@@ -399,6 +400,7 @@ fn tiled_demand_sweep_preserves_rectangles_aspects_cpu_holes_and_native_offsets(
         Footprint::new(
             mapping,
             WriteDomain::Image(ImageFootprint {
+                depth_slice: 0,
                 base: 0,
                 columns: 17,
                 rows: 13,
@@ -407,6 +409,7 @@ fn tiled_demand_sweep_preserves_rectangles_aspects_cpu_holes_and_native_offsets(
                 aspect_bytes,
                 storage: ImageStorage::BlockLinear {
                     block_height_log2: 2,
+                    block_depth_log2: 0,
                 },
                 native_base: 0,
                 native_element_bytes,
@@ -702,6 +705,7 @@ fn packed_image_aspects_do_not_claim_padding_or_each_others_bytes() {
         Footprint::new(
             Arc::clone(&mapping),
             WriteDomain::Image(ImageFootprint {
+                depth_slice: 0,
                 base: 0,
                 columns: 3,
                 rows: 2,

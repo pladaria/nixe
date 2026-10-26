@@ -142,7 +142,7 @@ pub use render_targets::{
     MaxwellThreeDRenderTargetWrite, MaxwellThreeDSeparateFragmentData,
     MaxwellThreeDZCompressionMode,
 };
-pub(crate) use resource::MaxwellThreeDResolvedResourceCache;
+pub(crate) use resource::{ComputeTextures, MaxwellThreeDResolvedResourceCache};
 pub use resource::{
     MaxwellThreeDGuestImageFormat, MaxwellThreeDMappingReference,
     MaxwellThreeDPreservedImageLayout, MaxwellThreeDResolvedBuffer, MaxwellThreeDResolvedImage,
@@ -168,9 +168,8 @@ pub use state::{
     MaxwellThreeDFillViaTriangleMode, MaxwellThreeDPointCenterMode, MaxwellThreeDPointSize,
     MaxwellThreeDPointSpriteOrigin, MaxwellThreeDPointSpriteRMode, MaxwellThreeDPointSpriteSelect,
     MaxwellThreeDRasterBoundingBox, MaxwellThreeDRasterBoundingBoxMode, MaxwellThreeDRasterState,
-    MaxwellThreeDRegister, MaxwellThreeDRegisterOrigin, MaxwellThreeDState,
-    MaxwellThreeDStateWrite, MaxwellThreeDViewportPixelCenter, MaxwellThreeDViewportState,
-    MaxwellThreeDViewportZClipRange,
+    MaxwellThreeDRegister, MaxwellThreeDState, MaxwellThreeDStateWrite,
+    MaxwellThreeDViewportPixelCenter, MaxwellThreeDViewportState, MaxwellThreeDViewportZClipRange,
 };
 pub(crate) use state::{MaxwellThreeDFrontendState, MaxwellThreeDResourceStateIdentity};
 pub use tiled_cache::{
@@ -224,6 +223,7 @@ enum PendingOperation {
         source: crate::MaxwellMethodSource,
     },
     ThreeD(MaxwellThreeDOperationTrigger),
+    RenderCondition(crate::MaxwellMethodSource),
     Synchronization(MaxwellThreeDSynchronizationTrigger),
     InlineToMemory(MaxwellInlineToMemoryUpload),
     InlineConstantBuffer(MaxwellThreeDInlineConstantBufferUpload),
@@ -358,6 +358,8 @@ enum MethodAction {
     IncrementSyncpoint,
     ViewportZClip,
     RenderEnableControl,
+    RenderEnableAddressUpper,
+    RenderEnableAddressLower,
     RenderEnableMode,
     RenderEnableOverride,
     PsOutputSampleMaskUsage,
@@ -1158,6 +1160,8 @@ methods!(
         0x0000_0003,
         MethodAction::RenderEnableOverride
     ),
+    SET_RENDER_ENABLE_A => (0x1550, "SET_RENDER_ENABLE_A", 0xff, MethodAction::RenderEnableAddressUpper),
+    SET_RENDER_ENABLE_B => (0x1554, "SET_RENDER_ENABLE_B", u32::MAX, MethodAction::RenderEnableAddressLower),
     SET_RENDER_ENABLE_C => (
         0x1558,
         "SET_RENDER_ENABLE_C",
@@ -1292,7 +1296,7 @@ where
                 .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
             return Ok(());
         }
-        let mut dispatch = MaxwellMethodDispatch::emitted_by_mme(source, CLASS);
+        let mut dispatch = MaxwellMethodDispatch::class_method(source, CLASS);
         // MME sends use the same method path, including shadow tracking/replay,
         // as pushbuffer writes. The interpreter and JIT both call CallMethod:
         // https://github.com/eden-emulator/mirror/blob/67bada77f8a43a90da2e94e89b8e7da73c256989/src/video_core/macro.cpp#L664-L666
@@ -1350,6 +1354,9 @@ fn lower_pending_operation(
             PendingEngineOperation::Notification { address, source }
         }
         PendingOperation::ThreeD(trigger) => PendingEngineOperation::ThreeD(trigger),
+        PendingOperation::RenderCondition(source) => {
+            PendingEngineOperation::ThreeDRenderCondition(source)
+        }
         PendingOperation::Synchronization(trigger) => {
             PendingEngineOperation::ThreeDSynchronization(trigger)
         }
@@ -1764,8 +1771,8 @@ fn preflight_register(
         | MethodAction::PointCenterMode
         | MethodAction::EdgeFlag
         | MethodAction::ViewportZClip
-        | MethodAction::RenderEnableOverride
-        | MethodAction::RenderEnableMode
+        | MethodAction::RenderEnableAddressUpper
+        | MethodAction::RenderEnableAddressLower
         | MethodAction::PsOutputSampleMaskUsage
         | MethodAction::HybridAntiAliasControl
         | MethodAction::TirMode
@@ -1812,6 +1819,12 @@ fn preflight_register(
                 candidate.apply(write, changed);
             }
             state_write()
+        }
+        MethodAction::RenderEnableMode | MethodAction::RenderEnableOverride => {
+            if let Some(write) = decode_declared_state(source, declaration)? {
+                candidate.apply(write, changed);
+            }
+            (Some(PendingOperation::RenderCondition(source)), true)
         }
         MethodAction::Notify => {
             if source.argument() != 0 {
@@ -2639,6 +2652,18 @@ fn decode_declared_state(
             );
             Ok(Some(write))
         }
+        MethodAction::RenderEnableAddressUpper => Ok(Some(MaxwellThreeDStateWrite::RenderEnable(
+            MaxwellThreeDRenderEnableStateWrite::AddressUpper {
+                value: source.argument() as u8,
+                source,
+            },
+        ))),
+        MethodAction::RenderEnableAddressLower => Ok(Some(MaxwellThreeDStateWrite::RenderEnable(
+            MaxwellThreeDRenderEnableStateWrite::AddressLower {
+                value: source.argument(),
+                source,
+            },
+        ))),
         MethodAction::RenderEnableMode => {
             let value = MaxwellThreeDRenderEnableMode::parse(source.argument()).ok_or(
                 MaxwellEngineDispatchError::InvalidMethodValue {
@@ -5441,14 +5466,7 @@ mod routing_tests {
     #[test]
     fn routing_covers_every_specialized_register_and_keeps_other_methods_out() {
         let mut channel = crate::engines::tests::three_d_channel();
-        crate::engines::tests::program_three_d(&mut channel, 0x0d74, 0);
-        let template = channel
-            .three_d()
-            .vertex_input()
-            .primitive()
-            .vertex_array_start()
-            .source()
-            .unwrap();
+        let template = crate::engines::tests::program_three_d(&mut channel, 0x0d74, 0);
         let candidate = channel.three_d_mut();
         for method in (0..0x4000).step_by(4) {
             for argument in [0, 1, u32::MAX] {

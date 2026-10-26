@@ -7,6 +7,7 @@ pub(crate) mod execution;
 mod layout;
 mod memory_accounting;
 mod thread;
+mod thread_local;
 
 pub use builder::ProcessBuilder;
 pub(crate) use builder::ThreadPolicy;
@@ -32,7 +33,7 @@ use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
 use crate::GuestCpuState;
-use crate::memory::{Mapping, MemoryKind, ProcessMemory};
+use crate::memory::ProcessMemory;
 use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
@@ -55,7 +56,6 @@ const DEFAULT_IMAGE_BASE: u64 = 0x7100_0000;
 const DEFAULT_HOME_BREW_STACK_SIZE: u64 = 0x10_0000;
 const MODULE_GUARD_SIZE: u64 = 0x1_0000;
 const RESOURCE_GUARD_SIZE: u64 = 0x1_0000;
-const TLS_SIZE: u64 = PAGE_SIZE;
 const HOME_BREW_CONFIG_ENTRY_SIZE: usize = 24;
 const HOME_BREW_MAIN_THREAD_HANDLE_KEY: u32 = 1;
 const HOME_BREW_ARGV_KEY: u32 = 5;
@@ -81,8 +81,8 @@ pub struct RunnableProcess {
     initial_thread_priority: i32,
     initial_ideal_vcpu: nixe_scheduler::VirtualCpuId,
     thread_policy: Option<ThreadPolicy>,
-    next_thread_tls: GuestVirtualAddress,
-    free_thread_tls: std::collections::BTreeSet<GuestVirtualAddress>,
+    thread_local: thread_local::ThreadLocalPages,
+    process_local_region: GuestVirtualAddress,
     threads: crate::ThreadTable,
     mounts: std::sync::Arc<crate::ProcessMountNamespace>,
     handles: std::sync::Arc<crate::HandleTable>,
@@ -118,6 +118,12 @@ impl RunnableProcess {
     #[must_use]
     pub const fn memory_layout(&self) -> ProcessMemoryLayout {
         self.memory_layout
+    }
+
+    /// Kernel-owned exception context, retained independently of thread TLS.
+    #[must_use]
+    pub const fn user_exception_context_address(&self) -> GuestVirtualAddress {
+        self.process_local_region
     }
 
     /// Returns the currently committed process heap size.
@@ -247,56 +253,23 @@ impl RunnableProcess {
         id: nixe_scheduler::GuestThreadId,
         request: &ThreadCreateRequest,
     ) -> Result<ThreadCreation, ThreadCreateError> {
-        let recycled_tls = self.free_thread_tls.pop_first();
-        let tls_base = match recycled_tls {
-            Some(tls_base) => tls_base,
-            None => self
-                .next_thread_tls
-                .checked_sub(TLS_SIZE)
-                .ok_or(ThreadCreateError::ResourceLimit)?,
-        };
-        if tls_base.get() < self.memory_layout.stack().base().get() {
-            log::debug!(
-                "thread TLS allocation exhausted stack region: tls={tls_base:?} stack={:?}",
-                self.memory_layout.stack()
-            );
-            return Err(ThreadCreateError::ResourceLimit);
-        }
-        self.memory
-            .map_zeroed(
-                tls_base,
-                TLS_SIZE,
-                Mapping {
-                    kind: MemoryKind::ThreadLocal,
-                    permissions: MemoryPermissions::READ_WRITE,
-                    uncached: false,
-                    locked: false,
-                    permission_locked: false,
-                },
-            )
-            .map_err(|error| {
-                log::debug!("thread TLS mapping failed: tls={tls_base:?} error={error:?}");
-                ThreadCreateError::ResourceLimit
-            })?;
+        let tls_base = self.thread_local.allocate(&self.memory).map_err(|error| {
+            log::debug!("thread TLS allocation failed: error={error:?}");
+            ThreadCreateError::ResourceLimit
+        })?;
         let object = crate::ThreadObject::new(id.get());
         let handle = match self.handles.insert(object.clone()) {
             Ok(handle) => handle,
             Err(error) => {
                 log::debug!("thread handle allocation failed: {error}");
-                self.rollback_thread_tls(tls_base);
-                if recycled_tls.is_some() {
-                    self.free_thread_tls.insert(tls_base);
-                }
+                self.thread_local.release(&self.memory, tls_base);
                 return Err(ThreadCreateError::ResourceLimit);
             }
         };
         let mut state = GuestCpuState::default();
         if initialize_created_thread(&mut state, request, tls_base).is_err() {
             let _ = self.handles.close(handle);
-            self.rollback_thread_tls(tls_base);
-            if recycled_tls.is_some() {
-                self.free_thread_tls.insert(tls_base);
-            }
+            self.thread_local.release(&self.memory, tls_base);
             return Err(ThreadCreateError::Internal);
         }
         let thread = GuestThread {
@@ -313,14 +286,8 @@ impl RunnableProcess {
         };
         if self.threads.insert(thread).is_err() {
             let _ = self.handles.close(handle);
-            self.rollback_thread_tls(tls_base);
-            if recycled_tls.is_some() {
-                self.free_thread_tls.insert(tls_base);
-            }
+            self.thread_local.release(&self.memory, tls_base);
             return Err(ThreadCreateError::Internal);
-        }
-        if recycled_tls.is_none() {
-            self.next_thread_tls = tls_base;
         }
         Ok(ThreadCreation { id, handle })
     }
@@ -328,7 +295,7 @@ impl RunnableProcess {
     pub(crate) fn rollback_created_thread(&mut self, id: nixe_scheduler::GuestThreadId) {
         if let Ok(thread) = self.threads.remove(id) {
             let _ = self.handles.close(thread.handle);
-            self.release_thread_tls(thread.tls_base);
+            self.thread_local.release(&self.memory, thread.tls_base);
         }
     }
 
@@ -340,40 +307,8 @@ impl RunnableProcess {
             .threads
             .remove(id)
             .map_err(|_| ThreadCreateError::Internal)?;
-        self.release_thread_tls(thread.tls_base);
+        self.thread_local.release(&self.memory, thread.tls_base);
         Ok(())
-    }
-
-    fn release_thread_tls(&mut self, tls_base: GuestVirtualAddress) {
-        self.rollback_thread_tls(tls_base);
-        if tls_base == self.next_thread_tls {
-            self.next_thread_tls = self
-                .next_thread_tls
-                .checked_add(TLS_SIZE)
-                .expect("allocated TLS lies below the finite stack-region end");
-            while self.free_thread_tls.remove(&self.next_thread_tls) {
-                self.next_thread_tls = self
-                    .next_thread_tls
-                    .checked_add(TLS_SIZE)
-                    .expect("freed TLS lies below the finite stack-region end");
-            }
-        } else {
-            self.free_thread_tls.insert(tls_base);
-        }
-    }
-
-    fn rollback_thread_tls(&self, tls_base: GuestVirtualAddress) {
-        let _ = self.memory.unmap(
-            tls_base,
-            TLS_SIZE,
-            Mapping {
-                kind: MemoryKind::ThreadLocal,
-                permissions: MemoryPermissions::READ_WRITE,
-                uncached: false,
-                locked: false,
-                permission_locked: false,
-            },
-        );
     }
 
     /// Replaces the provisional main-thread identity before publication. The

@@ -398,6 +398,12 @@ impl ShaderCompiler {
     pub fn usage(&self) -> (usize, usize) {
         self.cache.usage()
     }
+    pub(crate) fn cache_counters(&self) -> nixe_gpu::cache_counters::CacheCounters {
+        self.cache.counters()
+    }
+    pub(crate) fn stage_counters(&self) -> nixe_gpu::cache_counters::CacheCounters {
+        self.stages.counters.clone()
+    }
 }
 fn native_identity(stages: &[Arc<CompiledStage>]) -> ContentId {
     let identities: Vec<_> = stages.iter().map(|s| s.identity.0.as_slice()).collect();

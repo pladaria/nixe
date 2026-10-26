@@ -91,8 +91,8 @@ pub(super) const fn passive_action(action: MethodAction) -> bool {
         | MethodAction::EdgeFlag
         | MethodAction::ViewportZClip
         | MethodAction::RenderEnableControl
-        | MethodAction::RenderEnableMode
-        | MethodAction::RenderEnableOverride
+        | MethodAction::RenderEnableAddressUpper
+        | MethodAction::RenderEnableAddressLower
         | MethodAction::PsOutputSampleMaskUsage
         | MethodAction::VisibleCallLimit
         | MethodAction::SmTimeoutCounterBit
@@ -126,6 +126,8 @@ pub(super) const fn passive_action(action: MethodAction) -> bool {
         | MethodAction::ZCullEnable
         | MethodAction::ZCullBounds => true,
         MethodAction::Notify
+        | MethodAction::RenderEnableMode
+        | MethodAction::RenderEnableOverride
         | MethodAction::NoOperation
         | MethodAction::DecompressSurface
         | MethodAction::WaitForIdle
@@ -298,7 +300,7 @@ pub(in crate::engines) fn embedded_words(
     candidate.apply(
         MaxwellThreeDStateWrite::InlineToMemory(MaxwellThreeDInlineToMemoryStateWrite::Data {
             value: last.argument(),
-            next_offset: upload.offset() + count as u32 * 4,
+            next_offset: upload.offset() + upload.remaining_bytes().min(count as u32 * 4),
             source: last,
         }),
         true,
@@ -316,12 +318,11 @@ mod tests {
     #[test]
     fn deferred_values_are_visible_to_mme_before_decode_and_unchanged_groups_keep_identities() {
         let mut channel = crate::engines::tests::three_d_channel();
-        crate::engines::tests::program_three_d(&mut channel, 0x1518, 0);
-        let source = channel.three_d().raster().point_size().source().unwrap();
+        let source = crate::engines::tests::program_three_d(&mut channel, 0x1518, 0);
         let (profile, state) = channel.three_d_with_profile_mut();
         let before = state.operation_state().draw_state_identity();
         for value in 1..=100 {
-            let mut method = MaxwellMethodDispatch::emitted_by_mme(
+            let mut method = MaxwellMethodDispatch::class_method(
                 source.emitted_by_mme(GpuMethodId(0x1518), value),
                 CLASS,
             );
@@ -334,7 +335,7 @@ mod tests {
         assert!(!before.matches_parameters(state.operation_state()));
         let current = state.operation_state().draw_state_identity();
         for _ in 0..100 {
-            let mut method = MaxwellMethodDispatch::emitted_by_mme(
+            let mut method = MaxwellMethodDispatch::class_method(
                 source.emitted_by_mme(GpuMethodId(0x1518), 100),
                 CLASS,
             );
@@ -344,7 +345,7 @@ mod tests {
         // An intermediate changed value restored before consumption also keeps
         // the already decoded group and its prepared identity.
         for value in [101, 102, 100] {
-            let mut method = MaxwellMethodDispatch::emitted_by_mme(
+            let mut method = MaxwellMethodDispatch::class_method(
                 source.emitted_by_mme(GpuMethodId(0x1518), value),
                 CLASS,
             );
@@ -360,16 +361,10 @@ mod tests {
     #[test]
     fn passive_values_are_decoded_once_when_consumed() {
         let mut channel = crate::engines::tests::three_d_channel();
-        crate::engines::tests::program_three_d(&mut channel, 0x1220, 5);
-        let source = channel
-            .three_d()
-            .render_targets()
-            .compression_threshold()
-            .source()
-            .unwrap();
+        let source = crate::engines::tests::program_three_d(&mut channel, 0x1220, 5);
         let (profile, state) = channel.three_d_with_profile_mut();
         let write = |state: &mut MaxwellThreeDFrontendState, value| {
-            let mut method = MaxwellMethodDispatch::emitted_by_mme(
+            let mut method = MaxwellMethodDispatch::class_method(
                 source.emitted_by_mme(GpuMethodId(0x1220), value),
                 CLASS,
             );
@@ -409,14 +404,7 @@ mod tests {
     #[test]
     fn passive_table_never_coalesces_an_execution_method_or_unknown_address() {
         let mut channel = crate::engines::tests::three_d_channel();
-        crate::engines::tests::program_three_d(&mut channel, 0x0d74, 0);
-        let source = channel
-            .three_d()
-            .vertex_input()
-            .primitive()
-            .vertex_array_start()
-            .source()
-            .unwrap();
+        let source = crate::engines::tests::program_three_d(&mut channel, 0x0d74, 0);
         let (profile, state) = channel.three_d_with_profile_mut();
         for method in (0..0x4000).step_by(4) {
             if passive(GpuMethodId(method)) {

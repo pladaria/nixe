@@ -14,6 +14,27 @@ pub(super) struct Attachment {
     pub(super) pool: Option<usize>,
 }
 impl Attachment {
+    pub(super) fn write(
+        &self,
+        memory: &RenderMemory,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), RenderError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let machine = self.ranges[0].allocation().machine();
+        match machine
+            .write_captured(&self.ranges, offset, bytes)
+            .map_err(Arc::new)?
+        {
+            Access::Ready(()) => Ok(()),
+            Access::Pending(pending) => match memory.wait(pending)? {
+                AccessResult::Written => Ok(()),
+                _ => Err("invalid DSP memory write completion".into()),
+            },
+        }
+    }
     pub(super) fn read(
         &self,
         memory: &RenderMemory,

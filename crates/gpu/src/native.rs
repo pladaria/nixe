@@ -321,19 +321,10 @@ pub enum NativeCommand {
         sampling: Option<([i64; 2], [i64; 2])>,
     },
     Ordering(CacheMaintenanceOperation),
-    Barrier(BarrierOperation),
     ConvertNv12 {
-        images: Box<[GuestImage; 3]>,
+        destination: Box<GuestImage>,
+        source: Nv12Planes,
         transform: Nv12ColorTransform,
-    },
-    UploadPlanes {
-        images: Box<[GuestImage; 2]>,
-        bytes: [Arc<[u8]>; 2],
-        widths: [u32; 2],
-    },
-    ImportDecodedPlanes {
-        images: Box<[GuestImage; 2]>,
-        frame: DeviceImageFrame,
     },
 }
 #[derive(Clone, Debug)]
@@ -417,21 +408,9 @@ impl NativeCommand {
                 image(source, inputs)?;
                 image(destination, inputs)?;
             }
-            Self::ConvertNv12 { images, .. } => {
-                for input in images.iter() {
-                    image(input, inputs)?;
-                }
-            }
-            Self::UploadPlanes { images, .. } | Self::ImportDecodedPlanes { images, .. } => {
-                for input in images.iter() {
-                    image(input, inputs)?;
-                }
-            }
+            Self::ConvertNv12 { destination, .. } => image(destination, inputs)?,
             // ReportMemory already owns its exact AllocationRange values.
-            Self::ReportMemory { .. }
-            | Self::WaitForIdle
-            | Self::Ordering(_)
-            | Self::Barrier(_) => {}
+            Self::ReportMemory { .. } | Self::WaitForIdle | Self::Ordering(_) => {}
         }
         Ok(())
     }
@@ -445,6 +424,7 @@ pub enum GuestImageAspect {
 }
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct GuestImagePlane {
+    pub depth_slice: u32,
     pub mip_level: u32,
     pub array_layer: u32,
     pub aspect: GuestImageAspect,

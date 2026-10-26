@@ -63,12 +63,16 @@ impl Worker {
             .name("nixe-host1x".into())
             .spawn(move || {
                 let mut decoders = BTreeMap::new();
-                let mut channels = BTreeMap::new();
+                let mut channels = BTreeMap::<NvDrvFileDescriptor, DecodeState>::new();
                 while let Ok(message) = receiver.recv() {
                     match message {
                         Message::Stop => break,
                         Message::Close(fd, ack) => {
-                            decoders.remove(&fd);
+                            if decoders.remove(&fd).is_some() {
+                                for state in channels.values_mut() {
+                                    if state.vic.decoder == Some(fd) { state.vic = Default::default(); }
+                                }
+                            }
                             channels.remove(&fd);
                             let _ = ack.send(());
                         }
@@ -84,7 +88,7 @@ impl Worker {
                                 continue;
                             }
                             let execute = || -> Result<(), String> {
-                                let state = channels.entry(job.descriptor.fd()).or_insert_with(DecodeState::default);
+                                let state = channels.entry(job.descriptor.fd()).or_default();
                                 let operations = decode(state, &job)?;
                                 for operation in &operations {
                                     match operation {
@@ -100,12 +104,12 @@ impl Worker {
                                             match job.descriptor.kind() {
                                                 NvDrvDeviceKind::HostNvDec => {
                                                     if let std::collections::btree_map::Entry::Vacant(entry) = decoders.entry(job.descriptor.fd()) {
-                                                        entry.insert(video::NvDec::new(gpu.as_deref().and_then(|gpu| gpu.image_device()))?);
+                                                        entry.insert(video::NvDec::new(gpu.as_deref().and_then(|gpu| gpu.device_uuid())));
                                                     }
-                                                    decoders.get_mut(&job.descriptor.fd()).unwrap().execute(registers, &job.mappings, gpu.as_deref())?;
+                                                    decoders.get_mut(&job.descriptor.fd()).unwrap().execute(registers, &job.mappings)?;
                                                 }
                                                 NvDrvDeviceKind::HostVic => {
-                                                    super::vic::execute_with_gpu(registers, &job.mappings, gpu.as_deref())?
+                                                    state.vic.execute(registers, &job.mappings, gpu.as_deref(), &mut decoders)?
                                                 }
                                                 _ => return Err("invalid Host1x engine".into()),
                                             }
@@ -297,12 +301,14 @@ fn wait(
 struct DecodeState {
     packet: super::PacketState,
     registers: Vec<u32>,
+    vic: super::vic::Vic,
 }
 impl Default for DecodeState {
     fn default() -> Self {
         Self {
             packet: Default::default(),
             registers: vec![0; 0x446],
+            vic: Default::default(),
         }
     }
 }

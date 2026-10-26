@@ -68,6 +68,11 @@ struct Core final : Dynarmic::A64::UserCallbacks {
     conf.check_halt_on_memory_access = true;
     conf.hook_hint_instructions = true;
     conf.hook_data_cache_operations = true;
+    // Use Eden's defined choices for constrained-unpredictable encodings,
+    // including overlapping status/data zero registers in STXR/STLXR.
+    // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/STLXR--Store-Release-Exclusive-Register-
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+    conf.define_unpredictable_behaviour = true;
     conf.fastmem_pointer = arena;
 #if defined(__x86_64__)
     conf.physical_exclusive_page_table = exclusive_table;
@@ -152,6 +157,14 @@ struct Core final : Dynarmic::A64::UserCallbacks {
   void CallSVC(std::uint32_t imm) override { stop(2, imm, jit->GetPC() - 4); }
   void ExceptionRaised(std::uint64_t pc,
                        Dynarmic::A64::Exception exception) override {
+    // WFE is a NOP-compatible power-management hint. Userspace exclusive
+    // loops cannot depend on a SEV: hardware also wakes them when the global
+    // exclusive monitor is cleared. Like Eden, continue instead of turning
+    // this hint into a kernel wait without those hardware wake sources.
+    // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/WFE--Wait-for-event-
+    // https://github.com/eden-emulator/mirror/blob/master/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+    if (exception == Dynarmic::A64::Exception::WaitForEvent)
+      return;
     stop(3, static_cast<unsigned>(exception), pc);
   }
   void DataCacheOperationRaised(Dynarmic::A64::DataCacheOperation op,

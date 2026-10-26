@@ -34,6 +34,11 @@ impl From<Box<str>> for RenderError {
         Self::Diagnostic(detail)
     }
 }
+impl From<String> for RenderError {
+    fn from(detail: String) -> Self {
+        Self::Diagnostic(detail.into_boxed_str())
+    }
+}
 impl From<&str> for RenderError {
     fn from(detail: &str) -> Self {
         Self::Diagnostic(detail.into())
@@ -461,6 +466,7 @@ mod tests {
             mix[4..8].copy_from_slice(&48000_u32.to_le_bytes());
             mix[8..12].copy_from_slice(&2_u32.to_le_bytes());
             state.mixes = vec![Some(mix)];
+            state.rebuild_mix_order().unwrap();
             state.effect_order = vec![Vec::new()];
             let mut sink = [0; 0x140];
             sink[0] = 1;
@@ -518,7 +524,6 @@ mod tests {
             performance_frames: 0,
             splitters: 0,
             splitter_destinations: 0,
-            external_context_size: 0,
             revision: u32::from_le_bytes(*b"REV7"),
             rendering_device: 0,
             execution_mode: 0,

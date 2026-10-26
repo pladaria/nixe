@@ -1011,16 +1011,29 @@ const _: () = match SWITCH_1_GM20B_PROFILE.validate() {
     Err(_) => panic!("the built-in Switch 1 GM20B profile is inconsistent"),
 };
 
-/// Converts monotonic virtual nanoseconds to GM20B PTIMER ticks (13/8 ns).
-/// https://switchbrew.org/wiki/NV_services#NVGPU_GPU_IOCTL_GET_GPU_TIME
+/// Converts monotonic nanoseconds to the GM20B report clock at 614.4 MHz.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/common/cpu_features.h
 #[must_use]
 pub fn maxwell_gpu_timestamp(nanoseconds: u64) -> u64 {
-    (u128::from(nanoseconds) * 8 / 13) as u64
+    (u128::from(nanoseconds) * 384 / 625) as u64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_reports_use_the_614_4_mhz_clock() {
+        for (nanoseconds, ticks) in [
+            (0, 0),
+            (13, 7),
+            (625, 384),
+            (1_000_000_000, 614_400_000),
+            (u64::MAX, 11_333_679_558_887_148_512),
+        ] {
+            assert_eq!(maxwell_gpu_timestamp(nanoseconds), ticks);
+        }
+    }
 
     const TPC_MASKS: [u32; 2] = [0b11, 0b01];
     const PROFILE: MaxwellGpuProfile = MaxwellGpuProfile {

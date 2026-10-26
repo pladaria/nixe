@@ -1290,6 +1290,7 @@ dependencies = [
 name = "nixe-audio"
 version = "0.1.0"
 dependencies = [
+ "pkg-config",
  "sdl3",
  "sdl3-sys",
  "serde",
@@ -1424,6 +1425,7 @@ name = "nixe-horizon"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "bytemuck",
  "cc",
  "chrono",
  "chrono-tz",

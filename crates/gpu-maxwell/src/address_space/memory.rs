@@ -338,18 +338,20 @@ impl MaxwellGpuMemory {
         &self,
         address: GpuVirtualAddress,
         source: crate::MaxwellMethodSpan<'_>,
+        byte_count: usize,
         written: &mut impl FnMut(
             &[(nixe_memory::AllocationId, nixe_memory::Extent)],
         ) -> Result<(), Arc<MemoryError>>,
     ) -> Result<(), MaxwellGpuAccessError> {
+        debug_assert!(byte_count <= source.len() * 4);
         let source = if let Some(bytes) = source.gathered_bytes() {
-            nixe_memory::WriteSource::Bytes(bytes)
+            nixe_memory::WriteSource::Bytes(&bytes[..byte_count])
         } else {
             let (address, offset) = source.ram_bytes().expect("command source");
             nixe_memory::WriteSource::Ram {
                 address,
                 offset,
-                bytes: source.len() * 4,
+                bytes: byte_count,
             }
         };
         self.write_upload(address, source, written)

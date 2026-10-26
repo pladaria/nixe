@@ -665,57 +665,52 @@ impl MaxwellThreeDCoverageState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDCoverageStateWrite) {
         match write {
-            MaxwellThreeDCoverageStateWrite::AlphaToCoverageDither { value, source } => {
-                self.alpha_to_coverage_dither =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDCoverageStateWrite::AlphaToCoverageDither { value, source: _ } => {
+                self.alpha_to_coverage_dither = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDCoverageStateWrite::PostPsInitialCoverage { value, source } => {
+            MaxwellThreeDCoverageStateWrite::PostPsInitialCoverage { value, source: _ } => {
                 self.post_ps_initial_coverage =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+                    MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
-            MaxwellThreeDCoverageStateWrite::PostZPixelShaderImask { value, source } => {
-                self.post_z_pixel_shader_imask =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDCoverageStateWrite::PostZPixelShaderImask { value, source: _ } => {
+                self.post_z_pixel_shader_imask = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDCoverageStateWrite::TirMode { value, source } => {
-                self.tir_mode = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDCoverageStateWrite::TirMode { value, source: _ } => {
+                self.tir_mode = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDCoverageStateWrite::TirControl { value, source } => {
-                self.tir_control = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDCoverageStateWrite::TirControl { value, source: _ } => {
+                self.tir_control = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDCoverageStateWrite::TirModulation { value, source } => {
-                self.tir_modulation = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDCoverageStateWrite::TirModulation { value, source: _ } => {
+                self.tir_modulation = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDCoverageStateWrite::TirModulationFunction { value, source } => {
-                self.tir_modulation_function =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDCoverageStateWrite::TirModulationFunction { value, source: _ } => {
+                self.tir_modulation_function = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDCoverageStateWrite::CoverageToColor { value, source } => {
-                self.coverage_to_color =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDCoverageStateWrite::CoverageToColor { value, source: _ } => {
+                self.coverage_to_color = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDCoverageStateWrite::AlphaToCoverageOverride { value, source } => {
+            MaxwellThreeDCoverageStateWrite::AlphaToCoverageOverride { value, source: _ } => {
                 self.alpha_to_coverage_override =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
             MaxwellThreeDCoverageStateWrite::SampleLocations {
                 group,
                 value,
-                source,
+                source: _,
             } => {
                 self.sample_locations[group as usize] =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDCoverageStateWrite::HybridAntiAliasControl { value, source } => {
-                self.hybrid_anti_alias_control =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDCoverageStateWrite::HybridAntiAliasControl { value, source: _ } => {
+                self.hybrid_anti_alias_control = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDCoverageStateWrite::PsOutputSampleMaskUsage { value, source } => {
+            MaxwellThreeDCoverageStateWrite::PsOutputSampleMaskUsage { value, source: _ } => {
                 self.ps_output_sample_mask_usage =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDCoverageStateWrite::CsaaEnable { value, source } => {
-                self.csaa_enable = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDCoverageStateWrite::CsaaEnable { value, source: _ } => {
+                self.csaa_enable = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
         }
     }

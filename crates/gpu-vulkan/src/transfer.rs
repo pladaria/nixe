@@ -15,9 +15,11 @@ impl VulkanDevice {
             AllocationMode::Managed,
             "transfer device buffer",
         )?;
-        let (index, source_slice, destination_slice, ticket) =
-            self.submission.reserve_pair(&mut self.dispatch, bytes)?;
-        let command = self.submission.slots[index].command;
+        let (index, source_slice) = self.submission.reserve_upload(&mut self.dispatch, bytes)?;
+        let (_, destination_slice, ticket) = self
+            .submission
+            .reserve_readback(&mut self.dispatch, bytes.len() as u64)?;
+
         let slot = &self.submission.slots[index];
         let upload = slot.upload_buffer(source_slice).handle;
         let download = slot.readback_buffer(destination_slice).handle;
@@ -26,8 +28,7 @@ impl VulkanDevice {
             .src_offset(source_slice.offset)
             .size(bytes.len() as u64)];
         unsafe {
-            self.dispatch
-                .cmd_copy_buffer(command, upload, middle, &region);
+            self.dispatch.cmd_copy_buffer(upload, middle, &region);
         }
         let barrier = [vk::BufferMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COPY)
@@ -39,19 +40,15 @@ impl VulkanDevice {
             .buffer(middle)
             .size(vk::WHOLE_SIZE)];
         unsafe {
-            self.dispatch.barrier(
-                command,
-                &vk::DependencyInfo::default().buffer_memory_barriers(&barrier),
-            );
+            self.dispatch
+                .barrier(&vk::DependencyInfo::default().buffer_memory_barriers(&barrier));
             let region = [vk::BufferCopy::default()
                 .dst_offset(destination_slice.offset)
                 .size(bytes.len() as u64)];
-            self.dispatch
-                .cmd_copy_buffer(command, middle, download, &region);
+            self.dispatch.cmd_copy_buffer(middle, download, &region);
         }
         host_read_barrier(
             self,
-            command,
             download,
             destination_slice.offset,
             destination_slice.size,
@@ -84,9 +81,11 @@ impl VulkanDevice {
             mode,
             "transfer image",
         )?;
-        let (index, source_slice, destination_slice, ticket) =
-            self.submission.reserve_pair(&mut self.dispatch, bytes)?;
-        let command = self.submission.slots[index].command;
+        let (index, source_slice) = self.submission.reserve_upload(&mut self.dispatch, bytes)?;
+        let (_, destination_slice, ticket) = self
+            .submission
+            .reserve_readback(&mut self.dispatch, bytes.len() as u64)?;
+
         let slot = &self.submission.slots[index];
         let upload = slot.upload_buffer(source_slice).handle;
         let download = slot.readback_buffer(destination_slice).handle;
@@ -125,17 +124,10 @@ impl VulkanDevice {
                 depth: 1,
             })];
         unsafe {
-            self.dispatch.barrier(
-                command,
-                &vk::DependencyInfo::default().image_memory_barriers(&barrier),
-            );
-            self.dispatch.cmd_copy_buffer_to_image(
-                command,
-                upload,
-                image_handle,
-                destination,
-                &region,
-            );
+            self.dispatch
+                .barrier(&vk::DependencyInfo::default().image_memory_barriers(&barrier));
+            self.dispatch
+                .cmd_copy_buffer_to_image(upload, image_handle, destination, &region);
         }
         let barrier = [vk::ImageMemoryBarrier2::default()
             .old_layout(destination)
@@ -149,25 +141,17 @@ impl VulkanDevice {
             .image(image_handle)
             .subresource_range(range)];
         unsafe {
-            self.dispatch.barrier(
-                command,
-                &vk::DependencyInfo::default().image_memory_barriers(&barrier),
-            );
+            self.dispatch
+                .barrier(&vk::DependencyInfo::default().image_memory_barriers(&barrier));
             let region = [vk::BufferImageCopy {
                 buffer_offset: destination_slice.offset,
                 ..region[0]
             }];
-            self.dispatch.cmd_copy_image_to_buffer(
-                command,
-                image_handle,
-                source,
-                download,
-                &region,
-            );
+            self.dispatch
+                .cmd_copy_image_to_buffer(image_handle, source, download, &region);
         }
         host_read_barrier(
             self,
-            command,
             download,
             destination_slice.offset,
             destination_slice.size,
@@ -179,8 +163,7 @@ impl VulkanDevice {
         let ticket = self.enqueue_buffer_readback(bytes)?;
         // This diagnostic also verifies the normalized dynamic-rendering entry
         // points. Guest transfer recording adds no empty rendering scopes.
-        let index = self.submission.recording.expect("diagnostic recording");
-        let command = self.submission.slots[index].command;
+
         let info = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -191,8 +174,8 @@ impl VulkanDevice {
             })
             .layer_count(1);
         unsafe {
-            self.dispatch.begin_rendering(command, &info);
-            self.dispatch.end_rendering(command);
+            self.dispatch.begin_rendering(&info);
+            self.dispatch.end_rendering();
         }
         self.readback(ticket)
     }
@@ -209,7 +192,6 @@ impl VulkanDevice {
 }
 pub(crate) fn host_read_barrier(
     device: &mut VulkanDevice,
-    command: vk::CommandBuffer,
     buffer: vk::Buffer,
     offset: u64,
     size: u64,
@@ -229,9 +211,8 @@ pub(crate) fn host_read_barrier(
     // SAFETY: submitted resources/recording buffer belong to this device; the
     // caller waits the timeline before mapping readback bytes.
     unsafe {
-        device.dispatch.barrier(
-            command,
-            &vk::DependencyInfo::default().buffer_memory_barriers(&barrier),
-        );
+        device
+            .dispatch
+            .barrier(&vk::DependencyInfo::default().buffer_memory_barriers(&barrier));
     }
 }

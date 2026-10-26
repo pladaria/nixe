@@ -295,7 +295,6 @@ mod tests {
         let key = image_key(&allocation, 16);
         let a = super::super::image::conversion(&nixe_gpu::ConversionImage {
             description: key.description,
-            allocation: GpuAllocationDescription::new(4096, 1).unwrap(),
             view: key.view,
         })
         .unwrap();

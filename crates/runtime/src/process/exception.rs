@@ -90,6 +90,7 @@ impl RunnableProcess {
                 cpu: self.cpu,
                 address_space_limit: self.address_space.exclusive_limit(),
                 memory_layout: self.memory_layout,
+                process_local_region: self.process_local_region,
                 random_entropy: self.random_entropy,
                 thread_policy: self.thread_policy,
             },

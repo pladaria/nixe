@@ -22,6 +22,131 @@ impl AudioBackend for Backend {
 }
 
 #[test]
+fn modern_output_names_round_trip_volume_without_changing_the_legacy_port_list() {
+    for auto in [false, true] {
+        let (_directory, mut process) = fixture_process_with_svcs(&[0x21; 16]);
+        let backend = Arc::new(Backend(AtomicBool::new(true)));
+        let mut dispatcher = support::dispatcher(&process).with_audio_backend(backend);
+        let manager = process
+            .handles()
+            .insert(HorizonIpcObject::AudioRendererManager(Default::default()))
+            .unwrap();
+        let mut params = [0; 16];
+        params[..4].copy_from_slice(b"REV;"); // REV11, device API v2.
+        params[8..].copy_from_slice(&1_u64.to_le_bytes());
+        assert_eq!(
+            call(
+                &mut process,
+                &mut dispatcher,
+                manager,
+                &command(4, &params, None, None, false, false)
+            ),
+            0
+        );
+        let first = handle(&process);
+        assert_eq!(
+            call(
+                &mut process,
+                &mut dispatcher,
+                manager,
+                &command(4, &params, None, None, false, false)
+            ),
+            0
+        );
+        let second = handle(&process);
+        let input = process.main_thread().stack_bottom;
+        let output = input.checked_add(0x1000).unwrap();
+        let mut name = [0; 256];
+        name[..19].copy_from_slice(b"AudioExternalOutput");
+        write_guest_bytes(&process, input, &name);
+        assert_eq!(
+            call(
+                &mut process,
+                &mut dispatcher,
+                first,
+                &command(
+                    if auto { 7 } else { 1 },
+                    &2_f32.to_le_bytes(),
+                    Some((input.get(), 256)),
+                    None,
+                    auto,
+                    false
+                )
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut process,
+                &mut dispatcher,
+                second,
+                &command(
+                    if auto { 8 } else { 2 },
+                    &[],
+                    Some((input.get(), 256)),
+                    None,
+                    auto,
+                    false
+                )
+            ),
+            0
+        );
+        assert_eq!(data32(&process), 2_f32.to_bits());
+        assert_eq!(
+            call(
+                &mut process,
+                &mut dispatcher,
+                first,
+                &command(
+                    if auto { 6 } else { 0 },
+                    &[],
+                    None,
+                    Some((output.get(), 1280)),
+                    auto,
+                    false
+                )
+            ),
+            0
+        );
+        assert_eq!(data32(&process), 4);
+        assert_eq!(
+            call(
+                &mut process,
+                &mut dispatcher,
+                first,
+                &command(14, &[], None, Some((output.get(), 768)), false, false)
+            ),
+            0
+        );
+        assert_eq!(data32(&process), 3);
+        assert_eq!(
+            read_guest_bytes(&process, output.checked_add(512).unwrap(), 19),
+            b"AudioExternalOutput"
+        );
+        name.fill(0);
+        name[..13].copy_from_slice(b"AudioTvOutput");
+        write_guest_bytes(&process, input, &name);
+        assert_eq!(
+            call(
+                &mut process,
+                &mut dispatcher,
+                second,
+                &command(
+                    if auto { 8 } else { 2 },
+                    &[],
+                    Some((input.get(), 256)),
+                    None,
+                    auto,
+                    false
+                )
+            ),
+            0
+        );
+        assert_eq!(data32(&process), 1_f32.to_bits());
+    }
+}
+
+#[test]
 fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notifications() {
     for auto in [false, true] {
         let (_dir, mut process) = fixture_process_with_svcs(&[0x21; 100]);

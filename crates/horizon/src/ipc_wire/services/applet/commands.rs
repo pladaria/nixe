@@ -2,8 +2,6 @@
 
 use crate::object::{AppletObject, AppletProxyKind};
 
-pub(super) const PERFORMANCE_MODE_NORMAL: u32 = 0;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RootCommand {
     OpenApplicationProxy,
@@ -142,6 +140,7 @@ command_enum!(ApplicationFunctionsCommand {
     1 => PopLaunchParameter,
     21 => GetDesiredLanguage,
     22 => SetTerminateResult,
+    23 => GetDisplayVersion,
     40 => NotifyRunning,
     130 => GetGpuErrorDetectedSystemEvent,
 });

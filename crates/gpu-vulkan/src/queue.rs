@@ -21,7 +21,7 @@ pub struct QueueConfiguration {
     pub command_slots: usize,
     /// Capacity of each upload/readback arena in a command slot. Allocated lazily.
     pub arena_bytes: u64,
-    /// Total live overflow capacity across every slot and both directions.
+    /// Additional staging capacity per slot, shared by uploads and readbacks.
     pub overflow_bytes: u64,
 }
 impl Default for QueueConfiguration {
@@ -39,9 +39,9 @@ impl QueueConfiguration {
             || self.arena_bytes == 0
             || self
                 .arena_bytes
-                .checked_mul(self.command_slots as u64)
-                .and_then(|v| v.checked_mul(2))
+                .checked_mul(2)
                 .and_then(|v| v.checked_add(self.overflow_bytes))
+                .and_then(|v| v.checked_mul(self.command_slots as u64))
                 .is_none()
         {
             return Err(VulkanError::InvalidResource(
@@ -93,9 +93,10 @@ pub struct QueueUsage {
     pub scheduled_tick: u64,
     pub submitted_tick: u64,
     pub completed_tick: u64,
-    pub command_pools: usize,
+    pub command_slots: usize,
     pub arena_capacity: u64,
     pub overflow_capacity: u64,
+    pub oversized_capacity: u64,
     pub retained_readbacks: usize,
     pub retired_buffers: usize,
     pub retired_images: usize,
@@ -106,9 +107,6 @@ pub(crate) struct Arena {
     pub cursor: u64,
 }
 impl Arena {
-    fn reserve(&mut self, size: u64) -> Option<u64> {
-        self.reserve_aligned(size, 4)
-    }
     pub(crate) fn reserve_aligned(&mut self, size: u64, alignment: u64) -> Option<u64> {
         let start = align_up(self.cursor, self.buffer.host_alignment().max(alignment))?;
         let end = start.checked_add(size)?;
@@ -136,14 +134,15 @@ pub(crate) struct Slot {
     pub stream_descriptors: Option<crate::cache::DescriptorCache>,
     #[cfg(feature = "performance-counters")]
     timing: Option<timing::Queries>,
+    #[cfg(feature = "binding-probe")]
     owner: Arc<DeviceOwner>,
-    pub pool: vk::CommandPool,
-    pub command: vk::CommandBuffer,
+    pub native: Arc<crate::dispatch::CommandSlot>,
     pub tick: u64,
     stream_read_until: u64,
     pending_stream_read: bool,
     pub upload: Option<Arena>,
     pub readback: Option<Arena>,
+    overflow_capacity: u64,
     pub upload_overflow: Vec<Arena>,
     pub readback_overflow: Vec<Arena>,
     pub readbacks: Vec<Option<Slice>>,
@@ -175,6 +174,7 @@ pub(crate) struct Slot {
     pub active_targets: Option<Arc<crate::PreparedTargets>>,
     pub target_handles: std::collections::HashSet<usize>,
     pub graphics_parameters: Option<Arc<crate::GraphicsParameters>>,
+    pub feedback_aspects: Option<vk::ImageAspectFlags>,
     pub bound_set: vk::DescriptorSet,
     #[cfg(feature = "binding-probe")]
     pub bound_descriptor_buffer: vk::DeviceAddress,
@@ -183,28 +183,19 @@ pub(crate) struct Slot {
 }
 impl Slot {
     fn new(owner: Arc<DeviceOwner>, family: u32) -> Result<Self, VulkanError> {
-        // Reset the whole pool after its real last use; no per-buffer reset flag.
-        let pool = unsafe {
-            owner.device.create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .flags(vk::CommandPoolCreateFlags::TRANSIENT)
-                    .queue_family_index(family),
-                None,
-            )
-        }
-        .map_err(|e| VulkanError::vk("vkCreateCommandPool", e))?;
-        let mut slot = Self {
+        let slot = Self {
             stream_descriptors: None,
             #[cfg(feature = "performance-counters")]
             timing: timing::Queries::new(Arc::clone(&owner), family)?,
+            native: crate::dispatch::CommandSlot::new(Arc::clone(&owner), family),
+            #[cfg(feature = "binding-probe")]
             owner,
-            pool,
-            command: vk::CommandBuffer::null(),
             tick: 0,
             stream_read_until: 0,
             pending_stream_read: false,
             upload: None,
             readback: None,
+            overflow_capacity: 0,
             upload_overflow: Vec::new(),
             readback_overflow: Vec::new(),
             readbacks: Vec::new(),
@@ -236,24 +227,13 @@ impl Slot {
             active_targets: None,
             target_handles: Default::default(),
             graphics_parameters: None,
+            feedback_aspects: None,
             bound_set: vk::DescriptorSet::null(),
             #[cfg(feature = "binding-probe")]
             bound_descriptor_buffer: 0,
             #[cfg(feature = "binding-probe")]
             bound_descriptor_offset: u64::MAX,
         };
-        slot.command = unsafe {
-            slot.owner.device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(|e| VulkanError::vk("vkAllocateCommandBuffers", e))?[0];
-        slot.owner.name(pool, "nixe reusable command pool")?;
-        slot.owner
-            .name(slot.command, "nixe reusable command buffer")?;
         Ok(slot)
     }
     pub fn upload_buffer(&self, slice: Slice) -> &AllocatedBuffer {
@@ -283,12 +263,10 @@ impl Slot {
             && self.unread() == 0
     }
 }
+#[cfg(feature = "binding-probe")]
 impl Drop for Slot {
     fn drop(&mut self) {
         // QueueState proves completion/device loss before slots are dropped.
-        // Command buffers disappear before any referenced resource is freed.
-        unsafe { self.owner.device.destroy_command_pool(self.pool, None) };
-        #[cfg(feature = "binding-probe")]
         self.descriptors.destroy(&self.owner);
     }
 }
@@ -317,9 +295,9 @@ pub(crate) struct QueueState {
     pub(crate) configuration: QueueConfiguration,
     pub slots: Vec<Slot>,
     pub recording: Option<usize>,
+    pending_submit_deadline: Option<Instant>,
     pub scheduled: u64,
     pub completed: u64,
-    overflow_capacity: u64,
     pending_stream_reads: Vec<usize>,
     stopped: bool,
     lost: bool,
@@ -329,7 +307,7 @@ impl QueueState {
         if let Some(index) = self.recording
             && self.slots[index].active_targets.take().is_some()
         {
-            unsafe { dispatch.end_rendering(self.slots[index].command) };
+            unsafe { dispatch.end_rendering() };
         }
     }
     pub fn new(
@@ -358,10 +336,10 @@ impl QueueState {
             configuration,
             slots: Vec::new(),
             recording: None,
+            pending_submit_deadline: None,
             statistics: Default::default(),
             scheduled: 0,
             completed: 0,
-            overflow_capacity: 0,
             pending_stream_reads: Vec::new(),
             stopped: false,
             lost: false,
@@ -472,6 +450,7 @@ impl QueueState {
                 slot.retired_images.clear();
                 slot.retained_views.clear();
                 slot.graphics_parameters = None;
+                slot.feedback_aspects = None;
                 slot.native_targets.clear();
                 slot.target_handles.clear();
                 slot.native_bindings.clear();
@@ -480,16 +459,18 @@ impl QueueState {
                 slot.binding_handles.clear();
                 #[cfg(feature = "binding-probe")]
                 slot.probe_queries.clear();
-                self.overflow_capacity -= slot
+                slot.overflow_capacity -= slot
                     .upload_overflow
                     .iter()
+                    .filter(|arena| arena.buffer.size() <= self.configuration.overflow_bytes)
                     .map(|arena| arena.buffer.size())
                     .sum::<u64>();
                 slot.upload_overflow.clear();
                 if slot.unread() == 0 {
-                    self.overflow_capacity -= slot
+                    slot.overflow_capacity -= slot
                         .readback_overflow
                         .iter()
+                        .filter(|arena| arena.buffer.size() <= self.configuration.overflow_bytes)
                         .map(|arena| arena.buffer.size())
                         .sum::<u64>();
                     slot.readback_overflow.clear();
@@ -535,8 +516,6 @@ impl QueueState {
         &mut self,
         dispatch: &mut crate::dispatch::Dispatch,
     ) -> Result<usize, VulkanError> {
-        #[cfg(not(feature = "performance-counters"))]
-        let _ = dispatch;
         self.check_running()?;
         if let Some(index) = self.recording {
             return Ok(index);
@@ -567,12 +546,16 @@ impl QueueState {
         let slot = &mut self.slots[index];
         // The slot's previous GPU tick is complete. Reset/begin remain ordered
         // native jobs; no owner/worker round trip is needed to acquire a slot.
-        self.recording_handle
-            .begin(slot.pool, slot.command, tick, Arc::clone(&self.progress))?;
+        let deadline = Instant::now() + Duration::from_millis(2);
+        dispatch.begin_command_buffer(
+            Arc::clone(&slot.native),
+            tick,
+            Arc::clone(&self.progress),
+        )?;
         let slot = &mut self.slots[index];
         #[cfg(feature = "performance-counters")]
         if let Some(timing) = &mut slot.timing {
-            timing.begin(dispatch, slot.command);
+            timing.begin(dispatch);
         }
         slot.tick = tick;
         if let Some(arena) = &mut slot.upload {
@@ -591,6 +574,7 @@ impl QueueState {
         slot.push_stages = vk::ShaderStageFlags::empty();
         slot.push_bytes.clear();
         slot.graphics_parameters = None;
+        slot.feedback_aspects = None;
         slot.bound_set = vk::DescriptorSet::null();
         slot.bound_graphics_set = vk::DescriptorSet::null();
         slot.bound_compute_offsets.clear();
@@ -607,174 +591,9 @@ impl QueueState {
         // Their bounded cache recycles unleased pages on pressure; clearing it
         // here would discard unchanged streaming bindings on every submission.
         self.recording = Some(index);
+        self.pending_submit_deadline = Some(deadline);
         Ok(index)
     }
-    pub fn reserve_pair(
-        &mut self,
-        dispatch: &mut crate::dispatch::Dispatch,
-        bytes: &[u8],
-    ) -> Result<(usize, Slice, Slice, ReadbackTicket), VulkanError> {
-        if bytes.is_empty() {
-            return Err(VulkanError::InvalidResource("empty staging transfer"));
-        }
-        let size = bytes.len() as u64;
-        let max = self
-            .configuration
-            .arena_bytes
-            .max(self.configuration.overflow_bytes / 2);
-        if size > max {
-            return Err(VulkanError::StagingRequestTooLarge {
-                requested: size,
-                maximum: max,
-            });
-        }
-        let index = self.begin(dispatch)?;
-        let slot = &mut self.slots[index];
-        for (arena, location, usage, label) in [
-            (
-                &mut slot.upload,
-                MemoryLocation::CpuToGpu,
-                vk::BufferUsageFlags::TRANSFER_SRC
-                    | vk::BufferUsageFlags::VERTEX_BUFFER
-                    | vk::BufferUsageFlags::INDEX_BUFFER
-                    | vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::UNIFORM_BUFFER
-                    | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
-                    | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,
-                "nixe upload arena",
-            ),
-            (
-                &mut slot.readback,
-                MemoryLocation::GpuToCpu,
-                vk::BufferUsageFlags::TRANSFER_DST,
-                "nixe readback arena",
-            ),
-        ] {
-            if arena.is_none() {
-                *arena = Some(Arena {
-                    buffer: Arc::new(allocate_buffer(
-                        &self.owner,
-                        self.configuration.arena_bytes,
-                        usage,
-                        location,
-                        AllocationMode::Dedicated,
-                        label,
-                    )?),
-                    cursor: 0,
-                });
-            }
-        }
-        // Consume both arena ranges only when the pair fits. This is staging
-        // admission, not rollback of guest resource creation or command effects.
-        let upload = slot.upload.as_mut().expect("upload arena");
-        let readback = slot.readback.as_mut().expect("readback arena");
-        let fits = |arena: &Arena| {
-            align_up(arena.cursor, arena.buffer.host_alignment())
-                .and_then(|start| start.checked_add(size))
-                .is_some_and(|end| end <= arena.buffer.size())
-        };
-        let (source, destination) = if fits(upload) && fits(readback) {
-            (
-                Slice {
-                    overflow: None,
-                    offset: upload.reserve(size).expect("fits"),
-                    size,
-                },
-                Slice {
-                    overflow: None,
-                    offset: readback.reserve(size).expect("fits"),
-                    size,
-                },
-            )
-        } else {
-            let capacity = align_up(size, self.owner.non_coherent_atom_size.max(4))
-                .ok_or(VulkanError::InvalidResource("staging capacity overflow"))?;
-            let extra = capacity
-                .checked_mul(2)
-                .ok_or(VulkanError::InvalidResource("staging capacity overflow"))?;
-            if self
-                .overflow_capacity
-                .checked_add(extra)
-                .is_none_or(|total| total > self.configuration.overflow_bytes)
-            {
-                return Err(self.pressure());
-            }
-            let source = allocate_buffer(
-                &self.owner,
-                capacity,
-                vk::BufferUsageFlags::TRANSFER_SRC
-                    | vk::BufferUsageFlags::VERTEX_BUFFER
-                    | vk::BufferUsageFlags::INDEX_BUFFER
-                    | vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::UNIFORM_BUFFER
-                    | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
-                    | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,
-                MemoryLocation::CpuToGpu,
-                AllocationMode::Dedicated,
-                "nixe upload overflow",
-            )?;
-            let destination = allocate_buffer(
-                &self.owner,
-                capacity,
-                vk::BufferUsageFlags::TRANSFER_DST,
-                MemoryLocation::GpuToCpu,
-                AllocationMode::Dedicated,
-                "nixe readback overflow",
-            )?;
-            let slot = &mut self.slots[index];
-            let a = slot.upload_overflow.len();
-            let b = slot.readback_overflow.len();
-            slot.upload_overflow.push(Arena {
-                buffer: Arc::new(source),
-                cursor: capacity,
-            });
-            slot.readback_overflow.push(Arena {
-                buffer: Arc::new(destination),
-                cursor: capacity,
-            });
-            self.overflow_capacity += extra;
-            (
-                Slice {
-                    overflow: Some(a),
-                    offset: 0,
-                    size,
-                },
-                Slice {
-                    overflow: Some(b),
-                    offset: 0,
-                    size,
-                },
-            )
-        };
-        let slot = &mut self.slots[index];
-        let buffer = match source.overflow {
-            Some(i) => &mut slot.upload_overflow[i].buffer,
-            None => &mut slot.upload.as_mut().expect("upload arena").buffer,
-        };
-        // SAFETY: the recording slot has no earlier in-flight uses; allocations
-        // within it isolate mapped atoms. Submission follows this host write.
-        unsafe { buffer.write_range(source.offset, bytes) }.inspect_err(|error| {
-            self.stopped = true;
-            if let VulkanError::Vulkan { result, .. } = error {
-                self.lost |= *result == vk::Result::ERROR_DEVICE_LOST;
-            }
-        })?;
-        let entry = slot.readbacks.len();
-        slot.readbacks.push(Some(destination));
-        slot.unread_count += 1;
-        let work = self.ticket(self.scheduled + 1);
-        Ok((
-            index,
-            source,
-            destination,
-            ReadbackTicket {
-                work,
-                slot: index,
-                entry,
-            },
-        ))
-    }
-    /// Independent directions avoid allocating or filling the other arena.
     pub fn reserve_upload(
         &mut self,
         dispatch: &mut crate::dispatch::Dispatch,
@@ -840,16 +659,13 @@ impl QueueState {
         if size == 0 {
             return Err(VulkanError::InvalidResource("empty staging transfer"));
         }
-        let maximum = self
-            .configuration
-            .arena_bytes
-            .max(self.configuration.overflow_bytes);
-        if size > maximum {
-            return Err(VulkanError::StagingRequestTooLarge {
-                requested: size,
-                maximum,
-            });
-        }
+        let minimum = align_up(size, self.owner.non_coherent_atom_size.max(4))
+            .ok_or(VulkanError::InvalidResource("staging capacity overflow"))?;
+        let oversized = minimum
+            > self
+                .configuration
+                .arena_bytes
+                .max(self.configuration.overflow_bytes);
         let index = self.begin(dispatch)?;
         let (location, usage, label) = if upload {
             (
@@ -876,7 +692,7 @@ impl QueueState {
         } else {
             &mut slot.readback
         };
-        if arena.is_none() {
+        if !oversized && minimum <= self.configuration.arena_bytes && arena.is_none() {
             *arena = Some(Arena {
                 buffer: Arc::new(allocate_buffer(
                     &self.owner,
@@ -889,10 +705,10 @@ impl QueueState {
                 cursor: 0,
             });
         }
-        if let Some(offset) = arena
-            .as_mut()
-            .expect("arena")
-            .reserve_aligned(size, alignment)
+        if !oversized
+            && let Some(offset) = arena
+                .as_mut()
+                .and_then(|arena| arena.reserve_aligned(size, alignment))
         {
             return Ok((
                 index,
@@ -910,7 +726,8 @@ impl QueueState {
         };
         // Suballocate the current overflow arena as well. Small texture rows
         // must not create one VkBuffer/VkDeviceMemory allocation per request.
-        if let Some(arena) = overflow.last_mut()
+        if !oversized
+            && let Some(arena) = overflow.last_mut()
             && let Some(offset) = arena.reserve_aligned(size, alignment)
         {
             return Ok((
@@ -922,13 +739,15 @@ impl QueueState {
                 },
             ));
         }
-        let minimum = align_up(size, self.owner.non_coherent_atom_size.max(4))
-            .ok_or(VulkanError::InvalidResource("staging capacity overflow"))?;
-        let remaining = self.configuration.overflow_bytes - self.overflow_capacity;
-        if minimum > remaining {
-            return Err(self.pressure());
-        }
-        let capacity = minimum.max(self.configuration.arena_bytes).min(remaining);
+        let capacity = if oversized {
+            minimum
+        } else {
+            let remaining = self.configuration.overflow_bytes - slot.overflow_capacity;
+            if minimum > remaining {
+                return Err(self.pressure());
+            }
+            minimum.max(self.configuration.arena_bytes).min(remaining)
+        };
         let buffer = allocate_buffer(
             &self.owner,
             capacity,
@@ -948,7 +767,9 @@ impl QueueState {
             buffer: Arc::new(buffer),
             cursor: minimum,
         });
-        self.overflow_capacity += capacity;
+        if !oversized {
+            slot.overflow_capacity += capacity;
+        }
         Ok((
             index,
             Slice {
@@ -985,7 +806,7 @@ impl QueueState {
         {
             let slot = &mut self.slots[index];
             if let Some(timing) = &mut slot.timing {
-                timing.end(dispatch, slot.command);
+                timing.end(dispatch);
             }
         }
         if extra_signals.len() > 1 {
@@ -1004,35 +825,31 @@ impl QueueState {
         // command buffer in FIFO order while the owner prepares following work.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_scheduler.cpp
         nixe_gpu::trace::detail_event("queue_schedule", tick, 0, 0);
-        dispatch.flush_chunks()?;
-        let result = self
-            .recording_handle
-            .submit(crate::dispatch::QueueSubmission {
-                queue,
-                command: self.slots[index].command,
-                waits: waits
-                    .iter()
-                    .map(|info| {
-                        vk::SemaphoreSubmitInfo::default()
-                            .semaphore(info.semaphore)
-                            .value(info.value)
-                            .stage_mask(info.stage_mask)
-                            .device_index(info.device_index)
-                    })
-                    .collect(),
-                signals: signals[..1 + extra_signals.len()]
-                    .iter()
-                    .map(|info| {
-                        vk::SemaphoreSubmitInfo::default()
-                            .semaphore(info.semaphore)
-                            .value(info.value)
-                            .stage_mask(info.stage_mask)
-                            .device_index(info.device_index)
-                    })
-                    .collect(),
-                tick,
-                progress: Arc::clone(&self.progress),
-            });
+        let result = dispatch.submit(crate::dispatch::QueueSubmission {
+            queue,
+            waits: waits
+                .iter()
+                .map(|info| {
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(info.semaphore)
+                        .value(info.value)
+                        .stage_mask(info.stage_mask)
+                        .device_index(info.device_index)
+                })
+                .collect(),
+            signals: signals[..1 + extra_signals.len()]
+                .iter()
+                .map(|info| {
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(info.semaphore)
+                        .value(info.value)
+                        .stage_mask(info.stage_mask)
+                        .device_index(info.device_index)
+                })
+                .collect(),
+            tick,
+            progress: Arc::clone(&self.progress),
+        });
         if result.is_err() {
             self.progress.fail(
                 tick,
@@ -1044,6 +861,7 @@ impl QueueState {
         }
         self.scheduled = tick;
         self.recording = None;
+        self.pending_submit_deadline = None;
         Ok(Some(self.ticket(tick)))
     }
     fn wait_for_completion(
@@ -1123,7 +941,7 @@ impl QueueState {
             scheduled_tick: self.scheduled,
             submitted_tick: self.progress.submitted(),
             completed_tick: self.completed,
-            command_pools: self.slots.len(),
+            command_slots: self.slots.len(),
             arena_capacity: self
                 .slots
                 .iter()
@@ -1131,7 +949,14 @@ impl QueueState {
                 .flatten()
                 .map(|arena| arena.buffer.size())
                 .sum(),
-            overflow_capacity: self.overflow_capacity,
+            overflow_capacity: self.slots.iter().map(|slot| slot.overflow_capacity).sum(),
+            oversized_capacity: self
+                .slots
+                .iter()
+                .flat_map(|slot| slot.upload_overflow.iter().chain(&slot.readback_overflow))
+                .filter(|arena| arena.buffer.size() > self.configuration.overflow_bytes)
+                .map(|arena| arena.buffer.size())
+                .sum(),
             retained_readbacks: self.slots.iter().map(Slot::unread).sum(),
             retired_buffers: self
                 .slots
@@ -1175,9 +1000,9 @@ impl QueueState {
             }
         }
         self.recording = None;
+        self.pending_submit_deadline = None;
         self.slots.clear();
         self.pending_stream_reads.clear();
-        self.overflow_capacity = 0;
         if let Some(failure) = prior_failure.or_else(|| self.progress.failure())
             && !matches!(failure.cause, progress::NativeFailure::Stopped)
         {
@@ -1267,6 +1092,9 @@ impl VulkanDevice {
     pub fn work_ticket(&mut self) -> Result<WorkTicket, VulkanError> {
         self.begin_recording()?;
         Ok(self.submission.ticket(self.submission.scheduled + 1))
+    }
+    pub fn pending_submit_deadline(&self) -> Option<Instant> {
+        self.submission.pending_submit_deadline
     }
     /// Submit recorded commands and signal the single timeline, without waiting.
     pub fn flush(&mut self) -> Result<Option<WorkTicket>, VulkanError> {

@@ -41,21 +41,18 @@ pub trait MaxwellFrontend: Send + 'static {
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<NativeWork, MaxwellSubmissionExecutionError>;
     fn take_mme_scratch(&mut self) -> Vec<u32>;
+    fn render_enabled(&self) -> bool;
+    fn update_render_condition(
+        &mut self,
+        state: &MaxwellThreeDState,
+        address_space: &MaxwellGpuMemory,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
+    ) -> Result<(), MaxwellSubmissionExecutionError>;
     fn recycle_mme_scratch(&mut self, parameters: Vec<u32>);
     fn lower_nv12_conversion(
         &mut self,
-        images: [nixe_gpu::ConversionImage; 3],
+        destination: nixe_gpu::ConversionImage,
+        source: nixe_gpu::Nv12Planes,
         transform: nixe_gpu::Nv12ColorTransform,
-    ) -> Result<NativeWork, MaxwellLoweringError>;
-    fn lower_decoded_plane_uploads(
-        &mut self,
-        images: [nixe_gpu::ConversionImage; 2],
-        bytes: [Arc<[u8]>; 2],
-        widths: [u32; 2],
-    ) -> Result<NativeWork, MaxwellLoweringError>;
-    fn lower_device_plane_uploads(
-        &mut self,
-        images: [nixe_gpu::ConversionImage; 2],
-        frame: nixe_gpu::DeviceImageFrame,
     ) -> Result<NativeWork, MaxwellLoweringError>;
 }

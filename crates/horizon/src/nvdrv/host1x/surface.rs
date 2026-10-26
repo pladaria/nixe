@@ -1,4 +1,4 @@
-//! Canonical Tegra surface interpretations shared by NVDEC and VIC.
+//! Tegra VIC surface geometry and guest memory layouts.
 use super::video::{Mappings, gob_offset, read, region, word};
 
 pub(super) struct Surface {
@@ -16,7 +16,6 @@ impl Surface {
         mappings: &Mappings,
         address: u64,
         format: nixe_gpu::ImageFormat,
-        plane: bool,
     ) -> Result<nixe_gpu::ConversionImage, String> {
         use nixe_gpu::*;
         let (whole, offset) = region(mappings, address, self.length())?;
@@ -26,21 +25,10 @@ impl Surface {
             .ok_or("VIC mapping was lost")?;
         let allocation =
             GpuAllocationDescription::new(whole.bytes(), 1).map_err(|e| e.to_string())?;
-        let bytes = usize::from(
-            format
-                .plane_bytes_per_texel(0)
-                .ok_or("invalid VIC GPU image format")?,
-        );
-        // NVDEC may allocate a wider GOB stride than its visible source. Plane
-        // textures retain that stride; the validated source crop selects texels.
-        let width = if plane && self.kind == 1 {
-            self.pitch / bytes
-        } else {
-            self.width / if plane { bytes } else { 1 }
-        };
         let description = ImageDescription::new(
             ImageDimension::Two,
-            ImageExtent::new(width as u32, self.height as u32, 1).map_err(|e| e.to_string())?,
+            ImageExtent::new(self.width as u32, self.height as u32, 1)
+                .map_err(|e| e.to_string())?,
             format,
             ImageKind::Color,
             1,
@@ -86,11 +74,7 @@ impl Surface {
             )],
         )
         .map_err(|e| e.to_string())?;
-        Ok(ConversionImage {
-            description,
-            allocation,
-            view,
-        })
+        Ok(ConversionImage { description, view })
     }
     pub(super) fn decode(bytes: &[u8], bytes_per_pixel: usize) -> Result<Self, String> {
         let layout = word(bytes, 0);
@@ -134,6 +118,54 @@ impl Surface {
             y * self.pitch + x
         }
     }
+    /// Visible bytes in storage order. Full GOBs are contiguous 512-byte runs;
+    /// only edge GOBs need the 16-byte lane permutation. Adjacent runs coalesce
+    /// during traversal instead of sorting a per-row fragment list each frame.
+    pub(super) fn written_spans(&self, bytes_per_pixel: usize) -> Vec<std::ops::Range<usize>> {
+        let width = self.width * bytes_per_pixel;
+        let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut emit = |start: usize, bytes: usize| {
+            if let Some(last) = spans.last_mut()
+                && last.end == start
+            {
+                last.end += bytes;
+            } else {
+                spans.push(start..start + bytes);
+            }
+        };
+        if self.kind == 0 {
+            for y in 0..self.height {
+                emit(y * self.pitch, width);
+            }
+        } else {
+            let block_height = 1 << self.block_height;
+            let block_rows = block_height * 8;
+            let columns = self.pitch / 64;
+            for block_y in 0..self.height.div_ceil(block_rows) {
+                for gob_x in 0..width.div_ceil(64) {
+                    let columns_left = (width - gob_x * 64).min(64);
+                    let rows_left = (self.height - block_y * block_rows).min(block_rows);
+                    for gob_y in 0..rows_left.div_ceil(8) {
+                        let rows = (rows_left - gob_y * 8).min(8);
+                        let base = ((block_y * columns + gob_x) * block_height + gob_y) * 512;
+                        if columns_left == 64 && rows == 8 {
+                            emit(base, 512);
+                        } else {
+                            for offset in (0..512).step_by(16) {
+                                let x = (offset / 256) * 32 + (offset / 32 % 2) * 16;
+                                let y = (offset / 64 % 4) * 2 + offset / 16 % 2;
+                                if x < columns_left && y < rows {
+                                    emit(base + offset, (columns_left - x).min(16));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        spans
+    }
+
     pub(super) fn read_linear(&self, mappings: &Mappings, address: u64) -> Result<Vec<u8>, String> {
         let stored = read(mappings, address, self.length())?;
         if self.kind == 0 {

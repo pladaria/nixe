@@ -384,9 +384,14 @@ fn buffer_relocation_preserves_versions_cpu_holes_and_revalidates_readbacks() {
     authority.cpu_write(&[hole]).unwrap();
     let request = AllocationRange::new(allocation.pin(), PAGE_SIZE, 64).unwrap();
     let before = authority.resolve(std::slice::from_ref(&request)).unwrap();
-    let observation = authority.observe(1, full(old)).unwrap();
+    let observation = authority.observe(1, full(Arc::clone(&old))).unwrap();
+    let alias = full(old);
+    authority.register(3, vec![Arc::clone(&alias)]).unwrap();
     authority.register(2, vec![full(mapping)]).unwrap();
     authority.relocate_buffer(1, 2, NativeTick(4)).unwrap();
+    assert_eq!(authority.resources[&2].modification, version.get());
+    assert_eq!(authority.resources[&3].aliases, [2]);
+    let native = authority.observe_native(3, alias).unwrap();
     assert!(observation.is_invalid());
     assert!(authority.mapping(1, 0).is_none());
     let after = authority.resolve(&[request]).unwrap();
@@ -404,5 +409,6 @@ fn buffer_relocation_preserves_versions_cpu_holes_and_revalidates_readbacks() {
     authority
         .publish_write(&machine, writer, || Ok(((), NativeTick(5))))
         .unwrap();
+    assert!(native.is_invalid());
     assert_eq!(authority.live_record_count(), 1);
 }

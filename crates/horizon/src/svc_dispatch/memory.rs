@@ -67,6 +67,10 @@ pub(super) fn get_info(
         7 => context.process().used_user_physical_memory_size(),
         16 => context.process().total_system_resource_size(),
         17 => context.process().used_system_resource_size(),
+        // UserExceptionContextAddress is the process-local region, allocated
+        // from kernel TLS pages rather than borrowed from a live thread.
+        // https://switchbrew.org/wiki/SVC#InfoType
+        20 => context.process().user_exception_context_address().get(),
         21 => context
             .process()
             .total_non_system_user_physical_memory_size(),

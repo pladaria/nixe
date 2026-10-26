@@ -38,7 +38,7 @@ use ioctl::NvDrvIoctlResponse;
 pub(crate) use ioctl::{NvDrvInlineBuffer, NvDrvIoctlCaller, NvDrvIoctlOutcome, NvDrvIoctlRequest};
 use nvhost_as_gpu::{decode_bind_channel, ioctl_nvhost_as_gpu};
 use nvhost_ctrl::{NvHostControl, NvHostCtrlIoctlOutcome};
-use nvhost_ctrl_gpu::NvHostControlGpuEvents;
+use nvhost_ctrl_gpu::{NvHostControlGpuEvents, NvHostZbcTables};
 use nvhost_gpu::{NvHostGpu, NvHostGpuIoctlResources, NvHostGpuSubmitResources};
 pub use nvmap::{
     NvMapAllocationMetadata, NvMapCpuMapping, NvMapExportedId, NvMapHandle, NvMapImageViewMetadata,
@@ -55,6 +55,8 @@ const IOCTL_NVMAP_PARAM: u32 = 0xc00c_0109;
 const IOCTL_NVMAP_GET_ID: u32 = 0xc008_010e;
 const IOCTL_CTRL_GPU_ZCULL_GET_CTX_SIZE: u32 = 0x8004_4701;
 const IOCTL_CTRL_GPU_ZCULL_GET_INFO: u32 = 0x8028_4702;
+const IOCTL_CTRL_GPU_ZBC_SET_TABLE: u32 = 0x402c_4703;
+const IOCTL_CTRL_GPU_ZBC_QUERY_TABLE: u32 = 0xc034_4704;
 const IOCTL_CTRL_GPU_GET_CHARACTERISTICS: u32 = 0xc0b0_4705;
 const IOCTL_CTRL_GPU_GET_TPC_MASKS: u32 = 0xc018_4706;
 const IOCTL_CTRL_GPU_ZBC_GET_ACTIVE_SLOT_MASK: u32 = 0x8008_4714;
@@ -87,6 +89,7 @@ struct NvDrvClientState {
     nvhost_gpu: Arc<Mutex<NvHostGpu>>,
     nvhost_control: Arc<Mutex<NvHostControl>>,
     nvhost_control_gpu: BTreeMap<NvDrvFileDescriptor, NvHostControlGpuEvents>,
+    zbc_tables: NvHostZbcTables,
     nvmap: NvMapObjects,
     host1x: host1x::Host1x,
     gpu_profile: MaxwellGpuProfile,
@@ -169,6 +172,7 @@ impl NvDrvSession {
                 nvhost_gpu: Arc::new(Mutex::new(NvHostGpu::new())),
                 nvhost_control: Arc::new(Mutex::new(NvHostControl::default())),
                 nvhost_control_gpu: BTreeMap::new(),
+                zbc_tables: NvHostZbcTables::default(),
                 nvmap: NvMapObjects::default(),
                 host1x: host1x::Host1x::default(),
                 gpu_profile: SWITCH_1_GM20B_PROFILE,
@@ -618,9 +622,6 @@ impl NvDrvSession {
                 descriptor, request, error,
             ));
         }
-        let progress_backend = descriptor
-            .filter(|descriptor| descriptor.kind() == NvDrvDeviceKind::HostControl)
-            .and_then(|_| state.gpu_backend.as_ref().cloned());
         let result = match descriptor {
             Some(descriptor)
                 if process_memory.is_some_and(|(process_id, _, _)| {
@@ -655,6 +656,7 @@ impl NvDrvSession {
             Some(descriptor) if descriptor.kind() == NvDrvDeviceKind::HostControlGpu => {
                 ioctl_nvhost_ctrl_gpu(
                     state.gpu_profile,
+                    &mut state.zbc_tables,
                     descriptor,
                     request,
                     input,
@@ -805,10 +807,18 @@ impl NvDrvSession {
             )),
             None => Err(NvDrvCallError::GuestResult(NV_BAD_PARAMETER)),
         };
+        // A direct unresolved wait needs native completion now. Event
+        // registration, queries and zero-time polls only observe/arm progress;
+        // the owner's pending-work deadline keeps asynchronous fences live.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp
+        let progress_backend = match &result {
+            Ok(LockedIoctlOutcome::Standard(NvHostCtrlIoctlOutcome::Pending(_))) => {
+                state.gpu_backend.as_ref().cloned()
+            }
+            _ => None,
+        };
         drop(state);
-        if result.is_ok()
-            && let Some(backend) = progress_backend
-        {
+        if let Some(backend) = progress_backend {
             let descriptor =
                 descriptor.expect("GPU progress request has a host-control descriptor");
             backend
@@ -1100,6 +1110,7 @@ impl NvDrvSession {
             };
             state.devices.clear();
             state.nvhost_control_gpu.clear();
+            state.zbc_tables = NvHostZbcTables::default();
             state
                 .gpu_address_spaces
                 .lock()
@@ -1131,6 +1142,7 @@ impl NvDrvSession {
 
 fn ioctl_nvhost_ctrl_gpu(
     profile: MaxwellGpuProfile,
+    zbc_tables: &mut NvHostZbcTables,
     descriptor: NvDrvDeviceDescriptor,
     request: u32,
     input: &[u8],
@@ -1139,14 +1151,16 @@ fn ioctl_nvhost_ctrl_gpu(
 ) -> Result<Vec<u8>, NvDrvCallError> {
     debug_assert_eq!((profile.validate()).unwrap(), ());
     match request {
+        IOCTL_CTRL_GPU_ZBC_SET_TABLE => zbc_tables.set(input),
+        IOCTL_CTRL_GPU_ZBC_QUERY_TABLE => zbc_tables.query(input),
         IOCTL_CTRL_GPU_GET_GPU_TIME => {
             require_input_size(input, 16)?;
-            // Switch's PTIMER counter advances once per 1.625 ns (13/8 ns).
-            // Use the same monotonic clock as CPU timers and kernel waits.
-            // https://switchbrew.org/wiki/NV_services#NVGPU_GPU_IOCTL_GET_GPU_TIME
-            let ticks = nixe_gpu_maxwell::maxwell_gpu_timestamp(clock.scheduler_time_ns());
+            // This ioctl returns nanoseconds, independently of the 614.4 MHz
+            // timestamp encoded in Maxwell query reports.
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvdrv/devices/nvhost_ctrl_gpu.cpp
+            let nanoseconds = clock.scheduler_time_ns();
             let mut output = vec![0; 16];
-            write_u64(&mut output, 0, ticks)?;
+            write_u64(&mut output, 0, nanoseconds)?;
             Ok(output)
         }
         IOCTL_CTRL_GPU_ZCULL_GET_CTX_SIZE => {
@@ -1187,12 +1201,12 @@ fn ioctl_nvhost_ctrl_gpu(
             // Switch's output-only ABI is { u32 slot; u32 mask; }, with slot 7:
             // https://github.com/switchbrew/libnx/blob/master/nx/include/switch/nvidia/ioctl.h#L105-L108
             // https://github.com/switchbrew/libnx/blob/master/nx/source/nvidia/ioctl/nvhost-ctrl-gpu.c#L123-L137
-            // No ZBC entries are installed in the emulated GPU. Report an empty
-            // active mask, not the occupied slots of a physical driver's table.
-            // ZBC_SET_TABLE and ZBC_QUERY_TABLE remain unsupported; installing
-            // entries must also replace this empty mask with the table's state.
+            // Switch exposes this fixed slot/mask pair, independently of the
+            // registrations queried through ZBC_QUERY_TABLE.
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvdrv/devices/nvhost_ctrl_gpu.cpp
             let mut output = vec![0; 8];
             write_u32(&mut output, 0, 7)?;
+            write_u32(&mut output, 4, 1)?;
             Ok(output)
         }
         IOCTL_CTRL_GPU_GET_CHARACTERISTICS => {
@@ -2329,20 +2343,14 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_gpu_time_uses_shared_virtual_clock_and_ptimer_units() {
+    fn ctrl_gpu_time_uses_shared_virtual_nanoseconds() {
         let session = NvDrvSession::new(crate::test_memory::machine());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let clock = nixe_runtime::VirtualClock::new(nixe_runtime::VirtualClockMode::Fixed {
             unix_seconds: 0,
         });
-        for (nanoseconds, expected_ticks) in [
-            (0, 0),
-            (12, 7),
-            (13, 8),
-            (1_625_000, 1_000_000),
-            (u64::MAX, (u128::from(u64::MAX) * 8 / 13) as u64),
-        ] {
+        for nanoseconds in [0, 12, 13, 1_000_000_000, u64::MAX] {
             clock.advance_scheduler_to(nanoseconds);
             let NvDrvIoctlOutcome::Complete(response) = session
                 .ioctl_inner(
@@ -2364,7 +2372,7 @@ mod tests {
             assert_eq!(response.output.len(), 16);
             assert_eq!(
                 u64::from_le_bytes(response.output[..8].try_into().unwrap()),
-                expected_ticks
+                nanoseconds
             );
             assert_eq!(&response.output[8..], &[0; 8]);
         }
@@ -2499,12 +2507,12 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_gpu_zbc_mask_reports_no_installed_entries_without_accepting_table_mutations() {
+    fn ctrl_gpu_zbc_registrations_are_shared_deduplicated_and_queryable() {
         let session = NvDrvSession::new(crate::test_memory::machine());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let other_fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
-        let expected = vec![7, 0, 0, 0, 0, 0, 0, 0];
+        let expected = vec![7, 0, 0, 0, 1, 0, 0, 0];
         for queried_fd in [fd, other_fd] {
             assert_eq!(
                 (session.ioctl(queried_fd, IOCTL_CTRL_GPU_ZBC_GET_ACTIVE_SLOT_MASK, &[])).unwrap(),
@@ -2512,21 +2520,128 @@ mod tests {
             );
         }
 
-        // Advertising an empty table must not silently accept changes to it,
-        // or reinterpret a request with the wrong size/direction as this query.
-        for (request, input) in [
-            (0x402c_4703, vec![0; 44]),
-            (0xc034_4704, vec![0; 52]),
-            (0xc008_4714, vec![0; 8]),
-            (0x8004_4714, vec![]),
+        let words = |values: &[u32]| {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let mut color = words(&[
+            0x7fc0_0001,
+            0xff80_0000,
+            0x8000_0000,
+            0x3f80_0000,
+            0x1122_3344,
+            0x5566_7788,
+            0x99aa_bbcc,
+            0xddee_ff00,
+            0xdead_beef,
+            0x28,
+            1,
+        ]);
+        for _ in 0..2 {
+            assert_eq!(
+                session
+                    .ioctl(fd, IOCTL_CTRL_GPU_ZBC_SET_TABLE, &color)
+                    .unwrap()
+                    .1,
+                NV_SUCCESS
+            );
+        }
+        let query = |kind, index| {
+            let mut request = vec![0; 52];
+            write_u32(&mut request, 44, kind).unwrap();
+            write_u32(&mut request, 48, index).unwrap();
+            request
+        };
+        let mut expected_color = color[..32].to_vec();
+        expected_color.extend(words(&[0, 2, 0x28, 1, 1]));
+        assert_eq!(
+            session
+                .ioctl(other_fd, IOCTL_CTRL_GPU_ZBC_QUERY_TABLE, &query(1, 0))
+                .unwrap(),
+            (expected_color.clone(), NV_SUCCESS)
+        );
+
+        // Both guest color encodings participate in identity.
+        write_u32(&mut color, 16, 0xaabb_ccdd).unwrap();
+        assert_eq!(
+            session
+                .ioctl(other_fd, IOCTL_CTRL_GPU_ZBC_SET_TABLE, &color)
+                .unwrap()
+                .1,
+            NV_SUCCESS
+        );
+        write_u32(&mut expected_color, 48, 2).unwrap();
+        assert_eq!(
+            session
+                .ioctl(fd, IOCTL_CTRL_GPU_ZBC_QUERY_TABLE, &query(1, 0))
+                .unwrap(),
+            (expected_color, NV_SUCCESS)
+        );
+        let mut depth = vec![0x55; 44];
+        write_u32(&mut depth, 32, 0x3f80_0000).unwrap();
+        write_u32(&mut depth, 36, 1).unwrap();
+        write_u32(&mut depth, 40, 2).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                session
+                    .ioctl(fd, IOCTL_CTRL_GPU_ZBC_SET_TABLE, &depth)
+                    .unwrap()
+                    .1,
+                NV_SUCCESS
+            );
+        }
+        let mut expected_depth = vec![0; 32];
+        expected_depth.extend(words(&[0x3f80_0000, 2, 1, 2, 1]));
+        session.close(fd);
+        assert_eq!(
+            session
+                .ioctl(other_fd, IOCTL_CTRL_GPU_ZBC_QUERY_TABLE, &query(2, 0))
+                .unwrap(),
+            (expected_depth, NV_SUCCESS)
+        );
+
+        for (kind, index) in [(1, 2), (2, 1), (3, 0)] {
+            let request = query(kind, index);
+            assert_eq!(
+                session
+                    .ioctl(other_fd, IOCTL_CTRL_GPU_ZBC_QUERY_TABLE, &request)
+                    .unwrap(),
+                (request, NV_BAD_PARAMETER)
+            );
+        }
+        for kind in [0, 3] {
+            write_u32(&mut color, 40, kind).unwrap();
+            assert_eq!(
+                session
+                    .ioctl(other_fd, IOCTL_CTRL_GPU_ZBC_SET_TABLE, &color)
+                    .unwrap(),
+                (color.clone(), NV_BAD_PARAMETER)
+            );
+        }
+        for (request, size) in [
+            (IOCTL_CTRL_GPU_ZBC_SET_TABLE, 44),
+            (IOCTL_CTRL_GPU_ZBC_QUERY_TABLE, 52),
         ] {
+            for size in [size - 1, size + 1] {
+                let input = vec![0; size];
+                assert_eq!(
+                    session.ioctl(other_fd, request, &input).unwrap(),
+                    (input, NV_BAD_PARAMETER)
+                );
+            }
+        }
+
+        // Wrong request sizes/directions must not alias the supported ioctls.
+        for (request, input) in [(0xc008_4714, vec![0; 8]), (0x8004_4714, vec![])] {
             assert!(matches!(
-                session.ioctl(fd, request, &input),
+                session.ioctl(other_fd, request, &input),
                 Err(UnsupportedNvDrvOperation::Ioctl { .. })
             ));
         }
         assert_eq!(
-            (session.ioctl(fd, IOCTL_CTRL_GPU_ZBC_GET_ACTIVE_SLOT_MASK, &[])).unwrap(),
+            (session.ioctl(other_fd, IOCTL_CTRL_GPU_ZBC_GET_ACTIVE_SLOT_MASK, &[])).unwrap(),
             (expected, NV_SUCCESS)
         );
     }
@@ -2987,7 +3102,16 @@ mod tests {
 
     #[test]
     fn asynchronous_frontend_failures_retain_sources_and_never_publish_completion() {
-        for (legacy, empty) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (legacy, empty, zero_increment) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
             let session = NvDrvSession::new(crate::test_memory::machine());
             session.initialize(0);
             let nvmap_fd = session.open(b"/dev/nvmap", 1).unwrap();
@@ -3043,7 +3167,8 @@ mod tests {
             );
             let mut header = [0_u8; 24];
             header[8..12].copy_from_slice(&u32::from(!empty).to_le_bytes());
-            header[12..16].copy_from_slice(&4_u32.to_le_bytes());
+            header[12..16]
+                .copy_from_slice(&(4_u32 | (u32::from(zero_increment) << 8)).to_le_bytes());
             let (accepted, request) = if legacy {
                 let mut input = header.to_vec();
                 if !empty {
@@ -3080,6 +3205,9 @@ mod tests {
                 accepted.1, NV_SUCCESS,
                 "acceptance precedes frontend execution"
             );
+            assert_eq!(input_u32(&accepted.0, 12).unwrap(), 0);
+            assert_eq!(input_u32(&accepted.0, 16).unwrap(), syncpoint.get());
+            assert_eq!(input_u32(&accepted.0, 20).unwrap(), 0);
             let (backend, control_descriptor) = {
                 let state = session.state.lock().unwrap();
                 (

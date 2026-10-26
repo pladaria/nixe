@@ -131,6 +131,7 @@ struct LibraryState {
 struct Libraries {
     map: Mutex<LibraryState>,
     limit: usize,
+    counters: nixe_gpu::cache_counters::CacheCounters,
 }
 impl Libraries {
     fn get(
@@ -161,6 +162,7 @@ impl Libraries {
                     #[cfg(feature = "performance-counters")]
                     nixe_gpu::compilation_capture::Key::new(&victim).event("evict", usize::MAX, 0);
                     map.entries.remove(&victim);
+                    self.counters.evict(1);
                 }
                 let cell = Arc::new(LibraryCell {
                     result: Mutex::new(None),
@@ -171,6 +173,8 @@ impl Libraries {
                     capture_key.detail("identity", usize::MAX, 0, &format!("{key:?}"));
                 }
                 map.entries.insert(key, (Arc::clone(&cell), clock));
+                self.counters.miss();
+                self.counters.publish_usage(map.entries.len(), 0);
                 (cell, true)
             }
         };
@@ -231,6 +235,7 @@ pub struct PipelineCompiler {
     pool: Arc<CompilePool>,
     cache: Mutex<nixe_gpu::WorkingSet<PipelineKey, Arc<NativePipeline>>>,
     compiler: Arc<Compiler>,
+    counters: nixe_gpu::cache_counters::CacheCounters,
 }
 impl PipelineCompiler {
     pub(crate) fn bind_wakeup(&self, wake: Arc<dyn Fn() + Send + Sync>) {
@@ -295,8 +300,12 @@ impl PipelineCompiler {
         if device.profile().core.depth_bounds != 0 {
             dynamic.push(vk::DynamicState::DEPTH_BOUNDS);
         }
+        if device.profile().attachment_feedback_loop {
+            dynamic.push(vk::DynamicState::ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT);
+        }
         Ok(Self {
             pool,
+            counters: nixe_gpu::cache_counters::CacheCounters::new(config.pipeline_entries, 0),
             cache: Mutex::new(nixe_gpu::WorkingSet::new(
                 config.pipeline_entries,
                 config.pipeline_entries * std::mem::size_of::<NativePipeline>(),
@@ -311,6 +320,10 @@ impl PipelineCompiler {
                         clock: 0,
                     }),
                     limit: config.pipeline_entries,
+                    counters: nixe_gpu::cache_counters::CacheCounters::new(
+                        config.pipeline_entries,
+                        0,
+                    ),
                 },
                 strategy,
                 inline_modules: device.profile().graphics_pipeline_library,
@@ -430,11 +443,16 @@ impl PipelineCompiler {
             );
             build_pipeline.build_ready.notify_all();
         })?;
+        let previous_entries = cache.usage().0;
         cache.insert(
             key,
             Arc::clone(&pipeline),
             std::mem::size_of::<NativePipeline>(),
         );
+        let entries = cache.usage().0;
+        self.counters.miss();
+        self.counters.evict((previous_entries + 1 - entries) as u64);
+        self.counters.publish_usage(entries, 0);
         Ok(pipeline)
     }
     pub fn checkpoint(&self) -> Result<(), CompileError> {
@@ -442,6 +460,12 @@ impl PipelineCompiler {
     }
     pub fn usage(&self) -> (usize, usize) {
         self.cache.lock().unwrap().usage()
+    }
+    pub(crate) fn cache_counters(&self) -> nixe_gpu::cache_counters::CacheCounters {
+        self.counters.clone()
+    }
+    pub(crate) fn library_counters(&self) -> nixe_gpu::cache_counters::CacheCounters {
+        self.compiler.libraries.counters.clone()
     }
     pub fn library_entries(&self) -> usize {
         self.compiler.libraries.map.lock().unwrap().entries.len()

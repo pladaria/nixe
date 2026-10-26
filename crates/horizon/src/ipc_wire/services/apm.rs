@@ -1,7 +1,5 @@
 use super::prelude::*;
 
-const PERFORMANCE_MODE_NORMAL: u32 = 0;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PerformanceManagerCommand {
     OpenSession,
@@ -40,6 +38,7 @@ pub(in crate::ipc_wire) fn dispatch_performance_manager(
     process: &mut Request,
     manager: &PerformanceManagerSession,
     request: CmifRequest<'_>,
+    operation_mode: OperationMode,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let Some(command) = PerformanceManagerCommand::decode(request.command_id) else {
         return unsupported_service_command("apm", request.command_id);
@@ -60,12 +59,13 @@ pub(in crate::ipc_wire) fn dispatch_performance_manager(
             )),
         },
         PerformanceManagerCommand::GetPerformanceMode => {
-            log::debug!("apm returned normal performance mode");
+            let mode = operation_mode.performance_mode();
+            log::debug!("apm returned performance mode {mode} for {operation_mode:?}");
             Ok((
                 encode_response(
                     request.token,
                     HorizonIpcResult::SUCCESS,
-                    &PERFORMANCE_MODE_NORMAL.to_le_bytes(),
+                    &mode.to_le_bytes(),
                     None,
                 )?,
                 None,

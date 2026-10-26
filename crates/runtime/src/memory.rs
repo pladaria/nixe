@@ -177,7 +177,15 @@ impl ProcessMemory {
         bytes: u64,
         mapping: Mapping,
     ) -> Result<(), MappingError> {
-        let allocation = self.account.allocate(bytes)?;
+        // Horizon maps thread-local pages from kernel page buffers, outside
+        // the process's PhysicalMemoryMax resource limit.
+        // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/kern_k_thread_local_page.cpp
+        let account = if mapping.kind == MemoryKind::ThreadLocal {
+            &self.system
+        } else {
+            &self.account
+        };
+        let allocation = account.allocate(bytes)?;
         self.map(start, allocation, 0, bytes, mapping)
     }
     pub fn heap_size(&self) -> u64 {

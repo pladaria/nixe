@@ -264,46 +264,6 @@ impl ResourceAccess {
     }
 }
 
-/// A barrier-defined usage and visibility transition for one exact range.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ResourceTransition {
-    target: AccessTarget,
-    before: AccessScope,
-    after: AccessScope,
-}
-
-impl ResourceTransition {
-    pub fn new(
-        target: AccessTarget,
-        before: AccessScope,
-        after: AccessScope,
-    ) -> Result<Self, AccessDescriptionError> {
-        if before == after {
-            return Err(AccessDescriptionError::RedundantTransition);
-        }
-        Ok(Self {
-            target,
-            before,
-            after,
-        })
-    }
-
-    #[must_use]
-    pub const fn target(self) -> AccessTarget {
-        self.target
-    }
-
-    #[must_use]
-    pub const fn before(self) -> AccessScope {
-        self.before
-    }
-
-    #[must_use]
-    pub const fn after(self) -> AccessScope {
-        self.after
-    }
-}
-
 /// Pointer-free identity retained by an operation independently of byte access.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ResourceDependency {
@@ -318,7 +278,7 @@ pub enum ResourceDependency {
     QueryPool(QueryPoolId),
 }
 
-/// Failure to define an access or transition.
+/// Failure to define an access.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccessDescriptionError {
     EmptyBufferRange,
@@ -330,7 +290,6 @@ pub enum AccessDescriptionError {
         usage: ResourceUsage,
         mode: AccessMode,
     },
-    RedundantTransition,
 }
 
 impl Display for AccessDescriptionError {
@@ -345,9 +304,6 @@ impl Display for AccessDescriptionError {
                 formatter,
                 "resource usage does not permit access direction: usage={usage:?} mode={mode:?}"
             ),
-            Self::RedundantTransition => {
-                formatter.write_str("resource transition has identical before and after scopes")
-            }
         }
     }
 }
@@ -394,34 +350,6 @@ mod tests {
                 ResourceUsage::StorageBuffer,
             )
             .is_ok()
-        );
-    }
-
-    #[test]
-    fn transitions_preserve_both_explicit_scopes() {
-        let target = AccessTarget::Buffer {
-            buffer: BufferId::new(1),
-            range: BufferRange::new(0, 64).unwrap(),
-        };
-        let before = AccessScope::new(
-            PipelineStages::COPY,
-            AccessMode::Write,
-            ResourceUsage::TransferDestination,
-        )
-        .unwrap();
-        let after = AccessScope::new(
-            PipelineStages::VERTEX_INPUT,
-            AccessMode::Read,
-            ResourceUsage::VertexBuffer,
-        )
-        .unwrap();
-        let transition = ResourceTransition::new(target, before, after).unwrap();
-        assert_eq!(transition.target(), target);
-        assert_eq!(transition.before(), before);
-        assert_eq!(transition.after(), after);
-        assert_eq!(
-            ResourceTransition::new(target, before, before),
-            Err(AccessDescriptionError::RedundantTransition)
         );
     }
 }

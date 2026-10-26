@@ -80,7 +80,6 @@ impl Host {
             if let Some(ui) = &mut packet.ui {
                 self.renderer
                     .update_textures(cache, ui, descriptors, samplers)?;
-                cache.flush()?;
             }
             self.ui = packet.ui.take();
             if packet.screenshot.is_some() {
@@ -101,13 +100,12 @@ impl Host {
             {
                 let extent = source.dimensions();
                 let image = cache.allocate_host_image(extent, vk::Format::R8G8B8A8_UNORM)?;
-                let view = render::view(cache.device(), image, vk::Format::R8G8B8A8_UNORM)?;
+                let view = image.view_2d(vk::Format::R8G8B8A8_UNORM)?;
                 cache.device_mut().end_rendering();
-                let slot = cache.device_mut().begin_recording()?;
-                let command = cache.device().submission.slots[slot].command;
+                cache.device_mut().begin_recording()?;
+
                 render::transition(
                     cache.device_mut(),
-                    command,
                     view.image.handle,
                     vk::ImageLayout::UNDEFINED,
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -132,7 +130,6 @@ impl Host {
                 )?;
                 render::transition(
                     cache.device_mut(),
-                    command,
                     view.image.handle,
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -176,12 +173,11 @@ impl Host {
             None
         };
         cache.device_mut().end_rendering();
-        let slot = cache.device_mut().begin_recording()?;
+        cache.device_mut().begin_recording()?;
         self.pending_surface = Some(acquired);
-        let command = cache.device().submission.slots[slot].command;
+
         render::transition(
             cache.device_mut(),
-            command,
             acquired.image,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -224,8 +220,8 @@ impl Host {
                 .layer_count(1)
                 .color_attachments(&attachments);
             unsafe {
-                cache.device_mut().dispatch.begin_rendering(command, &info);
-                cache.device_mut().dispatch.end_rendering(command);
+                cache.device_mut().dispatch.begin_rendering(&info);
+                cache.device_mut().dispatch.end_rendering();
             }
         }
         if let (Some(ui), Some(pipeline)) = (&mut self.ui, ui_pipeline) {
@@ -241,7 +237,6 @@ impl Host {
         }
         render::transition(
             cache.device_mut(),
-            command,
             acquired.image,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             vk::ImageLayout::PRESENT_SRC_KHR,
@@ -297,7 +292,7 @@ impl Host {
                 Err(error) => return Err(error),
             };
             let device = cache.device_mut();
-            let command = device.submission.slots[slot].command;
+
             let copy = vk::BufferImageCopy::default()
                 .buffer_offset(slice.offset)
                 .image_offset(vk::Offset3D {
@@ -317,7 +312,6 @@ impl Host {
                 );
             unsafe {
                 device.dispatch.cmd_copy_image_to_buffer(
-                    command,
                     capture.view.image.handle,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     device.submission.slots[slot].readback_buffer(slice).handle,

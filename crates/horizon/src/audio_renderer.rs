@@ -15,6 +15,7 @@ mod buffer;
 mod effect;
 mod render;
 mod resample;
+mod splitter;
 mod state;
 pub(crate) mod update;
 mod voice;
@@ -22,10 +23,12 @@ mod worker;
 pub(crate) use worker::RenderError;
 
 pub(crate) const PARAMETER_SIZE: usize = 0x34;
+pub(crate) const CURRENT_REVISION: u32 = 15;
 
 pub(crate) fn revision_number(revision: u32) -> Option<u32> {
     let revision = revision.checked_sub(u32::from_le_bytes(*b"REV0"))?;
-    (revision & 0x00ff_ffff == 0 && (1..=15).contains(&(revision >> 24))).then_some(revision >> 24)
+    (revision & 0x00ff_ffff == 0 && (1..=CURRENT_REVISION).contains(&(revision >> 24)))
+        .then_some(revision >> 24)
 }
 
 #[derive(Clone, Debug)]
@@ -40,7 +43,6 @@ pub(crate) struct RendererParameters {
     pub(crate) performance_frames: u32,
     pub(crate) splitters: u32,
     pub(crate) splitter_destinations: u32,
-    pub(crate) external_context_size: u32,
     pub(crate) revision: u32,
     pub(crate) rendering_device: u8,
     pub(crate) execution_mode: u8,
@@ -60,7 +62,6 @@ impl RendererParameters {
             performance_frames: word(28),
             splitters: word(36),
             splitter_destinations: word(40),
-            external_context_size: word(44),
             revision: word(48),
             rendering_device: data[34],
             execution_mode: data[35],
@@ -71,11 +72,11 @@ impl RendererParameters {
         revision_number(self.revision)
     }
 
-    // REV1–REV7 negotiated work-memory layout, including revision-dependent
-    // routing, performance records and command storage. Keep calculations wide:
-    // untrusted counts must never wrap into a small guest allocation.
-    // Adapted from Yuzu (GPL-2.0-or-later), Copyright 2018 yuzu emulator team:
-    // https://github.com/eden-emulator/mirror/blob/d27abf5546bc392d498dedf87daed57e96268b0f/src/core/hle/service/audio/audren_u.cpp#L350
+    // Work storage follows the reference renderer's concrete metadata and
+    // command sizes, without depending on Rust struct layout. Wide arithmetic
+    // prevents guest counts from wrapping into a smaller allocation.
+    // https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/system.cpp
+    // https://switchbrew.org/wiki/Audio_services#BehaviorInfo_Revision
     pub(crate) fn work_buffer_size(&self, revision: u32) -> Option<u64> {
         let align = |value: u128, alignment: u128| value.div_ceil(alignment) * alignment;
         let samples = u128::from(self.samples);
@@ -89,43 +90,52 @@ impl RendererParameters {
         let nodes = submixes + 1;
         let entries = effects + submixes + sinks + voices + 1;
 
-        let mut size = align((mixes + 6) * 4 * (samples + 240) + submixes + sinks, 64);
-        size += align(u128::from(self.external_context_size), 64) + align(4 * mixes, 64);
-        size += align(8 * nodes, 16) + align(0x940 * nodes, 16) + align(1024 * submixes, 16);
+        let mut size = align(4 * mixes, 64) + submixes * 256 * 4 + nodes * 2368;
+        size += voices * (560 + 200 + 296);
+        size += align(nodes * 8, 16) + align(voices * 8, 16);
+        size += align(((sinks + submixes) * 240 + samples) * 4 * (mixes + 6), 64);
         if revision >= 2 {
-            let node_states = 4 * nodes * nodes + 12 * nodes + 2 * (align(nodes, 64) / 8);
-            size += align(node_states + 4 * nodes * nodes, 16);
+            let node_states = 4 * nodes * nodes + 48 * nodes + 2 * (align(nodes, 64) / 8);
+            let edges = align(nodes * nodes, 64) / 8;
+            size += align(node_states + edges, 16);
+            size += 264 * destinations + 32 * splitters;
+            if revision >= 5 {
+                size += align(4 * destinations, 16);
+            }
         }
-        size += align(8 * voices, 16) + align(0x220 * voices, 16);
-        size += align(0xd0 * voices, 16) + align(0x100 * voices, 16);
-        size += 0x48 + align(4 * (effects + voices) * 0x20, 16);
-        if revision >= 2 {
-            size += destinations + align(0x20 * splitters, 16) + align(0xe0 * destinations, 16);
+        size += (effects + 4 * voices) * 32;
+        if revision >= 9 {
+            size += effects * 128;
         }
-        size = align(size, 64);
-        size += align(0x280 * (submixes + sinks), 64);
-        size += align(0x2b0 * effects, 16) + align(0x170 * sinks, 16);
-        size += align(0x100 * voices + 63, 16);
+        size = align(size + 0x50, 64);
+        size += (sinks + submixes) * 616 + effects * 1592;
+        size += align(voices * 296, 64) + sinks * 352;
+        if revision >= 9 {
+            size += effects * 128;
+        }
         let (performance_header, performance_entry) = if revision >= 5 {
             (0x30, 0x18)
         } else {
             (0x18, 0x10)
         };
         let performance_frame = performance_header + performance_entry * (entries + 100);
-        size += align(
-            performance_frame * u128::from(self.performance_frames) + 1,
-            64,
-        ) + 64
-            + 128;
+        if self.performance_frames != 0 {
+            size += align(
+                performance_frame * (u128::from(self.performance_frames) + 1) + 0xc0,
+                256,
+            );
+        }
         size += if revision >= 5 {
-            effects * 0x540
-                + 0x24
-                + 0x1c * 24
-                + 0x28 * (entries + 100)
-                + sinks * 0x130
-                + destinations * 24 * 0x24
-                + submixes * (0x24 + 0x1c * 24 * 24)
-                + voices * (splitters * 0x50 + 0x9c + 2 * 0x2c + 0x20 + 0x13c)
+            effects * 1592
+                + 48
+                + 40 * 24 * 24
+                + 48
+                + 40 * 24
+                + 64 * (entries + 100)
+                + sinks * 320
+                + destinations * 24 * 48
+                + voices
+                    * (splitters * 96 + 2 * 80 + 40 + 328 + if revision >= 8 { 296 } else { 288 })
                 + 126
         } else {
             0x18000 + 126
@@ -254,15 +264,19 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_sizes_match_independently_executed_yuzu_reference() {
-        // Golden results from compiling the unmodified sizing lambdas at the
-        // pinned reference above, including a splitter/performance configuration.
+    fn negotiated_sizes_match_independently_executed_reference() {
+        // Golden results from compiling System::GetWorkBufferSize and its
+        // helpers in the reference linked above, including native struct sizes.
         for (revision, expected) in [
-            (1, 0x4f000),
-            (2, 0x4f000),
-            (4, 0x4f000),
-            (5, 0x50000),
-            (7, 0x50000),
+            (1, 0x5c000),
+            (2, 0x5c000),
+            (4, 0x5c000),
+            (5, 0x66000),
+            (7, 0x66000),
+            (8, 0x66000),
+            (9, 0x67000),
+            (11, 0x67000),
+            (15, 0x67000),
         ] {
             let params = parameters(revision);
             assert_eq!(params.revision_number(), Some(u32::from(revision)));
@@ -275,11 +289,12 @@ mod tests {
         params.voices = 12;
         params.sinks = 2;
         params.effects = 8;
-        params.external_context_size = 0x123;
         params.splitters = 4;
         params.splitter_destinations = 12;
         params.performance_frames = 3;
-        assert_eq!(params.work_buffer_size(7), Some(0x2e000));
+        for revision in [7, 8, 9, 15] {
+            assert_eq!(params.work_buffer_size(revision), Some(0x4a000));
+        }
     }
 
     #[test]
@@ -288,6 +303,7 @@ mod tests {
         for revision in [
             0,
             u32::from_le_bytes(*b"REV0"),
+            u32::from_le_bytes(*b"REV@"),
             u32::from_le_bytes(*b"rev7"),
             u32::from_le_bytes(*b"REV7") + 1,
         ] {

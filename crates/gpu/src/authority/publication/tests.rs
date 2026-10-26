@@ -32,6 +32,7 @@ fn partial_writers_ignore_retired_allocations_outside_their_exact_domain() {
         let mapping = PhysicalMapping::new(&ranges).unwrap();
         let (full_domain, partial_domain) = if image {
             let full = ImageFootprint {
+                depth_slice: 0,
                 base: 0,
                 columns: 1,
                 rows: 2,

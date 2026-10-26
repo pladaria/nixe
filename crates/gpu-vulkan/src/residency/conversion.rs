@@ -1,11 +1,9 @@
 //! Fixed-point NV12 is a host utility, compiled through the ordinary pipeline
-//! cache and recorded as an ordinary raster workload. External import is separate.
+//! cache. Decoded inputs are host-only textures; only VIC output owns guest bytes.
 use super::*;
-use crate::{
-    Binding, Draw, GraphicsParameters, PreparedDraw, RenderAttachment, RenderingTargets, cache::*,
-};
+use crate::{Draw, GraphicsParameters, PreparedDraw, RenderAttachment, RenderingTargets, cache::*};
 use nixe_gpu::{
-    Nv12ColorTransform, ShaderStage,
+    Nv12ColorTransform, Nv12Planes, ShaderStage,
     shader_module::{self as spirv, ResourceId},
 };
 use std::sync::OnceLock;
@@ -30,13 +28,164 @@ pub(crate) fn stage(
         None,
     )
 }
-pub struct PreparedNv12 {
+pub(crate) struct Nv12Inputs {
+    pub(crate) extent: [u32; 2],
+    uploaded_extent: [u32; 2],
+    views: [Arc<crate::AllocatedImageView>; 2],
+    initialized: bool,
+}
+impl Nv12Inputs {
+    pub(crate) fn dimensions(source: &Nv12Planes) -> Result<[u32; 2], VulkanError> {
+        let width = source.widths[0];
+        if width == 0
+            || source.widths[1] != width.div_ceil(2)
+            || source.bytes[0].is_empty()
+            || !source.bytes[0].len().is_multiple_of(width as usize)
+        {
+            return Err(VulkanError::InvalidResource(
+                "invalid owned NV12 row extents",
+            ));
+        }
+        let height = u32::try_from(source.bytes[0].len() / width as usize)
+            .map_err(|_| VulkanError::InvalidResource("NV12 height overflows"))?;
+        if source.bytes[1].len() as u64
+            != u64::from(source.widths[1]) * 2 * u64::from(height.div_ceil(2))
+        {
+            return Err(VulkanError::InvalidResource(
+                "invalid owned NV12 chroma extent",
+            ));
+        }
+        Ok([width, height])
+    }
+    pub(crate) fn new(cache: &mut VulkanResidency, extent: [u32; 2]) -> Result<Self, VulkanError> {
+        let y = cache
+            .allocate_host_image(extent, vk::Format::R8_UNORM)?
+            .view_2d(vk::Format::R8_UNORM)?;
+        let uv = cache
+            .allocate_host_image(extent.map(|v| v.div_ceil(2)), vk::Format::R8G8_UNORM)?
+            .view_2d(vk::Format::R8G8_UNORM)?;
+        Ok(Self {
+            extent,
+            uploaded_extent: [0, 0],
+            views: [y, uv],
+            initialized: false,
+        })
+    }
+    pub(crate) fn forget(self, descriptors: &mut DescriptorCache) {
+        for view in &self.views {
+            descriptors.forget_image(view);
+        }
+    }
+    pub(crate) fn upload(
+        &mut self,
+        cache: &mut VulkanResidency,
+        source: &Nv12Planes,
+    ) -> Result<(), VulkanError> {
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        cache.device.end_rendering();
+        cache.device.begin_recording()?;
+        for (index, view) in self.views.iter().enumerate() {
+            cache.barriers.queue_image(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(if self.initialized {
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER
+                    } else {
+                        vk::PipelineStageFlags2::NONE
+                    })
+                    .src_access_mask(if self.initialized {
+                        vk::AccessFlags2::SHADER_SAMPLED_READ
+                    } else {
+                        vk::AccessFlags2::NONE
+                    })
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .old_layout(if self.initialized {
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                    } else {
+                        vk::ImageLayout::UNDEFINED
+                    })
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(view.image.handle)
+                    .subresource_range(range),
+            );
+            cache.barriers.emit(&mut cache.device);
+            let width = source.widths[index];
+            let pitch = u64::from(width) * (index as u64 + 1);
+            let chunk_bytes = cache.device.submission.configuration.arena_bytes / pitch * pitch;
+            if chunk_bytes == 0 {
+                return Err(VulkanError::InvalidResource(
+                    "video row exceeds upload arena",
+                ));
+            }
+            for (chunk, bytes) in source.bytes[index].chunks(chunk_bytes as usize).enumerate() {
+                let (slot, slice) = cache.reserve_upload(bytes, 4)?;
+                let buffer = cache.device.submission.slots[slot]
+                    .upload_buffer(slice)
+                    .handle;
+                let work = cache.device.work_ticket()?;
+                cache.device.retire_image(Arc::clone(&view.image), work)?;
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(slice.offset)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_offset(vk::Offset3D {
+                        x: 0,
+                        y: ((chunk as u64 * chunk_bytes) / pitch) as i32,
+                        z: 0,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width,
+                        height: (bytes.len() as u64 / pitch) as u32,
+                        depth: 1,
+                    });
+                unsafe {
+                    cache.device.dispatch.cmd_copy_buffer_to_image(
+                        buffer,
+                        view.image.handle,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[region],
+                    );
+                }
+                cache.statistics.cpu_uploaded_bytes += bytes.len() as u64;
+            }
+            cache.barriers.queue_image(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(view.image.handle)
+                    .subresource_range(range),
+            );
+        }
+        cache.barriers.emit(&mut cache.device);
+        self.uploaded_extent = [
+            source.widths[0],
+            (source.bytes[0].len() / source.widths[0] as usize) as u32,
+        ];
+        self.initialized = true;
+        Ok(())
+    }
+}
+pub(crate) struct PreparedNv12 {
     draw: PreparedDraw,
     parameters: [u8; 80],
 }
 /// Request ahead of consumption, exactly like a guest graphics pipeline. The
 /// owner polls the returned publication; no synchronous compilation in recording.
-pub fn nv12_pipeline(
+pub(crate) fn nv12_pipeline(
     compiler: &PipelineCompiler,
     format: vk::Format,
 ) -> Result<Arc<NativePipeline>, CompileError> {
@@ -81,10 +230,11 @@ pub fn nv12_pipeline(
     })
 }
 impl VulkanResidency {
-    pub fn prepare_nv12(
+    pub(crate) fn prepare_nv12(
         &mut self,
         pipeline: Arc<NativePipeline>,
-        sources: [ImageViewId; 2],
+        descriptors: &mut DescriptorCache,
+        sources: &Nv12Inputs,
         destination: ImageId,
         plane: usize,
         transform: Nv12ColorTransform,
@@ -111,25 +261,16 @@ impl VulkanResidency {
                 "NV12 destination plane is absent",
             ))?
             .extent;
-        for (index, view) in sources.iter().enumerate() {
-            let image = self.image(view.image)?;
-            let d = image
-                .views
-                .get(view.view)
-                .ok_or(VulkanError::InvalidResource("NV12 source view is absent"))?;
-            let format = if index == 0 {
-                vk::Format::R8_UNORM
-            } else {
-                vk::Format::R8G8_UNORM
-            };
-            let end = [
-                t.source_origin[0].checked_add(extent.width),
-                t.source_origin[1].checked_add(extent.height),
-            ];
-            if image.description.format!=format || d.format!=format || d.view_type!=vk::ImageViewType::TYPE_2D || d.base_mip!=0 || d.mip_count!=1 || d.base_layer!=0 || d.layer_count!=1 || d.swizzle!=[vk::ComponentSwizzle::IDENTITY;4]
-                || end[0].is_none_or(|v|if index==0 {v} else {v.div_ceil(2)}>image.description.extent.width) || end[1].is_none_or(|v|if index==0 {v} else {v.div_ceil(2)}>image.description.extent.height) {
-                return Err(VulkanError::InvalidResource("NV12 needs complete R8/RG8 source views and a bounded source crop"));
-            }
+        if t.source_origin[0]
+            .checked_add(extent.width)
+            .is_none_or(|v| v > sources.uploaded_extent[0])
+            || t.source_origin[1]
+                .checked_add(extent.height)
+                .is_none_or(|v| v > sources.uploaded_extent[1])
+        {
+            return Err(VulkanError::InvalidResource(
+                "NV12 source crop exceeds decoded frame",
+            ));
         }
         let format = self.image(destination)?.description.format;
         if !matches!(
@@ -140,9 +281,19 @@ impl VulkanResidency {
                 "NV12 destination requires RGBA8/BGRA8 UNORM",
             ));
         }
-        let program = self.prepare_program(pipeline, &sources.map(Binding::Image))?;
-        let graphics = self.prepare_graphics(
-            program,
+        let record = descriptors.get(
+            &pipeline.layout,
+            &sources
+                .views
+                .each_ref()
+                .map(|view| DescriptorResource::Image {
+                    view: Arc::clone(view),
+                    layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                }),
+        )?;
+        let graphics = self.prepare_host_graphics(
+            pipeline,
+            record,
             GraphicsParameters::new(
                 GraphicsState::color(format),
                 vk::Extent2D {
@@ -179,7 +330,10 @@ impl VulkanResidency {
         let parameters = std::array::from_fn(|i| words[i / 4].to_le_bytes()[i % 4]);
         Ok(PreparedNv12 { draw, parameters })
     }
-    pub fn convert_nv12(&mut self, prepared: &PreparedNv12) -> Result<WorkTicket, VulkanError> {
+    pub(crate) fn convert_nv12(
+        &mut self,
+        prepared: &PreparedNv12,
+    ) -> Result<WorkTicket, VulkanError> {
         self.draw(
             &prepared.draw,
             Draw::Direct {

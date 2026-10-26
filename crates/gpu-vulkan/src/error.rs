@@ -6,7 +6,6 @@ pub enum VulkanError {
     Loader(Box<str>),
     Compilation(Box<str>),
     TextureDecode(Box<str>),
-    ExternalVideo(Box<str>),
     Vulkan {
         operation: &'static str,
         result: vk::Result,
@@ -26,10 +25,6 @@ pub enum VulkanError {
     QueuePressure {
         pending: Option<crate::WorkTicket>,
         retained_readbacks: usize,
-    },
-    StagingRequestTooLarge {
-        requested: u64,
-        maximum: u64,
     },
     QueueStopped,
     SubmissionFailed {
@@ -55,7 +50,6 @@ impl Display for VulkanError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TextureDecode(e) => write!(f,"Vulkan texture decode: {e}"),
-            Self::ExternalVideo(e) => write!(f,"Vulkan external video: {e}"),
             Self::Compilation(e) => write!(f,"Vulkan shader/pipeline compilation: {e}"),
             Self::Loader(e) => write!(f, "cannot load the Vulkan loader: {e}"),
             Self::Vulkan { operation, result } => write!(f, "{operation} failed: {result:?}"),
@@ -72,7 +66,6 @@ impl Display for VulkanError {
             Self::InvalidResource(e) => write!(f, "invalid Vulkan resource: {e}"),
             Self::Validation(e) => write!(f, "Vulkan validation reported errors: {}", e.join("; ")),
             Self::QueuePressure { pending, retained_readbacks } => write!(f, "Vulkan staging/command budget is full; pending work: {pending:?}, unread readbacks: {retained_readbacks}"),
-            Self::StagingRequestTooLarge { requested, maximum } => write!(f, "Vulkan staging request of {requested} bytes exceeds the bounded allocation size {maximum}; split the transfer into chunks"),
             Self::Memory(error) => write!(f, "Vulkan physical memory: {error}"),
             Self::ResidencyPressure { requested, allocated, budget } => write!(f, "Vulkan residency budget exhausted: requested {requested}, live/in-flight allocations {allocated}, budget {budget}; authoritative or leased contents cannot be discarded"),
             Self::DescriptorPressure => f.write_str("Vulkan descriptor slot budget is full; flush and continue in a recycled command slot"),

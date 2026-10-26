@@ -95,6 +95,9 @@ fn native_graphics_cache_normalizes_dynamic_state_and_reuses_library_parts() {
             state: changed,
         })
         .unwrap();
+    let counters = pipelines.cache_counters().snapshot();
+    assert_eq!(counters.entries, 2);
+    assert_eq!((counters.misses, counters.evictions), (2, 0));
     if pipelines.strategy() == PipelineStrategy::Libraries {
         assert_eq!(first_metrics.libraries_created, 4);
         assert_eq!(other.metrics().unwrap().libraries_created, 1);
@@ -153,6 +156,9 @@ fn descriptor_pressure(api: ApiPreference) {
     };
     let first = cache.get(&pipeline.layout, &resources(0)).unwrap();
     let second = cache.get(&pipeline.layout, &resources(alignment)).unwrap();
+    let counters = cache.cache_counters().snapshot();
+    assert_eq!((counters.entries, counters.entry_limit), (2, 2));
+    assert_eq!((counters.misses, counters.evictions), (2, 0));
     device.bind_native_pipeline(&pipeline).unwrap();
     device
         .bind_native_descriptors(
@@ -193,6 +199,9 @@ fn descriptor_pressure(api: ApiPreference) {
         .get(&pipeline.layout, &resources(alignment * 2))
         .unwrap();
     assert_eq!(cache.statistics().resets, 1);
+    let counters = cache.cache_counters().snapshot();
+    assert_eq!(counters.entries, 1);
+    assert_eq!((counters.misses, counters.evictions), (3, 2));
     device.bind_native_pipeline(&pipeline).unwrap();
     device
         .bind_native_descriptors(
@@ -321,9 +330,8 @@ fn dynamic_offsets_reuse_one_set_and_preserve_bounds_and_gpu_leases() {
     device
         .bind_native_descriptors(&pipeline, &record, &first_offsets)
         .unwrap();
-    let slot = device.submission.recording.unwrap();
-    let command = device.submission.slots[slot].command;
-    unsafe { device.dispatch.cmd_dispatch(command, 1, 1, 1) };
+
+    unsafe { device.dispatch.cmd_dispatch(1, 1, 1) };
     device
         .bind_native_descriptors(&pipeline, &record, &second_offsets)
         .unwrap();
@@ -350,7 +358,7 @@ fn dynamic_offsets_reuse_one_set_and_preserve_bounds_and_gpu_leases() {
         );
     }
     unsafe {
-        device.dispatch.cmd_dispatch(command, 1, 1, 1);
+        device.dispatch.cmd_dispatch(1, 1, 1);
         let barriers = [vk::BufferMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
             .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
@@ -360,10 +368,9 @@ fn dynamic_offsets_reuse_one_set_and_preserve_bounds_and_gpu_leases() {
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .buffer(buffer.handle)
             .size(buffer.size())];
-        device.dispatch.barrier(
-            command,
-            &vk::DependencyInfo::default().buffer_memory_barriers(&barriers),
-        );
+        device
+            .dispatch
+            .barrier(&vk::DependencyInfo::default().buffer_memory_barriers(&barriers));
     }
     let work = device.flush().unwrap().unwrap();
     // Command slots retain the immutable set after its cache is destroyed.

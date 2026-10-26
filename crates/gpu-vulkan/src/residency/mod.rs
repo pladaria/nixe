@@ -23,10 +23,8 @@ mod recording;
 mod sample_readback;
 mod transfers;
 pub use commands::{AttachmentLoad, AttachmentStore};
-pub use conversion::{PreparedNv12, nv12_pipeline};
+pub(crate) use conversion::{Nv12Inputs, nv12_pipeline};
 mod sync;
-pub use sync::{AccessScope, BarrierPolicy, BarrierStatistics, LayoutPolicy, RecordingPolicy};
-pub(crate) mod video;
 use crate::{
     AllocatedBuffer, AllocatedImage, AllocationMode, MemoryLocation, VulkanDevice, VulkanError,
     WorkTicket,
@@ -42,6 +40,15 @@ use nixe_gpu::authority::{ResourceObservation, WriterId};
 use nixe_gpu::physical::{Footprint, PhysicalMapping};
 use nixe_memory::Machine;
 use std::sync::Arc;
+pub use sync::{AccessScope, BarrierPolicy, BarrierStatistics, LayoutPolicy, RecordingPolicy};
+
+fn shader_attachment_layout(usage: vk::ImageUsageFlags) -> vk::ImageLayout {
+    if usage.contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT) {
+        vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+    } else {
+        vk::ImageLayout::GENERAL
+    }
+}
 
 macro_rules! cache_id {
     ($name:ident) => {
@@ -213,6 +220,7 @@ impl ImageEntry {
 /// Row padding remains canonical CPU storage; GPU image writes own texel bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImagePlane {
+    pub depth_slice: u32,
     pub offset: u64,
     pub row_pitch: u64,
     pub mip_level: u32,
@@ -303,7 +311,6 @@ pub struct VulkanResidency {
     buffer_downloads: std::collections::VecDeque<buffer_download::Download>,
     barriers: sync::Barriers,
     decoder: nixe_gpu::texture_decode::BlockDecoder,
-    pub(crate) video: video::VideoTransfers,
     sample_conversion: Option<sample_readback::SampleConversion>,
     #[cfg(feature = "binding-probe")]
     helpers: crate::helpers::Helpers,
@@ -458,7 +465,6 @@ impl VulkanResidency {
             buffer_downloads: Default::default(),
             barriers: sync::Barriers::default(),
             decoder: Default::default(),
-            video: Default::default(),
             sample_conversion: None,
             #[cfg(feature = "binding-probe")]
             helpers: crate::helpers::Helpers::default(),
@@ -567,9 +573,6 @@ impl VulkanResidency {
             .checked_add(bytes)
             .is_none_or(|used| used > self.budget.limit)
         {
-            if self.video.evict_idle(self.device.completed_tick()) {
-                continue;
-            }
             if !self.evict_one()? {
                 self.flush()?;
                 let completed = self.device.completed_tick();
@@ -906,11 +909,10 @@ impl VulkanResidency {
                 vk::AccessFlags2::TRANSFER_WRITE,
             ),
         )?;
-        let command = self.device.submission.slots[slot].command;
+
         self.barriers.emit(&mut self.device);
         self.publish_effect(&[writer], |device| unsafe {
             device.dispatch.cmd_copy_buffer(
-                command,
                 upload,
                 target,
                 &[vk::BufferCopy::default()

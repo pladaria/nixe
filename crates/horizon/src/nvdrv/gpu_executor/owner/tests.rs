@@ -48,6 +48,12 @@ impl QueueFixture {
 impl GpuExecution for QueueFixture {
     type Commands = nixe_gpu::native::NativeWork;
     type ImageRequest = nixe_gpu::native::NativePresentationImage;
+    fn flush(&mut self) -> Result<(), BackendRuntimeError> {
+        self.device
+            .flush()
+            .map(|_| ())
+            .map_err(|error| BackendRuntimeError::Backend(error.to_string().into()))
+    }
     fn consume(&mut self, batch: &Self::Commands) -> Result<bool, BackendRuntimeError> {
         if batch.frontend == FrontendSubmissionId::new(1)
             && !self.preparation_ready.load(Ordering::Acquire)
@@ -93,7 +99,7 @@ impl GpuExecution for QueueFixture {
             .map_err(|e| BackendRuntimeError::Backend(e.to_string().into()))?;
         Ok(self.complete())
     }
-    fn request_completion_wakeup(&mut self) -> Result<(), BackendRuntimeError> {
+    fn arm_completion_wakeup(&mut self) -> Result<(), BackendRuntimeError> {
         self.completion_wakeups += 1;
         Ok(())
     }
@@ -593,6 +599,9 @@ struct ControlledPreparation {
 impl GpuExecution for ControlledPreparation {
     type Commands = nixe_gpu::native::NativeWork;
     type ImageRequest = nixe_gpu::native::NativePresentationImage;
+    fn flush(&mut self) -> Result<(), BackendRuntimeError> {
+        Ok(())
+    }
     fn consume(&mut self, command: &Self::Commands) -> Result<bool, BackendRuntimeError> {
         if command.frontend.get() == 1 && !self.outer_ready.load(Ordering::Acquire) {
             return Ok(false);
@@ -781,4 +790,92 @@ fn stopping_with_suspended_channels_releases_admission_without_emitting_effects(
     stopper.join().unwrap();
     assert!(records.try_recv().is_err());
     assert_eq!(budget.state.lock().unwrap().active, 0);
+}
+
+#[test]
+fn idle_owner_submits_pending_native_work_at_its_deadline_without_new_commands() {
+    use super::super::super::super::{
+        NvDrvDescriptorOwner, NvDrvDeviceKind, NvDrvFileDescriptor, NvDrvPermissionProfile,
+        NvDrvSessionId,
+    };
+    use nixe_gpu::native::{NativeCommand, NativeWork};
+    use nixe_gpu_vulkan::{NativeGpuExecution, cache::CacheConfiguration};
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let memory = Machine::new(0x10000).unwrap();
+    let allocation = memory.account(4096).unwrap().allocate(4096).unwrap();
+    let target = AllocationRange::new(allocation.pin(), 0, 4096).unwrap();
+    let budget = Arc::new(GpuWorkBudget::default());
+    let (sender, receiver) = mpsc::channel();
+    let (completed, observed) = mpsc::channel();
+    let wake = sender.clone();
+    let mut native = NativeGpuExecution::new(
+        memory,
+        device,
+        nixe_gpu::shader_identity::ShaderNamespace {
+            guest: *b"nixe-native-test",
+            isa: 1,
+        },
+        CacheConfiguration::default(),
+        4 * 1024 * 1024,
+    )
+    .unwrap();
+    native
+        .bind_host_wakeup(Arc::new(move || {
+            let _ = completed.send(());
+            let _ = wake.send(GpuMessage::Wake);
+        }))
+        .unwrap();
+    let work = NativeWork {
+        frontend: FrontendSubmissionId::new(1),
+        command: NativeCommand::ReportMemory {
+            fence: true,
+            target: vec![target],
+            offset: 64,
+            bytes: Arc::from([0x37; 16]),
+        },
+    };
+    assert!(native.consume(&work).unwrap());
+    let token = native.submit(work.frontend).unwrap();
+    assert!(native.pending_submit_deadline().is_some());
+    let backend = Rc::new(RefCell::new(Some(native)));
+    let owner = Rc::new(RefCell::new(Owner::new(
+        &receiver,
+        Rc::clone(&backend),
+        &budget,
+        nixe_gpu_maxwell::MaxwellNativeFrontend::new(Default::default()),
+    )));
+    owner.borrow_mut().pending.push_back(PendingWork {
+        token,
+        work: GpuWork {
+            descriptor: NvDrvDeviceDescriptor::open(
+                NvDrvFileDescriptor::new(1),
+                NvDrvDeviceKind::HostGpu,
+                NvDrvDescriptorOwner::new(NvDrvSessionId::ROOT, 1),
+                NvDrvPermissionProfile::Application,
+            ),
+            request: 0xc018_481b,
+            frontend: work.frontend,
+            reservation: None,
+            control: Arc::new(Mutex::new(NvHostControl::default())),
+        },
+    });
+    let stopping = Arc::clone(&budget);
+    let watchdog = thread::spawn(move || {
+        let notified = observed.recv_timeout(Duration::from_secs(3)).is_ok();
+        stopping.stop();
+        let _ = sender.send(GpuMessage::Wake);
+        notified
+    });
+    Owner::drive(&owner).unwrap();
+    assert!(
+        watchdog.join().unwrap(),
+        "idle work needs a deadline, not another command or CPU request"
+    );
+    backend.borrow_mut().as_mut().unwrap().teardown().unwrap();
+    drop(owner);
+    drop(backend);
+    validation.check().unwrap();
 }

@@ -4,19 +4,40 @@
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/command/effect/biquad_filter.cpp
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/command/command_generator.cpp
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub(super) struct Parameters {
     enabled: bool,
     feed: [i16; 3],
     feedback: [i16; 2],
+    float: Option<([f32; 3], [f32; 2])>,
 }
 impl Parameters {
+    pub(super) fn q14(feed: [i16; 3], feedback: [i16; 2]) -> Self {
+        Self {
+            enabled: true,
+            feed,
+            feedback,
+            float: None,
+        }
+    }
     pub(super) fn decode(raw: &[u8]) -> Self {
         let coefficient = |i| i16::from_le_bytes(raw[i..i + 2].try_into().unwrap());
         Self {
             enabled: raw[0] != 0,
             feed: [coefficient(2), coefficient(4), coefficient(6)],
             feedback: [coefficient(8), coefficient(10)],
+            float: None,
+        }
+    }
+    pub(super) fn decode_float(raw: &[u8]) -> Self {
+        let coefficient = |i| f32::from_le_bytes(raw[i..i + 4].try_into().unwrap());
+        Self {
+            enabled: raw[0] != 0,
+            float: Some((
+                [coefficient(4), coefficient(8), coefficient(12)],
+                [coefficient(16), coefficient(20)],
+            )),
+            ..Self::default()
         }
     }
 }
@@ -41,8 +62,14 @@ impl State {
             let Self::Float(history) = self else {
                 unreachable!()
             };
-            let feed = params.feed.map(|v| f64::from(v) / 16384.0);
-            let feedback = params.feedback.map(|v| f64::from(v) / 16384.0);
+            let (feed, feedback) = if let Some((feed, feedback)) = params.float {
+                (feed.map(f64::from), feedback.map(f64::from))
+            } else {
+                (
+                    params.feed.map(|v| f64::from(v) / 16384.0),
+                    params.feedback.map(|v| f64::from(v) / 16384.0),
+                )
+            };
             for sample in samples {
                 let input = f64::from(*sample);
                 let output = input * feed[0]
@@ -86,6 +113,7 @@ mod tests {
             enabled: true,
             feed: [8192, 0, 0],
             feedback: [8192, 0],
+            float: None,
         }
     }
 

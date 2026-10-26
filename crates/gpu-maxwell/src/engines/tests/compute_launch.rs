@@ -20,7 +20,7 @@ fn pcas_address_is_shifted_without_truncation_and_does_not_launch_work() {
         let register = channel.compute().qmd_address();
         assert_eq!(register.raw(), Some(raw));
         assert_eq!(register.value().unwrap().get(), expected);
-        assert_eq!(register.source().unwrap().argument(), raw);
+
         assert_eq!(register.origin(), MaxwellComputeRegisterOrigin::Programmed);
     }
     assert_eq!(channel.three_d(), &graphics);

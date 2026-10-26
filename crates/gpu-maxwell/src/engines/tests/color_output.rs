@@ -19,23 +19,19 @@ fn separate_alpha_initial_state_is_consistent_across_targets_and_shadow_replay()
                     0x1e00 + target as u32 * 0x20,
                 )
             };
-            assert_eq!(
-                register.origin(),
-                MaxwellThreeDRegisterOrigin::VerifiedReset
-            );
+
             assert_eq!(register.raw(), Some(1));
             assert_eq!(
                 register.value(),
                 Some(&MaxwellThreeDFixedFunctionValue::Boolean(true))
             );
-            assert_eq!(register.source(), None);
+
             let raw = channel
                 .three_d_mut()
-                .raw_register(GpuMethodId(method))
+                .raw_register_value(GpuMethodId(method))
                 .unwrap();
-            assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
-            assert_eq!(raw.value(), Some(&1));
-            assert_eq!(raw.source(), None);
+
+            assert_eq!(Some(&raw), Some(&1));
         }
         // Replay an unprogrammed selector: the supplied invalid argument must
         // be replaced by the initial shadow value for common and per-RT state.

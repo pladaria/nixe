@@ -5,7 +5,9 @@ impl From<crate::VulkanError> for CompileError {
         Self::Failed(e.to_string().into())
     }
 }
+mod monitor;
 mod persistent;
+pub use monitor::CacheMonitor;
 mod shader;
 pub use shader::{CompilationTimings, CompiledStage, ShaderArtifact, ShaderCompiler};
 mod layout;

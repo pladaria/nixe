@@ -228,29 +228,24 @@ impl MaxwellThreeDLineState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDLineStateWrite) {
         match write {
-            MaxwellThreeDLineStateWrite::PolygonClipGeneratedEdge { value, source } => {
+            MaxwellThreeDLineStateWrite::PolygonClipGeneratedEdge { value, source: _ } => {
                 self.polygon_clip_generated_edge =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDLineStateWrite::AliasedLineWidthEnable { value, source } => {
-                self.aliased_line_width_enable =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDLineStateWrite::AliasedLineWidthEnable { value, source: _ } => {
+                self.aliased_line_width_enable = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDLineStateWrite::AntiAliasedLineEnable { value, source } => {
-                self.anti_aliased_line_enable =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDLineStateWrite::AntiAliasedLineEnable { value, source: _ } => {
+                self.anti_aliased_line_enable = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDLineStateWrite::AliasedLineWidth { value, source } => {
-                self.aliased_line_width =
-                    MaxwellThreeDRegister::programmed(value.get(), value, source);
+            MaxwellThreeDLineStateWrite::AliasedLineWidth { value, source: _ } => {
+                self.aliased_line_width = MaxwellThreeDRegister::decoded(value.get(), value);
             }
-            MaxwellThreeDLineStateWrite::StippleEnable { value, source } => {
-                self.stipple_enable =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            MaxwellThreeDLineStateWrite::StippleEnable { value, source: _ } => {
+                self.stipple_enable = MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
-            MaxwellThreeDLineStateWrite::StippleParameters { value, source } => {
-                self.stipple_parameters =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDLineStateWrite::StippleParameters { value, source: _ } => {
+                self.stipple_parameters = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
         }
     }

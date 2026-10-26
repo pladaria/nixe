@@ -33,11 +33,13 @@ pub(crate) struct HostSystems {
     pub keyboard: Option<nixe_applets::keyboard::KeyboardHost>,
     pub audio_backend: Option<std::sync::Arc<dyn nixe_audio::AudioBackend>>,
     pub audio_renderers: crate::AudioRendererManagerSession,
+    pub opus: crate::OpusManagerSession,
     pub hid: HidSystem,
     pub shared_fonts: crate::SharedFontSession,
     pub system_archives: std::sync::Arc<crate::SystemArchives>,
     pub settings: SettingsEnvironment,
     pub application_language: Option<crate::SystemLanguage>,
+    pub application_display_version: Option<[u8; 16]>,
     pub user_account_switch_locked: Option<bool>,
     pub save_data: Option<crate::SaveDataSystem>,
     pub diagnostics: crate::HorizonDiagnostics,
@@ -58,6 +60,9 @@ impl HorizonIpcObject {
             Self::Ssl(session) => session.is_domain(),
             Self::LogManager(session) => session.is_domain(),
             Self::ErrorContextWriter(session) => session.domain.is_domain(),
+            Self::OpusManager(session) => session.domain.is_domain(),
+            Self::OpusDecoder(session) => session.domain.is_domain(),
+            Self::PlayReport(session) => session.domain.is_domain(),
             _ => false,
         }
     }
@@ -102,6 +107,17 @@ impl HorizonIpcObject {
             Self::AudioRendererManager(_) => "audren:u",
             Self::AudioRenderer(_) => "IAudioRenderer",
             Self::AudioDevice(_) => "IAudioDevice",
+            Self::OpusManager(session) => {
+                if domain_object
+                    .and_then(|id| session.domain.object(id))
+                    .is_some()
+                {
+                    "IHardwareOpusDecoder"
+                } else {
+                    "hwopus"
+                }
+            }
+            Self::OpusDecoder(_) => "IHardwareOpusDecoder",
             Self::Hid(_) => "hid",
             Self::SharedFont(_) => "pl:u",
             Self::Irs(_) => "irs",
@@ -122,6 +138,7 @@ impl HorizonIpcObject {
             Self::LogManager(_) => "lm",
             Self::Logger(_) => "ILogger",
             Self::ErrorContextWriter(_) => "ectx:aw",
+            Self::PlayReport(_) => "prepo:u",
             Self::ParentalControl(session) => domain_object
                 .and_then(|object_id| session.object(object_id))
                 .map_or("pctl", |_| "IParentalControlService"),
@@ -324,9 +341,12 @@ pub(crate) async fn send_sync_request_from_buffer(
         HorizonIpcObject::UserSettings(settings) => {
             services::dispatch_user_settings(process, settings, request, &hipc).await?
         }
-        HorizonIpcObject::PerformanceManager(manager) => {
-            services::dispatch_performance_manager(process, manager, request)?
-        }
+        HorizonIpcObject::PerformanceManager(manager) => services::dispatch_performance_manager(
+            process,
+            manager,
+            request,
+            initial_operation_mode,
+        )?,
         HorizonIpcObject::Performance(session) => {
             services::dispatch_performance_session(session, request)?
         }
@@ -356,6 +376,15 @@ pub(crate) async fn send_sync_request_from_buffer(
         }
         HorizonIpcObject::AudioOutManager(session) => {
             services::dispatch_audio_out_manager(process, session, request, &hipc).await?
+        }
+        HorizonIpcObject::OpusManager(session) => {
+            services::dispatch_opus_manager(process, session, request, &hipc).await?
+        }
+        HorizonIpcObject::PlayReport(session) => {
+            services::dispatch_play_report(process, session, request, &hipc).await?
+        }
+        HorizonIpcObject::OpusDecoder(session) => {
+            services::dispatch_opus_decoder(process, session, request, &hipc).await?
         }
         HorizonIpcObject::AudioOut(session) => {
             services::dispatch_audio_out(process, session, request, &hipc).await?

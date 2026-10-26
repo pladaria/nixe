@@ -255,7 +255,7 @@ fn one_host_worker_preserves_independent_native_processes_and_retires_either_fir
 }
 
 #[test]
-fn scheduler_hints_use_vcpu_owned_event_and_interrupt_state() {
+fn scheduler_hints_keep_wfe_runnable_and_use_vcpu_interrupt_state() {
     const WFE: u32 = 0xd503_205f;
     const WFI: u32 = 0xd503_207f;
     const SEV: u32 = 0xd503_209f;
@@ -265,27 +265,26 @@ fn scheduler_hints_use_vcpu_owned_event_and_interrupt_state() {
     let mut coordinator = RuntimeCoordinator::new(profile());
     let waiter = coordinator
         .register_process(
-            synthetic_instruction_process_for_coordinator(1, &[WFE]),
+            synthetic_instruction_process_for_coordinator(1, &[WFE, WFE]),
             registration(&coordinator),
         )
         .unwrap();
-    let waited = coordinator.run_next(1).unwrap().unwrap();
-    assert!(matches!(
-        waited.report.stop,
-        ExecutionStop::Scheduled {
-            request: SchedulerRequest::WaitForEvent,
-            ..
-        }
-    ));
+    let waited = coordinator.run_next(2).unwrap().unwrap();
+    assert_eq!(waited.report.stop, ExecutionStop::BudgetExhausted);
+    assert_eq!(waited.report.progress, 2);
     assert_eq!(
         coordinator
             .scheduler()
             .thread(waited.lease.thread)
             .unwrap()
             .lifecycle,
-        nixe_scheduler::ThreadLifecycle::Waiting
+        nixe_scheduler::ThreadLifecycle::Ready
     );
-
+    coordinator
+        .remove_process(waiter)
+        .unwrap()
+        .try_teardown()
+        .unwrap();
     let sender = coordinator
         .register_process(
             synthetic_instruction_process_for_coordinator(2, &[SEV]),
@@ -301,15 +300,6 @@ fn scheduler_hints_use_vcpu_owned_event_and_interrupt_state() {
             ..
         }
     ));
-    assert_eq!(
-        coordinator
-            .scheduler()
-            .thread(waited.lease.thread)
-            .unwrap()
-            .lifecycle,
-        nixe_scheduler::ThreadLifecycle::Ready
-    );
-    assert!(coordinator.process(waiter).is_some());
 
     let mut interrupt_coordinator = RuntimeCoordinator::new(profile());
     interrupt_coordinator
@@ -877,7 +867,7 @@ fn terminal_thread_reaping_reclaims_and_reuses_its_tls_slot() {
             .unwrap()
             .memory_accounting()
             .used_non_system_user_physical_memory_size(),
-        initial_used + nixe_memory::PAGE_SIZE
+        initial_used
     );
     let tls = coordinator
         .process(process)
@@ -885,6 +875,29 @@ fn terminal_thread_reaping_reclaims_and_reuses_its_tls_slot() {
         .thread(first.id)
         .unwrap()
         .tls_base;
+    let memory = coordinator.process(process).unwrap().memory().clone();
+    let exception = coordinator
+        .process(process)
+        .unwrap()
+        .user_exception_context_address();
+    assert!(matches!(
+        memory.space().write(exception, &[0x3c; 0x200]).unwrap(),
+        nixe_memory::Access::Ready(())
+    ));
+    assert_eq!(
+        tls.get()
+            - coordinator
+                .process(process)
+                .unwrap()
+                .main_thread()
+                .tls_base
+                .get(),
+        0x200
+    );
+    assert!(matches!(
+        memory.space().write(tls, &[0xa5; 0x200]).unwrap(),
+        nixe_memory::Access::Ready(())
+    ));
     coordinator
         .scheduler
         .apply(SchedulerCommand::Terminate {
@@ -942,8 +955,19 @@ fn terminal_thread_reaping_reclaims_and_reuses_its_tls_slot() {
             .unwrap()
             .memory_accounting()
             .used_non_system_user_physical_memory_size(),
-        initial_used + nixe_memory::PAGE_SIZE
+        initial_used
     );
+    let mut bytes = [0xff; 0x200];
+    assert!(matches!(
+        memory.space().read_into(tls, &mut bytes).unwrap(),
+        nixe_memory::Access::Ready(())
+    ));
+    assert_eq!(bytes, [0; 0x200]);
+    assert!(matches!(
+        memory.space().read_into(exception, &mut bytes).unwrap(),
+        nixe_memory::Access::Ready(())
+    ));
+    assert_eq!(bytes, [0x3c; 0x200]);
 }
 
 struct TerminateDispatcher(crate::ExceptionTerminationScope);

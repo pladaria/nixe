@@ -84,6 +84,7 @@ struct Attachment {
     description: RenderAttachment,
     plane: ImagePlane,
     view: Arc<crate::AllocatedImageView>,
+    layout: vk::ImageLayout,
     format: vk::Format,
     samples: vk::SampleCountFlags,
 }
@@ -105,6 +106,7 @@ impl PreparedTargets {
                 a.description.source == b.description.source
                     && a.view.handle == b.view.handle
                     && a.plane == b.plane
+                    && a.layout == b.layout
                     && a.samples == b.samples
                     && a.format == b.format
             }
@@ -170,6 +172,7 @@ pub struct PreparedDraw {
     vertices: Box<[VertexBuffer]>,
     index: Option<IndexBuffer>,
     inline_index: Option<InlineIndex>,
+    feedback_aspects: vk::ImageAspectFlags,
 }
 impl PreparedDraw {
     pub(crate) fn can_group(&self) -> bool {
@@ -243,7 +246,7 @@ impl VulkanResidency {
         let native = |a: &Attachment| {
             vk::RenderingAttachmentInfo::default()
                 .image_view(a.view.handle)
-                .image_layout(vk::ImageLayout::GENERAL)
+                .image_layout(a.layout)
                 .load_op(a.description.load)
                 .store_op(a.description.store)
                 .clear_value(a.description.clear)
@@ -301,7 +304,7 @@ impl VulkanResidency {
                         aspects,
                         base_mip: p.mip_level,
                         mip_count: 1,
-                        base_layer: p.array_layer,
+                        base_layer: p.array_layer + p.depth_slice,
                         layer_count: 1,
                         swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
                     },
@@ -333,6 +336,7 @@ impl VulkanResidency {
                     ));
                 }
                 let p = ImagePlane {
+                    depth_slice: 0,
                     offset: 0,
                     row_pitch: 0,
                     mip_level: 0,
@@ -383,6 +387,7 @@ impl VulkanResidency {
             description: a,
             plane: p,
             view,
+            layout: shader_attachment_layout(description.usage),
             format: description.format,
             samples: description.samples,
         })
@@ -477,18 +482,34 @@ impl VulkanResidency {
                 }
             }
         }
+        let mut feedback_aspects = vk::ImageAspectFlags::empty();
         for resource in &graphics.program.uses {
-            if let Use::Image { id, plane, scope } = resource {
+            if let Use::Image { id, range, scope } = resource {
                 for a in targets.attachments().filter(|a| {
                     matches!(a.description.source,AttachmentSource::Canonical {image,..} if image==*id)
-                        && a.plane.mip_level == plane.mip_level && a.plane.array_layer == plane.array_layer
+                        && (range.base_mip_level..range.base_mip_level + range.level_count)
+                            .contains(&a.plane.mip_level)
+                        && (range.base_array_layer..range.base_array_layer + range.layer_count)
+                            .contains(&a.plane.array_layer)
                 }) {
                     // Load/store operations can touch adjacent depth/stencil
                     // aspects too. Both must be read-only before sharing reads.
-                    if scope.writes() || !read_only_attachment(a, state) {
+                    if scope.writes() {
                         return Err(VulkanError::InvalidResource(
-                            "attachment/shader feedback requires an exact snapshot or enabled feedback-loop lowering",
+                            "shader storage writes cannot alias a rendering attachment",
                         ));
+                    }
+                    if !read_only_attachment(a, state) {
+                        if !self.device.profile().attachment_feedback_loop
+                            || !self.image(*id)?.description.usage.contains(
+                                vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT,
+                            )
+                        {
+                            return Err(VulkanError::InvalidResource(
+                                "attachment feedback requires Vulkan feedback-loop support",
+                            ));
+                        }
+                        feedback_aspects |= range.aspect_mask;
                     }
                 }
             }
@@ -602,6 +623,7 @@ impl VulkanResidency {
             vertices,
             index,
             inline_index: None,
+            feedback_aspects,
         })
     }
     /// Consume immediately, synchronizing contents independently of cached bindings.
@@ -955,7 +977,7 @@ impl VulkanResidency {
                             image,
                             commands::plane_range(a.plane),
                             scope,
-                            vk::ImageLayout::GENERAL,
+                            a.layout,
                         )?;
                     }
                     AttachmentSource::ResidentOnly(id) => {
@@ -965,11 +987,10 @@ impl VulkanResidency {
             }
             self.barriers.emit(&mut self.device);
         }
-        let command = if empty {
-            let slot = self.device.begin_recording()?;
-            self.device.submission.slots[slot].command
+        if empty {
+            self.device.begin_recording()?;
         } else {
-            let command = self.program_bind_record(
+            self.program_bind_record(
                 &graphics.program,
                 push,
                 record.as_ref(),
@@ -979,8 +1000,8 @@ impl VulkanResidency {
                     .unwrap_or(&graphics.program.dynamic_offsets),
             )?;
             self.graphics_state(graphics)?;
-            command
-        };
+            self.set_feedback_loop(prepared.feedback_aspects);
+        }
         if let Some(offsets) = streams.dynamic_offsets {
             self.descriptor_offsets = offsets;
         }
@@ -1007,7 +1028,7 @@ impl VulkanResidency {
                     for (v, &value) in prepared.vertices.iter().zip(&prepared.native_vertices) {
                         if slot.vertex_bindings.get(&v.binding) != Some(&value) {
                             device.submission.statistics.vertex_binds += 1;
-                            raw.cmd_bind_vertex_buffers(command, v.binding, &[value.0], &[value.1]);
+                            raw.cmd_bind_vertex_buffers(v.binding, &[value.0], &[value.1]);
                             slot.vertex_bindings.insert(v.binding, value);
                         }
                     }
@@ -1018,7 +1039,7 @@ impl VulkanResidency {
                         && slot.index_binding != Some(value)
                     {
                         device.submission.statistics.index_binds += 1;
-                        raw.cmd_bind_index_buffer(command, value.0, value.1, value.2);
+                        raw.cmd_bind_index_buffer(value.0, value.1, value.2);
                         slot.index_binding = Some(value);
                     }
                 }
@@ -1039,7 +1060,7 @@ impl VulkanResidency {
                     // No render-pass object, framebuffer cache, HAL encoder or backend segment.
                     // https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdBeginRendering.html
                     device.submission.statistics.rendering_scopes += 1;
-                    raw.begin_rendering(command, &info);
+                    raw.begin_rendering(&info);
                     slot.active_targets = Some(Arc::clone(&prepared.targets));
                 }
                 if !empty {
@@ -1051,13 +1072,7 @@ impl VulkanResidency {
                                 instances,
                                 first_vertex,
                                 first_instance,
-                            } => raw.cmd_draw(
-                                command,
-                                vertices,
-                                instances,
-                                first_vertex,
-                                first_instance,
-                            ),
+                            } => raw.cmd_draw(vertices, instances, first_vertex, first_instance),
                             Draw::Indexed {
                                 indices,
                                 instances,
@@ -1065,7 +1080,6 @@ impl VulkanResidency {
                                 vertex_offset,
                                 first_instance,
                             } => raw.cmd_draw_indexed(
-                                command,
                                 indices,
                                 instances,
                                 first_index,
@@ -1081,20 +1095,13 @@ impl VulkanResidency {
                             } => {
                                 if indexed {
                                     raw.cmd_draw_indexed_indirect(
-                                        command,
                                         indirect.unwrap(),
                                         offset,
                                         count,
                                         stride,
                                     );
                                 } else {
-                                    raw.cmd_draw_indirect(
-                                        command,
-                                        indirect.unwrap(),
-                                        offset,
-                                        count,
-                                        stride,
-                                    );
+                                    raw.cmd_draw_indirect(indirect.unwrap(), offset, count, stride);
                                 }
                             }
                         }

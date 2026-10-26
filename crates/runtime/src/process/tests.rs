@@ -196,6 +196,53 @@ pub(crate) fn synthetic_process_for_coordinator(process_id: u64) -> RunnableProc
         .unwrap()
 }
 
+#[test]
+fn thread_creation_succeeds_after_heap_consumes_the_application_budget() {
+    let (_directory, plan) = plan();
+    let mut process = reference_process_builder()
+        .with_config(ProcessBuildConfig {
+            physical_memory_limit: 4 * 1024 * 1024,
+            ..ProcessBuildConfig::default()
+        })
+        .build(&plan)
+        .unwrap();
+    let memory = process.memory().clone();
+    let available = memory.account().limit() - memory.account().used_bytes();
+    let mut resize = Box::pin(memory.resize_heap(available));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        std::future::Future::poll(resize.as_mut(), &mut context),
+        std::task::Poll::Ready(Ok(_))
+    ));
+    assert_eq!(memory.account().used_bytes(), memory.account().limit());
+    let kernel_before = memory.system_account().used_bytes();
+    let core = nixe_scheduler::VirtualCpuId::new(0);
+    let profile = nixe_scheduler::MachineSchedulerProfile::new(
+        vec![nixe_scheduler::VirtualCpuDescriptor::new(core, 0)],
+        nixe_scheduler::PriorityRange::new(0, 63).unwrap(),
+        10,
+    )
+    .unwrap();
+    let request = ThreadCreateRequest {
+        entry: GuestVirtualAddress::new(process.entry_module().entry_address()),
+        argument: 0,
+        stack_top: process.main_thread().stack_top,
+        priority: 44,
+        ideal_vcpu: Some(core),
+        affinity: profile.all_cores(),
+    };
+    for id in 2..=10 {
+        process
+            .commit_created_thread(nixe_scheduler::GuestThreadId::new(id), &request)
+            .unwrap();
+    }
+    assert_eq!(memory.account().used_bytes(), memory.account().limit());
+    assert_eq!(
+        memory.system_account().used_bytes(),
+        kernel_before + PAGE_SIZE
+    );
+}
+
 pub(crate) fn synthetic_instruction_process_for_coordinator(
     process_id: u64,
     encodings: &[u32],

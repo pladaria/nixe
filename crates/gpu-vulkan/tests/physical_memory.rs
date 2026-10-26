@@ -18,6 +18,7 @@ fn padded_rgba_image(input: &AllocationRange) -> nixe_gpu::native::GuestImage {
     let footprint = Footprint::new(
         PhysicalMapping::new(std::slice::from_ref(input)).unwrap(),
         WriteDomain::Image(ImageFootprint {
+            depth_slice: 0,
             base: 0,
             columns: 4,
             rows: 4,
@@ -50,6 +51,7 @@ fn padded_rgba_image(input: &AllocationRange) -> nixe_gpu::native::GuestImage {
         )
         .unwrap(),
         planes: Arc::from([GuestImagePlane {
+            depth_slice: 0,
             mip_level: 0,
             array_layer: 0,
             aspect: GuestImageAspect::Color,
@@ -276,10 +278,16 @@ fn recorded_literal_publishes_after_native_completion_without_a_frontend_token()
         if actual == 0x12345678u32.to_le_bytes() {
             break;
         }
-        execution.request_completion_wakeup().unwrap();
-        notifications
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("recorded release must wake its owner");
+        execution.arm_completion_wakeup().unwrap();
+        let wake_at = execution.pending_submit_deadline().unwrap_or(deadline);
+        match notifications
+            .recv_timeout(wake_at.saturating_duration_since(std::time::Instant::now()))
+        {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("native completion wake disconnected")
+            }
+        }
     }
     assert!(matches!(
         space
@@ -617,7 +625,7 @@ fn access(
                 if let Some(result) = pending.poll() {
                     break result.unwrap();
                 }
-                execution.request_completion_wakeup().unwrap();
+                execution.arm_completion_wakeup().unwrap();
                 assert!(std::time::Instant::now() < deadline);
                 std::thread::yield_now();
             }

@@ -1277,7 +1277,7 @@ impl MaxwellThreeDFixedFunctionState {
                 } else {
                     &mut self.surface_clip_horizontal
                 };
-                *register = MaxwellThreeDRegister::programmed(raw, value, source);
+                *register = MaxwellThreeDRegister::decoded(raw, value);
             }
             MaxwellThreeDFixedFunctionWrite::ViewportFloat {
                 viewport,
@@ -1288,12 +1288,11 @@ impl MaxwellThreeDFixedFunctionState {
                 let target = &mut self.viewport[viewport as usize];
                 match field {
                     0..=2 => {
-                        target.scale[field as usize] =
-                            MaxwellThreeDRegister::programmed(raw, value, source)
+                        target.scale[field as usize] = MaxwellThreeDRegister::decoded(raw, value)
                     }
                     3..=5 => {
                         target.offset[(field - 3) as usize] =
-                            MaxwellThreeDRegister::programmed(raw, value, source)
+                            MaxwellThreeDRegister::decoded(raw, value)
                     }
                     _ => unreachable!(),
                 }
@@ -1306,10 +1305,10 @@ impl MaxwellThreeDFixedFunctionState {
             } => {
                 if vertical {
                     self.viewport[viewport as usize].clip_vertical =
-                        MaxwellThreeDRegister::programmed(raw, value, source)
+                        MaxwellThreeDRegister::decoded(raw, value)
                 } else {
                     self.viewport[viewport as usize].clip_horizontal =
-                        MaxwellThreeDRegister::programmed(raw, value, source)
+                        MaxwellThreeDRegister::decoded(raw, value)
                 }
             }
             MaxwellThreeDFixedFunctionWrite::ViewportDepth {
@@ -1320,27 +1319,26 @@ impl MaxwellThreeDFixedFunctionState {
             } => {
                 if maximum {
                     self.viewport[viewport as usize].clip_max_z =
-                        MaxwellThreeDRegister::programmed(raw, value, source)
+                        MaxwellThreeDRegister::decoded(raw, value)
                 } else {
                     self.viewport[viewport as usize].clip_min_z =
-                        MaxwellThreeDRegister::programmed(raw, value, source)
+                        MaxwellThreeDRegister::decoded(raw, value)
                 }
             }
             MaxwellThreeDFixedFunctionWrite::ViewportSnapGridPrecision {
                 viewport, value, ..
             } => {
                 self.viewport[viewport as usize].snap_grid_precision =
-                    MaxwellThreeDRegister::programmed(raw, value, source);
+                    MaxwellThreeDRegister::decoded(raw, value);
             }
             MaxwellThreeDFixedFunctionWrite::ViewportCoordinateSwizzle {
                 viewport, value, ..
             } => {
                 self.viewport[viewport as usize].coordinate_swizzle =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDFixedFunctionWrite::ScissorEnable { scissor, value, .. } => {
-                self.scissor[scissor as usize].enable =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.scissor[scissor as usize].enable = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDFixedFunctionWrite::ScissorRectangle {
                 scissor,
@@ -1350,10 +1348,10 @@ impl MaxwellThreeDFixedFunctionState {
             } => {
                 if vertical {
                     self.scissor[scissor as usize].vertical =
-                        MaxwellThreeDRegister::programmed(raw, value, source)
+                        MaxwellThreeDRegister::decoded(raw, value)
                 } else {
                     self.scissor[scissor as usize].horizontal =
-                        MaxwellThreeDRegister::programmed(raw, value, source)
+                        MaxwellThreeDRegister::decoded(raw, value)
                 }
             }
             MaxwellThreeDFixedFunctionWrite::WindowClipRectangle {
@@ -1364,28 +1362,23 @@ impl MaxwellThreeDFixedFunctionState {
             } => {
                 if vertical {
                     self.window_clip[region as usize].vertical =
-                        MaxwellThreeDRegister::programmed(raw, value, source)
+                        MaxwellThreeDRegister::decoded(raw, value)
                 } else {
                     self.window_clip[region as usize].horizontal =
-                        MaxwellThreeDRegister::programmed(raw, value, source)
+                        MaxwellThreeDRegister::decoded(raw, value)
                 }
             }
             MaxwellThreeDFixedFunctionWrite::Register {
                 register, value, ..
-            } => {
-                self.registers[register.index()] =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
-            }
+            } => self.registers[register.index()] = MaxwellThreeDRegister::decoded(raw, value),
             MaxwellThreeDFixedFunctionWrite::SingleRopControl { value, .. } => {
-                self.single_rop_control = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.single_rop_control = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDFixedFunctionWrite::BlendEnable { target, value, .. } => {
-                self.blend_enable[target as usize] =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.blend_enable[target as usize] = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDFixedFunctionWrite::ColorMask { target, value, .. } => {
-                self.color_mask[target as usize] =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.color_mask[target as usize] = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDFixedFunctionWrite::BlendState {
                 target,
@@ -1394,27 +1387,25 @@ impl MaxwellThreeDFixedFunctionState {
                 ..
             } => {
                 self.per_target_blend[target as usize][field as usize] =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDFixedFunctionWrite::BlendPerFormatEnable { value, .. } => {
-                self.blend_controls.per_format_enable =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.blend_controls.per_format_enable = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDFixedFunctionWrite::BlendFloatPixelKillEnable { value, .. } => {
                 self.blend_controls.float_pixel_kill_enable =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDFixedFunctionWrite::BlendZeroTimesAnythingIsZero { value, .. } => {
                 self.blend_controls.zero_times_anything_is_zero =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDFixedFunctionWrite::IteratedBlend { value, .. } => {
-                self.blend_controls.iterated_blend =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.blend_controls.iterated_blend = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDFixedFunctionWrite::IteratedBlendPassCount { value, .. } => {
                 self.blend_controls.iterated_blend_pass_count =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
         }
     }

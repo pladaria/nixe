@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use nixe_gpu::{
     FrontendSubmissionId, GpuVirtualAddress, GuestSyncpointId, GuestSyncpointValue,
-    GuestTimelinePoint, ReservedTimelinePoint,
+    GuestTimelinePoint,
 };
 use nixe_gpu_maxwell::{
     MAXWELL_GPFIFO_ENTRY_SIZE, MaxwellChannelConfiguration, MaxwellChannelError,
@@ -576,29 +576,29 @@ fn submit_gpfifo(
     scheduler
         .prepare_enqueue(&channel, &validated, dependency, completion_increments != 0)
         .map_err(|error| scheduling_error(descriptor, request, error))?;
-    let completion = if completion_increments != 0 {
-        let syncpoint = channel
-            .syncpoint()
-            .ok_or_else(|| unsupported_state(descriptor, request))?;
+    let syncpoint = channel
+        .syncpoint()
+        .ok_or_else(|| unsupported_state(descriptor, request))?;
+    let (completion, returned_fence) = if completion_increments != 0 {
         // NVIDIA's public Tegra channel implementation inserts a requested
         // wait before user GPFIFO entries and the requested syncpoint increment
         // after them. The increment is reserved here but cannot be published
         // until backend work and memory visibility have completed:
         // https://android.googlesource.com/kernel/tegra.git/+/76359c267702c0815c82c970f38f5b27031d5ba6/drivers/gpu/nvgpu/gk20a/channel_gk20a.c#1496
-        Some(
-            resources
-                .control
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .reserve_channel_submission(
-                    descriptor,
-                    request,
-                    syncpoint,
-                    completion_increments,
-                )?,
-        )
+        let reservation = resources
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reserve_channel_submission(descriptor, request, syncpoint, completion_increments)?;
+        let point = reservation.point();
+        (Some(reservation), point)
     } else {
-        None
+        let point = resources
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .channel_submission_fence(descriptor, syncpoint)?;
+        (None, point)
     };
     scheduler
         .enqueue(&channel, validated, dependency, completion)
@@ -616,10 +616,6 @@ fn submit_gpfifo(
         .dispatch_next(dependency_reached, dispatch_address_space.memory())
         .map_err(|error| scheduling_error(descriptor, request, error))?
         .ok_or_else(|| unsupported_state(descriptor, request))?;
-    let expected_completion = dispatch
-        .scheduled()
-        .completion()
-        .map(ReservedTimelinePoint::point);
     let reservation = dispatch.scheduled().completion().cloned();
     let submission = GpuSubmission::new(
         descriptor,
@@ -633,11 +629,9 @@ fn submit_gpfifo(
     );
 
     let mut output = submit.response.to_vec();
-    if let Some(reservation) = reservation {
-        debug_assert_eq!(expected_completion, Some(reservation.point()));
-        write_u32(&mut output, 16, reservation.point().syncpoint().get())?;
-        write_u32(&mut output, 20, reservation.point().value().get())?;
-    }
+    write_u32(&mut output, 12, 0)?;
+    write_u32(&mut output, 16, returned_fence.syncpoint().get())?;
+    write_u32(&mut output, 20, returned_fence.value().get())?;
     Ok((output, submission))
 }
 
@@ -692,7 +686,8 @@ fn gpfifo_driver_result(
     match error {
         MaxwellGpfifoDecodeError::Invalid(error) => NvDrvCallError::GuestResult(match error {
             MaxwellInvalidGpfifoSubmission::EntryByteCountOverflow { .. }
-            | MaxwellInvalidGpfifoSubmission::EntryByteCountMismatch { .. } => NV_BAD_PARAMETER,
+            | MaxwellInvalidGpfifoSubmission::EntryByteCountMismatch { .. }
+            | MaxwellInvalidGpfifoSubmission::FenceWaitWithIncrementValue => NV_BAD_PARAMETER,
             MaxwellInvalidGpfifoSubmission::EntryCountExceedsAllocation { .. }
             | MaxwellInvalidGpfifoSubmission::ReservedEntryBit { .. }
             | MaxwellInvalidGpfifoSubmission::AddressOutOfRange { .. }

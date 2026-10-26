@@ -22,11 +22,13 @@ struct State {
 pub(super) struct Stages {
     maximum: usize,
     state: Mutex<State>,
+    pub(super) counters: nixe_gpu::cache_counters::CacheCounters,
 }
 impl Stages {
     pub(super) fn new(maximum: usize) -> Self {
         Self {
             maximum,
+            counters: nixe_gpu::cache_counters::CacheCounters::new(maximum, 0),
             state: Mutex::new(State {
                 entries: HashMap::default(),
                 clock: 0,
@@ -60,6 +62,7 @@ impl Stages {
                         .map(|(key, _)| *key)
                         .ok_or(CompileError::Budget)?;
                     state.entries.remove(&victim);
+                    self.counters.evict(1);
                     #[cfg(feature = "performance-counters")]
                     nixe_gpu::compilation_capture::Key::new(&victim).event("evict", usize::MAX, 0);
                 }
@@ -68,6 +71,7 @@ impl Stages {
                     ready: Condvar::new(),
                 });
                 state.entries.insert(key, (Arc::clone(&cell), clock));
+                self.counters.publish_usage(state.entries.len(), 0);
                 cell
             }
         };
@@ -100,6 +104,7 @@ impl Stages {
         }
         *value = Value::Compiling;
         drop(value);
+        self.counters.miss();
         #[cfg(feature = "performance-counters")]
         let start = Instant::now();
         #[cfg(feature = "performance-counters")]
@@ -193,6 +198,9 @@ mod tests {
         let first = cache.get(key(1), || Ok(stage())).unwrap();
         let second = cache.get(key(2), || Ok(stage())).unwrap();
         assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
+        let counters = cache.counters.snapshot();
+        assert_eq!(counters.entries, 1);
+        assert_eq!((counters.misses, counters.evictions), (2, 1));
         assert_eq!(first.module.words, second.module.words);
         let error = cache
             .get(key(3), || panic!("fixture emitter panic"))

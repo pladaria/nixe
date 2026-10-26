@@ -8,6 +8,7 @@ use crate::GuestCpuState;
 use crate::memory::ProcessMemory;
 use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::profile::ProcessCpuContext;
+use nixe_memory::GuestVirtualAddress;
 use nixe_scheduler::{GuestThreadId, VirtualCpuId};
 
 use crate::{
@@ -170,6 +171,7 @@ pub struct ExceptionProcessContext<'a> {
     cpu: ProcessCpuContext,
     address_space_limit: u64,
     memory_layout: ProcessMemoryLayout,
+    process_local_region: GuestVirtualAddress,
     random_entropy: [u64; 4],
     thread_policy: Option<crate::process::ThreadPolicy>,
     memory: &'a std::sync::Arc<ProcessMemory>,
@@ -184,6 +186,7 @@ pub(crate) struct ExceptionProcessMetadata {
     pub cpu: ProcessCpuContext,
     pub address_space_limit: u64,
     pub memory_layout: ProcessMemoryLayout,
+    pub process_local_region: GuestVirtualAddress,
     pub random_entropy: [u64; 4],
     pub thread_policy: Option<crate::process::ThreadPolicy>,
 }
@@ -208,6 +211,7 @@ impl<'a> ExceptionProcessContext<'a> {
             cpu: metadata.cpu,
             address_space_limit: metadata.address_space_limit,
             memory_layout: metadata.memory_layout,
+            process_local_region: metadata.process_local_region,
             random_entropy: metadata.random_entropy,
             thread_policy: metadata.thread_policy,
             memory: resources.memory,
@@ -233,6 +237,11 @@ impl<'a> ExceptionProcessContext<'a> {
     #[must_use]
     pub const fn memory_layout(&self) -> ProcessMemoryLayout {
         self.memory_layout
+    }
+
+    #[must_use]
+    pub const fn user_exception_context_address(&self) -> GuestVirtualAddress {
+        self.process_local_region
     }
 
     /// Returns one of the four immutable entropy words assigned at process creation.

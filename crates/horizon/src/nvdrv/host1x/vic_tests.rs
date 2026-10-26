@@ -108,7 +108,9 @@ fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
     registers[0x100] = 0x20;
     registers[0x101] = 0x30;
     registers[0x1c8] = 0x100;
-    execute(&registers, &mappings).unwrap();
+    Vic::default()
+        .execute(&registers, &mappings, None, &mut BTreeMap::new())
+        .unwrap();
     let mut result = vec![0; 8192];
     crate::test_memory::read(
         &[input.slice(0xf000, result.len() as u64).unwrap()],
@@ -131,20 +133,77 @@ fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
     machine
         .write_resolved(&[input.slice(0, config.len() as u64).unwrap()], &config)
         .unwrap();
-    execute(&registers, &mappings).unwrap();
+    Vic::default()
+        .execute(&registers, &mappings, None, &mut BTreeMap::new())
+        .unwrap();
     let mut general = vec![0; result.len()];
     crate::test_memory::read(
         &[input.slice(0xf000, general.len() as u64).unwrap()],
         &mut general,
     );
     assert_eq!(general, result);
+    // NV12 output stores the composited Y/U/V values directly. Exercise odd
+    // visible extents, larger allocations and both linear and tiled padding.
+    registers[0x1c9] = 0x180;
+    let visible_width = width - 3;
+    let visible_height = height - 1;
+    for (kind, block) in [(0, 0), (1, 1), (1, 2)] {
+        put(&mut config, 0x20, 68 | (kind << 11) | (block << 15));
+        put(
+            &mut config,
+            0x24,
+            (visible_width - 1) | ((visible_height - 1) << 14),
+        );
+        put(&mut config, 0x28, (width - 1) | ((height + 1 - 1) << 14));
+        put(&mut config, 0x2c, (width / 2 - 1) | ((height - 1) << 14));
+        let output = Surface::decode(&config[0x20..0x30], 1).unwrap();
+        let chroma = chroma_surface(&output, word(&config, 0x2c)).unwrap();
+        for (surface, offset) in [(&output, 0xf000), (&chroma, 0x17000)] {
+            machine
+                .write_resolved(
+                    &[input.slice(offset, surface.length() as u64).unwrap()],
+                    &vec![0xa5; surface.length()],
+                )
+                .unwrap();
+        }
+        machine
+            .write_resolved(&[input.slice(0, config.len() as u64).unwrap()], &config)
+            .unwrap();
+        Vic::default()
+            .execute(&registers, &mappings, None, &mut BTreeMap::new())
+            .unwrap();
+        for (is_chroma, surface, offset) in [(false, &output, 0xf000), (true, &chroma, 0x17000)] {
+            let mut actual = vec![0; surface.length()];
+            crate::test_memory::read(
+                &[input.slice(offset, actual.len() as u64).unwrap()],
+                &mut actual,
+            );
+            let mut expected = vec![0xa5; actual.len()];
+            for y in 0..surface.height {
+                for x in 0..surface.width {
+                    expected[surface.offset(x, y)] = if !is_chroma {
+                        (x + y) as u8
+                    } else if x % 2 == 0 {
+                        16
+                    } else {
+                        192
+                    };
+                }
+            }
+            assert_eq!(
+                actual, expected,
+                "kind={kind} block={block} chroma={is_chroma}"
+            );
+        }
+    }
     // Reject fractional/scaled rectangles rather than copying the wrong source area.
     put(&mut config, slot + 0x24, ((width - 1) << 16) + 1);
     machine
         .write_resolved(&[input.slice(0, config.len() as u64).unwrap()], &config)
         .unwrap();
     assert!(
-        execute(&registers, &mappings)
+        Vic::default()
+            .execute(&registers, &mappings, None, &mut BTreeMap::new())
             .unwrap_err()
             .contains("subpixel")
     );
@@ -273,4 +332,117 @@ fn nv12_simd_matches_scalar_signed_matrices_crops_clamp_and_channel_order() {
             }
         }
     }
+}
+
+#[test]
+fn opaque_nv12_plane_copy_preserves_crop_pitch_and_tiled_padding() {
+    let machine = crate::test_memory::machine();
+    let allocation = machine.account(0x10000).unwrap().allocate(0x10000).unwrap();
+    let input = nixe_memory::AllocationRange::new(allocation.pin(), 0, 0x10000).unwrap();
+    let mut nvmap = NvMapObjects::default();
+    let owner = NvMapOwner::new(1);
+    let handle = nvmap.create(owner, 0x10000).unwrap();
+    nvmap
+        .allocate(
+            owner,
+            handle,
+            NvMapAllocationMetadata::new(0, 0, 4096, 0),
+            NvMapCpuMapping::new(AddressSpaceId::new(1), GuestVirtualAddress::new(0x1000)),
+            Arc::from([input.clone()]),
+        )
+        .unwrap();
+    let object = nvmap
+        .object_snapshot_by_owned_handle(owner, handle)
+        .unwrap();
+    let mappings = Arc::new(BTreeMap::from([(
+        0x1000,
+        Mapping {
+            physical: nixe_gpu::physical::PhysicalMapping::new(object.ranges().unwrap()).unwrap(),
+            object,
+            references: 1,
+        },
+    )]));
+    let source: Vec<u8> = (0..128 * 64).map(|i| (i * 17 + i / 128) as u8).collect();
+    for (kind, block_height) in [(0, 0), (1, 1), (1, 3)] {
+        for width in [66, 67] {
+            let output = Surface {
+                width,
+                height: 37,
+                pitch: 128,
+                rows: 48,
+                kind,
+                block_height,
+                format: 68,
+            };
+            machine
+                .write_resolved(std::slice::from_ref(&input), &vec![0xa5; 0x10000])
+                .unwrap();
+            write_plane(&output, &source, 128, [4, 6], &mappings, 0x2000).unwrap();
+            let mut actual = vec![0; output.length()];
+            crate::test_memory::read(
+                &[input.slice(0x1000, actual.len() as u64).unwrap()],
+                &mut actual,
+            );
+            let mut expected = vec![0xa5; output.length()];
+            for y in 0..output.height {
+                for x in 0..output.width {
+                    expected[output.offset(x, y)] = source[(y + 6) * 128 + x + 4];
+                }
+            }
+            assert_eq!(
+                actual, expected,
+                "kind={kind} block-height={block_height} width={width}"
+            );
+        }
+    }
+}
+
+#[test]
+fn visible_surface_runs_cover_pixels_once_in_physical_order() {
+    for (kind, block_height) in [(0, 0), (1, 0), (1, 1), (1, 2), (1, 4)] {
+        for bpp in [1, 4] {
+            for width in [1, 15, 16, 17, 63, 64, 65, 128] {
+                for height in [1, 7, 8, 9, 16, 17, 37] {
+                    let plane = Surface {
+                        width,
+                        height,
+                        pitch: (width * bpp).next_multiple_of(64) + 64,
+                        rows: height + 3,
+                        kind,
+                        block_height,
+                        format: 68,
+                    };
+                    let spans = plane.written_spans(bpp);
+                    assert!(spans.windows(2).all(|pair| pair[0].end < pair[1].start));
+                    let mut actual = vec![false; plane.length()];
+                    for span in spans {
+                        for byte in &mut actual[span] {
+                            assert!(!*byte);
+                            *byte = true;
+                        }
+                    }
+                    let mut expected = vec![false; plane.length()];
+                    for y in 0..height {
+                        for x in 0..width * bpp {
+                            expected[plane.offset(x, y)] = true;
+                        }
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "kind={kind} block-height={block_height} bpp={bpp} extent={width}x{height}"
+                    );
+                }
+            }
+        }
+    }
+    let full = Surface {
+        width: 1280,
+        height: 720,
+        pitch: 5120,
+        rows: 720,
+        kind: 1,
+        block_height: 4,
+        format: 31,
+    };
+    assert_eq!(full.written_spans(4).len(), 80);
 }

@@ -10,7 +10,10 @@ impl VulkanResidency {
         value: vk::ClearValue,
     ) -> Result<WorkTicket, VulkanError> {
         let p = self.checked_image_rect(id, plane, rect)?;
-        if rect == transfers::full_rect(p) {
+        if rect == transfers::full_rect(p)
+            && !(self.image(id)?.description.image_type == vk::ImageType::TYPE_3D
+                && self.image(id)?.description.extent.depth > 1)
+        {
             return if p.aspect == vk::ImageAspectFlags::COLOR {
                 self.clear_color_image(id, plane, unsafe { value.color })
             } else {
@@ -55,7 +58,7 @@ impl VulkanResidency {
                 aspects,
                 base_mip: p.mip_level,
                 mip_count: 1,
-                base_layer: p.array_layer,
+                base_layer: p.array_layer + p.depth_slice,
                 layer_count: 1,
                 swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
             },
@@ -82,7 +85,7 @@ impl VulkanResidency {
         )?;
         self.barriers.emit(&mut self.device);
         let slot = self.device.begin_recording()?;
-        let command = self.device.submission.slots[slot].command;
+
         let attachment = vk::RenderingAttachmentInfo::default()
             .image_view(leased.handle)
             .image_layout(layout)
@@ -104,16 +107,15 @@ impl VulkanResidency {
             .color_attachment(0)
             .clear_value(value);
         self.publish_effect(&[writer], |device| unsafe {
-            device.dispatch.begin_rendering(command, &info);
+            device.dispatch.begin_rendering(&info);
             device.dispatch.cmd_clear_attachments(
-                command,
                 &[clear],
                 &[vk::ClearRect::default()
                     .rect(rect)
                     .base_array_layer(0)
                     .layer_count(1)],
             );
-            device.dispatch.end_rendering(command);
+            device.dispatch.end_rendering();
         })?;
         self.device.submission.slots[slot]
             .retained_views
@@ -154,6 +156,7 @@ impl VulkanResidency {
         if source == destination
             && src.mip_level == dst.mip_level
             && src.array_layer == dst.array_layer
+            && src.depth_slice == dst.depth_slice
         {
             return Err(VulkanError::InvalidResource(
                 "same-subresource blit requires an explicit source snapshot",
@@ -231,30 +234,29 @@ impl VulkanResidency {
             ),
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         )?;
-        let corners = |r: vk::Rect2D| {
+        let corners = |r: vk::Rect2D, z: u32| {
             [
                 vk::Offset3D {
                     x: r.offset.x,
                     y: r.offset.y,
-                    z: 0,
+                    z: z as i32,
                 },
                 vk::Offset3D {
                     x: r.offset.x + r.extent.width as i32,
                     y: r.offset.y + r.extent.height as i32,
-                    z: 1,
+                    z: z as i32 + 1,
                 },
             ]
         };
         let region = vk::ImageBlit::default()
             .src_subresource(src.layers())
             .dst_subresource(dst.layers())
-            .src_offsets(corners(source_rect))
-            .dst_offsets(corners(destination_rect));
+            .src_offsets(corners(source_rect, src.depth_slice))
+            .dst_offsets(corners(destination_rect, dst.depth_slice));
         self.barriers.emit(&mut self.device);
-        let slot = self.device.begin_recording()?;
+        self.device.begin_recording()?;
         self.publish_effect(&[writer], |device| unsafe {
             device.dispatch.cmd_blit_image(
-                device.submission.slots[slot].command,
                 source,
                 src_layout,
                 target,

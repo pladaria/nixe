@@ -172,7 +172,7 @@ where
         }
         Ok(())
     }
-    fn flush_progress(&mut self) -> Result<(), GpuExecutorFailure> {
+    fn arm_progress(&mut self) -> Result<(), GpuExecutorFailure> {
         // Each caller has polled its ready prefix. Registration also delivers
         // an immediate wake if native completion raced with that poll.
         self.backend
@@ -180,9 +180,27 @@ where
             .as_mut()
             .map_or(Ok(()), |runtime| {
                 runtime
-                    .request_completion_wakeup()
+                    .arm_completion_wakeup()
                     .map_err(|error| self.failure(FrontendSubmissionId::new(0), error.to_string()))
             })
+    }
+    fn flush_progress(&mut self) -> Result<(), GpuExecutorFailure> {
+        let mut backend = self.backend.borrow_mut();
+        if let Some(runtime) = backend.as_mut() {
+            runtime
+                .flush()
+                .map_err(|error| self.runtime_failure(FrontendSubmissionId::new(0), error))?;
+            runtime
+                .arm_completion_wakeup()
+                .map_err(|error| self.runtime_failure(FrontendSubmissionId::new(0), error))?;
+        }
+        Ok(())
+    }
+    fn pending_submit_deadline(&self) -> Option<std::time::Instant> {
+        self.backend
+            .borrow()
+            .as_ref()
+            .and_then(GpuExecution::pending_submit_deadline)
     }
     fn runtime_failure(
         &self,
@@ -256,6 +274,12 @@ where
         result.map_err(|error| self.runtime_failure(FrontendSubmissionId::new(0), error))
     }
     fn service_ready_control(&mut self) -> Result<(), GpuExecutorFailure> {
+        if self
+            .pending_submit_deadline()
+            .is_some_and(|deadline| deadline <= std::time::Instant::now())
+        {
+            self.poll()?;
+        }
         // Eden ticks CPU coherency requests after PrepareDraw has consumed its
         // resources, including when native compilation had to wait. A request
         // must not resolve against authority missing that pending effect.
@@ -334,8 +358,21 @@ where
             if owner.borrow().recheck {
                 continue;
             }
-            owner.borrow_mut().flush_progress()?;
-            let message = owner.borrow().receiver.recv();
+            owner.borrow_mut().arm_progress()?;
+            let deadline = owner.borrow().pending_submit_deadline();
+            let message = if let Some(deadline) = deadline {
+                match owner
+                    .borrow()
+                    .receiver
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                {
+                    Ok(message) => Ok(message),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::RecvError),
+                }
+            } else {
+                owner.borrow().receiver.recv()
+            };
             match message {
                 Ok(message) => owner.borrow_mut().service_control(message)?,
                 Err(_) if running.is_empty() => return Ok(()),
@@ -387,35 +424,16 @@ where
                 });
             }
             GpuMessage::ConvertNv12 {
-                images,
+                destination,
                 transform,
+                source,
                 reply,
             } => (
                 frontend
                     .borrow_mut()
-                    .lower_nv12_conversion(*images, transform),
+                    .lower_nv12_conversion(*destination, source, transform),
                 reply,
             ),
-            GpuMessage::DecodedPlanes {
-                images,
-                data,
-                reply,
-            } => {
-                let work = match data {
-                    DecodedPlaneData::Device(frame) => frontend
-                        .borrow_mut()
-                        .lower_device_plane_uploads(*images, frame),
-                    DecodedPlaneData::Linear {
-                        bytes,
-                        visible_widths,
-                    } => frontend.borrow_mut().lower_decoded_plane_uploads(
-                        *images,
-                        bytes,
-                        visible_widths,
-                    ),
-                };
-                (work, reply)
-            }
             message => return owner.borrow_mut().service_control(message),
         };
         let (work, reply) = conversion;
@@ -435,6 +453,9 @@ where
                 .unwrap()
                 .submit(id)
                 .map_err(|error| owner.borrow().failure(id, error.to_string()))?;
+            // Host1x awaits this operation's completion before publishing its
+            // output fence; this is an actual dependency, not a wake registration.
+            owner.borrow_mut().flush_progress()?;
             Ok((id, token))
         }
         .await;
@@ -546,7 +567,7 @@ where
         for message in deferred {
             match message {
                 GpuMessage::MemoryAccess(request) => request.finish(Err(Arc::clone(cause))),
-                GpuMessage::ConvertNv12 { reply, .. } | GpuMessage::DecodedPlanes { reply, .. } => {
+                GpuMessage::ConvertNv12 { reply, .. } => {
                     let _ = reply.send(Err("GPU owner is shutting down".into()));
                 }
                 GpuMessage::PresentImage { reply, .. } => {
@@ -748,6 +769,8 @@ impl<
         })
     }
     fn timestamp(&self) -> u64 {
-        nixe_gpu_maxwell::maxwell_gpu_timestamp(self.clock.scheduler_time_ns())
+        // Match Eden's default fast GPU report clock; CPU/driver time stays unscaled.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/gpu.cpp
+        nixe_gpu_maxwell::maxwell_gpu_timestamp(self.clock.scheduler_time_ns()) / 256
     }
 }

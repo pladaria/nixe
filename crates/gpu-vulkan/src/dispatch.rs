@@ -2,10 +2,12 @@
 use crate::{VulkanError, profile::ApiPath};
 use ash::{Device, Instance, vk};
 
-mod commands;
+mod arena;
 mod record;
+mod slot;
+mod state;
 mod worker;
-pub(crate) use commands::Command;
+pub(crate) use slot::CommandSlot;
 use worker::Recorder;
 pub(crate) use worker::{QueueSubmission, RecordingHandle};
 
@@ -18,6 +20,7 @@ struct Functions {
     #[cfg(feature = "binding-probe")]
     timestamp: vk::PFN_vkCmdWriteTimestamp2,
     state: Option<StateDispatch>,
+    feedback: Option<vk::PFN_vkCmdSetAttachmentFeedbackLoopEnableEXT>,
 }
 
 pub(crate) struct Dispatch {
@@ -26,24 +29,29 @@ pub(crate) struct Dispatch {
     pub release_swapchain_images: Option<vk::PFN_vkReleaseSwapchainImagesEXT>,
 }
 impl Dispatch {
-    pub(crate) fn flush_chunks(&mut self) -> Result<(), VulkanError> {
-        self.recorder.flush_chunks()
+    pub(crate) fn begin_command_buffer(
+        &mut self,
+        slot: std::sync::Arc<CommandSlot>,
+        tick: u64,
+        progress: std::sync::Arc<crate::queue::progress::SubmissionProgress>,
+    ) -> Result<(), VulkanError> {
+        self.recorder.begin(slot, tick, progress)
+    }
+    pub(crate) fn submit(&mut self, work: QueueSubmission) -> Result<(), VulkanError> {
+        self.recorder.submit(work)
     }
 
     pub(crate) fn discard_pending(&mut self) {
         self.recorder.discard_pending();
     }
 
-    #[cfg(feature = "binding-probe")]
-    pub(crate) fn finish(&mut self) -> Result<(), VulkanError> {
-        self.recorder.finish()
-    }
     pub fn new(
         instance: &Instance,
         device: &Device,
         path: ApiPath,
         maintenance: crate::SwapchainMaintenance,
         dynamic: bool,
+        feedback_loop: bool,
         queue_mutex: std::sync::Arc<std::sync::Mutex<()>>,
     ) -> Result<Self, VulkanError> {
         let (submit, barrier, begin, end) = match path {
@@ -127,6 +135,11 @@ impl Dispatch {
                 }
             }
         });
+        let feedback = feedback_loop.then(|| {
+            ash::ext::attachment_feedback_loop_dynamic_state::Device::new(instance, device)
+                .fp()
+                .cmd_set_attachment_feedback_loop_enable_ext
+        });
         let recorder = Recorder::new(
             device.clone(),
             Functions {
@@ -137,6 +150,7 @@ impl Dispatch {
                 #[cfg(feature = "binding-probe")]
                 timestamp,
                 state,
+                feedback,
             },
             queue_mutex,
         )?;
@@ -149,34 +163,79 @@ impl Dispatch {
     #[cfg(feature = "binding-probe")]
     pub unsafe fn timestamp(
         &mut self,
-        command: vk::CommandBuffer,
         stage: vk::PipelineStageFlags2,
         pool: vk::QueryPool,
-        query: u32,
+        index: u32,
     ) {
-        self.recorder.push(Command::Timestamp {
-            command,
-            stage,
-            pool,
-            index: query,
+        self.recorder.record(move |ctx| {
+            ctx.flush_draw();
+            unsafe { (ctx.functions.timestamp)(ctx.command, stage, pool, index) };
+            Ok(())
         });
+    }
+    #[cfg(feature = "binding-probe")]
+    pub(crate) unsafe fn record<F>(&mut self, function: F)
+    where
+        F: Fn(&mut worker::Context) -> Result<(), crate::queue::progress::NativeFailure>
+            + Send
+            + 'static,
+    {
+        self.recorder.record(function);
     }
     pub fn recording_handle(&self) -> RecordingHandle {
         self.recorder.handle.clone()
     }
-    pub unsafe fn dynamic_state(
-        &mut self,
-        command: vk::CommandBuffer,
-        state: &crate::cache::GraphicsState,
-    ) {
-        self.recorder.push(Command::Dynamic {
-            command,
-            state: commands::DynamicState::from(state),
+    pub unsafe fn cmd_set_feedback_loop(&mut self, aspects: vk::ImageAspectFlags) {
+        self.recorder.record(move |ctx| {
+            ctx.flush_draw();
+            unsafe {
+                (ctx.functions
+                    .feedback
+                    .expect("enabled attachment feedback state"))(
+                    ctx.command, aspects
+                )
+            };
+            Ok(())
         });
     }
-    pub unsafe fn barrier(&mut self, command: vk::CommandBuffer, info: &vk::DependencyInfo<'_>) {
+    pub unsafe fn dynamic_state(&mut self, state: &crate::cache::GraphicsState) {
+        let s = state::DynamicState::from(state);
+        self.recorder.record(move |ctx| {
+            ctx.flush_draw();
+            let state = ctx
+                .functions
+                .state
+                .as_ref()
+                .expect("enabled native dynamic state");
+            let command = ctx.command;
+            unsafe {
+                (state.cull)(command, s.cull);
+                (state.front)(command, s.front_face);
+                (state.depth_test)(command, u32::from(s.depth_test));
+                (state.depth_write)(command, u32::from(s.depth_write));
+                (state.depth_compare)(command, s.depth_compare);
+                (state.depth_bounds)(command, u32::from(s.depth_bounds));
+                (state.stencil_test)(command, u32::from(s.stencil_test));
+                for (face, stencil) in [
+                    (vk::StencilFaceFlags::FRONT, s.front),
+                    (vk::StencilFaceFlags::BACK, s.back),
+                ] {
+                    (state.stencil)(
+                        command,
+                        face,
+                        stencil.fail,
+                        stencil.pass,
+                        stencil.depth_fail,
+                        stencil.compare,
+                    );
+                }
+            }
+            Ok(())
+        });
+    }
+    /// All chains must be null; array elements contain only native handles and scalars.
+    pub unsafe fn barrier(&mut self, info: &vk::DependencyInfo<'_>) {
         debug_assert!(info.p_next.is_null());
-        // SAFETY: the caller supplies live arrays; all entries are copied now.
         let memory = if info.memory_barrier_count == 0 {
             &[]
         } else {
@@ -212,57 +271,28 @@ impl Dispatch {
                 && buffers.iter().all(|v| v.p_next.is_null())
                 && images.iter().all(|v| v.p_next.is_null())
         );
-        self.recorder.push(Command::Barrier {
-            command,
-            flags: info.dependency_flags,
-            memory: memory
-                .iter()
-                .map(|v| {
-                    vk::MemoryBarrier2::default()
-                        .src_stage_mask(v.src_stage_mask)
-                        .src_access_mask(v.src_access_mask)
-                        .dst_stage_mask(v.dst_stage_mask)
-                        .dst_access_mask(v.dst_access_mask)
-                })
-                .collect(),
-            buffers: buffers
-                .iter()
-                .map(|v| {
-                    vk::BufferMemoryBarrier2::default()
-                        .src_stage_mask(v.src_stage_mask)
-                        .src_access_mask(v.src_access_mask)
-                        .dst_stage_mask(v.dst_stage_mask)
-                        .dst_access_mask(v.dst_access_mask)
-                        .src_queue_family_index(v.src_queue_family_index)
-                        .dst_queue_family_index(v.dst_queue_family_index)
-                        .buffer(v.buffer)
-                        .offset(v.offset)
-                        .size(v.size)
-                })
-                .collect(),
-            images: images
-                .iter()
-                .map(|v| {
-                    vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(v.src_stage_mask)
-                        .src_access_mask(v.src_access_mask)
-                        .dst_stage_mask(v.dst_stage_mask)
-                        .dst_access_mask(v.dst_access_mask)
-                        .src_queue_family_index(v.src_queue_family_index)
-                        .dst_queue_family_index(v.dst_queue_family_index)
-                        .image(v.image)
-                        .old_layout(v.old_layout)
-                        .new_layout(v.new_layout)
-                        .subresource_range(v.subresource_range)
-                })
-                .collect(),
-        });
+        let flags = info.dependency_flags;
+        // SAFETY: these structs have no borrowed fields beyond their null pNext.
+        // Copy their owned values directly into the capture arena, without a temporary vector.
+        unsafe {
+            self.recorder.record_arrays(
+                memory,
+                buffers,
+                images,
+                move |ctx, memory, buffers, images| {
+                    ctx.flush_draw();
+                    let info = vk::DependencyInfo::default()
+                        .dependency_flags(flags)
+                        .memory_barriers(memory)
+                        .buffer_memory_barriers(buffers)
+                        .image_memory_barriers(images);
+                    (ctx.functions.barrier)(ctx.command, &info);
+                    Ok(())
+                },
+            )
+        };
     }
-    pub unsafe fn begin_rendering(
-        &mut self,
-        command: vk::CommandBuffer,
-        info: &vk::RenderingInfo<'_>,
-    ) {
+    pub unsafe fn begin_rendering(&mut self, info: &vk::RenderingInfo<'_>) {
         debug_assert!(info.p_next.is_null());
         let own = |v: &vk::RenderingAttachmentInfo<'_>| {
             debug_assert!(v.p_next.is_null());
@@ -276,7 +306,6 @@ impl Dispatch {
                 .store_op(v.store_op)
                 .clear_value(v.clear_value)
         };
-        // SAFETY: all caller-owned attachments are copied into this command.
         let colors = if info.color_attachment_count == 0 {
             &[]
         } else {
@@ -287,21 +316,39 @@ impl Dispatch {
                 )
             }
         };
+        debug_assert!(colors.iter().all(|v| v.p_next.is_null()));
         let depth = unsafe { info.p_depth_attachment.as_ref() }.map(own);
         let stencil = unsafe { info.p_stencil_attachment.as_ref() }.map(own);
-        self.recorder.push(Command::BeginRendering {
-            command,
-            flags: info.flags,
-            area: info.render_area,
-            layers: info.layer_count,
-            mask: info.view_mask,
-            colors: colors.iter().map(own).collect(),
-            depth,
-            stencil,
-        });
+        let flags = info.flags;
+        let area = info.render_area;
+        let layers = info.layer_count;
+        let mask = info.view_mask;
+        unsafe {
+            self.recorder.record_array(colors, move |ctx, colors| {
+                ctx.flush_draw();
+                let mut info = vk::RenderingInfo::default()
+                    .flags(flags)
+                    .render_area(area)
+                    .layer_count(layers)
+                    .view_mask(mask)
+                    .color_attachments(colors);
+                if let Some(depth) = &depth {
+                    info = info.depth_attachment(depth);
+                }
+                if let Some(stencil) = &stencil {
+                    info = info.stencil_attachment(stencil);
+                }
+                (ctx.functions.begin)(ctx.command, &info);
+                Ok(())
+            })
+        };
     }
-    pub unsafe fn end_rendering(&mut self, command: vk::CommandBuffer) {
-        self.recorder.push(Command::EndRendering { command });
+    pub unsafe fn end_rendering(&mut self) {
+        self.recorder.record(|ctx| {
+            ctx.flush_draw();
+            unsafe { (ctx.functions.end)(ctx.command) };
+            Ok(())
+        });
     }
 }
 

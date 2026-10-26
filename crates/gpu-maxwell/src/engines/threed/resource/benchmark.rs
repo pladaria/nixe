@@ -1,4 +1,4 @@
-//! Same descriptor-consumer harness for the frozen and candidate source trees.
+//! Measurements of the descriptor and retained-binding production paths.
 use super::*;
 use crate::engines::tests::register_benchmark::ALLOCATIONS;
 use crate::{
@@ -40,10 +40,10 @@ fn descriptor_lookup_throughput() {
     let mut builder = ResourceBuilder::new(space.memory(), None, &mut cache, &mut memory_access);
     let address = mapping.offset().get();
     builder
-        .buffer(
+        .descriptor_pool(
             MaxwellThreeDResourceRole::TextureHeaders,
-            MaxwellThreeDUnresolvedAddress::new((address >> 32) as u8, address as u32),
-            8192,
+            Some(address),
+            Some(255),
         )
         .unwrap();
     for _ in 0..100 {

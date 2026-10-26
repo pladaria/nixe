@@ -1005,27 +1005,23 @@ impl MaxwellThreeDRenderTargetState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDRenderTargetWrite) {
         let raw = write.raw();
-        let source = write.source();
         match write {
             MaxwellThreeDRenderTargetWrite::ColorAddressUpper { target, value, .. } => {
                 self.color[target as usize].address_upper =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ColorAddressLower { target, value, .. } => {
                 self.color[target as usize].address_lower =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ColorWidth { target, value, .. } => {
-                self.color[target as usize].width =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.color[target as usize].width = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ColorHeight { target, value, .. } => {
-                self.color[target as usize].height =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.color[target as usize].height = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ColorFormat { target, value, .. } => {
-                self.color[target as usize].format =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.color[target as usize].format = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ColorLayout {
                 target,
@@ -1033,120 +1029,103 @@ impl MaxwellThreeDRenderTargetState {
                 kind,
                 ..
             } => {
-                self.color[target as usize].layout =
-                    MaxwellThreeDRegister::programmed(raw, layout, source);
-                self.color[target as usize].kind =
-                    MaxwellThreeDRegister::programmed(raw, kind, source);
+                self.color[target as usize].layout = MaxwellThreeDRegister::decoded(raw, layout);
+                self.color[target as usize].kind = MaxwellThreeDRegister::decoded(raw, kind);
             }
             MaxwellThreeDRenderTargetWrite::ColorThirdDimension { target, value, .. } => {
                 self.color[target as usize].third_dimension =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ColorArrayPitch { target, value, .. } => {
-                self.color[target as usize].array_pitch =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.color[target as usize].array_pitch = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ColorLayer { target, value, .. } => {
-                self.color[target as usize].layer =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.color[target as usize].layer = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ColorCompression { target, value, .. } => {
-                self.color[target as usize].compression =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.color[target as usize].compression = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ColorTargetSelection { value, .. } => {
-                self.color_target_selection = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.color_target_selection = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::CompressionThreshold { value, .. } => {
-                self.compression_threshold = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.compression_threshold = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ColorZeroBandwidthClear { value, .. } => {
-                self.color_zero_bandwidth_clear =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.color_zero_bandwidth_clear = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::DepthZeroBandwidthClear { value, .. } => {
-                self.depth_zero_bandwidth_clear =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.depth_zero_bandwidth_clear = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::SrgbWrite { value, .. } => {
-                self.srgb_write = MaxwellThreeDRegister::programmed(raw, value, source);
+                self.srgb_write = MaxwellThreeDRegister::decoded(raw, value);
             }
             MaxwellThreeDRenderTargetWrite::SeparateFragmentData { value, .. } => {
-                self.separate_fragment_data = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.separate_fragment_data = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::RenderTargetLayer { value, .. } => {
-                self.render_target_layer = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.render_target_layer = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::RenderTargetIndexOffset { value, .. } => {
-                self.render_target_index_offset =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.render_target_index_offset = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::DepthTargetCount { value, .. } => {
-                self.depth_target_count = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.depth_target_count = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::DepthAddressUpper { value, .. } => {
-                self.depth_stencil.address_upper =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.depth_stencil.address_upper = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::DepthAddressLower { value, .. } => {
-                self.depth_stencil.address_lower =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.depth_stencil.address_lower = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::DepthSparse { value, .. } => {
-                self.depth_stencil.sparse = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.depth_stencil.sparse = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::DepthFormat { value, .. } => {
-                self.depth_stencil.format = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.depth_stencil.format = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::DepthLayout { value, .. } => {
-                self.depth_stencil.layout = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.depth_stencil.layout = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::DepthWidth { value, .. } => {
-                self.depth_stencil.width = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.depth_stencil.width = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::DepthHeight { value, .. } => {
-                self.depth_stencil.height = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.depth_stencil.height = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::DepthThirdDimension { value, control, .. } => {
-                self.depth_stencil.third_dimension =
-                    MaxwellThreeDRegister::programmed(raw, value, source);
-                self.depth_stencil.array_control =
-                    MaxwellThreeDRegister::programmed(raw, control, source);
+                self.depth_stencil.third_dimension = MaxwellThreeDRegister::decoded(raw, value);
+                self.depth_stencil.array_control = MaxwellThreeDRegister::decoded(raw, control);
             }
             MaxwellThreeDRenderTargetWrite::DepthArrayPitch { value, .. } => {
-                self.depth_stencil.array_pitch =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.depth_stencil.array_pitch = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::DepthLayer { value, .. } => {
-                self.depth_stencil.layer = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.depth_stencil.layer = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::DepthCompression { value, .. } => {
-                self.depth_stencil.compression =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.depth_stencil.compression = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ClearColor {
                 component, value, ..
-            } => {
-                self.clear.color[component as usize] =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
-            }
+            } => self.clear.color[component as usize] = MaxwellThreeDRegister::decoded(raw, value),
             MaxwellThreeDRenderTargetWrite::ClearDepth { value, .. } => {
-                self.clear.depth = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.clear.depth = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ClearStencil { value, .. } => {
-                self.clear.stencil = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.clear.stencil = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ClearHorizontal { value, .. } => {
-                self.clear.horizontal = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.clear.horizontal = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ClearVertical { value, .. } => {
-                self.clear.vertical = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.clear.vertical = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ClearSurfaceControl { value, .. } => {
-                self.clear.surface_control = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.clear.surface_control = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDRenderTargetWrite::ClearSurface { value, .. } => {
-                self.clear.last_surface = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.clear.last_surface = MaxwellThreeDRegister::decoded(raw, value)
             }
         }
     }

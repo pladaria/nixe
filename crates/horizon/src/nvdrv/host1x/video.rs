@@ -1,4 +1,4 @@
-//! NVDEC packet reconstruction and actual decoded surface writes.
+//! NVDEC packet reconstruction and retained decoded frames consumed by VIC.
 //! Layout: https://github.com/averne/FFmpeg/blob/nvtegra/libavutil/nvdec_drv.h
 //! NVDEC TBL uses 64x8-byte GOBs and at least two GOBs per block:
 //! https://github.com/averne/FFmpeg/blob/nvtegra/libavutil/hwcontext_nvtegra.c
@@ -7,29 +7,27 @@ use nixe_gpu::physical::PhysicalMapping;
 use nixe_memory::{
     Access, AccessOperation, AccessResult, AllocationId, AllocationRange, ArenaOffset, MachineId,
 };
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::Arc;
 
 unsafe extern "C" {
-    fn nixe_nvdec_create(uuid: *const u8) -> *mut c_void;
-    fn nixe_video_hardware_supported(uuid: *const u8) -> c_int;
-    fn nixe_video_frame_context(frame: *const c_void) -> usize;
-    fn nixe_video_transfer_create(
-        frame: *const c_void,
-        fd: i32,
-        semaphore_fd: i32,
-        size: u64,
-        uuid: *const u8,
-        pitch: u64,
-        chroma: u64,
-        initialize: c_int,
-    ) -> *mut c_void;
-    fn nixe_video_transfer_enqueue(target: *mut c_void, frame: *const c_void) -> c_int;
-    fn nixe_video_transfer_wait(target: *mut c_void) -> c_int;
-    fn nixe_video_transfer_free(target: *mut c_void);
+    fn nixe_nvdec_create(codec: u32, uuid: *const u8) -> *mut c_void;
+    fn nixe_video_hardware_supported(codec: u32, uuid: *const u8) -> c_int;
+    fn nixe_nvdec_send_packet(
+        decoder: *mut c_void,
+        packet: *const u8,
+        length: usize,
+        origin: u64,
+    ) -> c_int;
     fn nixe_video_error() -> *const c_char;
     fn nixe_video_frame_free(frame: *mut c_void);
+    fn nixe_video_frame_planes(
+        frame: *const c_void,
+        planes: *mut *const u8,
+        strides: *mut i32,
+    ) -> c_int;
     fn nixe_nvdec_destroy(decoder: *mut c_void);
     fn nixe_nvdec_error(decoder: *const c_void) -> *const c_char;
     fn nixe_nvdec_send(
@@ -46,59 +44,146 @@ unsafe extern "C" {
         origin: *mut u64,
         width: *mut u32,
         height: *mut u32,
-        planes: *mut *const u8,
-        strides: *mut i32,
-        device_frame: *mut *mut c_void,
+        retained_frame: *mut *mut c_void,
     ) -> c_int;
 }
 
 #[derive(Debug)]
-struct CudaFrame(*mut c_void);
-// Immutable AVFrame reference pins its CUDA pixels and device context. Transfers
-// execute on the backend owner; the producer cannot recycle the pinned surface.
-unsafe impl Send for CudaFrame {}
-unsafe impl Sync for CudaFrame {}
-impl Drop for CudaFrame {
+pub(super) struct Frame {
+    raw: *mut c_void,
+    pub(super) width: usize,
+    pub(super) height: usize,
+    planes: [*const u8; 3],
+    strides: [usize; 3],
+}
+// Host1x owns each immutable AVFrame reference until VIC consumes it. Borrowed
+// plane slices cannot outlive that reference; only owned uploads cross threads.
+impl Drop for Frame {
     fn drop(&mut self) {
-        unsafe { nixe_video_frame_free(self.0) };
+        unsafe { nixe_video_frame_free(self.raw) };
     }
 }
-impl nixe_gpu::DeviceImageSource for CudaFrame {
-    fn transfer_context(&self) -> usize {
-        unsafe { nixe_video_frame_context(self.0) }
-    }
-    fn import_nv12(
-        &self,
-        target: nixe_gpu::ExternalImageBuffer,
-    ) -> Result<Box<dyn nixe_gpu::DeviceImageTransfer>, Box<str>> {
-        let transfer = unsafe {
-            nixe_video_transfer_create(
-                self.0,
-                target.fd,
-                target.semaphore_fd,
-                target.allocation_size,
-                target.device_uuid.as_ptr(),
-                target.row_pitch,
-                target.chroma_offset,
-                c_int::from(target.initialize),
-            )
+impl Frame {
+    fn new(raw: *mut c_void, width: usize, height: usize) -> Result<Self, String> {
+        if raw.is_null() {
+            return Err("NVDEC returned no retained frame".into());
+        }
+        let mut frame = Self {
+            raw,
+            width,
+            height,
+            planes: [std::ptr::null(); 3],
+            strides: [0; 3],
         };
-        if transfer.is_null() {
-            return Err(video_error());
+        let mut strides = [0; 3];
+        let count = unsafe {
+            nixe_video_frame_planes(raw, frame.planes.as_mut_ptr(), strides.as_mut_ptr())
+        };
+        if count < 0 {
+            return Err(video_error().into());
         }
-        Ok(Box::new(CudaImageTransfer(transfer)))
+        let widths = [
+            width,
+            if count == 2 {
+                width.div_ceil(2) * 2
+            } else {
+                width.div_ceil(2)
+            },
+            width.div_ceil(2),
+        ];
+        for i in 0..count as usize {
+            if frame.planes[i].is_null() || strides[i] < widths[i] as i32 {
+                return Err("invalid decoded host video plane".into());
+            }
+            frame.strides[i] = strides[i] as usize;
+        }
+        Ok(frame)
     }
-    fn enqueue_nv12(&self, target: &mut dyn nixe_gpu::DeviceImageTransfer) -> Result<(), Box<str>> {
-        let target = (target as &mut dyn std::any::Any)
-            .downcast_mut::<CudaImageTransfer>()
-            .ok_or_else(|| {
-                Box::<str>::from("decoded frame and transfer use different producer APIs")
-            })?;
-        if unsafe { nixe_video_transfer_enqueue(target.0, self.0) } < 0 {
-            Err(video_error())
-        } else {
-            Ok(())
+    pub(super) fn luma(&self) -> &[u8] {
+        // SAFETY: FFmpeg owns all visible rows with their validated positive
+        // stride. Excluding final row padding keeps the slice within its plane.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.planes[0],
+                (self.height - 1) * self.strides[0] + self.width,
+            )
         }
+    }
+    pub(super) fn chroma_pitch(&self) -> usize {
+        if self.planes[2].is_null() {
+            self.strides[1]
+        } else {
+            self.width.div_ceil(2) * 2
+        }
+    }
+    pub(super) fn luma_pitch(&self) -> usize {
+        self.strides[0]
+    }
+    pub(super) fn chroma(&self) -> Cow<'_, [u8]> {
+        let width = self.width.div_ceil(2) * 2;
+        let rows = self.height.div_ceil(2);
+        if self.planes[2].is_null() {
+            // SAFETY: receive validated the NV12 plane and its complete extent.
+            Cow::Borrowed(unsafe {
+                std::slice::from_raw_parts(self.planes[1], (rows - 1) * self.strides[1] + width)
+            })
+        } else {
+            // The CPU compositor consumes semiplanar UV. Convert only software
+            // planar output; CUDA already supplies an interleaved host plane.
+            let mut uv = vec![0; width * rows];
+            for (y, row) in uv.chunks_exact_mut(width).enumerate() {
+                for (x, value) in row.iter_mut().enumerate() {
+                    unsafe {
+                        *value = *self.planes[1 + x % 2].add(y * self.strides[1 + x % 2] + x / 2);
+                    }
+                }
+            }
+            Cow::Owned(uv)
+        }
+    }
+    /// Own only the visible pixels needed by the asynchronous graphics owner.
+    /// CPU VIC reads the retained planes directly instead of making this copy.
+    pub(super) fn linear_planes(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Result<[Arc<[u8]>; 2], String> {
+        if width == 0 || width > self.width || height == 0 || height > self.height {
+            return Err("VIC source exceeds decoded frame dimensions".into());
+        }
+        let widths = [width, width.div_ceil(2) * 2];
+        let heights = [height, height.div_ceil(2)];
+        Ok(std::array::from_fn(|plane| {
+            let width = widths[plane];
+            let mut bytes = Arc::<[u8]>::new_uninit_slice(width * heights[plane]);
+            for (y, row) in Arc::get_mut(&mut bytes)
+                .unwrap()
+                .chunks_exact_mut(width)
+                .enumerate()
+            {
+                if plane == 0 || self.planes[2].is_null() {
+                    // SAFETY: the validated FFmpeg row contains `width` bytes;
+                    // the unique output row has exactly that writable extent.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.planes[plane].add(y * self.strides[plane]),
+                            row.as_mut_ptr().cast::<u8>(),
+                            width,
+                        );
+                    }
+                } else {
+                    for (x, value) in row.iter_mut().enumerate() {
+                        unsafe {
+                            value.write(
+                                *self.planes[1 + x % 2].add(y * self.strides[1 + x % 2] + x / 2),
+                            );
+                        }
+                    }
+                }
+            }
+            // SAFETY: every output byte was initialized in the row loop above.
+            unsafe { bytes.assume_init() }
+        }))
     }
 }
 
@@ -107,26 +192,6 @@ fn video_error() -> Box<str> {
         .to_string_lossy()
         .into_owned()
         .into_boxed_str()
-}
-
-#[derive(Debug)]
-struct CudaImageTransfer(*mut c_void);
-// Imports retain their device context. The concrete Vulkan owner serializes
-// copies; destruction occurs only after its actual consumer completion.
-unsafe impl Send for CudaImageTransfer {}
-impl nixe_gpu::DeviceImageTransfer for CudaImageTransfer {
-    fn wait(&mut self) -> Result<(), Box<str>> {
-        if unsafe { nixe_video_transfer_wait(self.0) } < 0 {
-            Err(video_error())
-        } else {
-            Ok(())
-        }
-    }
-}
-impl Drop for CudaImageTransfer {
-    fn drop(&mut self) {
-        unsafe { nixe_video_transfer_free(self.0) };
-    }
 }
 
 pub(super) type Mappings = Arc<BTreeMap<u32, Mapping>>;
@@ -177,28 +242,19 @@ pub(super) fn read(mappings: &Mappings, address: u64, length: usize) -> Result<V
     };
     Ok(bytes.into_vec())
 }
-/// One write names only modified runs. Padding and masked components are not
+/// Callers provide coalesced runs in storage order. One write names only
+/// modified bytes. Padding and masked components are not
 /// read back or overwritten merely because they share pages with the output.
 pub(super) fn write_spans(
     physical: &PhysicalMapping,
     offset: u64,
     bytes: &[u8],
-    mut spans: Vec<std::ops::Range<usize>>,
+    spans: Vec<std::ops::Range<usize>>,
 ) -> Result<(), String> {
-    spans.sort_unstable_by_key(|span| span.start);
-    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    debug_assert!(spans.windows(2).all(|pair| pair[0].end <= pair[1].start));
+    let mut ranges = Vec::with_capacity(spans.len());
+    let mut payload = Vec::with_capacity(spans.iter().map(|span| span.end - span.start).sum());
     for span in spans {
-        if let Some(last) = merged.last_mut()
-            && last.end >= span.start
-        {
-            last.end = last.end.max(span.end);
-        } else {
-            merged.push(span);
-        }
-    }
-    let mut ranges = Vec::new();
-    let mut payload = Vec::new();
-    for span in merged {
         let data = bytes
             .get(span.clone())
             .ok_or("Host1x write exceeds captured output")?;
@@ -222,7 +278,7 @@ pub(super) fn write_spans(
 pub(super) fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
-fn surface_identity(
+pub(super) fn surface_identity(
     mappings: &Mappings,
     address: u64,
 ) -> Result<(MachineId, AllocationId, ArenaOffset), String> {
@@ -246,35 +302,67 @@ pub(super) fn gob_offset(x: usize, y: usize, pitch: usize, log2_height: u32) -> 
         + x % 16
 }
 
+pub(super) type SurfaceIdentity = (MachineId, AllocationId, ArenaOffset);
 #[derive(Debug)]
 struct Output {
-    mappings: Mappings,
-    luma: u64,
-    chroma: u64,
+    identity: SurfaceIdentity,
     width: usize,
     height: usize,
-    luma_pitch: usize,
-    chroma_pitch: usize,
-    block_height: u32,
 }
 #[derive(Debug)]
 pub(super) struct NvDec {
     decoder: *mut c_void,
+    codec: u32,
+    device: Option<[u8; 16]>,
+    h264_initialized: bool,
     next_origin: u64,
     outputs: BTreeMap<u64, Output>,
-    surfaces: BTreeMap<[(MachineId, AllocationId, ArenaOffset); 2], u64>,
+    surfaces: BTreeMap<[SurfaceIdentity; 2], u64>,
+    frames: VecDeque<(SurfaceIdentity, Frame)>,
 }
-// The codec is exclusively owned by one Host1x worker and never accessed concurrently.
-unsafe impl Send for NvDec {}
 impl Drop for NvDec {
     fn drop(&mut self) {
         unsafe { nixe_nvdec_destroy(self.decoder) };
     }
 }
 impl NvDec {
-    pub(super) fn new(device: Option<[u8; 16]>) -> Result<Self, String> {
-        let device = match device {
-            Some(uuid) => match unsafe { nixe_video_hardware_supported(uuid.as_ptr()) } {
+    pub(super) fn new(device: Option<[u8; 16]>) -> Self {
+        Self {
+            decoder: std::ptr::null_mut(),
+            codec: 0,
+            device,
+            h264_initialized: false,
+            next_origin: 1,
+            outputs: BTreeMap::new(),
+            surfaces: BTreeMap::new(),
+            frames: VecDeque::new(),
+        }
+    }
+    pub(super) fn has_frame(&self, identity: SurfaceIdentity) -> bool {
+        self.frames.iter().any(|(surface, _)| *surface == identity)
+    }
+    pub(super) fn pop_frame(&mut self) -> Option<Frame> {
+        // The VIC channel identifies its decoder once. FFmpeg receive order
+        // already accounts for H.264 display reordering.
+        self.frames.pop_front().map(|(_, frame)| frame)
+    }
+    fn select_codec(&mut self, codec: u32) -> Result<(), String> {
+        if self.codec == codec {
+            return Ok(());
+        }
+        if !matches!(codec, 3 | 9) {
+            return Err(format!("unsupported NVDEC codec {codec:#x}"));
+        }
+        unsafe { nixe_nvdec_destroy(self.decoder) };
+        self.decoder = std::ptr::null_mut();
+        self.codec = 0;
+        self.h264_initialized = false;
+        self.outputs.clear();
+        self.surfaces.clear();
+        self.frames.clear();
+        let name = if codec == 3 { "H.264" } else { "VP9" };
+        let device = match self.device {
+            Some(uuid) => match unsafe { nixe_video_hardware_supported(codec, uuid.as_ptr()) } {
                 1 => Some(uuid),
                 0 => None,
                 _ => {
@@ -288,6 +376,7 @@ impl NvDec {
         };
         let decoder = unsafe {
             nixe_nvdec_create(
+                codec,
                 device
                     .as_ref()
                     .map_or(std::ptr::null(), |uuid| uuid.as_ptr()),
@@ -295,38 +384,31 @@ impl NvDec {
         };
         if decoder.is_null() {
             return Err(format!(
-                "cannot initialize FFmpeg VP9 decoder: {}",
+                "cannot initialize FFmpeg {name} decoder: {}",
                 unsafe { CStr::from_ptr(nixe_video_error()) }.to_string_lossy()
             ));
         }
         log::info!(
-            "VP9 decoder selected: {}",
+            "{name} decoder selected: {}",
             if device.is_some() {
-                "CUDA/NVDEC hardware, device-resident NV12"
+                "CUDA/NVDEC hardware, retained frames"
             } else {
                 "software"
             }
         );
-        Ok(Self {
-            decoder,
-            next_origin: 1,
-            outputs: BTreeMap::new(),
-            surfaces: BTreeMap::new(),
-        })
+        self.decoder = decoder;
+        self.codec = codec;
+        Ok(())
     }
     fn error(&self) -> String {
         unsafe { CStr::from_ptr(nixe_nvdec_error(self.decoder)) }
             .to_string_lossy()
             .into_owned()
     }
-    pub(super) fn execute(
-        &mut self,
-        registers: &[u32],
-        mappings: &Mappings,
-        gpu: Option<&super::super::gpu_executor::NvDrvGpuExecutor>,
-    ) -> Result<(), String> {
-        if registers[0x80] != 9 {
-            return Err(format!("unsupported NVDEC codec {:#x}", registers[0x80]));
+    pub(super) fn execute(&mut self, registers: &[u32], mappings: &Mappings) -> Result<(), String> {
+        self.select_codec(registers[0x80])?;
+        if self.codec == 3 {
+            return self.execute_h264(registers, mappings);
         }
         let picture = read(mappings, u64::from(registers[0x101]) << 8, 256)?;
         let entropy = read(mappings, u64::from(registers[0x170]) << 8, 3744)?;
@@ -389,14 +471,9 @@ impl NvDec {
         self.outputs.insert(
             origin,
             Output {
-                mappings: Arc::clone(mappings),
-                luma: offsets[3],
-                chroma: u64::from(registers[0x11d + 3]) << 8,
+                identity: surface_identity(mappings, offsets[3])?,
                 width,
                 height,
-                luma_pitch,
-                chroma_pitch,
-                block_height,
             },
         );
         log::trace!(
@@ -419,241 +496,141 @@ impl NvDec {
                 self.error()
             ));
         }
+        self.receive()?;
+        if self.outputs.contains_key(&origin) {
+            return Err(
+                "NVDEC visible VP9 frame did not produce a surface before completion".into(),
+            );
+        }
+        Ok(())
+    }
+    fn execute_h264(&mut self, registers: &[u32], mappings: &Mappings) -> Result<(), String> {
+        let context = read(mappings, u64::from(registers[0x101]) << 8, 0x2fc)?;
+        let picture = super::h264::Picture::decode(&context, registers)?;
+        if picture.stream_length == 0 || picture.stream_length > i32::MAX as usize - 512 {
+            return Err("invalid NVDEC H.264 bitstream length".into());
+        }
+        let stream = read(
+            mappings,
+            u64::from(registers[0x102]) << 8,
+            picture.stream_length,
+        )?;
+        let packet = if !self.h264_initialized || picture.frame_number == 0 {
+            let mut packet = super::h264::headers(&context)?;
+            packet.extend_from_slice(&stream);
+            packet
+        } else {
+            stream
+        };
+        self.h264_initialized = true;
+        let origin = self.next_origin;
+        self.next_origin = self
+            .next_origin
+            .checked_add(1)
+            .ok_or("NVDEC frame origin overflow")?;
+        self.outputs.insert(
+            origin,
+            Output {
+                identity: surface_identity(mappings, picture.luma)?,
+                width: picture.width,
+                height: picture.height,
+            },
+        );
+        log::trace!(
+            "NVDEC H.264 input: origin={origin} frame={} dimensions={}x{} bytes={} pitch={}/{} block-height={}",
+            picture.frame_number,
+            picture.width,
+            picture.height,
+            packet.len(),
+            picture.luma_pitch,
+            picture.chroma_pitch,
+            picture.block_height
+        );
+        if unsafe { nixe_nvdec_send_packet(self.decoder, packet.as_ptr(), packet.len(), origin) }
+            < 0
+        {
+            return Err(format!(
+                "H.264 reconstruction/decode failed: {}",
+                self.error()
+            ));
+        }
+        // H.264 may retain pictures for display reordering. Keep their exact
+        // submitted surfaces until FFmpeg returns each packet's origin.
+        self.receive()
+    }
+    fn receive(&mut self) -> Result<(), String> {
         // Drain before another send, as required by FFmpeg's send/receive protocol.
         loop {
             let mut decoded_origin = 0;
             let mut decoded_width = 0;
             let mut decoded_height = 0;
-            let mut planes = [std::ptr::null(); 3];
-            let mut strides = [0; 3];
-            let mut device_frame = std::ptr::null_mut();
+            let mut retained_frame = std::ptr::null_mut();
             let result = unsafe {
                 nixe_nvdec_receive(
                     self.decoder,
                     &mut decoded_origin,
                     &mut decoded_width,
                     &mut decoded_height,
-                    planes.as_mut_ptr(),
-                    strides.as_mut_ptr(),
-                    &mut device_frame,
+                    &mut retained_frame,
                 )
             };
             if result < 0 {
-                return Err(format!("VP9 receive failed: {}", self.error()));
+                return Err(format!("NVDEC receive failed: {}", self.error()));
             }
             if result == 0 {
                 break;
             }
-            let device_frame = (!device_frame.is_null()).then(|| CudaFrame(device_frame));
+            let frame = Frame::new(
+                retained_frame,
+                decoded_width as usize,
+                decoded_height as usize,
+            )?;
             let output = self
                 .outputs
                 .remove(&decoded_origin)
                 .ok_or("NVDEC returned an unknown frame origin")?;
-            if output.width != decoded_width as usize
-                || output.height != decoded_height as usize
-                || (device_frame.is_none()
-                    && (strides[0] < output.width as i32
-                        || strides[1] < output.width.div_ceil(2) as i32
-                        || strides[2] < output.width.div_ceil(2) as i32
-                        || planes.iter().any(|p| p.is_null())))
-            {
-                return Err("NVDEC output dimensions/planes do not match submitted surface".into());
+            if output.width != frame.width || output.height != frame.height {
+                return Err("NVDEC output dimensions do not match submitted surface".into());
             }
-            if let Some(frame) = device_frame {
-                let gpu = gpu.ok_or("hardware video requires an accelerated GPU backend")?;
-                gpu.upload_device_planes(
-                    output.images()?,
-                    nixe_gpu::DeviceImageFrame {
-                        width: decoded_width,
-                        height: decoded_height,
-                        source: Arc::new(frame),
-                    },
-                )?;
-            } else if let Some(gpu) = gpu {
-                output.upload(planes, strides, gpu)?;
-            } else {
-                output.write(planes, strides)?;
+            // Presentation order is FFmpeg receive order, including H.264 B
+            // pictures. Pin the frame, not a native image or a copy of guest RAM.
+            let limit = 100;
+            if self.frames.len() >= limit {
+                self.frames.pop_front();
             }
+            self.frames.push_back((output.identity, frame));
             log::trace!(
-                "NVDEC VP9 output: origin={decoded_origin} dimensions={decoded_width}x{decoded_height}"
+                "NVDEC output: origin={decoded_origin} dimensions={decoded_width}x{decoded_height}"
             );
         }
-        if self.outputs.contains_key(&origin) {
-            return Err("NVDEC visible frame did not produce a surface before completion".into());
-        }
         Ok(())
     }
 }
-impl Output {
-    fn upload(
-        &self,
-        planes: [*const u8; 3],
-        strides: [i32; 3],
-        gpu: &super::super::gpu_executor::NvDrvGpuExecutor,
-    ) -> Result<(), String> {
-        let images = self.images()?;
-        let bytes = self.linear_planes(planes, strides);
-        gpu.upload_decoded_planes(
-            images,
-            bytes,
-            [self.width as u32, self.width.div_ceil(2) as u32],
-        )
-    }
-
-    fn images(&self) -> Result<[nixe_gpu::ConversionImage; 2], String> {
-        let surface = |chroma| super::surface::Surface {
-            width: if chroma {
-                self.width.div_ceil(2) * 2
-            } else {
-                self.width
-            },
-            height: if chroma {
-                self.height.div_ceil(2)
-            } else {
-                self.height
-            },
-            pitch: if chroma {
-                self.chroma_pitch
-            } else {
-                self.luma_pitch
-            },
-            rows: if chroma {
-                self.height.div_ceil(2)
-            } else {
-                self.height
-            },
-            kind: 1,
-            block_height: self.block_height,
-            format: 68,
-        };
-        let images = [
-            surface(false).gpu_image(
-                &self.mappings,
-                self.luma,
-                nixe_gpu::ImageFormat::R8Unorm,
-                true,
-            )?,
-            surface(true).gpu_image(
-                &self.mappings,
-                self.chroma,
-                nixe_gpu::ImageFormat::Rg8Unorm,
-                true,
-            )?,
-        ];
-        Ok(images)
-    }
-
-    // The FFI frame is borrowed only until the next receive. Own linear planes
-    // across the frontend/backend queues without swizzling canonical memory.
-    fn linear_planes(&self, planes: [*const u8; 3], strides: [i32; 3]) -> [Arc<[u8]>; 2] {
-        let mut luma = Arc::<[u8]>::new_uninit_slice(self.width * self.height);
-        let chroma_width = self.width.div_ceil(2);
-        let mut uv = Arc::<[u8]>::new_uninit_slice(chroma_width * 2 * self.height.div_ceil(2));
-        for (y, row) in Arc::get_mut(&mut luma)
-            .unwrap()
-            .chunks_exact_mut(self.width)
-            .enumerate()
-        {
-            // SAFETY: receive validates positive strides and complete plane
-            // dimensions; this copy finishes before the next receive.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    planes[0].add(y * strides[0] as usize),
-                    row.as_mut_ptr().cast::<u8>(),
-                    self.width,
-                );
-            }
-        }
-        for (y, row) in Arc::get_mut(&mut uv)
-            .unwrap()
-            .chunks_exact_mut(chroma_width * 2)
-            .enumerate()
-        {
-            for x in 0..chroma_width {
-                // SAFETY: both chroma planes have the validated row extents.
-                unsafe {
-                    row[x * 2].write(*planes[1].add(y * strides[1] as usize + x));
-                    row[x * 2 + 1].write(*planes[2].add(y * strides[2] as usize + x));
-                }
-            }
-        }
-        // SAFETY: every byte of both tightly packed planes was initialized above.
-        unsafe { [luma.assume_init(), uv.assume_init()] }
-    }
-
-    fn write(&self, planes: [*const u8; 3], strides: [i32; 3]) -> Result<(), String> {
-        for chroma in [false, true] {
-            let pitch = if chroma {
-                self.chroma_pitch
-            } else {
-                self.luma_pitch
-            };
-            let width = if chroma {
-                self.width.div_ceil(2) * 2
-            } else {
-                self.width
-            };
-            let rows = if chroma {
-                self.height.div_ceil(2)
-            } else {
-                self.height
-            };
-            let length = pitch * rows.next_multiple_of(8 << self.block_height);
-            let address = if chroma { self.chroma } else { self.luma };
-            let (backing, offset) = region(&self.mappings, address, length)?;
-            let mut bytes = vec![0; length];
-            let mut spans = Vec::with_capacity(rows * width.div_ceil(16));
-            // A GOB stores each 16-byte horizontal run contiguously. Copy runs
-            // rather than recomputing the block-linear address for every byte.
-            // Preserve padding in the backing snapshot, including partial runs.
-            for y in 0..rows {
-                // SAFETY: receive validated positive strides and complete plane
-                // dimensions; FFmpeg keeps this borrowed frame alive until the
-                // next receive. The luma row contains at least `width` bytes.
-                let luma = if chroma {
-                    None
-                } else {
-                    Some(unsafe {
-                        std::slice::from_raw_parts(planes[0].add(y * strides[0] as usize), width)
-                    })
-                };
-                for x in (0..width).step_by(16) {
-                    let count = (width - x).min(16);
-                    let target = gob_offset(x, y, pitch, self.block_height);
-                    spans.push(target..target + count);
-                    if let Some(luma) = luma {
-                        bytes[target..target + count].copy_from_slice(&luma[x..x + count]);
-                    } else {
-                        let mut interleaved = [0; 16];
-                        for (i, value) in interleaved[..count].iter_mut().enumerate() {
-                            let channel = (x + i) % 2;
-                            // SAFETY: the verified chroma rows contain ceil(width/2)
-                            // values in each source plane, with positive strides.
-                            *value = unsafe {
-                                *planes[1 + channel]
-                                    .add(y * strides[1 + channel] as usize + (x + i) / 2)
-                            };
-                        }
-                        bytes[target..target + count].copy_from_slice(&interleaved[..count]);
-                    }
-                }
-            }
-            write_spans(backing, offset, &bytes, spans)?;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::nvdrv::nvmap::{NvMapAllocationMetadata, NvMapCpuMapping, NvMapObjects, NvMapOwner};
     use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
+
     #[test]
-    fn decoded_gob_runs_preserve_partial_rows_chroma_and_padding() {
+    fn h264_reconstructed_headers_retain_frames_including_reordered_surfaces() {
+        // Original 16x16 red frames encoded with libx264, high profile, QP20,
+        // bframes=0, ref=4. Only slices remain: the guest supplies SPS/PPS fields
+        // through NVDEC's context rather than the original container headers.
+        let slices: [&[u8]; 3] = [
+            &[
+                0x65, 0x88, 0x84, 0x3f, 0xfe, 0xbd, 0x67, 0xe6, 0x58, 0xdf, 0x1c, 0x74, 0x91, 0x6d,
+                0x28, 0x43, 0xda, 0x81,
+            ],
+            &[0x41, 0x9a, 0x3b, 0x1f, 0xfe, 0xc0],
+            &[0x41, 0x9a, 0x57, 0xe1, 0x0c, 0x99, 0x4c, 0x3f, 0xfe, 0xc1],
+        ];
         let machine = crate::test_memory::machine();
         let allocation = machine.account(0x10000).unwrap().allocate(0x10000).unwrap();
-        let input = nixe_memory::AllocationRange::new(allocation.pin(), 0, 0x10000).unwrap();
+        let input = AllocationRange::new(allocation.pin(), 0, 0x10000).unwrap();
+        machine
+            .write_resolved(std::slice::from_ref(&input), &vec![0xa5; 0x10000])
+            .unwrap();
         let mut nvmap = NvMapObjects::default();
         let owner = NvMapOwner::new(1);
         let handle = nvmap.create(owner, 0x10000).unwrap();
@@ -666,79 +643,219 @@ mod tests {
                 Arc::from([input.clone()]),
             )
             .unwrap();
-        let mappings = Arc::new(BTreeMap::from([(0x1000, {
-            let object = nvmap
-                .object_snapshot_by_owned_handle(owner, handle)
-                .unwrap();
+        let object = nvmap
+            .object_snapshot_by_owned_handle(owner, handle)
+            .unwrap();
+        let mappings = Arc::new(BTreeMap::from([(
+            0x1000,
             Mapping {
-                physical: nixe_gpu::physical::PhysicalMapping::new(object.ranges().unwrap())
-                    .unwrap(),
+                physical: PhysicalMapping::new(object.ranges().unwrap()).unwrap(),
                 object,
                 references: 1,
+            },
+        )]));
+        let mut context = vec![0; 0x2fc];
+        for (offset, value) in [
+            (8, 1_u32),
+            (12, 1),
+            (16, 1),
+            (0x18, 1),
+            (0x20, 3),
+            (0x28, 1),
+            (0x30, 1),
+            (0x34, 64),
+            (0x38, 64),
+            (0x44, 1),
+            (0x50, 1),
+        ] {
+            context[0x58 + offset..0x5c + offset].copy_from_slice(&value.to_le_bytes());
+        }
+        context[0x1c0..0x2a0].fill(16);
+        let flags =
+            2_u64 | 4 | (1 << 12) | (2 << 14) | (58 << 16) | (30 << 22) | (30 << 27) | (4 << 34);
+        let mut registers = [0; 0x200];
+        registers[0x80] = 3;
+        registers[0x101] = 0x10;
+        registers[0x102] = 0x14;
+        registers[0x10c + 4] = 0x30;
+        registers[0x11d + 4] = 0x60;
+        let mut decoder = NvDec::new(None);
+        let fd = super::super::super::NvDrvFileDescriptor::new(7);
+        let mut vic = super::super::vic::Vic::default();
+        // Repeated IDR also exercises header regeneration when the movie loops.
+        for frame in [0, 1, 2, 0] {
+            let mut packet = vec![0, 0, 1];
+            packet.extend_from_slice(slices[frame]);
+            context[0x48..0x4c].copy_from_slice(&(packet.len() as u32).to_le_bytes());
+            context[0xb0..0xb8].copy_from_slice(&(flags | ((frame as u64) << 46)).to_le_bytes());
+            machine
+                .write_resolved(&[input.slice(0, context.len() as u64).unwrap()], &context)
+                .unwrap();
+            machine
+                .write_resolved(&[input.slice(0x400, packet.len() as u64).unwrap()], &packet)
+                .unwrap();
+            decoder.execute(&registers, &mappings).unwrap();
+            assert!(decoder.outputs.is_empty());
+            {
+                let frame = &decoder.frames.front().unwrap().1;
+                assert_eq!(frame.luma().as_ptr(), frame.planes[0]);
+                let planes = frame.linear_planes(frame.width, frame.height).unwrap();
+                assert!(planes[0].iter().all(|&v| v == 81));
+                assert!(planes[1].chunks_exact(2).all(|uv| uv == [90, 240]));
+                // Crop both width and coded height before an owned GPU upload.
+                let cropped = frame.linear_planes(13, 13).unwrap();
+                assert_eq!(cropped[0].len(), 13 * 13);
+                assert_eq!(cropped[1].len(), 14 * 7);
+                assert!(cropped[0].iter().all(|&v| v == 81));
+                assert!(cropped[1].chunks_exact(2).all(|uv| uv == [90, 240]));
             }
-        })]));
-        let width = 67usize;
-        let height = 37usize;
-        let y = (0..73 * height).map(|i| (i * 7) as u8).collect::<Vec<_>>();
-        let u = (0..37 * height.div_ceil(2))
-            .map(|i| (i * 3) as u8)
-            .collect::<Vec<_>>();
-        let v = (0..39 * height.div_ceil(2))
-            .map(|i| (255usize.wrapping_sub(i * 5)) as u8)
-            .collect::<Vec<_>>();
-        machine
-            .write_resolved(
-                &[input.slice(0, vec![0xa5; 0x10000].len() as u64).unwrap()],
-                &vec![0xa5; 0x10000],
-            )
-            .unwrap();
-        let output = Output {
-            mappings,
-            luma: 0x2000,
-            chroma: 0x5000,
-            width,
-            height,
-            luma_pitch: 128,
-            chroma_pitch: 128,
-            block_height: 2,
-        };
-        let planes = [y.as_ptr(), u.as_ptr(), v.as_ptr()];
-        let linear = output.linear_planes(planes, [73, 37, 39]);
-        output.write(planes, [73, 37, 39]).unwrap();
-        for chroma in [false, true] {
-            let rows = if chroma { height.div_ceil(2) } else { height };
-            let w = if chroma { width.div_ceil(2) * 2 } else { width };
-            let length = 128 * rows.next_multiple_of(32);
-            let mut expected = vec![0xa5; length];
-            for row in 0..rows {
-                for x in 0..w {
-                    expected[gob_offset(x, row, 128, 2)] = if !chroma {
-                        y[row * 73 + x]
-                    } else if x % 2 == 0 {
-                        u[row * 37 + x / 2]
-                    } else {
-                        v[row * 39 + x / 2]
-                    };
-                }
+            // Consume the actual retained frame through CPU VIC. Its FFmpeg
+            // strides differ from the guest surface pitches; input RAM still
+            // contains the sentinel rather than a materialized decode surface.
+            let nv12 = frame % 2 == 0;
+            let mut config = vec![0; 0x610];
+            for (offset, value) in [
+                (0x10, 4u32),
+                (0x18, 15 << 16),
+                (0x1c, 12 << 16),
+                (0x20, if nv12 { 68 } else { 31 }),
+                (0x24, 15 | 12 << 14),
+                (0x28, if nv12 { 31 | 15 << 14 } else { 19 | 15 << 14 }),
+                (0x2c, 15 | 7 << 14),
+                (0x90, 0x101),
+                (0xa0, 1023 << 10),
+                (0xa4, 1023),
+                (0xb4, 15 << 16),
+                (0xbc, 12 << 16),
+                (0xc0, 15 << 16),
+                (0xc4, 12 << 16),
+                (0xd0, 68 | 1 << 11 | 1 << 15),
+                (0xd4, 15 | 15 << 14),
+                (0xd8, 63 | 15 << 14),
+                (0xdc, 31 | 7 << 14),
+                (0x130, 1023),
+                (0x134, 0x2050),
+            ] {
+                config[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             }
-            let mut actual = vec![0; length];
+            machine
+                .write_resolved(&[input.slice(0x800, config.len() as u64).unwrap()], &config)
+                .unwrap();
+            machine
+                .write_resolved(&[input.slice(0xb000, 0x3000).unwrap()], &vec![0xa5; 0x3000])
+                .unwrap();
+            let mut vic_registers = [0; 0x446];
+            vic_registers[0x1c2] = 0x18;
+            // Once bound, VIC consumes its decoder FIFO even when the guest
+            // supplies a different/unmapped decode surface for a later picture.
+            vic_registers[0x100] = if vic.decoder.is_none() {
+                0x31
+            } else {
+                0xffff00
+            };
+            vic_registers[0x101] = 0x61;
+            vic_registers[0x1c8] = 0xc0;
+            vic_registers[0x1c9] = 0xd0;
+            let mut decoders = BTreeMap::from([(fd, decoder)]);
+            vic.execute(&vic_registers, &mappings, None, &mut decoders)
+                .unwrap();
+            // A repeated VIC execute has no new decoder frame and must retain
+            // the previous picture instead of reading the unmaterialized input.
+            vic.execute(&vic_registers, &mappings, None, &mut decoders)
+                .unwrap();
+            decoder = decoders.remove(&fd).unwrap();
+            assert!(decoder.frames.is_empty());
+            let pitch = if nv12 { 32 } else { 80 };
+            let mut pixels = vec![0; pitch * 16];
             crate::test_memory::read(
-                &[input
-                    .slice(if chroma { 0x4000 } else { 0x1000 }, actual.len() as u64)
-                    .unwrap()],
-                &mut actual,
+                &[input.slice(0xb000, pixels.len() as u64).unwrap()],
+                &mut pixels,
             );
-            assert_eq!(actual, expected);
-            let pitch = if chroma { width.div_ceil(2) * 2 } else { width };
-            for row in 0..rows {
-                for x in 0..w {
-                    assert_eq!(
-                        linear[usize::from(chroma)][row * pitch + x],
-                        expected[gob_offset(x, row, 128, 2)]
-                    );
+            let mut expected = vec![0xa5; pixels.len()];
+            for y in 0..13 {
+                if nv12 {
+                    expected[y * pitch..y * pitch + 16].fill(81);
+                } else {
+                    for pixel in expected[y * pitch..y * pitch + 64].chunks_exact_mut(4) {
+                        pixel.copy_from_slice(&[81, 90, 240, 255]);
+                    }
                 }
+            }
+            assert_eq!(pixels, expected);
+            if nv12 {
+                let mut uv = vec![0; 32 * 8];
+                crate::test_memory::read(&[input.slice(0xc000, uv.len() as u64).unwrap()], &mut uv);
+                let mut expected = vec![0xa5; uv.len()];
+                for y in 0..7 {
+                    for pair in expected[y * 32..y * 32 + 16].chunks_exact_mut(2) {
+                        pair.copy_from_slice(&[90, 240]);
+                    }
+                }
+                assert_eq!(uv, expected);
             }
         }
+        assert!(
+            decoder
+                .select_codec(0xff)
+                .unwrap_err()
+                .contains("unsupported NVDEC codec")
+        );
+        decoder.select_codec(9).unwrap();
+        assert!(!decoder.h264_initialized);
+        decoder.select_codec(3).unwrap();
+        assert!(!decoder.h264_initialized);
+
+        // Eight synthetic gray levels with two B pictures between references.
+        // Decode order differs from display order; VIC must consume FFmpeg
+        // receive order rather than selecting a picture by its decode surface.
+        let reordered: [&[u8]; 8] = [
+            &[
+                0x65, 0x88, 0x84, 0x00, 0xff, 0xfe, 0xbd, 0x67, 0xe6, 0x59, 0x29, 0x1a, 0xdd, 0x24,
+                0x5b, 0x49, 0xae, 0x1a, 0x81,
+            ],
+            &[
+                0x41, 0x9a, 0x23, 0x6c, 0x7f, 0x5f, 0xcb, 0xff, 0xff, 0xe7, 0xcd, 0x56, 0x94, 0xf8,
+                0xb2, 0x1a, 0x16, 0xf6, 0x96, 0xe0, 0x58,
+            ],
+            &[0x41, 0x9e, 0x41, 0x78, 0xaf, 0xda, 0x81],
+            &[0x01, 0x9e, 0x62, 0x6a, 0x49, 0xff, 0xdb, 0x80],
+            &[
+                0x41, 0x9a, 0x66, 0x35, 0x08, 0x2d, 0x13, 0x29, 0x81, 0xff, 0x90, 0xff, 0x9e, 0x14,
+                0x7f, 0xff, 0xf3, 0x43, 0xdb, 0xc0, 0xf4, 0x18, 0x5e, 0x61, 0x17, 0x61,
+            ],
+            &[0x41, 0x9e, 0x84, 0x6e, 0x51, 0x12, 0xd7, 0xda, 0x81],
+            &[0x01, 0x9e, 0xa5, 0x6a, 0x49, 0xff, 0xdb, 0x81],
+            &[
+                0x41, 0x9a, 0xa7, 0x35, 0x08, 0x2d, 0x93, 0x29, 0x81, 0xff, 0x56, 0x5a, 0xff, 0xff,
+                0xf3, 0x4a, 0xd2, 0x9a, 0x43, 0xca, 0x62, 0xf6, 0x85,
+            ],
+        ];
+        let flags = (flags & !(3 << 14)) | (2 << 32);
+        context[0x58..0x5c].copy_from_slice(&2_u32.to_le_bytes());
+        for (i, slice) in reordered.into_iter().enumerate() {
+            let frame = [0, 1, 2, 3, 3, 4, 5, 5][i];
+            registers[0x10c + 4] = 0x30 + i as u32 * 8;
+            registers[0x11d + 4] = 0x80 + i as u32 * 8;
+            let mut packet = vec![0, 0, 1];
+            packet.extend_from_slice(slice);
+            context[0x48..0x4c].copy_from_slice(&(packet.len() as u32).to_le_bytes());
+            context[0xb0..0xb8].copy_from_slice(&(flags | (frame << 46)).to_le_bytes());
+            machine
+                .write_resolved(&[input.slice(0, context.len() as u64).unwrap()], &context)
+                .unwrap();
+            machine
+                .write_resolved(&[input.slice(0x400, packet.len() as u64).unwrap()], &packet)
+                .unwrap();
+            decoder.execute(&registers, &mappings).unwrap();
+        }
+        let produced = decoder.frames.len();
+        assert!(produced >= 5);
+        let expected = [48, 64, 80, 96, 112, 128, 144, 160];
+        for &value in &expected[..produced] {
+            let frame = decoder.pop_frame().unwrap();
+            assert_eq!(frame.luma()[0], value);
+        }
+        assert!(decoder.frames.is_empty());
     }
 
     #[test]

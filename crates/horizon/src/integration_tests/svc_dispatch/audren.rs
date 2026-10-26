@@ -2,6 +2,13 @@ use super::*;
 
 #[test]
 fn audren_opens_updates_starts_and_stops() {
+    for (revision, work_size) in [(7_u32, 0x66000), (8, 0x66000), (9, 0x67000), (15, 0x67000)] {
+        exercise_renderer(revision, work_size);
+    }
+}
+
+fn exercise_renderer(revision: u32, work_size: u32) {
+    let revision_tag = (u32::from_le_bytes(*b"REV0") + (revision << 24)).to_le_bytes();
     let mut instructions = vec![svc(0x1f)];
     instructions.extend(std::iter::repeat_n(svc(0x21), 5));
     instructions.push(svc(0x15));
@@ -83,11 +90,11 @@ fn audren_opens_updates_starts_and_stops() {
     ] {
         put_u32(&mut request, 32 + offset, value);
     }
-    request[80..84].copy_from_slice(b"REV7");
+    request[80..84].copy_from_slice(&revision_tag);
     for (words, revision, expected) in [
         (18, *b"REV7", HorizonIpcResult::CMIF_INVALID_IN_HEADER),
         (21, *b"bad!", HorizonIpcResult::AUDIO_INVALID_REVISION),
-        (21, *b"REV7", HorizonIpcResult::SUCCESS),
+        (21, revision_tag, HorizonIpcResult::SUCCESS),
     ] {
         put_u32(&mut request, 4, words);
         request[80..84].copy_from_slice(&revision);
@@ -104,7 +111,7 @@ fn audren_opens_updates_starts_and_stops() {
         if expected == HorizonIpcResult::SUCCESS {
             assert_eq!(
                 read_guest_u32(&process, tls.checked_add(32).unwrap()),
-                0x50000
+                work_size
             );
             assert_eq!(read_guest_u32(&process, tls.checked_add(36).unwrap()), 0);
         }
@@ -115,7 +122,7 @@ fn audren_opens_updates_starts_and_stops() {
         .memory()
         .map_zeroed(
             work_address,
-            0x50000,
+            u64::from(work_size),
             nixe_runtime::memory::Mapping {
                 kind: nixe_runtime::memory::MemoryKind::Heap,
                 permissions: MemoryPermissions::READ_WRITE,
@@ -125,9 +132,9 @@ fn audren_opens_updates_starts_and_stops() {
             },
         )
         .unwrap();
-    write_guest_bytes(&process, work_address, &[0xcc; 0x50000]);
+    write_guest_bytes(&process, work_address, &vec![0xcc; work_size as usize]);
     state(&mut process).write_x(x(1), work_address.get());
-    state(&mut process).write_x(x(2), 0x50000);
+    state(&mut process).write_x(x(2), u64::from(work_size));
     state(&mut process).write_w(x(3), 0);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
@@ -153,16 +160,16 @@ fn audren_opens_updates_starts_and_stops() {
     request[48..100].copy_from_slice(&parameters);
     put_u64(&mut request, 112, 1); // aruid.
     for (handle, size, expected) in [
-        (0xdead, 0x50000, HorizonIpcResult::AUDIO_INVALID_HANDLE),
+        (0xdead, work_size, HorizonIpcResult::AUDIO_INVALID_HANDLE),
         (
             transfer,
-            0x4f000,
+            work_size - 4096,
             HorizonIpcResult::AUDIO_INSUFFICIENT_BUFFER,
         ),
-        (transfer, 0x50000, HorizonIpcResult::SUCCESS),
+        (transfer, work_size, HorizonIpcResult::SUCCESS),
     ] {
         put_u32(&mut request, 20, handle);
-        put_u64(&mut request, 104, size);
+        put_u64(&mut request, 104, u64::from(size));
         write_guest_bytes(&process, tls, &request);
         state(&mut process).write_w(x(0), manager);
         let outcome = dispatch_next(&mut process, &mut dispatcher);
@@ -191,7 +198,7 @@ fn audren_opens_updates_starts_and_stops() {
             .as_deref(),
         Some(HorizonIpcObject::AudioRenderer(_))
     ));
-    let mut work_bytes = vec![0xff; 0x50000];
+    let mut work_bytes = vec![0xff; work_size as usize];
     let retained = process
         .handles()
         .lookup_as::<nixe_runtime::TransferMemoryObject>(transfer)
@@ -255,22 +262,32 @@ fn audren_opens_updates_starts_and_stops() {
     // Stopped RequestUpdate has one input and two outputs, including the
     // optional performance output. No voice or effect is registered yet.
     let pool_count = 96 * 4 + 14;
-    let input_size =
-        0x40 + 0x10 + pool_count * 0x20 + 96 * 0x70 + 96 * 0x170 + 14 * 0xc0 + 0x20 + 0x140 + 0x10;
-    let output_size = 0x40 + pool_count * 0x10 + 96 * 0x10 + 14 * 0x10 + 0x20 + 0x10 + 0xb0 + 0x10;
+    let voice_size = if revision >= 15 { 0x188 } else { 0x170 };
+    let effect_status_size = if revision >= 9 { 0x90 } else { 0x10 };
+    let input_size = 0x40
+        + 0x10
+        + pool_count * 0x20
+        + 96 * 0x70
+        + 96 * voice_size
+        + 14 * 0xc0
+        + 0x20
+        + 0x140
+        + 0x10;
+    let output_size =
+        0x40 + pool_count * 0x10 + 96 * 0x10 + 14 * effect_status_size + 0x20 + 0x10 + 0xb0 + 0x10;
     let mut update = vec![0; input_size];
     for (offset, value) in [
-        (0, u32::from_le_bytes(*b"REV7")),
+        (0, u32::from_le_bytes(revision_tag)),
         (4, 0x10),
         (8, pool_count as u32 * 0x20),
-        (12, 96 * 0x170),
+        (12, 96 * voice_size as u32),
         (16, 96 * 0x70),
         (20, 14 * 0xc0),
         (24, 0x20),
         (28, 0x140),
         (32, 0x10),
         (60, input_size as u32),
-        (0x40, u32::from_le_bytes(*b"REV7")),
+        (0x40, u32::from_le_bytes(revision_tag)),
     ] {
         put_u32(&mut update, offset, value);
     }
@@ -310,7 +327,7 @@ fn audren_opens_updates_starts_and_stops() {
     }
     assert_eq!(
         read_guest_u32(&process, output_address),
-        u32::from_le_bytes(*b"REV7")
+        u32::from_le_bytes(*b"REV?")
     );
     assert_eq!(
         read_guest_u32(&process, output_address.checked_add(60).unwrap()),

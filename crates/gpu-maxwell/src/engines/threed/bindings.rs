@@ -482,19 +482,16 @@ impl MaxwellThreeDShaderBindingState {
         match write {
             MaxwellThreeDShaderBindingWrite::GeometryPassthroughMask { index, value, .. } => {
                 self.geometry_passthrough_mask[index as usize] =
-                    MaxwellThreeDRegister::programmed(raw, value, source);
+                    MaxwellThreeDRegister::decoded(raw, value);
             }
             MaxwellThreeDShaderBindingWrite::ProgramRegionAddressUpper { value, .. } => {
-                self.program_region.address_upper =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.program_region.address_upper = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::ProgramRegionAddressLower { value, .. } => {
-                self.program_region.address_lower =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.program_region.address_lower = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::SpaVersion { value, .. } => {
-                self.program_region.spa_version =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.program_region.spa_version = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::PipelineShader {
                 pipeline,
@@ -503,47 +500,43 @@ impl MaxwellThreeDShaderBindingState {
                 ..
             } => {
                 self.pipeline[pipeline as usize].enabled =
-                    MaxwellThreeDRegister::programmed(raw, enabled, source);
-                self.pipeline[pipeline as usize].stage =
-                    MaxwellThreeDRegister::programmed(raw, stage, source);
+                    MaxwellThreeDRegister::decoded(raw, enabled);
+                self.pipeline[pipeline as usize].stage = MaxwellThreeDRegister::decoded(raw, stage);
             }
             MaxwellThreeDShaderBindingWrite::PipelineProgram {
                 pipeline, offset, ..
             } => {
                 self.pipeline[pipeline as usize].program_offset =
-                    MaxwellThreeDRegister::programmed(raw, offset, source)
+                    MaxwellThreeDRegister::decoded(raw, offset)
             }
             MaxwellThreeDShaderBindingWrite::PipelineRegisterCount {
                 pipeline, count, ..
             } => {
                 self.pipeline[pipeline as usize].register_count =
-                    MaxwellThreeDRegister::programmed(raw, count, source)
+                    MaxwellThreeDRegister::decoded(raw, count)
             }
             MaxwellThreeDShaderBindingWrite::PipelineGroup {
                 pipeline, group, ..
             } => {
-                self.pipeline[pipeline as usize].group =
-                    MaxwellThreeDRegister::programmed(raw, group, source)
+                self.pipeline[pipeline as usize].group = MaxwellThreeDRegister::decoded(raw, group)
             }
             MaxwellThreeDShaderBindingWrite::SelectorSize { size, .. } => {
-                self.selector.size = MaxwellThreeDRegister::programmed(raw, size, source)
+                self.selector.size = MaxwellThreeDRegister::decoded(raw, size)
             }
             MaxwellThreeDShaderBindingWrite::SelectorAddressUpper { value, .. } => {
-                self.selector.address_upper = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.selector.address_upper = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::SelectorAddressLower { value, .. } => {
-                self.selector.address_lower = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.selector.address_lower = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::ConstantBufferLoadOffset { value, .. } => {
-                self.constant_buffer_load.offset =
-                    MaxwellThreeDRegister::programmed(raw, value, source);
+                self.constant_buffer_load.offset = MaxwellThreeDRegister::decoded(raw, value);
                 self.constant_buffer_load.next_offset = Some(u32::from(value));
             }
             MaxwellThreeDShaderBindingWrite::ConstantBufferLoadData {
                 value, next_offset, ..
             } => {
-                self.constant_buffer_load.last_data =
-                    MaxwellThreeDRegister::programmed(raw, value, source);
+                self.constant_buffer_load.last_data = MaxwellThreeDRegister::decoded(raw, value);
                 self.constant_buffer_load.next_offset = Some(next_offset);
             }
             MaxwellThreeDShaderBindingWrite::BindConstantBuffer {
@@ -563,42 +556,38 @@ impl MaxwellThreeDShaderBindingState {
                     })
             }
             MaxwellThreeDShaderBindingWrite::TextureHeaderAddressUpper { value, .. } => {
-                self.texture_headers.address_upper =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.texture_headers.address_upper = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::TextureHeaderAddressLower { value, .. } => {
-                self.texture_headers.address_lower =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.texture_headers.address_lower = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::TextureHeaderMaximumIndex { value, .. } => {
-                self.texture_headers.maximum_index =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.texture_headers.maximum_index = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::SamplerAddressUpper { value, .. } => {
-                self.samplers.address_upper = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.samplers.address_upper = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::SamplerAddressLower { value, .. } => {
-                self.samplers.address_lower = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.samplers.address_lower = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::SamplerMaximumIndex { value, .. } => {
-                self.samplers.maximum_index = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.samplers.maximum_index = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::SamplerBinding { value, .. } => {
-                self.sampler_binding = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.sampler_binding = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::MaxwellTextureHeaders { value, .. } => {
-                self.maxwell_texture_headers = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.maxwell_texture_headers = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::BindlessTextureSlot { value, .. } => {
                 self.bindless_texture_constant_buffer_slot =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                    MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::TessellationLod { level, value, .. } => {
-                self.tessellation_lod[level.index()] =
-                    MaxwellThreeDRegister::programmed(raw, value, source)
+                self.tessellation_lod[level.index()] = MaxwellThreeDRegister::decoded(raw, value)
             }
             MaxwellThreeDShaderBindingWrite::TessellationMode { value, .. } => {
-                self.tessellation_mode = MaxwellThreeDRegister::programmed(raw, value, source)
+                self.tessellation_mode = MaxwellThreeDRegister::decoded(raw, value)
             }
         }
     }

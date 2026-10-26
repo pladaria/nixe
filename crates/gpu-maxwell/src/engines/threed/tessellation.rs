@@ -111,11 +111,9 @@ pub(in crate::engines) fn draw_state(
         .value()
         .copied()
         .ok_or(Error::IncompleteDraw("SET_TESSELLATION_PARAMETERS"))?;
-    let mode = value.lower().map_err(|reason| Error::TessellationMode {
-        value,
-        source: register.source(),
-        reason,
-    })?;
+    let mode = value
+        .lower()
+        .map_err(|reason| Error::TessellationMode { value, reason })?;
     if !enabled(Stage::Tessellation) {
         return Err(Error::IncompleteDraw(
             "patch draw requires tessellation evaluation shader",

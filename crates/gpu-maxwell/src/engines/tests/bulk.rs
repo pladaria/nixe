@@ -105,8 +105,8 @@ fn constant_buffer_packet_modes_preserve_bytes_and_only_update_one_cursor() {
             scalar.three_d().shader_bindings().constant_buffer_load()
         );
         assert_eq!(
-            fast.three_d_mut().raw_register(GpuMethodId(0x2390)),
-            scalar.three_d_mut().raw_register(GpuMethodId(0x2390))
+            fast.three_d_mut().raw_register_value(GpuMethodId(0x2390)),
+            scalar.three_d_mut().raw_register_value(GpuMethodId(0x2390))
         );
     }
 }

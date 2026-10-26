@@ -1389,6 +1389,17 @@ impl Machine {
         }
         Ok(true)
     }
+    /// Inspect the page cache state when selecting a CPU or native device path.
+    /// This is metadata, not a RAM access grant: the chosen operation still
+    /// performs its normal ordered access and retains these allocations.
+    pub fn device_modified(&self, ranges: &[AllocationRange]) -> Result<bool, MemoryError> {
+        self.validate_ranges(ranges)?;
+        Ok(ranges
+            .iter()
+            .flat_map(AllocationRange::physical_extents)
+            .any(|extent| self.tracking().device.any(extent)))
+    }
+
     /// Return a contiguous RAM source for consumption on the graphics owner.
     /// The retained range must outlive every raw load through this pointer.
     /// Subsequent owner effects can change coherence, just as for a native

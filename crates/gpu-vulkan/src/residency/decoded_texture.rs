@@ -167,13 +167,10 @@ impl VulkanResidency {
         for footprint in &geometry {
             parts.extend(self.authority.resolve_footprint(footprint)?);
         }
-        let device = geometry
-            .iter()
-            .map(|f| {
-                self.authority
-                    .observe_native(Resource::Image(id), Arc::clone(f))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let device = vec![
+            self.authority
+                .observe_native_resource(Resource::Image(id))?,
+        ];
         let captured = if parts.iter().all(|p| p.producer.is_none()) {
             let mut inputs = Vec::new();
             for footprint in &geometry {
@@ -343,7 +340,7 @@ impl VulkanResidency {
             .image_offset(vk::Offset3D {
                 x: rect.offset.x,
                 y: rect.offset.y,
-                z: 0,
+                z: p.depth_slice as i32,
             })
             .image_extent(vk::Extent3D {
                 width: rect.extent.width,
@@ -353,7 +350,6 @@ impl VulkanResidency {
         self.barriers.emit(&mut self.device);
         unsafe {
             self.device.dispatch.cmd_copy_buffer_to_image(
-                self.device.submission.slots[slot].command,
                 self.device.submission.slots[slot]
                     .upload_buffer(slice)
                     .handle,

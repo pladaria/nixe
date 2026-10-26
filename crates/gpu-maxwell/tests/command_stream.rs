@@ -193,6 +193,48 @@ fn inline_upload_header_and_payload_can_cross_multiple_entries() {
 }
 
 #[test]
+fn embedded_inline_zero_and_partial_lengths_preserve_neighboring_bytes() {
+    for (length, payload, expected) in [
+        (3, vec![0x4433_2211], vec![0x11, 0x22, 0x33, 0, 0, 0, 0, 0]),
+        (
+            5,
+            vec![0x4433_2211, 0x8877_6655],
+            vec![0x11, 0x22, 0x33, 0x44, 0x55, 0, 0, 0],
+        ),
+    ] {
+        let mut fixture = Fixture::new(|base| {
+            let mut words = Vec::new();
+            packet(
+                &mut words,
+                0,
+                &[SWITCH_1_GM20B_PROFILE.classes().three_d().0],
+            );
+            packet(
+                &mut words,
+                0x0180,
+                &[0, 1, (base >> 32) as u32, base as u32],
+            );
+            packet(&mut words, 0x01b0, &[0x1011]);
+            packet(&mut words, 0x0180, &[4, 0]);
+            packet(&mut words, 0x01b0, &[0x1011]);
+            packet(&mut words, 0x0180, &[length, 1]);
+            packet(&mut words, 0x01b0, &[0x1011]);
+            if payload.len() == 1 {
+                packet(&mut words, 0x01b4, &payload);
+            } else {
+                words.push(header(3, 0x01b4, payload.len() as u32));
+                words.extend_from_slice(&payload);
+            }
+            vec![words]
+        });
+        fixture
+            .run(&mut |_| panic!("inline upload must stay a direct memory effect"))
+            .unwrap();
+        assert_eq!(fixture.read(0, 8), expected);
+    }
+}
+
+#[test]
 fn malformed_tail_reports_source_after_consuming_the_valid_prefix() {
     let mut fixture = Fixture::new(|_| vec![vec![header(3, 0x78, 3), 0, 0]]);
     let mut waits = 0;
@@ -601,4 +643,102 @@ fn inline_uploads_to_observed_resources_do_not_materialize_a_payload() {
         counts[0], counts[1],
         "payload size must not add an allocation"
     );
+}
+
+#[test]
+fn dma_tiling_and_untile_preserve_padding_and_complete_in_canonical_memory() {
+    for (block, native) in [0, 2, 4]
+        .into_iter()
+        .flat_map(|block| [(block, false), (block, true)])
+    {
+        let mut fixture = Fixture::new(|base| {
+            let mut words = Vec::new();
+            let addresses = [base + 0x4000, base + 0x8000, base + 0xc000];
+            for (method, value) in [
+                (0, SWITCH_1_GM20B_PROFILE.classes().dma_copy().0),
+                (0x400, (addresses[0] >> 32) as u32),
+                (0x404, addresses[0] as u32),
+                (0x408, (addresses[1] >> 32) as u32),
+                (0x40c, addresses[1] as u32),
+                (0x410, 96),
+                (0x418, 67),
+                (0x41c, 19),
+                (0x70c, 0x1000 | block << 4),
+                (0x710, 128),
+                (0x714, 32),
+                (0x718, 1),
+                (0x720, 5 | 3 << 16),
+                (0x300, 1 | 1 << 7 | 1 << 9),
+                (0x400, (addresses[1] >> 32) as u32),
+                (0x404, addresses[1] as u32),
+                (0x408, (addresses[2] >> 32) as u32),
+                (0x40c, addresses[2] as u32),
+                (0x414, 96),
+                (0x728, 0x1000 | block << 4),
+                (0x72c, 128),
+                (0x730, 32),
+                (0x734, 1),
+                (0x73c, 5 | 3 << 16),
+                (0x300, 1 | 1 << 8 | 1 << 9),
+            ] {
+                let at = words.len();
+                packet(&mut words, method, &[value]);
+                words[at] |= 4 << 13;
+            }
+            vec![words]
+        });
+        let source: Vec<u8> = (0..96 * 19).map(|i| (i * 13 + i / 96) as u8).collect();
+        fixture
+            .memory
+            .write_resolved(
+                &[nixe_memory::AllocationRange::new(
+                    fixture.allocation.pin(),
+                    0x4000,
+                    source.len() as u64,
+                )
+                .unwrap()],
+                &source,
+            )
+            .unwrap();
+        fixture
+            .memory
+            .write_resolved(
+                &[
+                    nixe_memory::AllocationRange::new(fixture.allocation.pin(), 0x8000, 0x8000)
+                        .unwrap(),
+                ],
+                &vec![0xa5; 0x8000],
+            )
+            .unwrap();
+        let tiled =
+            nixe_memory::AllocationRange::new(fixture.allocation.pin(), 0x8000, 0x4000).unwrap();
+        if native {
+            fixture
+                .memory
+                .publish_device_write(std::slice::from_ref(&tiled), || Ok(()))
+                .unwrap();
+        }
+        let mut native_copies = 0;
+        fixture
+            .run(&mut |work| {
+                assert!(
+                    native,
+                    "RAM layout conversion must not expand into native buffer copies"
+                );
+                assert!(matches!(work.command, NativeCommand::CopyBuffer { .. }));
+                native_copies += 1;
+            })
+            .unwrap();
+        if native {
+            assert_eq!(native_copies, 2);
+            fixture.memory.retire_device_pages(&[tiled]).unwrap();
+            continue;
+        }
+        let actual = fixture.read(0xc000, source.len());
+        let mut expected = vec![0xa5; source.len()];
+        for y in 0..19 {
+            expected[y * 96..y * 96 + 67].copy_from_slice(&source[y * 96..y * 96 + 67]);
+        }
+        assert_eq!(actual, expected, "block-height={block}");
+    }
 }

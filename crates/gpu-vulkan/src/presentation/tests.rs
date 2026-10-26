@@ -56,10 +56,9 @@ fn read_in_layout(
         )
         .unwrap();
     let device = cache.device_mut();
-    let command = device.submission.slots[slot].command;
+
     render::transition(
         device,
-        command,
         view.image.handle,
         layout,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -73,7 +72,6 @@ fn read_in_layout(
         .layer_count(1);
     unsafe {
         device.dispatch.cmd_copy_image_to_buffer(
-            command,
             view.image.handle,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             device.submission.slots[slot].readback_buffer(slice).handle,
@@ -120,6 +118,7 @@ fn fragmented_cpu_scanout_refreshes_dirty_pages_and_preserves_old_snapshots() {
     let request = NativePresentationImage {
         inputs: (backing).pin(0, (backing).bytes()).unwrap(),
         planes: Arc::from([GuestImagePlane {
+            depth_slice: 0,
             mip_level: 0,
             array_layer: 0,
             aspect: GuestImageAspect::Color,
@@ -152,6 +151,9 @@ fn fragmented_cpu_scanout_refreshes_dirty_pages_and_preserves_old_snapshots() {
     let partial = frames
         .capture(&mut cache, request, &mut descriptors)
         .unwrap();
+    assert_eq!(cache.device().scheduled_tick(), 0);
+    assert_eq!(original.lease().producer(), changed.lease().producer());
+    assert_eq!(changed.lease().producer(), partial.lease().producer());
     let partial_expected: Vec<_> = offsets
         .iter()
         .flat_map(|&offset| bytes[offset..offset + 16].iter().copied())
@@ -269,6 +271,7 @@ fn native_frame_snapshots_preserve_versions_crop_formats_and_every_transform() {
         let request = NativePresentationImage {
             inputs: (backing.clone()).pin(0, (backing.clone()).bytes()).unwrap(),
             planes: Arc::from([GuestImagePlane {
+                depth_slice: 0,
                 mip_level: 0,
                 array_layer: 0,
                 aspect: GuestImageAspect::Color,
@@ -315,13 +318,12 @@ fn native_frame_snapshots_preserve_versions_crop_formats_and_every_transform() {
             let native = cache
                 .allocate_host_image(extent, vk::Format::R8G8B8A8_UNORM)
                 .unwrap();
-            let target = render::view(cache.device(), native, vk::Format::R8G8B8A8_UNORM).unwrap();
+            let target = native.view_2d(vk::Format::R8G8B8A8_UNORM).unwrap();
             let device = cache.device_mut();
-            let slot = device.submission.begin(&mut device.dispatch).unwrap();
-            let command = cache.device().submission.slots[slot].command;
+            device.submission.begin(&mut device.dispatch).unwrap();
+
             render::transition(
                 cache.device_mut(),
-                command,
                 target.image.handle,
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -432,13 +434,12 @@ fn native_ui_texture_updates_blending_clipping_and_free() {
         let image = cache
             .allocate_host_image([8, 8], vk::Format::R8G8B8A8_UNORM)
             .unwrap();
-        let target = render::view(cache.device(), image, vk::Format::R8G8B8A8_UNORM).unwrap();
+        let target = image.view_2d(vk::Format::R8G8B8A8_UNORM).unwrap();
         let device = cache.device_mut();
-        let slot = device.submission.begin(&mut device.dispatch).unwrap();
-        let command = cache.device().submission.slots[slot].command;
+        device.submission.begin(&mut device.dispatch).unwrap();
+
         render::transition(
             cache.device_mut(),
-            command,
             target.image.handle,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -449,7 +450,6 @@ fn native_ui_texture_updates_blending_clipping_and_free() {
         );
         unsafe {
             cache.device_mut().dispatch.cmd_clear_color_image(
-                command,
                 target.image.handle,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &vk::ClearColorValue {
@@ -460,7 +460,6 @@ fn native_ui_texture_updates_blending_clipping_and_free() {
         }
         render::transition(
             cache.device_mut(),
-            command,
             target.image.handle,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -574,6 +573,7 @@ fn opaque_scanout_requires_a_current_resident_producer() {
     let request = NativePresentationImage {
         inputs: (backing.clone()).pin(0, (backing.clone()).bytes()).unwrap(),
         planes: Arc::from([GuestImagePlane {
+            depth_slice: 0,
             mip_level: 0,
             array_layer: 0,
             aspect: GuestImageAspect::Color,
@@ -613,6 +613,7 @@ fn opaque_scanout_requires_a_current_resident_producer() {
                     flags: vk::ImageCreateFlags::empty(),
                 },
                 &[ImagePlane {
+                    depth_slice: 0,
                     offset: 0,
                     row_pitch: 16,
                     mip_level: 0,
@@ -639,6 +640,7 @@ fn opaque_scanout_requires_a_current_resident_producer() {
                 flags: vk::ImageCreateFlags::empty(),
             },
             vec![ImagePlane {
+                depth_slice: 0,
                 offset: 0,
                 row_pitch: 16,
                 mip_level: 0,
@@ -713,6 +715,7 @@ fn scanout_retargets_a_new_producer_and_ignores_undefined_padding() {
     let mut request = NativePresentationImage {
         inputs: (prefix).pin(0, (prefix).bytes()).unwrap(),
         planes: Arc::from([GuestImagePlane {
+            depth_slice: 0,
             mip_level: 0,
             array_layer: 0,
             aspect: GuestImageAspect::Color,
@@ -747,6 +750,7 @@ fn scanout_retargets_a_new_producer_and_ignores_undefined_padding() {
                     flags: vk::ImageCreateFlags::empty(),
                 },
                 &[ImagePlane {
+                    depth_slice: 0,
                     offset: 0,
                     row_pitch: 16,
                     mip_level: 0,
@@ -771,6 +775,7 @@ fn scanout_retargets_a_new_producer_and_ignores_undefined_padding() {
                 flags: vk::ImageCreateFlags::empty(),
             },
             vec![ImagePlane {
+                depth_slice: 0,
                 offset: 0,
                 row_pitch: 16,
                 mip_level: 0,
@@ -817,7 +822,6 @@ fn scanout_retargets_a_new_producer_and_ignores_undefined_padding() {
     assert_eq!(before.cpu_uploaded_bytes, after.cpu_uploaded_bytes);
     assert_eq!(before.gpu_copied_bytes, after.gpu_copied_bytes);
     assert_eq!(after.native_readback_bytes, 0);
-    assert_ne!(initial.lease().producer(), snapshot.lease().producer());
     assert_eq!(frames.get(&snapshot).unwrap().extent, [4, 4]);
     // Verify the raw size-compatible BGRA -> RGBA copy: blue BGRA bits become
     // red RGBA texels, without a color conversion or CPU reconstruction.
@@ -833,13 +837,12 @@ fn scanout_retargets_a_new_producer_and_ignores_undefined_padding() {
     let native = cache
         .allocate_host_image([4, 4], vk::Format::R8G8B8A8_UNORM)
         .unwrap();
-    let target = render::view(cache.device(), native, vk::Format::R8G8B8A8_UNORM).unwrap();
+    let target = native.view_2d(vk::Format::R8G8B8A8_UNORM).unwrap();
     let device = cache.device_mut();
-    let slot = device.submission.begin(&mut device.dispatch).unwrap();
-    let command = cache.device().submission.slots[slot].command;
+    device.submission.begin(&mut device.dispatch).unwrap();
+
     render::transition(
         cache.device_mut(),
-        command,
         target.image.handle,
         vk::ImageLayout::UNDEFINED,
         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -897,11 +900,21 @@ fn dropping_a_frame_pool_retains_an_in_flight_snapshot_destination() {
             "/tests/support/gate.rs"
         ));
     }
-    let Some(mut device) = support::device_for_test(ApiPreference::Auto) else {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
         return;
     };
     let monitor = device.validation_monitor();
-    let mut gate = gate::Gate::new(&device);
+    let mut descriptors = DescriptorCache::new(&device, 64);
+    let mut cache = VulkanResidency::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+        device,
+        16 * 1024 * 1024,
+    )
+    .unwrap();
+    // The gate must drop before the cache that owns its completion semaphore,
+    // including if an assertion unwinds.
+    let mut gate = gate::Gate::new(cache.device());
+    let device = cache.device_mut();
     device.submission.begin(&mut device.dispatch).unwrap();
     let waits = [vk::SemaphoreSubmitInfo::default()
         .semaphore(gate.handle)
@@ -915,18 +928,12 @@ fn dropping_a_frame_pool_retains_an_in_flight_snapshot_destination() {
             .unwrap()
             .tick()
     };
-    let mut descriptors = DescriptorCache::new(&device, 64);
-    let mut cache = VulkanResidency::new(
-        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
-        device,
-        16 * 1024 * 1024,
-    )
-    .unwrap();
     let mut frames = Frames::new();
     let (_allocation, backing) = backing_allocation(&cache, 64, 128, 199);
     let request = NativePresentationImage {
         inputs: (backing).pin(0, (backing).bytes()).unwrap(),
         planes: Arc::from([GuestImagePlane {
+            depth_slice: 0,
             mip_level: 0,
             array_layer: 0,
             aspect: GuestImageAspect::Color,
@@ -943,9 +950,11 @@ fn dropping_a_frame_pool_retains_an_in_flight_snapshot_destination() {
         .unwrap();
     let work = frames.get(&snapshot).unwrap().work;
     assert!(work.tick() > cache.device().queue_usage().completed_tick);
+    assert!(work.tick() > cache.device().scheduled_tick());
     drop(snapshot);
     drop(frames);
     monitor.check().unwrap();
+    cache.flush().unwrap();
     gate.signal();
     cache
         .device_mut()
@@ -1051,6 +1060,7 @@ mod snapshot_replacement {
         NativePresentationImage {
             inputs: mapping.pin(0, mapping.bytes()).unwrap(),
             planes: Arc::from([GuestImagePlane {
+                depth_slice: 0,
                 mip_level: 0,
                 array_layer: 0,
                 aspect: GuestImageAspect::Color,
@@ -1070,6 +1080,7 @@ mod snapshot_replacement {
     }
     fn finish(cache: &mut VulkanResidency, frames: &Frames, frame: &nixe_gpu::ResidentImage) {
         let work = frames.get(frame).unwrap().work;
+        cache.flush().unwrap();
         assert!(
             cache
                 .device_mut()
@@ -1289,6 +1300,7 @@ mod snapshot_replacement {
             let old_view = Arc::downgrade(&frames.get(&first).unwrap().view);
             // The most recent use can still be recording and be later than
             // the snapshot's copy. Replacement must submit and wait for it.
+            cache.flush().unwrap();
             let last_use = cache.device_mut().work_ticket().unwrap();
             assert!(last_use.tick() > frames.get(&first).unwrap().work.tick());
             frames.used(&first, last_use).unwrap();

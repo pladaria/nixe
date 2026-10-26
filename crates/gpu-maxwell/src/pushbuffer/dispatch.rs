@@ -176,7 +176,7 @@ pub struct MaxwellMethodDispatch {
 }
 
 impl MaxwellMethodDispatch {
-    pub(crate) const fn emitted_by_mme(source: MaxwellMethodSource, class: GpuClassId) -> Self {
+    pub(crate) const fn class_method(source: MaxwellMethodSource, class: GpuClassId) -> Self {
         Self {
             source,
             class,
@@ -333,30 +333,19 @@ impl Display for MaxwellMethodDispatchError {
 
 impl std::error::Error for MaxwellMethodDispatchError {}
 
-/// Resolve an already decoded class-only packet once for bulk consumers.
-/// Binding-changing and host methods retain the ordered scalar dispatcher.
-pub(crate) fn class_packet_methods(
-    channel: &MaxwellGpuChannel,
-    submission: FrontendSubmissionId,
-    packet: PacketView<'_>,
-) -> Result<Option<(GpuClassId, MaxwellPushbufferSubchannel)>, MaxwellMethodDispatchError> {
-    Ok(packet_methods(channel, submission, packet)?
-        .and_then(|(subchannel, _, class)| class.map(|class| (class, subchannel))))
-}
+type RoutedMethods<'a> = (
+    MaxwellPushbufferSubchannel,
+    crate::MaxwellMethodSpan<'a>,
+    MaxwellDecodedMethod,
+    Option<GpuClassId>,
+);
 
 /// Validate packet routing once; register dispatch itself cannot suspend.
 pub(crate) fn packet_methods<'a>(
     channel: &MaxwellGpuChannel,
     submission: FrontendSubmissionId,
     packet: PacketView<'a>,
-) -> Result<
-    Option<(
-        MaxwellPushbufferSubchannel,
-        crate::MaxwellMethodSpan<'a>,
-        Option<GpuClassId>,
-    )>,
-    MaxwellMethodDispatchError,
-> {
+) -> Result<Option<RoutedMethods<'a>>, MaxwellMethodDispatchError> {
     match packet {
         PacketView::Methods {
             header,
@@ -370,9 +359,8 @@ pub(crate) fn packet_methods<'a>(
             }
             let subchannel = subchannel
                 .ok_or(MaxwellMethodDispatchError::MissingPacketSubchannel { source: header })?;
-            let class = if let Some(first) = methods.first()
-                && first.method().0 >= HOST_METHOD_LIMIT
-            {
+            let first = methods.first().unwrap();
+            let class = if first.method().0 >= HOST_METHOD_LIMIT {
                 validate_source_identity(channel.id(), submission, first.argument_source())?;
                 Some(channel.frontend().subchannel_binding(subchannel).ok_or(
                     MaxwellMethodDispatchError::UnboundSubchannel {
@@ -382,7 +370,7 @@ pub(crate) fn packet_methods<'a>(
             } else {
                 None
             };
-            Ok(Some((subchannel, methods, class)))
+            Ok(Some((subchannel, methods, first, class)))
         }
         PacketView::Control { operation, source } => {
             validate_source_identity(channel.id(), submission, source)?;
@@ -671,7 +659,8 @@ mod tests {
         packet: &MaxwellDecodedPacket,
     ) -> Result<MaxwellPacketDispatch, MaxwellMethodDispatchError> {
         let mut methods = Vec::new();
-        if let Some((subchannel, span, _)) = packet_methods(channel, submission, packet.view())? {
+        if let Some((subchannel, span, _, _)) = packet_methods(channel, submission, packet.view())?
+        {
             let profile = channel.profile();
             for method in span {
                 methods.push(dispatch_method(

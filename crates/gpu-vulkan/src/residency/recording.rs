@@ -101,7 +101,6 @@ impl VulkanResidency {
             self.barriers.emit(&mut self.device);
             unsafe {
                 self.device.dispatch.cmd_copy_buffer(
-                    self.device.submission.slots[slot].command,
                     source,
                     self.buffer(id)?.native.handle,
                     &regions,
@@ -204,12 +203,9 @@ impl VulkanResidency {
                 .size(bytes.len() as u64)];
             self.barriers.emit(&mut self.device);
             unsafe {
-                self.device.dispatch.cmd_copy_buffer(
-                    self.device.submission.slots[index].command,
-                    upload,
-                    target,
-                    &regions,
-                );
+                self.device
+                    .dispatch
+                    .cmd_copy_buffer(upload, target, &regions);
             }
             self.buffer_mut(id)
                 .validate_interval(offset + (part * limit) as u64, bytes.len() as u64);
@@ -248,15 +244,14 @@ impl VulkanResidency {
                     vk::AccessFlags2::TRANSFER_WRITE,
                 ),
             )?;
-            let index = self.device.begin_recording()?;
-            let command = self.device.submission.slots[index].command;
+            self.device.begin_recording()?;
+
             let work = self.device.work_ticket()?;
             self.contents_mut(Resource::Buffer(source)).last_use = Some(work);
             self.contents_mut(Resource::Buffer(destination)).last_use = Some(work);
             self.barriers.emit(&mut self.device);
             unsafe {
                 self.device.dispatch.cmd_copy_buffer(
-                    command,
                     src,
                     dst,
                     &[vk::BufferCopy::default()
@@ -287,16 +282,12 @@ impl VulkanResidency {
                     .iter()
                     .map(|piece| piece.region(destination_offset + piece.logical - offset))
                     .collect();
-                let index = self.device.begin_recording()?;
+                self.device.begin_recording()?;
                 self.barriers.emit(&mut self.device);
                 unsafe {
-                    self.device.dispatch.cmd_copy_image_to_buffer(
-                        self.device.submission.slots[index].command,
-                        src,
-                        layout,
-                        dst,
-                        &regions,
-                    );
+                    self.device
+                        .dispatch
+                        .cmd_copy_image_to_buffer(src, layout, dst, &regions);
                 }
             } else {
                 let (scratch, slices) =
@@ -311,15 +302,10 @@ impl VulkanResidency {
                             .size(piece.length)
                     })
                     .collect();
-                let index = self.device.begin_recording()?;
+                self.device.begin_recording()?;
                 self.barriers.emit(&mut self.device);
                 unsafe {
-                    self.device.dispatch.cmd_copy_buffer(
-                        self.device.submission.slots[index].command,
-                        scratch,
-                        dst,
-                        &regions,
-                    );
+                    self.device.dispatch.cmd_copy_buffer(scratch, dst, &regions);
                 }
             }
             self.statistics.gpu_copied_bytes += size;
@@ -394,18 +380,14 @@ impl VulkanResidency {
                 .zip(&offsets)
                 .map(|(p, &to)| p.region(to))
                 .collect();
-            let slot = self.device.begin_recording()?;
+            self.device.begin_recording()?;
             let work = self.device.work_ticket()?;
             self.device.retire_buffer(Arc::clone(destination), work)?;
             self.barriers.emit(&mut self.device);
             unsafe {
-                self.device.dispatch.cmd_copy_image_to_buffer(
-                    self.device.submission.slots[slot].command,
-                    src,
-                    layout,
-                    dst,
-                    &regions,
-                );
+                self.device
+                    .dispatch
+                    .cmd_copy_image_to_buffer(src, layout, dst, &regions);
             }
         } else {
             let (scratch, slices) = self.image_pieces_buffer(source, &pieces, &[])?;
@@ -420,17 +402,12 @@ impl VulkanResidency {
                         .size(p.length)
                 })
                 .collect();
-            let slot = self.device.begin_recording()?;
+            self.device.begin_recording()?;
             let work = self.device.work_ticket()?;
             self.device.retire_buffer(Arc::clone(destination), work)?;
             self.barriers.emit(&mut self.device);
             unsafe {
-                self.device.dispatch.cmd_copy_buffer(
-                    self.device.submission.slots[slot].command,
-                    scratch,
-                    dst,
-                    &regions,
-                );
+                self.device.dispatch.cmd_copy_buffer(scratch, dst, &regions);
             }
         }
         self.statistics.gpu_copied_bytes += copies.iter().map(|&(_, _, size)| size).sum::<u64>();
@@ -524,7 +501,7 @@ impl VulkanResidency {
                 next += 1;
             }
             let (index, slice, ticket) = self.reserve_readback(bytes, 4)?;
-            let command = self.device.submission.slots[index].command;
+
             let target = self.device.submission.slots[index]
                 .readback_buffer(slice)
                 .handle;
@@ -543,7 +520,6 @@ impl VulkanResidency {
                 self.barriers.emit(&mut self.device);
                 unsafe {
                     self.device.dispatch.cmd_copy_buffer(
-                        command,
                         source,
                         target,
                         &[vk::BufferCopy::default()
@@ -559,7 +535,7 @@ impl VulkanResidency {
                 });
                 packed += length;
             }
-            host_read_barrier(&mut self.device, command, target, slice.offset, bytes);
+            host_read_barrier(&mut self.device, target, slice.offset, bytes);
             self.enqueue_cpu_transfer(
                 request,
                 Transfer {
@@ -657,7 +633,7 @@ impl VulkanResidency {
                 }
             }
             let (index, slice, ticket) = self.reserve_readback(bytes, alignment)?;
-            let command = self.device.submission.slots[index].command;
+
             let buffer = self.device.submission.slots[index]
                 .readback_buffer(slice)
                 .handle;
@@ -686,7 +662,6 @@ impl VulkanResidency {
                         });
                     unsafe {
                         self.device.dispatch.cmd_copy_image_to_buffer(
-                            command,
                             image,
                             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                             buffer,
@@ -707,10 +682,10 @@ impl VulkanResidency {
                 unsafe {
                     self.device
                         .dispatch
-                        .cmd_copy_image_to_buffer(command, image, layout, buffer, &regions);
+                        .cmd_copy_image_to_buffer(image, layout, buffer, &regions);
                 }
             }
-            host_read_barrier(&mut self.device, command, buffer, slice.offset, bytes);
+            host_read_barrier(&mut self.device, buffer, slice.offset, bytes);
             let mut copies = Vec::new();
             let mut windows = Vec::new();
             for (offset, (key, piece, scatter)) in batch {
@@ -750,14 +725,13 @@ impl VulkanResidency {
                 vk::AccessFlags2::TRANSFER_READ,
             ),
         )?;
-        let command = self.device.submission.slots[index].command;
+
         let target = self.device.submission.slots[index]
             .readback_buffer(slice)
             .handle;
         self.barriers.emit(&mut self.device);
         unsafe {
             self.device.dispatch.cmd_copy_buffer(
-                command,
                 source,
                 target,
                 &[vk::BufferCopy::default()
@@ -778,22 +752,16 @@ impl VulkanResidency {
             .size(size)];
         self.barriers.emit(&mut self.device);
         unsafe {
-            self.device.dispatch.barrier(
-                command,
-                &vk::DependencyInfo::default().buffer_memory_barriers(&barriers),
-            );
+            self.device
+                .dispatch
+                .barrier(&vk::DependencyInfo::default().buffer_memory_barriers(&barriers));
         }
         Ok(ticket)
     }
 }
 
 pub(super) use crate::transfer::host_read_barrier;
-pub(super) fn scratch_read_barrier(
-    device: &mut VulkanDevice,
-    command: vk::CommandBuffer,
-    buffer: vk::Buffer,
-    size: u64,
-) {
+pub(super) fn scratch_read_barrier(device: &mut VulkanDevice, buffer: vk::Buffer, size: u64) {
     let barriers = [vk::BufferMemoryBarrier2::default()
         .buffer(buffer)
         .size(size)
@@ -804,10 +772,9 @@ pub(super) fn scratch_read_barrier(
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)];
     unsafe {
-        device.dispatch.barrier(
-            command,
-            &vk::DependencyInfo::default().buffer_memory_barriers(&barriers),
-        );
+        device
+            .dispatch
+            .barrier(&vk::DependencyInfo::default().buffer_memory_barriers(&barriers));
     }
 }
 
@@ -921,19 +888,16 @@ impl VulkanResidency {
                     );
                     offset += bytes;
                 }
-                let slot = self.device.begin_recording()?;
+                self.device.begin_recording()?;
                 self.barriers.emit(&mut self.device);
-                let command = self.device.submission.slots[slot].command;
+
                 let work = self.device.work_ticket()?;
                 self.device.retire_buffer(Arc::clone(scratch), work)?;
                 unsafe {
-                    self.device.dispatch.cmd_copy_buffer(
-                        command,
-                        source_handle,
-                        scratch.handle,
-                        &packed,
-                    );
-                    scratch_read_barrier(&mut self.device, command, scratch.handle, scratch_bytes);
+                    self.device
+                        .dispatch
+                        .cmd_copy_buffer(source_handle, scratch.handle, &packed);
+                    scratch_read_barrier(&mut self.device, scratch.handle, scratch_bytes);
                 }
                 self.statistics.gpu_copied_bytes += scratch_bytes;
             }
@@ -969,10 +933,10 @@ impl VulkanResidency {
                         .size(region.bytes)
                 })
                 .collect();
-            let slot = self.device.begin_recording()?;
+            self.device.begin_recording()?;
             self.barriers.emit(&mut self.device);
             let target = self.buffer(destination.buffer)?.native.handle;
-            let command = self.device.submission.slots[slot].command;
+
             if let Some(scratch) = &scratch {
                 let work = self.device.work_ticket()?;
                 self.device.retire_buffer(Arc::clone(scratch), work)?;
@@ -987,7 +951,7 @@ impl VulkanResidency {
             self.publish_effect(&writers, |device| unsafe {
                 device
                     .dispatch
-                    .cmd_copy_buffer(command, source_handle, target, &copies);
+                    .cmd_copy_buffer(source_handle, target, &copies);
             })?;
             for (offset, bytes) in written {
                 self.finish_buffer_write(destination.buffer, offset, bytes)?;

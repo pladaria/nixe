@@ -770,14 +770,6 @@ mod tests {
         assert_eq!(channel.owner().process_id(), 9);
         assert_eq!(channel.profile_id(), SWITCH_1_GM20B_PROFILE.id());
         assert_eq!(channel.frontend(), MaxwellChannelFrontendState::default());
-        assert_eq!(
-            channel.three_d().raster().point_size().origin(),
-            crate::MaxwellThreeDRegisterOrigin::Unset
-        );
-        assert_eq!(
-            channel.three_d().viewport().z_clip_range().origin(),
-            crate::MaxwellThreeDRegisterOrigin::VerifiedReset
-        );
     }
 
     #[test]

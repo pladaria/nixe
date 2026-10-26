@@ -11,6 +11,7 @@ fn native_depth_reuse_does_not_expand_or_initialize_unwritten_stencil() {
     let validation = cache.device.validation_monitor();
     let (_allocation, mapping) = backing_allocation(&cache, 4096, 4096, 0x73);
     let domain = ImageFootprint {
+        depth_slice: 0,
         base: 0,
         columns: 8,
         rows: 8,
@@ -19,6 +20,7 @@ fn native_depth_reuse_does_not_expand_or_initialize_unwritten_stencil() {
         aspect_bytes: 3,
         storage: ImageStorage::BlockLinear {
             block_height_log2: 0,
+            block_depth_log2: 0,
         },
         native_base: 0,
         native_element_bytes: 4,
@@ -51,6 +53,7 @@ fn native_depth_reuse_does_not_expand_or_initialize_unwritten_stencil() {
         depth: 1,
     };
     let depth = ImagePlane {
+        depth_slice: 0,
         offset: 0,
         row_pitch: 32,
         mip_level: 0,
@@ -118,6 +121,7 @@ fn alternating_partial_aliases_copy_only_newest_texels_and_bound_replay_plans() 
         depth: 1,
     };
     let plane = ImagePlane {
+        depth_slice: 0,
         offset: 0,
         row_pitch: 256,
         mip_level: 0,
@@ -224,6 +228,7 @@ fn image_eviction_preserves_authority_and_recycles_generation_after_views_retire
         depth: 1,
     };
     let plane = ImagePlane {
+        depth_slice: 0,
         offset: 0,
         row_pitch: 16,
         mip_level: 0,
@@ -324,6 +329,7 @@ fn rgba64_layout() -> (NativeImageDescription, ImagePlane) {
             flags: vk::ImageCreateFlags::empty(),
         },
         ImagePlane {
+            depth_slice: 0,
             offset: 0,
             row_pitch: 256,
             mip_level: 0,
@@ -441,6 +447,7 @@ fn tiled_alias_batches_a_partial_rectangle() {
     };
     domain.storage = ImageStorage::BlockLinear {
         block_height_log2: 0,
+        block_depth_log2: 0,
     };
     let geometry = vec![Footprint::new(mapping, WriteDomain::Image(domain)).unwrap()];
     let a = cache
@@ -639,6 +646,7 @@ mod visibility {
             let geometry = Footprint::new(
                 Arc::clone(&mapping),
                 WriteDomain::Image(ImageFootprint {
+                    depth_slice: 0,
                     base,
                     columns: width,
                     rows: height,
@@ -669,6 +677,7 @@ mod visibility {
                 flags: vk::ImageCreateFlags::empty(),
             };
             let plane = ImagePlane {
+                depth_slice: 0,
                 offset: 0,
                 row_pitch: u64::from(width) * 4,
                 mip_level: 0,
@@ -777,6 +786,7 @@ mod visibility {
                 Footprint::new(
                     Arc::clone(&mapping),
                     WriteDomain::Image(ImageFootprint {
+                        depth_slice: 0,
                         base: 0,
                         columns: 8,
                         rows: 8,
@@ -798,6 +808,7 @@ mod visibility {
                 .unwrap(),
             );
             planes.push(ImagePlane {
+                depth_slice: 0,
                 offset: native_base,
                 row_pitch: 8 * u64::from(native_bytes),
                 mip_level: 0,

@@ -273,53 +273,56 @@ impl VulkanResidency {
         let address = self.buffer(id)?.address;
         self.barriers.emit(&mut self.device);
         let slot = &mut self.device.submission.slots[index];
-        let command = slot.command;
-        self.device.dispatch.finish()?;
-        unsafe {
-            {
-                owner
-                    .device
-                    .cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
-                slot.bound_compute = 0;
-                slot.bound_set = vk::DescriptorSet::null();
-                slot.bound_descriptor_buffer = 0;
-                slot.bound_descriptor_offset = u64::MAX;
-            }
+
+        slot.bound_compute = 0;
+        slot.bound_set = vk::DescriptorSet::null();
+        slot.bound_descriptor_buffer = 0;
+        slot.bound_descriptor_offset = u64::MAX;
+        if let Some(binding) = data {
             match binding {
-                BufferBinding::DeviceAddress => {
-                    let address = address + offset;
-                    let mut push = [0; 16];
-                    push[..8].copy_from_slice(&address.to_ne_bytes());
-                    push[12..].copy_from_slice(&count.to_ne_bytes());
-                    owner.device.cmd_push_constants(
-                        command,
-                        layout,
-                        vk::ShaderStageFlags::COMPUTE,
-                        0,
-                        &push,
-                    );
+                BindingData::Set(set) => slot.bound_set = set,
+                BindingData::Buffer(address, offset) => {
+                    slot.bound_descriptor_buffer = address;
+                    slot.bound_descriptor_offset = offset;
                 }
-                _ => {
-                    match data.expect("descriptor binding") {
-                        BindingData::Set(set) => {
-                            if slot.bound_set != set {
-                                owner.device.cmd_bind_descriptor_sets(
-                                    command,
-                                    vk::PipelineBindPoint::COMPUTE,
-                                    layout,
-                                    0,
-                                    &[set],
-                                    &[],
-                                );
-                                slot.bound_set = set;
-                            }
-                        }
-                        BindingData::Buffer(address, offset) => {
-                            let extension = self
-                                .descriptor_dispatch
-                                .as_ref()
-                                .expect("enabled descriptor dispatch");
-                            if slot.bound_descriptor_buffer != address {
+            }
+        }
+        let extension = self.descriptor_dispatch.clone();
+        // The probe uses the same typed command arena and worker context as
+        // guest graphics; no drain or owner-thread command recording is needed.
+        unsafe {
+            self.device.dispatch.record(move |ctx| {
+                ctx.flush_draw();
+                let command = ctx.command;
+                let device = &ctx.device;
+                device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
+                match binding {
+                    BufferBinding::DeviceAddress => {
+                        let address = address + offset;
+                        let mut push = [0; 16];
+                        push[..8].copy_from_slice(&address.to_ne_bytes());
+                        push[12..].copy_from_slice(&count.to_ne_bytes());
+                        device.cmd_push_constants(
+                            command,
+                            layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            &push,
+                        );
+                    }
+                    _ => {
+                        match data.expect("descriptor binding") {
+                            BindingData::Set(set) => device.cmd_bind_descriptor_sets(
+                                command,
+                                vk::PipelineBindPoint::COMPUTE,
+                                layout,
+                                0,
+                                &[set],
+                                &[],
+                            ),
+                            BindingData::Buffer(address, offset) => {
+                                let extension =
+                                    extension.as_ref().expect("enabled descriptor dispatch");
                                 extension.cmd_bind_descriptor_buffers(
                                     command,
                                     &[vk::DescriptorBufferBindingInfoEXT::default()
@@ -328,10 +331,6 @@ impl VulkanResidency {
                                             vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT,
                                         )],
                                 );
-                            }
-                            if slot.bound_descriptor_offset != offset
-                                || slot.bound_descriptor_buffer != address
-                            {
                                 extension.cmd_set_descriptor_buffer_offsets(
                                     command,
                                     vk::PipelineBindPoint::COMPUTE,
@@ -340,27 +339,26 @@ impl VulkanResidency {
                                     &[0],
                                     &[offset],
                                 );
-                                slot.bound_descriptor_buffer = address;
-                                slot.bound_descriptor_offset = offset;
                             }
                         }
+                        let mut push = [0; 8];
+                        push[..4].copy_from_slice(&(offset as u32 / 4).to_ne_bytes());
+                        push[4..].copy_from_slice(&count.to_ne_bytes());
+                        device.cmd_push_constants(
+                            command,
+                            layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            &push,
+                        );
                     }
-                    let mut push = [0; 8];
-                    push[..4].copy_from_slice(&(offset as u32 / 4).to_ne_bytes());
-                    push[4..].copy_from_slice(&count.to_ne_bytes());
-                    owner.device.cmd_push_constants(
-                        command,
-                        layout,
-                        vk::ShaderStageFlags::COMPUTE,
-                        0,
-                        &push,
-                    );
                 }
-            }
-        }
+                Ok(())
+            })
+        };
         let writer = self.prepare_write(Resource::Buffer(id), offset, size)?;
-        self.publish_effect(&[writer], |_| unsafe {
-            owner.device.cmd_dispatch(command, groups, 1, 1);
+        self.publish_effect(&[writer], |device| unsafe {
+            device.dispatch.cmd_dispatch(groups, 1, 1);
         })?;
         self.finish_buffer_write(id, offset, size)?;
         self.device.work_ticket()

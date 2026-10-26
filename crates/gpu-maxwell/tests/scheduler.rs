@@ -127,6 +127,44 @@ fn global_fifo_order_is_independent_of_channel_identity() {
 }
 
 #[test]
+fn zero_stream_increment_submits_without_a_completion_reservation() {
+    let (_allocation, address_space, channel) = setup();
+    let mapping = address_space.mapping_dump(1).entries[0];
+    let decoded = decode_gpfifo_submission(
+        SWITCH_1_GM20B_PROFILE,
+        8,
+        MaxwellGpfifoSubmitRequest {
+            entry_count: 1,
+            flags: HARDWARE_FORMAT | (1 << 8),
+            fence_id: 0,
+            fence_value: 0,
+        },
+        &descriptor(mapping.offset.get(), 1),
+    )
+    .unwrap();
+    let validated = validate_gpfifo_submission(
+        &channel.configuration(),
+        FrontendSubmissionId::new(12),
+        decoded,
+        address_space.memory(),
+    )
+    .unwrap();
+    let mut scheduler = MaxwellScheduler::default();
+    scheduler
+        .enqueue(&channel.configuration(), validated, None, None)
+        .unwrap();
+    assert!(
+        scheduler
+            .dispatch_next(true, address_space.memory())
+            .unwrap()
+            .unwrap()
+            .scheduled()
+            .completion()
+            .is_none()
+    );
+}
+
+#[test]
 fn dispatch_defers_stale_mapping_detection_to_command_consumption() {
     let (_allocation, mut address_space, channel) = setup();
     let validated = submission(&channel.configuration(), &address_space, 3);

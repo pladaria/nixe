@@ -13,6 +13,7 @@ enum HidCommand {
     SetSupportedNpadIdType,
     ActivateNpad,
     AcquireNpadStyleSetUpdateEventHandle,
+    DisconnectNpad,
     ActivateNpadWithRevision,
     SetNpadJoyHoldType,
     GetNpadJoyHoldType,
@@ -37,6 +38,7 @@ impl HidCommand {
             102 => Some(Self::SetSupportedNpadIdType),
             103 => Some(Self::ActivateNpad),
             106 => Some(Self::AcquireNpadStyleSetUpdateEventHandle),
+            107 => Some(Self::DisconnectNpad),
             109 => Some(Self::ActivateNpadWithRevision),
             120 => Some(Self::SetNpadJoyHoldType),
             121 => Some(Self::GetNpadJoyHoldType),
@@ -342,6 +344,30 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
                 .map_err(IpcWireError::SystemMemory)?
             {
                 return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
+            }
+            semantic_success(request.token, false, &[], &[], &[], None)
+        }
+        // u32 Npad ID and aligned u64 ARUID, with PID and no buffers.
+        // https://switchbrew.org/wiki/HID_services#DisconnectNpad
+        HidCommand::DisconnectNpad => {
+            if hipc.pid.is_none()
+                || !request.has_payload_size(16)
+                || has_ipc_descriptors_other_than_pid(hipc)
+            {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let id = request_u32(request.data, 0).unwrap();
+            log::trace!("hid disconnect Npad requested: id={id:#x}");
+            let disconnected = hid_system
+                .disconnect_npad(id)
+                .map_err(|error| match error {
+                    crate::HidInputError::Memory(error) => IpcWireError::SystemMemory(error),
+                    crate::HidInputError::Vibration(error) => {
+                        IpcWireError::InputBackend(error.to_string().into_boxed_str())
+                    }
+                })?;
+            if !disconnected {
+                return cmif_error(request.token, HorizonIpcResult::HID_INVALID_NPAD_ID);
             }
             semantic_success(request.token, false, &[], &[], &[], None)
         }

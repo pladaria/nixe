@@ -234,7 +234,7 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
         submitted,
         "retrying an already submitted demand must not split independent recording"
     );
-    execution.request_completion_wakeup().unwrap();
+    execution.arm_completion_wakeup().unwrap();
     release.send(()).unwrap();
     wakes.recv_timeout(Duration::from_secs(3)).unwrap();
     assert!(
@@ -392,7 +392,7 @@ fn completed_native_work_still_wakes_its_pending_logical_completion() {
     );
     // Native progress can advance after the owner's poll while the logical
     // completion is still queued. Registration must deliver that action.
-    execution.request_completion_wakeup().unwrap();
+    execution.arm_completion_wakeup().unwrap();
     let notified = notifications.recv_timeout(Duration::from_secs(1)).is_ok();
     let completed = execution.poll_completion().unwrap().unwrap();
     assert_eq!(completed.submission(), token);
@@ -484,7 +484,7 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
             &[],
         )
         .unwrap();
-    execution.request_completion_wakeup().unwrap();
+    execution.arm_completion_wakeup().unwrap();
     assert!(execution.poll_completion().unwrap().is_none());
 
     let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -709,6 +709,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         swizzle: Swizzle::IDENTITY,
         canonical_texels: true,
         planes: Arc::from([GuestImagePlane {
+            depth_slice: 0,
             mip_level: 0,
             array_layer: 0,
             aspect: GuestImageAspect::Color,
@@ -1321,6 +1322,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let bytes = cpu_read(&mut execution.residency, &backing);
     assert!(bytes.chunks_exact(4).all(|pixel| pixel == [0, 255, 0, 255]));
     drop(retained);
+    constant_blend_factors_follow_dynamic_constants(&mut execution, &state, &backing);
     overlapping_graphics_buffers_preserve_shader_bindings(&mut execution, &uniform_draw, &backing);
     render_area_preserves_undefined_padding(&mut execution, &state);
     window_depth_reconstructs_reads_and_clamps_exports(&mut execution, &state);
@@ -1329,6 +1331,73 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     execution.teardown().unwrap();
     drop(execution);
     monitor.check().unwrap();
+}
+
+fn constant_blend_factors_follow_dynamic_constants(
+    execution: &mut NativeGpuExecution,
+    template: &Arc<GuestDrawState>,
+    output: &Arc<PhysicalMapping>,
+) {
+    use nixe_gpu::{BlendComponent, BlendFactor as F, BlendOperation, ColorBlendState};
+    for (index, factor) in [
+        F::ConstantColor,
+        F::OneMinusConstantColor,
+        F::ConstantAlpha,
+        F::OneMinusConstantAlpha,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (phase, (constants, expected)) in [
+            ([0.5, 0.75, 0.5, 0.25], [191, 64, 64, 191]),
+            ([0.75, 0.25, 0.75, 0.75], [64, 191, 191, 64]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut draw = (**template).clone();
+            draw.identity = PreparedStateId::new(30000 + (index * 2 + phase) as u64, 1);
+            let parameters = Arc::make_mut(&mut draw.parameters);
+            parameters.identity = draw.identity;
+            parameters.shader_state.force_early_z = index % 2 != 0;
+            parameters.blend_constants = constants;
+            parameters.color_outputs[0].blend = Some(ColorBlendState {
+                color: BlendComponent {
+                    operation: BlendOperation::Add,
+                    source: factor,
+                    destination: F::Zero,
+                },
+                alpha: BlendComponent {
+                    operation: BlendOperation::Add,
+                    source: F::One,
+                    destination: F::Zero,
+                },
+            });
+            let work = NativeWork {
+                frontend: FrontendSubmissionId::new(30000 + (index * 2 + phase) as u64),
+                command: NativeCommand::Draw {
+                    state: Arc::new(draw),
+                    arguments: DrawArguments::NonIndexed {
+                        first_vertex: 0,
+                        vertex_count: 3,
+                        first_instance: 0,
+                        instance_count: 1,
+                    },
+                },
+            };
+            consume(execution, &work)
+                .and_then(|()| execution.submit(work.frontend))
+                .unwrap();
+            for pixel in cpu_read(&mut execution.residency, output).chunks_exact(4) {
+                assert_eq!(
+                    pixel,
+                    [0, expected[index], 0, 255],
+                    "factor={factor:?} phase={phase}"
+                );
+            }
+            finish_next(execution).unwrap().unwrap();
+        }
+    }
 }
 
 fn overlapping_graphics_buffers_preserve_shader_bindings(
@@ -1784,7 +1853,7 @@ fn uniform_color_resource() -> nixe_gpu::shader_module::ResourceId {
 }
 
 #[test]
-fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames() {
+fn native_video_owned_planes_convert_crop_and_reuse_host_images() {
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {
         return;
     };
@@ -1820,6 +1889,7 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
             )
             .unwrap(),
             planes: Arc::from([GuestImagePlane {
+                depth_slice: 0,
                 mip_level: 0,
                 array_layer: 0,
                 aspect: GuestImageAspect::Color,
@@ -1835,8 +1905,6 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
         };
         (_allocation_5, image)
     };
-    let (_y, y) = plane(ImageFormat::R8Unorm, 5, 3);
-    let (_uv, uv) = plane(ImageFormat::Rg8Unorm, 3, 2);
     let (_output, output) = plane(ImageFormat::Bgra8Unorm, 4, 2);
     let transform = Nv12ColorTransform {
         coefficients: [
@@ -1851,25 +1919,27 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
         source_origin: [1, 1],
     };
     let mut descriptor_updates = 0;
-    for frame in 0..4 {
-        let ys: Arc<[u8]> = (0..15).map(|i| (i * 11 + frame * 13) as u8).collect();
-        let uvs: Arc<[u8]> = (0..12).map(|i| (i * 7 + frame * 9) as u8).collect();
+    for (frame, (width, height)) in [(5u32, 3u32), (9, 7), (7, 5), (5, 3), (9, 7)]
+        .into_iter()
+        .enumerate()
+    {
+        let uv_width = width.div_ceil(2);
+        let ys: Arc<[u8]> = (0..width * height)
+            .map(|i| (i * 11 + frame as u32 * 13) as u8)
+            .collect();
+        let uvs: Arc<[u8]> = (0..uv_width * 2 * height.div_ceil(2))
+            .map(|i| (i * 7 + frame as u32 * 9) as u8)
+            .collect();
         let submission = NativeWork {
             frontend: FrontendSubmissionId::new(frame as u64 + 1),
-            command: NativeCommand::Sequence(
-                vec![
-                    NativeCommand::UploadPlanes {
-                        images: Box::new([y.clone(), uv.clone()]),
-                        widths: [5, 3],
-                        bytes: [Arc::clone(&ys), Arc::clone(&uvs)],
-                    },
-                    NativeCommand::ConvertNv12 {
-                        images: Box::new([y.clone(), uv.clone(), output.clone()]),
-                        transform,
-                    },
-                ]
-                .into_boxed_slice(),
-            ),
+            command: NativeCommand::ConvertNv12 {
+                destination: Box::new(output.clone()),
+                source: Nv12Planes {
+                    widths: [width, uv_width],
+                    bytes: [Arc::clone(&ys), Arc::clone(&uvs)],
+                },
+                transform,
+            },
         };
 
         consume(&mut execution, &submission)
@@ -1885,9 +1955,9 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
                 let sx = column + 1;
                 let sy = row + 1;
                 let values = [
-                    i32::from(ys[sy * 5 + sx]) * 4,
-                    i32::from(uvs[(sy / 2 * 3 + sx / 2) * 2]) * 4,
-                    i32::from(uvs[(sy / 2 * 3 + sx / 2) * 2 + 1]) * 4,
+                    i32::from(ys[sy * width as usize + sx]) * 4,
+                    i32::from(uvs[(sy / 2 * uv_width as usize + sx / 2) * 2]) * 4,
+                    i32::from(uvs[(sy / 2 * uv_width as usize + sx / 2) * 2 + 1]) * 4,
                 ];
                 let rgb = transform.coefficients.map(|c| {
                     (((values[0] * c[0] + values[1] * c[1] + values[2] * c[2]) + c[3]) >> 8)
@@ -1900,7 +1970,7 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
                 );
             }
         }
-        if frame == 0 {
+        if frame <= 1 {
             descriptor_updates = execution.descriptors.statistics().updates;
         }
         assert_eq!(
@@ -1908,6 +1978,15 @@ fn native_video_software_planes_convert_crop_and_reuse_resources_across_frames()
             descriptor_updates
         );
         assert_eq!(execution.video_pipelines.len(), 1);
+        assert_eq!(
+            execution.residency.statistics().image_allocations,
+            1,
+            "decoded host inputs must not register guest image representations"
+        );
+        assert_eq!(
+            execution.video_inputs.as_ref().unwrap().extent,
+            if frame == 0 { [5, 3] } else { [9, 7] }
+        );
     }
     execution.teardown().unwrap();
     drop(execution);
@@ -2097,6 +2176,7 @@ fn pressure_image(execution: &NativeGpuExecution) -> (nixe_memory::Allocation, G
             canonical_texels: true,
             sample_grid: [1, 1],
             planes: Arc::from([GuestImagePlane {
+                depth_slice: 0,
                 mip_level: 0,
                 array_layer: 0,
                 aspect: nixe_gpu::native::GuestImageAspect::Color,
@@ -2159,4 +2239,71 @@ fn blit_keeps_selected_source_while_allocating_destination() {
         result.is_ok(),
         "budget holds both operands after evicting the unrelated image"
     );
+}
+
+#[test]
+fn completion_registration_preserves_shared_batch_until_its_deadline() {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let mut execution = NativeGpuExecution::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+        device,
+        ShaderNamespace {
+            guest: *b"deadline-batches",
+            isa: 1,
+        },
+        CacheConfiguration::default(),
+        4 * 1024 * 1024,
+    )
+    .unwrap();
+    let (_allocation, backing) = backing_allocation(&execution.residency, 4096, 4096, 0x19);
+    let (woken, wakes) = std::sync::mpsc::channel();
+    execution
+        .bind_host_wakeup(Arc::new(move || {
+            let _ = woken.send(());
+        }))
+        .unwrap();
+    let mut tokens = Vec::new();
+    for id in 1..=2 {
+        let work = NativeWork {
+            frontend: FrontendSubmissionId::new(id),
+            command: NativeCommand::ReportMemory {
+                fence: true,
+                target: backing.pin(0, backing.bytes()).unwrap(),
+                offset: 64,
+                bytes: Arc::from([id as u8; 16]),
+            },
+        };
+        consume(&mut execution, &work).unwrap();
+        tokens.push(execution.submit(work.frontend).unwrap());
+        execution.arm_completion_wakeup().unwrap();
+        assert_eq!(
+            execution.residency.device().scheduled_tick(),
+            0,
+            "registration is not an explicit submit dependency"
+        );
+    }
+    let a = execution.completions[0].work.unwrap();
+    assert_eq!(execution.completions[1].work.unwrap(), a);
+    let deadline = execution.pending_submit_deadline().unwrap();
+    std::thread::sleep(
+        deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+    );
+    execution.progress().unwrap();
+    assert!(execution.pending_submit_deadline().is_none());
+    assert_eq!(execution.residency.device().scheduled_tick(), a.tick());
+    wakes.recv_timeout(Duration::from_secs(3)).unwrap();
+    for token in tokens {
+        assert_eq!(
+            execution.poll_completion().unwrap().unwrap().submission(),
+            token
+        );
+    }
+    let bytes = cpu_read(&mut execution.residency, &backing);
+    assert_eq!(&bytes[64..80], &[2; 16]);
+    execution.teardown().unwrap();
+    drop(execution);
+    validation.check().unwrap();
 }

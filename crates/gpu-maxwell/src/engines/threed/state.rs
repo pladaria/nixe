@@ -229,39 +229,14 @@ pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u
     }
 }
 
-/// How a modeled Maxwell register acquired its current value.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellThreeDRegisterOrigin {
-    /// No verified reset or method write establishes a value.
-    Unset,
-    /// Pinned public sources establish the modeled profile's reset value.
-    VerifiedReset,
-    /// A validated guest method programmed the register.
-    Programmed,
-}
-
-/// One typed register with explicit validity and optional write provenance.
+/// Decoded register bits and value. Command provenance stays at execution boundaries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDRegister<T> {
     raw: Option<u32>,
     value: Option<T>,
-    source: Option<MaxwellMethodSource>,
 }
 
 impl<T> MaxwellThreeDRegister<T> {
-    /// Returns whether the value is absent, sourced from a verified reset, or
-    /// explicitly programmed. Callers must not treat `Unset` as zero.
-    #[must_use]
-    pub const fn origin(&self) -> MaxwellThreeDRegisterOrigin {
-        if self.source.is_some() {
-            MaxwellThreeDRegisterOrigin::Programmed
-        } else if self.raw.is_some() {
-            MaxwellThreeDRegisterOrigin::VerifiedReset
-        } else {
-            MaxwellThreeDRegisterOrigin::Unset
-        }
-    }
-
     /// Exact method/reset bits retained before later semantic interpretation.
     #[must_use]
     pub const fn raw(&self) -> Option<u32> {
@@ -273,12 +248,6 @@ impl<T> MaxwellThreeDRegister<T> {
     pub const fn value(&self) -> Option<&T> {
         self.value.as_ref()
     }
-
-    /// Source of a programmed value. Reset and unset states have no method.
-    #[must_use]
-    pub const fn source(&self) -> Option<MaxwellMethodSource> {
-        self.source
-    }
 }
 
 impl<T> Default for MaxwellThreeDRegister<T> {
@@ -286,7 +255,6 @@ impl<T> Default for MaxwellThreeDRegister<T> {
         Self {
             raw: None,
             value: None,
-            source: None,
         }
     }
 }
@@ -296,15 +264,13 @@ impl<T> MaxwellThreeDRegister<T> {
         Self {
             raw: Some(raw),
             value,
-            source: None,
         }
     }
 
-    pub(super) const fn programmed(raw: u32, value: T, source: MaxwellMethodSource) -> Self {
+    pub(super) const fn decoded(raw: u32, value: T) -> Self {
         Self {
             raw: Some(raw),
             value: Some(value),
-            source: Some(source),
         }
     }
 }
@@ -711,73 +677,59 @@ impl MaxwellThreeDRasterState {
             point_size: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             attribute_point_size: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             point_sprite_enable: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             anti_aliased_point_enable: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             point_sprite_select: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             point_center_mode: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             edge_flag: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             alpha_fraction: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             bounding_box: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             fill_via_triangle: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             conservative_raster: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             polygon_smooth_enable: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             polygon_stipple_enable: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             polygon_stipple_pattern: [const {
                 MaxwellThreeDRegister {
                     raw: None,
                     value: None,
-                    source: None,
                 }
             }; MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT],
         }
@@ -941,12 +893,10 @@ impl MaxwellThreeDViewportState {
             z_clip_range: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
             pixel_center: MaxwellThreeDRegister {
                 raw: None,
                 value: None,
-                source: None,
             },
         }
     }
@@ -1328,21 +1278,8 @@ impl MaxwellThreeDFrontendState {
 
     /// Returns the last validated raw value for one byte-addressed class method.
     #[must_use]
-    pub(super) fn raw_register_value(&self, method: GpuMethodId) -> Option<u32> {
+    pub(in crate::engines) fn raw_register_value(&self, method: GpuMethodId) -> Option<u32> {
         self.raw_registers.raw(method)
-    }
-
-    #[cfg(test)]
-    pub fn raw_register(&self, method: GpuMethodId) -> Option<MaxwellThreeDRegister<u32>> {
-        let value = self.raw_registers.raw(method)?;
-        Some(match self.pending_sources[(method.0 / 4) as usize] {
-            Some((location, subchannel)) => MaxwellThreeDRegister::programmed(
-                value,
-                value,
-                MaxwellMethodSource::from_parts(location, subchannel, method, value),
-            ),
-            None => MaxwellThreeDRegister::verified_reset(value, Some(value)),
-        })
     }
 
     pub(super) fn defer_register(&mut self, source: MaxwellMethodSource) {
@@ -1686,76 +1623,76 @@ impl MaxwellThreeDFrontendState {
             );
         }
         match write {
-            MaxwellThreeDStateWrite::PointSize { value, source } => {
+            MaxwellThreeDStateWrite::PointSize { value, source: _ } => {
                 self.operation_state_mut().raster.point_size =
-                    MaxwellThreeDRegister::programmed(value.bits(), value, source);
+                    MaxwellThreeDRegister::decoded(value.bits(), value);
             }
             MaxwellThreeDStateWrite::InlineToMemory(write) => {
                 self.operation_state_mut().inline_to_memory.apply(write);
             }
-            MaxwellThreeDStateWrite::AttributePointSize { value, source } => {
+            MaxwellThreeDStateWrite::AttributePointSize { value, source: _ } => {
                 self.operation_state_mut().raster.attribute_point_size =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDStateWrite::PointSpriteEnable { value, source } => {
+            MaxwellThreeDStateWrite::PointSpriteEnable { value, source: _ } => {
                 self.operation_state_mut().raster.point_sprite_enable =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+                    MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
-            MaxwellThreeDStateWrite::AntiAliasedPointEnable { value, source } => {
+            MaxwellThreeDStateWrite::AntiAliasedPointEnable { value, source: _ } => {
                 self.operation_state_mut().raster.anti_aliased_point_enable =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+                    MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
-            MaxwellThreeDStateWrite::PointSpriteSelect { value, source } => {
+            MaxwellThreeDStateWrite::PointSpriteSelect { value, source: _ } => {
                 self.operation_state_mut().raster.point_sprite_select =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDStateWrite::PointCenterMode { value, source } => {
+            MaxwellThreeDStateWrite::PointCenterMode { value, source: _ } => {
                 self.operation_state_mut().raster.point_center_mode =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDStateWrite::EdgeFlag { value, source } => {
+            MaxwellThreeDStateWrite::EdgeFlag { value, source: _ } => {
                 self.operation_state_mut().raster.edge_flag =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDStateWrite::AlphaFraction { value, source } => {
+            MaxwellThreeDStateWrite::AlphaFraction { value, source: _ } => {
                 self.operation_state_mut().raster.alpha_fraction =
-                    MaxwellThreeDRegister::programmed(u32::from(value.raw()), value, source);
+                    MaxwellThreeDRegister::decoded(u32::from(value.raw()), value);
             }
-            MaxwellThreeDStateWrite::RasterBoundingBox { value, source } => {
+            MaxwellThreeDStateWrite::RasterBoundingBox { value, source: _ } => {
                 self.operation_state_mut().raster.bounding_box =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDStateWrite::FillViaTriangle { value, source } => {
+            MaxwellThreeDStateWrite::FillViaTriangle { value, source: _ } => {
                 self.operation_state_mut().raster.fill_via_triangle =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDStateWrite::ConservativeRaster { value, source } => {
+            MaxwellThreeDStateWrite::ConservativeRaster { value, source: _ } => {
                 self.operation_state_mut().raster.conservative_raster =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDStateWrite::PolygonSmoothEnable { value, source } => {
+            MaxwellThreeDStateWrite::PolygonSmoothEnable { value, source: _ } => {
                 self.operation_state_mut().raster.polygon_smooth_enable =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+                    MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
-            MaxwellThreeDStateWrite::PolygonStippleEnable { value, source } => {
+            MaxwellThreeDStateWrite::PolygonStippleEnable { value, source: _ } => {
                 self.operation_state_mut().raster.polygon_stipple_enable =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+                    MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
             MaxwellThreeDStateWrite::PolygonStipplePattern {
                 word,
                 value,
-                source,
+                source: _,
             } => {
                 self.operation_state_mut().raster.polygon_stipple_pattern[word as usize] =
-                    MaxwellThreeDRegister::programmed(value, value, source);
+                    MaxwellThreeDRegister::decoded(value, value);
             }
-            MaxwellThreeDStateWrite::ViewportZClip { value, source } => {
+            MaxwellThreeDStateWrite::ViewportZClip { value, source: _ } => {
                 self.operation_state_mut().viewport.z_clip_range =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDStateWrite::ViewportPixelCenter { value, source } => {
+            MaxwellThreeDStateWrite::ViewportPixelCenter { value, source: _ } => {
                 self.operation_state_mut().viewport.pixel_center =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
             MaxwellThreeDStateWrite::RenderTarget(write) => {
                 self.operation_state_mut().render_targets.apply(write);
@@ -2030,11 +1967,14 @@ impl MaxwellThreeDStateWrite {
             | Self::ViewportZClip { .. }
             | Self::ViewportPixelCenter { .. }
             | Self::FixedFunction(_)
-            | Self::RenderEnable(_)
             | Self::ColorReduction(_)
-            | Self::ConstantColorRendering(_)
             | Self::Coverage(_)
             | Self::Line(_) => true,
+            // The reference renderer retains this register family without
+            // replacing fragment shader outputs or specializing the pipeline.
+            // https://github.com/eden-emulator/mirror/blob/master/src/video_core/engines/maxwell_3d.h
+            Self::ConstantColorRendering(_) => false,
+            Self::RenderEnable(write) => matches!(write, MaxwellThreeDRenderEnableStateWrite::ConditionalLoadConstantBuffer{..}),
             Self::ShaderExecution(write) => !matches!(write, MaxwellThreeDShaderExecutionStateWrite::OpportunisticEarlyZHysteresis { .. }),
             Self::RenderTarget(write) => !matches!(
                 write,
@@ -2171,10 +2111,7 @@ mod tests {
             ] {
                 assert_eq!(register.raw(), Some(expected));
                 assert_eq!(register.value().map(|value| value.get()), Some(expected));
-                assert_eq!(
-                    register.origin(),
-                    super::MaxwellThreeDRegisterOrigin::VerifiedReset
-                );
+
                 assert_eq!(
                     super::verified_raw_register_reset(nixe_gpu::GpuMethodId(
                         0x0c00 + index as u32 * 16 + offset

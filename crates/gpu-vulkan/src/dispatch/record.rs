@@ -3,326 +3,348 @@ use super::*;
 impl Dispatch {
     pub unsafe fn cmd_bind_pipeline(
         &mut self,
-        command: vk::CommandBuffer,
         point: vk::PipelineBindPoint,
         pipeline: std::sync::Arc<crate::cache::NativePipeline>,
     ) {
-        self.recorder.push(Command::BindPipeline {
-            command,
-            point,
-            pipeline,
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe {
+                device.cmd_bind_pipeline(
+                    command,
+                    point,
+                    pipeline
+                        .handle()
+                        .map_err(crate::queue::progress::NativeFailure::Compilation)?,
+                )
+            };
+            Ok(())
         });
     }
     pub unsafe fn cmd_bind_descriptor_sets(
         &mut self,
-        command: vk::CommandBuffer,
         point: vk::PipelineBindPoint,
         layout: vk::PipelineLayout,
         first: u32,
         sets: &[vk::DescriptorSet],
         offsets: &[u32],
     ) {
-        self.recorder.push(Command::BindDescriptorSets {
-            command,
-            point,
-            layout,
-            first,
-            sets: sets.iter().copied().collect(),
-            offsets: offsets.iter().copied().collect(),
-        });
+        unsafe {
+            self.recorder
+                .record_pair(sets, offsets, move |context, sets, offsets| {
+                    context.flush_draw();
+                    let command = context.command;
+                    let device = &context.device;
+
+                    device.cmd_bind_descriptor_sets(command, point, layout, first, sets, offsets);
+                    Ok(())
+                });
+        }
     }
     pub unsafe fn cmd_bind_vertex_buffers(
         &mut self,
-        command: vk::CommandBuffer,
         first: u32,
         buffers: &[vk::Buffer],
         offsets: &[vk::DeviceSize],
     ) {
-        self.recorder.push(Command::BindVertexBuffers {
-            command,
-            first,
-            buffers: buffers.iter().copied().collect(),
-            offsets: offsets.iter().copied().collect(),
-        });
+        unsafe {
+            self.recorder
+                .record_pair(buffers, offsets, move |context, buffers, offsets| {
+                    context.flush_draw();
+                    let command = context.command;
+                    let device = &context.device;
+                    device.cmd_bind_vertex_buffers(command, first, buffers, offsets);
+                    Ok(())
+                });
+        }
     }
     pub unsafe fn cmd_bind_index_buffer(
         &mut self,
-        command: vk::CommandBuffer,
         buffer: vk::Buffer,
         offset: vk::DeviceSize,
         kind: vk::IndexType,
     ) {
-        self.recorder.push(Command::BindIndexBuffer {
-            command,
-            buffer,
-            offset,
-            kind,
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_bind_index_buffer(command, buffer, offset, kind) };
+            Ok(())
         });
     }
     pub unsafe fn cmd_push_constants(
         &mut self,
-        command: vk::CommandBuffer,
         layout: vk::PipelineLayout,
         stages: vk::ShaderStageFlags,
         offset: u32,
         bytes: &[u8],
     ) {
-        self.recorder.push(Command::PushConstants {
-            command,
-            layout,
-            stages,
-            offset,
-            bytes: bytes.iter().copied().collect(),
-        });
+        unsafe {
+            self.recorder.record_array(bytes, move |context, bytes| {
+                context.flush_draw();
+                let command = context.command;
+                let device = &context.device;
+                device.cmd_push_constants(command, layout, stages, offset, bytes);
+                Ok(())
+            });
+        }
     }
     pub unsafe fn cmd_draw(
         &mut self,
-        command: vk::CommandBuffer,
         vertices: u32,
         instances: u32,
         first_vertex: u32,
         first_instance: u32,
     ) {
-        self.recorder.push(Command::Draw {
-            command,
-            vertices,
-            instances,
-            first_vertex,
-            first_instance,
+        self.recorder.record(move |context| {
+            context.draw(worker::PendingDraw::Draw {
+                vertices,
+                instances,
+                first_vertex,
+                first_instance,
+            });
+            Ok(())
         });
     }
     pub unsafe fn cmd_draw_indexed(
         &mut self,
-        command: vk::CommandBuffer,
         indices: u32,
         instances: u32,
         first_index: u32,
         vertex_offset: i32,
         first_instance: u32,
     ) {
-        self.recorder.push(Command::DrawIndexed {
-            command,
-            indices,
-            instances,
-            first_index,
-            vertex_offset,
-            first_instance,
+        self.recorder.record(move |context| {
+            context.draw(worker::PendingDraw::DrawIndexed {
+                indices,
+                instances,
+                first_index,
+                vertex_offset,
+                first_instance,
+            });
+            Ok(())
         });
     }
     pub unsafe fn cmd_draw_indirect(
         &mut self,
-        command: vk::CommandBuffer,
         buffer: vk::Buffer,
         offset: vk::DeviceSize,
         count: u32,
         stride: u32,
     ) {
-        self.recorder.push(Command::DrawIndirect {
-            command,
-            buffer,
-            offset,
-            count,
-            stride,
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_draw_indirect(command, buffer, offset, count, stride) };
+            Ok(())
         });
     }
     pub unsafe fn cmd_draw_indexed_indirect(
         &mut self,
-        command: vk::CommandBuffer,
         buffer: vk::Buffer,
         offset: vk::DeviceSize,
         count: u32,
         stride: u32,
     ) {
-        self.recorder.push(Command::DrawIndexedIndirect {
-            command,
-            buffer,
-            offset,
-            count,
-            stride,
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_draw_indexed_indirect(command, buffer, offset, count, stride) };
+            Ok(())
         });
     }
-    pub unsafe fn cmd_dispatch(&mut self, command: vk::CommandBuffer, x: u32, y: u32, z: u32) {
-        self.recorder.push(Command::Dispatch { command, x, y, z });
-    }
-    pub unsafe fn cmd_dispatch_indirect(
-        &mut self,
-        command: vk::CommandBuffer,
-        buffer: vk::Buffer,
-        offset: vk::DeviceSize,
-    ) {
-        self.recorder.push(Command::DispatchIndirect {
-            command,
-            buffer,
-            offset,
+    pub unsafe fn cmd_dispatch(&mut self, x: u32, y: u32, z: u32) {
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_dispatch(command, x, y, z) };
+            Ok(())
         });
     }
-    pub unsafe fn cmd_set_viewport(
-        &mut self,
-        command: vk::CommandBuffer,
-        first: u32,
-        values: &[vk::Viewport],
-    ) {
-        self.recorder.push(Command::SetViewport {
-            command,
-            first,
-            values: values.iter().copied().collect(),
+    pub unsafe fn cmd_dispatch_indirect(&mut self, buffer: vk::Buffer, offset: vk::DeviceSize) {
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_dispatch_indirect(command, buffer, offset) };
+            Ok(())
         });
     }
-    pub unsafe fn cmd_set_scissor(
-        &mut self,
-        command: vk::CommandBuffer,
-        first: u32,
-        values: &[vk::Rect2D],
-    ) {
-        self.recorder.push(Command::SetScissor {
-            command,
-            first,
-            values: values.iter().copied().collect(),
+    pub unsafe fn cmd_set_viewport(&mut self, first: u32, values: &[vk::Viewport]) {
+        unsafe {
+            self.recorder.record_array(values, move |context, values| {
+                context.flush_draw();
+                let command = context.command;
+                let device = &context.device;
+                device.cmd_set_viewport(command, first, values);
+                Ok(())
+            });
+        }
+    }
+    pub unsafe fn cmd_set_scissor(&mut self, first: u32, values: &[vk::Rect2D]) {
+        unsafe {
+            self.recorder.record_array(values, move |context, values| {
+                context.flush_draw();
+                let command = context.command;
+                let device = &context.device;
+                device.cmd_set_scissor(command, first, values);
+                Ok(())
+            });
+        }
+    }
+    pub unsafe fn cmd_set_line_width(&mut self, width: f32) {
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_set_line_width(command, width) };
+            Ok(())
         });
     }
-    pub unsafe fn cmd_set_line_width(&mut self, command: vk::CommandBuffer, width: f32) {
-        self.recorder.push(Command::SetLineWidth { command, width });
-    }
-    pub unsafe fn cmd_set_depth_bias(
-        &mut self,
-        command: vk::CommandBuffer,
-        constant: f32,
-        clamp: f32,
-        slope: f32,
-    ) {
-        self.recorder.push(Command::SetDepthBias {
-            command,
-            constant,
-            clamp,
-            slope,
+    pub unsafe fn cmd_set_depth_bias(&mut self, constant: f32, clamp: f32, slope: f32) {
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_set_depth_bias(command, constant, clamp, slope) };
+            Ok(())
         });
     }
-    pub unsafe fn cmd_set_blend_constants(
-        &mut self,
-        command: vk::CommandBuffer,
-        values: &[f32; 4],
-    ) {
-        self.recorder.push(Command::SetBlendConstants {
-            command,
-            values: *values,
+    pub unsafe fn cmd_set_blend_constants(&mut self, values: &[f32; 4]) {
+        let values = *values;
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_set_blend_constants(command, &values) };
+            Ok(())
         });
     }
-    pub unsafe fn cmd_set_stencil_compare_mask(
-        &mut self,
-        command: vk::CommandBuffer,
-        face: vk::StencilFaceFlags,
-        mask: u32,
-    ) {
-        self.recorder.push(Command::SetStencilCompareMask {
-            command,
-            face,
-            mask,
+    pub unsafe fn cmd_set_stencil_compare_mask(&mut self, face: vk::StencilFaceFlags, mask: u32) {
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_set_stencil_compare_mask(command, face, mask) };
+            Ok(())
         });
     }
-    pub unsafe fn cmd_set_stencil_write_mask(
-        &mut self,
-        command: vk::CommandBuffer,
-        face: vk::StencilFaceFlags,
-        mask: u32,
-    ) {
-        self.recorder.push(Command::SetStencilWriteMask {
-            command,
-            face,
-            mask,
+    pub unsafe fn cmd_set_stencil_write_mask(&mut self, face: vk::StencilFaceFlags, mask: u32) {
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_set_stencil_write_mask(command, face, mask) };
+            Ok(())
         });
     }
-    pub unsafe fn cmd_set_stencil_reference(
-        &mut self,
-        command: vk::CommandBuffer,
-        face: vk::StencilFaceFlags,
-        reference: u32,
-    ) {
-        self.recorder.push(Command::SetStencilReference {
-            command,
-            face,
-            reference,
+    pub unsafe fn cmd_set_stencil_reference(&mut self, face: vk::StencilFaceFlags, reference: u32) {
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_set_stencil_reference(command, face, reference) };
+            Ok(())
         });
     }
-    pub unsafe fn cmd_set_depth_bounds(
-        &mut self,
-        command: vk::CommandBuffer,
-        minimum: f32,
-        maximum: f32,
-    ) {
-        self.recorder.push(Command::SetDepthBounds {
-            command,
-            minimum,
-            maximum,
+    pub unsafe fn cmd_set_depth_bounds(&mut self, minimum: f32, maximum: f32) {
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_set_depth_bounds(command, minimum, maximum) };
+            Ok(())
         });
     }
     pub unsafe fn cmd_copy_buffer(
         &mut self,
-        command: vk::CommandBuffer,
         source: vk::Buffer,
         destination: vk::Buffer,
         regions: &[vk::BufferCopy],
     ) {
-        self.recorder.push(Command::CopyBuffer {
-            command,
-            source,
-            destination,
-            regions: regions.iter().copied().collect(),
-        });
+        unsafe {
+            self.recorder
+                .record_array(regions, move |context, regions| {
+                    context.flush_draw();
+                    let command = context.command;
+                    let device = &context.device;
+                    device.cmd_copy_buffer(command, source, destination, regions);
+                    Ok(())
+                });
+        }
     }
     pub unsafe fn cmd_copy_buffer_to_image(
         &mut self,
-        command: vk::CommandBuffer,
         source: vk::Buffer,
         destination: vk::Image,
         layout: vk::ImageLayout,
         regions: &[vk::BufferImageCopy],
     ) {
-        self.recorder.push(Command::CopyBufferToImage {
-            command,
-            source,
-            destination,
-            layout,
-            regions: regions.iter().copied().collect(),
-        });
+        unsafe {
+            self.recorder
+                .record_array(regions, move |context, regions| {
+                    context.flush_draw();
+                    let command = context.command;
+                    let device = &context.device;
+
+                    device.cmd_copy_buffer_to_image(command, source, destination, layout, regions);
+                    Ok(())
+                });
+        }
     }
     pub unsafe fn cmd_copy_image_to_buffer(
         &mut self,
-        command: vk::CommandBuffer,
         source: vk::Image,
         layout: vk::ImageLayout,
         destination: vk::Buffer,
         regions: &[vk::BufferImageCopy],
     ) {
-        self.recorder.push(Command::CopyImageToBuffer {
-            command,
-            source,
-            layout,
-            destination,
-            regions: regions.iter().copied().collect(),
-        });
+        unsafe {
+            self.recorder
+                .record_array(regions, move |context, regions| {
+                    context.flush_draw();
+                    let command = context.command;
+                    let device = &context.device;
+
+                    device.cmd_copy_image_to_buffer(command, source, layout, destination, regions);
+                    Ok(())
+                });
+        }
     }
     pub unsafe fn cmd_copy_image(
         &mut self,
-        command: vk::CommandBuffer,
         source: vk::Image,
         source_layout: vk::ImageLayout,
         destination: vk::Image,
         destination_layout: vk::ImageLayout,
         regions: &[vk::ImageCopy],
     ) {
-        self.recorder.push(Command::CopyImage {
-            command,
-            source,
-            source_layout,
-            destination,
-            destination_layout,
-            regions: regions.iter().copied().collect(),
-        });
+        unsafe {
+            self.recorder
+                .record_array(regions, move |context, regions| {
+                    context.flush_draw();
+                    let command = context.command;
+                    let device = &context.device;
+
+                    device.cmd_copy_image(
+                        command,
+                        source,
+                        source_layout,
+                        destination,
+                        destination_layout,
+                        regions,
+                    );
+                    Ok(())
+                });
+        }
     }
     #[allow(clippy::too_many_arguments, reason = "native Vulkan command signature")]
     pub unsafe fn cmd_blit_image(
         &mut self,
-        command: vk::CommandBuffer,
         source: vk::Image,
         source_layout: vk::ImageLayout,
         destination: vk::Image,
@@ -330,122 +352,147 @@ impl Dispatch {
         regions: &[vk::ImageBlit],
         filter: vk::Filter,
     ) {
-        self.recorder.push(Command::BlitImage {
-            command,
-            source,
-            source_layout,
-            destination,
-            destination_layout,
-            regions: regions.iter().copied().collect(),
-            filter,
-        });
+        unsafe {
+            self.recorder
+                .record_array(regions, move |context, regions| {
+                    context.flush_draw();
+                    let command = context.command;
+                    let device = &context.device;
+
+                    device.cmd_blit_image(
+                        command,
+                        source,
+                        source_layout,
+                        destination,
+                        destination_layout,
+                        regions,
+                        filter,
+                    );
+                    Ok(())
+                });
+        }
     }
     pub unsafe fn cmd_resolve_image(
         &mut self,
-        command: vk::CommandBuffer,
         source: vk::Image,
         source_layout: vk::ImageLayout,
         destination: vk::Image,
         destination_layout: vk::ImageLayout,
         regions: &[vk::ImageResolve],
     ) {
-        self.recorder.push(Command::ResolveImage {
-            command,
-            source,
-            source_layout,
-            destination,
-            destination_layout,
-            regions: regions.iter().copied().collect(),
-        });
+        unsafe {
+            self.recorder
+                .record_array(regions, move |context, regions| {
+                    context.flush_draw();
+                    let command = context.command;
+                    let device = &context.device;
+
+                    device.cmd_resolve_image(
+                        command,
+                        source,
+                        source_layout,
+                        destination,
+                        destination_layout,
+                        regions,
+                    );
+                    Ok(())
+                });
+        }
     }
     pub unsafe fn cmd_fill_buffer(
         &mut self,
-        command: vk::CommandBuffer,
         buffer: vk::Buffer,
         offset: vk::DeviceSize,
         size: vk::DeviceSize,
         value: u32,
     ) {
-        self.recorder.push(Command::FillBuffer {
-            command,
-            buffer,
-            offset,
-            size,
-            value,
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_fill_buffer(command, buffer, offset, size, value) };
+            Ok(())
         });
     }
     pub unsafe fn cmd_clear_color_image(
         &mut self,
-        command: vk::CommandBuffer,
         image: vk::Image,
         layout: vk::ImageLayout,
         color: &vk::ClearColorValue,
         ranges: &[vk::ImageSubresourceRange],
     ) {
-        self.recorder.push(Command::ClearColorImage {
-            command,
-            image,
-            layout,
-            color: *color,
-            ranges: ranges.iter().copied().collect(),
-        });
+        let color = *color;
+        unsafe {
+            self.recorder.record_array(ranges, move |context, ranges| {
+                context.flush_draw();
+                let command = context.command;
+                let device = &context.device;
+                device.cmd_clear_color_image(command, image, layout, &color, ranges);
+                Ok(())
+            });
+        }
     }
     pub unsafe fn cmd_clear_depth_stencil_image(
         &mut self,
-        command: vk::CommandBuffer,
         image: vk::Image,
         layout: vk::ImageLayout,
         value: &vk::ClearDepthStencilValue,
         ranges: &[vk::ImageSubresourceRange],
     ) {
-        self.recorder.push(Command::ClearDepthStencilImage {
-            command,
-            image,
-            layout,
-            value: *value,
-            ranges: ranges.iter().copied().collect(),
-        });
+        let value = *value;
+        unsafe {
+            self.recorder.record_array(ranges, move |context, ranges| {
+                context.flush_draw();
+                let command = context.command;
+                let device = &context.device;
+
+                device.cmd_clear_depth_stencil_image(command, image, layout, &value, ranges);
+                Ok(())
+            });
+        }
     }
     pub unsafe fn cmd_clear_attachments(
         &mut self,
-        command: vk::CommandBuffer,
         attachments: &[vk::ClearAttachment],
         rectangles: &[vk::ClearRect],
     ) {
-        self.recorder.push(Command::ClearAttachments {
-            command,
-            attachments: attachments.iter().copied().collect(),
-            rectangles: rectangles.iter().copied().collect(),
-        });
+        unsafe {
+            self.recorder.record_pair(
+                attachments,
+                rectangles,
+                move |context, attachments, rectangles| {
+                    context.flush_draw();
+                    let command = context.command;
+                    let device = &context.device;
+                    device.cmd_clear_attachments(command, attachments, rectangles);
+                    Ok(())
+                },
+            );
+        }
     }
     #[cfg(any(test, feature = "performance-counters", feature = "binding-probe"))]
-    pub unsafe fn cmd_reset_query_pool(
-        &mut self,
-        command: vk::CommandBuffer,
-        pool: vk::QueryPool,
-        first: u32,
-        count: u32,
-    ) {
-        self.recorder.push(Command::ResetQueryPool {
-            command,
-            pool,
-            first,
-            count,
+    pub unsafe fn cmd_reset_query_pool(&mut self, pool: vk::QueryPool, first: u32, count: u32) {
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_reset_query_pool(command, pool, first, count) };
+            Ok(())
         });
     }
     #[cfg(any(test, feature = "performance-counters"))]
     pub unsafe fn cmd_write_timestamp(
         &mut self,
-        command: vk::CommandBuffer,
         stage: vk::PipelineStageFlags,
         pool: vk::QueryPool,
         index: u32,
     ) {
-        self.recorder.push(Command::WriteTimestamp {
-            command,
-            stage,
-            pool,
-            index,
+        self.recorder.record(move |context| {
+            context.flush_draw();
+            let command = context.command;
+            let device = &context.device;
+            unsafe { device.cmd_write_timestamp(command, stage, pool, index) };
+            Ok(())
         });
     }
 }

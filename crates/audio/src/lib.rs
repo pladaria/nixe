@@ -8,6 +8,7 @@ use std::fmt::{self, Debug};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 mod host;
+pub mod opus;
 pub use host::{HostAudioBackend, HostAudioRuntime};
 
 /// Speaker layout is explicit, rather than inferred from a sample count.
@@ -81,13 +82,25 @@ struct Buffer {
     cursor: usize,
 }
 
-#[derive(Default)]
 struct State {
     started: bool,
     queued: VecDeque<Buffer>,
     released: VecDeque<Buffer>,
     played_frames: u64,
     failure: Option<AudioError>,
+    volume: f32,
+}
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            started: false,
+            queued: VecDeque::new(),
+            released: VecDeque::new(),
+            played_frames: 0,
+            failure: None,
+            volume: 1.0,
+        }
+    }
 }
 
 /// Callback-side view of an interleaved signed-16-bit PCM playback queue.
@@ -135,6 +148,12 @@ impl AudioFeed {
                 // the caller drains releases, avoiding allocator work here.
                 state.released.push_back(buffer);
                 released = true;
+            }
+        }
+        if state.volume != 1.0 {
+            for sample in &mut output[..written] {
+                *sample = (f32::from(*sample) * state.volume)
+                    .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
             }
         }
         #[cfg(feature = "performance-counters")]
@@ -198,6 +217,18 @@ impl AudioOutput {
 
     pub fn started(&self) -> Result<bool, AudioError> {
         Ok(self.state()?.started)
+    }
+    /// Per-stream gain is applied when the host consumes PCM, including buffers
+    /// queued before a volume change.
+    pub fn set_volume(&self, volume: f32) -> Result<(), AudioError> {
+        if !volume.is_finite() {
+            return Err(AudioError("stream volume must be finite".into()));
+        }
+        self.state()?.volume = volume;
+        Ok(())
+    }
+    pub fn volume(&self) -> Result<f32, AudioError> {
+        Ok(self.state()?.volume)
     }
 
     pub fn start(&self) -> Result<(), AudioError> {
@@ -326,6 +357,31 @@ mod tests {
         .unwrap();
         let feed = backend.0.lock().unwrap().take().unwrap();
         (output, feed, ready)
+    }
+
+    #[test]
+    fn stream_volume_applies_to_queued_audio_without_changing_consumption_or_release() {
+        let (output, feed, ready) = output();
+        assert_eq!(output.volume().unwrap(), 1.0);
+        output
+            .append(11, vec![1000, -1000, 32767, -32768, 100, -100])
+            .unwrap();
+        output.start().unwrap();
+        output.set_volume(0.5).unwrap();
+        let mut frame = [0; 2];
+        feed.render(&mut frame);
+        assert_eq!(frame, [500, -500]);
+        output.set_volume(2.0).unwrap();
+        feed.render(&mut frame);
+        assert_eq!(frame, [32767, -32768]);
+        output.set_volume(0.0).unwrap();
+        feed.render(&mut frame);
+        assert_eq!(frame, [0, 0]);
+        assert!(ready.load(Ordering::SeqCst));
+        assert_eq!(output.released(1).unwrap(), [11]);
+        assert_eq!(output.played_frames().unwrap(), 3);
+        assert!(output.set_volume(f32::NAN).is_err());
+        assert_eq!(output.volume().unwrap(), 0.0);
     }
 
     #[test]

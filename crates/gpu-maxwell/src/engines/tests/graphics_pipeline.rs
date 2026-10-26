@@ -7,11 +7,11 @@ fn raw_words_and_shadow_words_preserve_values() {
     let mut channel = three_d_channel();
     let reset = channel
         .three_d_mut()
-        .raw_register(GpuMethodId(0x0dac))
+        .raw_register_value(GpuMethodId(0x0dac))
         .unwrap();
-    assert_eq!(reset.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
-    assert_eq!(reset.raw(), Some(0x1b02));
-    assert_eq!(reset.source(), None);
+
+    assert_eq!(Some(reset), Some(0x1b02));
+
     assert!(
         channel
             .three_d_mut()
@@ -23,7 +23,7 @@ fn raw_words_and_shadow_words_preserve_values() {
         assert!(
             channel
                 .three_d_mut()
-                .raw_register(GpuMethodId(method))
+                .raw_register_value(GpuMethodId(method))
                 .is_none()
         );
         assert!(
@@ -44,10 +44,10 @@ fn raw_words_and_shadow_words_preserve_values() {
         let source = applied.methods().last().unwrap().method().source();
         let raw = channel
             .three_d_mut()
-            .raw_register(GpuMethodId(method))
+            .raw_register_value(GpuMethodId(method))
             .unwrap();
-        assert_eq!(raw.raw(), Some(u32::MAX));
-        assert_eq!(raw.value(), Some(&u32::MAX));
+        assert_eq!(Some(raw), Some(u32::MAX));
+        assert_eq!(Some(&raw), Some(&u32::MAX));
         assert_eq!(
             channel
                 .three_d_mut()
@@ -60,16 +60,16 @@ fn raw_words_and_shadow_words_preserve_values() {
         let rewrite = dispatch_method(&mut channel, method / 4, u32::MAX).unwrap();
         let new_source = rewrite.methods()[0].method().source();
         assert_ne!(source, new_source);
-        assert_eq!(retained.raw_register(GpuMethodId(method)), Some(raw));
+        assert_eq!(retained.raw_register_value(GpuMethodId(method)), Some(raw));
         assert_eq!(
             retained.mme().shadow_value(GpuMethodId(method)),
             Some(u32::MAX)
         );
         let rewritten = channel
             .three_d_mut()
-            .raw_register(GpuMethodId(method))
+            .raw_register_value(GpuMethodId(method))
             .unwrap();
-        assert_eq!(rewritten.raw(), raw.raw());
+        assert_eq!(Some(rewritten), Some(raw));
         assert_eq!(
             channel
                 .three_d_mut()
@@ -89,8 +89,7 @@ fn notification_address_state_arms_a_single_following_no_operation() {
         assert_eq!(
             channel
                 .three_d_mut()
-                .raw_register(GpuMethodId(method))
-                .and_then(|register| register.raw()),
+                .raw_register_value(GpuMethodId(method)),
             Some(value)
         );
     }
@@ -149,22 +148,12 @@ fn z_compression_selector_is_typed_depth_state_without_an_operation() {
     let mut channel = three_d_channel();
     let color_before = channel.three_d().render_targets().color().clone();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .render_targets()
-            .depth_stencil()
-            .compression()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     for (argument, expected) in [
         (0, MaxwellThreeDZCompressionMode::Disabled),
         (1, MaxwellThreeDZCompressionMode::Enabled),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x19cc / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let register = channel
             .three_d()
             .render_targets()
@@ -177,10 +166,10 @@ fn z_compression_selector_is_typed_depth_state_without_an_operation() {
         );
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(expected));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(expected.raw(), argument);
         assert_eq!(channel.three_d().render_targets().color(), &color_before);
         assert_eq!(channel.two_d(), &two_d_before);
@@ -228,26 +217,21 @@ fn color_compression_selectors_are_typed_and_isolated_per_target() {
 
         for state in channel.three_d().render_targets().color().iter() {
             let compression = state.compression();
-            assert_eq!(
-                compression.origin(),
-                MaxwellThreeDRegisterOrigin::VerifiedReset
-            );
+
             assert_eq!(compression.raw(), Some(0));
             assert_eq!(
                 compression.value().copied(),
                 Some(MaxwellThreeDColorCompressionMode::Disabled)
             );
-            assert_eq!(compression.source(), None);
         }
         for index in 0..MAXWELL_COLOR_TARGET_COUNT {
             let raw = channel
                 .three_d_mut()
-                .raw_register(GpuMethodId(0x19e0 + index as u32 * 4))
+                .raw_register_value(GpuMethodId(0x19e0 + index as u32 * 4))
                 .expect("color compression reset must be visible to MME");
-            assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
-            assert_eq!(raw.raw(), Some(0));
-            assert_eq!(raw.value().copied(), Some(0));
-            assert_eq!(raw.source(), None);
+
+            assert_eq!(Some(raw), Some(0));
+            assert_eq!(Some(&raw).copied(), Some(0));
         }
 
         for (argument, expected) in [
@@ -256,7 +240,6 @@ fn color_compression_selectors_are_typed_and_isolated_per_target() {
         ] {
             let method = 0x19e0 + u32::from(target) * 4;
             let dispatch = dispatch_method(&mut channel, method / 4, argument).unwrap();
-            let source = dispatch.methods()[0].method().source();
             let targets = channel.three_d().render_targets().color();
             let register = targets[target as usize].compression();
 
@@ -266,24 +249,20 @@ fn color_compression_selectors_are_typed_and_isolated_per_target() {
             );
 
             assert!(dispatch.operations().is_empty());
-            assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
             assert_eq!(register.raw(), Some(argument));
             assert_eq!(register.value().copied(), Some(expected));
-            assert_eq!(register.source(), Some(source));
+
             assert_eq!(expected.raw(), argument);
             for (other, state) in targets.iter().enumerate() {
                 if other != target as usize {
                     let compression = state.compression();
-                    assert_eq!(
-                        compression.origin(),
-                        MaxwellThreeDRegisterOrigin::VerifiedReset
-                    );
+
                     assert_eq!(compression.raw(), Some(0));
                     assert_eq!(
                         compression.value().copied(),
                         Some(MaxwellThreeDColorCompressionMode::Disabled)
                     );
-                    assert_eq!(compression.source(), None);
                 }
             }
             assert_eq!(
@@ -367,10 +346,7 @@ fn zero_bandwidth_clear_masks_preserve_independent_state_without_gpu_work() {
             };
             assert_eq!(register.raw(), Some(mask));
             assert_eq!(register.value(), Some(&(mask as u16)));
-            assert_eq!(
-                register.source(),
-                Some(dispatch.methods()[0].method().source())
-            );
+
             assert!(draw_identity.matches(channel.three_d()));
             assert!(
                 resource_identities
@@ -404,16 +380,15 @@ fn compression_threshold_is_typed_source_preserving_nonsemantic_policy() {
     ] {
         let dispatch = dispatch_method(&mut channel, 0x1220 / 4, argument).unwrap();
         let method = &dispatch.methods()[0];
-        let source = method.method().source();
         let register = channel.three_d().render_targets().compression_threshold();
 
         assert_eq!(method.metadata().method_name(), "SET_COMPRESSION_THRESHOLD");
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(expected));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(expected.raw(), argument);
         assert_eq!(expected.sample_count(), samples);
         assert_eq!(channel.two_d(), &two_d_before);
@@ -436,7 +411,6 @@ fn color_target_selection_retains_all_fields_for_counts_zero_through_eight() {
     for count in 0..=8 {
         let argument = color_target_selection_raw(count, targets);
         let dispatch = dispatch_method(&mut channel, 0x121c / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let register = channel.three_d().render_targets().color_target_selection();
         let selection = register.value().copied().unwrap();
 
@@ -445,9 +419,9 @@ fn color_target_selection_retains_all_fields_for_counts_zero_through_eight() {
             "SET_CT_SELECT"
         );
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(selection.target_count(), count);
         assert_eq!(selection.targets(), targets);
         assert_eq!(selection.active_targets(), &targets[..usize::from(count)]);
@@ -490,7 +464,6 @@ fn render_target_layer_is_typed_source_preserving_and_consumer_scoped() {
         ),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x15cc / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let value = MaxwellThreeDRenderTargetLayer::new(layer, control);
         let register = channel.three_d().render_targets().render_target_layer();
 
@@ -505,10 +478,9 @@ fn render_target_layer_is_typed_source_preserving_and_consumer_scoped() {
         assert_eq!(value.raw(), argument);
         assert_eq!(value.affects_draw_layering(false), fixed_layering);
         assert_eq!(value.affects_draw_layering(true), geometry_layering);
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&value));
-        assert_eq!(register.source(), Some(source));
     }
 
     program_three_d(&mut channel, 0x15cc, 0);
@@ -605,10 +577,7 @@ fn three_d_register_write_applies_immediately() {
     let before = channel.three_d().clone();
 
     dispatch_first(&mut channel, &decoded).unwrap();
-    assert_eq!(
-        channel.three_d().raster().point_size().origin(),
-        MaxwellThreeDRegisterOrigin::Programmed
-    );
+
     assert_eq!(
         channel.three_d().raster().point_size().raw(),
         Some(0x3fc0_0000)
@@ -724,10 +693,7 @@ fn clear_and_fixed_function_state_preserve_typed_values_and_sources() {
     assert_eq!(clear.horizontal().value().unwrap().min, 10);
     assert_eq!(clear.horizontal().value().unwrap().max, 640);
     assert_eq!(clear.last_surface().value().unwrap().color_mask(), 0xf);
-    assert_eq!(
-        clear.last_surface().source().unwrap().method(),
-        GpuMethodId(0x19d0)
-    );
+
     assert_eq!(
         state
             .fixed_function()
@@ -775,7 +741,6 @@ fn clear_surface_control_is_typed_source_preserving_and_pipeline_neutral() {
             | ((combination & 8) << 9);
         let dispatch = dispatch_method(&mut channel, 0x10f8 / 4, argument).unwrap();
         let method = dispatch.methods()[0];
-        let source = method.method().source();
         let register = channel.three_d().render_targets().clear().surface_control();
         let value = register.value().copied().unwrap();
 
@@ -787,9 +752,9 @@ fn clear_surface_control_is_typed_source_preserving_and_pipeline_neutral() {
         assert_eq!(value.use_clear_rect(), combination & 2 != 0);
         assert_eq!(value.use_scissor_zero(), combination & 4 != 0);
         assert_eq!(value.use_viewport_clip_zero(), combination & 8 != 0);
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(channel.two_d(), &two_d_before);
     }
 }
@@ -852,8 +817,7 @@ fn window_clip_type_is_typed_and_rejects_unknown_values_atomically() {
         (1, MaxwellThreeDWindowClipType::Exclusive),
         (2, MaxwellThreeDWindowClipType::ClipAll),
     ] {
-        let dispatch = dispatch_method(&mut channel, 0x1950 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
+        dispatch_method(&mut channel, 0x1950 / 4, argument).unwrap();
         let register = channel
             .three_d()
             .fixed_function()
@@ -865,7 +829,6 @@ fn window_clip_type_is_typed_and_rejects_unknown_values_atomically() {
             register.value(),
             Some(&MaxwellThreeDFixedFunctionValue::WindowClipType(expected))
         );
-        assert_eq!(register.source(), Some(source));
     }
 
     for argument in [3, 0x8000_0000, u32::MAX] {
@@ -924,7 +887,6 @@ fn window_clip_packet_programs_all_eight_typed_source_preserving_pairs() {
             (true, region.vertical(), region_index * 2 + 1),
         ] {
             let method = dispatch.methods()[word];
-            let source = method.method().source();
             let expected = MaxwellThreeDRectangle {
                 min: (region_index * 10 + usize::from(vertical)) as u16,
                 max: (region_index * 10 + usize::from(vertical) + 100) as u16,
@@ -937,10 +899,8 @@ fn window_clip_packet_programs_all_eight_typed_source_preserving_pairs() {
 
             assert_eq!(method.metadata().method_name(), method_name);
 
-            assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
             assert_eq!(register.raw(), Some(arguments[word]));
             assert_eq!(register.value(), Some(&expected));
-            assert_eq!(register.source(), Some(source));
         }
     }
 }
@@ -975,14 +935,6 @@ fn clip_id_test_enable_is_typed_source_preserving_and_atomic() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
     let window_clip_before = channel.three_d().fixed_function().window_clip().to_owned();
-    assert_eq!(
-        channel
-            .three_d()
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::ClipIdTestEnable)
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     for (argument, expected) in [
         (0, MaxwellThreeDClipIdTestEnable::Disabled),
@@ -990,7 +942,6 @@ fn clip_id_test_enable_is_typed_source_preserving_and_atomic() {
     ] {
         let dispatch = dispatch_method(&mut channel, 0x197c / 4, argument).unwrap();
         let method = dispatch.methods()[0];
-        let source = method.method().source();
         let register = channel
             .three_d()
             .fixed_function()
@@ -1001,10 +952,10 @@ fn clip_id_test_enable_is_typed_source_preserving_and_atomic() {
 
         assert!(dispatch.operations().is_empty());
         assert_eq!(expected.raw(), argument);
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&value));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(
             channel.three_d().fixed_function().window_clip(),
             &window_clip_before
@@ -1054,7 +1005,6 @@ fn viewport_scale_offset_enable_is_typed_source_preserving_and_atomic() {
     ] {
         let dispatch = dispatch_method(&mut channel, 0x192c / 4, argument).unwrap();
         let method = dispatch.methods()[0];
-        let source = method.method().source();
         let register = channel
             .three_d()
             .fixed_function()
@@ -1065,10 +1015,9 @@ fn viewport_scale_offset_enable_is_typed_source_preserving_and_atomic() {
 
         assert!(dispatch.operations().is_empty());
         assert_eq!(expected.raw(), argument);
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&value));
-        assert_eq!(register.source(), Some(source));
     }
 
     for argument in [2, 3, 0x8000_0000, u32::MAX] {
@@ -1108,7 +1057,6 @@ fn mme_ram_loads_capture_typed_programs_with_sources_and_auto_advance() {
     let mut channel = three_d_channel();
 
     let start_dispatch = dispatch_incrementing(&mut channel, 0x011c / 4, &[5, 7]).unwrap();
-    let start_source = start_dispatch.methods()[1].method().source();
     assert_eq!(
         start_dispatch.methods()[0].metadata().method_name(),
         "LOAD_MME_START_ADDRESS_RAM_POINTER"
@@ -1147,14 +1095,12 @@ fn mme_ram_loads_capture_typed_programs_with_sources_and_auto_advance() {
     for (word, expected) in instruction_words.into_iter().enumerate() {
         let address = MaxwellThreeDMmeRamAddress::new(7 + word as u32);
         let register = mme.instruction(address).unwrap();
-        let source = instruction_dispatch.methods()[word + 1].method().source();
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(expected));
         assert_eq!(
             register.value(),
             Some(&MaxwellThreeDMmeInstruction::new(expected))
         );
-        assert_eq!(register.source(), Some(source));
     }
     assert_eq!(mme.start_address_pointer().raw(), Some(5));
     assert_eq!(
@@ -1166,7 +1112,6 @@ fn mme_ram_loads_capture_typed_programs_with_sources_and_auto_advance() {
         .unwrap();
     assert_eq!(start.raw(), Some(7));
     assert_eq!(start.value(), Some(&MaxwellThreeDMmeRamAddress::new(7)));
-    assert_eq!(start.source(), Some(start_source));
 }
 
 #[test]
@@ -1272,18 +1217,11 @@ fn mme_macro_executes_captured_code_and_emits_validated_methods() {
 
     let point_size = channel.three_d().raster().point_size();
     assert_eq!(point_size.raw(), Some(argument));
-    let source = point_size.source().unwrap();
-    assert_eq!(
-        source.location(),
-        dispatch.methods()[0].method().source().location()
-    );
-    assert_eq!(source.method(), GpuMethodId(0x1518));
-    assert_eq!(source.argument(), argument);
+
     assert_eq!(
         channel
             .three_d_mut()
-            .raw_register(GpuMethodId(0x1518))
-            .and_then(|register| register.raw()),
+            .raw_register_value(GpuMethodId(0x1518)),
         Some(argument)
     );
 }
@@ -1333,10 +1271,7 @@ fn mme_emitted_methods_track_replay_and_bypass_the_same_shadow_registers_as_push
 fn mme_replay_restores_firmware_color_target_selection_after_temporary_override() {
     let mut channel = three_d_channel();
     let selection = channel.three_d().render_targets().color_target_selection();
-    assert_eq!(
-        selection.origin(),
-        MaxwellThreeDRegisterOrigin::VerifiedReset
-    );
+
     assert_eq!(selection.raw(), Some(0x0fac_6881));
     assert_eq!(selection.value().unwrap().raw(), 0x0fac_6881);
     let macro_index = 5;
@@ -1414,9 +1349,7 @@ fn shadow_replay_restores_each_color_descriptor_field_to_verified_firmware_value
             assert_eq!(
                 channel
                     .three_d_mut()
-                    .raw_register(GpuMethodId(method))
-                    .unwrap()
-                    .raw(),
+                    .raw_register_value(GpuMethodId(method)),
                 Some(expected),
                 "{method:#x}"
             );
@@ -1532,15 +1465,14 @@ fn mme_reads_polygon_mode_reset_bits_until_guest_programming_overrides_them() {
     ] {
         let raw = channel
             .three_d_mut()
-            .raw_register(GpuMethodId(method))
+            .raw_register_value(GpuMethodId(method))
             .unwrap();
-        assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
-        assert_eq!(raw.raw(), Some(0x1b02));
-        assert_eq!(raw.value(), Some(&0x1b02));
-        assert_eq!(raw.source(), None);
+
+        assert_eq!(Some(raw), Some(0x1b02));
+        assert_eq!(Some(&raw), Some(&0x1b02));
 
         let typed = channel.three_d().fixed_function().register(register);
-        assert_eq!(typed.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
+
         assert_eq!(typed.raw(), Some(0x1b02));
         assert_eq!(
             typed.value(),
@@ -1548,7 +1480,6 @@ fn mme_reads_polygon_mode_reset_bits_until_guest_programming_overrides_them() {
                 MaxwellThreeDPolygonMode::Fill
             ))
         );
-        assert_eq!(typed.source(), None);
     }
 
     let macro_index = 3;
@@ -1567,27 +1498,19 @@ fn mme_reads_polygon_mode_reset_bits_until_guest_programming_overrides_them() {
     program_three_d(&mut channel, 0x0dac, 0x1b02);
     let raw = channel
         .three_d_mut()
-        .raw_register(GpuMethodId(0x0dac))
+        .raw_register_value(GpuMethodId(0x0dac))
         .unwrap();
-    assert_eq!(raw.raw(), Some(0x1b02));
+    assert_eq!(Some(raw), Some(0x1b02));
     let typed = channel
         .three_d()
         .fixed_function()
         .register(MaxwellThreeDFixedFunctionRegister::FrontPolygonMode);
-    assert_eq!(typed.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
     assert_eq!(
         typed.value(),
         Some(&MaxwellThreeDFixedFunctionValue::PolygonMode(
             MaxwellThreeDPolygonMode::Fill,
         ))
-    );
-    assert_eq!(
-        channel
-            .three_d_mut()
-            .raw_register(GpuMethodId(0x0db0))
-            .unwrap()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::VerifiedReset
     );
 }
 
@@ -1609,47 +1532,30 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
         ][pipeline];
         let raw = channel
             .three_d_mut()
-            .raw_register(GpuMethodId(method))
+            .raw_register_value(GpuMethodId(method))
             .unwrap();
-        assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
-        assert_eq!(raw.raw(), Some(header));
-        assert_eq!(raw.value(), Some(&header));
-        assert_eq!(raw.source(), None);
+
+        assert_eq!(Some(raw), Some(header));
+        assert_eq!(Some(&raw), Some(&header));
 
         let binding = &channel.three_d().shader_bindings().pipeline()[pipeline];
-        assert_eq!(
-            binding.enabled().origin(),
-            MaxwellThreeDRegisterOrigin::VerifiedReset
-        );
+
         assert_eq!(binding.enabled().raw(), Some(header));
         assert_eq!(binding.enabled().value(), Some(&(header & 1 != 0)));
-        assert_eq!(binding.enabled().source(), None);
-        assert_eq!(
-            binding.stage().origin(),
-            MaxwellThreeDRegisterOrigin::VerifiedReset
-        );
+
         assert_eq!(binding.stage().raw(), Some(header));
         assert_eq!(binding.stage().value(), Some(&stage));
-        assert_eq!(binding.stage().source(), None);
-        assert_eq!(
-            binding.group().origin(),
-            MaxwellThreeDRegisterOrigin::VerifiedReset
-        );
+
         assert_eq!(binding.group().raw(), Some(u32::from(group)));
         assert_eq!(binding.group().value(), Some(&group));
-        assert_eq!(binding.group().source(), None);
 
         let raw_binding = channel
             .three_d_mut()
-            .raw_register(GpuMethodId(method + 0x10))
+            .raw_register_value(GpuMethodId(method + 0x10))
             .unwrap();
-        assert_eq!(
-            raw_binding.origin(),
-            MaxwellThreeDRegisterOrigin::VerifiedReset
-        );
-        assert_eq!(raw_binding.raw(), Some(u32::from(group)));
-        assert_eq!(raw_binding.value(), Some(&u32::from(group)));
-        assert_eq!(raw_binding.source(), None);
+
+        assert_eq!(Some(raw_binding), Some(u32::from(group)));
+        assert_eq!(Some(&raw_binding), Some(&u32::from(group)));
     }
 
     let macro_index = 4;
@@ -1680,19 +1586,13 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
     program_three_d(&mut channel, 0x20c0, 0x41);
     let raw = channel
         .three_d_mut()
-        .raw_register(GpuMethodId(0x20c0))
+        .raw_register_value(GpuMethodId(0x20c0))
         .unwrap();
-    assert_eq!(raw.raw(), Some(0x41));
+    assert_eq!(Some(raw), Some(0x41));
     let binding = &channel.three_d().shader_bindings().pipeline()[3];
-    assert_eq!(
-        binding.enabled().origin(),
-        MaxwellThreeDRegisterOrigin::Programmed
-    );
+
     assert_eq!(binding.enabled().value(), Some(&true));
-    assert_eq!(
-        binding.stage().origin(),
-        MaxwellThreeDRegisterOrigin::Programmed
-    );
+
     assert_eq!(binding.stage().value(), Some(&MaxwellShaderStage::Geometry));
     assert_eq!(binding.group().value(), Some(&2));
     assert_eq!(binding.effective_group(), Some(2));
@@ -1702,28 +1602,14 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
     );
     program_three_d(&mut channel, 0x20d0, 6);
     let binding = &channel.three_d().shader_bindings().pipeline()[3];
-    assert_eq!(
-        binding.group().origin(),
-        MaxwellThreeDRegisterOrigin::Programmed
-    );
+
     assert_eq!(binding.effective_group(), Some(6));
-    assert_eq!(
-        channel
-            .three_d_mut()
-            .raw_register(GpuMethodId(0x2100))
-            .unwrap()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::VerifiedReset
-    );
 }
 
 #[test]
 fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
     let mut channel = three_d_channel();
-    assert_eq!(
-        channel.three_d_mut().mme().shadow_ram_control().origin(),
-        MaxwellThreeDRegisterOrigin::VerifiedReset
-    );
+
     assert_eq!(
         channel.three_d_mut().mme().shadow_ram_control().value(),
         Some(&MaxwellThreeDMmeShadowRamControl::MethodTrack)
@@ -1754,9 +1640,7 @@ fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
     assert_eq!(
         channel
             .three_d_mut()
-            .raw_register(GpuMethodId(0x0dac))
-            .unwrap()
-            .raw(),
+            .raw_register_value(GpuMethodId(0x0dac)),
         Some(0x1b01)
     );
 
@@ -1767,9 +1651,7 @@ fn mme_shadow_ram_control_tracks_bypasses_replays_and_is_atomic() {
     assert_eq!(
         channel
             .three_d_mut()
-            .raw_register(GpuMethodId(0x0dac))
-            .unwrap()
-            .raw(),
+            .raw_register_value(GpuMethodId(0x0dac)),
         Some(0x1b02)
     );
 
@@ -1806,16 +1688,16 @@ fn depth_layer_reset_is_shared_by_live_state_and_mme_shadow_replay() {
     let mut channel = three_d_channel();
     let reset_state = channel.three_d().clone();
     let layer = reset_state.render_targets().depth_stencil().layer();
-    assert_eq!(layer.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
+
     assert_eq!(layer.raw(), Some(0));
     assert_eq!(layer.value(), Some(&0));
-    assert_eq!(layer.source(), None);
+
     let raw = channel
         .three_d_mut()
-        .raw_register(GpuMethodId(0x179c))
+        .raw_register_value(GpuMethodId(0x179c))
         .unwrap();
-    assert_eq!(raw.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
-    assert_eq!(raw.raw(), Some(0));
+
+    assert_eq!(Some(raw), Some(0));
     // Shadow storage is sparse: an unwritten entry resolves through the shared
     // reset table, as exercised by replay below, without allocating an entry.
     assert!(
@@ -1826,14 +1708,7 @@ fn depth_layer_reset_is_shared_by_live_state_and_mme_shadow_replay() {
             .is_none()
     );
     // The reset is not a target binding and does not initialize other fields.
-    assert_eq!(
-        reset_state
-            .render_targets()
-            .depth_stencil()
-            .format()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
+
     assert!(
         fixture_bindings(
             &reset_state,
@@ -1922,13 +1797,12 @@ fn mme_reset_tracking_preserves_a_complete_color_target_across_passthrough_and_r
         MaxwellThreeDAttachmentReadiness::Ready
     );
     let layer = channel.three_d().render_targets().color()[0].layer();
-    assert_eq!(layer.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
+
     assert_eq!(layer.value(), Some(&0));
     assert_eq!(
         channel
             .three_d_mut()
-            .raw_register(GpuMethodId(0x0820))
-            .and_then(|register| register.raw()),
+            .raw_register_value(GpuMethodId(0x0820)),
         Some(0)
     );
 
@@ -1953,8 +1827,7 @@ fn mme_reset_tracking_preserves_a_complete_color_target_across_passthrough_and_r
         assert_eq!(
             channel
                 .three_d_mut()
-                .raw_register(GpuMethodId(method))
-                .and_then(|register| register.raw()),
+                .raw_register_value(GpuMethodId(method)),
             Some(argument)
         );
     }
@@ -1993,9 +1866,8 @@ fn mme_shadow_replay_uses_the_verified_window_origin_reset() {
         .three_d()
         .fixed_function()
         .register(MaxwellThreeDFixedFunctionRegister::WindowOrigin);
-    assert_eq!(reset.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
+
     assert_eq!(reset.raw(), Some(0));
-    assert_eq!(reset.source(), None);
 
     program_three_d(&mut channel, 0x0124, 3);
     let dispatch = dispatch_method(&mut channel, 0x13ac / 4, 0x10).unwrap();
@@ -2010,16 +1882,12 @@ fn mme_shadow_replay_uses_the_verified_window_origin_reset() {
         .three_d()
         .fixed_function()
         .register(MaxwellThreeDFixedFunctionRegister::WindowOrigin);
-    assert_eq!(
-        window_origin.origin(),
-        MaxwellThreeDRegisterOrigin::Programmed
-    );
+
     assert_eq!(window_origin.raw(), Some(0));
     assert_eq!(
         window_origin.value(),
         Some(&MaxwellThreeDFixedFunctionValue::Mask(0))
     );
-    assert_eq!(window_origin.source(), Some(source));
 
     // Replay consumes the immutable reset without turning it into a tracked
     // guest write.
@@ -2058,9 +1926,7 @@ fn mme_scratch_reads_verified_initial_values_without_defaulting_unknown_register
         assert_eq!(
             channel
                 .three_d_mut()
-                .raw_register(GpuMethodId(method))
-                .unwrap()
-                .raw(),
+                .raw_register_value(GpuMethodId(method)),
             Some(0xcafe_babe)
         );
     }
@@ -2073,7 +1939,6 @@ fn mme_shadow_scratch_family_is_indexed_readable_and_keeps_valid_prefix() {
     for (index, value) in [(0_u8, 0_u32), (1, 0xfeed_beef), (u8::MAX, u32::MAX)] {
         let method = 0x3400 + u32::from(index) * 4;
         let dispatch = dispatch_method(&mut channel, method / 4, value).unwrap();
-        let source = dispatch.methods()[0].method().source();
         assert_eq!(
             dispatch.methods()[0].metadata().method_name(),
             "SET_MME_SHADOW_SCRATCH"
@@ -2084,16 +1949,14 @@ fn mme_shadow_scratch_family_is_indexed_readable_and_keeps_valid_prefix() {
             .mme()
             .shadow_scratch(MaxwellThreeDMmeShadowScratchIndex::new(index))
             .unwrap();
-        assert_eq!(scratch.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(scratch.raw(), Some(value));
         assert_eq!(scratch.value(), Some(&value));
-        assert_eq!(scratch.source(), Some(source));
+
         assert_eq!(
             channel
                 .three_d_mut()
-                .raw_register(GpuMethodId(method))
-                .unwrap()
-                .raw(),
+                .raw_register_value(GpuMethodId(method)),
             Some(value)
         );
     }
@@ -2143,20 +2006,18 @@ fn falcon_call_four_applies_masked_pgraph_writes_and_signals_completion() {
     let register = channel.three_d().falcon().register(address).unwrap();
     assert_eq!(register.known_mask(), 0x00ff_0f00);
     assert_eq!(register.value(), 0x00f0_0500);
-    assert_eq!(register.source(), source);
+
     let completion = channel
         .three_d_mut()
         .mme()
         .shadow_scratch(MaxwellThreeDMmeShadowScratchIndex::new(0))
         .unwrap();
     assert_eq!(completion.raw(), Some(1));
-    assert_eq!(completion.source(), Some(source));
+
     assert_eq!(
         channel
             .three_d_mut()
-            .raw_register(GpuMethodId(0x3400))
-            .unwrap()
-            .raw(),
+            .raw_register_value(GpuMethodId(0x3400)),
         Some(1)
     );
 
@@ -2437,7 +2298,6 @@ fn vertex_assembly_controls_are_typed_source_preserving_and_isolated() {
     let two_d_before = channel.two_d().clone();
 
     let dispatch = dispatch_method(&mut channel, 0x1610 / 4, 0x0e).unwrap();
-    let defaults_source = dispatch.methods()[0].method().source();
     let defaults = channel
         .three_d()
         .vertex_input()
@@ -2450,9 +2310,8 @@ fn vertex_assembly_controls_are_typed_source_preserving_and_isolated() {
         "SET_ATTRIBUTE_DEFAULT"
     );
 
-    assert_eq!(defaults.origin(), MaxwellThreeDRegisterOrigin::Programmed);
     assert_eq!(defaults.raw(), Some(0x0e));
-    assert_eq!(defaults.source(), Some(defaults_source));
+
     assert_eq!(
         value.color_front_diffuse(),
         MaxwellThreeDAttributeDefaultVector::Vector0001
@@ -2487,7 +2346,6 @@ fn vertex_assembly_controls_are_typed_source_preserving_and_isolated() {
     );
 
     let dispatch = dispatch_method(&mut channel, 0x164c / 4, 0x1000).unwrap();
-    let vertex_id_source = dispatch.methods()[0].method().source();
     let input = channel.three_d().vertex_input();
     let vertex_id = input.assembly().vertex_id_uses_array_start();
 
@@ -2496,13 +2354,12 @@ fn vertex_assembly_controls_are_typed_source_preserving_and_isolated() {
         "SET_DA_OUTPUT"
     );
 
-    assert_eq!(vertex_id.origin(), MaxwellThreeDRegisterOrigin::Programmed);
     assert_eq!(vertex_id.raw(), Some(0x1000));
     assert_eq!(
         vertex_id.value(),
         Some(&MaxwellThreeDVertexIdUsesArrayStart::Enabled)
     );
-    assert_eq!(vertex_id.source(), Some(vertex_id_source));
+
     assert_eq!(input.streams(), input_before.streams());
     assert_eq!(input.attributes(), input_before.attributes());
     assert_eq!(input.index(), input_before.index());
@@ -2582,10 +2439,8 @@ fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
     let primitive = channel.three_d().vertex_input().primitive();
     assert!(primitive.is_open());
     assert_eq!(primitive.active_begin().unwrap().topology(), 4);
-    let begin_source = primitive.begin().source().unwrap();
 
     let dispatch = dispatch_method(&mut channel, 0x1614 / 4, 0).unwrap();
-    let source = dispatch.methods()[0].method().source();
     assert_eq!(dispatch.methods()[0].metadata().method_name(), "END");
 
     assert!(dispatch.operations().is_empty());
@@ -2594,14 +2449,9 @@ fn end_closes_the_active_begin_and_preserves_sequence_provenance_atomically() {
     assert!(!primitive.is_open());
     assert_eq!(primitive.active_begin(), None);
     assert_eq!(primitive.begin().value().unwrap().topology(), 4);
-    assert_eq!(primitive.begin().source(), Some(begin_source));
-    assert_eq!(
-        primitive.end().origin(),
-        MaxwellThreeDRegisterOrigin::Programmed
-    );
+
     assert_eq!(primitive.end().raw(), Some(0));
     assert_eq!(primitive.end().value(), Some(&false));
-    assert_eq!(primitive.end().source(), Some(source));
 
     let frontend_before = channel.frontend();
     let two_d_before = channel.two_d().clone();
@@ -2766,7 +2616,6 @@ fn program_region_is_source_preserving_and_only_active_for_shader_pipelines() {
     let two_d_before = channel.two_d().clone();
 
     let lower_dispatch = dispatch_method(&mut channel, 0x160c / 4, 0).unwrap();
-    let lower_source = lower_dispatch.methods()[0].method().source();
     let region = channel.three_d().shader_bindings().program_region();
     assert_eq!(
         lower_dispatch.methods()[0].metadata().method_name(),
@@ -2775,17 +2624,15 @@ fn program_region_is_source_preserving_and_only_active_for_shader_pipelines() {
 
     assert!(region.address().is_none());
     assert_eq!(region.address_lower().raw(), Some(0));
-    assert_eq!(region.address_lower().source(), Some(lower_source));
 
     let upper_dispatch = dispatch_method(&mut channel, 0x1608 / 4, 4).unwrap();
-    let upper_source = upper_dispatch.methods()[0].method().source();
     let region = channel.three_d().shader_bindings().program_region();
     assert_eq!(
         upper_dispatch.methods()[0].metadata().method_name(),
         "SET_PROGRAM_REGION_A"
     );
     assert_eq!(region.address_upper().raw(), Some(4));
-    assert_eq!(region.address_upper().source(), Some(upper_source));
+
     assert_eq!(region.address().unwrap().get(), 0x0000_0004_0000_0000);
     assert_eq!(channel.two_d(), &two_d_before);
 
@@ -2800,7 +2647,6 @@ fn spa_version_is_shared_source_preserving_and_only_active_for_shader_pipelines(
 
     let dispatch = dispatch_method(&mut channel, 0x0310 / 4, 0x0503).unwrap();
     let method = dispatch.methods()[0];
-    let source = method.method().source();
     let register = channel
         .three_d()
         .shader_bindings()
@@ -2815,9 +2661,9 @@ fn spa_version_is_shared_source_preserving_and_only_active_for_shader_pipelines(
     assert_eq!(value.major(), 5);
     assert_eq!(value.minor(), 3);
     assert_eq!(value.raw(), 0x0503);
-    assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
     assert_eq!(register.raw(), Some(0x0503));
-    assert_eq!(register.source(), Some(source));
+
     assert_eq!(channel.two_d(), &two_d_before);
 
     program_three_d(&mut channel, 0x2000, 0x11);
@@ -2910,7 +2756,6 @@ fn vertex_stream_substitute_address_is_typed_source_preserving_and_pipeline_neut
 
     let lower_dispatch = dispatch_method(&mut channel, 0x0f88 / 4, 0x082c_3000).unwrap();
     let lower_method = lower_dispatch.methods()[0];
-    let lower_source = lower_method.method().source();
     assert_eq!(
         lower_method.metadata().method_name(),
         "SET_VERTEX_STREAM_SUBSTITUTE_B"
@@ -2919,11 +2764,9 @@ fn vertex_stream_substitute_address_is_typed_source_preserving_and_pipeline_neut
     let substitute = channel.three_d().vertex_input().stream_substitute();
     assert!(substitute.address().is_none());
     assert_eq!(substitute.address_lower().raw(), Some(0x082c_3000));
-    assert_eq!(substitute.address_lower().source(), Some(lower_source));
 
     let upper_dispatch = dispatch_method(&mut channel, 0x0f84 / 4, 0x7f).unwrap();
     let upper_method = upper_dispatch.methods()[0];
-    let upper_source = upper_method.method().source();
     assert_eq!(
         upper_method.metadata().method_name(),
         "SET_VERTEX_STREAM_SUBSTITUTE_A"
@@ -2931,7 +2774,7 @@ fn vertex_stream_substitute_address_is_typed_source_preserving_and_pipeline_neut
 
     let substitute = channel.three_d().vertex_input().stream_substitute();
     assert_eq!(substitute.address_upper().raw(), Some(0x7f));
-    assert_eq!(substitute.address_upper().source(), Some(upper_source));
+
     assert_eq!(substitute.address().unwrap().get(), 0x7f_082c_3000);
     assert_eq!(channel.two_d(), &two_d_before);
 }
@@ -3011,7 +2854,6 @@ fn tessellation_lod_family_is_source_preserving() {
             0x3f80_0000 + index as u32
         };
         let dispatch = dispatch_method(&mut channel, method / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         assert_eq!(
             dispatch.methods()[0].metadata().method_name(),
             "SET_TESSELLATION_LOD"
@@ -3020,7 +2862,6 @@ fn tessellation_lod_family_is_source_preserving() {
         let register = channel.three_d().shader_bindings().tessellation_lod(level);
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&argument));
-        assert_eq!(register.source(), Some(source));
     }
 
     program_three_d(&mut channel, 0x2080, 0x21);
@@ -3045,7 +2886,6 @@ fn render_target_index_offset_is_typed_source_preserving_and_conditionally_depen
     ] {
         let dispatch = dispatch_method(&mut channel, 0x11f0 / 4, argument).unwrap();
         let method = dispatch.methods()[0];
-        let source = method.method().source();
         let register = channel
             .three_d()
             .render_targets()
@@ -3059,10 +2899,10 @@ fn render_target_index_offset_is_typed_source_preserving_and_conditionally_depen
         assert!(dispatch.operations().is_empty());
         assert_eq!(expected.raw(), argument);
         assert_eq!(expected.enabled(), enabled);
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(expected));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(channel.two_d(), &two_d_before);
     }
 
@@ -3095,10 +2935,7 @@ fn opportunistic_early_z_threshold_retains_sources_and_rejects_reserved_encoding
             .shader_execution()
             .opportunistic_early_z_hysteresis();
         assert_eq!(register.value(), Some(&(raw as u8)));
-        assert_eq!(
-            register.source(),
-            Some(dispatch.methods()[0].method().source())
-        );
+
         assert!(dispatch.ordered_operations().is_empty());
     }
     for raw in [20, 30, 32, u32::MAX] {
@@ -3124,8 +2961,7 @@ fn viewport_firmware_defaults_are_shared_by_live_state_and_shadow_replay() {
     ] {
         let value = channel.three_d().fixed_function().register(register);
         assert_eq!(value.raw(), Some(raw));
-        assert_eq!(value.origin(), MaxwellThreeDRegisterOrigin::VerifiedReset);
-        assert!(value.source().is_none());
+
         assert!(
             channel
                 .three_d_mut()
@@ -3227,6 +3063,86 @@ fn native_draw_fixture() -> NativeDrawFixture {
         shaders,
         vertex,
         fragment_header: header,
+    }
+}
+
+#[test]
+fn native_draw_retains_shader_outputs_with_constant_color_registers_programmed() {
+    use crate::execution::MaxwellFrontend;
+    use nixe_gpu::native::NativeCommand;
+    let NativeDrawFixture {
+        space, mut channel, ..
+    } = native_draw_fixture();
+    let mut frontend = crate::MaxwellNativeFrontend::new(Default::default());
+    let mut previous = None;
+    for enabled in [false, true, false] {
+        for (method, value) in [
+            (0x0f40, u32::from(enabled)),
+            (0x0f44, 1.0_f32.to_bits()),
+            (0x0f48, 0),
+            (0x0f4c, 0),
+            (0x0f50, 1.0_f32.to_bits()),
+        ] {
+            program_three_d(&mut channel, method, value);
+        }
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let draw = &dispatch.operations()[0];
+        let work = frontend
+            .lower_three_d(
+                draw.state(),
+                draw.trigger(),
+                space.memory(),
+                FrontendSubmissionId::new(1),
+                None,
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
+        let NativeCommand::Draw { state, .. } = work.command else {
+            panic!("expected draw")
+        };
+        if let Some(previous) = previous {
+            assert!(Arc::ptr_eq(&previous, &state));
+        }
+        previous = Some(state);
+    }
+    assert_eq!(frontend.statistics.prepared_draws, 1);
+    assert_eq!(frontend.statistics.warm_draws, 2);
+}
+
+#[test]
+fn native_draw_early_fragment_tests_follow_consumed_state_changes() {
+    use crate::execution::MaxwellFrontend;
+    use nixe_gpu::native::NativeCommand;
+    let NativeDrawFixture {
+        space, mut channel, ..
+    } = native_draw_fixture();
+    let mut frontend = crate::MaxwellNativeFrontend::new(Default::default());
+    let mut previous: Option<Arc<nixe_gpu::native::GuestDrawState>> = None;
+    for enabled in [false, true, true, false] {
+        program_three_d(&mut channel, 0x0210, u32::from(enabled));
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let draw = &dispatch.operations()[0];
+        let work = frontend
+            .lower_three_d(
+                draw.state(),
+                draw.trigger(),
+                space.memory(),
+                FrontendSubmissionId::new(1),
+                None,
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
+        let NativeCommand::Draw { state, .. } = work.command else {
+            panic!("expected draw")
+        };
+        assert_eq!(state.parameters.shader_state.force_early_z, enabled);
+        if let Some(previous) = previous {
+            assert_eq!(
+                Arc::ptr_eq(&previous.parameters, &state.parameters),
+                previous.parameters.shader_state.force_early_z == enabled
+            );
+        }
+        previous = Some(state);
     }
 }
 

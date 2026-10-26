@@ -36,10 +36,6 @@ fn disabled_depth_bias_parameters_preserve_float_bits_without_triggering_work() 
                     MaxwellThreeDRawValue::new(bits)
                 ))
             );
-            assert_eq!(
-                value.source(),
-                Some(dispatch.methods()[0].method().source())
-            );
         }
     }
 }
@@ -48,18 +44,9 @@ fn disabled_depth_bias_parameters_preserve_float_bits_without_triggering_work() 
 fn sm_timeout_counter_bit_is_bounded_source_preserving_state() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .shader_execution()
-            .sm_timeout_counter_bit()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     for argument in [0, 0x17, MAXWELL_THREE_D_SM_TIMEOUT_COUNTER_BIT_MAX] {
         let dispatch = dispatch_method(&mut channel, 0x0de4 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let value = MaxwellThreeDSmTimeoutCounterBit::new(argument).unwrap();
         let register = channel
             .three_d()
@@ -72,10 +59,10 @@ fn sm_timeout_counter_bit_is_bounded_source_preserving_state() {
         );
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(u32::from(value.get()), argument);
         assert_eq!(channel.two_d(), &two_d_before);
     }
@@ -110,17 +97,12 @@ fn csaa_enable_is_typed_source_preserving_state_isolated_from_multisample() {
     let mut channel = three_d_channel();
     let fixed_function_before = channel.three_d().fixed_function().clone();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel.three_d().coverage().csaa_enable().origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     for (argument, expected) in [
         (0, MaxwellThreeDCsaaEnable::Disabled),
         (1, MaxwellThreeDCsaaEnable::Enabled),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x15b4 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let register = channel.three_d().coverage().csaa_enable();
 
         assert_eq!(
@@ -129,10 +111,10 @@ fn csaa_enable_is_typed_source_preserving_state_isolated_from_multisample() {
         );
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(expected));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(channel.three_d().fixed_function(), &fixed_function_before);
         assert_eq!(channel.two_d(), &two_d_before);
     }
@@ -149,7 +131,6 @@ fn sample_location_family_preserves_all_coordinates_and_keeps_valid_prefix_on_fa
         MAXWELL_SAMPLE_LOCATION_GROUP_COUNT
     );
     for (group, argument) in arguments.into_iter().enumerate() {
-        let source = dispatch.methods()[group].method().source();
         let register = &channel.three_d().coverage().sample_locations()[group];
         let value = register.value().copied().unwrap();
 
@@ -169,9 +150,8 @@ fn sample_location_family_preserves_all_coordinates_and_keeps_valid_prefix_on_fa
             assert_eq!(location.y(), ((argument >> (index * 8 + 4)) & 0xf) as u8);
         }
         assert_eq!(value.is_centered(), argument == 0x8888_8888);
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
-        assert_eq!(register.source(), Some(source));
     }
     assert!(dispatch.operations().is_empty());
 
@@ -194,18 +174,9 @@ fn ps_output_sample_mask_usage_is_typed_source_preserving_coverage_state() {
     let fixed_function_before = channel.three_d().fixed_function().clone();
     let csaa_before = *channel.three_d().coverage().csaa_enable();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .coverage()
-            .ps_output_sample_mask_usage()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     for argument in 0..=3 {
         let dispatch = dispatch_method(&mut channel, 0x0300 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let register = channel.three_d().coverage().ps_output_sample_mask_usage();
         let value = register.value().copied().unwrap();
 
@@ -228,7 +199,7 @@ fn ps_output_sample_mask_usage_is_typed_source_preserving_coverage_state() {
         );
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(channel.three_d().coverage().csaa_enable(), &csaa_before);
         assert_eq!(channel.three_d().fixed_function(), &fixed_function_before);
         assert_eq!(channel.two_d(), &two_d_before);
@@ -240,19 +211,9 @@ fn ps_output_sample_mask_usage_is_typed_source_preserving_coverage_state() {
 fn primitive_circular_buffer_throttle_is_typed_source_preserving_and_pipeline_neutral() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .vertex_input()
-            .primitive()
-            .circular_buffer_throttle()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     for argument in [0, 1, MAXWELL_THREE_D_PRIMITIVE_AREA_MAX] {
         let dispatch = dispatch_method(&mut channel, 0x02d0 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let register = channel
             .three_d()
             .vertex_input()
@@ -267,7 +228,7 @@ fn primitive_circular_buffer_throttle_is_typed_source_preserving_and_pipeline_ne
 
         assert_eq!(value.primitive_area(), argument);
         assert_eq!(register.raw(), Some(argument));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(channel.two_d(), &two_d_before);
         assert!(dispatch.operations().is_empty());
     }
@@ -279,14 +240,6 @@ fn unorm8_color_reduction_thresholds_are_typed_source_preserving_and_isolated() 
     let fixed_function_before = channel.three_d().fixed_function().clone();
     let render_targets_before = channel.three_d().render_targets().clone();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .color_reduction()
-            .thresholds_unorm8()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     for (argument, all_hit_once, all_covered) in [
         (0, 0, 0),
@@ -295,7 +248,6 @@ fn unorm8_color_reduction_thresholds_are_typed_source_preserving_and_isolated() 
         (0x00ff_00ff, 0xff, 0xff),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x10cc / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let value = MaxwellThreeDColorReductionThresholdsUnorm8::new(
             MaxwellThreeDUnorm8::new(all_hit_once),
             MaxwellThreeDUnorm8::new(all_covered),
@@ -308,10 +260,10 @@ fn unorm8_color_reduction_thresholds_are_typed_source_preserving_and_isolated() 
         );
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(value.raw(), argument);
         assert_eq!(value.all_covered_all_hit_once().raw(), all_hit_once);
         assert_eq!(value.all_covered().raw(), all_covered);
@@ -336,14 +288,6 @@ fn unorm10_color_reduction_thresholds_are_typed_source_preserving_and_independen
     let fixed_function_before = channel.three_d().fixed_function().clone();
     let render_targets_before = channel.three_d().render_targets().clone();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .color_reduction()
-            .thresholds_unorm10()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     for (argument, all_hit_once, all_covered) in [
         (0, 0, 0),
@@ -352,7 +296,6 @@ fn unorm10_color_reduction_thresholds_are_typed_source_preserving_and_independen
         (0x00ff_00ff, 0xff, 0xff),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x10e0 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let value = MaxwellThreeDColorReductionThresholdsUnorm10::new(
             MaxwellThreeDUnorm8::new(all_hit_once),
             MaxwellThreeDUnorm8::new(all_covered),
@@ -365,10 +308,10 @@ fn unorm10_color_reduction_thresholds_are_typed_source_preserving_and_independen
         );
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(value.raw(), argument);
         assert_eq!(value.all_covered_all_hit_once().raw(), all_hit_once);
         assert_eq!(value.all_covered().raw(), all_covered);
@@ -392,14 +335,6 @@ fn unorm16_color_reduction_thresholds_are_typed_source_preserving_and_independen
     let fixed_function_before = channel.three_d().fixed_function().clone();
     let render_targets_before = channel.three_d().render_targets().clone();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .color_reduction()
-            .thresholds_unorm16()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     for (argument, all_hit_once, all_covered) in [
         (0, 0, 0),
@@ -408,7 +343,6 @@ fn unorm16_color_reduction_thresholds_are_typed_source_preserving_and_independen
         (0x00ff_00ff, 0xff, 0xff),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x10e4 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let value = MaxwellThreeDColorReductionThresholdsUnorm16::new(
             MaxwellThreeDUnorm8::new(all_hit_once),
             MaxwellThreeDUnorm8::new(all_covered),
@@ -421,10 +355,10 @@ fn unorm16_color_reduction_thresholds_are_typed_source_preserving_and_independen
         );
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(value.raw(), argument);
         assert_eq!(value.all_covered_all_hit_once().raw(), all_hit_once);
         assert_eq!(value.all_covered().raw(), all_covered);
@@ -461,14 +395,6 @@ fn fp16_color_reduction_thresholds_are_typed_source_preserving_and_independent()
     let fixed_function_before = channel.three_d().fixed_function().clone();
     let render_targets_before = channel.three_d().render_targets().clone();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .color_reduction()
-            .thresholds_fp16()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     for (argument, all_hit_once, all_covered) in [
         (0, 0, 0),
@@ -477,7 +403,6 @@ fn fp16_color_reduction_thresholds_are_typed_source_preserving_and_independent()
         (0x00ff_00ff, 0xff, 0xff),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x10ec / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let value = MaxwellThreeDColorReductionThresholdsFp16::new(
             MaxwellThreeDColorReductionFp16Threshold::new(all_hit_once),
             MaxwellThreeDColorReductionFp16Threshold::new(all_covered),
@@ -490,10 +415,10 @@ fn fp16_color_reduction_thresholds_are_typed_source_preserving_and_independent()
         );
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(value.raw(), argument);
         assert_eq!(value.all_covered_all_hit_once().raw(), all_hit_once);
         assert_eq!(value.all_covered().raw(), all_covered);
@@ -529,14 +454,6 @@ fn srgb8_color_reduction_thresholds_are_typed_source_preserving_and_independent(
     let fixed_function_before = channel.three_d().fixed_function().clone();
     let render_targets_before = channel.three_d().render_targets().clone();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .color_reduction()
-            .thresholds_srgb8()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     for (argument, all_hit_once, all_covered) in [
         (0, 0, 0),
@@ -545,7 +462,6 @@ fn srgb8_color_reduction_thresholds_are_typed_source_preserving_and_independent(
         (0x00ff_00ff, 0xff, 0xff),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x10f0 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let value = MaxwellThreeDColorReductionThresholdsSrgb8::new(
             MaxwellThreeDColorReductionSrgb8Threshold::new(all_hit_once),
             MaxwellThreeDColorReductionSrgb8Threshold::new(all_covered),
@@ -558,10 +474,10 @@ fn srgb8_color_reduction_thresholds_are_typed_source_preserving_and_independent(
         );
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(value.raw(), argument);
         assert_eq!(value.all_covered_all_hit_once().raw(), all_hit_once);
         assert_eq!(value.all_covered().raw(), all_covered);
@@ -707,7 +623,6 @@ fn patch_size_is_typed_source_preserving_and_reserved_bits_are_atomic() {
 
     for argument in [0, 1, 3, 32, 0xff] {
         let dispatch = dispatch_method(&mut channel, 0x0dcc / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let value = MaxwellThreeDPatchSize::new(argument as u8);
         let register = channel.three_d().vertex_input().primitive().patch_size();
 
@@ -716,10 +631,9 @@ fn patch_size_is_typed_source_preserving_and_reserved_bits_are_atomic() {
         assert!(dispatch.operations().is_empty());
         assert_eq!(value.control_points(), argument as u8);
         assert_eq!(value.raw(), argument);
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&value));
-        assert_eq!(register.source(), Some(source));
     }
 
     for argument in [0x100, 0x8000_0000, u32::MAX] {
@@ -776,10 +690,7 @@ fn iterated_blend_family_is_typed_source_preserving_and_disabled_pipeline_neutra
     assert!(!value.enabled());
     assert_eq!(value.raw(), 0);
     assert_eq!(controls.iterated_blend().raw(), Some(0));
-    assert_eq!(
-        controls.iterated_blend().source(),
-        Some(dispatch.methods()[0].method().source())
-    );
+
     let pass_count = controls
         .iterated_blend_pass_count()
         .value()
@@ -788,10 +699,7 @@ fn iterated_blend_family_is_typed_source_preserving_and_disabled_pipeline_neutra
     assert_eq!(pass_count.pass_count(), 5);
     assert_eq!(pass_count.raw(), 5);
     assert_eq!(controls.iterated_blend_pass_count().raw(), Some(5));
-    assert_eq!(
-        controls.iterated_blend_pass_count().source(),
-        Some(dispatch.methods()[1].method().source())
-    );
+
     assert_eq!(
         channel.three_d().fixed_function().single_rop_control(),
         &ordinary_blend_before
@@ -807,7 +715,6 @@ fn edge_flag_state_is_typed_source_preserving_and_atomic() {
         (1, MaxwellThreeDEdgeFlag::Enabled),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x15e4 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let register = channel.three_d().raster().edge_flag();
 
         assert_eq!(
@@ -816,8 +723,6 @@ fn edge_flag_state_is_typed_source_preserving_and_atomic() {
         );
         assert_eq!(register.value(), Some(&expected));
         assert_eq!(register.raw(), Some(expected.raw()));
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
-        assert_eq!(register.source(), Some(source));
     }
 
     let frontend_before = channel.frontend();
@@ -851,15 +756,6 @@ fn edge_flag_state_is_typed_source_preserving_and_atomic() {
 fn vertex_array_restart_is_typed_source_preserving_and_isolated_from_indexed_restart() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .vertex_input()
-            .primitive()
-            .vertex_array_restart_enabled()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     program_three_d(&mut channel, 0x1644, 1);
     program_three_d(&mut channel, 0x1648, 0xfeed_beef);
@@ -881,7 +777,6 @@ fn vertex_array_restart_is_typed_source_preserving_and_isolated_from_indexed_res
         (1, MaxwellThreeDVertexArrayPrimitiveRestartEnable::Enabled),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x0de8 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let primitive = channel.three_d().vertex_input().primitive();
         let register = primitive.vertex_array_restart_enabled();
 
@@ -891,10 +786,10 @@ fn vertex_array_restart_is_typed_source_preserving_and_isolated_from_indexed_res
         );
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(expected));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(expected.raw(), argument);
         assert_eq!(primitive.restart_enabled(), &indexed_enable_before);
         assert_eq!(primitive.restart_index(), &indexed_index_before);
@@ -967,21 +862,12 @@ fn shade_mode_is_typed_and_source_preserving() {
         .register(MaxwellThreeDFixedFunctionRegister::DepthTestEnable)
         .to_owned();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::ShadeMode)
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     for (argument, expected) in [
         (0x1d00, MaxwellThreeDShadeMode::Flat),
         (0x1d01, MaxwellThreeDShadeMode::Smooth),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x12d4 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let register = channel
             .three_d()
             .fixed_function()
@@ -993,13 +879,13 @@ fn shade_mode_is_typed_and_source_preserving() {
         );
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(
             register.value().copied(),
             Some(MaxwellThreeDFixedFunctionValue::ShadeMode(expected))
         );
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(expected.raw(), argument);
         assert_eq!(
             channel
@@ -1074,7 +960,6 @@ fn blend_controls_are_typed_source_preserving_and_family_isolated() {
             .blend_controls()
             .zero_times_anything_is_zero();
         let dispatch = dispatch_method(&mut channel, 0x1140 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let fixed = channel.three_d().fixed_function();
         let register = fixed.blend_controls().per_format_enable();
 
@@ -1083,10 +968,9 @@ fn blend_controls_are_typed_source_preserving_and_family_isolated() {
             "SET_BLEND_PER_FORMAT_ENABLE"
         );
 
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(value.raw(), argument);
         assert_eq!(
             fixed.blend_controls().float_pixel_kill_enable(),
@@ -1113,7 +997,6 @@ fn blend_controls_are_typed_source_preserving_and_family_isolated() {
             .blend_controls()
             .zero_times_anything_is_zero();
         let dispatch = dispatch_method(&mut channel, 0x0fdc / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let fixed = channel.three_d().fixed_function();
         let register = fixed.blend_controls().float_pixel_kill_enable();
 
@@ -1122,10 +1005,9 @@ fn blend_controls_are_typed_source_preserving_and_family_isolated() {
             "SET_BLEND_OPT_CONTROL"
         );
 
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(value.raw(), argument);
         assert_eq!(
             fixed.blend_controls().per_format_enable(),
@@ -1152,7 +1034,6 @@ fn blend_controls_are_typed_source_preserving_and_family_isolated() {
             .blend_controls()
             .float_pixel_kill_enable();
         let dispatch = dispatch_method(&mut channel, 0x19c0 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let fixed = channel.three_d().fixed_function();
         let register = fixed.blend_controls().zero_times_anything_is_zero();
 
@@ -1161,10 +1042,9 @@ fn blend_controls_are_typed_source_preserving_and_family_isolated() {
             "SET_BLEND_FLOAT_OPTION"
         );
 
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(value));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(value.raw(), argument);
         assert_eq!(
             fixed.blend_controls().per_format_enable(),
@@ -1215,21 +1095,12 @@ fn single_rop_control_is_typed_source_preserving_and_family_isolated() {
     let per_target_enable_before = *channel.three_d().fixed_function().blend_enable();
     let per_target_state_before = *channel.three_d().fixed_function().per_target_blend();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .fixed_function()
-            .single_rop_control()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::VerifiedReset
-    );
 
     for (argument, expected) in [
         (0, MaxwellThreeDSingleRopControl::Disabled),
         (1, MaxwellThreeDSingleRopControl::Enabled),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x135c / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let fixed = channel.three_d().fixed_function();
         let register = fixed.single_rop_control();
 
@@ -1239,10 +1110,10 @@ fn single_rop_control_is_typed_source_preserving_and_family_isolated() {
         );
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(expected));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(expected.raw(), argument);
         assert_eq!(
             fixed.register(MaxwellThreeDFixedFunctionRegister::BlendPerTargetEnable),
@@ -1313,21 +1184,12 @@ fn aliased_line_width_selector_is_typed_source_preserving_isolated_state() {
     let fixed_function_before = channel.three_d().fixed_function().clone();
     let coverage_before = channel.three_d().coverage().clone();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .line()
-            .aliased_line_width_enable()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::Unset
-    );
 
     for (argument, expected) in [
         (0, MaxwellThreeDAliasedLineWidthEnable::Disabled),
         (1, MaxwellThreeDAliasedLineWidthEnable::Enabled),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x020c / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let register = channel.three_d().line().aliased_line_width_enable();
 
         assert_eq!(
@@ -1336,10 +1198,10 @@ fn aliased_line_width_selector_is_typed_source_preserving_isolated_state() {
         );
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(expected));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(channel.three_d().fixed_function(), &fixed_function_before);
         assert_eq!(channel.three_d().coverage(), &coverage_before);
         assert_eq!(channel.two_d(), &two_d_before);
@@ -1351,14 +1213,6 @@ fn polygon_clip_generated_edge_is_typed_source_preserving_line_state() {
     let mut channel = three_d_channel();
     let fixed_function_before = channel.three_d().fixed_function().clone();
     let two_d_before = channel.two_d().clone();
-    assert_eq!(
-        channel
-            .three_d()
-            .line()
-            .polygon_clip_generated_edge()
-            .origin(),
-        MaxwellThreeDRegisterOrigin::VerifiedReset
-    );
 
     for (argument, expected) in [
         (0, MaxwellThreeDPolygonClipGeneratedEdge::DrawLine),
@@ -1366,7 +1220,6 @@ fn polygon_clip_generated_edge_is_typed_source_preserving_line_state() {
     ] {
         let dispatch = dispatch_method(&mut channel, 0x0f8c / 4, argument).unwrap();
         let method = &dispatch.methods()[0];
-        let source = method.method().source();
         let register = channel.three_d().line().polygon_clip_generated_edge();
 
         assert_eq!(
@@ -1375,10 +1228,10 @@ fn polygon_clip_generated_edge_is_typed_source_preserving_line_state() {
         );
 
         assert!(dispatch.operations().is_empty());
-        assert_eq!(register.origin(), MaxwellThreeDRegisterOrigin::Programmed);
+
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value().copied(), Some(expected));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(expected.raw(), argument);
         assert_eq!(channel.three_d().fixed_function(), &fixed_function_before);
         assert_eq!(channel.two_d(), &two_d_before);
@@ -1432,19 +1285,16 @@ fn tir_mode_and_controls_are_typed_source_preserving_state() {
         (1, MaxwellThreeDTirMode::RasterNTargetM),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x0fb4 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let register = channel.three_d().coverage().tir_mode();
 
         assert_eq!(dispatch.methods()[0].metadata().method_name(), "SET_TIR");
 
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&expected));
-        assert_eq!(register.source(), Some(source));
     }
 
     for argument in [0, 1, 2, 3, 0x10, 0x11, 0x12, 0x13] {
         let dispatch = dispatch_method(&mut channel, 0x1130 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let register = channel.three_d().coverage().tir_control();
         let value = register.value().copied().unwrap();
 
@@ -1462,7 +1312,6 @@ fn tir_mode_and_controls_are_typed_source_preserving_state() {
             value.alpha_to_coverage_uses_raster_samples(),
             argument & 0x10 != 0
         );
-        assert_eq!(register.source(), Some(source));
     }
 
     for (argument, expected) in [
@@ -1475,7 +1324,6 @@ fn tir_mode_and_controls_are_typed_source_preserving_state() {
         (3, MaxwellThreeDTirModulationComponentSelect::ModulateRgba),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x0fd4 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let register = channel.three_d().coverage().tir_modulation();
 
         assert_eq!(
@@ -1485,7 +1333,7 @@ fn tir_mode_and_controls_are_typed_source_preserving_state() {
 
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&expected));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(expected.raw(), argument);
     }
 
@@ -1494,7 +1342,6 @@ fn tir_mode_and_controls_are_typed_source_preserving_state() {
         (1, MaxwellThreeDTirModulationFunction::Table),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x0fd8 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let register = channel.three_d().coverage().tir_modulation_function();
 
         assert_eq!(
@@ -1504,7 +1351,7 @@ fn tir_mode_and_controls_are_typed_source_preserving_state() {
 
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&expected));
-        assert_eq!(register.source(), Some(source));
+
         assert_eq!(expected.raw(), argument);
     }
 }
@@ -1517,7 +1364,6 @@ fn coverage_output_controls_are_typed_source_preserving_state() {
         for enabled in [false, true] {
             let argument = (color_target << 4) | u32::from(enabled);
             let dispatch = dispatch_method(&mut channel, 0x11f8 / 4, argument).unwrap();
-            let source = dispatch.methods()[0].method().source();
             let register = channel.three_d().coverage().coverage_to_color();
             let value = register.value().copied().unwrap();
 
@@ -1529,13 +1375,11 @@ fn coverage_output_controls_are_typed_source_preserving_state() {
             assert_eq!(value.color_target(), color_target as u8);
             assert_eq!(value.raw(), argument);
             assert_eq!(register.raw(), Some(argument));
-            assert_eq!(register.source(), Some(source));
         }
     }
 
     for argument in 0..4 {
         let dispatch = dispatch_method(&mut channel, 0x16b4 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
         let register = channel.three_d().coverage().alpha_to_coverage_override();
         let value = register.value().copied().unwrap();
 
@@ -1550,6 +1394,5 @@ fn coverage_output_controls_are_typed_source_preserving_state() {
         );
         assert_eq!(value.raw(), argument);
         assert_eq!(register.raw(), Some(argument));
-        assert_eq!(register.source(), Some(source));
     }
 }

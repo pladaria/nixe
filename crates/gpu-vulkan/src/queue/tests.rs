@@ -208,7 +208,7 @@ fn exercise_reuse(api: crate::ApiPreference) {
     let usage = device.queue_usage();
     assert_eq!(
         (
-            usage.command_pools,
+            usage.command_slots,
             usage.retired_buffers,
             usage.retired_images
         ),
@@ -217,11 +217,11 @@ fn exercise_reuse(api: crate::ApiPreference) {
     assert!(
         matches!(device.enqueue_buffer_readback(&bytes), Err(VulkanError::QueuePressure { pending: Some(ticket), .. }) if ticket == first_work)
     );
-    let pools: Vec<_> = device
+    let slots: Vec<_> = device
         .submission
         .slots
         .iter()
-        .map(|slot| slot.pool)
+        .map(|slot| Arc::as_ptr(&slot.native))
         .collect();
     gate.signal();
     assert!(
@@ -253,16 +253,16 @@ fn exercise_reuse(api: crate::ApiPreference) {
         let pattern: Vec<_> = bytes.iter().map(|byte| byte.wrapping_add(cycle)).collect();
         let readback = device.enqueue_buffer_readback(&pattern).unwrap();
         assert_eq!(device.readback(readback).unwrap(), pattern);
-        assert_eq!(device.queue_usage().command_pools, 2);
+        assert_eq!(device.queue_usage().command_slots, 2);
         assert_eq!(device.queue_usage().arena_capacity, 4096);
         assert_eq!(
             device
                 .submission
                 .slots
                 .iter()
-                .map(|slot| slot.pool)
+                .map(|slot| Arc::as_ptr(&slot.native))
                 .collect::<Vec<_>>(),
-            pools
+            slots
         );
     }
     assert!(device.readback(stale).is_err());
@@ -339,7 +339,7 @@ fn native_recording_waits_for_actual_slot_capacity_without_growing_the_budget() 
         released.load(std::sync::atomic::Ordering::Acquire),
         "capacity cannot recycle before the actual GPU dependency"
     );
-    assert_eq!(device.queue_usage().command_pools, 1);
+    assert_eq!(device.queue_usage().command_slots, 1);
     let next = device.work_ticket().unwrap();
     assert!(next.tick() > first.tick());
     device.flush().unwrap();
@@ -389,10 +389,11 @@ fn staging_pressure_is_bounded_and_unread_bytes_survive_completion() {
     ));
     assert_eq!(device.readback(second).unwrap(), [0xa7; 512]);
     assert_eq!(device.queue_usage().overflow_capacity, 0);
-    assert!(matches!(
-        device.enqueue_buffer_readback(&[0; 2048]),
-        Err(VulkanError::StagingRequestTooLarge { .. })
-    ));
+    let large = device.enqueue_buffer_readback(&[0x49; 2048]).unwrap();
+    assert_eq!(device.queue_usage().overflow_capacity, 0);
+    assert_eq!(device.queue_usage().oversized_capacity, 4096);
+    assert_eq!(device.readback(large).unwrap(), [0x49; 2048]);
+    assert_eq!(device.queue_usage().oversized_capacity, 0);
     assert_eq!(
         device.transfer_round_trip(&[0x5c; 257]).unwrap(),
         [0x5c; 257]
@@ -492,7 +493,6 @@ fn staging_overflow_suballocates_small_transfers_and_preserves_unread_slices() {
         let slot = &device.submission.slots[index];
         unsafe {
             device.dispatch.cmd_copy_buffer(
-                slot.command,
                 slot.upload_buffer(source).handle,
                 slot.readback_buffer(destination).handle,
                 &[vk::BufferCopy::default()
@@ -552,7 +552,147 @@ fn prior_native_use_retires_after_a_later_failure_without_submitting_dependent_t
     assert!(device.shutdown().is_err());
     assert_eq!(device.queue_usage().submitted_tick, a.tick());
     assert_eq!(device.queue_usage().completed_tick, a.tick());
-    assert_eq!(device.queue_usage().command_pools, 0);
+    assert_eq!(device.queue_usage().command_slots, 0);
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+fn each_in_flight_slot_has_its_own_staging_budget() {
+    let Some(mut device) = small_device(
+        crate::ApiPreference::Auto,
+        QueueConfiguration {
+            command_slots: 2,
+            arena_bytes: 512,
+            overflow_bytes: 1024,
+        },
+    ) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let mut gate = Gate::new(&device);
+    let mut reads = Vec::new();
+    for value in [0x19, 0x37] {
+        reads.push((
+            value,
+            device.enqueue_buffer_readback(&[value; 512]).unwrap(),
+        ));
+    }
+    let first = unsafe {
+        device.submission.flush(
+            device.queue,
+            &mut device.dispatch,
+            &[vk::SemaphoreSubmitInfo::default()
+                .semaphore(gate.handle)
+                .value(1)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)],
+            &[],
+        )
+    }
+    .unwrap()
+    .unwrap();
+    gate.last_use = first.tick();
+    for value in [0x51, 0xa7] {
+        reads.push((
+            value,
+            device.enqueue_buffer_readback(&[value; 512]).unwrap(),
+        ));
+    }
+    assert_eq!(device.queue_usage().command_slots, 2);
+    assert_eq!(device.queue_usage().overflow_capacity, 2048);
+    assert!(matches!(
+        device.enqueue_buffer_readback(&[0; 512]),
+        Err(VulkanError::QueuePressure { .. })
+    ));
+    device.flush().unwrap();
+    gate.signal();
+    for (value, read) in reads {
+        assert_eq!(device.readback(read).unwrap(), [value; 512]);
+    }
+    assert_eq!(device.queue_usage().overflow_capacity, 0);
+    drop(gate);
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[cfg(feature = "performance-counters")]
+#[test]
+fn full_chunks_record_without_submitting_and_queue_pressure_needs_no_owner_callback() {
+    let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let first = device.work_ticket().unwrap();
+    let queued_chunks = || {
+        nixe_gpu::metrics::snapshot()
+            .into_iter()
+            .find(|(name, _)| *name == "NativeQueuedChunks")
+            .unwrap()
+            .1
+    };
+    let initial_chunks = queued_chunks();
+    let mutex = Arc::clone(&device.owner.queue_mutex);
+    let (held, ready) = std::sync::mpsc::sync_channel(1);
+    let mut reads = Vec::new();
+    std::thread::scope(|scope| {
+        let blocked_worker = scope.spawn(move || {
+            let _lock = mutex.lock().unwrap();
+            held.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            // One active submit, eight queued chunks, and a pending handoff.
+            while queued_chunks() < initial_chunks + 10 {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            true
+        });
+        ready.recv().unwrap();
+        device.flush().unwrap();
+        for index in 0..300 {
+            let value = (index % 251) as u8;
+            reads.push((value, device.enqueue_buffer_readback(&[value; 16]).unwrap()));
+        }
+        assert_eq!(
+            device.scheduled_tick(),
+            first.tick(),
+            "full recording chunks must not seal a batch"
+        );
+        assert_eq!(device.queue_usage().command_slots, 2);
+        device.flush().unwrap();
+        assert!(
+            blocked_worker.join().unwrap(),
+            "the worker gate must fill the bounded chunk queue"
+        );
+    });
+    for (value, read) in reads {
+        assert_eq!(device.readback(read).unwrap(), [value; 16]);
+    }
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+fn recording_chunk_fullness_does_not_seal_a_native_batch() {
+    let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let mut reads = Vec::new();
+    for value in 0..64u8 {
+        reads.push((value, device.enqueue_buffer_readback(&[value; 16]).unwrap()));
+    }
+    assert_eq!(device.scheduled_tick(), 0);
+    assert_eq!(device.queue_usage().submitted_tick, 0);
+    assert!(
+        reads
+            .iter()
+            .all(|(_, ticket)| ticket.work() == reads[0].1.work())
+    );
+    for (value, ticket) in reads {
+        assert_eq!(device.readback(ticket).unwrap(), [value; 16]);
+    }
     drop(device);
     validation.check().unwrap();
 }

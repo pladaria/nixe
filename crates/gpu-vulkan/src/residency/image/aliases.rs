@@ -179,7 +179,6 @@ impl VulkanResidency {
                 self.barriers.emit(&mut self.device);
                 unsafe {
                     self.device.dispatch.cmd_copy_buffer(
-                        self.device.submission.slots[slot].command,
                         self.device.submission.slots[slot]
                             .upload_buffer(slice)
                             .handle,
@@ -203,26 +202,23 @@ impl VulkanResidency {
                 )?;
             }
             let native = self.buffer(source)?.native.handle;
-            let slot = self.device.begin_recording()?;
+            self.device.begin_recording()?;
             let work = self.device.work_ticket()?;
             self.device.retire_buffer(Arc::clone(&scratch), work)?;
             self.barriers.emit(&mut self.device);
             unsafe {
-                self.device.dispatch.cmd_copy_buffer(
-                    self.device.submission.slots[slot].command,
-                    native,
-                    scratch.handle,
-                    &copies,
-                );
+                self.device
+                    .dispatch
+                    .cmd_copy_buffer(native, scratch.handle, &copies);
             }
             self.statistics.gpu_copied_bytes += copies.iter().map(|c| c.size).sum::<u64>();
         }
         for (source, copies) in images {
             self.copy_image_bytes(source, &scratch, &copies)?;
         }
-        let slot = self.device.begin_recording()?;
-        let command = self.device.submission.slots[slot].command;
-        scratch_read_barrier(&mut self.device, command, scratch.handle, scratch_bytes);
+        self.device.begin_recording()?;
+
+        scratch_read_barrier(&mut self.device, scratch.handle, scratch_bytes);
         self.copy_rows_to_image(&scratch, base, id, &dirty)
     }
 
@@ -236,7 +232,7 @@ impl VulkanResidency {
     ) -> Result<bool, VulkanError> {
         let target = self.image(id)?;
         let mut groups = rustc_hash::FxHashMap::<
-            (ImageId, u32, u32, u32, u32, u32),
+            (ImageId, u32, u32, u32, u32, u32, u32, u32),
             (ImagePlane, ImagePlane, Vec<vk::ImageCopy>),
         >::default();
         for part in parts {
@@ -324,12 +320,12 @@ impl VulkanResidency {
                     .src_offset(vk::Offset3D {
                         x: sx as i32,
                         y: sy as i32,
-                        z: 0,
+                        z: src.depth_slice as i32,
                     })
                     .dst_offset(vk::Offset3D {
                         x: dx as i32,
                         y: dy as i32,
-                        z: 0,
+                        z: dst.depth_slice as i32,
                     })
                     .extent(vk::Extent3D {
                         width,
@@ -342,8 +338,10 @@ impl VulkanResidency {
                         src.aspect.as_raw(),
                         src.mip_level,
                         src.array_layer,
+                        src.depth_slice,
                         dst.mip_level,
                         dst.array_layer,
+                        dst.depth_slice,
                     ))
                     .or_insert_with(|| (src, dst, Vec::new()))
                     .2
@@ -355,60 +353,67 @@ impl VulkanResidency {
         }
         for ((source, ..), (src, dst, mut copies)) in groups {
             coalesce_copies(&mut copies);
-            let (native, layout) = self.image_access_subresources(
-                source,
-                commands::plane_range(src),
-                AccessScope::new(
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_READ,
-                ),
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            )?;
-            let (target, target_layout) = self.image_access_subresources(
-                id,
-                commands::plane_range(dst),
-                AccessScope::new(
-                    vk::PipelineStageFlags2::COPY,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                ),
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            )?;
-            let slot = self.device.begin_recording()?;
-            self.barriers.emit(&mut self.device);
-            unsafe {
-                self.device.dispatch.cmd_copy_image(
-                    self.device.submission.slots[slot].command,
-                    native,
-                    layout,
-                    target,
-                    target_layout,
-                    &copies,
-                );
-            }
-            self.statistics.alias_copy_commands += 1;
-            self.statistics.alias_copy_regions += copies.len() as u64;
-            for copy in copies {
-                self.define_image_rect(
-                    id,
-                    dst,
-                    vk::Rect2D {
-                        offset: vk::Offset2D {
-                            x: copy.dst_offset.x,
-                            y: copy.dst_offset.y,
-                        },
-                        extent: vk::Extent2D {
-                            width: copy.extent.width,
-                            height: copy.extent.height,
-                        },
-                    },
-                );
-                self.statistics.gpu_copied_bytes +=
-                    u64::from(copy.extent.width.div_ceil(dst.block_extent.width))
-                        * u64::from(copy.extent.height.div_ceil(dst.block_extent.height))
-                        * u64::from(dst.bytes_per_block);
-            }
+            self.copy_alias_regions(source, src, id, dst, &copies)?;
         }
         Ok(true)
+    }
+
+    pub(super) fn copy_alias_regions(
+        &mut self,
+        source: ImageId,
+        src: ImagePlane,
+        id: ImageId,
+        dst: ImagePlane,
+        copies: &[vk::ImageCopy],
+    ) -> Result<(), VulkanError> {
+        let (native, layout) = self.image_access_subresources(
+            source,
+            commands::plane_range(src),
+            AccessScope::new(
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_READ,
+            ),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        )?;
+        let (target, target_layout) = self.image_access_subresources(
+            id,
+            commands::plane_range(dst),
+            AccessScope::new(
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            ),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        )?;
+        self.device.begin_recording()?;
+        self.barriers.emit(&mut self.device);
+        unsafe {
+            self.device
+                .dispatch
+                .cmd_copy_image(native, layout, target, target_layout, copies);
+        }
+        self.statistics.alias_copy_commands += 1;
+        self.statistics.alias_copy_regions += copies.len() as u64;
+        for copy in copies {
+            self.define_image_rect(
+                id,
+                dst,
+                vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: copy.dst_offset.x,
+                        y: copy.dst_offset.y,
+                    },
+                    extent: vk::Extent2D {
+                        width: copy.extent.width,
+                        height: copy.extent.height,
+                    },
+                },
+            );
+            self.statistics.gpu_copied_bytes +=
+                u64::from(copy.extent.width.div_ceil(dst.block_extent.width))
+                    * u64::from(copy.extent.height.div_ceil(dst.block_extent.height))
+                    * u64::from(dst.bytes_per_block);
+        }
+        Ok(())
     }
 }
 

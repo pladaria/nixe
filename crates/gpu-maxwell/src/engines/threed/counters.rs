@@ -73,12 +73,11 @@ impl MaxwellThreeDCounterState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDCounterStateWrite) {
         match write {
-            MaxwellThreeDCounterStateWrite::StatisticsEnable { value, source } => {
-                self.statistics_enable = MaxwellThreeDRegister::programmed(value, value, source);
+            MaxwellThreeDCounterStateWrite::StatisticsEnable { value, source: _ } => {
+                self.statistics_enable = MaxwellThreeDRegister::decoded(value, value);
             }
-            MaxwellThreeDCounterStateWrite::ZPassPixelCountEnable { value, source } => {
-                self.zpass_pixel_count_enable =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDCounterStateWrite::ZPassPixelCountEnable { value, source: _ } => {
+                self.zpass_pixel_count_enable = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
         }
     }

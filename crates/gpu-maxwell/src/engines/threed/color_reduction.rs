@@ -416,28 +416,23 @@ impl MaxwellThreeDColorReductionState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDColorReductionStateWrite) {
         match write {
-            MaxwellThreeDColorReductionStateWrite::Enable { value, source } => {
-                self.enable = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDColorReductionStateWrite::Enable { value, source: _ } => {
+                self.enable = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm8 { value, source } => {
-                self.thresholds_unorm8 =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm8 { value, source: _ } => {
+                self.thresholds_unorm8 = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm10 { value, source } => {
-                self.thresholds_unorm10 =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm10 { value, source: _ } => {
+                self.thresholds_unorm10 = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm16 { value, source } => {
-                self.thresholds_unorm16 =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm16 { value, source: _ } => {
+                self.thresholds_unorm16 = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDColorReductionStateWrite::ThresholdsFp16 { value, source } => {
-                self.thresholds_fp16 =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDColorReductionStateWrite::ThresholdsFp16 { value, source: _ } => {
+                self.thresholds_fp16 = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDColorReductionStateWrite::ThresholdsSrgb8 { value, source } => {
-                self.thresholds_srgb8 =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDColorReductionStateWrite::ThresholdsSrgb8 { value, source: _ } => {
+                self.thresholds_srgb8 = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
         }
     }

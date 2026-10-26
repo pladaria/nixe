@@ -71,7 +71,6 @@ pub struct NativeGpuExecution {
     frames: crate::presentation::Frames,
     host: Option<crate::presentation::Host>,
     residency: VulkanResidency,
-    video_device: Option<[u8; 16]>,
     shaders: ShaderCompiler,
     pipelines: Arc<PipelineCompiler>,
     descriptors: DescriptorCache,
@@ -87,10 +86,10 @@ pub struct NativeGpuExecution {
     )>,
     programs: nixe_gpu::WorkingSet<(PreparedStateId, usize), Arc<PreparedProgram>>,
     next_collection: usize,
-    recording_batch: Option<(Option<WorkTicket>, usize)>,
     computing: HashMap<PreparedStateId, Computing>,
     affine_pipelines: HashMap<vk::Format, Arc<NativePipeline>>,
     video_pipelines: HashMap<vk::Format, Arc<NativePipeline>>,
+    video_inputs: Option<crate::residency::Nv12Inputs>,
     completions: VecDeque<Completion>,
     next: u64,
     pub statistics: NativeExecutionStatistics,
@@ -104,7 +103,7 @@ fn runtime(error: VulkanError) -> BackendRuntimeError {
 impl NativeGpuExecution {
     fn progress_accesses(&mut self) -> Result<(), BackendRuntimeError> {
         self.residency.progress_device_accesses().map_err(runtime)?;
-        if self.residency.readback_submission_pending() {
+        if self.residency.device_access_submission_pending() {
             self.residency.flush().map_err(runtime)?;
         }
         if let Some(wakeup) = &self.completion_wakeup
@@ -173,14 +172,12 @@ impl NativeGpuExecution {
         let samplers = SamplerCache::new(&device, configuration.sampler_entries);
         let mut residency = VulkanResidency::new(memory, device, resident_bytes)?;
         residency.enable_sample_conversion(Arc::clone(&pipelines));
-        let video_device = crate::residency::video::device_uuid(residency.device());
         residency
             .memory()
             .enable_cpu_write_collection()
             .map_err(VulkanError::from)?;
         Ok(Self {
             completion_wakeup: None,
-            video_device,
             frames: crate::presentation::Frames::new(),
             host: None,
             residency,
@@ -195,10 +192,10 @@ impl NativeGpuExecution {
             index_buffer: None,
             programs: nixe_gpu::WorkingSet::new(8192, 32 * 1024 * 1024),
             next_collection: 0,
-            recording_batch: None,
             computing: HashMap::default(),
             affine_pipelines: HashMap::default(),
             video_pipelines: HashMap::default(),
+            video_inputs: None,
             completions: VecDeque::new(),
             next: 1,
             statistics: Default::default(),
@@ -206,6 +203,15 @@ impl NativeGpuExecution {
     }
     pub fn device_profile(&self) -> &DeviceProfile {
         self.residency.device().profile()
+    }
+    pub fn cache_monitor(&self) -> CacheMonitor {
+        CacheMonitor::new([
+            ("shader cache", self.shaders.cache_counters()),
+            ("shader stages", self.shaders.stage_counters()),
+            ("pipeline cache", self.pipelines.cache_counters()),
+            ("pipeline libraries", self.pipelines.library_counters()),
+            ("descriptor sets", self.descriptors.cache_counters()),
+        ])
     }
     pub fn recording_statistics(&self) -> RecordingStatistics {
         self.residency.device().recording_statistics()
@@ -620,10 +626,10 @@ impl NativeGpuExecution {
                 }
             }
             NativeCommand::Dispatch { program, .. } => self.computing(program),
-            NativeCommand::ConvertNv12 { images, .. } => {
-                let format = images::format(images[2].description.format());
+            NativeCommand::ConvertNv12 { destination, .. } => {
+                let format = images::format(destination.description.format());
                 if !self.video_pipelines.contains_key(&format) {
-                    let pending = match crate::nv12_pipeline(&self.pipelines, format) {
+                    let pending = match crate::residency::nv12_pipeline(&self.pipelines, format) {
                         Ok(pending) => pending,
                         Err(CompileError::Backpressure | CompileError::Budget) => return Ok(false),
                         Err(error) => {
@@ -764,71 +770,47 @@ impl NativeGpuExecution {
                 *resolve,
                 *sampling,
             )?,
-            NativeCommand::Barrier(_) => {
-                self.residency.flush()?;
-            }
             // Canonical CPU epochs, captured TIC/TSC/code identities and native
             // access scopes already make later consumers coherent, including
             // dirty-write flush requests. CPU visibility and explicit completion
             // demand submit pending work; cache maintenance is not an idle wait.
             NativeCommand::Ordering(_) => {}
-            NativeCommand::ConvertNv12 { images, transform } => {
-                let retained = self.residency.constructing.len();
-                let result: Result<(), VulkanError> = (|| {
-                    let format = images::format(images[2].description.format());
-                    let pipeline = Arc::clone(&self.video_pipelines[&format]);
-                    let first = self.video_view(&images[0])?;
-                    self.residency
-                        .constructing
-                        .push(Resource::Image(first.image));
-                    let second = self.video_view(&images[1])?;
-                    self.residency
-                        .constructing
-                        .push(Resource::Image(second.image));
-                    let sources = [first, second];
-                    let destination = self.image(&images[2])?;
-                    self.residency
-                        .constructing
-                        .push(Resource::Image(destination));
-                    let conversion = self.residency.prepare_nv12(
-                        pipeline,
-                        sources,
-                        destination,
-                        0,
-                        *transform,
-                    )?;
-                    self.residency.convert_nv12(&conversion)?;
-
-                    Ok(())
-                })();
-                self.residency.constructing.truncate(retained);
-                result?;
-            }
-            NativeCommand::UploadPlanes {
-                images,
-                bytes,
-                widths,
+            NativeCommand::ConvertNv12 {
+                destination,
+                source,
+                transform,
             } => {
-                for index in 0..2 {
-                    let image = self.image(&images[index])?;
-                    self.residency
-                        .upload_video_plane(image, widths[index], &bytes[index])?;
+                let extent = crate::residency::Nv12Inputs::dimensions(source)?;
+                if self.video_inputs.as_ref().is_none_or(|inputs| {
+                    inputs.extent[0] < extent[0] || inputs.extent[1] < extent[1]
+                }) {
+                    let mut capacity = extent;
+                    if let Some(old) = self.video_inputs.take() {
+                        capacity = std::array::from_fn(|axis| capacity[axis].max(old.extent[axis]));
+                        old.forget(&mut self.descriptors);
+                    }
+                    self.video_inputs = Some(crate::residency::Nv12Inputs::new(
+                        &mut self.residency,
+                        capacity,
+                    )?);
                 }
-            }
-            NativeCommand::ImportDecodedPlanes { images, frame } => {
-                let retained = self.residency.constructing.len();
-                let result: Result<(), VulkanError> = (|| {
-                    let first = self.image(&images[0])?;
-                    self.residency.constructing.push(Resource::Image(first));
-                    let second = self.image(&images[1])?;
-                    self.residency.constructing.push(Resource::Image(second));
-                    let planes = [first, second];
-                    self.residency.import_decoded_planes(planes, frame)?;
-
-                    Ok(())
-                })();
-                self.residency.constructing.truncate(retained);
-                result?;
+                self.video_inputs
+                    .as_mut()
+                    .unwrap()
+                    .upload(&mut self.residency, source)?;
+                let output = self.image(destination)?;
+                let pipeline = Arc::clone(
+                    &self.video_pipelines[&images::format(destination.description.format())],
+                );
+                let conversion = self.residency.prepare_nv12(
+                    pipeline,
+                    &mut self.descriptors,
+                    self.video_inputs.as_ref().unwrap(),
+                    output,
+                    0,
+                    *transform,
+                )?;
+                self.residency.convert_nv12(&conversion)?;
             }
         }
         Ok(true)
@@ -848,24 +830,6 @@ impl NativeGpuExecution {
             return Ok(false);
         }
         let work = self.residency.device().preceding_work();
-        // A guest delivery boundary is not a host queue dependency. Publish
-        // accepted ownership now; visibility, presentation and completion
-        // demand flush the owner. Bound batching to keep the GPU supplied even
-        // under a continuous producer that never drains its inbox.
-        let commands = command_count(&batch.command);
-        let pending = self
-            .recording_batch
-            .filter(|(previous, _)| *previous == work)
-            .map_or(commands, |(_, count)| count.saturating_add(commands));
-        // Releases retain their ordered visibility versions. Submit them when
-        // a consumer demands progress or the recording reaches its bound.
-        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/fence_manager.h
-        if pending >= 256 {
-            self.residency.flush().map_err(runtime)?;
-            self.recording_batch = None;
-        } else {
-            self.recording_batch = Some((work, pending));
-        }
         nixe_gpu::trace::detail_event(
             "backend_accept",
             batch.frontend.get(),
@@ -908,9 +872,6 @@ impl NativeGpuExecution {
             return Ok(None);
         };
         self.residency
-            .video
-            .retire_sources(self.residency.device().completed_tick());
-        self.residency
             .publish_buffer_downloads(self.residency.device().completed_tick())?;
         let completed = self.completions.pop_front().unwrap();
         Ok(Some(BackendExecutionCompletion::new(
@@ -927,8 +888,8 @@ impl Drop for NativeGpuExecution {
 impl GpuExecution for NativeGpuExecution {
     type Commands = NativeWork;
     type ImageRequest = NativePresentationImage;
-    fn external_image_device(&self) -> Option<[u8; 16]> {
-        self.video_device
+    fn device_uuid(&self) -> Option<[u8; 16]> {
+        Some(self.residency.device().profile().device_uuid)
     }
     fn bind_host_wakeup(
         &mut self,
@@ -950,13 +911,15 @@ impl GpuExecution for NativeGpuExecution {
         }
         Ok(())
     }
-    fn request_completion_wakeup(&mut self) -> Result<(), BackendRuntimeError> {
+    fn pending_submit_deadline(&self) -> Option<std::time::Instant> {
+        self.residency.device().pending_submit_deadline()
+    }
+    fn flush(&mut self) -> Result<(), BackendRuntimeError> {
+        self.residency.flush().map_err(runtime)?;
+        Ok(())
+    }
+    fn arm_completion_wakeup(&mut self) -> Result<(), BackendRuntimeError> {
         let demand = self.residency.readback_point();
-        if self.residency.readback_submission_pending() {
-            // Feed demanded downloads even while an older frontend completion
-            // is pending, without an extra idle wake before their submission.
-            self.residency.flush().map_err(runtime)?;
-        }
         let Some(wakeup) = &self.completion_wakeup else {
             return Ok(());
         };
@@ -974,9 +937,6 @@ impl GpuExecution for NativeGpuExecution {
             )
             .min();
         if let Some(point) = point {
-            if point > self.residency.device().scheduled_tick() {
-                self.residency.flush().map_err(runtime)?;
-            }
             // Native progress may advance after the owner's logical poll.
             // Registration must also deliver already-completed pending work.
             return wakeup.arm(point).map_err(runtime);
@@ -1080,6 +1040,18 @@ impl GpuExecution for NativeGpuExecution {
         self.progress_accesses()
     }
     fn progress(&mut self) -> Result<(), BackendRuntimeError> {
+        if self
+            .pending_submit_deadline()
+            .is_some_and(|deadline| deadline <= std::time::Instant::now())
+        {
+            nixe_gpu::trace::detail_event(
+                "native_submit_deadline",
+                self.residency.device().scheduled_tick() + 1,
+                0,
+                0,
+            );
+            self.residency.flush().map_err(runtime)?;
+        }
         let memory = self.residency.memory().clone();
         let cpu_writes = memory
             .collect_cpu_writes()
@@ -1187,7 +1159,6 @@ impl GpuExecution for NativeGpuExecution {
             host.shutdown(&mut self.residency).map_err(runtime)?;
         }
         #[cfg(target_os = "linux")]
-        log::info!("native Vulkan video: {:?}", self.residency.video.statistics);
         log::info!("native Vulkan residency: {:?}", self.residency.statistics());
         log::info!("native Vulkan recording: {:?}", self.recording_statistics());
         log::info!("native Vulkan preparation: {:?}", self.statistics);
@@ -1216,13 +1187,6 @@ impl GpuExecution for NativeGpuExecution {
             .check()
             .map_err(runtime)?;
         Ok(())
-    }
-}
-
-fn command_count(command: &NativeCommand) -> usize {
-    match command {
-        NativeCommand::Sequence(commands) => commands.iter().map(command_count).sum(),
-        _ => 1,
     }
 }
 

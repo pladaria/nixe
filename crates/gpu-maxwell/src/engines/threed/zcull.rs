@@ -691,78 +691,73 @@ impl MaxwellThreeDZCullState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDZCullStateWrite) {
         match write {
-            MaxwellThreeDZCullStateWrite::ReportSelection { value, source } => {
-                self.report_selection = MaxwellThreeDRegister::programmed(value, value, source);
+            MaxwellThreeDZCullStateWrite::ReportSelection { value, source: _ } => {
+                self.report_selection = MaxwellThreeDRegister::decoded(value, value);
             }
-            MaxwellThreeDZCullStateWrite::ReportType { value, source } => {
-                self.report_type = MaxwellThreeDRegister::programmed(value, value, source);
+            MaxwellThreeDZCullStateWrite::ReportType { value, source: _ } => {
+                self.report_type = MaxwellThreeDRegister::decoded(value, value);
             }
 
-            MaxwellThreeDZCullStateWrite::SubregionAllocation { value, source } => {
-                self.subregion_allocation =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDZCullStateWrite::SubregionAllocation { value, source: _ } => {
+                self.subregion_allocation = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDZCullStateWrite::SubregionAlgorithm { value, source } => {
-                self.subregion_algorithm =
-                    MaxwellThreeDRegister::programmed(value as u32, value, source);
+            MaxwellThreeDZCullStateWrite::SubregionAlgorithm { value, source: _ } => {
+                self.subregion_algorithm = MaxwellThreeDRegister::decoded(value as u32, value);
             }
 
             MaxwellThreeDZCullStateWrite::Storage {
                 index,
                 value,
-                source,
+                source: _,
             } => {
-                self.storage[index] = MaxwellThreeDRegister::programmed(value, value, source);
+                self.storage[index] = MaxwellThreeDRegister::decoded(value, value);
             }
 
-            MaxwellThreeDZCullStateWrite::RegionLocation { value, source } => {
-                self.region_location =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDZCullStateWrite::RegionLocation { value, source: _ } => {
+                self.region_location = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDZCullStateWrite::RegionAliquots { value, source } => {
-                self.region_aliquots =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            MaxwellThreeDZCullStateWrite::RegionAliquots { value, source: _ } => {
+                self.region_aliquots = MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
-            MaxwellThreeDZCullStateWrite::RegionFormat { value, source } => {
-                self.region_format = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDZCullStateWrite::RegionFormat { value, source: _ } => {
+                self.region_format = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
             MaxwellThreeDZCullStateWrite::RegionSize {
                 axis,
                 value,
-                source,
+                source: _,
             } => {
                 self.region_size[axis as usize] =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+                    MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
             MaxwellThreeDZCullStateWrite::RegionPixelOffset {
                 axis,
                 value,
-                source,
+                source: _,
             } => {
                 self.region_pixel_offset[axis as usize] =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+                    MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
-            MaxwellThreeDZCullStateWrite::Subregion { value, source } => {
-                self.subregion = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDZCullStateWrite::Subregion { value, source: _ } => {
+                self.subregion = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDZCullStateWrite::DirectionFormat { value, source } => {
-                self.direction_format =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDZCullStateWrite::DirectionFormat { value, source: _ } => {
+                self.direction_format = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDZCullStateWrite::Criterion { value, source } => {
-                self.criterion = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDZCullStateWrite::Criterion { value, source: _ } => {
+                self.criterion = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDZCullStateWrite::Enable { value, source } => {
-                self.enable = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDZCullStateWrite::Enable { value, source: _ } => {
+                self.enable = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDZCullStateWrite::Bounds { value, source } => {
-                self.bounds = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDZCullStateWrite::Bounds { value, source: _ } => {
+                self.bounds = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDZCullStateWrite::ActiveRegion { value, source } => {
-                self.active_region = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDZCullStateWrite::ActiveRegion { value, source: _ } => {
+                self.active_region = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDZCullStateWrite::StatsEnable { value, source } => {
-                self.stats_enable = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDZCullStateWrite::StatsEnable { value, source: _ } => {
+                self.stats_enable = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
         }
     }

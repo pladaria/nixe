@@ -112,25 +112,24 @@ pub use threed::{
     MaxwellThreeDPrimitiveTopology, MaxwellThreeDProgramRegionState, MaxwellThreeDProvokingVertex,
     MaxwellThreeDPsOutputSampleMaskUsage, MaxwellThreeDRasterBoundingBox,
     MaxwellThreeDRasterBoundingBoxMode, MaxwellThreeDRasterState, MaxwellThreeDRawValue,
-    MaxwellThreeDRectangle, MaxwellThreeDRegister, MaxwellThreeDRegisterOrigin,
-    MaxwellThreeDRenderEnableMode, MaxwellThreeDRenderEnableOverride,
-    MaxwellThreeDRenderEnableState, MaxwellThreeDRenderTargetIndexOffset,
-    MaxwellThreeDRenderTargetLayer, MaxwellThreeDRenderTargetLayerControl,
-    MaxwellThreeDRenderTargetState, MaxwellThreeDReportSemaphoreControl,
-    MaxwellThreeDReportSemaphoreOperation, MaxwellThreeDReportSemaphorePipelineLocation,
-    MaxwellThreeDReportSemaphoreState, MaxwellThreeDReportSemaphoreStructureSize,
-    MaxwellThreeDReportSemaphoreWrite, MaxwellThreeDResolvedBuffer, MaxwellThreeDResolvedImage,
-    MaxwellThreeDResolvedResource, MaxwellThreeDResolvedResources, MaxwellThreeDResolvedSampler,
-    MaxwellThreeDResourceAccess, MaxwellThreeDResourceError, MaxwellThreeDResourceRole,
-    MaxwellThreeDRopL2CacheRequest, MaxwellThreeDSampleLocation, MaxwellThreeDSampleLocationGroup,
-    MaxwellThreeDSampleMode, MaxwellThreeDSamplerBindingMode, MaxwellThreeDScissorState,
-    MaxwellThreeDSeparateFragmentData, MaxwellThreeDShadeMode, MaxwellThreeDShaderBindingState,
-    MaxwellThreeDShaderCacheInvalidation, MaxwellThreeDShaderExceptionsEnable,
-    MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderLocalMemoryPerWarpSize,
-    MaxwellThreeDShaderLocalMemoryState, MaxwellThreeDShaderWatermarkRange,
-    MaxwellThreeDShaderWatermarkTarget, MaxwellThreeDSingleRopControl,
-    MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState, MaxwellThreeDStencilOp,
-    MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
+    MaxwellThreeDRectangle, MaxwellThreeDRegister, MaxwellThreeDRenderEnableMode,
+    MaxwellThreeDRenderEnableOverride, MaxwellThreeDRenderEnableState,
+    MaxwellThreeDRenderTargetIndexOffset, MaxwellThreeDRenderTargetLayer,
+    MaxwellThreeDRenderTargetLayerControl, MaxwellThreeDRenderTargetState,
+    MaxwellThreeDReportSemaphoreControl, MaxwellThreeDReportSemaphoreOperation,
+    MaxwellThreeDReportSemaphorePipelineLocation, MaxwellThreeDReportSemaphoreState,
+    MaxwellThreeDReportSemaphoreStructureSize, MaxwellThreeDReportSemaphoreWrite,
+    MaxwellThreeDResolvedBuffer, MaxwellThreeDResolvedImage, MaxwellThreeDResolvedResource,
+    MaxwellThreeDResolvedResources, MaxwellThreeDResolvedSampler, MaxwellThreeDResourceAccess,
+    MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDRopL2CacheRequest,
+    MaxwellThreeDSampleLocation, MaxwellThreeDSampleLocationGroup, MaxwellThreeDSampleMode,
+    MaxwellThreeDSamplerBindingMode, MaxwellThreeDScissorState, MaxwellThreeDSeparateFragmentData,
+    MaxwellThreeDShadeMode, MaxwellThreeDShaderBindingState, MaxwellThreeDShaderCacheInvalidation,
+    MaxwellThreeDShaderExceptionsEnable, MaxwellThreeDShaderExecutionState,
+    MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderLocalMemoryState,
+    MaxwellThreeDShaderWatermarkRange, MaxwellThreeDShaderWatermarkTarget,
+    MaxwellThreeDSingleRopControl, MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDState,
+    MaxwellThreeDStencilOp, MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
     MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationPlan,
     MaxwellThreeDSynchronizationTrigger, MaxwellThreeDSyncpointCondition,
     MaxwellThreeDSyncpointIncrement, MaxwellThreeDSystemMemoryVolatile,
@@ -263,6 +262,7 @@ pub(crate) enum PendingEngineOperation {
     ComputeLaunch(MaxwellComputeLaunch),
     ThreeDInlineConstantBuffer(MaxwellThreeDInlineConstantBufferUpload),
     ThreeD(MaxwellThreeDOperationTrigger),
+    ThreeDRenderCondition(MaxwellMethodSource),
     ThreeDSynchronization(MaxwellThreeDSynchronizationTrigger),
 }
 
@@ -701,52 +701,51 @@ pub(crate) async fn stream_maxwell_engine_packet<E>(
 ) -> Result<(), MaxwellEngineStreamError<E>> {
     #[cfg(test)]
     let mut methods = methods;
-    if mme_methods.is_none() && bulk::stream_packet(channel, submission, packet, consume).await? {
-        #[cfg(test)]
-        if let Some(observed) = methods.as_deref_mut()
-            && let crate::pushbuffer::packet::PacketView::Methods {
-                methods: span,
-                subchannel: Some(subchannel),
-                ..
-            } = packet
-        {
-            let class = channel.frontend().subchannel_binding(subchannel).unwrap();
-            for method in span.iter() {
-                observed.push(MaxwellEngineMethodDispatch::new(
-                    MaxwellMethodDispatch::emitted_by_mme(
-                        MaxwellMethodSource::decoded(method, subchannel),
-                        class,
-                    ),
-                    MaxwellEngineMethodMetadata::new(
-                        class,
-                        if class == threed::CLASS {
-                            "MAXWELL_B"
-                        } else if class == compute::CLASS {
-                            "MAXWELL_COMPUTE_B"
-                        } else {
-                            "MAXWELL_INLINE_TO_MEMORY_A"
-                        },
-                        method.method(),
-                        if class == threed::CLASS {
-                            "STATE_REGISTER"
-                        } else {
-                            "LOAD_INLINE_DATA"
-                        },
-                    ),
-                ));
-            }
-        }
-        return Ok(());
-    }
-    if let Some((subchannel, span, plain_class)) = packet_methods(channel, submission, packet)
-        .map_err(|error| MaxwellEngineStreamError::dispatch(error.into()))?
+    if let Some((subchannel, span, first, plain_class)) =
+        packet_methods(channel, submission, packet)
+            .map_err(|error| MaxwellEngineStreamError::dispatch(error.into()))?
     {
+        if mme_methods.is_none()
+            && let Some(class) = plain_class
+            && span.len() >= 2
+            && let Some(port) = bulk::port(first.method())
+            && bulk::stream_packet(channel, class, subchannel, span, first, port, consume).await?
+        {
+            #[cfg(test)]
+            if let Some(observed) = methods.as_deref_mut() {
+                for method in span.iter() {
+                    observed.push(MaxwellEngineMethodDispatch::new(
+                        MaxwellMethodDispatch::class_method(
+                            MaxwellMethodSource::decoded(method, subchannel),
+                            class,
+                        ),
+                        MaxwellEngineMethodMetadata::new(
+                            class,
+                            if class == threed::CLASS {
+                                "MAXWELL_B"
+                            } else if class == compute::CLASS {
+                                "MAXWELL_COMPUTE_B"
+                            } else {
+                                "MAXWELL_INLINE_TO_MEMORY_A"
+                            },
+                            method.method(),
+                            if class == threed::CLASS {
+                                "STATE_REGISTER"
+                            } else {
+                                "LOAD_INLINE_DATA"
+                            },
+                        ),
+                    ));
+                }
+            }
+            return Ok(());
+        }
         // Macro payloads are one ordered word span. Admit the range once, as
         // the command pusher does, rather than routing every argument through
         // the ordinary register dispatcher.
         if plain_class == Some(threed::CLASS)
-            && let (Some(first), Some(last)) = (span.first(), span.last())
             && threed::is_mme_aperture(first.method())
+            && let Some(last) = span.last()
             && threed::is_mme_aperture(last.method())
         {
             let first_method = first.method().0;
@@ -760,13 +759,10 @@ pub(crate) async fn stream_maxwell_engine_packet<E>(
                 && (last.method().0 == expected || last.method().0 == expected + 4)
             {
                 if starts_call {
-                    let first = dispatch_method(
-                        &channel.profile(),
-                        subchannel,
-                        first,
-                        channel.frontend_mut(),
-                    )
-                    .map_err(|error| MaxwellEngineStreamError::dispatch(error.into()))?;
+                    let first = MaxwellMethodDispatch::class_method(
+                        MaxwellMethodSource::decoded(first, subchannel),
+                        threed::CLASS,
+                    );
                     mme_parameters.clear();
                     *mme_methods = Some(first);
                 }
@@ -780,7 +776,7 @@ pub(crate) async fn stream_maxwell_engine_packet<E>(
                 if let Some(observed) = methods.as_deref_mut() {
                     for (index, decoded) in span.iter().enumerate() {
                         let source = MaxwellMethodSource::decoded(decoded, subchannel);
-                        let method = MaxwellMethodDispatch::emitted_by_mme(source, threed::CLASS);
+                        let method = MaxwellMethodDispatch::class_method(source, threed::CLASS);
                         observed.push(MaxwellEngineMethodDispatch::new(
                             method,
                             MaxwellEngineMethodMetadata::new(
@@ -825,7 +821,7 @@ pub(crate) async fn stream_maxwell_engine_packet<E>(
                         #[cfg(test)]
                         if let Some(observed) = methods.as_deref_mut() {
                             let mut dispatch =
-                                MaxwellMethodDispatch::emitted_by_mme(source, threed::CLASS);
+                                MaxwellMethodDispatch::class_method(source, threed::CLASS);
                             dispatch.set_effective_argument(argument);
                             observed.push(MaxwellEngineMethodDispatch::new(
                                 dispatch,
@@ -843,8 +839,15 @@ pub(crate) async fn stream_maxwell_engine_packet<E>(
                 cursor += count - 1;
                 continue;
             }
-            let method = dispatch_method(&profile, subchannel, decoded, channel.frontend_mut())
-                .map_err(|error| MaxwellEngineStreamError::dispatch(error.into()))?;
+            let method = if let Some(class) = plain_class {
+                MaxwellMethodDispatch::class_method(
+                    MaxwellMethodSource::decoded(decoded, subchannel),
+                    class,
+                )
+            } else {
+                dispatch_method(&profile, subchannel, decoded, channel.frontend_mut())
+                    .map_err(|error| MaxwellEngineStreamError::dispatch(error.into()))?
+            };
             if mme_methods.is_some() {
                 let first_method = mme_methods.unwrap().source().method().0;
                 let next_method = method.source().method().0;

@@ -66,8 +66,8 @@ impl MaxwellMemoryCopyRemap {
 pub struct MaxwellMemoryCopyOperation {
     pub(super) source_address: u64,
     pub(super) destination_address: u64,
-    pub(super) source_layout: MaxwellMemoryCopyLayout,
-    pub(super) destination_layout: MaxwellMemoryCopyLayout,
+    pub(crate) source_layout: MaxwellMemoryCopyLayout,
+    pub(crate) destination_layout: MaxwellMemoryCopyLayout,
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) remap: Option<MaxwellMemoryCopyRemap>,
@@ -121,6 +121,16 @@ impl MaxwellMemoryCopyOperation {
 
     pub(crate) const fn has_remap(self) -> bool {
         self.remap.is_some()
+    }
+
+    pub(crate) fn has_block_layout(self) -> bool {
+        matches!(
+            self.source_layout,
+            MaxwellMemoryCopyLayout::BlockLinear { .. }
+        ) || matches!(
+            self.destination_layout,
+            MaxwellMemoryCopyLayout::BlockLinear { .. }
+        )
     }
 
     /// Contiguous byte runs in both layouts. A Tegra GOB has 16-byte contiguous
@@ -243,8 +253,8 @@ impl MaxwellMemoryCopyOperation {
         self,
     ) -> Result<Vec<std::ops::Range<usize>>, MaxwellMemoryCopyError> {
         let remap = self.remap.expect("remapped copy");
-        let (_, element_bytes) = self.element_sizes();
         let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+        let (_, element_bytes) = self.element_sizes();
         for y in 0..self.height {
             for x in 0..self.width {
                 let base = layout_offset(self.destination_layout, x, y, element_bytes)?;

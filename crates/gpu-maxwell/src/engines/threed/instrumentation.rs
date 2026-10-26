@@ -61,11 +61,11 @@ impl MaxwellThreeDInstrumentationState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDInstrumentationStateWrite) {
         match write {
-            MaxwellThreeDInstrumentationStateWrite::Header { value, source } => {
-                self.header = MaxwellThreeDRegister::programmed(value.bits(), value, source);
+            MaxwellThreeDInstrumentationStateWrite::Header { value, source: _ } => {
+                self.header = MaxwellThreeDRegister::decoded(value.bits(), value);
             }
-            MaxwellThreeDInstrumentationStateWrite::Data { value, source } => {
-                self.data = MaxwellThreeDRegister::programmed(value.bits(), value, source);
+            MaxwellThreeDInstrumentationStateWrite::Data { value, source: _ } => {
+                self.data = MaxwellThreeDRegister::decoded(value.bits(), value);
             }
         }
     }

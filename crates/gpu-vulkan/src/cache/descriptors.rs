@@ -190,6 +190,7 @@ pub struct DescriptorCache {
     records: HashMap<u128, Entry>,
     clock: u64,
     statistics: DescriptorStatistics,
+    counters: nixe_gpu::cache_counters::CacheCounters,
 }
 impl DescriptorCache {
     pub fn new(device: &VulkanDevice, maximum: usize) -> Self {
@@ -215,10 +216,14 @@ impl DescriptorCache {
             records: HashMap::default(),
             clock: 0,
             statistics: Default::default(),
+            counters: nixe_gpu::cache_counters::CacheCounters::new(maximum, 0),
         }
     }
     pub fn statistics(&self) -> DescriptorStatistics {
         self.statistics
+    }
+    pub(crate) fn cache_counters(&self) -> nixe_gpu::cache_counters::CacheCounters {
+        self.counters.clone()
     }
     /// A host texture's allocation has ended. Pending command slots retain
     /// their binding records; remove only the obsolete future-lookup entries.
@@ -399,6 +404,7 @@ impl DescriptorCache {
                             | vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL
                             | vk::ImageLayout::STENCIL_READ_ONLY_OPTIMAL
                             | vk::ImageLayout::READ_ONLY_OPTIMAL
+                            | vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
                     ) {
                         return Err(VulkanError::InvalidResource(
                             "sampled image descriptor requires a shader-readable layout",
@@ -424,6 +430,8 @@ impl DescriptorCache {
         }
         .map_err(|e| VulkanError::vk("native descriptor allocation", e))?[0];
         self.pages[page].allocated += 1;
+        self.counters.add_entries(1);
+        self.counters.miss();
         let buffers: Vec<_> = resources
             .iter()
             .map(|r| match r {
@@ -557,6 +565,8 @@ impl DescriptorCache {
                 }
                 .map_err(|e| VulkanError::vk("recycle descriptor page", e))?;
                 self.statistics.resets += 1;
+                self.counters
+                    .remove_entries(self.pages[i].allocated as usize);
                 self.pages[i].allocated = 0;
                 if self.pages[i].page.key == layout.key {
                     return Ok(i);
@@ -619,12 +629,15 @@ impl DescriptorCache {
                 return Err(VulkanError::DescriptorPressure);
             };
             self.records.remove(&key);
+            self.counters.evict(1);
         }
     }
     /// Drop only reconstructible index ownership under residency pressure.
     /// Prepared and in-flight records keep their resource/pool leases alive.
     pub fn trim(&mut self) {
+        let previous = self.records.len();
         self.records.retain(|_, e| Arc::strong_count(&e.record) > 1);
+        self.counters.evict((previous - self.records.len()) as u64);
     }
 }
 
@@ -650,11 +663,8 @@ impl VulkanDevice {
             return Ok(());
         }
         unsafe {
-            self.dispatch.cmd_bind_pipeline(
-                slot.command,
-                pipeline.bind_point,
-                Arc::clone(pipeline),
-            );
+            self.dispatch
+                .cmd_bind_pipeline(pipeline.bind_point, Arc::clone(pipeline));
         }
         self.submission.statistics.pipeline_binds += 1;
         *bound = identity;
@@ -737,7 +747,6 @@ impl VulkanDevice {
         }
         unsafe {
             self.dispatch.cmd_bind_descriptor_sets(
-                slot.command,
                 pipeline.bind_point,
                 pipeline.layout.handle,
                 0,

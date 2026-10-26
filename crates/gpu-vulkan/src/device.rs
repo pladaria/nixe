@@ -241,6 +241,7 @@ impl VulkanDevice {
             selected.profile.api_path,
             selected.profile.swapchain_maintenance,
             selected.profile.dynamic_state.base,
+            selected.profile.attachment_feedback_loop,
             Arc::clone(&owner.queue_mutex),
         )?;
         debug_assert_eq!(

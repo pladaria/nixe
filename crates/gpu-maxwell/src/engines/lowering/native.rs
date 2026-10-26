@@ -57,6 +57,7 @@ struct PresentationKey {
 // Dirty revisions and current bindings belong to the channel. Immutable content
 // caches and the compiler below belong to the command owner and survive switches.
 struct ChannelPreparation {
+    render_enabled: bool,
     resources: super::super::threed::MaxwellThreeDResolvedResourceCache,
     draw_roles: Vec<MaxwellThreeDResourceRole>,
     code: Option<Code>,
@@ -94,6 +95,7 @@ pub struct MaxwellNativeFrontend {
 impl ChannelPreparation {
     fn new(alignment: u64) -> Self {
         Self {
+            render_enabled: true,
             resources: MaxwellThreeDResolvedResourceCache::new(alignment),
             draw_roles: Vec::new(),
             code: None,
@@ -492,17 +494,6 @@ impl MaxwellNativeFrontend {
             }
             let selection = selection.as_mut().unwrap();
             let (tessellation, raster) = lowering(validate_consumed_state(state, trigger))?;
-            if state
-                .render_enable()
-                .execution_mode()
-                .is_some_and(|m| m != MaxwellThreeDRenderEnableMode::Enabled)
-            {
-                return Err(Error::Lowering(
-                    MaxwellLoweringError::UnsupportedRenderEnableMode(
-                        state.render_enable().execution_mode().unwrap(),
-                    ),
-                ));
-            }
             if state.shader_execution().stream_output_enable().value() == Some(&true) {
                 return Err(Error::Lowering(
                     MaxwellLoweringError::UnsupportedStreamOutputSemantics,
@@ -800,6 +791,39 @@ fn plane_metadata_bytes(image: &GuestImage) -> usize {
 }
 
 impl MaxwellNativeFrontend {
+    fn binding(
+        &mut self,
+        resources: &MaxwellThreeDResolvedResources,
+        role: MaxwellThreeDResourceRole,
+    ) -> Result<GuestBinding, Error> {
+        Ok(if matches!(role, MaxwellThreeDResourceRole::Sampler(_)) {
+            let sampler = resources
+                .sampler(role)
+                .ok_or_else(|| compilation("absent consumed sampler"))?;
+            GuestBinding::Sampler(sampler.description().map_err(Error::ThreeDResource)?)
+        } else {
+            let index = role;
+            match resources
+                .resource(role)
+                .ok_or_else(|| compilation("absent consumed resource"))?
+            {
+                MaxwellThreeDResolvedResource::Buffer(b) => {
+                    GuestBinding::Buffer(b.view().backing().mapping().clone())
+                }
+                MaxwellThreeDResolvedResource::Image(_) => GuestBinding::Image {
+                    image: self.image(resources, index)?,
+                    arrayed: matches!(
+                        role,
+                        MaxwellThreeDResourceRole::SampledImage {
+                            dimension: super::super::threed::MaxwellThreeDTextureDimension::TwoArray
+                                | super::super::threed::MaxwellThreeDTextureDimension::CubeArray,
+                            ..
+                        }
+                    ),
+                },
+            }
+        })
+    }
     fn native_program(
         &mut self,
         shader: &Arc<GuestShaderCode>,
@@ -824,33 +848,7 @@ impl MaxwellNativeFrontend {
             .map(|p| Arc::clone(&p.draw.program));
         let mut changed = previous.is_none().then(|| Vec::with_capacity(roles.len()));
         for (index, &(id, role)) in roles.iter().enumerate() {
-            let binding = if matches!(role, MaxwellThreeDResourceRole::Sampler(_)) {
-                let sampler = resources
-                    .sampler(role)
-                    .ok_or_else(|| compilation("absent consumed sampler"))?;
-                GuestBinding::Sampler(sampler.description().map_err(Error::ThreeDResource)?)
-            } else {
-                let index = role;
-                match resources
-                    .resource(role)
-                    .ok_or_else(|| compilation("absent consumed resource"))?
-                {
-                    MaxwellThreeDResolvedResource::Buffer(b) => {
-                        GuestBinding::Buffer(b.view().backing().mapping().clone())
-                    }
-                    MaxwellThreeDResolvedResource::Image(_) => GuestBinding::Image {
-                        image: self.image(resources, index)?,
-                        arrayed: matches!(
-                            role,
-                            MaxwellThreeDResourceRole::SampledImage {
-                                dimension:
-                                    super::super::threed::MaxwellThreeDTextureDimension::TwoArray,
-                                ..
-                            }
-                        ),
-                    },
-                }
-            };
+            let binding = self.binding(resources, role)?;
             if changed.is_none() {
                 let old = &previous.as_ref().unwrap().bindings;
                 if old[index].0 == id && same_binding(&old[index].1, &binding) {
@@ -1018,13 +1016,6 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
         instances: Option<(u32, u32)>,
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<NativeWork, Error> {
-        if let Some(mode) = state.render_enable().execution_mode()
-            && mode != MaxwellThreeDRenderEnableMode::Enabled
-        {
-            return Err(Error::Lowering(
-                MaxwellLoweringError::UnsupportedRenderEnableMode(mode),
-            ));
-        }
         if trigger.is_draw() {
             return self.draw(state, trigger, space, frontend, instances, access);
         }
@@ -1042,9 +1033,6 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             .last_surface()
             .value()
             .ok_or_else(|| compilation("CLEAR_SURFACE state is incomplete"))?;
-        if clear.last_surface().source() != Some(trigger.source()) {
-            return Err(Error::Lowering(MaxwellLoweringError::TriggerStateMismatch));
-        }
         if surface.array_layer() != 0 {
             return Err(compilation(
                 "native clear array-layer selection requires a selected attachment layer",
@@ -1154,7 +1142,13 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             && Arc::ptr_eq(&program.shader, &code)
             && let Some(resources) = &mut self.channel.compute_resources
             && resources
-                .refresh(launch, space, &mut self.capture_memory, access)
+                .refresh(
+                    launch,
+                    space,
+                    &mut self.capture_memory,
+                    access,
+                    &mut self.channel.resources,
+                )
                 .map_err(Error::ComputeLaunch)?
         {
             return Ok(NativeWork {
@@ -1165,7 +1159,7 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
                 },
             });
         }
-        let resources = launch
+        let mut resources = launch
             .native_resources(
                 &inputs.stages[0].info,
                 self.configuration.host.min_ssbo_alignment.max(1),
@@ -1174,6 +1168,11 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
                 access,
             )
             .map_err(Error::ComputeLaunch)?;
+        resources.textures = self
+            .channel
+            .resources
+            .resolve_compute_textures(launch, &inputs.stages[0].info, space, access)
+            .map_err(Error::ThreeDResource)?;
         let mut bindings = Vec::new();
         for (resource, range) in &resources.bindings {
             let Some(range) = range else {
@@ -1186,6 +1185,12 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
                 GuestBinding::Buffer(retained.backing.mapping().clone()),
             ));
         }
+        if let Some(textures) = &resources.textures {
+            for &(id, role) in &textures.bindings {
+                bindings.push((id, self.binding(&textures.resources, role)?));
+            }
+        }
+        bindings.sort_unstable_by_key(|(id, _)| *id);
         self.channel.compute_resources = Some(resources);
         if let Some(old) = &self.channel.prepared_compute
             && Arc::ptr_eq(&old.shader, &code)
@@ -1355,6 +1360,50 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
             },
         })
     }
+    fn render_enabled(&self) -> bool {
+        self.channel.render_enabled
+    }
+    fn update_render_condition(
+        &mut self,
+        state: &MaxwellThreeDState,
+        space: &MaxwellGpuMemory,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
+    ) -> Result<(), Error> {
+        use MaxwellThreeDRenderEnableMode as Mode;
+        let condition = state.render_enable();
+        let mode = condition.execution_mode().unwrap_or(Mode::Enabled);
+        // Evaluate in command order when SET_RENDER_ENABLE_C/OVERRIDE executes,
+        // and retain the result until the next condition command. An unchanged
+        // mode is still an evaluation; ordinary draws do not reread query RAM.
+        // https://github.com/eden-emulator/mirror/blob/master/src/video_core/engines/maxwell_3d.cpp
+        self.channel.render_enabled = match mode {
+            Mode::Enabled => true,
+            Mode::Disabled => false,
+            _ => {
+                let address = condition
+                    .address()
+                    .ok_or_else(|| compilation("render condition address is incomplete"))?;
+                let mut bytes = [0; 24];
+                space
+                    .read_into(
+                        space.address(address.get()).map_err(compilation)?,
+                        &mut bytes,
+                        access,
+                    )
+                    .map_err(compilation)?;
+                let words = std::array::from_fn::<_, 6, _>(|i| {
+                    u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+                });
+                match mode {
+                    Mode::Conditional => words[0] != 0 && words[1] != 0,
+                    Mode::RenderIfEqual => words[0] == words[4] && words[1] == words[5],
+                    Mode::RenderIfNotEqual => words[0] != words[4] || words[1] != words[5],
+                    _ => unreachable!(),
+                }
+            }
+        };
+        Ok(())
+    }
     fn take_mme_scratch(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.parameters)
     }
@@ -1363,54 +1412,16 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
     }
     fn lower_nv12_conversion(
         &mut self,
-        images: [nixe_gpu::ConversionImage; 3],
+        destination: nixe_gpu::ConversionImage,
+        source: nixe_gpu::Nv12Planes,
         transform: nixe_gpu::Nv12ColorTransform,
     ) -> Result<NativeWork, MaxwellLoweringError> {
-        let mut native = Vec::with_capacity(3);
-        for image in images {
-            native.push(self.conversion_image(image)?);
-        }
         Ok(NativeWork {
             frontend: FrontendSubmissionId::new(u64::MAX - self.identity().slot()),
             command: NativeCommand::ConvertNv12 {
-                images: native.into_boxed_slice().try_into().unwrap(),
+                destination: Box::new(self.conversion_image(destination)?),
+                source,
                 transform,
-            },
-        })
-    }
-    fn lower_decoded_plane_uploads(
-        &mut self,
-        images: [nixe_gpu::ConversionImage; 2],
-        bytes: [Arc<[u8]>; 2],
-        widths: [u32; 2],
-    ) -> Result<NativeWork, MaxwellLoweringError> {
-        let mut native = Vec::with_capacity(2);
-        for image in images {
-            native.push(self.conversion_image(image)?);
-        }
-        Ok(NativeWork {
-            frontend: FrontendSubmissionId::new(u64::MAX - self.identity().slot()),
-            command: NativeCommand::UploadPlanes {
-                images: native.into_boxed_slice().try_into().unwrap(),
-                bytes,
-                widths,
-            },
-        })
-    }
-    fn lower_device_plane_uploads(
-        &mut self,
-        images: [nixe_gpu::ConversionImage; 2],
-        frame: nixe_gpu::DeviceImageFrame,
-    ) -> Result<NativeWork, MaxwellLoweringError> {
-        let mut native = Vec::with_capacity(2);
-        for image in images {
-            native.push(self.conversion_image(image)?);
-        }
-        Ok(NativeWork {
-            frontend: FrontendSubmissionId::new(u64::MAX - self.identity().slot()),
-            command: NativeCommand::ImportDecodedPlanes {
-                images: native.into_boxed_slice().try_into().unwrap(),
-                frame,
             },
         })
     }
@@ -1432,6 +1443,73 @@ mod producer_tests {
         MaxwellMapRequest, SWITCH_1_GM20B_PROFILE,
     };
     use nixe_memory::MemoryPermissions;
+
+    #[test]
+    fn render_condition_is_evaluated_at_commands_and_retained_per_channel() {
+        use crate::engines::tests::{program_three_d, three_d_channel};
+        let (allocation, space, address) = crate::shader::test_support::mapped_memory();
+        let mut channel = three_d_channel();
+        let mut frontend = MaxwellNativeFrontend::new(Default::default());
+        frontend.bind_channel(crate::MaxwellChannelId::new(1));
+        program_three_d(&mut channel, 0x1550, (address >> 32) as u32);
+        program_three_d(&mut channel, 0x1554, address as u32);
+        for (mode, words, expected) in [
+            (0, [1, 1, 0, 0, 2, 2], false),
+            (1, [0; 6], true),
+            (2, [1, 1, 0, 0, 0, 0], true),
+            (2, [1, 0, 0, 0, 0, 0], false),
+            (3, [3, 7, 99, 88, 3, 7], true),
+            (3, [3, 7, 99, 88, 3, 8], false),
+            (4, [3, 7, 99, 88, 3, 7], false),
+            (4, [3, 7, 99, 88, 4, 7], true),
+        ] {
+            let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            crate::test_memory::write(&allocation, 0, &bytes).unwrap();
+            program_three_d(&mut channel, 0x1558, mode);
+            frontend
+                .update_render_condition(
+                    channel.three_d(),
+                    space.memory(),
+                    &mut crate::test_memory::access(space.memory().machine()),
+                )
+                .unwrap();
+            assert_eq!(frontend.channel.render_enabled, expected, "mode={mode}");
+        }
+        program_three_d(&mut channel, 0x1558, 4);
+        crate::test_memory::write(&allocation, 0, &[0; 24]).unwrap();
+        frontend
+            .update_render_condition(
+                channel.three_d(),
+                space.memory(),
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
+        assert!(!frontend.channel.render_enabled);
+        // Later memory changes do not change the decision before another
+        // condition command.
+        crate::test_memory::write(&allocation, 0, &1_u32.to_le_bytes()).unwrap();
+        assert!(!frontend.render_enabled());
+        frontend
+            .update_render_condition(
+                channel.three_d(),
+                space.memory(),
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
+        assert!(frontend.channel.render_enabled);
+        // Override does not consume an address or read query bytes.
+        program_three_d(&mut channel, 0x1944, 2);
+        frontend
+            .update_render_condition(channel.three_d(), space.memory(), &mut |_, _| {
+                panic!("override must not read memory")
+            })
+            .unwrap();
+        assert!(!frontend.channel.render_enabled);
+        frontend.bind_channel(crate::MaxwellChannelId::new(2));
+        assert!(frontend.channel.render_enabled);
+        frontend.bind_channel(crate::MaxwellChannelId::new(1));
+        assert!(!frontend.channel.render_enabled);
+    }
 
     #[test]
     fn alternating_native_shader_sources_share_code_and_observe_committed_changes() {
@@ -1625,14 +1703,7 @@ mod producer_tests {
         }
         let mut frontend = MaxwellNativeFrontend::new(Default::default());
         let mut channel = crate::engines::tests::three_d_channel();
-        crate::engines::tests::program_three_d(&mut channel, 0x19d0, 0x3c);
-        let source = channel
-            .three_d()
-            .render_targets()
-            .clear()
-            .last_surface()
-            .source()
-            .unwrap();
+        let source = crate::engines::tests::program_three_d(&mut channel, 0x19d0, 0x3c);
         let request = crate::MaxwellTwoDBlitOperation {
             source,
             images: [

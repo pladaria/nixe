@@ -26,17 +26,25 @@ pub(super) struct CpuReadback {
     sealed: bool,
 }
 impl VulkanResidency {
-    pub(crate) fn readback_submission_pending(&self) -> bool {
+    pub(crate) fn device_access_submission_pending(&self) -> bool {
         let scheduled = self.device.scheduled_tick();
-        self.buffer_downloads
+        self.cpu_readbacks.values().any(|job| {
+            job.required_tick > scheduled
+                || job
+                    .transfers
+                    .back()
+                    .is_some_and(|t| t.ticket.work().tick() > scheduled)
+        }) || self
+            .buffer_downloads
             .back()
             .is_some_and(|job| job.work().tick() > scheduled)
-            || self.cpu_readbacks.values().any(|job| {
-                job.required_tick > scheduled
-                    || job
-                        .transfers
-                        .back()
-                        .is_some_and(|t| t.ticket.work().tick() > scheduled)
+            && self.authority.access_requests().any(|id| {
+                let request = self.authority.access_request(id).expect("pending access");
+                !matches!(request.operation(), nixe_memory::AccessOperation::Write(_))
+                    && self
+                        .buffer_downloads
+                        .iter()
+                        .any(|job| job.work().tick() > scheduled && job.overlaps(request.ranges()))
             })
     }
 

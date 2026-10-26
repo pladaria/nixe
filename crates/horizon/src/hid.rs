@@ -106,6 +106,7 @@ struct HidProducer {
     home: Lifo,
     capture: Lifo,
     connected: bool,
+    disconnected_by_guest: bool,
     publication: Publication,
     latest_controller: Option<(Option<EmulatedControllerState>, Duration)>,
     latest_touch: Option<(EmulatedTouchScreenState, Duration)>,
@@ -172,6 +173,7 @@ impl Publication {
         }
         if let Some(connected) = self.connected.take() {
             state.connected.store(connected, Ordering::Release);
+            log::debug!("hid Npad connection changed: id=0x0 connected={connected}");
         }
         Ok(true)
     }
@@ -269,6 +271,7 @@ impl HidSystem {
                 home: Lifo::default(),
                 capture: Lifo::default(),
                 connected: false,
+                disconnected_by_guest: false,
                 publication: Publication::default(),
                 latest_controller: None,
                 latest_touch: None,
@@ -351,7 +354,15 @@ impl HidSystem {
         state: Option<&EmulatedControllerState>,
         delta: Duration,
     ) -> Result<(), HidInputError> {
-        self.producer.lock().unwrap().latest_controller = Some((state.copied(), delta));
+        {
+            let mut producer = self.producer.lock().unwrap();
+            // A software disconnect lasts until a host disconnect/reconnect;
+            // ordinary input samples must not immediately reconnect the pad.
+            if state.is_none() {
+                producer.disconnected_by_guest = false;
+            }
+            producer.latest_controller = Some((state.copied(), delta));
+        }
         self.poll_publication()
     }
     pub fn publish_touch_screen(
@@ -378,6 +389,34 @@ impl HidSystem {
         if let Some((event, _)) = self.state.style_events[0].get() {
             event.signal();
         }
+    }
+
+    pub(crate) fn disconnect_npad(&self, id: u32) -> Result<bool, HidInputError> {
+        let Some(index) = npad_index(id) else {
+            return Ok(false);
+        };
+        // Disconnect the modeled host device and publish through the existing
+        // producer, so an in-flight memory write cannot restore its old style.
+        // Other slots have no attached device; their style event still fires.
+        // https://github.com/eden-emulator/mirror/blob/master/src/hid_core/resources/npad/npad.cpp
+        if index == 0 {
+            {
+                let mut producer = self.producer.lock().unwrap();
+                producer.disconnected_by_guest = true;
+                producer.latest_controller = Some((None, Duration::ZERO));
+            }
+            self.poll_publication()?;
+            if self.producer.lock().unwrap().connected
+                || self.state.connected.load(Ordering::Acquire)
+            {
+                // The producer signals after pending shared-memory writes finish.
+                return Ok(true);
+            }
+        }
+        if let Some((event, _)) = self.state.style_events[index].get() {
+            event.signal();
+        }
+        Ok(true)
     }
 
     pub(crate) fn activate_npad(&self) {
@@ -559,6 +598,7 @@ impl HidProducer {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (
                 configuration.npad_active
+                    && !self.disconnected_by_guest
                     && configuration.supported_style_set & NPAD_STYLE_FULL_KEY != 0
                     && configuration.supported_ids.contains(&0),
                 // FullKey, Player 1, device index 2. The packed handle layout
@@ -593,7 +633,9 @@ impl HidProducer {
                     output.stop()?;
                 }
                 self.sampling_number = self.sampling_number.saturating_add(1);
-                writes.write(NPAD_OFFSET, &[0; NPAD_ENTRY_SIZE]);
+                // Assignment mode persists across disconnection.
+                writes.write_u32(NPAD_OFFSET, 0);
+                writes.write(NPAD_OFFSET + 8, &[0; NPAD_ENTRY_SIZE - 8]);
                 self.full_key = Lifo::default();
                 self.six_axis = Lifo::default();
                 self.publish_system_button(writes, HOME_BUTTON_LIFO_OFFSET, false, true);
@@ -1000,6 +1042,46 @@ mod tests {
 
         hid.publish(None, Duration::from_millis(5)).unwrap();
         assert_eq!(read_u32(&memory, NPAD_OFFSET), 0);
+    }
+
+    #[test]
+    fn guest_disconnect_notifies_the_target_and_waits_for_host_reconnection() {
+        let hid = hid();
+        configure_player_one(&hid, false);
+        let memory = hid.shared_memory();
+        let state = EmulatedControllerState::default();
+        hid.publish(Some(&state), Duration::ZERO).unwrap();
+        let event = hid.acquire_style_event(0).unwrap();
+        let other = hid.acquire_style_event(1).unwrap();
+        event.clear();
+        other.clear();
+        assert!(hid.disconnect_npad(1).unwrap());
+        assert!(other.is_signalled());
+        assert!(!event.is_signalled());
+        assert_eq!(hid.connected_full_key_id(), Some(0));
+
+        // Assignment is persistent state, independent of device connection.
+        memory
+            .write(NPAD_OFFSET + 4, &1_u32.to_le_bytes())
+            .unwrap()
+            .into_ready()
+            .unwrap();
+        assert!(hid.disconnect_npad(0).unwrap());
+        assert!(event.is_signalled());
+        assert_eq!(hid.connected_full_key_id(), None);
+        assert_eq!(read_u32(&memory, NPAD_OFFSET), 0);
+        assert_eq!(read_u32(&memory, NPAD_OFFSET + 4), 1);
+        event.clear();
+        hid.publish(Some(&state), Duration::ZERO).unwrap();
+        assert!(!event.is_signalled());
+        assert_eq!(read_u32(&memory, NPAD_OFFSET), 0);
+        hid.publish(None, Duration::ZERO).unwrap();
+        hid.publish(Some(&state), Duration::ZERO).unwrap();
+        assert_eq!(hid.connected_full_key_id(), Some(0));
+        assert!(event.is_signalled());
+        for id in [8, 9, 0x11, u32::MAX] {
+            assert!(!hid.disconnect_npad(id).unwrap());
+        }
     }
 
     #[test]

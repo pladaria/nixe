@@ -742,44 +742,39 @@ impl MaxwellThreeDShaderExecutionState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDShaderExecutionStateWrite) {
         match write {
-            MaxwellThreeDShaderExecutionStateWrite::StreamOutputEnable { value, source } => {
-                self.stream_output_enable =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            MaxwellThreeDShaderExecutionStateWrite::StreamOutputEnable { value, source: _ } => {
+                self.stream_output_enable = MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
             MaxwellThreeDShaderExecutionStateWrite::PixelShaderInterlockControl {
                 value,
-                source,
+                source: _,
             } => {
                 self.pixel_shader_interlock_control =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
             MaxwellThreeDShaderExecutionStateWrite::OpportunisticEarlyZHysteresis {
                 value,
-                source,
+                source: _,
             } => {
                 self.opportunistic_early_z_hysteresis =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+                    MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
-            MaxwellThreeDShaderExecutionStateWrite::ApiMandatedEarlyZ { value, source } => {
-                self.api_mandated_early_z =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDShaderExecutionStateWrite::ApiMandatedEarlyZ { value, source: _ } => {
+                self.api_mandated_early_z = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDShaderExecutionStateWrite::ShaderExceptionsEnable { value, source } => {
-                self.shader_exceptions_enable =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDShaderExecutionStateWrite::ShaderExceptionsEnable { value, source: _ } => {
+                self.shader_exceptions_enable = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobA { value, source } => {
-                self.subtiling_perf_knob_a =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobA { value, source: _ } => {
+                self.subtiling_perf_knob_a = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobB { value, source } => {
-                self.subtiling_perf_knob_b =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobB { value, source: _ } => {
+                self.subtiling_perf_knob_b = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
             MaxwellThreeDShaderExecutionStateWrite::ShaderWatermarks {
                 target,
                 value,
-                source,
+                source: _,
             } => {
                 let register = match target {
                     MaxwellThreeDShaderWatermarkTarget::VertexTessellationGeometryWarps => {
@@ -790,61 +785,57 @@ impl MaxwellThreeDShaderExecutionState {
                         &mut self.ps_register_watermarks
                     }
                 };
-                *register = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                *register = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDShaderExecutionStateWrite::L1Configuration { value, source } => {
-                self.l1_configuration =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDShaderExecutionStateWrite::L1Configuration { value, source: _ } => {
+                self.l1_configuration = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDShaderExecutionStateWrite::VisibleCallLimit { value, source } => {
-                self.visible_call_limit =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDShaderExecutionStateWrite::VisibleCallLimit { value, source: _ } => {
+                self.visible_call_limit = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDShaderExecutionStateWrite::SmTimeoutCounterBit { value, source } => {
-                self.sm_timeout_counter_bit =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDShaderExecutionStateWrite::SmTimeoutCounterBit { value, source: _ } => {
+                self.sm_timeout_counter_bit = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
             MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryWindowBaseAddress {
                 value,
-                source,
+                source: _,
             } => {
                 self.shader_local_memory.window_base_address =
-                    MaxwellThreeDRegister::programmed(value, value, source);
+                    MaxwellThreeDRegister::decoded(value, value);
             }
             MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryAddressUpper {
                 value,
-                source,
+                source: _,
             } => {
                 self.shader_local_memory.address_upper =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+                    MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
             MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryAddressLower {
                 value,
-                source,
+                source: _,
             } => {
                 self.shader_local_memory.address_lower =
-                    MaxwellThreeDRegister::programmed(value, value, source);
+                    MaxwellThreeDRegister::decoded(value, value);
             }
             MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemorySizeUpper {
                 value,
-                source,
+                source: _,
             } => {
                 self.shader_local_memory.size_upper =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+                    MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
             MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemorySizeLower {
                 value,
-                source,
+                source: _,
             } => {
-                self.shader_local_memory.size_lower =
-                    MaxwellThreeDRegister::programmed(value, value, source);
+                self.shader_local_memory.size_lower = MaxwellThreeDRegister::decoded(value, value);
             }
             MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryDefaultSizePerWarp {
                 value,
-                source,
+                source: _,
             } => {
                 self.shader_local_memory.default_size_per_warp =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+                    MaxwellThreeDRegister::decoded(value.raw(), value);
             }
         }
     }

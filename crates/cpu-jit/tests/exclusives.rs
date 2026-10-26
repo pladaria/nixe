@@ -103,6 +103,61 @@ fn run(jit: &mut JitThread, state: &mut ThreadState) -> CpuExit {
 }
 
 #[test]
+fn exclusive_store_with_overlapping_zero_registers_preserves_memory_semantics() {
+    // LDAXR X2,[X8]; optionally CLREX; STLXR WZR,XZR,[X8]; SVC.
+    // The overlapping status/data registers select the same defined behavior
+    // as Eden, including the exact store encoding from the reported failure.
+    // https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/STLXR--Store-Release-Exclusive-Register-
+    for reserve in [false, true] {
+        for clear in [false, true] {
+            for observed in [false, true] {
+                let mut code = Vec::new();
+                if reserve {
+                    code.push(0xc85ffd02);
+                }
+                if clear {
+                    code.push(0xd5033f5f);
+                }
+                code.extend([0xc81ffd1f, 0xd4000001]);
+                let (memory, process) = fixture(&code);
+                memory
+                    .write_value(DATA, 8, 7)
+                    .unwrap()
+                    .into_ready()
+                    .unwrap();
+                let observation = nixe_memory::Observation::default();
+                if observed {
+                    let range = memory.capture(DATA, 8, MemoryPermissions::READ).unwrap();
+                    memory
+                        .machine()
+                        .access_captured(
+                            &range,
+                            nixe_memory::AccessOperation::ReadObserved(observation.clone()),
+                        )
+                        .unwrap()
+                        .into_ready()
+                        .unwrap();
+                }
+                let mut state = state();
+                state.write_x(x(8), DATA.get());
+                state.write_x(A64Register::StackPointer, 0x7000);
+                let stop = run(&mut process.create_thread().unwrap(), &mut state);
+                assert!(matches!(stop, CpuExit::SupervisorCall { .. }), "{stop:?}");
+                assert_eq!(state.read_x(A64Register::StackPointer), 0x7000);
+                let committed = reserve && !clear;
+                assert_eq!(
+                    memory.read_value(DATA, 8).unwrap().into_ready().unwrap(),
+                    if committed { 0 } else { 7 }
+                );
+                if observed {
+                    assert_eq!(observation.is_invalid(), committed);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn every_scalar_width_and_acquire_release_use_physical_alias_reservations() {
     for (load, store, size) in [
         (0x085f7c22, 0x08037c80, MemoryAccessSize::Byte),

@@ -158,9 +158,10 @@ Clear rectangles use dynamic rendering and `vkCmdClearAttachments`. Aligned buff
 fills use `vkCmdFillBuffer`; arbitrary boundaries need at most six upload bytes.
 Native blits perform supported format conversion/scaling, and copies snapshot an
 overlapping source on GPU. Unsupported filter/format/depth combinations fail.
-`nv12_pipeline`/`prepare_nv12`/`convert_nv12` implement the existing fixed-point
-matrix, crop, clamp, truncation, RGBA/BGRA and alpha contract through ordinary
-cached raster execution. Presentation imports use typed leases and versioned snapshots.
+VIC RGB conversion consumes immutable host NV12 planes through ordinary cached
+raster execution. These inputs have no guest-memory alias or authority entry;
+only the output uses canonical guest image tracking. CPU VIC handles linear
+NV12 output directly. Presentation imports use typed leases and versioned snapshots.
 
 Buffer storage writes and sampled image aliases share the canonical producer
 index. The next image use imports the latest GPU bytes without CPU readback for

@@ -151,8 +151,8 @@ impl ProcessBuilder {
             .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
         }
 
-        let stack_size = align_up(stack_size.max(nixe_memory::PAGE_SIZE), TLS_SIZE)?;
-        if stack_size + (RESOURCE_GUARD_SIZE * 3) + (TLS_SIZE * 2) > memory_layout.stack().size() {
+        let stack_size = align_up(stack_size.max(PAGE_SIZE), PAGE_SIZE)?;
+        if stack_size + (RESOURCE_GUARD_SIZE * 3) + (PAGE_SIZE * 2) > memory_layout.stack().size() {
             return Err(error(
                 ProcessBuildStage::Placement,
                 "main-thread resources exceed the reserved stack region",
@@ -162,10 +162,10 @@ impl ProcessBuilder {
         let stack_top = stack_bottom
             .checked_add(stack_size)
             .ok_or_else(|| error(ProcessBuildStage::Placement, "main stack overflows"))?;
-        let tls_base = stack_top
+        let local_page = stack_top
             .checked_add(RESOURCE_GUARD_SIZE)
             .ok_or_else(|| error(ProcessBuildStage::Placement, "TLS base overflows"))?;
-        validate_range(address_space, tls_base.get(), TLS_SIZE)?;
+        validate_range(address_space, local_page.get(), PAGE_SIZE)?;
         memory
             .map_zeroed(
                 stack_bottom,
@@ -178,17 +178,34 @@ impl ProcessBuilder {
             .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
         memory
             .map_zeroed(
-                tls_base,
-                TLS_SIZE,
+                local_page,
+                PAGE_SIZE,
                 kernel_mapping(
                     crate::memory::MemoryKind::ThreadLocal,
                     MemoryPermissions::READ_WRITE,
                 ),
             )
             .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
+        // Reserve the first 0x200-byte region for the process before allocating
+        // the main thread's TLS, as KProcess::Initialize/CreateThreadLocalRegion.
+        // Both regions share the same kernel-owned page and allocation index.
+        // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/kernel/k_process.cpp
+        let process_local_region = local_page;
+        let mut thread_local = thread_local::ThreadLocalPages::new(
+            local_page,
+            memory_layout.stack().base(),
+            memory_layout
+                .stack()
+                .base()
+                .checked_add(memory_layout.stack().size())
+                .expect("validated stack region has a finite end"),
+        );
+        let tls_base = thread_local
+            .allocate(&memory)
+            .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
         let (abi_context, loader_return) = if matches!(abi, InitialProcessAbi::Homebrew) {
-            let address = tls_base
-                .checked_add(TLS_SIZE + RESOURCE_GUARD_SIZE)
+            let address = local_page
+                .checked_add(PAGE_SIZE + RESOURCE_GUARD_SIZE)
                 .ok_or_else(|| error(ProcessBuildStage::Placement, "ABI context overflows"))?;
             validate_range(address_space, address.get(), nixe_memory::PAGE_SIZE)?;
             install_homebrew_context(
@@ -275,12 +292,8 @@ impl ProcessBuilder {
             initial_thread_priority: metadata.priority,
             initial_ideal_vcpu: metadata.ideal_vcpu,
             thread_policy: metadata.thread_policy,
-            next_thread_tls: memory_layout
-                .stack()
-                .base()
-                .checked_add(memory_layout.stack().size())
-                .expect("validated stack region has a finite end"),
-            free_thread_tls: std::collections::BTreeSet::new(),
+            thread_local,
+            process_local_region,
             threads,
             mounts: std::sync::Arc::new(crate::ProcessMountNamespace::from_launch_plan(
                 plan,

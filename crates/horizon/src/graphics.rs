@@ -922,6 +922,7 @@ struct BufferSlot {
 #[derive(Debug)]
 struct BufferQueue {
     connected_api: Option<i32>,
+    override_max_buffer_count: i32,
     weak_references: i64,
     strong_references: i64,
     slots: BTreeMap<i32, BufferSlot>,
@@ -980,6 +981,7 @@ impl BufferQueue {
     fn new(binder_id: i32) -> Self {
         Self {
             connected_api: None,
+            override_max_buffer_count: 0,
             weak_references: 0,
             strong_references: 0,
             slots: BTreeMap::new(),
@@ -1033,16 +1035,33 @@ impl BufferQueue {
                     writer.write_i32(-22);
                 }
             }
+            2 => {
+                let count = reader.read_i32()?;
+                let status = if !(0..=MAX_BUFFER_SLOTS).contains(&count)
+                    || self.slots.values().any(|slot| {
+                        matches!(
+                            slot.ownership,
+                            SlotOwnership::Dequeued | SlotOwnership::Queueing
+                        )
+                    }) {
+                    -22
+                } else {
+                    self.override_max_buffer_count = count;
+                    self.update_availability();
+                    0
+                };
+                writer.write_i32(status);
+            }
             3 => {
                 let _async = reader.read_i32()?;
                 let _width = reader.read_u32()?;
                 let _height = reader.read_u32()?;
                 let _format = reader.read_i32()?;
                 let _usage = reader.read_u32()?;
-                let free = self
-                    .slots
-                    .iter_mut()
-                    .find(|(_, slot)| slot.ownership == SlotOwnership::Free);
+                let max_count = self.max_buffer_count();
+                let free = self.slots.iter_mut().find(|(index, slot)| {
+                    **index < max_count && slot.ownership == SlotOwnership::Free
+                });
                 if let Some((&slot_index, slot)) = free {
                     slot.ownership = SlotOwnership::Dequeued;
                     writer.write_i32(slot_index);
@@ -1052,13 +1071,7 @@ impl BufferQueue {
                     writer.write_i32(1);
                     writer.write_flattened(&encode_nv_multi_fence(&slot.release_fences))?;
                     writer.write_i32(0);
-                    if !self
-                        .slots
-                        .values()
-                        .any(|slot| slot.ownership == SlotOwnership::Free)
-                    {
-                        self.available_event.clear();
-                    }
+                    self.update_availability();
                 } else {
                     writer.write_i32(-1);
                     writer.write_i32(0);
@@ -1103,7 +1116,7 @@ impl BufferQueue {
                 }
                 slot.release_fences = fences;
                 slot.ownership = SlotOwnership::Free;
-                self.available_event.signal();
+                self.update_availability();
             }
             9 => {
                 let _what = reader.read_i32()?;
@@ -1150,6 +1163,7 @@ impl BufferQueue {
                 };
                 if status == 0 {
                     self.connected_api = None;
+                    self.override_max_buffer_count = 0;
                     self.next_acquire_sequence = 0;
                     self.blocked_this_advance = false;
                     self.slots.clear();
@@ -1185,6 +1199,7 @@ impl BufferQueue {
                             release_fences: Box::default(),
                         },
                     );
+                    self.override_max_buffer_count = self.slots.len() as i32;
                 } else {
                     return Err(ParcelError::Malformed(
                         "preallocated buffer presence flag is invalid",
@@ -1224,11 +1239,30 @@ impl BufferQueue {
         .unwrap_or(u32::MAX)
     }
 
+    fn max_buffer_count(&self) -> i32 {
+        if self.override_max_buffer_count != 0 {
+            return self.override_max_buffer_count;
+        }
+        self.slots
+            .iter()
+            .filter(|(_, slot)| {
+                matches!(
+                    slot.ownership,
+                    SlotOwnership::Dequeued | SlotOwnership::Queueing | SlotOwnership::Queued
+                )
+            })
+            .map(|(&index, _)| index + 1)
+            .max()
+            .unwrap_or(2)
+            .max(2)
+    }
+
     fn update_availability(&self) {
+        let max_count = self.max_buffer_count();
         if self
             .slots
-            .values()
-            .any(|slot| slot.ownership == SlotOwnership::Free)
+            .iter()
+            .any(|(&index, slot)| index < max_count && slot.ownership == SlotOwnership::Free)
         {
             self.available_event.signal();
         } else {
@@ -1247,7 +1281,7 @@ impl BufferQueue {
         // Composition is complete synchronously before this transition, so no
         // future guest GPU point is required for the next producer dequeue.
         slot.release_fences = Box::default();
-        self.available_event.signal();
+        self.update_availability();
         true
     }
 
@@ -1377,6 +1411,12 @@ fn parse_queue_buffer_input(bytes: &[u8]) -> Result<QueueBufferInput, ParcelErro
     let u32_at = |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
     let i32_at = |offset: usize| i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
     let acquire_fences = parse_nv_multi_fence(&bytes[48..84])?;
+    nixe_memory::trace::event(
+        "queue_options",
+        u64::from(u32_at(40)),
+        u64::from(u32_at(8)),
+        u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+    );
     Ok(QueueBufferInput {
         timestamp: i64::from_le_bytes(bytes[0..8].try_into().unwrap()),
         auto_timestamp: i32_at(8) != 0,
@@ -1840,6 +1880,9 @@ mod tests {
     impl nixe_gpu::GpuExecution for ResidentTestRuntime {
         type Commands = nixe_gpu::native::NativeWork;
         type ImageRequest = nixe_gpu::native::NativePresentationImage;
+        fn flush(&mut self) -> Result<(), nixe_gpu::BackendRuntimeError> {
+            Ok(())
+        }
         fn consume(&mut self, _batch: &Self::Commands) -> Result<bool, BackendRuntimeError> {
             unreachable!("resident presentation fixture records no GPU work")
         }
@@ -2343,6 +2386,89 @@ mod tests {
     }
 
     #[test]
+    fn set_buffer_count_limits_dequeue_and_respects_producer_ownership() {
+        let mut queue = BufferQueue::new(4);
+        let slot = BufferSlot {
+            ownership: SlotOwnership::Free,
+            buffer: GraphicBuffer {
+                nvmap_id: 1,
+                stride_pixels: 1,
+                format: 1,
+                external_format: 1,
+                usage: 0,
+                total_size: 4,
+                planes: Box::new([]),
+            },
+            flattened_buffer: Box::new([]),
+            presentation_source: None,
+            release_fences: Box::new([]),
+        };
+        for index in 0..3 {
+            queue.slots.insert(index, slot.clone());
+        }
+        let set_count = |queue: &mut BufferQueue, count| {
+            let mut request = producer_request();
+            request.write_i32(count);
+            let reply = queue.transact(2, &request.finish().unwrap()).unwrap();
+            ParcelReader::decode(&reply.reply)
+                .unwrap()
+                .read_i32()
+                .unwrap()
+        };
+        let dequeue = |queue: &mut BufferQueue| {
+            let mut request = producer_request();
+            for value in [0, 1, 1, 1, 0] {
+                request.write_i32(value);
+            }
+            let reply = queue.transact(3, &request.finish().unwrap()).unwrap();
+            let mut reader = ParcelReader::decode(&reply.reply).unwrap();
+            let slot = reader.read_i32().unwrap();
+            if reader.read_i32().unwrap() != 0 {
+                reader.read_flattened().unwrap();
+            }
+            (slot, reader.read_i32().unwrap())
+        };
+        let cancel = |queue: &mut BufferQueue, index| {
+            let mut request = producer_request();
+            request.write_i32(index);
+            request
+                .write_flattened(&encode_nv_multi_fence(&[]))
+                .unwrap();
+            queue.transact(8, &request.finish().unwrap()).unwrap();
+        };
+
+        for invalid in [-1, MAX_BUFFER_SLOTS + 1] {
+            assert_eq!(set_count(&mut queue, invalid), -22);
+        }
+        assert_eq!(set_count(&mut queue, 3), 0);
+        let mut connect = producer_request();
+        for value in [0, 2, 0] {
+            connect.write_i32(value);
+        }
+        queue.transact(10, &connect.finish().unwrap()).unwrap();
+        assert!(queue.available_event.readable().is_signalled());
+        for index in 0..3 {
+            assert_eq!(dequeue(&mut queue), (index, 0));
+        }
+        assert!(!queue.available_event.readable().is_signalled());
+        assert_eq!(set_count(&mut queue, 2), -22);
+        assert_eq!(queue.override_max_buffer_count, 3);
+
+        for index in 0..3 {
+            cancel(&mut queue, index);
+        }
+        assert_eq!(set_count(&mut queue, 2), 0);
+        assert_eq!(dequeue(&mut queue), (0, 0));
+        assert_eq!(dequeue(&mut queue), (1, 0));
+        assert_eq!(dequeue(&mut queue), (-1, -11));
+        assert!(!queue.available_event.readable().is_signalled());
+        cancel(&mut queue, 0);
+        cancel(&mut queue, 1);
+        assert_eq!(set_count(&mut queue, 0), 0);
+        assert_eq!(queue.max_buffer_count(), 2);
+    }
+
+    #[test]
     fn request_buffer_returns_the_registered_descriptor_only_to_its_producer() {
         let mut queue = BufferQueue::new(4);
         let request = |slot| {
@@ -2388,6 +2514,7 @@ mod tests {
         register.write_i32(1);
         register.write_flattened(&flattened).unwrap();
         queue.transact(14, &register.finish().unwrap()).unwrap();
+        assert_eq!(queue.override_max_buffer_count, 1);
         assert_error(&queue.transact(1, &request(0)).unwrap().reply, -22);
 
         let mut dequeue = producer_request();

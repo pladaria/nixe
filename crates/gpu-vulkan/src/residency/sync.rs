@@ -281,9 +281,6 @@ impl Barriers {
             );
         }
     }
-    pub fn queue_buffer(&mut self, barrier: vk::BufferMemoryBarrier2<'static>) {
-        self.buffers.push(barrier);
-    }
     pub fn queue_image(&mut self, barrier: vk::ImageMemoryBarrier2<'static>) {
         self.images.push(barrier);
     }
@@ -297,13 +294,8 @@ impl Barriers {
         if self.is_empty() {
             return;
         }
-        let index = device
-            .submission
-            .recording
-            .expect("barriers have a recording slot");
         unsafe {
             device.dispatch.barrier(
-                device.submission.slots[index].command,
                 &vk::DependencyInfo::default()
                     .memory_barriers(&self.memory)
                     .buffer_memory_barriers(&self.buffers)
@@ -441,7 +433,10 @@ impl VulkanResidency {
                 "image access exceeds subresources",
             ));
         }
-        let layout = if self.unified_layouts && conventional != vk::ImageLayout::PRESENT_SRC_KHR {
+        let layout = if self.unified_layouts
+            && conventional != vk::ImageLayout::PRESENT_SRC_KHR
+            && conventional != vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+        {
             vk::ImageLayout::GENERAL
         } else {
             conventional

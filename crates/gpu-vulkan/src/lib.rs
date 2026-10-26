@@ -24,8 +24,7 @@ pub use memory::NativeImageDescription;
 pub use residency::{
     AccessScope, AttachmentId, AttachmentLoad, AttachmentStore, BarrierPolicy, BarrierStatistics,
     BufferId, BufferRange, BufferUpload, ImageId, ImagePlane, ImageViewDescription, ImageViewId,
-    LayoutPolicy, PreparedNv12, RecordingPolicy, ResidencyStatistics, VulkanResidency,
-    nv12_pipeline,
+    LayoutPolicy, RecordingPolicy, ResidencyStatistics, VulkanResidency,
 };
 mod validation;
 pub use gpu_allocator::MemoryLocation;

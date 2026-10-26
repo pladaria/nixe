@@ -87,11 +87,11 @@ pub(in crate::ipc_wire) async fn dispatch_audio_device(
         let Some(end) = name.iter().position(|&byte| byte == 0) else {
             return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_ARGUMENT);
         };
-        let Some(device) = session
-            .names()
-            .iter()
-            .position(|name_| name_.as_bytes() == &name[..end])
-        else {
+        let Some(device) = session.volume_device(&name[..end]) else {
+            log::debug!(
+                "audio device volume: command={command} unknown-name={:?}",
+                String::from_utf8_lossy(&name[..end])
+            );
             return cmif_error(request.token, HorizonIpcResult::AUDIO_NOT_FOUND);
         };
         if matches!(command, 1 | 7) {
@@ -102,7 +102,7 @@ pub(in crate::ipc_wire) async fn dispatch_audio_device(
             session.state.set_volume(device, volume);
             log::debug!(
                 "audio device output volume: device={} volume={volume}",
-                session.names()[device]
+                DEVICE_NAMES[device]
             );
             return semantic_success(request.token, false, &[], &[], &[], None);
         }

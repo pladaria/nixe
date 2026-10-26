@@ -219,6 +219,7 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
                 | "shader_compile"
                 | "pipeline_compile"
                 | "queue_buffer"
+                | "queue_options"
                 | "requested_interval"
                 | "vi_latch"
                 | "buffer_release"

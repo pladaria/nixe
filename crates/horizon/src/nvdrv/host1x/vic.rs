@@ -5,6 +5,7 @@
 use super::surface::Surface;
 use super::video::write_spans;
 use super::video::{Mappings, read, region, word};
+use std::borrow::Cow;
 
 fn wide(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
@@ -21,7 +22,69 @@ struct Matrix {
     shift: u32,
     enabled: bool,
 }
+
+fn chroma_surface(luma: &Surface, size: u32) -> Result<Surface, String> {
+    let chroma = Surface {
+        width: luma.width.div_ceil(2) * 2,
+        height: luma.height.div_ceil(2),
+        pitch: (((size & 0x3fff) as usize + 1) * 2).next_multiple_of(if luma.kind == 1 {
+            64
+        } else {
+            16
+        }),
+        rows: (size >> 14 & 0x3fff) as usize + 1,
+        kind: luma.kind,
+        block_height: luma.block_height,
+        format: luma.format,
+    };
+    if chroma.pitch < chroma.width || chroma.rows < chroma.height {
+        return Err("invalid VIC chroma allocation".into());
+    }
+    Ok(chroma)
+}
+
+// NV12 retains Y/U/V components through the compositor. The color matrices
+// define their interpretation; no implicit RGB round trip is involved.
+// https://github.com/eden-emulator/mirror/blob/master/src/video_core/host1x/vic.cpp
+fn write_nv12(
+    output: &Surface,
+    chroma: &Surface,
+    pixels: &[[i64; 4]],
+    matrix: Matrix,
+    mappings: &Mappings,
+    addresses: [u64; 2],
+) -> Result<(), String> {
+    for (index, (plane, address)) in [output, chroma].into_iter().zip(addresses).enumerate() {
+        let is_chroma = index == 1;
+        let (backing, offset) = region(mappings, address, plane.length())?;
+        let mut bytes = vec![0; plane.length()];
+        for y in 0..plane.height {
+            for x0 in (0..plane.width).step_by(16) {
+                let count = (plane.width - x0).min(16);
+                let target = plane.offset(x0, y);
+                for x in 0..count {
+                    let (sx, sy, channel) = if is_chroma {
+                        ((x0 + x) / 2 * 2, y * 2, 1 + (x0 + x) % 2)
+                    } else {
+                        (x0 + x, y, 0)
+                    };
+                    let pixel = matrix.apply(pixels[sy * output.width + sx]);
+                    bytes[target + x] = (pixel[channel].clamp(0, 1023) >> 2) as u8;
+                }
+            }
+        }
+        write_spans(backing, offset, &bytes, plane.written_spans(1))?;
+    }
+    Ok(())
+}
 impl Matrix {
+    fn is_identity(&self) -> bool {
+        !self.enabled
+            || self.coefficients
+                == std::array::from_fn(|r| {
+                    std::array::from_fn(|c| if r == c { 256 << self.shift } else { 0 })
+                })
+    }
     fn decode(bytes: &[u8]) -> Self {
         let columns = std::array::from_fn::<_, 4, _>(|i| wide(bytes, i * 8));
         Self {
@@ -327,365 +390,468 @@ fn write_opaque_nv12(
             }
         }
     }
-    let mut spans = Vec::with_capacity(output.height * (output.width * 4).div_ceil(16));
-    for y in 0..output.height {
-        for x in (0..output.width * 4).step_by(16) {
-            let target = output.offset(x, y);
-            spans.push(target..target + (output.width * 4 - x).min(16));
-        }
-    }
-    write_spans(backing, offset, &bytes, spans)?;
+    write_spans(backing, offset, &bytes, output.written_spans(4))?;
     Ok(())
 }
 
-#[cfg(test)]
-pub(super) fn execute(registers: &[u32], mappings: &Mappings) -> Result<(), String> {
-    execute_with_gpu(registers, mappings, None)
+/// The decoder owns the frame until VIC consumes it. A RAM source remains a
+/// real VIC input when no decoder supplied that physical surface.
+fn source_planes<'a>(
+    frame: Option<&'a super::video::Frame>,
+    input: &mut Surface,
+    chroma: &mut Surface,
+    mappings: &Mappings,
+    addresses: [u64; 2],
+) -> Result<[Cow<'a, [u8]>; 2], String> {
+    if let Some(frame) = frame {
+        input.pitch = frame.luma_pitch();
+        chroma.pitch = frame.chroma_pitch();
+        Ok([Cow::Borrowed(frame.luma()), frame.chroma()])
+    } else {
+        Ok([
+            Cow::Owned(input.read_linear(mappings, addresses[0])?),
+            Cow::Owned(chroma.read_linear(mappings, addresses[1])?),
+        ])
+    }
 }
 
-pub(super) fn execute_with_gpu(
-    registers: &[u32],
+fn write_plane(
+    output: &Surface,
+    source: &[u8],
+    pitch: usize,
+    origin: [usize; 2],
     mappings: &Mappings,
-    gpu: Option<&super::super::gpu_executor::NvDrvGpuExecutor>,
+    address: u64,
 ) -> Result<(), String> {
-    let config = read(mappings, u64::from(registers[0x1c2]) << 8, 0x610)?;
-    let output = Surface::decode(&config[0x20..0x30], 4)?;
-    if !matches!(output.format, 31 | 32 | 35 | 36) {
-        return Err(format!(
-            "unsupported VIC output pixel format {}",
-            output.format
-        ));
-    }
-    let out_config = wide(&config, 0x10);
-    if bits(out_config, 46, 5) != 0 {
-        return Err("VIC output regamma/flip/transpose is not implemented".into());
-    }
-    let alpha_mode = bits(out_config, 0, 3);
-    let alpha_slot = bits(out_config, 3, 3) as usize;
-    if alpha_mode > 5 {
-        return Err("invalid VIC output alpha mode".into());
-    }
-    let background = [
-        bits(out_config, 16, 10) as i64,
-        bits(out_config, 26, 10) as i64,
-        bits(out_config, 36, 10) as i64,
-        bits(out_config, 6, 10) as i64,
-    ];
-    let final_matrix = Matrix::decode(&config[0x30..0x50]);
-    let single_slot = (0..8)
-        .filter(|slot| wide(&config, 0x90 + slot * 0xb0) & 1 != 0)
-        .count()
-        == 1;
-    let mut pixels = Vec::new();
-    let mut selected_alpha = Vec::new();
-    let target_x = word(&config, 0x18);
-    let target_y = word(&config, 0x1c);
-    let target_left = (target_x & 0x3fff) as usize;
-    let target_right = (target_x >> 16 & 0x3fff) as usize;
-    let target_top = (target_y & 0x3fff) as usize;
-    let target_bottom = (target_y >> 16 & 0x3fff) as usize;
-    for slot in 0..8 {
-        let start = 0x90 + slot * 0xb0;
-        let state = &config[start..start + 0xb0];
-        let flags = wide(state, 0);
-        if flags & 1 == 0 {
-            continue;
+    let (backing, offset) = region(mappings, address, output.length())?;
+    let mut bytes = vec![0; output.length()];
+    for y in 0..output.height {
+        let start = (origin[1] + y) * pitch + origin[0];
+        let row = source
+            .get(start..start + output.width)
+            .ok_or("VIC copy exceeds decoded plane")?;
+        let run = if output.kind == 0 { output.width } else { 16 };
+        for x in (0..output.width).step_by(run) {
+            let count = (output.width - x).min(run);
+            let target = output.offset(x, y);
+            bytes[target..target + count].copy_from_slice(&row[x..x + count]);
         }
-        let controls = wide(state, 16);
-        log::trace!(
-            "VIC slot: index={slot} config={:016x?} surface={:08x?}",
-            (0..7).map(|i| wide(state, i * 8)).collect::<Vec<_>>(),
-            (0..4)
-                .map(|i| word(state, 0x40 + i * 4))
-                .collect::<Vec<_>>()
-        );
-        if flags & 0xfe != 0
-            || bits(flags, 9, 11) != 0
-            || bits(flags, 24, 12) != 0
-            || bits(controls, 43, 16) != 0
-            || bits(wide(state, 0x58), 40, 1) != 0
+    }
+    write_spans(backing, offset, &bytes, output.written_spans(1))
+}
+
+/// Decoder association belongs to the VIC channel and is discarded on close.
+#[derive(Default)]
+pub(super) struct Vic {
+    pub(super) decoder: Option<super::super::NvDrvFileDescriptor>,
+    current: Option<super::video::Frame>,
+}
+impl Vic {
+    fn frame(
+        &mut self,
+        mappings: &Mappings,
+        address: u64,
+        decoders: &mut std::collections::BTreeMap<
+            super::super::NvDrvFileDescriptor,
+            super::video::NvDec,
+        >,
+    ) -> Result<Option<&super::video::Frame>, String> {
+        if self.decoder.is_none() {
+            let identity = super::video::surface_identity(mappings, address)?;
+            self.decoder = decoders
+                .iter()
+                .find_map(|(&fd, decoder)| decoder.has_frame(identity).then_some(fd));
+        }
+        if let Some(fd) = self.decoder
+            && let Some(frame) = decoders
+                .get_mut(&fd)
+                .and_then(super::video::NvDec::pop_frame)
         {
+            self.current = Some(frame);
+        }
+        // An execute without a new decoded picture repeats the retained image,
+        // as VIC's persistent slot/output surface does in the reference design.
+        Ok(self.current.as_ref())
+    }
+
+    pub(super) fn execute(
+        &mut self,
+        registers: &[u32],
+        mappings: &Mappings,
+        gpu: Option<&super::super::gpu_executor::NvDrvGpuExecutor>,
+        decoders: &mut std::collections::BTreeMap<
+            super::super::NvDrvFileDescriptor,
+            super::video::NvDec,
+        >,
+    ) -> Result<(), String> {
+        let config = read(mappings, u64::from(registers[0x1c2]) << 8, 0x610)?;
+        let nv12_output = word(&config, 0x20) & 127 == 68;
+        let output = Surface::decode(&config[0x20..0x30], if nv12_output { 1 } else { 4 })?;
+        if !matches!(output.format, 31 | 32 | 35 | 36 | 68) {
             return Err(format!(
-                "unsupported VIC slot processing: flags={flags:#x} controls={controls:#x}"
+                "unsupported VIC output pixel format {}",
+                output.format
             ));
         }
-        if flags & (1 << 8) == 0 {
-            return Err("VIC enabled slot lacks its current input field".into());
+        let out_config = wide(&config, 0x10);
+        if bits(out_config, 46, 5) != 0 {
+            return Err("VIC output regamma/flip/transpose is not implemented".into());
         }
-        let input = Surface::decode(&state[0x40..0x50], 1)?;
-        if input.format != 68 {
-            return Err(format!(
-                "unsupported VIC input pixel format {}",
-                input.format
-            ));
+        let alpha_mode = bits(out_config, 0, 3);
+        let alpha_slot = bits(out_config, 3, 3) as usize;
+        if alpha_mode > 5 {
+            return Err("invalid VIC output alpha mode".into());
         }
-        let chroma_size = word(state, 0x4c);
-        let chroma = Surface {
-            width: input.width.div_ceil(2) * 2,
-            height: input.height.div_ceil(2),
-            pitch: (((chroma_size & 0x3fff) as usize + 1) * 2)
-                .next_multiple_of(if input.kind == 1 { 64 } else { 16 }),
-            rows: (chroma_size >> 14 & 0x3fff) as usize + 1,
-            kind: input.kind,
-            block_height: input.block_height,
-            format: input.format,
-        };
-        if chroma.pitch < chroma.width || chroma.rows < chroma.height {
-            return Err("invalid VIC chroma allocation".into());
-        }
-        let left = (word(state, 0x20) & 0x3fffffff) as usize;
-        let right = (word(state, 0x24) & 0x3fffffff) as usize;
-        let top = (word(state, 0x28) & 0x3fffffff) as usize;
-        let bottom = (word(state, 0x2c) & 0x3fffffff) as usize;
-        let dx = word(state, 0x30);
-        let dy = word(state, 0x34);
-        let dl = (dx & 0x3fff) as usize;
-        let dr = (dx >> 16 & 0x3fff) as usize;
-        let dt = (dy & 0x3fff) as usize;
-        let db = (dy >> 16 & 0x3fff) as usize;
-        if right < left
-            || bottom < top
-            || dr < dl
-            || db < dt
-            || [left, right, top, bottom].iter().any(|v| v & 0xffff != 0)
-            || right / 65536 - left / 65536 != dr - dl
-            || bottom / 65536 - top / 65536 != db - dt
-        {
-            return Err("VIC scaling/subpixel rectangles are not implemented".into());
-        }
-        if right / 65536 >= input.width || bottom / 65536 >= input.height {
-            return Err("VIC source rectangle exceeds surface".into());
-        }
-        let color = Matrix::decode(&state[0x60..0x80]);
-        let gamut = Matrix::decode(&state[0x80..0xa0]);
-        let minimum = bits(controls, 0, 10) as i64;
-        let maximum = bits(controls, 10, 10) as i64;
-        if minimum > maximum {
-            return Err("invalid VIC soft clamp range".into());
-        }
-        let alpha = bits(controls, 32, 10) as i64;
-        let blend = &state[0xa0..0xb0];
-        let constants = word(blend, 0);
-        let factors = word(blend, 4);
-        let overrides = word(blend, 12);
-        if overrides & 0x000f_f000 != 0 {
-            return Err("VIC blend channel overrides/masks are not implemented".into());
-        }
-        let k1 = (constants & 1023) as i64;
-        let k2 = (constants >> 16 & 1023) as i64;
-        let selectors = [
-            factors & 7,
-            factors >> 4 & 7,
-            factors >> 8 & 7,
-            factors >> 12 & 7,
+        let background = [
+            bits(out_config, 16, 10) as i64,
+            bits(out_config, 26, 10) as i64,
+            bits(out_config, 36, 10) as i64,
+            bits(out_config, 6, 10) as i64,
         ];
-        let x0 = dl.max(target_left);
-        let x1 = dr.min(target_right).min(output.width - 1);
-        let y0 = dt.max(target_top);
-        let y1 = db.min(target_bottom).min(output.height - 1);
-        if x0 > x1 || y0 > y1 {
-            continue;
-        }
-        // A single full-surface opaque NV12 slot does not need a compositor
-        // framebuffer, alpha array, blend divides or a second full-pixel pass.
-        // Select this from actual VIC state; matrices, clamp, format, source
-        // crop and alpha still have their exact guest-defined semantics.
-        let source_alpha = alpha.clamp(minimum, maximum);
-        if single_slot
-            && !gamut.enabled
-            && !final_matrix.enabled
-            && x0 == 0
-            && y0 == 0
-            && x1 + 1 == output.width
-            && y1 + 1 == output.height
-            && factor(selectors[0], k1, k2, source_alpha, background[3], 0)? == 1023
-            && dst_factor(selectors[1], k1, k2, source_alpha, background[3], 0)? == 0
-        {
-            let sf = factor(selectors[2], k1, k2, source_alpha, background[3], 3)?;
-            let df = dst_factor(selectors[3], k1, k2, source_alpha, background[3], 3)?;
-            let composited_alpha =
-                ((source_alpha * sf + background[3] * df + 511) / 1023).clamp(0, 1023);
-            let final_alpha = if matches!(output.format, 35 | 36) {
-                1023
-            } else {
-                match alpha_mode {
-                    0 => 1023,
-                    1 => background[3],
-                    2 | 4 => composited_alpha,
-                    3 | 5 => {
-                        if slot == alpha_slot {
-                            source_alpha
-                        } else {
-                            0
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-            };
-            if let Some(gpu) = gpu
-                && (output.kind == 0 || output.pitch == (output.width * 4).next_multiple_of(64))
-            {
-                let format = if matches!(output.format, 32 | 36) {
-                    nixe_gpu::ImageFormat::Bgra8Unorm
-                } else {
-                    nixe_gpu::ImageFormat::Rgba8Unorm
-                };
-                let images = [
-                    input.gpu_image(
-                        mappings,
-                        u64::from(registers[0x100 + slot * 24]) << 8,
-                        nixe_gpu::ImageFormat::R8Unorm,
-                        true,
-                    )?,
-                    chroma.gpu_image(
-                        mappings,
-                        u64::from(registers[0x101 + slot * 24]) << 8,
-                        nixe_gpu::ImageFormat::Rg8Unorm,
-                        true,
-                    )?,
-                    output.gpu_image(mappings, u64::from(registers[0x1c8]) << 8, format, false)?,
-                ];
-                gpu.convert_nv12(
-                    images,
-                    nixe_gpu::Nv12ColorTransform {
-                        coefficients: color.coefficients.map(|row| row.map(|c| c as i32)),
-                        shift: color.shift,
-                        enabled: color.enabled,
-                        clamp: [minimum as i32, maximum as i32],
-                        alpha: (final_alpha.clamp(0, 1023) >> 2) as u8,
-                        source_origin: [
-                            (left / 65536 + x0 - dl) as u32,
-                            (top / 65536 + y0 - dt) as u32,
-                        ],
-                    },
-                )?;
-                return Ok(());
+        let final_matrix = Matrix::decode(&config[0x30..0x50]);
+        let single_slot = (0..8)
+            .filter(|slot| wide(&config, 0x90 + slot * 0xb0) & 1 != 0)
+            .count()
+            == 1;
+        let mut pixels = Vec::new();
+        let mut selected_alpha = Vec::new();
+        let target_x = word(&config, 0x18);
+        let target_y = word(&config, 0x1c);
+        let target_left = (target_x & 0x3fff) as usize;
+        let target_right = (target_x >> 16 & 0x3fff) as usize;
+        let target_top = (target_y & 0x3fff) as usize;
+        let target_bottom = (target_y >> 16 & 0x3fff) as usize;
+        for slot in 0..8 {
+            let start = 0x90 + slot * 0xb0;
+            let state = &config[start..start + 0xb0];
+            let flags = wide(state, 0);
+            if flags & 1 == 0 {
+                continue;
             }
-            let luma = input.read_linear(mappings, u64::from(registers[0x100 + slot * 24]) << 8)?;
-            let uv = chroma.read_linear(mappings, u64::from(registers[0x101 + slot * 24]) << 8)?;
-            write_opaque_nv12(
-                &output,
-                &input,
-                &chroma,
-                &luma,
-                &uv,
-                color,
-                minimum,
-                maximum,
-                (final_alpha.clamp(0, 1023) >> 2) as u8,
-                left / 65536 + x0 - dl,
-                top / 65536 + y0 - dt,
-                mappings,
-                u64::from(registers[0x1c8]) << 8,
-            )?;
-            return Ok(());
+            let controls = wide(state, 16);
+            log::trace!(
+                "VIC slot: index={slot} config={:016x?} surface={:08x?}",
+                (0..7).map(|i| wide(state, i * 8)).collect::<Vec<_>>(),
+                (0..4)
+                    .map(|i| word(state, 0x40 + i * 4))
+                    .collect::<Vec<_>>()
+            );
+            if flags & 0xfe != 0
+                || bits(flags, 9, 11) != 0
+                || bits(flags, 24, 12) != 0
+                || bits(controls, 43, 16) != 0
+                || bits(wide(state, 0x58), 40, 1) != 0
+            {
+                return Err(format!(
+                    "unsupported VIC slot processing: flags={flags:#x} controls={controls:#x}"
+                ));
+            }
+            if flags & (1 << 8) == 0 {
+                return Err("VIC enabled slot lacks its current input field".into());
+            }
+            let mut input = Surface::decode(&state[0x40..0x50], 1)?;
+            if input.format != 68 {
+                return Err(format!(
+                    "unsupported VIC input pixel format {}",
+                    input.format
+                ));
+            }
+            let mut chroma = chroma_surface(&input, word(state, 0x4c))?;
+            let source_address = [
+                u64::from(registers[0x100 + slot * 24]) << 8,
+                u64::from(registers[0x101 + slot * 24]) << 8,
+            ];
+            let frame = self.frame(mappings, source_address[0], decoders)?;
+
+            let left = (word(state, 0x20) & 0x3fffffff) as usize;
+            let right = (word(state, 0x24) & 0x3fffffff) as usize;
+            let top = (word(state, 0x28) & 0x3fffffff) as usize;
+            let bottom = (word(state, 0x2c) & 0x3fffffff) as usize;
+            let dx = word(state, 0x30);
+            let dy = word(state, 0x34);
+            let dl = (dx & 0x3fff) as usize;
+            let dr = (dx >> 16 & 0x3fff) as usize;
+            let dt = (dy & 0x3fff) as usize;
+            let db = (dy >> 16 & 0x3fff) as usize;
+            if right < left
+                || bottom < top
+                || dr < dl
+                || db < dt
+                || [left, right, top, bottom].iter().any(|v| v & 0xffff != 0)
+                || right / 65536 - left / 65536 != dr - dl
+                || bottom / 65536 - top / 65536 != db - dt
+            {
+                return Err("VIC scaling/subpixel rectangles are not implemented".into());
+            }
+            if right / 65536 >= input.width || bottom / 65536 >= input.height {
+                return Err("VIC source rectangle exceeds surface".into());
+            }
+            if let Some(frame) = &frame
+                && (right / 65536 >= frame.width || bottom / 65536 >= frame.height)
+            {
+                return Err("VIC source rectangle exceeds decoded frame".into());
+            }
+            let color = Matrix::decode(&state[0x60..0x80]);
+            let gamut = Matrix::decode(&state[0x80..0xa0]);
+            let minimum = bits(controls, 0, 10) as i64;
+            let maximum = bits(controls, 10, 10) as i64;
+            if minimum > maximum {
+                return Err("invalid VIC soft clamp range".into());
+            }
+            let alpha = bits(controls, 32, 10) as i64;
+            let blend = &state[0xa0..0xb0];
+            let constants = word(blend, 0);
+            let factors = word(blend, 4);
+            let overrides = word(blend, 12);
+            if overrides & 0x000f_f000 != 0 {
+                return Err("VIC blend channel overrides/masks are not implemented".into());
+            }
+            let k1 = (constants & 1023) as i64;
+            let k2 = (constants >> 16 & 1023) as i64;
+            let selectors = [
+                factors & 7,
+                factors >> 4 & 7,
+                factors >> 8 & 7,
+                factors >> 12 & 7,
+            ];
+            let x0 = dl.max(target_left);
+            let x1 = dr.min(target_right).min(output.width - 1);
+            let y0 = dt.max(target_top);
+            let y1 = db.min(target_bottom).min(output.height - 1);
+            if x0 > x1 || y0 > y1 {
+                continue;
+            }
+            // A single full-surface opaque NV12 slot does not need a compositor
+            // framebuffer, alpha array, blend divides or a second full-pixel pass.
+            // Select this from actual VIC state; matrices, clamp, format, source
+            // crop and alpha still have their exact guest-defined semantics.
+            let source_alpha = alpha.clamp(minimum, maximum);
+            if single_slot
+                && !gamut.enabled
+                && !final_matrix.enabled
+                && x0 == 0
+                && y0 == 0
+                && x1 + 1 == output.width
+                && y1 + 1 == output.height
+                && factor(selectors[0], k1, k2, source_alpha, background[3], 0)? == 1023
+                && dst_factor(selectors[1], k1, k2, source_alpha, background[3], 0)? == 0
+            {
+                if nv12_output
+                    && color.is_identity()
+                    && minimum == 0
+                    && maximum == 1023
+                    && left.is_multiple_of(2 * 65536)
+                    && top.is_multiple_of(2 * 65536)
+                {
+                    let output_chroma = chroma_surface(&output, word(&config, 0x2c))?;
+                    let [luma, uv] =
+                        source_planes(frame, &mut input, &mut chroma, mappings, source_address)?;
+                    for (index, (plane, address)) in [&output, &output_chroma]
+                        .into_iter()
+                        .zip([
+                            u64::from(registers[0x1c8]) << 8,
+                            u64::from(registers[0x1c9]) << 8,
+                        ])
+                        .enumerate()
+                    {
+                        let pitch = if index == 0 {
+                            input.pitch
+                        } else {
+                            chroma.pitch
+                        };
+                        let source = if index == 0 { &luma } else { &uv };
+                        let x = left / 65536 + x0 - dl;
+                        let y = top / 65536 + y0 - dt;
+                        let origin = if index == 0 {
+                            [x, y]
+                        } else {
+                            [x / 2 * 2, y / 2]
+                        };
+                        write_plane(plane, source, pitch, origin, mappings, address)?;
+                    }
+                    return Ok(());
+                }
+                let sf = factor(selectors[2], k1, k2, source_alpha, background[3], 3)?;
+                let df = dst_factor(selectors[3], k1, k2, source_alpha, background[3], 3)?;
+                let composited_alpha =
+                    ((source_alpha * sf + background[3] * df + 511) / 1023).clamp(0, 1023);
+                let final_alpha = if matches!(output.format, 35 | 36) {
+                    1023
+                } else {
+                    match alpha_mode {
+                        0 => 1023,
+                        1 => background[3],
+                        2 | 4 => composited_alpha,
+                        3 | 5 => {
+                            if slot == alpha_slot {
+                                source_alpha
+                            } else {
+                                0
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+                if !nv12_output && let (Some(gpu), Some(frame)) = (gpu, frame) {
+                    let format = if matches!(output.format, 32 | 36) {
+                        nixe_gpu::ImageFormat::Bgra8Unorm
+                    } else {
+                        nixe_gpu::ImageFormat::Rgba8Unorm
+                    };
+                    let origin = [left / 65536 + x0 - dl, top / 65536 + y0 - dt];
+                    let width = origin[0] + output.width;
+                    let height = origin[1] + output.height;
+                    gpu.convert_nv12(
+                        output.gpu_image(mappings, u64::from(registers[0x1c8]) << 8, format)?,
+                        nixe_gpu::Nv12Planes {
+                            bytes: frame.linear_planes(width, height)?,
+                            widths: [width as u32, width.div_ceil(2) as u32],
+                        },
+                        nixe_gpu::Nv12ColorTransform {
+                            coefficients: color.coefficients.map(|row| row.map(|c| c as i32)),
+                            shift: color.shift,
+                            enabled: color.enabled,
+                            clamp: [minimum as i32, maximum as i32],
+                            alpha: (final_alpha.clamp(0, 1023) >> 2) as u8,
+                            source_origin: origin.map(|v| v as u32),
+                        },
+                    )?;
+                    return Ok(());
+                }
+                if !nv12_output {
+                    let [luma, uv] =
+                        source_planes(frame, &mut input, &mut chroma, mappings, source_address)?;
+                    write_opaque_nv12(
+                        &output,
+                        &input,
+                        &chroma,
+                        &luma,
+                        &uv,
+                        color,
+                        minimum,
+                        maximum,
+                        (final_alpha.clamp(0, 1023) >> 2) as u8,
+                        left / 65536 + x0 - dl,
+                        top / 65536 + y0 - dt,
+                        mappings,
+                        u64::from(registers[0x1c8]) << 8,
+                    )?;
+                    return Ok(());
+                }
+            }
+            if pixels.is_empty() {
+                pixels.resize(output.width * output.height, background);
+                selected_alpha.resize(pixels.len(), 0);
+            }
+            let [luma, uv] =
+                source_planes(frame, &mut input, &mut chroma, mappings, source_address)?;
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let sx = left / 65536 + x - dl;
+                    let sy = top / 65536 + y - dt;
+                    let cx = sx / 2 * 2;
+                    let cy = sy / 2;
+                    let source = [
+                        i64::from(luma[sy * input.pitch + sx]) << 2,
+                        i64::from(uv[cy * chroma.pitch + cx]) << 2,
+                        i64::from(uv[cy * chroma.pitch + cx + 1]) << 2,
+                        alpha,
+                    ];
+                    let source = gamut
+                        .apply(color.apply(source))
+                        .map(|v| v.clamp(minimum, maximum));
+                    let index = y * output.width + x;
+                    let destination = pixels[index];
+                    for channel in 0..4 {
+                        let sf = factor(
+                            selectors[if channel == 3 { 2 } else { 0 }],
+                            k1,
+                            k2,
+                            source[3],
+                            destination[3],
+                            channel,
+                        )?;
+                        let df = dst_factor(
+                            selectors[if channel == 3 { 3 } else { 1 }],
+                            k1,
+                            k2,
+                            source[3],
+                            destination[3],
+                            channel,
+                        )?;
+                        pixels[index][channel] =
+                            ((source[channel] * sf + destination[channel] * df + 511) / 1023)
+                                .clamp(0, 1023);
+                    }
+                    if slot == alpha_slot {
+                        selected_alpha[index] = source[3];
+                    }
+                }
+            }
         }
+        // No enabled/intersecting slot still produces the configured background.
         if pixels.is_empty() {
             pixels.resize(output.width * output.height, background);
             selected_alpha.resize(pixels.len(), 0);
         }
-        let luma = input.read_linear(mappings, u64::from(registers[0x100 + slot * 24]) << 8)?;
-        let uv = chroma.read_linear(mappings, u64::from(registers[0x101 + slot * 24]) << 8)?;
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                let sx = left / 65536 + x - dl;
-                let sy = top / 65536 + y - dt;
-                let cx = sx / 2 * 2;
-                let cy = sy / 2;
-                let source = [
-                    i64::from(luma[sy * input.pitch + sx]) << 2,
-                    i64::from(uv[cy * chroma.pitch + cx]) << 2,
-                    i64::from(uv[cy * chroma.pitch + cx + 1]) << 2,
-                    alpha,
-                ];
-                let source = gamut
-                    .apply(color.apply(source))
-                    .map(|v| v.clamp(minimum, maximum));
-                let index = y * output.width + x;
-                let destination = pixels[index];
-                for channel in 0..4 {
-                    let sf = factor(
-                        selectors[if channel == 3 { 2 } else { 0 }],
-                        k1,
-                        k2,
-                        source[3],
-                        destination[3],
-                        channel,
-                    )?;
-                    let df = dst_factor(
-                        selectors[if channel == 3 { 3 } else { 1 }],
-                        k1,
-                        k2,
-                        source[3],
-                        destination[3],
-                        channel,
-                    )?;
-                    pixels[index][channel] =
-                        ((source[channel] * sf + destination[channel] * df + 511) / 1023)
-                            .clamp(0, 1023);
-                }
-                if slot == alpha_slot {
-                    selected_alpha[index] = source[3];
-                }
-            }
+        if nv12_output {
+            return write_nv12(
+                &output,
+                &chroma_surface(&output, word(&config, 0x2c))?,
+                &pixels,
+                final_matrix,
+                mappings,
+                [
+                    u64::from(registers[0x1c8]) << 8,
+                    u64::from(registers[0x1c9]) << 8,
+                ],
+            );
         }
-    }
-    // No enabled/intersecting slot still produces the configured background.
-    if pixels.is_empty() {
-        pixels.resize(output.width * output.height, background);
-        selected_alpha.resize(pixels.len(), 0);
-    }
-    let address = u64::from(registers[0x1c8]) << 8;
-    let length = output.length();
-    let (backing, offset) = region(mappings, address, length)?;
-    let mut bytes = vec![0; length];
+        let address = u64::from(registers[0x1c8]) << 8;
+        let length = output.length();
+        let (backing, offset) = region(mappings, address, length)?;
+        let mut bytes = vec![0; length];
 
-    for y in 0..output.height {
-        for x0 in (0..output.width).step_by(4) {
-            let count = (output.width - x0).min(4);
-            let mut packed = [0; 16];
-            for i in 0..count {
-                let x = x0 + i;
-                let index = y * output.width + x;
-                let mut pixel = final_matrix.apply(pixels[index]);
-                pixel[3] = match alpha_mode {
-                    0 => 1023,
-                    1 => background[3],
-                    2 | 4 => pixel[3],
-                    3 | 5 => selected_alpha[index],
-                    _ => unreachable!(),
-                };
-                if matches!(output.format, 35 | 36) {
-                    pixel[3] = 1023;
+        for y in 0..output.height {
+            for x0 in (0..output.width).step_by(4) {
+                let count = (output.width - x0).min(4);
+                let mut packed = [0; 16];
+                for i in 0..count {
+                    let x = x0 + i;
+                    let index = y * output.width + x;
+                    let mut pixel = final_matrix.apply(pixels[index]);
+                    pixel[3] = match alpha_mode {
+                        0 => 1023,
+                        1 => background[3],
+                        2 | 4 => pixel[3],
+                        3 | 5 => selected_alpha[index],
+                        _ => unreachable!(),
+                    };
+                    if matches!(output.format, 35 | 36) {
+                        pixel[3] = 1023;
+                    }
+                    if matches!(output.format, 32 | 36) {
+                        pixel.swap(0, 2);
+                    }
+                    for (c, value) in pixel.into_iter().enumerate() {
+                        packed[i * 4 + c] = (value.clamp(0, 1023) >> 2) as u8;
+                    }
                 }
-                if matches!(output.format, 32 | 36) {
-                    pixel.swap(0, 2);
-                }
-                for (c, value) in pixel.into_iter().enumerate() {
-                    packed[i * 4 + c] = (value.clamp(0, 1023) >> 2) as u8;
-                }
+                let target = output.offset(x0 * 4, y);
+                bytes[target..target + count * 4].copy_from_slice(&packed[..count * 4]);
             }
-            let target = output.offset(x0 * 4, y);
-            bytes[target..target + count * 4].copy_from_slice(&packed[..count * 4]);
         }
+        write_spans(backing, offset, &bytes, output.written_spans(4))?;
+        log::trace!(
+            "VIC output: dimensions={}x{} format={} layout={} block-height={}",
+            output.width,
+            output.height,
+            output.format,
+            output.kind,
+            output.block_height
+        );
+        Ok(())
     }
-    let mut spans = Vec::with_capacity(output.height * (output.width * 4).div_ceil(16));
-    for y in 0..output.height {
-        for x in (0..output.width * 4).step_by(16) {
-            let target = output.offset(x, y);
-            spans.push(target..target + (output.width * 4 - x).min(16));
-        }
-    }
-    write_spans(backing, offset, &bytes, spans)?;
-    log::trace!(
-        "VIC output: dimensions={}x{} format={} layout={} block-height={}",
-        output.width,
-        output.height,
-        output.format,
-        output.kind,
-        output.block_height
-    );
-    Ok(())
 }
 
 #[cfg(test)]

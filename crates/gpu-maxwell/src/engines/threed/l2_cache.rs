@@ -163,16 +163,16 @@ impl MaxwellThreeDL2CacheState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDL2CacheStateWrite) {
         match write {
-            MaxwellThreeDL2CacheStateWrite::VafControl { value, source } => {
-                self.vaf_control = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDL2CacheStateWrite::VafControl { value, source: _ } => {
+                self.vaf_control = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
             MaxwellThreeDL2CacheStateWrite::RopPolicy {
                 request,
                 value,
-                source,
+                source: _,
             } => {
                 self.rop_policies[request.index()] =
-                    MaxwellThreeDRegister::programmed(value.encoded(), value, source);
+                    MaxwellThreeDRegister::decoded(value.encoded(), value);
             }
         }
     }

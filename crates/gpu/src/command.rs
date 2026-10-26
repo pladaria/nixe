@@ -1,6 +1,5 @@
 //! Immutable backend-independent GPU operations and submission ordering.
 
-use crate::ResourceTransition;
 use std::fmt::{Display, Formatter};
 
 /// Origin of an image operation in texels.
@@ -632,12 +631,6 @@ impl StencilTestState {
     }
 }
 
-/// One barrier containing all resource transitions committed together.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BarrierOperation {
-    transitions: Box<[ResourceTransition]>,
-}
-
 /// Backend-independent device cache-maintenance operation.
 ///
 /// This is an ordering command, not a model of any host GPU's physical cache.
@@ -659,22 +652,6 @@ pub enum CacheMaintenanceOperation {
     },
     /// Make dirty device writes visible before later work on the submission.
     FlushDirtyDeviceWrites,
-}
-
-impl BarrierOperation {
-    pub fn new(transitions: Vec<ResourceTransition>) -> Result<Self, CommandDescriptionError> {
-        if transitions.is_empty() {
-            return Err(CommandDescriptionError::EmptyBarrier);
-        }
-        Ok(Self {
-            transitions: transitions.into_boxed_slice(),
-        })
-    }
-
-    #[must_use]
-    pub fn transitions(&self) -> &[ResourceTransition] {
-        &self.transitions
-    }
 }
 
 /// Whether existing attachment contents participate in a render pass.
@@ -712,7 +689,6 @@ pub enum CommandDescriptionError {
     VertexAttributeExceedsStride,
     DuplicateVertexShaderLocation,
     EmptyDispatch,
-    EmptyBarrier,
     AttachmentKindMismatch,
     AttachmentCountMismatch,
     AttachmentDescriptionMismatch,
@@ -759,7 +735,6 @@ impl Display for CommandDescriptionError {
                 formatter.write_str("draw has duplicate vertex shader locations")
             }
             Self::EmptyDispatch => formatter.write_str("dispatch has a zero workgroup dimension"),
-            Self::EmptyBarrier => formatter.write_str("barrier has no resource transitions"),
             Self::AttachmentKindMismatch => {
                 formatter.write_str("render attachment kind and format disagree")
             }

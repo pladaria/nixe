@@ -26,6 +26,10 @@ fn blend_factor(value: nixe_gpu::BlendFactor) -> vk::BlendFactor {
         B::DestinationColor => vk::BlendFactor::DST_COLOR,
         B::OneMinusDestinationColor => vk::BlendFactor::ONE_MINUS_DST_COLOR,
         B::SourceAlphaSaturated => vk::BlendFactor::SRC_ALPHA_SATURATE,
+        B::ConstantColor => vk::BlendFactor::CONSTANT_COLOR,
+        B::OneMinusConstantColor => vk::BlendFactor::ONE_MINUS_CONSTANT_COLOR,
+        B::ConstantAlpha => vk::BlendFactor::CONSTANT_ALPHA,
+        B::OneMinusConstantAlpha => vk::BlendFactor::ONE_MINUS_CONSTANT_ALPHA,
     }
 }
 fn blend_op(value: nixe_gpu::BlendOperation) -> vk::BlendOp {

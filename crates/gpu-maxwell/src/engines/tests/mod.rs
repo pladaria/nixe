@@ -290,8 +290,16 @@ fn bind_three_d(channel: &mut MaxwellGpuChannel) {
         .unwrap();
 }
 
-pub(crate) fn program_three_d(channel: &mut MaxwellGpuChannel, method: u32, argument: u32) {
-    dispatch_method(channel, method / 4, argument).unwrap();
+pub(crate) fn program_three_d(
+    channel: &mut MaxwellGpuChannel,
+    method: u32,
+    argument: u32,
+) -> crate::MaxwellMethodSource {
+    dispatch_method(channel, method / 4, argument)
+        .unwrap()
+        .methods()[0]
+        .method()
+        .source()
 }
 
 /// Isolates tests of state-neutral class methods from the architecturally

@@ -4,6 +4,7 @@
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/command/mix/mix.cpp
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/command/mix/volume.cpp
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/command/sink/device.cpp
+//! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/command/command_generator.cpp
 
 use super::{
     RendererParameters,
@@ -14,8 +15,6 @@ use super::{
 #[derive(Debug)]
 pub(super) struct RenderBuffers {
     samples: Vec<i32>,
-    offsets: Vec<usize>,
-    order: Vec<(usize, usize)>,
     voice_scratch: super::voice::VoiceScratch,
 }
 
@@ -53,8 +52,6 @@ impl RenderBuffers {
     pub(super) fn new(params: &RendererParameters) -> Self {
         Self {
             samples: vec![0; params.mixes as usize * params.samples as usize],
-            offsets: vec![0; params.submixes as usize + 1],
-            order: Vec::with_capacity(params.submixes as usize + 1),
             voice_scratch: super::voice::VoiceScratch::default(),
         }
     }
@@ -68,91 +65,64 @@ impl RenderBuffers {
         volume: f32,
     ) -> Result<bool, RenderError> {
         self.samples.fill(0);
-        self.prepare_mixes(state, params)?;
         let samples = params.samples as usize;
         for voice in &mut state.voices {
-            let id = voice.mix_id();
-            let Some(mix) = state.mixes.get(id).and_then(Option::as_ref) else {
-                continue;
-            };
-            let buffers = word(mix.as_slice(), 8) as usize;
             voice.render(
                 memory,
                 params.revision_number().unwrap(),
                 &mut self.voice_scratch,
                 samples,
-                &state.resources,
-                &state.previous_resources,
-                &mut self.samples
-                    [self.offsets[id] * samples..(self.offsets[id] + buffers) * samples],
-                buffers,
+                &mut state.resources,
+                &mut self.samples,
+                &state.mixes,
+                &state.mix_offsets,
+                &mut state.splitters,
             )?;
         }
-        for (previous, current) in state.previous_resources.iter_mut().zip(&state.resources) {
-            for (i, value) in previous.iter_mut().enumerate() {
-                *value = f32::from_bits(word(current, 4 + i * 4));
-            }
-        }
-        self.mix_and_output(state, params, pcm, volume)
-            .map_err(Into::into)
+        state.splitters.finish_voices();
+        self.mix_and_output(memory, state, params, pcm, volume)
     }
 
-    fn prepare_mixes(
+    fn mix_add(
         &mut self,
-        state: &RendererUpdateState,
-        params: &RendererParameters,
+        source: usize,
+        destination: usize,
+        samples: usize,
+        volume: f32,
+        precision: u32,
     ) -> Result<(), Box<str>> {
-        let mut offset = 0;
-        self.order.clear();
-        for (id, mix) in state.mixes.iter().enumerate() {
-            let Some(mix) = mix else { continue };
-            if word(mix.as_slice(), 4) != params.sample_rate {
-                return Err(format!(
-                    "rendering: mix {id} requires sample-rate conversion ({} Hz)",
-                    word(mix.as_slice(), 4)
-                )
-                .into());
-            }
-            self.offsets[id] = offset;
-            offset += word(mix.as_slice(), 8) as usize;
-            let mut depth = 0;
-            let mut current = id;
-            while current != 0 {
-                let Some(mix) = state.mixes.get(current).and_then(Option::as_ref) else {
-                    break;
-                };
-                let next = word(mix.as_slice(), 0x924);
-                if next == i32::MAX as u32 {
-                    break;
-                }
-                current = next as usize;
-                depth += 1;
-                if depth > state.mixes.len() {
-                    return Err("rendering: cyclic mix routing".into());
-                }
-            }
-            self.order.push((id, depth));
+        if volume == 0.0 {
+            return Ok(());
         }
-        // No allocation and no comparison closure holding mutable graph state.
-        self.order
-            .sort_unstable_by_key(|&(_, depth)| std::cmp::Reverse(depth));
+        let scaled = volume * (1_u64 << precision) as f32;
+        if !scaled.is_finite() || scaled.abs() >= (1_u64 << 63) as f32 {
+            return Err("rendering: mix gain cannot be represented in fixed point".into());
+        }
+        let gain = scaled as i64;
+        for sample in 0..samples {
+            let dst = destination * samples + sample;
+            let src = source * samples + sample;
+            self.samples[dst] =
+                self.samples[dst].wrapping_add(fixed_gain(self.samples[src], gain, precision));
+        }
         Ok(())
     }
 
     fn mix_and_output(
         &mut self,
+        memory: &RenderMemory,
         state: &mut RendererUpdateState,
         params: &RendererParameters,
         pcm: &mut [i16],
         volume: f32,
-    ) -> Result<bool, Box<str>> {
+    ) -> Result<bool, RenderError> {
         let samples = params.samples as usize;
         let precision = if params.revision_number().unwrap() >= 7 {
             23
         } else {
             15
         };
-        for &(id, _) in &self.order {
+        for &id in &state.mix_order {
             let mix = state.mixes[id].as_ref().unwrap();
             let count = word(mix.as_slice(), 8) as usize;
             for &slot in &state.effect_order[id] {
@@ -160,8 +130,9 @@ impl RenderBuffers {
                     break;
                 }
                 state.effects[slot].process(
-                    &mut self.samples
-                        [self.offsets[id] * samples..(self.offsets[id] + count) * samples],
+                    memory,
+                    &mut self.samples[state.mix_offsets[id] * samples
+                        ..(state.mix_offsets[id] + count) * samples],
                     samples,
                     count,
                 )?;
@@ -170,7 +141,7 @@ impl RenderBuffers {
             if id == 0 {
                 if volume != 1.0 {
                     for sample in &mut self.samples
-                        [self.offsets[id] * samples..(self.offsets[id] + count) * samples]
+                        [state.mix_offsets[id] * samples..(state.mix_offsets[id] + count) * samples]
                     {
                         *sample = gain(*sample, volume, precision)?;
                     }
@@ -178,29 +149,55 @@ impl RenderBuffers {
                 continue;
             }
             let dest_id = word(mix.as_slice(), 0x924) as usize;
-            let Some(dest) = state.mixes.get(dest_id).and_then(Option::as_ref) else {
-                continue;
-            };
-            let dest_count = word(dest.as_slice(), 8) as usize;
-            for input in 0..count {
-                for output in 0..dest_count {
-                    let volume = volume
-                        * f32::from_bits(word(mix.as_slice(), 0x24 + (input * 24 + output) * 4));
-                    if volume == 0.0 {
+            if dest_id == super::splitter::UNUSED_MIX {
+                let splitter = word(mix.as_slice(), 0x928) as usize;
+                let Some(info) = state.splitters.infos.get(splitter) else {
+                    continue;
+                };
+                if count == 0 {
+                    continue;
+                }
+                for (input, &destination_id) in info.destinations.iter().enumerate() {
+                    let destination = &state.splitters.destinations[destination_id];
+                    if !destination.in_use || destination.mix == super::splitter::UNUSED_MIX {
                         continue;
                     }
-                    let src = (self.offsets[id] + input) * samples;
-                    let dst = (self.offsets[dest_id] + output) * samples;
-                    for sample in 0..samples {
-                        self.samples[dst + sample] = self.samples[dst + sample].wrapping_add(gain(
-                            self.samples[src + sample],
+                    let Some(target) = state.mixes.get(destination.mix).and_then(Option::as_ref)
+                    else {
+                        continue;
+                    };
+                    let src = state.mix_offsets[id] + input % count;
+                    for output in 0..word(target.as_slice(), 8) as usize {
+                        self.mix_add(
+                            src,
+                            state.mix_offsets[destination.mix] + output,
+                            samples,
+                            volume * destination.volumes[output],
+                            precision,
+                        )?;
+                    }
+                }
+            } else if let Some(dest) = state.mixes.get(dest_id).and_then(Option::as_ref) {
+                let dest_count = word(dest.as_slice(), 8) as usize;
+                for input in 0..count {
+                    for output in 0..dest_count {
+                        let volume = volume
+                            * f32::from_bits(word(
+                                mix.as_slice(),
+                                0x24 + (input * 24 + output) * 4,
+                            ));
+                        self.mix_add(
+                            state.mix_offsets[id] + input,
+                            state.mix_offsets[dest_id] + output,
+                            samples,
                             volume,
                             precision,
-                        )?);
+                        )?;
                     }
                 }
             }
         }
+
         let mut device_sink = None;
         for (id, sink) in state.sinks.iter().enumerate() {
             if sink[0] == 1 && sink[1] != 0 {
@@ -233,7 +230,7 @@ impl RenderBuffers {
                 )
                 .into());
             }
-            *offset = (self.offsets[0] + input) * samples;
+            *offset = (state.mix_offsets[0] + input) * samples;
         }
         for sample in 0..samples {
             let mut frame = [0; 6];
@@ -318,12 +315,12 @@ mod tests {
         sink[0x124] = 1; // Reverse the final mix channels.
         state.sinks = vec![sink];
         let mut buffers = RenderBuffers::new(&params);
-        buffers.prepare_mixes(&state, &params).unwrap();
+        state.rebuild_mix_order().unwrap();
         buffers.samples[6..].copy_from_slice(&[40000, -40000, 3, 6, -6, 65536]);
         let mut pcm = [0; 6];
         assert!(
             buffers
-                .mix_and_output(&mut state, &params, &mut pcm, 1.0)
+                .mix_and_output(&RenderMemory::testing(), &mut state, &params, &mut pcm, 1.0)
                 .unwrap()
         );
         assert_eq!(pcm, [3, 20000, -3, -20000, 32767, 1]);
@@ -331,7 +328,7 @@ mod tests {
         buffers.samples[6..].copy_from_slice(&[40000, -40000, 3, 6, -6, 65536]);
         assert!(
             buffers
-                .mix_and_output(&mut state, &params, &mut pcm, 0.5)
+                .mix_and_output(&RenderMemory::testing(), &mut state, &params, &mut pcm, 0.5)
                 .unwrap()
         );
         assert_eq!(pcm, [1, 10000, -1, -10000, 16383, 0]);
@@ -339,7 +336,13 @@ mod tests {
         buffers.samples[6..].copy_from_slice(&[40000, -40000, 3, 6, -6, 65536]);
         assert!(
             buffers
-                .mix_and_output(&mut state, &params, &mut pcm, 1.85)
+                .mix_and_output(
+                    &RenderMemory::testing(),
+                    &mut state,
+                    &params,
+                    &mut pcm,
+                    1.85
+                )
                 .unwrap()
         );
         assert_eq!(pcm, [5, 32767, -5, -32768, 32767, 1]);
@@ -413,11 +416,11 @@ mod tests {
         state.effects = vec![effect];
         state.effect_order = vec![Vec::new(), vec![0]];
         let mut buffers = RenderBuffers::new(&params);
-        buffers.prepare_mixes(&state, &params).unwrap();
+        state.rebuild_mix_order().unwrap();
         buffers.samples[6..12].copy_from_slice(&[1000, -1000, 3, 6, -6, 100]);
         let mut pcm = [0; 6];
         buffers
-            .mix_and_output(&mut state, &params, &mut pcm, 1.0)
+            .mix_and_output(&RenderMemory::testing(), &mut state, &params, &mut pcm, 1.0)
             .unwrap();
         assert_eq!(pcm, [500, 3, -500, -3, 1, 50]);
     }
@@ -433,5 +436,79 @@ mod tests {
             assert_eq!(gain(-1, 0.5, precision).unwrap(), -1);
         }
         assert!(gain(1, f32::NAN, 23).is_err());
+    }
+
+    #[test]
+    fn submix_splitter_fans_out_then_rejoins_and_cycles_are_rejected() {
+        use super::super::splitter::{Destination, Splitter};
+        let mut raw = [0; super::super::PARAMETER_SIZE];
+        for (offset, value) in [
+            (0, 48000_u32),
+            (4, 2),
+            (8, 6),
+            (12, 2),
+            (20, 1),
+            (48, u32::from_le_bytes(*b"REV9")),
+        ] {
+            raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let params = RendererParameters::decode(&raw);
+        let mut state = RendererUpdateState::default();
+        for id in 0..3 {
+            let mut mix = Box::new([0; 0x930]);
+            for (offset, value) in [
+                (0, [1_f32, 0.5, 2.0][id].to_bits()),
+                (4, 48000),
+                (8, 2),
+                (0x924, if id == 1 { i32::MAX as u32 } else { 0 }),
+                (0x928, if id == 1 { 0 } else { u32::MAX }),
+            ] {
+                mix[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            for i in [0x24, 0x24 + 25 * 4] {
+                mix[i..i + 4].copy_from_slice(&1_f32.to_le_bytes());
+            }
+            state.mixes.push(Some(mix));
+            state.effect_order.push(Vec::new());
+        }
+        state.splitters.infos = vec![Splitter {
+            destinations: vec![0, 1, 2, 3],
+        }];
+        for (mix, channel, gain) in [(0, 0, 1_f32), (0, 1, 1.0), (2, 0, 0.5), (2, 1, 0.25)] {
+            let mut destination = Destination {
+                mix,
+                in_use: true,
+                ..Destination::default()
+            };
+            destination.volumes[channel] = gain;
+            state.splitters.destinations.push(destination);
+        }
+        state.rebuild_mix_order().unwrap();
+        assert_eq!(state.mix_order, [1, 2, 0]);
+        let mut sink = [0; 0x140];
+        sink[0] = 1;
+        sink[1] = 1;
+        sink[0x120..0x124].copy_from_slice(&2_u32.to_le_bytes());
+        sink[0x125] = 1;
+        state.sinks.push(sink);
+        let mut buffers = RenderBuffers::new(&params);
+        buffers.samples[4..8].copy_from_slice(&[100, -100, 200, -200]);
+        let mut output = [0; 4];
+        buffers
+            .mix_and_output(
+                &RenderMemory::testing(),
+                &mut state,
+                &params,
+                &mut output,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(output, [100, 150, -100, -150]);
+        // A destination back into the producer must fail at the update boundary.
+        state.splitters.destinations[2].mix = 1;
+        assert!(matches!(
+            state.rebuild_mix_order(),
+            Err(super::super::update::UpdateError::Invalid)
+        ));
     }
 }

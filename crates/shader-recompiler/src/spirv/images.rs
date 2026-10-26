@@ -50,6 +50,10 @@ impl EmitContext<'_> {
                 ));
             }
         };
+        if dim == Dim::DimCube && array {
+            self.builder
+                .capability(spirv::Capability::SampledCubeArray)?;
+        }
         self.builder.type_image(
             if integer {
                 self.types.u32[0]

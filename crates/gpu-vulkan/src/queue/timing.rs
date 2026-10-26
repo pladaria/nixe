@@ -44,25 +44,15 @@ impl Queries {
             pending: false,
         }))
     }
-    pub fn begin(&mut self, dispatch: &mut crate::dispatch::Dispatch, command: vk::CommandBuffer) {
+    pub fn begin(&mut self, dispatch: &mut crate::dispatch::Dispatch) {
         unsafe {
-            dispatch.cmd_reset_query_pool(command, self.pool, 0, 2);
-            dispatch.cmd_write_timestamp(
-                command,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                self.pool,
-                0,
-            );
+            dispatch.cmd_reset_query_pool(self.pool, 0, 2);
+            dispatch.cmd_write_timestamp(vk::PipelineStageFlags::TOP_OF_PIPE, self.pool, 0);
         }
     }
-    pub fn end(&mut self, dispatch: &mut crate::dispatch::Dispatch, command: vk::CommandBuffer) {
+    pub fn end(&mut self, dispatch: &mut crate::dispatch::Dispatch) {
         unsafe {
-            dispatch.cmd_write_timestamp(
-                command,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                self.pool,
-                1,
-            );
+            dispatch.cmd_write_timestamp(vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.pool, 1);
         }
         self.pending = true;
     }

@@ -14,28 +14,9 @@ pub(crate) fn color_range() -> vk::ImageSubresourceRange {
         .level_count(1)
         .layer_count(1)
 }
-pub(crate) fn view(
-    device: &VulkanDevice,
-    image: Arc<AllocatedImage>,
-    format: vk::Format,
-) -> Result<Arc<AllocatedImageView>, VulkanError> {
-    let handle = unsafe {
-        device.owner.device.create_image_view(
-            &vk::ImageViewCreateInfo::default()
-                .image(image.handle)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(format)
-                .subresource_range(color_range()),
-            None,
-        )
-    }
-    .map_err(|e| VulkanError::vk("host image view", e))?;
-    Ok(Arc::new(AllocatedImageView::from_handle(image, handle)))
-}
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn transition(
     device: &mut VulkanDevice,
-    command: vk::CommandBuffer,
     image: vk::Image,
     old: vk::ImageLayout,
     new: vk::ImageLayout,
@@ -56,10 +37,9 @@ pub(crate) fn transition(
         .dst_stage_mask(destination)
         .dst_access_mask(writes)];
     unsafe {
-        device.dispatch.barrier(
-            command,
-            &vk::DependencyInfo::default().image_memory_barriers(&barriers),
-        );
+        device
+            .dispatch
+            .barrier(&vk::DependencyInfo::default().image_memory_barriers(&barriers));
     }
 }
 fn shader(kind: u8) -> Arc<ShaderArtifact> {
@@ -238,7 +218,7 @@ impl ScreenRenderer {
                         ));
                     }
                     let native = cache.allocate_host_image(extent, vk::Format::R8G8B8A8_UNORM)?;
-                    let view = view(cache.device(), native, vk::Format::R8G8B8A8_UNORM)?;
+                    let view = native.view_2d(vk::Format::R8G8B8A8_UNORM)?;
                     if let Some(old) = self.textures.remove(id) {
                         descriptors.forget_image(&old.view);
                     }
@@ -306,7 +286,7 @@ impl ScreenRenderer {
                     .submission
                     .reserve_upload(&mut device.dispatch, &bytes)?;
                 let device = cache.device_mut();
-                let command = device.submission.slots[slot].command;
+
                 let old = if delta.pos.is_none() {
                     vk::ImageLayout::UNDEFINED
                 } else {
@@ -314,7 +294,6 @@ impl ScreenRenderer {
                 };
                 transition(
                     device,
-                    command,
                     texture.view.image.handle,
                     old,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -342,7 +321,6 @@ impl ScreenRenderer {
                     });
                 unsafe {
                     device.dispatch.cmd_copy_buffer_to_image(
-                        command,
                         device.submission.slots[slot].upload_buffer(slice).handle,
                         texture.view.image.handle,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -351,7 +329,6 @@ impl ScreenRenderer {
                 }
                 transition(
                     device,
-                    command,
                     texture.view.image.handle,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -479,7 +456,7 @@ impl ScreenRenderer {
         }
         cache.bind_host_graphics(&graphics, &push)?;
         let device = cache.device_mut();
-        let command = device.submission.slots[device.submission.recording.unwrap()].command;
+
         let attachments = [vk::RenderingAttachmentInfo::default()
             .image_view(target)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -498,9 +475,9 @@ impl ScreenRenderer {
             .layer_count(1)
             .color_attachments(&attachments);
         unsafe {
-            device.dispatch.begin_rendering(command, &info);
-            device.dispatch.cmd_draw(command, 3, 1, 0, 0);
-            device.dispatch.end_rendering(command);
+            device.dispatch.begin_rendering(&info);
+            device.dispatch.cmd_draw(3, 1, 0, 0);
+            device.dispatch.end_rendering();
         }
         Ok(())
     }
@@ -582,8 +559,8 @@ impl ScreenRenderer {
         push[..4].copy_from_slice(&(extent.width as f32 / ui.pixels_per_point).to_le_bytes());
         push[4..8].copy_from_slice(&(extent.height as f32 / ui.pixels_per_point).to_le_bytes());
         cache.device_mut().end_rendering();
-        let index = cache.device_mut().begin_recording()?;
-        let command = cache.device().submission.slots[index].command;
+        cache.device_mut().begin_recording()?;
+
         let dependency = [vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -592,10 +569,10 @@ impl ScreenRenderer {
                 vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
             )];
         unsafe {
-            cache.device_mut().dispatch.barrier(
-                command,
-                &vk::DependencyInfo::default().memory_barriers(&dependency),
-            );
+            cache
+                .device_mut()
+                .dispatch
+                .barrier(&vk::DependencyInfo::default().memory_barriers(&dependency));
         }
         let attachments = [vk::RenderingAttachmentInfo::default()
             .image_view(target)
@@ -610,7 +587,7 @@ impl ScreenRenderer {
             .layer_count(1)
             .color_attachments(&attachments);
         unsafe {
-            cache.device_mut().dispatch.begin_rendering(command, &info);
+            cache.device_mut().dispatch.begin_rendering(&info);
         }
         let draw_result = (|| -> Result<(), VulkanError> {
             for (texture, clip, first, count, base) in ranges {
@@ -654,23 +631,19 @@ impl ScreenRenderer {
                     cache.prepare_host_graphics(Arc::clone(&pipeline), record, parameters)?;
                 cache.bind_host_graphics(&graphics, &push)?;
                 let device = cache.device_mut();
-                let command = device.submission.slots[slot].command;
+
                 unsafe {
                     device.dispatch.cmd_bind_vertex_buffers(
-                        command,
                         0,
                         &[vertex_handle],
                         &[vertices.offset],
                     );
                     device.dispatch.cmd_bind_index_buffer(
-                        command,
                         index_handle,
                         indices.offset,
                         vk::IndexType::UINT32,
                     );
-                    device
-                        .dispatch
-                        .cmd_draw_indexed(command, count, 1, first, base, 0);
+                    device.dispatch.cmd_draw_indexed(count, 1, first, base, 0);
                 }
                 let work = cache.device_mut().work_ticket()?;
                 cache
@@ -680,7 +653,7 @@ impl ScreenRenderer {
             Ok(())
         })();
         unsafe {
-            cache.device_mut().dispatch.end_rendering(command);
+            cache.device_mut().dispatch.end_rendering();
         }
         // Host UI changed raw vertex/index binds; invalidate guest bind knowledge.
         cache.device_mut().submission.slots[slot]

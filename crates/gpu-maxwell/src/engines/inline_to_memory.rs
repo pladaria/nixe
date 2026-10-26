@@ -439,6 +439,7 @@ pub enum MaxwellInlineToMemoryStateWrite {
 pub struct MaxwellInlineToMemoryUpload {
     address: MaxwellInlineToMemoryAddress,
     offset: u32,
+    remaining_bytes: u32,
     value: u32,
     source: MaxwellMethodSource,
 }
@@ -447,12 +448,14 @@ impl MaxwellInlineToMemoryUpload {
     pub(crate) const fn new(
         address: MaxwellInlineToMemoryAddress,
         offset: u32,
+        remaining_bytes: u32,
         value: u32,
         source: MaxwellMethodSource,
     ) -> Self {
         Self {
             address,
             offset,
+            remaining_bytes,
             value,
             source,
         }
@@ -466,6 +469,11 @@ impl MaxwellInlineToMemoryUpload {
     #[must_use]
     pub const fn offset(self) -> u32 {
         self.offset
+    }
+
+    #[must_use]
+    pub const fn remaining_bytes(self) -> u32 {
+        self.remaining_bytes
     }
 
     #[must_use]
@@ -598,6 +606,7 @@ pub(super) fn preflight(
                 pending.next_offset() % pending.line_length,
                 pending.next_offset() / pending.line_length,
             ) as u32,
+            remaining_bytes: pending.byte_length() - pending.next_offset(),
             value: raw,
             source,
         };
@@ -820,7 +829,7 @@ pub(super) fn data_words(
     let source = MaxwellMethodSource::decoded(words.first().unwrap(), subchannel);
     let pending = candidate.pending();
     let applied = preflight(
-        MaxwellMethodDispatch::emitted_by_mme(source, CLASS),
+        MaxwellMethodDispatch::class_method(source, CLASS),
         candidate,
     )?;
     let pending = pending.expect("validated inline data has an armed transfer");

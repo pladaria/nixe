@@ -195,6 +195,7 @@ pub struct CompilationCache<K, T> {
     state: Arc<Mutex<State<K, T>>>,
     entries: usize,
     bytes: usize,
+    counters: crate::cache_counters::CacheCounters,
 }
 impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> CompilationCache<K, T> {
     pub fn new(entries: usize, bytes: usize) -> Self {
@@ -206,6 +207,7 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
             })),
             entries,
             bytes,
+            counters: crate::cache_counters::CacheCounters::new(entries, bytes),
         }
     }
     pub fn request(
@@ -249,6 +251,8 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
             }
             let old = state.entries.remove(&key).unwrap();
             state.weight -= old.weight;
+            self.counters
+                .publish_usage(state.entries.len(), state.weight);
         }
         if weight > self.bytes || self.entries == 0 {
             return Err(CompileError::Budget);
@@ -273,6 +277,9 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
             crate::compilation_capture::Key::new(&candidate).event("evict", usize::MAX, 0);
             let old = state.entries.remove(&candidate).unwrap();
             state.weight -= old.weight;
+            self.counters.evict(1);
+            self.counters
+                .publish_usage(state.entries.len(), state.weight);
         }
         let pending = Pending(Arc::new(Cell {
             result: OnceLock::new(),
@@ -281,6 +288,7 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
         }));
         let publish = pending.clone();
         let state_owner = Arc::clone(&self.state);
+        let counters = self.counters.clone();
         let publish_key = key.clone();
         let byte_budget = self.bytes;
         #[cfg(feature = "performance-counters")]
@@ -317,6 +325,7 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
                     crate::compilation_capture::Key::new(&candidate).event("evict", worker, 0);
                     let entry = state.entries.remove(&candidate).unwrap();
                     state.weight -= entry.weight;
+                    counters.evict(1);
                 }
                 if actual > byte_budget
                     || state.weight - old > byte_budget - actual.min(byte_budget)
@@ -327,6 +336,7 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
                     state.weight = state.weight - old + actual;
                 }
             }
+            counters.publish_usage(state.entries.len(), state.weight);
             #[cfg(feature = "performance-counters")]
             capture_key.detail(
                 if result.is_ok() { "end" } else { "failed" },
@@ -349,7 +359,13 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
                 weight,
             },
         );
+        self.counters.miss();
+        self.counters
+            .publish_usage(state.entries.len(), state.weight);
         Ok(pending)
+    }
+    pub fn counters(&self) -> crate::cache_counters::CacheCounters {
+        self.counters.clone()
     }
     pub fn usage(&self) -> (usize, usize) {
         let s = self.state.lock().unwrap();
@@ -359,6 +375,7 @@ impl<K: Eq + Hash + Clone + Send + 'static, T: Send + Sync + 'static> Compilatio
         let mut s = self.state.lock().unwrap();
         s.entries.retain(|_, e| e.pending.poll().is_none());
         s.weight = s.entries.values().map(|e| e.weight).sum();
+        self.counters.publish_usage(s.entries.len(), s.weight);
     }
 }
 
@@ -393,6 +410,9 @@ mod tests {
             assert!(Arc::ptr_eq(&first, &ready(p)));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let counters = cache.counters().snapshot();
+        assert_eq!((counters.entries, counters.bytes), (1, 4));
+        assert_eq!((counters.misses, counters.evictions), (1, 0));
     }
     #[test]
     fn queue_pressure_does_not_drop_a_required_or_duplicate_job() {
@@ -446,6 +466,9 @@ mod tests {
         assert_eq!(cache.usage(), (1, 24));
         assert_eq!(value[0], 7);
         assert_eq!(other[0], 9);
+        let counters = cache.counters().snapshot();
+        assert_eq!((counters.entries, counters.bytes), cache.usage());
+        assert_eq!((counters.misses, counters.evictions), (2, 1));
         let too_large = cache
             .request_sized(&pool, 3, 1, Vec::len, |_| Ok(vec![0; 33]))
             .unwrap();

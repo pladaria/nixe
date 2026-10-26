@@ -64,6 +64,8 @@ enum ServiceKind {
     Ssl,
     AudioOut,
     AudioRenderer,
+    Opus,
+    PlayReport,
     Vi(ViServiceKind),
     NvDrv,
     LogManager,
@@ -90,6 +92,8 @@ impl ServiceKind {
             b"ssl" => Some(Self::Ssl),
             b"audout:u" => Some(Self::AudioOut),
             b"audren:u" => Some(Self::AudioRenderer),
+            b"hwopus" => Some(Self::Opus),
+            b"prepo:u" => Some(Self::PlayReport),
             b"nvdrv" | b"nvdrv:a" | b"nvdrv:s" => Some(Self::NvDrv),
             b"lm" => Some(Self::LogManager),
             // Public ECTX application-writer service registration:
@@ -255,6 +259,12 @@ fn connect_service(
         ServiceKind::AudioRenderer => process.return_handle(
             HorizonIpcObject::AudioRendererManager(host_systems.audio_renderers.clone()),
         ),
+        ServiceKind::Opus => process.return_handle(HorizonIpcObject::OpusManager(
+            host_systems.opus.open_session(),
+        )),
+        ServiceKind::PlayReport => process.return_handle(HorizonIpcObject::PlayReport(
+            crate::PlayReportSession::new("dump/play-reports"),
+        )),
         ServiceKind::Vi(kind) => process.return_handle(HorizonIpcObject::Vi(ViSession::new(
             ViObjectKind::Root(kind),
             host_systems.video.clone(),

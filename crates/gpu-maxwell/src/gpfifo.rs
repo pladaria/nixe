@@ -394,6 +394,7 @@ pub enum MaxwellInvalidGpfifoSubmission {
         words: u32,
         bits: u8,
     },
+    FenceWaitWithIncrementValue,
 }
 
 impl Display for MaxwellInvalidGpfifoSubmission {
@@ -437,6 +438,9 @@ impl Display for MaxwellInvalidGpfifoSubmission {
                 formatter,
                 "GPFIFO pushbuffer range exceeds profile width: entry={entry} address=0x{address:016x} words={words} bits={bits}"
             ),
+            Self::FenceWaitWithIncrementValue => formatter.write_str(
+                "fence wait cannot use its input value as a command-stream increment count",
+            ),
         }
     }
 }
@@ -447,8 +451,6 @@ pub enum MaxwellUnsupportedGpfifoSubmission {
     UnknownSubmitFlags { flags: u32 },
     NonHardwareDescriptorFormat,
     SyncFenceFileDescriptor,
-    ConflictingFenceCompletionModes,
-    ZeroFenceIncrementValue,
     ConditionalFetch { entry: u32 },
     ControlEntry { entry: u32, opcode: u8 },
 }
@@ -467,11 +469,6 @@ impl Display for MaxwellUnsupportedGpfifoSubmission {
             }
             Self::SyncFenceFileDescriptor => formatter
                 .write_str("GPFIFO sync-fence file-descriptor semantics are not implemented"),
-            Self::ConflictingFenceCompletionModes => formatter.write_str(
-                "fence-get combined with a command-stream increment count is not implemented",
-            ),
-            Self::ZeroFenceIncrementValue => formatter
-                .write_str("command-stream fence increment mode has a zero increment count"),
             Self::ConditionalFetch { entry } => write!(
                 formatter,
                 "conditional GPFIFO fetch is not implemented: entry={entry}"
@@ -561,17 +558,12 @@ pub fn decode_gpfifo_submission(
             MaxwellUnsupportedGpfifoSubmission::SyncFenceFileDescriptor,
         ));
     }
-    if request.flags & SUBMIT_FENCE_INCREMENT_VALUE != 0 {
-        if request.flags & SUBMIT_FENCE_GET != 0 {
-            return Err(MaxwellGpfifoDecodeError::Unsupported(
-                MaxwellUnsupportedGpfifoSubmission::ConflictingFenceCompletionModes,
-            ));
-        }
-        if request.fence_value == 0 {
-            return Err(MaxwellGpfifoDecodeError::Unsupported(
-                MaxwellUnsupportedGpfifoSubmission::ZeroFenceIncrementValue,
-            ));
-        }
+    if request.flags & (SUBMIT_FENCE_WAIT | SUBMIT_FENCE_INCREMENT_VALUE)
+        == (SUBMIT_FENCE_WAIT | SUBMIT_FENCE_INCREMENT_VALUE)
+    {
+        return Err(MaxwellGpfifoDecodeError::Invalid(
+            MaxwellInvalidGpfifoSubmission::FenceWaitWithIncrementValue,
+        ));
     }
 
     let address_bits = profile.virtual_address().address_bits().bits();

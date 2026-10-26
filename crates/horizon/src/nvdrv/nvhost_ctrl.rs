@@ -366,6 +366,17 @@ impl NvHostControl {
             })
     }
 
+    pub(super) fn channel_submission_fence(
+        &mut self,
+        descriptor: NvDrvDeviceDescriptor,
+        id: GuestSyncpointId,
+    ) -> Result<GuestTimelinePoint, NvDrvCallError> {
+        if self.channel_syncpoints.get(&id).copied() != Some(descriptor.owner().process_id()) {
+            return Err(NvDrvCallError::GuestResult(NV_INVALID_STATE));
+        }
+        Ok(self.timeline(descriptor, id)?.latest_reserved_point())
+    }
+
     /// Publishes backend-complete work after host execution and canonical
     /// visibility have already succeeded on the GPU owner thread.
     pub(super) fn complete_channel_submission(
@@ -966,6 +977,27 @@ mod tests {
         );
         assert_ne!(control.timelines[&id].instance(), first_instance);
         assert_eq!(control.timelines[&id].outstanding_increments(), 0);
+    }
+
+    #[test]
+    fn zero_increment_submission_returns_latest_reserved_fence() {
+        let mut control = NvHostControl::default();
+        control.open(FD);
+        let id = control
+            .allocate_channel_syncpoint(descriptor(), IOCTL_SYNCPT_INCREMENT)
+            .unwrap()
+            .syncpoint();
+        let reserved = control
+            .reserve_channel_submission(descriptor(), IOCTL_SYNCPT_INCREMENT, id, 3)
+            .unwrap();
+        assert_eq!(
+            control.channel_submission_fence(descriptor(), id).unwrap(),
+            reserved.point()
+        );
+        assert_eq!(
+            control.timelines[&id].current_point().value(),
+            GuestSyncpointValue::new(0)
+        );
     }
 
     #[test]

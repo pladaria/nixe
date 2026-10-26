@@ -30,7 +30,6 @@ pub(super) fn fixture_bindings(
             }),
         );
     }
-    roles.extend([R::TextureHeaders, R::Samplers]);
     roles.extend((0..state.render_targets().color().len()).map(|i| R::ColorTarget(i as u8)));
     let depth = state.render_targets().depth_stencil();
     if state.render_targets().depth_target_count().value()

@@ -16,11 +16,7 @@ mod conversion;
 pub use color::{
     BlendComponent, BlendFactor, BlendOperation, ColorBlendState, ColorOutputState, ColorWriteMask,
 };
-pub use conversion::{ConversionImage, Nv12ColorTransform};
-mod device_image;
-pub use device_image::{
-    DeviceImageFrame, DeviceImageSource, DeviceImageTransfer, ExternalImageBuffer,
-};
+pub use conversion::{ConversionImage, Nv12ColorTransform, Nv12Planes};
 mod diagnostics;
 mod execution;
 mod presentation;
@@ -38,7 +34,7 @@ mod view;
 
 pub use access::{
     AccessDescriptionError, AccessMode, AccessScope, AccessTarget, BufferRange, PipelineStages,
-    QueryRange, ResourceAccess, ResourceDependency, ResourceTransition, ResourceUsage,
+    QueryRange, ResourceAccess, ResourceDependency, ResourceUsage,
 };
 pub use address::{
     GpuVirtualAddress, GpuVirtualAddressError, MappingGeneration, MappingGenerationExhausted,
@@ -49,9 +45,9 @@ pub use allocation::{
 };
 
 pub use command::{
-    AlphaCompareOperation, AlphaTest, AttachmentLoad, AttachmentStore, BarrierOperation,
-    BlitFilter, CacheMaintenanceOperation, ClearValue, CommandDescriptionError, CullMode,
-    DepthBias, DepthCompareOperation, DepthState, DrawArguments, FragmentDepthTransform, FrontFace,
+    AlphaCompareOperation, AlphaTest, AttachmentLoad, AttachmentStore, BlitFilter,
+    CacheMaintenanceOperation, ClearValue, CommandDescriptionError, CullMode, DepthBias,
+    DepthCompareOperation, DepthState, DrawArguments, FragmentDepthTransform, FrontFace,
     ImageOrigin, IndexType, LineRasterization, PrimitiveTopology, ScissorRect, StencilFaceState,
     StencilOperation, StencilTestState, TriangleRasterization, VertexAttribute,
     VertexComponentCount, VertexComponentWidth, VertexFormat, VertexPositionTransform,
@@ -84,6 +80,7 @@ pub use view::{
     Swizzle,
 };
 
+pub mod cache_counters;
 /// Diagnostic counters compiled only when explicitly enabled.
 pub mod metrics;
 pub use nixe_memory::trace;

@@ -702,13 +702,19 @@ pub struct ByteRect {
 }
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ImageStorage {
-    Pitch { row_pitch: u64 },
-    BlockLinear { block_height_log2: u8 },
+    Pitch {
+        row_pitch: u64,
+    },
+    BlockLinear {
+        block_height_log2: u8,
+        block_depth_log2: u8,
+    },
 }
 /// Coordinates are compressed blocks or samples when the image uses those
 /// representations. Each aspect names only its actual bytes in a packed block.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ImageFootprint {
+    pub depth_slice: u32,
     pub base: u64,
     pub columns: u32,
     pub rows: u32,
@@ -761,12 +767,28 @@ impl ImageFootprint {
     }
     fn offset(self, x: u64, y: u64) -> u64 {
         match self.storage {
-            ImageStorage::Pitch { row_pitch } => y * row_pitch + x,
-            ImageStorage::BlockLinear { block_height_log2 } => {
+            ImageStorage::Pitch { row_pitch } => {
+                (u64::from(self.depth_slice) * u64::from(self.rows) + y) * row_pitch + x
+            }
+            ImageStorage::BlockLinear {
+                block_height_log2,
+                block_depth_log2,
+            } => {
+                // GOB X/block-row strides include all Z slices even for a
+                // 2D plane; only the selected slice owns physical bytes.
+                // https://github.com/eden-emulator/mirror/blob/master/src/video_core/textures/decoders.cpp
                 let height = 8u64 << block_height_log2;
                 let row_bytes = u64::from(self.columns) * u64::from(self.packed_bytes);
-                (y / height) * row_bytes.div_ceil(64) * (512 << block_height_log2)
-                    + (x / 64) * (512 << block_height_log2)
+                let slice = u64::from(self.depth_slice);
+                let slice_bytes = u64::from(self.rows).div_ceil(height)
+                    * row_bytes.div_ceil(64)
+                    * (512u64 << (block_height_log2 + block_depth_log2));
+                (slice >> block_depth_log2) * slice_bytes
+                    + (slice % (1u64 << block_depth_log2)) * (512u64 << block_height_log2)
+                    + (y / height)
+                        * row_bytes.div_ceil(64)
+                        * (512 << (block_height_log2 + block_depth_log2))
+                    + (x / 64) * (512 << (block_height_log2 + block_depth_log2))
                     + (y % height / 8) * 512
                     + (x % 64 / 32) * 256
                     + (y % 8 / 2) * 64
@@ -778,13 +800,20 @@ impl ImageFootprint {
     }
     fn same_geometry(self, other: Self) -> bool {
         self.base == other.base
+            && self.depth_slice == other.depth_slice
             && self.packed_bytes == other.packed_bytes
             && self.storage == other.storage
             && match self.storage {
-                ImageStorage::Pitch { .. } => true,
-                ImageStorage::BlockLinear { .. } => {
+                ImageStorage::Pitch { .. } => self.depth_slice == 0 || self.rows == other.rows,
+                ImageStorage::BlockLinear {
+                    block_height_log2,
+                    block_depth_log2,
+                } => {
                     (u64::from(self.columns) * u64::from(self.packed_bytes)).div_ceil(64)
                         == (u64::from(other.columns) * u64::from(other.packed_bytes)).div_ceil(64)
+                        && (self.depth_slice < (1 << block_depth_log2)
+                            || self.rows.div_ceil(8 << block_height_log2)
+                                == other.rows.div_ceil(8 << block_height_log2))
                 }
             }
     }
@@ -817,14 +846,20 @@ impl ImageFootprint {
         let row_bytes = u64::from(self.columns) * u64::from(self.packed_bytes);
         let size = match self.storage {
             ImageStorage::Pitch { row_pitch } if row_pitch >= row_bytes => row_pitch
-                .checked_mul(u64::from(self.rows - 1))
+                .checked_mul((u64::from(self.depth_slice) + 1) * u64::from(self.rows) - 1)
                 .and_then(|size| size.checked_add(row_bytes)),
-            ImageStorage::BlockLinear { block_height_log2 } if block_height_log2 <= 5 => {
+            ImageStorage::BlockLinear {
+                block_height_log2,
+                block_depth_log2,
+            } if block_height_log2 <= 5 && block_depth_log2 <= 5 => {
                 let height = 8u64 << block_height_log2;
                 let padded = row_bytes
                     .div_ceil(64)
-                    .checked_mul(512 << block_height_log2)
-                    .and_then(|row| row.checked_mul(u64::from(self.rows).div_ceil(height)));
+                    .checked_mul(512 << (block_height_log2 + block_depth_log2))
+                    .and_then(|row| row.checked_mul(u64::from(self.rows).div_ceil(height)))
+                    .and_then(|slice| {
+                        slice.checked_mul((u64::from(self.depth_slice) >> block_depth_log2) + 1)
+                    });
                 padded.map(|_| {
                     let x = row_bytes - 1;
                     let y = u64::from(self.rows - 1);
@@ -855,22 +890,43 @@ impl ImageFootprint {
         match self.storage {
             ImageStorage::Pitch { row_pitch } => (
                 offset % row_pitch,
-                offset / row_pitch,
+                if offset / (u64::from(self.rows) * row_pitch) == u64::from(self.depth_slice) {
+                    offset / row_pitch % u64::from(self.rows)
+                } else {
+                    u64::from(self.rows)
+                },
                 row_pitch - offset % row_pitch,
             ),
-            ImageStorage::BlockLinear { block_height_log2 } => {
+            ImageStorage::BlockLinear {
+                block_height_log2,
+                block_depth_log2,
+            } => {
                 let row_bytes = u64::from(self.columns) * u64::from(self.packed_bytes);
-                let block_bytes = 512u64 << block_height_log2;
+                let block_bytes = 512u64 << (block_height_log2 + block_depth_log2);
                 let pitch = row_bytes.div_ceil(64) * block_bytes;
-                let block_row = offset / pitch;
-                let in_row = offset % pitch;
+                let slice_bytes = u64::from(self.rows).div_ceil(8u64 << block_height_log2) * pitch;
+                let slice_group = offset / slice_bytes;
+                let in_slice_group = offset % slice_bytes;
+                let block_row = in_slice_group / pitch;
+                let in_row = in_slice_group % pitch;
+                let within_block = in_row % block_bytes;
+                let plane_bytes = 512u64 << block_height_log2;
+                let slice = (slice_group << block_depth_log2) + within_block / plane_bytes;
+                if slice != u64::from(self.depth_slice) {
+                    // The remaining Z slices are not part of this 2D plane.
+                    return (
+                        0,
+                        u64::from(self.rows),
+                        plane_bytes - within_block % plane_bytes,
+                    );
+                }
                 let gob = in_row % 512;
                 let x = (in_row / block_bytes) * 64
                     + (gob / 256) * 32
                     + ((gob / 32) & 1) * 16
                     + gob % 16;
                 let y = block_row * (8 << block_height_log2)
-                    + (in_row % block_bytes / 512) * 8
+                    + (within_block % plane_bytes / 512) * 8
                     + ((gob / 64) & 3) * 2
                     + ((gob / 16) & 1);
                 (x, y, 16 - gob % 16)
@@ -878,6 +934,14 @@ impl ImageFootprint {
         }
     }
 }
+/// Native copies require congruent physical addressing and matching aspect lanes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ImageOverlap {
+    Disjoint,
+    Reinterpret,
+    Rect(ByteRect),
+}
+
 impl Footprint {
     pub fn new(
         mapping: Arc<PhysicalMapping>,
@@ -990,6 +1054,87 @@ impl Footprint {
     pub fn bounds(&self) -> std::ops::Range<u64> {
         self.start..self.end
     }
+    /// Native image caches synchronize layout-compatible aliases. A reused
+    /// heap can contain unrelated image lifetimes with incompatible tilings;
+    /// their overlap still participates in physical CPU visibility.
+    /// https://github.com/eden-emulator/mirror/blob/master/src/video_core/texture_cache/texture_cache.h
+    pub(crate) fn native_cache_compatible(&self, other: &Self) -> bool {
+        let (WriteDomain::Image(a), WriteDomain::Image(b)) = (self.domain, other.domain) else {
+            return true;
+        };
+        if a.packed_bytes != b.packed_bytes {
+            return false;
+        }
+        match (a.storage, b.storage) {
+            (ImageStorage::Pitch { row_pitch: ap }, ImageStorage::Pitch { row_pitch: bp }) => {
+                let origin = |mapping: &PhysicalMapping, base: u64| {
+                    let span = &mapping.spans()[0];
+                    span.start
+                        .get()
+                        .wrapping_sub(span.logical)
+                        .wrapping_add(base)
+                };
+                ap == bp && origin(&self.mapping, a.base) == origin(&other.mapping, b.base)
+            }
+            (
+                ImageStorage::BlockLinear {
+                    block_height_log2: ah,
+                    block_depth_log2: ad,
+                },
+                ImageStorage::BlockLinear {
+                    block_height_log2: bh,
+                    block_depth_log2: bd,
+                },
+            ) => {
+                ah == bh
+                    && ad == bd
+                    && (u64::from(a.columns) * u64::from(a.packed_bytes)).div_ceil(64)
+                        == (u64::from(b.columns) * u64::from(b.packed_bytes)).div_ceil(64)
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn image_overlap(&self, source: &Self) -> ImageOverlap {
+        let (WriteDomain::Image(target), WriteDomain::Image(source_image)) =
+            (self.domain, source.domain)
+        else {
+            return ImageOverlap::Reinterpret;
+        };
+        if !self.mapping.is_injective()
+            || !source.mapping.is_injective()
+            || !self.mapping.same_addressing(&source.mapping)
+            || !target.same_geometry(source_image)
+        {
+            return ImageOverlap::Reinterpret;
+        }
+        if target.aspect_offset >= source_image.aspect_offset + source_image.aspect_bytes
+            || source_image.aspect_offset >= target.aspect_offset + target.aspect_bytes
+        {
+            return ImageOverlap::Disjoint;
+        }
+        if target.aspect_offset != source_image.aspect_offset
+            || target.aspect_bytes != source_image.aspect_bytes
+        {
+            return ImageOverlap::Reinterpret;
+        }
+        let x = target.rect.x.max(source_image.rect.x);
+        let y = target.rect.y.max(source_image.rect.y);
+        let end_x =
+            (target.rect.x + target.rect.width).min(source_image.rect.x + source_image.rect.width);
+        let end_y = (target.rect.y + target.rect.height)
+            .min(source_image.rect.y + source_image.rect.height);
+        if x >= end_x || y >= end_y {
+            return ImageOverlap::Disjoint;
+        }
+        ImageOverlap::Rect(ByteRect {
+            x,
+            y,
+            width: end_x - x,
+            height: end_y - y,
+        })
+    }
+
     pub fn covers(&self, other: &Self) -> bool {
         if !self.mapping.same_addressing(&other.mapping) {
             return false;
@@ -1223,6 +1368,7 @@ mod tests {
             Footprint::new(
                 mapping,
                 WriteDomain::Image(ImageFootprint {
+                    depth_slice: 0,
                     base: 0,
                     columns,
                     rows,
@@ -1231,6 +1377,7 @@ mod tests {
                     aspect_bytes,
                     storage: ImageStorage::BlockLinear {
                         block_height_log2: 1,
+                        block_depth_log2: 0,
                     },
                     native_base: 0,
                     native_element_bytes: 4,
@@ -1340,18 +1487,103 @@ mod tests {
     fn storage_offset(storage: ImageStorage, width: u64, x: u64, y: u64) -> u64 {
         match storage {
             ImageStorage::Pitch { row_pitch } => y * row_pitch + x,
-            ImageStorage::BlockLinear { block_height_log2 } => {
+            ImageStorage::BlockLinear {
+                block_height_log2,
+                block_depth_log2,
+            } => {
                 let height = 1u64 << block_height_log2;
                 let gob_x = x / 64;
                 let gob_y = y / 8;
                 let group_y = gob_y / height;
-                let gob = (group_y * width.div_ceil(64) + gob_x) * height + gob_y % height;
+                let gob = (((group_y * width.div_ceil(64) + gob_x) * height) << block_depth_log2)
+                    + gob_y % height;
                 let interleaved =
                     (x & 15) | ((y & 1) << 4) | ((x & 16) << 1) | ((y & 6) << 5) | ((x & 32) << 3);
                 gob * 512 + interleaved
             }
         }
     }
+    #[test]
+    fn volume_slice_projection_matches_gob_oracle_across_depth_groups() {
+        use std::collections::BTreeMap;
+        let machine = Machine::new(16 * PAGE_SIZE).unwrap();
+        let allocation = machine
+            .account(16 * PAGE_SIZE)
+            .unwrap()
+            .allocate(16 * PAGE_SIZE)
+            .unwrap();
+        let mapping =
+            PhysicalMapping::new(&[
+                AllocationRange::new(allocation.pin(), 0, 16 * PAGE_SIZE).unwrap()
+            ])
+            .unwrap();
+        let origin = mapping.spans()[0].start.get();
+        for (bh, bd) in [(0, 0), (0, 3), (1, 2)] {
+            for z in 0..7 {
+                let image = Footprint::new(
+                    mapping.clone(),
+                    WriteDomain::Image(ImageFootprint {
+                        depth_slice: z,
+                        base: 13,
+                        columns: 23,
+                        rows: 21,
+                        packed_bytes: 4,
+                        aspect_offset: 1,
+                        aspect_bytes: 3,
+                        storage: ImageStorage::BlockLinear {
+                            block_height_log2: bh,
+                            block_depth_log2: bd,
+                        },
+                        native_base: 0,
+                        native_element_bytes: 4,
+                        native_row_pitch: 92,
+                        rect: ByteRect {
+                            x: 3,
+                            y: 2,
+                            width: 17,
+                            height: 13,
+                        },
+                    }),
+                )
+                .unwrap();
+                let mut actual = BTreeMap::new();
+                image
+                    .visit(0, mapping.spans()[0].start, mapping.bytes(), |part| {
+                        for byte in 0..part.bytes {
+                            assert!(
+                                actual
+                                    .insert(part.native + byte, part.start.get() + byte)
+                                    .is_none()
+                            );
+                        }
+                        true
+                    })
+                    .unwrap();
+                let mut expected = BTreeMap::new();
+                let h = 1u64 << bh;
+                let d = 1u64 << bd;
+                for y in 2u64..15 {
+                    for x in 3u64..20 {
+                        for lane in 1..4 {
+                            let raw_x = x * 4 + lane;
+                            let block = 512 * h * d;
+                            let address = (u64::from(z) / d) * 21u64.div_ceil(8 * h) * 2 * block
+                                + (y / (8 * h) * 2 + raw_x / 64) * block
+                                + (u64::from(z) % d * h + y / 8 % h) * 512
+                                + (raw_x & 15)
+                                + ((y & 1) << 4)
+                                + ((raw_x & 16) << 1)
+                                + ((y & 6) << 5)
+                                + ((raw_x & 32) << 3);
+                            expected.insert(y * 92 + x * 4 + lane - 1, origin + 13 + address);
+                        }
+                    }
+                }
+                assert_eq!(actual, expected, "block={bh}/{bd}, slice={z}");
+            }
+        }
+    }
+
     #[test]
     fn aspect_intersections_match_bytes_across_layouts_and_unaligned_origins() {
         use std::collections::BTreeSet;
@@ -1367,12 +1599,23 @@ mod tests {
             ImageStorage::Pitch { row_pitch: 80 },
             ImageStorage::BlockLinear {
                 block_height_log2: 0,
+                block_depth_log2: 0,
             },
             ImageStorage::BlockLinear {
                 block_height_log2: 1,
+                block_depth_log2: 0,
+            },
+            ImageStorage::BlockLinear {
+                block_height_log2: 0,
+                block_depth_log2: 3,
+            },
+            ImageStorage::BlockLinear {
+                block_height_log2: 1,
+                block_depth_log2: 2,
             },
             ImageStorage::BlockLinear {
                 block_height_log2: 3,
+                block_depth_log2: 0,
             },
         ] {
             for origin in [0, 1, 4] {
@@ -1387,6 +1630,7 @@ mod tests {
                     let footprint = Footprint::new(
                         Arc::clone(&mapping),
                         WriteDomain::Image(ImageFootprint {
+                            depth_slice: 0,
                             base: 0,
                             columns: 17,
                             rows: 13,
@@ -1449,15 +1693,27 @@ mod tests {
             ImageStorage::Pitch { row_pitch: 100 },
             ImageStorage::BlockLinear {
                 block_height_log2: 0,
+                block_depth_log2: 0,
             },
             ImageStorage::BlockLinear {
                 block_height_log2: 1,
+                block_depth_log2: 0,
+            },
+            ImageStorage::BlockLinear {
+                block_height_log2: 0,
+                block_depth_log2: 3,
+            },
+            ImageStorage::BlockLinear {
+                block_height_log2: 1,
+                block_depth_log2: 2,
             },
             ImageStorage::BlockLinear {
                 block_height_log2: 3,
+                block_depth_log2: 0,
             },
             ImageStorage::BlockLinear {
                 block_height_log2: 5,
+                block_depth_log2: 0,
             },
         ] {
             for (aspect_offset, aspect_bytes, native_element_bytes) in
@@ -1478,6 +1734,7 @@ mod tests {
                     },
                 ] {
                     let image = ImageFootprint {
+                        depth_slice: 0,
                         base: 67,
                         columns: 23,
                         rows: 21,
@@ -1757,9 +2014,19 @@ mod submapping_tests {
             ImageStorage::Pitch { row_pitch: 1024 },
             ImageStorage::BlockLinear {
                 block_height_log2: 1,
+                block_depth_log2: 0,
+            },
+            ImageStorage::BlockLinear {
+                block_height_log2: 0,
+                block_depth_log2: 3,
+            },
+            ImageStorage::BlockLinear {
+                block_height_log2: 1,
+                block_depth_log2: 2,
             },
         ] {
             domains.push(WriteDomain::Image(ImageFootprint {
+                depth_slice: 0,
                 base: 0,
                 columns: 17,
                 rows: 13,

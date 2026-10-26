@@ -85,6 +85,52 @@ fn run(
     )
 }
 #[test]
+fn exclusive_wait_loop_progresses_after_a_store_without_an_explicit_sev() {
+    let process = fixture(&[
+        0xd50320bf, // SEVL
+        0xd503205f, // loop: WFE
+        0x885ffc20, // LDAXR W0,[X1]
+        0x35ffffc0, // CBNZ W0,loop
+        0xd4000001, // SVC
+        0x889ffc3f, // STLR WZR,[X1]
+        0xd4000001, // SVC
+    ]);
+    assert!(matches!(
+        process
+            .space
+            .write(GuestVirtualAddress::new(DATA), &1_u32.to_le_bytes())
+            .unwrap(),
+        Access::Ready(())
+    ));
+    let mut consumer = process.create_thread().unwrap();
+    let mut consumer_state = state();
+    let mut consumer_worker = NativeWorker::default();
+    assert_eq!(
+        run(&mut consumer, &mut consumer_worker, &mut consumer_state)
+            .unwrap()
+            .stop,
+        CpuExit::BudgetExhausted
+    );
+
+    let mut producer = process.create_thread().unwrap();
+    let mut producer_state = state();
+    producer_state.set_pc(CODE + 20);
+    assert!(matches!(
+        run(&mut producer, &mut consumer_worker, &mut producer_state)
+            .unwrap()
+            .stop,
+        CpuExit::SupervisorCall { .. }
+    ));
+    assert!(matches!(
+        run(&mut consumer, &mut consumer_worker, &mut consumer_state)
+            .unwrap()
+            .stop,
+        CpuExit::SupervisorCall { .. }
+    ));
+    assert_eq!(consumer_state.read_x(register(0)), 0);
+}
+
+#[test]
 fn canonical_process_prepares_code_and_retains_registers_across_svc_and_migration() {
     let process = fixture(&[0x91000400, 0xd4000001, 0x17fffffe]); // ADD X0,#1; SVC; B start.
     let mut first = process.create_thread().unwrap();

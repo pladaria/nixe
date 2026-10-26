@@ -309,6 +309,7 @@ pub(crate) fn image_geometry(
             Footprint::new(
                 mapping.clone(),
                 WriteDomain::Image(ImageFootprint {
+                    depth_slice: 0,
                     base: plane.offset,
                     columns: width,
                     rows,
@@ -343,6 +344,7 @@ pub(crate) fn plane_geometry(
     Footprint::new(
         mapping,
         WriteDomain::Image(ImageFootprint {
+            depth_slice: 0,
             base: 0,
             columns: extent[0],
             rows: extent[1],
@@ -640,6 +642,7 @@ fn rgba_image() -> (NativeImageDescription, Vec<ImagePlane>) {
             flags: vk::ImageCreateFlags::MUTABLE_FORMAT,
         },
         vec![ImagePlane {
+            depth_slice: 0,
             offset: 32,
             row_pitch: 24,
             mip_level: 0,
@@ -949,6 +952,7 @@ fn dense_cpu_images_upload_once_without_buffers_and_preserve_later_gpu_writes() 
     let backing = Footprint::new(
         physical.clone(),
         nixe_gpu::physical::WriteDomain::Image(nixe_gpu::physical::ImageFootprint {
+            depth_slice: 0,
             base: 0,
             columns: 57,
             rows: 33,
@@ -957,6 +961,7 @@ fn dense_cpu_images_upload_once_without_buffers_and_preserve_later_gpu_writes() 
             aspect_bytes: 4,
             storage: nixe_gpu::physical::ImageStorage::BlockLinear {
                 block_height_log2: 0,
+                block_depth_log2: 0,
             },
             native_base: 0,
             native_element_bytes: 4,
@@ -976,6 +981,7 @@ fn dense_cpu_images_upload_once_without_buffers_and_preserve_later_gpu_writes() 
         depth: 1,
     };
     let plane = ImagePlane {
+        depth_slice: 0,
         offset: 0,
         row_pitch: 228,
         mip_level: 0,
@@ -1053,7 +1059,7 @@ fn dense_cpu_images_upload_once_without_buffers_and_preserve_later_gpu_writes() 
         actual[4..].iter().all(|&byte| byte == 0x31),
         "CPU replacements must retire previous GPU authority before a partial GPU writer"
     );
-    assert!(cache.device.queue_usage().command_pools <= 2);
+    assert!(cache.device.queue_usage().command_slots <= 2);
     assert_eq!(cache.device.queue_usage().overflow_capacity, 0);
     drop(cache);
     validation.check().unwrap();
@@ -1104,13 +1110,12 @@ fn large_uploads_retain_streams_until_their_actual_consumer() {
         .submission
         .reserve_readback(&mut cache.device.dispatch, 64)
         .unwrap();
-    let command = cache.device.submission.slots[slot].command;
+
     let target = cache.device.submission.slots[slot]
         .readback_buffer(destination)
         .handle;
     unsafe {
         cache.device.dispatch.cmd_copy_buffer(
-            command,
             source.handle,
             target,
             &[vk::BufferCopy::default()
@@ -1119,7 +1124,7 @@ fn large_uploads_retain_streams_until_their_actual_consumer() {
                 .size(64)],
         );
     }
-    recording::host_read_barrier(&mut cache.device, command, target, destination.offset, 64);
+    recording::host_read_barrier(&mut cache.device, target, destination.offset, 64);
     cache.device.submission.release_stream_uploads();
     let mut gate = gate::Gate::new(&cache.device);
     let waits = [vk::SemaphoreSubmitInfo::default()
@@ -1147,7 +1152,7 @@ fn large_uploads_retain_streams_until_their_actual_consumer() {
         cache.read_buffer(image_bytes, 0, 4096).unwrap(),
         [0x34; 4096]
     );
-    assert_eq!(cache.device.queue_usage().command_pools, 2);
+    assert_eq!(cache.device.queue_usage().command_slots, 2);
     assert_eq!(cache.device.queue_usage().overflow_capacity, 0);
     drop(gate);
     drop(source);
@@ -1186,6 +1191,7 @@ fn native_compressed_blocks_mips_and_layers_preserve_exact_bytes() {
                 depth: 1,
             };
             planes.push(ImagePlane {
+                depth_slice: 0,
                 offset,
                 row_pitch: 16,
                 mip_level: mip,
@@ -1334,6 +1340,7 @@ fn packed_rgb565_keeps_native_storage_without_rgba_expansion() {
         flags: vk::ImageCreateFlags::empty(),
     };
     let plane = ImagePlane {
+        depth_slice: 0,
         offset: 2,
         row_pitch: 6,
         mip_level: 0,
@@ -1384,6 +1391,7 @@ fn fragmented_image_import_batches_transfers_and_bounds_temporary_allocations() 
         depth: 1,
     };
     let plane = ImagePlane {
+        depth_slice: 0,
         offset: 0,
         row_pitch: u64::from(width * 4),
         mip_level: 0,
@@ -1439,6 +1447,7 @@ fn fragmented_image_import_batches_transfers_and_bounds_temporary_allocations() 
     let greens = Footprint::new(
         backing.clone(),
         nixe_gpu::physical::WriteDomain::Image(nixe_gpu::physical::ImageFootprint {
+            depth_slice: 0,
             base: 0,
             columns: width,
             rows: height,
@@ -1646,7 +1655,6 @@ fn query_reports_commit_at_the_next_fence_and_keep_cpu_overwrites() {
         .report_memory(ranges(128), 0, &Arc::from([0x42; 4]), false)
         .unwrap();
     assert!(cache.buffer_downloads.is_empty());
-    assert!(!cache.readback_submission_pending());
     assert_eq!(cache.device.scheduled_tick(), 0);
     cpu_write(&mut cache, &allocation, 128, &[0x5a; 4]).unwrap();
     cache

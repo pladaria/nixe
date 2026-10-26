@@ -35,6 +35,7 @@ pub(super) fn format(value: F) -> vk::Format {
         F::Rg32Float => vk::Format::R32G32_SFLOAT,
         F::Rgba32Float => vk::Format::R32G32B32A32_SFLOAT,
         F::Rg11b10Ufloat => vk::Format::B10G11R11_UFLOAT_PACK32,
+        F::Rgb10a2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
         F::Depth16Unorm => vk::Format::D16_UNORM,
         F::Depth24UnormStencil8Uint => vk::Format::D24_UNORM_S8_UINT,
         F::Depth32Float => vk::Format::D32_SFLOAT,
@@ -96,6 +97,7 @@ impl NativeGpuExecution {
             );
             let mip = guest.description.mip_extent(p.mip_level as u8).unwrap();
             planes.push(ImagePlane {
+                depth_slice: p.depth_slice,
                 offset,
                 row_pitch: p.row_pitch,
                 mip_level: p.mip_level,
@@ -108,7 +110,7 @@ impl NativeGpuExecution {
                 extent: vk::Extent3D {
                     width: mip.width,
                     height: mip.height,
-                    depth: mip.depth,
+                    depth: 1,
                 },
                 block_extent: vk::Extent2D {
                     width: bw,
@@ -156,6 +158,11 @@ impl NativeGpuExecution {
             flags: vk::ImageCreateFlags::MUTABLE_FORMAT
                 | if guest.description.dimension() == ImageDimension::Cube {
                     vk::ImageCreateFlags::CUBE_COMPATIBLE
+                } else if guest.description.dimension() == ImageDimension::Three {
+                    // A 3D image retains its native type; attachments select
+                    // 2D slice views, as in the shared texture-cache design.
+                    // https://github.com/eden-emulator/mirror/blob/master/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+                    vk::ImageCreateFlags::TYPE_2D_ARRAY_COMPATIBLE
                 } else {
                     vk::ImageCreateFlags::empty()
                 },
@@ -179,22 +186,6 @@ impl NativeGpuExecution {
         };
         self.residency.set_guest_image(image, guest);
         Ok(image)
-    }
-    pub(super) fn video_view(&mut self, guest: &GuestImage) -> Result<ImageViewId, VulkanError> {
-        let native = self.image(guest)?;
-        self.residency.image_view(
-            native,
-            ImageViewDescription {
-                format: self.residency.image(native)?.description.format,
-                view_type: vk::ImageViewType::TYPE_2D,
-                aspects: vk::ImageAspectFlags::COLOR,
-                base_mip: 0,
-                mip_count: 1,
-                base_layer: 0,
-                layer_count: 1,
-                swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
-            },
-        )
     }
     fn view(&mut self, guest: &GuestImage, arrayed: bool) -> Result<ImageViewId, VulkanError> {
         let requested_format = format(guest.description.format());
@@ -221,7 +212,18 @@ impl NativeGpuExecution {
             ImageViewDescription {
                 format: self.residency.image(native)?.view_format(requested_format),
                 view_type: if guest.description.dimension() == ImageDimension::Cube {
-                    vk::ImageViewType::CUBE
+                    if arrayed {
+                        if self.device_profile().core.image_cube_array == 0 {
+                            return Err(VulkanError::InvalidResource(
+                                "host does not support cubemap arrays",
+                            ));
+                        }
+                        vk::ImageViewType::CUBE_ARRAY
+                    } else {
+                        vk::ImageViewType::CUBE
+                    }
+                } else if guest.description.dimension() == ImageDimension::Three {
+                    vk::ImageViewType::TYPE_3D
                 } else if arrayed {
                     vk::ImageViewType::TYPE_2D_ARRAY
                 } else {
@@ -231,8 +233,10 @@ impl NativeGpuExecution {
                 base_mip,
                 mip_count: u32::from(guest.description.mip_levels()),
                 base_layer,
-                layer_count: if arrayed || guest.description.dimension() == ImageDimension::Cube {
+                layer_count: if arrayed {
                     u32::from(guest.description.array_layers())
+                } else if guest.description.dimension() == ImageDimension::Cube {
+                    6
                 } else {
                     1
                 },
@@ -657,6 +661,263 @@ mod tests {
     use crate::residency::tests::backing_allocation;
 
     #[test]
+    fn volume_slices_keep_native_type_attachment_views_and_exact_visibility() {
+        use nixe_gpu::physical::{ByteRect, Footprint, ImageFootprint, ImageStorage, WriteDomain};
+        let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+            return;
+        };
+        let validation = device.validation_monitor();
+        let mut execution = NativeGpuExecution::new(
+            nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+            device,
+            ShaderNamespace {
+                guest: *b"nixe-native-test",
+                isa: 1,
+            },
+            CacheConfiguration::default(),
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+        let (_allocation, backing) = backing_allocation(&execution.residency, 4096, 4096, 0x73);
+        let guest = GuestImage {
+            view_identity: None,
+            description: nixe_gpu::ImageDescription::new(
+                ImageDimension::Three,
+                nixe_gpu::ImageExtent::new(16, 8, 4).unwrap(),
+                F::Rgba8Unorm,
+                nixe_gpu::ImageKind::Color,
+                1,
+                1,
+                SampleCount::One,
+            )
+            .unwrap(),
+            swizzle: nixe_gpu::Swizzle::IDENTITY,
+            canonical_texels: true,
+            sample_grid: [1, 1],
+            planes: (0..4)
+                .map(|depth_slice| GuestImagePlane {
+                    depth_slice,
+                    mip_level: 0,
+                    array_layer: 0,
+                    aspect: nixe_gpu::native::GuestImageAspect::Color,
+                    footprint: Footprint::new(
+                        backing.clone(),
+                        WriteDomain::Image(ImageFootprint {
+                            depth_slice,
+                            base: 0,
+                            columns: 16,
+                            rows: 8,
+                            packed_bytes: 4,
+                            aspect_offset: 0,
+                            aspect_bytes: 4,
+                            storage: ImageStorage::BlockLinear {
+                                block_height_log2: 0,
+                                block_depth_log2: 3,
+                            },
+                            native_base: 0,
+                            native_element_bytes: 4,
+                            native_row_pitch: 64,
+                            rect: ByteRect {
+                                x: 0,
+                                y: 0,
+                                width: 16,
+                                height: 8,
+                            },
+                        }),
+                    )
+                    .unwrap(),
+                    row_pitch: 64,
+                    bytes_per_block: 4,
+                })
+                .collect(),
+        };
+        let native = execution.image(&guest).unwrap();
+        assert_eq!(
+            execution
+                .residency
+                .image(native)
+                .unwrap()
+                .description
+                .image_type,
+            vk::ImageType::TYPE_3D
+        );
+        execution.view(&guest, false).unwrap(); // sampled 3D view
+        execution
+            .residency
+            .image_view(
+                native,
+                crate::ImageViewDescription {
+                    format: vk::Format::R8G8B8A8_UNORM,
+                    view_type: vk::ImageViewType::TYPE_2D,
+                    aspects: vk::ImageAspectFlags::COLOR,
+                    base_mip: 0,
+                    mip_count: 1,
+                    base_layer: 2,
+                    layer_count: 1,
+                    swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
+                },
+            )
+            .unwrap(); // attachment slice view
+        execution
+            .residency
+            .clear_color_image(
+                native,
+                2,
+                vk::ClearColorValue {
+                    float32: [1., 0., 0., 1.],
+                },
+            )
+            .unwrap();
+        execution
+            .residency
+            .clear_color_image(
+                native,
+                1,
+                vk::ClearColorValue {
+                    float32: [0., 0., 1., 1.],
+                },
+            )
+            .unwrap();
+        let bytes = crate::residency::tests::cpu_read(&mut execution.residency, &backing);
+        assert_eq!(&bytes[..512], &[0x73; 512]);
+        assert_eq!(&bytes[512..1024], [0, 0, 255, 255].repeat(128));
+        assert_eq!(&bytes[1024..1536], [255, 0, 0, 255].repeat(128));
+        assert_eq!(&bytes[1536..], &[0x73; 2560]);
+        let (_output_allocation, output) = backing_allocation(&execution.residency, 4096, 4096, 0);
+        let mut target_description = execution.residency.image(native).unwrap().description;
+        target_description.image_type = vk::ImageType::TYPE_2D;
+        target_description.extent.depth = 1;
+        target_description.flags = vk::ImageCreateFlags::MUTABLE_FORMAT;
+        let plane = crate::ImagePlane {
+            depth_slice: 0,
+            offset: 0,
+            row_pitch: 64,
+            mip_level: 0,
+            array_layer: 0,
+            aspect: vk::ImageAspectFlags::COLOR,
+            extent: target_description.extent,
+            block_extent: vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+            bytes_per_block: 4,
+        };
+        let target = execution
+            .residency
+            .image_for(
+                crate::residency::tests::image_geometry(
+                    output.clone(),
+                    target_description,
+                    &[plane],
+                ),
+                target_description,
+                vec![plane],
+            )
+            .unwrap();
+        for z in 0..4 {
+            execution
+                .residency
+                .copy_image_region(
+                    native,
+                    z,
+                    vk::Rect2D {
+                        offset: Default::default(),
+                        extent: vk::Extent2D {
+                            width: 16,
+                            height: 8,
+                        },
+                    },
+                    target,
+                    0,
+                    Default::default(),
+                )
+                .unwrap();
+            let copied = crate::residency::tests::cpu_read(&mut execution.residency, &output);
+            let expected = if z == 2 {
+                [255, 0, 0, 255].repeat(128)
+            } else if z == 1 {
+                [0, 0, 255, 255].repeat(128)
+            } else {
+                vec![0x73; 512]
+            };
+            assert_eq!(&copied[..512], expected, "native Z transfer {z}");
+        }
+        execution.teardown().unwrap();
+        drop(execution);
+        validation.check().unwrap();
+    }
+
+    #[test]
+    fn cubemap_array_views_share_faces_with_single_cube_views() {
+        let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+            return;
+        };
+        let validation = device.validation_monitor();
+        let mut execution = NativeGpuExecution::new(
+            nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+            device,
+            ShaderNamespace {
+                guest: *b"nixe-native-test",
+                isa: 1,
+            },
+            CacheConfiguration::default(),
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+        let (_allocation, backing) = backing_allocation(&execution.residency, 4096, 4096, 0);
+        let guest = GuestImage {
+            view_identity: None,
+            description: nixe_gpu::ImageDescription::new(
+                ImageDimension::Cube,
+                nixe_gpu::ImageExtent::new(1, 1, 1).unwrap(),
+                F::Rgba8Unorm,
+                nixe_gpu::ImageKind::Color,
+                1,
+                12,
+                SampleCount::One,
+            )
+            .unwrap(),
+            swizzle: nixe_gpu::Swizzle::IDENTITY,
+            canonical_texels: true,
+            sample_grid: [1, 1],
+            planes: (0..12)
+                .map(|layer| GuestImagePlane {
+                    depth_slice: 0,
+                    mip_level: 0,
+                    array_layer: layer,
+                    aspect: nixe_gpu::native::GuestImageAspect::Color,
+                    footprint: crate::residency::tests::plane_geometry(
+                        backing.slice(u64::from(layer) * 4, 4).unwrap(),
+                        [1, 1],
+                        4,
+                        4,
+                    ),
+                    row_pitch: 4,
+                    bytes_per_block: 4,
+                })
+                .collect(),
+        };
+        let array = execution.view(&guest, true).unwrap();
+        let cube = execution.view(&guest, false).unwrap();
+        assert_ne!(array, cube);
+        assert_eq!(array.image, cube.image);
+        let before = execution.residency.statistics();
+        assert_eq!(execution.view(&guest, true).unwrap(), array);
+        assert_eq!(execution.view(&guest, false).unwrap(), cube);
+        assert_eq!(
+            execution.residency.statistics().image_allocations,
+            before.image_allocations
+        );
+        assert_eq!(
+            execution.residency.statistics().image_view_allocations,
+            before.image_view_allocations
+        );
+        execution.teardown().unwrap();
+        drop(execution);
+        validation.check().unwrap();
+    }
+
+    #[test]
     fn contained_mip_and_layer_reuse_native_storage() {
         let Some(device) = support::device_for_test(ApiPreference::Auto) else {
             return;
@@ -690,6 +951,7 @@ mod tests {
                 };
                 domain.base = offset;
                 planes.push(GuestImagePlane {
+                    depth_slice: 0,
                     mip_level: mip,
                     array_layer: layer,
                     aspect: nixe_gpu::native::GuestImageAspect::Color,
@@ -737,6 +999,7 @@ mod tests {
                 )
                 .unwrap(),
                 planes: Arc::from([GuestImagePlane {
+                    depth_slice: 0,
                     mip_level: 0,
                     array_layer: 0,
                     aspect: nixe_gpu::native::GuestImageAspect::Color,
@@ -823,6 +1086,7 @@ mod tests {
             canonical_texels: true,
             sample_grid: [1, 1],
             planes: Arc::from([GuestImagePlane {
+                depth_slice: 0,
                 mip_level: 0,
                 array_layer: 0,
                 aspect: nixe_gpu::native::GuestImageAspect::Color,

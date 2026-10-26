@@ -214,15 +214,6 @@ pub(in crate::ipc_wire) async fn dispatch_audio_renderer_manager(
     let Some(revision) = params.revision_number() else {
         return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_REVISION);
     };
-    if revision > 7 {
-        return Err(IpcWireError::UnsupportedService(
-            UnsupportedServiceOperation::CommandVariant {
-                service: "audren:u",
-                command_id: command,
-                detail: "work-memory layout for REV8 and later is not implemented",
-            },
-        ));
-    }
     let Some(size) = params.work_buffer_size(revision) else {
         return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_ARGUMENT);
     };

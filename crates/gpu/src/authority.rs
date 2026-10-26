@@ -16,6 +16,8 @@ use std::{
 };
 
 mod access;
+mod images;
+pub use images::{ImageChanges, ImageCopy};
 mod lifetime;
 mod publication;
 use access::PendingRequest;
@@ -64,7 +66,9 @@ fn prune_on_insert<T>(entries: &mut Vec<T>, next: &mut usize, keep: impl FnMut(&
         *next = entries.len().saturating_mul(2).max(16);
     }
 }
-struct Resource {
+struct Resource<R> {
+    aliases: Vec<R>,
+    modification: u64,
     footprints: Vec<Arc<Footprint>>,
     registrations: Vec<IntervalKey>,
     writers: Vec<WriterId>,
@@ -183,7 +187,7 @@ pub struct ResolvedBytes<R> {
 pub struct Authority<R> {
     machine: MachineId,
     index: IntervalIndex<Indexed<R>>,
-    resources: FxHashMap<R, Resource>,
+    resources: FxHashMap<R, Resource<R>>,
     writers: FxHashMap<WriterId, Writer<R>>,
     next_writer: u64,
     sequence: u64,
@@ -219,6 +223,24 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                 "resource authority names another machine",
             ));
         }
+        // Retain overlap relationships at registration rather than rediscovering
+        // them while binding each draw's images.
+        // https://github.com/eden-emulator/mirror/blob/master/src/video_core/texture_cache/image_base.h
+        let mut aliases = FxHashSet::default();
+        for footprint in &footprints {
+            aliases.extend(self.candidates(footprint));
+        }
+        let aliases: Vec<_> = aliases
+            .into_iter()
+            .filter(|candidate| {
+                footprints.iter().any(|f| {
+                    self.resources[candidate]
+                        .footprints
+                        .iter()
+                        .any(|other| f.native_cache_compatible(other))
+                })
+            })
+            .collect();
         let mut registrations = Vec::new();
         for (footprint, f) in footprints.iter().enumerate() {
             for (span, s) in f.mapping().spans().iter().enumerate() {
@@ -250,6 +272,8 @@ impl<R: Copy + Eq + Hash> Authority<R> {
         self.resources.insert(
             resource,
             Resource {
+                aliases: aliases.clone(),
+                modification: 0,
                 footprints,
                 registrations,
                 writers: Vec::new(),
@@ -259,6 +283,13 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                 normalize_at: 64,
             },
         );
+        for alias in aliases {
+            self.resources
+                .get_mut(&alias)
+                .unwrap()
+                .aliases
+                .push(resource);
+        }
         Ok(())
     }
     /// Cold resource interpretation lookup uses this same physical index.
@@ -402,6 +433,7 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             entry.consumers_prune_at = entry.consumers.len().saturating_mul(2).max(16);
             for consumer in &entry.consumers {
                 if !(consumer.native && candidate == resource)
+                    && (!consumer.native || footprint.native_cache_compatible(&consumer.footprint))
                     && footprint.intersects(&consumer.footprint)
                 {
                     consumers.push(consumer.invalid.clone());
@@ -476,6 +508,7 @@ impl<R: Copy + Eq + Hash> Authority<R> {
         }
         writer.consumers_prune_at = 16;
         let sequence = writer.sequence;
+        self.resources.get_mut(&resource).unwrap().modification = sequence.get();
         if first_publication {
             let entry = self.resources.get_mut(&resource).unwrap();
             entry.live_writers += 1;
@@ -555,7 +588,14 @@ impl<R: Copy + Eq + Hash> Authority<R> {
         let mut writers: Vec<_> = candidates
             .into_iter()
             .flat_map(|candidate| self.resources[&candidate].writers.iter().copied())
-            .filter(|id| self.writers[id].sequence.0 != 0)
+            .filter(|id| {
+                let writer = &self.writers[id];
+                writer.sequence.0 != 0
+                    && self.resources[&resource]
+                        .footprints
+                        .iter()
+                        .any(|f| f.native_cache_compatible(&writer.footprint))
+            })
             .collect();
         writers.sort_unstable_by_key(|id| std::cmp::Reverse(self.writers[id].sequence));
         // Newest bytes enter this ordered union once. Older domains query only
@@ -741,18 +781,31 @@ impl<R: Copy + Eq + Hash> Authority<R> {
         let direct = footprint.mapping().is_injective();
         self.observe_contents(resource, footprint, direct)
     }
+    /// A whole native interpretation has one invalidation flag, independent
+    /// of how many transfer planes (including volume slices) describe it.
+    pub fn observe_native_resource(
+        &mut self,
+        resource: R,
+    ) -> Result<ResourceObservation, MemoryError> {
+        let footprints = self
+            .resources
+            .get(&resource)
+            .ok_or(MemoryError::Invalid("consumer resource is not registered"))?
+            .footprints
+            .clone();
+        let flag = Arc::new(AtomicBool::new(false));
+        for footprint in footprints {
+            let native = footprint.mapping().is_injective();
+            self.subscribe_contents(resource, footprint, native, &flag);
+        }
+        Ok(ResourceObservation(flag))
+    }
     fn observe_contents(
         &mut self,
         resource: R,
         footprint: Arc<Footprint>,
         native: bool,
     ) -> Result<ResourceObservation, MemoryError> {
-        let _trace = crate::trace::span(
-            "resource_observe",
-            footprint.bounds().start,
-            footprint.bounds().end,
-            u64::from(native),
-        );
         let entry = self
             .resources
             .get(&resource)
@@ -765,13 +818,33 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                 "consumer domain is outside its registered resource",
             ))?;
         let flag = Arc::new(AtomicBool::new(false));
-        for candidate in self.candidates(&footprint) {
-            if native && candidate == resource {
-                continue;
-            }
+        self.subscribe_contents(resource, footprint, native, &flag);
+        Ok(ResourceObservation(flag))
+    }
+    fn subscribe_contents(
+        &mut self,
+        resource: R,
+        footprint: Arc<Footprint>,
+        native: bool,
+        flag: &Arc<AtomicBool>,
+    ) {
+        let _trace = crate::trace::span(
+            "resource_observe",
+            footprint.bounds().start,
+            footprint.bounds().end,
+            u64::from(native),
+        );
+        let candidates: Vec<_> = if native {
+            self.resources[&resource].aliases.clone()
+        } else {
+            self.candidates(&footprint).into_iter().collect()
+        };
+        for candidate in candidates {
             for id in &self.resources[&candidate].writers {
                 let writer = self.writers.get_mut(id).unwrap();
-                if footprint.intersects(&writer.footprint) {
+                if (!native || footprint.native_cache_compatible(&writer.footprint))
+                    && footprint.intersects(&writer.footprint)
+                {
                     prune_on_insert(
                         &mut writer.consumers,
                         &mut writer.consumers_prune_at,
@@ -780,7 +853,7 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                                 .is_some_and(|flag| !flag.load(Ordering::Acquire))
                         },
                     );
-                    writer.consumers.push(Arc::downgrade(&flag));
+                    writer.consumers.push(Arc::downgrade(flag));
                 }
             }
         }
@@ -797,10 +870,9 @@ impl<R: Copy + Eq + Hash> Authority<R> {
         );
         entry.consumers.push(Consumer {
             footprint,
-            invalid: Arc::downgrade(&flag),
+            invalid: Arc::downgrade(flag),
             native,
         });
-        Ok(ResourceObservation(flag))
     }
     /// The caller holds the exact access dependency until the RAM write and this
     /// subtraction have both completed. Overwritten bytes need no download.
@@ -1345,6 +1417,13 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             self.remove_writer(id);
         }
         let entry = self.resources.remove(&resource).unwrap();
+        for alias in entry.aliases {
+            self.resources
+                .get_mut(&alias)
+                .unwrap()
+                .aliases
+                .retain(|&r| r != resource);
+        }
         for key in entry.registrations {
             self.index.remove(key);
         }

@@ -90,15 +90,14 @@ impl MaxwellThreeDReportSemaphoreState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDReportSemaphoreStateWrite) {
         match write {
-            MaxwellThreeDReportSemaphoreStateWrite::AddressUpper { value, source } => {
-                self.address_upper =
-                    MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            MaxwellThreeDReportSemaphoreStateWrite::AddressUpper { value, source: _ } => {
+                self.address_upper = MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
-            MaxwellThreeDReportSemaphoreStateWrite::AddressLower { value, source } => {
-                self.address_lower = MaxwellThreeDRegister::programmed(value, value, source);
+            MaxwellThreeDReportSemaphoreStateWrite::AddressLower { value, source: _ } => {
+                self.address_lower = MaxwellThreeDRegister::decoded(value, value);
             }
-            MaxwellThreeDReportSemaphoreStateWrite::Payload { value, source } => {
-                self.payload = MaxwellThreeDRegister::programmed(value, value, source);
+            MaxwellThreeDReportSemaphoreStateWrite::Payload { value, source: _ } => {
+                self.payload = MaxwellThreeDRegister::decoded(value, value);
             }
         }
     }

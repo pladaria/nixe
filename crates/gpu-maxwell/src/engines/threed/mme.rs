@@ -1043,15 +1043,14 @@ impl MaxwellThreeDMmeState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDMmeStateWrite) {
         match write {
-            MaxwellThreeDMmeStateWrite::InstructionPointer { value, source } => {
-                self.instruction_pointer =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDMmeStateWrite::InstructionPointer { value, source: _ } => {
+                self.instruction_pointer = MaxwellThreeDRegister::decoded(value.raw(), value);
                 self.next_instruction_address = Some(value);
             }
             MaxwellThreeDMmeStateWrite::Instruction {
                 address,
                 value,
-                source,
+                source: _,
             } => {
                 nixe_gpu::trace::event(
                     "mme_upload",
@@ -1061,7 +1060,7 @@ impl MaxwellThreeDMmeState {
                 );
                 Arc::make_mut(&mut self.instructions).insert(
                     address.raw(),
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source),
+                    MaxwellThreeDRegister::decoded(value.raw(), value),
                 );
                 self.next_instruction_address = Some(MaxwellThreeDMmeRamAddress::new(
                     address
@@ -1070,15 +1069,14 @@ impl MaxwellThreeDMmeState {
                         .expect("MME address was preflighted"),
                 ));
             }
-            MaxwellThreeDMmeStateWrite::StartAddressPointer { value, source } => {
-                self.start_address_pointer =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDMmeStateWrite::StartAddressPointer { value, source: _ } => {
+                self.start_address_pointer = MaxwellThreeDRegister::decoded(value.raw(), value);
                 self.next_start_address_index = Some(value);
             }
             MaxwellThreeDMmeStateWrite::StartAddress {
                 index,
                 address,
-                source,
+                source: _,
             } => {
                 nixe_gpu::trace::event(
                     "mme_start",
@@ -1100,7 +1098,7 @@ impl MaxwellThreeDMmeState {
                 }
                 Arc::make_mut(&mut self.start_addresses).insert(
                     index.raw(),
-                    MaxwellThreeDRegister::programmed(address.raw(), address, source),
+                    MaxwellThreeDRegister::decoded(address.raw(), address),
                 );
                 self.next_start_address_index = Some(MaxwellThreeDMmeRamAddress::new(
                     index
@@ -1109,23 +1107,19 @@ impl MaxwellThreeDMmeState {
                         .expect("MME index was preflighted"),
                 ));
             }
-            MaxwellThreeDMmeStateWrite::ShadowRamControl { value, source } => {
-                self.shadow_ram_control =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDMmeStateWrite::ShadowRamControl { value, source: _ } => {
+                self.shadow_ram_control = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDMmeStateWrite::MutableMethodControl { value, source } => {
-                self.mutable_method_control =
-                    MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDMmeStateWrite::MutableMethodControl { value, source: _ } => {
+                self.mutable_method_control = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
             MaxwellThreeDMmeStateWrite::ShadowScratch {
                 index,
                 value,
-                source,
+                source: _,
             } => {
-                self.shadow_scratch.insert(
-                    index.raw(),
-                    MaxwellThreeDRegister::programmed(value, value, source),
-                );
+                self.shadow_scratch
+                    .insert(index.raw(), MaxwellThreeDRegister::decoded(value, value));
             }
         }
     }

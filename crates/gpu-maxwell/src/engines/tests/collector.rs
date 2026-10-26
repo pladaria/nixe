@@ -28,6 +28,7 @@ pub enum MaxwellEngineOperation {
     },
     ThreeDInlineConstantBuffer(MaxwellThreeDInlineConstantBufferUpload),
     ThreeD(Box<MaxwellThreeDTriggeredOperation>),
+    ThreeDRenderCondition(MaxwellMethodSource),
     ThreeDSynchronization(Box<MaxwellThreeDSynchronizationOperation>),
 }
 
@@ -113,6 +114,9 @@ pub fn dispatch_maxwell_engine_packet(
                     trigger,
                     state: Arc::new(event.three_d.clone()),
                 }))
+            }
+            PendingEngineOperation::ThreeDRenderCondition(source) => {
+                MaxwellEngineOperation::ThreeDRenderCondition(source)
             }
             PendingEngineOperation::ThreeDSynchronization(trigger) => {
                 MaxwellEngineOperation::ThreeDSynchronization(Box::new(

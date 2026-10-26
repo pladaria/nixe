@@ -399,11 +399,6 @@ impl Thread {
                         source,
                         request: SchedulerRequest::WaitForInterrupt,
                     },
-                    4 if events.consume_event() => continue,
-                    4 => CpuExit::Scheduled {
-                        source,
-                        request: SchedulerRequest::WaitForEvent,
-                    },
                     5 => CpuExit::Scheduled {
                         source,
                         request: SchedulerRequest::SendEvent,

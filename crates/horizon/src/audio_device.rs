@@ -11,24 +11,21 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
 };
 
-pub(crate) const DEVICE_NAMES: [&str; 4] = [
+pub(crate) const DEVICE_NAMES: [&str; 5] = [
     "AudioStereoJackOutput",
     "AudioBuiltInSpeakerOutput",
     "AudioTvOutput",
     "AudioUsbDeviceOutput",
-];
-pub(crate) const OUTPUT_NAMES: [&str; 3] = [
-    "AudioBuiltInSpeakerOutput",
-    "AudioTvOutput",
     "AudioExternalOutput",
 ];
+pub(crate) const OUTPUT_NAMES: [&str; 3] = [DEVICE_NAMES[1], DEVICE_NAMES[2], DEVICE_NAMES[4]];
 pub(crate) const ACTIVE_DEVICE: usize = 2;
 
 #[derive(Debug)]
 pub(crate) struct AudioDeviceState {
     // Device gains are shared across manager/device connections, renderers and
     // AudioOut, including streams created after the volume was set.
-    volumes: [AtomicU32; 4],
+    volumes: [AtomicU32; DEVICE_NAMES.len()],
 }
 
 impl Default for AudioDeviceState {
@@ -88,6 +85,19 @@ impl AudioDeviceSession {
         // AudioUsbDeviceOutput is introduced by renderer REV4.
         // https://github.com/eden-emulator/mirror/blob/master/src/audio_core/common/feature_support.h
         &DEVICE_NAMES[..if self.revision >= 4 { 4 } else { 3 }]
+    }
+    pub(crate) fn volume_device(&self, name: &[u8]) -> Option<usize> {
+        // Device API v2 adds logical output names. External output is a
+        // volume route, while the legacy port list still has jack and USB.
+        // https://switchbrew.org/wiki/Audio_services#IAudioDevice
+        let count = if self.revision >= 10 {
+            DEVICE_NAMES.len()
+        } else {
+            self.names().len()
+        };
+        DEVICE_NAMES[..count]
+            .iter()
+            .position(|device| device.as_bytes() == name)
     }
     pub(crate) fn channels(&self) -> Result<u32, AudioError> {
         Ok(self.backend.output_layout()?.channels() as u32)

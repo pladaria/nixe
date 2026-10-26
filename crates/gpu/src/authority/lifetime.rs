@@ -71,6 +71,13 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             ));
         }
         let entry = self.resources.remove(&source).unwrap();
+        for alias in &entry.aliases {
+            self.resources
+                .get_mut(alias)
+                .unwrap()
+                .aliases
+                .retain(|&id| id != source);
+        }
         for key in entry.registrations {
             self.index.remove(key);
         }
@@ -88,6 +95,7 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             writer.tick = tick;
         }
         let target = self.resources.get_mut(&destination).unwrap();
+        target.modification = target.modification.max(entry.modification);
         target.writers.extend(entry.writers);
         target.live_writers += entry.live_writers;
         target.normalize_at = target.live_writers.saturating_mul(2).max(64);

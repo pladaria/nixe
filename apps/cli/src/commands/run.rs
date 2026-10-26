@@ -257,6 +257,9 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
                 UserAccountSwitchLock::Unknown(_) => None,
             }
         }),
+        application_display_version: plan
+            .control_metadata()
+            .map(|control| control.nacp.display_version.clone()),
         save_data: plan.packaged_identity().zip(plan.control_metadata()).map(
             |(identity, control)| {
                 SaveDataSystem::new(
@@ -294,7 +297,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         }
     };
     frontend = frontend.map(|frontend| frontend.with_window_state(saved_window_state));
-    let video_system = {
+    let (video_system, gpu_caches) = {
         let options = vulkan;
         let (device, native_presentation) = if let Some(frontend) = frontend.as_mut() {
             let (device, client) = frontend
@@ -333,12 +336,18 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         let maxwell = nixe_gpu_maxwell::MaxwellNativeFrontend::new(
             renderer.device_profile().shader_compiler.clone(),
         );
-        VideoSystem::with_gpu_frontend(
+        let gpu_caches = renderer.cache_monitor();
+        let video = VideoSystem::with_gpu_frontend(
             process.memory().space().machine().clone(),
             presenter,
             renderer,
             maxwell,
-        )
+        );
+        (video, gpu_caches)
+    };
+    let diagnostics = ExecutionDiagnostics {
+        trace_interpreter,
+        gpu_caches,
     };
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
     // SDL initialization and final subsystem shutdown remain on the main thread.
@@ -370,7 +379,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
             video_system,
             host_input,
             audio_backend,
-            trace_interpreter,
+            diagnostics,
         ));
     };
     let frontend =
@@ -389,7 +398,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
                 video_system,
                 host_input,
                 audio_backend,
-                trace_interpreter,
+                diagnostics,
             )
         })
         .map_err(|error| format!("cannot start guest execution worker: {error}"))?;
@@ -598,6 +607,7 @@ struct HorizonEnvironment {
     shared_fonts: nixe_horizon::SharedFontSession,
     system_archives: nixe_horizon::SystemArchives,
     application_language: Option<SystemLanguage>,
+    application_display_version: Option<String>,
     user_account_switch_locked: Option<bool>,
     save_data: Option<SaveDataSystem>,
     diagnostics: HorizonDiagnostics,
@@ -610,6 +620,11 @@ struct HostInputReaders {
     vibration: nixe_input::VibrationOutput,
 }
 
+struct ExecutionDiagnostics {
+    trace_interpreter: bool,
+    gpu_caches: nixe_gpu_vulkan::cache::CacheMonitor,
+}
+
 fn execute_worker(
     mut coordinator: RuntimeCoordinator,
     process: RunnableProcess,
@@ -617,7 +632,7 @@ fn execute_worker(
     video_system: VideoSystem,
     mut host_input: HostInputReaders,
     audio_backend: Arc<nixe_audio::HostAudioBackend>,
-    trace_interpreter: bool,
+    mut diagnostics: ExecutionDiagnostics,
 ) -> WorkerResult {
     let registration = ProcessRegistration {
         priority: process.initial_thread_priority(),
@@ -639,7 +654,7 @@ fn execute_worker(
         execution_video,
         &mut host_input,
         audio_backend,
-        trace_interpreter,
+        &mut diagnostics,
     );
     log::debug!(
         "guest execution stopped after {:?}",
@@ -746,8 +761,9 @@ fn execute(
     video_system: VideoSystem,
     host_input: &mut HostInputReaders,
     audio_backend: Arc<nixe_audio::HostAudioBackend>,
-    trace_interpreter: bool,
+    diagnostics: &mut ExecutionDiagnostics,
 ) -> Result<ExecutionSummary, String> {
+    let trace_interpreter = diagnostics.trace_interpreter;
     let coordinator = &mut *scheduled.coordinator;
     let process_id = scheduled.process_id;
     let mut dispatcher = HorizonSvcDispatcher::new_with_video_and_settings(
@@ -777,6 +793,9 @@ fn execute(
     }
     if let Some(language) = horizon_environment.application_language {
         dispatcher = dispatcher.with_application_language(language);
+    }
+    if let Some(version) = horizon_environment.application_display_version {
+        dispatcher = dispatcher.with_application_display_version(&version);
     }
     let execution_started = coordinator.emulation_elapsed();
     let execution_rate_enabled = log::log_enabled!(log::Level::Info);
@@ -927,6 +946,21 @@ fn execute(
                         log::info!(
                             "guest CPU completion rate: completions_per_second={completions_per_second:.0}, completions={execution_completions}, elapsed={elapsed:?}"
                         );
+                        log::info!("{}", diagnostics.gpu_caches.sample());
+                        if log::log_enabled!(log::Level::Trace)
+                            && let Some(process) = coordinator.process(process_id)
+                        {
+                            for (thread, _) in process.threads().iter() {
+                                if let Ok(cpu) = coordinator.thread_cpu_state(thread.get()) {
+                                    log::trace!(
+                                        "guest thread snapshot: id={} scheduler={:?} registers=[{}]",
+                                        thread.get(),
+                                        coordinator.thread_scheduling_info(thread.get()),
+                                        cpu.register_context(),
+                                    );
+                                }
+                            }
+                        }
                         last_rate_completions = execution_completions;
                         last_rate_elapsed = elapsed;
                     }

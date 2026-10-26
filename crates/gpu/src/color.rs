@@ -13,6 +13,10 @@ pub enum BlendFactor {
     DestinationColor,
     OneMinusDestinationColor,
     SourceAlphaSaturated,
+    ConstantColor,
+    OneMinusConstantColor,
+    ConstantAlpha,
+    OneMinusConstantAlpha,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

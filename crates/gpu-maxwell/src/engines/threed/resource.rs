@@ -6,6 +6,8 @@
 
 #[cfg(test)]
 mod benchmark;
+mod compute;
+pub(crate) use compute::ComputeTextures;
 
 use std::{
     cell::Cell,
@@ -61,6 +63,10 @@ const MAXWELL_C128_2CR_KIND: u8 = 0xf5;
 // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/image_formats.cpp#L35-L73
 const MAXWELL_S8Z24_2CZ_KIND: u8 = 0x17;
 const MAXWELL_Z24S8_2CZ_KIND: u8 = 0x51;
+// Single-sample Z16 depth compression. Render-target descriptors still define
+// its block-linear geometry; native depth clears/draws materialize the pixels.
+// https://github.com/NVIDIA/open-gpu-doc/blob/master/manuals/volta/gv100/dev_mmu.ref.txt
+const MAXWELL_Z16_2Z_KIND: u8 = 0x07;
 // Four-sample kinds selected by deko3d. Their bytes are never imported as
 // single-sample texels, even when compression of subsequent writes is off.
 // https://github.com/devkitPro/deko3d/blob/master/source/maxwell/image_formats.cpp
@@ -101,8 +107,10 @@ pub enum MaxwellThreeDResourceRole {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum MaxwellThreeDTextureDimension {
     Two,
+    Three,
     TwoArray,
     Cube,
+    CubeArray,
 }
 
 /// Draw-local location of a raw Maxwell TIC/TSC handle.
@@ -324,6 +332,7 @@ impl MaxwellThreeDPreservedImageLayout {
                     | MAXWELL_C128_2CR_KIND
                     | MAXWELL_S8Z24_2CZ_KIND
                     | MAXWELL_Z24S8_2CZ_KIND
+                    | MAXWELL_Z16_2Z_KIND
                     | MAXWELL_C32_MS4_2CBR_KIND
                     | MAXWELL_S8Z24_MS4_2CZ_KIND
                     | MAXWELL_Z24S8_MS4_2CZ_KIND
@@ -535,6 +544,11 @@ fn resolve_binding(
         });
     let mut builder = ResourceBuilder::new(address_space, sample_mode, retained_backings, access);
     let bindings = state.shader_bindings();
+    let texture_cbuf = |texture: MaxwellThreeDTextureReference, slot: u8| {
+        bindings.groups()[usize::from(texture.group)].constant_buffers()[usize::from(slot)]
+            .filter(|b| b.enabled())
+            .and_then(|b| Some((b.address()?.get(), u64::from(b.size()?))))
+    };
     match role {
         R::VertexStream(slot) => {
             let stream = &state.vertex_input().streams()[slot as usize];
@@ -623,25 +637,38 @@ fn resolve_binding(
                 storage_alignment,
             )?;
         }
-        R::TextureHeaders => builder.descriptor_pool(
-            role,
-            bindings.texture_headers(),
-            bindings.texture_headers().maximum_index().value().copied(),
-        )?,
-        R::Samplers => builder.sampler_pool(bindings)?,
         R::SampledImage { texture, dimension } => {
-            builder.texture_buffers(bindings, texture)?;
+            let handle = builder.texture_handle(
+                texture,
+                texture_cbuf(texture, texture.constant_buffer_slot),
+                texture
+                    .secondary
+                    .and_then(|(slot, _, _)| texture_cbuf(texture, slot)),
+            )?;
             builder.descriptor_pool(
                 R::TextureHeaders,
-                bindings.texture_headers(),
+                bindings.texture_headers().address().map(|a| a.get()),
                 bindings.texture_headers().maximum_index().value().copied(),
             )?;
-            builder.sampled_texture(bindings, texture, dimension, sampled)?;
+            builder.sampled_texture(
+                bindings.maxwell_texture_headers().value().copied(),
+                bindings.sampler_binding().value().copied(),
+                texture,
+                handle,
+                dimension,
+                sampled,
+            )?;
         }
         R::Sampler(texture) => {
-            builder.texture_buffers(bindings, texture)?;
+            let handle = builder.texture_handle(
+                texture,
+                texture_cbuf(texture, texture.constant_buffer_slot),
+                texture
+                    .secondary
+                    .and_then(|(slot, _, _)| texture_cbuf(texture, slot)),
+            )?;
             builder.sampler_pool(bindings)?;
-            builder.sampler(bindings, texture)?;
+            builder.sampler(bindings.sampler_binding().value().copied(), texture, handle)?;
         }
         R::ColorTarget(slot) => {
             let target = &state.render_targets().color()[slot as usize];
@@ -653,19 +680,15 @@ fn resolve_binding(
             }
         }
         R::DepthStencilTarget => builder.depth_target(state.render_targets().depth_stencil())?,
-        R::BlitSource | R::BlitDestination => {
+        R::TextureHeaders | R::Samplers | R::BlitSource | R::BlitDestination => {
             return Err(MaxwellThreeDResourceError::IncompleteState { role });
         }
     }
-    let mut resource = None;
-    let mut dependencies = Vec::new();
-    for resolved in builder.resources {
-        if resolved.role() == role {
-            resource = Some(Arc::new(resolved));
-        } else {
-            dependencies.push(resolved.source().clone());
-        }
-    }
+    let resource = builder
+        .resources
+        .into_iter()
+        .find(|resolved| resolved.role() == role)
+        .map(Arc::new);
     Ok(RetainedBinding {
         address_space: address_space.id(),
         state: state.resource_state_identity(role),
@@ -676,7 +699,6 @@ fn resolve_binding(
             .samplers
             .into_iter()
             .find(|sampler| sampler.role() == role),
-        dependencies: dependencies.into_boxed_slice(),
         descriptor_reads: builder.descriptor_reads.into_boxed_slice(),
         mapping_generation: address_space.mapping_generation().get(),
     })
@@ -690,6 +712,7 @@ struct ResourceBuilder<'a, 'm> {
     resources: Vec<MaxwellThreeDResolvedResource>,
     samplers: Vec<MaxwellThreeDResolvedSampler>,
     descriptor_reads: Vec<MaxwellThreeDDescriptorRead>,
+    compute: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -845,7 +868,6 @@ struct RetainedBinding {
     sampled: bool,
     resource: Option<Arc<MaxwellThreeDResolvedResource>>,
     sampler: Option<MaxwellThreeDResolvedSampler>,
-    dependencies: Box<[MaxwellResolvedRange]>,
     descriptor_reads: Box<[MaxwellThreeDDescriptorRead]>,
     mapping_generation: u64,
 }
@@ -1449,7 +1471,6 @@ impl MaxwellThreeDResolvedResourceCache {
                 .resource
                 .iter()
                 .map(|resource| resource.source())
-                .chain(entry.dependencies.iter())
                 .any(|source| {
                     source.segments().iter().any(|segment| {
                         !address_space.retained_mapping_is_current(segment.mapping())
@@ -1561,6 +1582,7 @@ pub(crate) struct MaxwellThreeDRetainedBackingCache {
     view_clock: usize,
     samplers: nixe_gpu::WorkingSet<[u8; 32], MaxwellThreeDResolvedSampler>,
     descriptor_tables: [DescriptorTable; 2],
+    compute_descriptor_tables: [DescriptorTable; 2],
 }
 
 impl Default for MaxwellThreeDRetainedBackingCache {
@@ -1573,6 +1595,7 @@ impl Default for MaxwellThreeDRetainedBackingCache {
             view_clock: 0,
             samplers: nixe_gpu::WorkingSet::new(4096, 1024 * 1024),
             descriptor_tables: Default::default(),
+            compute_descriptor_tables: Default::default(),
         }
     }
 }
@@ -1806,6 +1829,7 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
             resources: Vec::new(),
             samplers: Vec::new(),
             descriptor_reads: Vec::new(),
+            compute: false,
         }
     }
 
@@ -1813,13 +1837,18 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
     /// layers align the complete chain rather than every level to the base block.
     /// https://github.com/eden-emulator/mirror/blob/master/src/video_core/texture_cache/util.cpp
     fn sampled_mip_layouts(
-        width: u32,
-        height: u32,
+        extent: ImageExtent,
         format: ImageFormat,
         levels: u8,
-        block_height_log2: u8,
+        block: [u8; 2],
         role: MaxwellThreeDResourceRole,
     ) -> Result<SampledMipChain, MaxwellThreeDResourceError> {
+        let ImageExtent {
+            width,
+            height,
+            depth,
+        } = extent;
+        let [block_height_log2, block_depth_log2] = block;
         let [bw, bh] = format.block_extent();
         let bytes = u64::from(format.plane_bytes_per_block(0).unwrap());
         let mut layouts = Vec::with_capacity(usize::from(levels));
@@ -1827,21 +1856,30 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         for level in 0..levels {
             let columns = (width >> level).max(1).div_ceil(bw);
             let rows = (height >> level).max(1).div_ceil(bh);
+            let slices = (depth >> level).max(1);
+            let mut gob_depth = block_depth_log2;
             let mut gob_height = block_height_log2;
             if levels > 1 {
                 while gob_height > 0 && u64::from(rows) <= (8_u64 << (gob_height - 1)) {
                     gob_height -= 1;
                 }
             }
+            if levels > 1 {
+                while gob_depth > 0 && u64::from(slices) <= (1u64 << (gob_depth - 1)) {
+                    gob_depth -= 1;
+                }
+            }
+            let padded_slices = align_up(u64::from(slices), 1u64 << gob_depth, role)?;
             let size = align_up(u64::from(columns) * bytes, 64, role)?
                 .checked_mul(align_up(u64::from(rows), 8_u64 << gob_height, role)?)
+                .and_then(|size| size.checked_mul(padded_slices))
                 .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
             layouts.push((
                 offset,
                 ImageMemoryLayout::BlockLinear(BlockLinearLayout {
                     block_width_log2: 0,
                     block_height_log2: gob_height,
-                    block_depth_log2: 0,
+                    block_depth_log2: gob_depth,
                     layer_stride: size,
                 }),
             ));
@@ -1855,7 +1893,11 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         while gob_height > 0 && aligned_height <= (8_u64 << (gob_height - 1)) {
             gob_height -= 1;
         }
-        let stride = align_up(offset, 512_u64 << gob_height, role)?;
+        let mut gob_depth = block_depth_log2;
+        while gob_depth > 0 && u64::from(depth) <= (1u64 << (gob_depth - 1)) {
+            gob_depth -= 1;
+        }
+        let stride = align_up(offset, 512_u64 << (gob_height + gob_depth), role)?;
         Ok(SampledMipChain {
             layouts,
             layer_stride: stride,
@@ -2022,26 +2064,6 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         );
         self.buffer(role, address, end.map_or(size, |end| size.min(end)))
     }
-    fn texture_buffers(
-        &mut self,
-        bindings: &super::MaxwellThreeDShaderBindingState,
-        texture: MaxwellThreeDTextureReference,
-    ) -> Result<(), MaxwellThreeDResourceError> {
-        let mut end = u64::from(texture.byte_offset) + 4;
-        if let Some((slot, offset, _)) = texture.secondary {
-            if slot == texture.constant_buffer_slot {
-                end = end.max(u64::from(offset) + 4);
-            } else {
-                self.constant_buffer(bindings, texture.group, slot, Some(u64::from(offset) + 4))?;
-            }
-        }
-        self.constant_buffer(
-            bindings,
-            texture.group,
-            texture.constant_buffer_slot,
-            Some(end),
-        )
-    }
     fn sampler_pool(
         &mut self,
         bindings: &super::MaxwellThreeDShaderBindingState,
@@ -2055,7 +2077,7 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         };
         self.descriptor_pool(
             MaxwellThreeDResourceRole::Samplers,
-            bindings.samplers(),
+            bindings.samplers().address().map(|a| a.get()),
             maximum.copied(),
         )
     }
@@ -2063,24 +2085,33 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
     fn descriptor_pool(
         &mut self,
         role: MaxwellThreeDResourceRole,
-        pool: &super::MaxwellThreeDDescriptorPoolState,
+        address: Option<u64>,
         maximum_index: Option<u32>,
     ) -> Result<(), MaxwellThreeDResourceError> {
-        let programmed = pool.address_upper().raw().is_some()
-            || pool.address_lower().raw().is_some()
-            || maximum_index.is_some();
+        let programmed = address.is_some() || maximum_index.is_some();
         if !programmed {
             return Ok(());
         }
-        let address = pool
-            .address()
-            .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
+        let address = address.ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
         let maximum = maximum_index.ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-        let size = u64::from(maximum)
-            .checked_add(1)
-            .and_then(|count| count.checked_mul(MAXWELL_DESCRIPTOR_SIZE))
-            .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
-        self.buffer(role, address, size)
+        let base = self
+            .address_space
+            .address(address)
+            .map_err(|_| MaxwellThreeDResourceError::AddressOutOfRange { role, address })?;
+        let kind = match role {
+            MaxwellThreeDResourceRole::TextureHeaders => DescriptorTableKind::Image,
+            MaxwellThreeDResourceRole::Samplers => DescriptorTableKind::Sampler,
+            _ => unreachable!("only TIC and TSC pools contain table descriptors"),
+        };
+        let tables = if self.compute {
+            &mut self.retained_backings.compute_descriptor_tables
+        } else {
+            &mut self.retained_backings.descriptor_tables
+        };
+        // Synchronize table state; only consumed descriptors require mapped RAM.
+        // https://github.com/eden-emulator/mirror/blob/master/src/video_core/texture_cache/descriptor_table.h
+        tables[kind as usize].synchronize(base, maximum);
+        Ok(())
     }
 
     fn descriptor_bytes(
@@ -2088,35 +2119,17 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         role: MaxwellThreeDResourceRole,
         index: u32,
     ) -> Result<[u8; 32], MaxwellThreeDResourceError> {
-        let buffer = self
-            .resources
-            .iter()
-            .find_map(|resource| match resource {
-                MaxwellThreeDResolvedResource::Buffer(buffer) if buffer.role() == role => {
-                    Some(buffer)
-                }
-                _ => None,
-            })
-            .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-        let offset = u64::from(index)
-            .checked_mul(MAXWELL_DESCRIPTOR_SIZE)
-            .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
-        if offset
-            .checked_add(MAXWELL_DESCRIPTOR_SIZE)
-            .is_none_or(|end| end > buffer.description().size())
-        {
-            return Err(MaxwellThreeDResourceError::DescriptorIndexOutOfRange { role, index });
-        }
         let kind = match role {
             MaxwellThreeDResourceRole::TextureHeaders => DescriptorTableKind::Image,
             MaxwellThreeDResourceRole::Samplers => DescriptorTableKind::Sampler,
             _ => unreachable!("only TIC and TSC pools contain table descriptors"),
         };
-        let table = &mut self.retained_backings.descriptor_tables[kind as usize];
-        let limit = u32::try_from(buffer.description().size() / MAXWELL_DESCRIPTOR_SIZE - 1)
-            .map_err(|_| MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
-        table.synchronize(buffer.source().offset(), limit);
-        let (bytes, version) = table.read(
+        let tables = if self.compute {
+            &mut self.retained_backings.compute_descriptor_tables
+        } else {
+            &mut self.retained_backings.descriptor_tables
+        };
+        let (bytes, version) = tables[kind as usize].read(
             role,
             index,
             self.address_space,
@@ -2135,18 +2148,19 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
 
     fn sampled_texture(
         &mut self,
-        bindings: &super::MaxwellThreeDShaderBindingState,
+        maxwell_headers: Option<bool>,
+        sampler_mode: Option<MaxwellThreeDSamplerBindingMode>,
         texture_reference: MaxwellThreeDTextureReference,
+        raw_handle: u32,
         dimension: MaxwellThreeDTextureDimension,
         needs_sampler: bool,
     ) -> Result<(), MaxwellThreeDResourceError> {
-        let raw_handle = self.texture_handle(texture_reference)?;
         // An unprogrammed selector retains the Maxwell class reset mode. Only
         // an explicit false selects the legacy texture-header interpretation;
         // the TIC decoder below independently requires a Maxwell v3 header.
         // The public class definition confirms this is a one-bit selector:
         // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1210-L1213
-        if !uses_maxwell_texture_headers(bindings.maxwell_texture_headers().value()) {
+        if !uses_maxwell_texture_headers(maxwell_headers.as_ref()) {
             return Err(MaxwellThreeDResourceError::UnsupportedTextureBindingMode {
                 descriptor: raw_handle,
             });
@@ -2160,8 +2174,8 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
             // Texel fetch consumes only the TIC portion, never TSC selection/state.
             raw_handle & 0x000f_ffff
         } else {
-            match bindings.sampler_binding().value() {
-                Some(mode) => texture_descriptor_pair(*mode, raw_handle).0,
+            match sampler_mode {
+                Some(mode) => texture_descriptor_pair(mode, raw_handle).0,
                 None => {
                     return Err(MaxwellThreeDResourceError::IncompleteState {
                         role: MaxwellThreeDResourceRole::Sampler(texture_reference),
@@ -2175,16 +2189,14 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
     }
     fn sampler(
         &mut self,
-        bindings: &super::MaxwellThreeDShaderBindingState,
+        sampler_mode: Option<MaxwellThreeDSamplerBindingMode>,
         texture_reference: MaxwellThreeDTextureReference,
+        raw: u32,
     ) -> Result<(), MaxwellThreeDResourceError> {
-        let raw = self.texture_handle(texture_reference)?;
-        let mode = bindings.sampler_binding().value().ok_or(
-            MaxwellThreeDResourceError::IncompleteState {
-                role: MaxwellThreeDResourceRole::Sampler(texture_reference),
-            },
-        )?;
-        let (_, sampler_index) = texture_descriptor_pair(*mode, raw);
+        let mode = sampler_mode.ok_or(MaxwellThreeDResourceError::IncompleteState {
+            role: MaxwellThreeDResourceRole::Sampler(texture_reference),
+        })?;
+        let (_, sampler_index) = texture_descriptor_pair(mode, raw);
         let tsc = self.descriptor_bytes(MaxwellThreeDResourceRole::Samplers, sampler_index)?;
         let mut sampler = if let Some(sampler) = self.retained_backings.samplers.get(&tsc) {
             *sampler
@@ -2205,14 +2217,17 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
     fn texture_handle(
         &mut self,
         texture_reference: MaxwellThreeDTextureReference,
+        primary: Option<(u64, u64)>,
+        secondary: Option<(u64, u64)>,
     ) -> Result<u32, MaxwellThreeDResourceError> {
         let primary = self.texture_handle_word(
             texture_reference,
             texture_reference.constant_buffer_slot,
             texture_reference.byte_offset,
+            primary,
         )? << texture_reference.shift_left;
         let secondary = if let Some((slot, offset, shift)) = texture_reference.secondary {
-            self.texture_handle_word(texture_reference, slot, offset)? << shift
+            self.texture_handle_word(texture_reference, slot, offset, secondary)? << shift
         } else {
             0
         };
@@ -2224,35 +2239,29 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         texture_reference: MaxwellThreeDTextureReference,
         slot: u8,
         byte_offset: u32,
+        binding: Option<(u64, u64)>,
     ) -> Result<u32, MaxwellThreeDResourceError> {
         let role = MaxwellThreeDResourceRole::ConstantBuffer {
             group: texture_reference.group,
             slot,
         };
-        let buffer = self
-            .resources
-            .iter()
-            .find_map(|resource| match resource {
-                MaxwellThreeDResolvedResource::Buffer(buffer) if buffer.role() == role => {
-                    Some(buffer)
-                }
-                _ => None,
-            })
-            .ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
-        let end = u64::from(byte_offset)
-            .checked_add(4)
-            .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
-        if end > buffer.description().size() {
+        let (base, size) = binding.ok_or(MaxwellThreeDResourceError::IncompleteState { role })?;
+        if u64::from(byte_offset) + 4 > size {
             return Err(MaxwellThreeDResourceError::TextureHandleOutOfRange {
                 texture_reference,
-                constant_buffer_size: buffer.description().size(),
+                constant_buffer_size: size,
             });
         }
-        let address = self
-            .address_space
-            .checked_add(buffer.source().offset(), u64::from(byte_offset))
-            .map_err(|_| MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
-        let bytes = self.descriptor_read(role, address, 4, None)?;
+        let address = base
+            .checked_add(u64::from(byte_offset))
+            .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
+        let source = self.resolve(
+            MaxwellThreeDUnresolvedAddress::new((address >> 32) as u8, address as u32),
+            4,
+            MemoryPermissions::READ,
+            role,
+        )?;
+        let bytes = self.descriptor_read(role, source.offset(), 4, Some(source))?;
         Ok(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
     }
 
@@ -2296,34 +2305,30 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
             field: "format/component/swizzle",
             value: format_word,
         })?;
-        let sample_swizzle = if matches!(
-            format,
-            ImageFormat::R8Unorm
-                | ImageFormat::Bc4RUnorm
-                | ImageFormat::Bc4RSnorm
-                | ImageFormat::Rg8Unorm
-                | ImageFormat::Bc5RgUnorm
-                | ImageFormat::Bc5RgSnorm
-                | ImageFormat::Bc3RgbaUnorm
-                | ImageFormat::Bc3RgbaSrgb
-                | ImageFormat::Bc7RgbaUnorm
-                | ImageFormat::Bc7RgbaSrgb
-        ) && !(format == ImageFormat::R8Unorm && swizzle == [2, 0, 0, 7])
-            || format.astc_profile().is_some()
-        {
-            Swizzle(swizzle.map(|component| match component {
-                0 => ComponentSwizzle::Zero,
-                2 => ComponentSwizzle::Red,
-                3 => ComponentSwizzle::Green,
-                4 => ComponentSwizzle::Blue,
-                5 => ComponentSwizzle::Alpha,
-                7 => ComponentSwizzle::One,
-                _ => unreachable!("validated TIC component mapping"),
-            }))
-        } else {
-            // Existing format tuples include their native component mapping.
-            Swizzle::IDENTITY
-        };
+        let sample_swizzle =
+            if !matches!(
+                format,
+                ImageFormat::Bgra8Unorm
+                    | ImageFormat::Bgra8Srgb
+                    | ImageFormat::Rgb565Unorm
+                    | ImageFormat::Depth24UnormStencil8Uint
+                    | ImageFormat::Depth32Float
+            ) && !(matches!(format, ImageFormat::R8Unorm | ImageFormat::Depth16Unorm)
+                && swizzle == [2, 0, 0, 7])
+            {
+                Swizzle(swizzle.map(|component| match component {
+                    0 => ComponentSwizzle::Zero,
+                    2 => ComponentSwizzle::Red,
+                    3 => ComponentSwizzle::Green,
+                    4 => ComponentSwizzle::Blue,
+                    5 => ComponentSwizzle::Alpha,
+                    7 => ComponentSwizzle::One,
+                    _ => unreachable!("validated TIC component mapping"),
+                }))
+            } else {
+                // Existing format tuples include their native component mapping.
+                Swizzle::IDENTITY
+            };
         let header_version = ((words[2] >> 21) & 7) as u8;
         let texture_type = ((words[4] >> 23) & 0xf) as u8;
         let width = (words[4] & 0xffff) + 1;
@@ -2343,9 +2348,20 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
             | (((words[2] >> 29) & 7) << 8);
         let (required_texture_type, layers) = match required_dimension {
             MaxwellThreeDTextureDimension::Two => (1, 1_u16),
+            MaxwellThreeDTextureDimension::Three => (2, 1),
             // A single TIC cubemap has depth one and six independent faces.
             // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/texture_cache/image_info.cpp
             MaxwellThreeDTextureDimension::Cube => (3, 6),
+            MaxwellThreeDTextureDimension::CubeArray => (
+                8,
+                u16::try_from(depth * 6).map_err(|_| {
+                    MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
+                        descriptor: descriptor_index,
+                        field: "cube-array face count",
+                        value: depth,
+                    }
+                })?,
+            ),
             MaxwellThreeDTextureDimension::TwoArray => (
                 5,
                 u16::try_from(depth).map_err(|_| {
@@ -2358,8 +2374,18 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
             ),
         };
         let pitch_linear = header_version == 2;
+        let cube = matches!(
+            required_dimension,
+            MaxwellThreeDTextureDimension::Cube | MaxwellThreeDTextureDimension::CubeArray
+        );
         let texture_type_matches = texture_type == required_texture_type
-            || (texture_type == 7 && required_dimension != MaxwellThreeDTextureDimension::Cube)
+            || (texture_type == 7
+                && matches!(
+                    required_dimension,
+                    MaxwellThreeDTextureDimension::Two | MaxwellThreeDTextureDimension::TwoArray
+                ))
+            || (required_dimension == MaxwellThreeDTextureDimension::CubeArray
+                && texture_type == 3)
             || (required_dimension == MaxwellThreeDTextureDimension::TwoArray && texture_type == 1);
         // TEX's array coordinate does not require multiple storage layers. A
         // non-array TIC can be sampled through a one-layer array view, retaining
@@ -2368,12 +2394,12 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         // https://github.com/eden-emulator/mirror/blob/master/src/shader_recompiler/ir_opt/texture_pass.cpp
         if !matches!(header_version, 2 | 3)
             || !texture_type_matches
-            || (required_dimension == MaxwellThreeDTextureDimension::Cube
-                && (pitch_linear || width != height || depth != 1))
+            || (cube && (pitch_linear || width != height))
             || (pitch_linear && depth != 1)
-            || (texture_type != 5 && depth != 1)
+            || (!matches!(texture_type, 2 | 5 | 8) && depth != 1)
             || (required_dimension == MaxwellThreeDTextureDimension::Two && depth != 1)
-            || (!pitch_linear && (block_width_log2 != 0 || block_depth_log2 != 0))
+            || (!pitch_linear
+                && (block_width_log2 != 0 || block_depth_log2 > 5 || block_height_log2 > 5))
             || (pitch_linear && mip_max != 0)
             || view_mip_min != 0
             || view_mip_max != mip_max
@@ -2387,7 +2413,7 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
             );
             return Err(MaxwellThreeDResourceError::UnsupportedTextureDescriptor {
                 descriptor: descriptor_index,
-                field: "2D/2D-array/cube shape",
+                field: "sampled texture shape",
                 value: words[2] ^ words[3] ^ words[4] ^ words[5] ^ words[7],
             });
         }
@@ -2401,15 +2427,21 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
             });
         }
         let description = ImageDescription::new(
-            if required_dimension == MaxwellThreeDTextureDimension::Cube {
+            if cube {
                 ImageDimension::Cube
+            } else if required_dimension == MaxwellThreeDTextureDimension::Three {
+                ImageDimension::Three
             } else {
                 ImageDimension::Two
             },
             ImageExtent {
                 width,
                 height,
-                depth: 1,
+                depth: if required_dimension == MaxwellThreeDTextureDimension::Three {
+                    depth
+                } else {
+                    1
+                },
             },
             format,
             if format.is_depth_stencil() {
@@ -2458,7 +2490,13 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
                 layer_size: layer_stride,
             }
         } else {
-            Self::sampled_mip_layouts(width, height, format, mip_max + 1, block_height_log2, role)?
+            Self::sampled_mip_layouts(
+                description.extent(),
+                format,
+                mip_max + 1,
+                [block_height_log2, block_depth_log2],
+                role,
+            )?
         };
         let layout = match mip_layouts[0].1 {
             ImageMemoryLayout::BlockLinear(mut blocks) => {
@@ -2486,12 +2524,12 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         // but refer to the same compressed allocation. Only texel formats
         // (not BC blocks) may use these color-compression families. Lowering
         // must supply an existing resident image; these bytes cannot be uploaded.
-        let compressed_kind = if format == ImageFormat::Depth24UnormStencil8Uint {
-            Some(MAXWELL_Z24S8_2CZ_KIND)
-        } else {
-            (!format.is_depth_stencil() && block_width == 1 && block_height == 1)
+        let compressed_kind = match format {
+            ImageFormat::Depth16Unorm => Some(MAXWELL_Z16_2Z_KIND),
+            ImageFormat::Depth24UnormStencil8Uint => Some(MAXWELL_Z24S8_2CZ_KIND),
+            _ => (!format.is_depth_stencil() && block_width == 1 && block_height == 1)
                 .then(|| single_sample_compressed_color_kind(u64::from(bytes_per_block)))
-                .flatten()
+                .flatten(),
         };
         let expected_kind = if pitch_linear {
             MAXWELL_PITCH_KIND
@@ -2595,6 +2633,10 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
                     MaxwellThreeDGuestImageFormat::DepthStencil(
                         MaxwellThreeDDepthStencilFormat::Z24Stencil8,
                     )
+                } else if format == ImageFormat::Depth16Unorm {
+                    MaxwellThreeDGuestImageFormat::DepthStencil(
+                        MaxwellThreeDDepthStencilFormat::Z16,
+                    )
                 } else if format == ImageFormat::Depth32Float {
                     MaxwellThreeDGuestImageFormat::DepthStencil(
                         MaxwellThreeDDepthStencilFormat::ZFloat32,
@@ -2697,10 +2739,7 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         let role = MaxwellThreeDResourceRole::DepthStencilTarget;
         if target.sparse().value().is_some_and(|value| value & 1 != 0) {
             return Err(MaxwellThreeDResourceError::UnsupportedSparseDepth {
-                source: target
-                    .sparse()
-                    .source()
-                    .expect("enabled sparse depth is programmed"),
+                value: *target.sparse().value().unwrap(),
             });
         }
         let address = unresolved(
@@ -2933,6 +2972,9 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
                 };
                 let compressed_depth_kind = match guest_format {
                     MaxwellThreeDGuestImageFormat::DepthStencil(
+                        MaxwellThreeDDepthStencilFormat::Z16,
+                    ) if samples == SampleCount::One => Some(MAXWELL_Z16_2Z_KIND),
+                    MaxwellThreeDGuestImageFormat::DepthStencil(
                         MaxwellThreeDDepthStencilFormat::Stencil8Z24,
                     ) => Some(if samples == SampleCount::Four {
                         MAXWELL_S8Z24_MS4_2CZ_KIND
@@ -3137,9 +3179,11 @@ fn color_image_format(
         0xca => Ok(ImageFormat::Rgba16Float),
         0xcf => Ok(ImageFormat::Bgra8Unorm),
         0xd0 => Ok(ImageFormat::Bgra8Srgb),
+        0xd1 => Ok(ImageFormat::Rgb10a2Unorm),
         0xd5 => Ok(ImageFormat::Rgba8Unorm),
         0xd6 => Ok(ImageFormat::Rgba8Srgb),
         0xe0 => Ok(ImageFormat::Rg11b10Ufloat),
+        0xf2 => Ok(ImageFormat::R16Float),
         0xf3 => Ok(ImageFormat::R8Unorm),
         _ => Err(MaxwellThreeDResourceError::UnsupportedColorFormat { role, format }),
     }
@@ -3156,10 +3200,10 @@ fn decode_sampled_texture_format(
     srgb: bool,
     reserved: u32,
 ) -> Option<ImageFormat> {
-    if reserved != 0 {
+    if reserved != 0 || !swizzle.iter().all(|c| matches!(c, 0 | 2..=5 | 7)) {
         return None;
     }
-    if components == [2; 4] && swizzle.iter().all(|c| matches!(c, 0 | 2..=5 | 7)) {
+    if components == [2; 4] {
         let astc = match (image_format, srgb) {
             (0x40, false) => Some(ImageFormat::Astc4x4Unorm),
             (0x40, true) => Some(ImageFormat::Astc4x4Srgb),
@@ -3203,86 +3247,55 @@ fn decode_sampled_texture_format(
         // Z24S8 uses unsigned stencil R and normalized depth G. Selecting G
         // for RGB samples the depth aspect, with alpha forced to one.
         (0x29, [4, 2, 2, 2], [3, 3, 3, 7], false) => Some(ImageFormat::Depth24UnormStencil8Uint),
+        // https://github.com/eden-emulator/mirror/blob/master/src/video_core/texture_cache/format_lookup_table.cpp
+        (0x3a, [2, 2, 2, 2] | [2, 4, 4, 4], _, false) => Some(ImageFormat::Depth16Unorm),
         // ZF32 uses a float depth channel, replicated to RGB by its TIC mapping.
         // https://github.com/devkitPro/deko3d/blob/master/source/maxwell/image_formats.h
         (0x2f, [7, 2, 2, 2], [2, 2, 2, 7], false) => Some(ImageFormat::Depth32Float),
-        (0x27, [2, 2, 2, 2], mapping, false)
-            if mapping.iter().all(|c| matches!(c, 0 | 2..=5 | 7)) =>
-        {
-            Some(ImageFormat::Bc4RUnorm)
-        }
-        (0x28, [2, 2, 2, 2], mapping, false)
-            if mapping.iter().all(|c| matches!(c, 0 | 2..=5 | 7)) =>
-        {
-            Some(ImageFormat::Bc5RgUnorm)
-        }
+        (0x27, [2, 2, 2, 2], _, false) => Some(ImageFormat::Bc4RUnorm),
+        (0x28, [2, 2, 2, 2], _, false) => Some(ImageFormat::Bc5RgUnorm),
         // Component type 1 is SNORM; signed RGTC endpoints are not UNORM.
         // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/image_formats.h
-        (0x27, [1, 1, 1, 1], mapping, false)
-            if mapping.iter().all(|c| matches!(c, 0 | 2..=5 | 7)) =>
-        {
-            Some(ImageFormat::Bc4RSnorm)
-        }
-        (0x28, [1, 1, 1, 1], mapping, false)
-            if mapping.iter().all(|c| matches!(c, 0 | 2..=5 | 7)) =>
-        {
-            Some(ImageFormat::Bc5RgSnorm)
-        }
-        (0x17, [2, 2, 2, 2], mapping, srgb)
-            if mapping.iter().all(|c| matches!(c, 0 | 2..=5 | 7)) =>
-        {
-            Some(if srgb {
-                ImageFormat::Bc7RgbaSrgb
-            } else {
-                ImageFormat::Bc7RgbaUnorm
-            })
-        }
-        (0x26, [2, 2, 2, 2], mapping, srgb)
-            if mapping.iter().all(|c| matches!(c, 0 | 2..=5 | 7)) =>
-        {
-            Some(if srgb {
-                ImageFormat::Bc3RgbaSrgb
-            } else {
-                ImageFormat::Bc3RgbaUnorm
-            })
-        }
+        (0x27, [1, 1, 1, 1], _, false) => Some(ImageFormat::Bc4RSnorm),
+        (0x28, [1, 1, 1, 1], _, false) => Some(ImageFormat::Bc5RgSnorm),
+        (0x17, [2, 2, 2, 2], _, srgb) => Some(if srgb {
+            ImageFormat::Bc7RgbaSrgb
+        } else {
+            ImageFormat::Bc7RgbaUnorm
+        }),
+        (0x26, [2, 2, 2, 2], _, srgb) => Some(if srgb {
+            ImageFormat::Bc3RgbaSrgb
+        } else {
+            ImageFormat::Bc3RgbaUnorm
+        }),
         // https://registry.khronos.org/OpenGL/extensions/EXT/EXT_texture_compression_s3tc.txt
         // DXT1 storage and TIC selectors are independent. The opaque RGB
         // variant is equivalent only when no output observes the stored alpha.
-        (0x24, [2, 2, 2, 2], mapping, srgb)
-            if mapping.iter().all(|c| matches!(c, 0 | 2..=5 | 7)) =>
-        {
-            Some(match (mapping.contains(&5), srgb) {
-                (false, false) => ImageFormat::Bc1RgbUnorm,
-                (false, true) => ImageFormat::Bc1RgbSrgb,
-                (true, false) => ImageFormat::Bc1RgbaUnorm,
-                (true, true) => ImageFormat::Bc1RgbaSrgb,
-            })
-        }
+        (0x24, [2, 2, 2, 2], mapping, srgb) => Some(match (mapping.contains(&5), srgb) {
+            (false, false) => ImageFormat::Bc1RgbUnorm,
+            (false, true) => ImageFormat::Bc1RgbSrgb,
+            (true, false) => ImageFormat::Bc1RgbaUnorm,
+            (true, true) => ImageFormat::Bc1RgbaSrgb,
+        }),
         // Single-channel masks can independently route R or constants to
         // every sampled component, including white RGB with red as alpha.
-        (0x1d, [2, 2, 2, 2], mapping, false) if mapping.iter().all(|c| matches!(c, 0 | 2 | 7)) => {
-            Some(ImageFormat::R8Unorm)
-        }
+        (0x1d, [2, 2, 2, 2], _, false) => Some(ImageFormat::R8Unorm),
         // Storage and view selectors are independent; luminance-alpha uses
         // R,R,R,G without changing the two-byte RG8 storage format.
         // https://github.com/eden-emulator/mirror/blob/master/src/video_core/texture_cache/format_lookup_table.cpp
-        (0x18, [2, 2, 2, 2], mapping, false)
-            if mapping.iter().all(|c| matches!(c, 0 | 2..=5 | 7)) =>
-        {
-            Some(ImageFormat::Rg8Unorm)
-        }
-        (0x08, [2, 2, 2, 2], [2, 3, 4, 5], false) => Some(ImageFormat::Rgba8Unorm),
-        (0x08, [2, 2, 2, 2], [2, 3, 4, 5], true) => Some(ImageFormat::Rgba8Srgb),
+        (0x18, [2, 2, 2, 2], _, false) => Some(ImageFormat::Rg8Unorm),
         (0x08, [2, 2, 2, 2], [4, 3, 2, 5], false) => Some(ImageFormat::Bgra8Unorm),
         (0x08, [2, 2, 2, 2], [4, 3, 2, 5], true) => Some(ImageFormat::Bgra8Srgb),
-        (0x1b, [7, 7, 7, 7], [2, 0, 0, 7], false) => Some(ImageFormat::R16Float),
-        (0x0c, [7, 7, 7, 7], [2, 3, 0, 7], false) => Some(ImageFormat::Rg16Float),
-        (0x03, [7, 7, 7, 7], [2, 3, 4, 5], false) => Some(ImageFormat::Rgba16Float),
-        (0x21, [7, 7, 7, 7], [2, 3, 4, 7], false) => Some(ImageFormat::Rg11b10Ufloat),
-        (0x0f, [7, 7, 7, 7], [2, 0, 0, 7], false) => Some(ImageFormat::R32Float),
-        (0x04, [7, 7, 7, 7], [2, 3, 0, 7], false) => Some(ImageFormat::Rg32Float),
-        (0x01, [7, 7, 7, 7], [2, 3, 4, 5], false) => Some(ImageFormat::Rgba32Float),
+        (0x08, [2, 2, 2, 2], _, false) => Some(ImageFormat::Rgba8Unorm),
+        (0x08, [2, 2, 2, 2], _, true) => Some(ImageFormat::Rgba8Srgb),
+        (0x1b, [7, 7, 7, 7], _, false) => Some(ImageFormat::R16Float),
+        (0x0c, [7, 7, 7, 7], _, false) => Some(ImageFormat::Rg16Float),
+        (0x03, [7, 7, 7, 7], _, false) => Some(ImageFormat::Rgba16Float),
+        (0x21, [7, 7, 7, 7], _, false) => Some(ImageFormat::Rg11b10Ufloat),
+        (0x09, [2, 2, 2, 2], _, false) => Some(ImageFormat::Rgb10a2Unorm),
+        (0x0f, [7, 7, 7, 7], _, false) => Some(ImageFormat::R32Float),
+        (0x04, [7, 7, 7, 7], _, false) => Some(ImageFormat::Rg32Float),
+        (0x01, [7, 7, 7, 7], _, false) => Some(ImageFormat::Rgba32Float),
         _ => None,
     }
 }
@@ -3662,7 +3675,7 @@ pub enum MaxwellThreeDResourceError {
         format: u8,
     },
     UnsupportedSparseDepth {
-        source: crate::MaxwellMethodSource,
+        value: u8,
     },
     UnsupportedDepthFormat {
         role: MaxwellThreeDResourceRole,
@@ -3743,9 +3756,9 @@ impl Display for MaxwellThreeDResourceError {
                 formatter,
                 "Maxwell color format has no neutral interpretation: role={role:?} format=0x{format:02x}"
             ),
-            Self::UnsupportedSparseDepth { source } => write!(
+            Self::UnsupportedSparseDepth { value } => write!(
                 formatter,
-                "sparse depth attachment semantics are not implemented: {source}"
+                "sparse depth attachment semantics are not implemented: SET_ZT_SPARSE={value:#x}"
             ),
             Self::UnsupportedDepthFormat { role, format } => write!(
                 formatter,
@@ -3838,6 +3851,128 @@ mod tests {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         bytes
+    }
+
+    #[test]
+    fn volume_tic_preserves_depth_mips_and_slice_geometry() {
+        let machine = crate::test_memory::machine();
+        let allocation = crate::test_memory::allocate(&machine, 4096);
+        let mut space = MaxwellGpuAddressSpace::new(
+            machine,
+            MaxwellAddressSpaceId::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let address = space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(1),
+                backing: crate::test_memory::ranges(&allocation),
+                backing_offset: 0,
+                size: 4096,
+                allocation_alignment: 4096,
+                page_size: 0,
+                kind: MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
+                cacheable: true,
+                permissions: MemoryPermissions::READ_WRITE,
+                fixed_offset: None,
+            })
+            .unwrap()
+            .offset()
+            .get();
+        let format = 0x08
+            | (2 << 7)
+            | (2 << 10)
+            | (2 << 13)
+            | (2 << 16)
+            | (2 << 19)
+            | (3 << 22)
+            | (4 << 25)
+            | (5 << 28);
+        let words = [
+            format,
+            address as u32,
+            (address >> 32) as u32 | (3 << 21),
+            (2 << 6) | (2 << 28),
+            7 | (2 << 23),
+            7 | (3 << 16) | (1 << 31),
+            0,
+            2 << 4,
+        ];
+        let mut retained = MaxwellThreeDRetainedBackingCache::default();
+        let mut access = crate::test_memory::access(space.memory().machine());
+        let mut builder =
+            super::ResourceBuilder::new(space.memory(), None, &mut retained, &mut access);
+        builder
+            .sampled_image(
+                super::MaxwellThreeDTextureReference::new(4, 0, 0),
+                MaxwellThreeDTextureDimension::Three,
+                0,
+                descriptor_bytes(words),
+            )
+            .unwrap();
+        let super::MaxwellThreeDResolvedResource::Image(image) = &builder.resources[0] else {
+            panic!("expected volume")
+        };
+        assert_eq!(
+            image.description().dimension(),
+            nixe_gpu::ImageDimension::Three
+        );
+        assert_eq!(
+            image.description().extent(),
+            nixe_gpu::ImageExtent {
+                width: 8,
+                height: 8,
+                depth: 4
+            }
+        );
+        assert_eq!(image.description().array_layers(), 1);
+        assert_eq!(image.description().mip_levels(), 3);
+        assert_eq!(image.source().size(), 3584);
+        assert_eq!(image.view().bindings().len(), 3);
+        for (level, binding) in image.view().bindings().iter().enumerate() {
+            assert_eq!(binding.subresources().mip_level, level as u8);
+            assert_eq!(binding.subresources().layer_count, 1);
+            let nixe_gpu::ImageMemoryLayout::BlockLinear(block) = binding.layout() else {
+                panic!("expected GOB layout")
+            };
+            assert_eq!(block.block_depth_log2, 2u8.saturating_sub(level as u8));
+        }
+    }
+
+    #[test]
+    fn linked_sampler_table_uses_tic_limit_without_resolving_a_buffer() {
+        let machine = crate::test_memory::machine();
+        let space = MaxwellGpuAddressSpace::new(
+            machine,
+            MaxwellAddressSpaceId::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        let mut channel = crate::engines::tests::three_d_channel();
+        let mut retained = MaxwellThreeDRetainedBackingCache::default();
+        let mut access = crate::test_memory::access(space.memory().machine());
+        for (mode, maximum, expected_limit) in [(1, 63, 63), (0, 63, 0), (1, 31, 31)] {
+            for (method, argument) in [
+                (0x155c, 0),
+                (0x1560, 0x4000),
+                (0x1564, 0),
+                (0x157c, maximum),
+                (0x1234, mode),
+            ] {
+                crate::engines::tests::program_three_d(&mut channel, method, argument);
+            }
+            let mut builder =
+                super::ResourceBuilder::new(space.memory(), None, &mut retained, &mut access);
+            builder
+                .sampler_pool(channel.three_d().shader_bindings())
+                .unwrap();
+            assert!(builder.resources.is_empty());
+            let table = &builder.retained_backings.descriptor_tables
+                [super::DescriptorTableKind::Sampler as usize];
+            assert_eq!(table.limit, expected_limit);
+            assert_eq!(table.base.unwrap().get(), 0x4000);
+        }
     }
 
     #[test]
@@ -4350,6 +4485,23 @@ mod tests {
     }
 
     #[test]
+    fn r16_float_target_and_texture_use_the_same_half_float_storage() {
+        let format =
+            super::color_image_format(0xf2, MaxwellThreeDResourceRole::ColorTarget(0)).unwrap();
+        assert_eq!(format, nixe_gpu::ImageFormat::R16Float);
+        assert_eq!(format.plane_bytes_per_block(0), Some(2));
+        assert_eq!(
+            decode_sampled_texture_format(0x1b, [7; 4], [2, 0, 0, 7], false, 0),
+            Some(format)
+        );
+        for raw in [0xee, 0xef, 0xf0, 0xf1] {
+            assert!(
+                super::color_image_format(raw, MaxwellThreeDResourceRole::ColorTarget(0)).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn rgba16_float_target_and_texture_encodings_have_the_same_interpretation() {
         let target =
             super::color_image_format(0xca, MaxwellThreeDResourceRole::ColorTarget(0)).unwrap();
@@ -4368,6 +4520,107 @@ mod tests {
     }
 
     #[test]
+    fn packed_rgb10a2_target_and_texture_preserve_unorm_channels_and_storage() {
+        let target =
+            super::color_image_format(0xd1, MaxwellThreeDResourceRole::ColorTarget(0)).unwrap();
+        assert_eq!(target, nixe_gpu::ImageFormat::Rgb10a2Unorm);
+        assert_eq!(target.plane_bytes_per_texel(0), Some(4));
+        for swizzle in [[2, 3, 4, 7], [4, 3, 2, 5], [2, 2, 2, 5], [7, 7, 7, 2]] {
+            assert_eq!(
+                decode_sampled_texture_format(0x09, [2; 4], swizzle, false, 0),
+                Some(target)
+            );
+        }
+        assert_eq!(
+            decode_sampled_texture_format(0x09, [2; 4], [2, 3, 4, 5], false, 0),
+            Some(target)
+        );
+        for (components, srgb, reserved) in
+            [([4; 4], false, 0), ([2; 4], true, 0), ([2; 4], false, 1)]
+        {
+            assert_eq!(
+                decode_sampled_texture_format(0x09, components, [2, 3, 4, 5], srgb, reserved),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn sampled_storage_preserves_independent_alpha_and_constant_component_views() {
+        let machine = crate::test_memory::machine();
+        let allocation = crate::test_memory::allocate(&machine, 0x1000);
+        let mut space = MaxwellGpuAddressSpace::new(
+            machine,
+            MaxwellAddressSpaceId::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let address = space
+            .map(MaxwellMapRequest {
+                allocation: MaxwellAllocationId::new(1),
+                backing: crate::test_memory::ranges(&allocation),
+                backing_offset: 0,
+                size: 0x1000,
+                allocation_alignment: 0x1000,
+                page_size: 0,
+                kind: MAXWELL_GENERIC_BLOCK_LINEAR_KIND,
+                cacheable: true,
+                fixed_offset: None,
+                permissions: MemoryPermissions::READ_WRITE,
+            })
+            .unwrap()
+            .offset()
+            .get();
+        for (word, format, swizzle) in [
+            (
+                0x5b6a4908,
+                nixe_gpu::ImageFormat::Rgba8Unorm,
+                nixe_gpu::Swizzle([nixe_gpu::ComponentSwizzle::Alpha; 4]),
+            ),
+            (
+                0x78d24909,
+                nixe_gpu::ImageFormat::Rgb10a2Unorm,
+                nixe_gpu::Swizzle([
+                    nixe_gpu::ComponentSwizzle::Red,
+                    nixe_gpu::ComponentSwizzle::Green,
+                    nixe_gpu::ComponentSwizzle::Blue,
+                    nixe_gpu::ComponentSwizzle::One,
+                ]),
+            ),
+        ] {
+            let words = [
+                word,
+                address as u32,
+                (address >> 32) as u32 | (3 << 21),
+                0,
+                7 | (1 << 23),
+                7 | (1 << 31),
+                0,
+                0,
+            ];
+            let mut access = crate::test_memory::access(space.memory().machine());
+            let mut retained = MaxwellThreeDRetainedBackingCache::default();
+            let mut builder =
+                super::ResourceBuilder::new(space.memory(), None, &mut retained, &mut access);
+            builder
+                .sampled_image(
+                    super::MaxwellThreeDTextureReference::new(4, 0, 0),
+                    MaxwellThreeDTextureDimension::Two,
+                    0,
+                    descriptor_bytes(words),
+                )
+                .unwrap();
+            let super::MaxwellThreeDResolvedResource::Image(image) = &builder.resources[0] else {
+                panic!("expected sampled image")
+            };
+            assert_eq!(image.description.format(), format);
+            assert_eq!(image.view.swizzle(), swizzle);
+        }
+    }
+
+    #[test]
     fn packed_unsigned_float_target_and_texture_preserve_storage_and_opaque_alpha() {
         // deko3d format_traits.inc: BF10GF11RF11, Float components, R,G,B,OneFloat.
         // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/format_traits.inc
@@ -4381,8 +4634,6 @@ mod tests {
         );
         for (components, swizzle, srgb, reserved) in [
             ([2; 4], [2, 3, 4, 7], false, 0),
-            ([7; 4], [4, 3, 2, 7], false, 0),
-            ([7; 4], [2, 3, 4, 5], false, 0),
             ([7; 4], [2, 3, 4, 7], true, 0),
             ([7; 4], [2, 3, 4, 7], false, 1),
         ] {
@@ -4733,16 +4984,23 @@ mod tests {
         let address = map.offset().get();
         for (code, r_type, swizzle, format, guest) in [
             (
+                0x3a,
+                2,
+                [2, 0, 0, 7],
+                ImageFormat::Depth16Unorm,
+                super::MaxwellThreeDDepthStencilFormat::Z16,
+            ),
+            (
                 0x29,
                 4,
-                3,
+                [3, 3, 3, 7],
                 ImageFormat::Depth24UnormStencil8Uint,
                 super::MaxwellThreeDDepthStencilFormat::Z24Stencil8,
             ),
             (
                 0x2f,
                 7,
-                2,
+                [2, 2, 2, 7],
                 ImageFormat::Depth32Float,
                 super::MaxwellThreeDDepthStencilFormat::ZFloat32,
             ),
@@ -4752,10 +5010,10 @@ mod tests {
                 | (2 << 10)
                 | (2 << 13)
                 | (2 << 16)
-                | (swizzle << 19)
-                | (swizzle << 22)
-                | (swizzle << 25)
-                | (7 << 28);
+                | (swizzle[0] << 19)
+                | (swizzle[1] << 22)
+                | (swizzle[2] << 25)
+                | (swizzle[3] << 28);
             let words = [
                 format_word,
                 address as u32,
@@ -4786,6 +5044,7 @@ mod tests {
                 panic!("expected depth image")
             };
             assert_eq!(image.description().format(), format);
+            assert_eq!(image.view().swizzle(), nixe_gpu::Swizzle::IDENTITY);
             assert_eq!(
                 image.description().kind(),
                 nixe_gpu::ImageKind::DepthStencil
@@ -4810,7 +5069,7 @@ mod tests {
         address_space
             .initialize(MaxwellAddressSpaceInitialization::default())
             .unwrap();
-        let allocation = crate::test_memory::allocate(&machine, 0x24000);
+        let allocation = crate::test_memory::allocate(&machine, 0x48000);
         let backing = crate::test_memory::ranges(&allocation);
         let mapping = address_space
             .map(MaxwellMapRequest {
@@ -4830,7 +5089,7 @@ mod tests {
         let offsets = [0, 16384, 20480, 21504, 22016, 22528, 23040, 23552];
         let sizes = [16384, 4096, 1024, 512, 512, 512, 512, 512];
         let heights = [2, 1, 0, 0, 0, 0, 0, 0];
-        for layers in [1, 2, 6] {
+        for layers in [1, 2, 6, 12] {
             let words = [
                 0x58d24926,
                 address as u32,
@@ -4841,10 +5100,17 @@ mod tests {
                         1
                     } else if layers == 6 {
                         3
+                    } else if layers == 12 {
+                        8
                     } else {
                         5
                     }) << 23),
-                127 | ((if layers == 6 { 0 } else { layers - 1 }) << 16) | (1 << 31),
+                127 | ((if layers >= 6 {
+                    layers / 6 - 1
+                } else {
+                    layers - 1
+                }) << 16)
+                    | (1 << 31),
                 0x03000000,
                 7 << 4,
             ];
@@ -4863,6 +5129,8 @@ mod tests {
                         MaxwellThreeDTextureDimension::Two
                     } else if layers == 6 {
                         MaxwellThreeDTextureDimension::Cube
+                    } else if layers == 12 {
+                        MaxwellThreeDTextureDimension::CubeArray
                     } else {
                         MaxwellThreeDTextureDimension::TwoArray
                     },
@@ -4877,7 +5145,7 @@ mod tests {
             assert_eq!(image.description().array_layers(), layers as u16);
             assert_eq!(
                 image.description().dimension(),
-                if layers == 6 {
+                if layers >= 6 {
                     nixe_gpu::ImageDimension::Cube
                 } else {
                     nixe_gpu::ImageDimension::Two
@@ -5030,30 +5298,27 @@ mod tests {
             &mut memory_access,
         );
         builder
-            .buffer(
+            .descriptor_pool(
                 MaxwellThreeDResourceRole::TextureHeaders,
-                super::MaxwellThreeDUnresolvedAddress::new((address >> 32) as u8, address as u32),
-                32,
+                Some(address),
+                Some(0xfffff),
             )
             .unwrap();
-        builder
-            .buffer(
-                MaxwellThreeDResourceRole::ConstantBuffer { group: 4, slot: 0 },
-                super::MaxwellThreeDUnresolvedAddress::new(
-                    (address >> 32) as u8,
-                    (address + 0x100) as u32,
-                ),
-                4,
-            )
+        let reference = super::MaxwellThreeDTextureReference::new(4, 0, 0);
+        let handle = builder
+            .texture_handle(reference, Some((address + 0x100, 4)), None)
             .unwrap();
         builder
             .sampled_texture(
-                &super::super::MaxwellThreeDShaderBindingState::default(),
-                super::MaxwellThreeDTextureReference::new(4, 0, 0),
+                None,
+                None,
+                reference,
+                handle,
                 MaxwellThreeDTextureDimension::Two,
                 false,
             )
             .unwrap();
+        assert_eq!(builder.resources.len(), 1); // only the actual sampled image
         assert!(builder.samplers.is_empty());
         assert_eq!(builder.descriptor_reads.len(), 2); // handle and TIC, no TSC
         use crate::engines::tests::register_benchmark::ALLOCATIONS;

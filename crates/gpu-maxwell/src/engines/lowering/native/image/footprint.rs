@@ -9,13 +9,14 @@ use std::sync::Arc;
 pub(super) fn plane_footprint(
     backing: Arc<PhysicalMapping>,
     layout: ImageMemoryLayout,
-    layer: u32,
+    subresource: [u32; 2],
     extent: [u32; 2],
     bytes: u32,
     packed: u32,
     aspect: (u32, u32),
 ) -> Result<Arc<Footprint>, MemoryError> {
     let [columns, rows] = extent;
+    let [layer, depth_slice] = subresource;
     let (base, storage) = match layout {
         ImageMemoryLayout::PitchLinear {
             row_pitch,
@@ -28,7 +29,7 @@ pub(super) fn plane_footprint(
         ),
         ImageMemoryLayout::BlockLinear(blocks) => {
             if blocks.block_width_log2 != 0
-                || blocks.block_depth_log2 != 0
+                || blocks.block_depth_log2 > 5
                 || blocks.block_height_log2 > 5
             {
                 return Err(MemoryError::Invalid(
@@ -41,6 +42,7 @@ pub(super) fn plane_footprint(
                     .ok_or(MemoryError::Invalid("image layer offset overflows"))?,
                 ImageStorage::BlockLinear {
                     block_height_log2: blocks.block_height_log2,
+                    block_depth_log2: blocks.block_depth_log2,
                 },
             )
         }
@@ -49,6 +51,7 @@ pub(super) fn plane_footprint(
     Footprint::new(
         backing,
         WriteDomain::Image(ImageFootprint {
+            depth_slice,
             base,
             columns,
             rows,
@@ -97,7 +100,7 @@ mod tests {
             let footprint = plane_footprint(
                 source.clone(),
                 layout,
-                0,
+                [0, 0],
                 [1920, 1080],
                 bytes,
                 4,
@@ -120,11 +123,11 @@ mod tests {
             pages.push(ranges[0].slice(offset, PAGE_SIZE).unwrap());
         }
         let source = PhysicalMapping::new(&pages).unwrap();
-        for height in [0, 1, 4, 5] {
+        for (height, depth) in [(0, 0), (1, 0), (4, 0), (5, 0), (0, 3), (1, 2)] {
             let blocks = BlockLinearLayout {
                 block_width_log2: 0,
                 block_height_log2: height,
-                block_depth_log2: 0,
+                block_depth_log2: depth,
                 layer_stride: 32768,
             };
             for layout in [
@@ -148,7 +151,7 @@ mod tests {
                     let view = plane_footprint(
                         source.clone(),
                         layout,
-                        1,
+                        [1, 0],
                         [columns, rows],
                         bytes,
                         packed,
@@ -196,8 +199,9 @@ mod tests {
                                             + y / (8 * h)
                                                 * 512
                                                 * h
+                                                * (1u64 << p.block_depth_log2)
                                                 * u64::from(columns * packed).div_ceil(64)
-                                            + raw_x / 64 * 512 * h
+                                            + raw_x / 64 * 512 * h * (1u64 << p.block_depth_log2)
                                             + y % (8 * h) / 8 * 512
                                             + raw_x % 64 / 32 * 256
                                             + y % 8 / 2 * 64

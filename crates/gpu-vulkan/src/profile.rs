@@ -65,13 +65,10 @@ pub struct DeviceProfile {
     pub smooth_lines: bool,
     pub bresenham_lines: bool,
     pub unified_image_layouts: bool,
+    pub attachment_feedback_loop: bool,
     pub swapchain_maintenance: SwapchainMaintenance,
     pub swapchain_mutable_format: bool,
     pub portability: Option<PortabilitySupport>,
-    /// Enabled API extensions; resource-specific import/export support is queried
-    /// when an external allocation is created, not inferred from these bits.
-    pub external_memory_fd: bool,
-    pub external_semaphore_fd: bool,
     pub enabled_extensions: Vec<String>,
 }
 #[derive(Debug)]
@@ -298,6 +295,8 @@ optional_features! {
     descriptors: vk::PhysicalDeviceDescriptorBufferFeaturesEXT<'static> => fixed!(ash::ext::descriptor_buffer::NAME),
     objects: vk::PhysicalDeviceShaderObjectFeaturesEXT<'static> => fixed!(ash::ext::shader_object::NAME),
     feedback: vk::PhysicalDeviceTransformFeedbackFeaturesEXT<'static> => fixed!(ash::ext::transform_feedback::NAME),
+    feedback_layout: vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT<'static> => fixed!(ash::ext::attachment_feedback_loop_layout::NAME),
+    feedback_dynamic: vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT<'static> => fixed!(ash::ext::attachment_feedback_loop_dynamic_state::NAME),
     index8: vk::PhysicalDeviceIndexTypeUint8FeaturesKHR<'static> => |_, _, e: &ExtensionSet| supported(e, ash::khr::index_type_uint8::NAME).or_else(|| supported(e, ash::ext::index_type_uint8::NAME)),
     custom_border: vk::PhysicalDeviceCustomBorderColorFeaturesEXT<'static> => fixed!(ash::ext::custom_border_color::NAME),
     provoking: vk::PhysicalDeviceProvokingVertexFeaturesEXT<'static> => fixed!(ash::ext::provoking_vertex::NAME),
@@ -402,14 +401,8 @@ impl FeatureSet {
         {
             self.names.push(ash::ext::pipeline_creation_feedback::NAME);
         }
-        for name in [
-            ash::ext::memory_budget::NAME,
-            ash::khr::external_memory_fd::NAME,
-            ash::khr::external_semaphore_fd::NAME,
-        ] {
-            if ext.contains(name) {
-                self.names.push(name);
-            }
+        if ext.contains(ash::ext::memory_budget::NAME) {
+            self.names.push(ash::ext::memory_budget::NAME);
         }
     }
 
@@ -585,6 +578,8 @@ impl FeatureSet {
             smooth_lines: self.lines.smooth_lines != 0,
             bresenham_lines: self.lines.bresenham_lines != 0,
             unified_image_layouts: self.layouts.layouts != 0,
+            attachment_feedback_loop: self.feedback_layout.attachment_feedback_loop_layout != 0
+                && self.feedback_dynamic.attachment_feedback_loop_dynamic_state != 0,
             swapchain_mutable_format: self
                 .names
                 .contains(&ash::khr::swapchain_mutable_format::NAME),
@@ -605,8 +600,6 @@ impl FeatureSet {
                     tessellation_point_mode: self.portability.tessellation_point_mode != 0,
                     separate_stencil_mask_ref: self.portability.separate_stencil_mask_ref != 0,
                 }),
-            external_memory_fd: self.names.contains(&ash::khr::external_memory_fd::NAME),
-            external_semaphore_fd: self.names.contains(&ash::khr::external_semaphore_fd::NAME),
             enabled_extensions: self
                 .names
                 .iter()

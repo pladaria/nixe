@@ -88,19 +88,19 @@ impl MaxwellThreeDTiledCacheState {
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDTiledCacheStateWrite) {
         match write {
-            MaxwellThreeDTiledCacheStateWrite::Enable { value, source } => {
-                self.enabled = MaxwellThreeDRegister::programmed(u32::from(value), value, source);
+            MaxwellThreeDTiledCacheStateWrite::Enable { value, source: _ } => {
+                self.enabled = MaxwellThreeDRegister::decoded(u32::from(value), value);
             }
-            MaxwellThreeDTiledCacheStateWrite::TileSize { value, source } => {
-                self.tile_size = MaxwellThreeDRegister::programmed(value.raw(), value, source);
+            MaxwellThreeDTiledCacheStateWrite::TileSize { value, source: _ } => {
+                self.tile_size = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
             MaxwellThreeDTiledCacheStateWrite::UnknownConfig {
                 index,
                 value,
-                source,
+                source: _,
             } => {
                 self.unknown_config[usize::from(index)] =
-                    MaxwellThreeDRegister::programmed(value.bits(), value, source);
+                    MaxwellThreeDRegister::decoded(value.bits(), value);
             }
         }
     }
