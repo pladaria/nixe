@@ -3730,6 +3730,145 @@ fn affine_fixed_point_sampling_reverses_crops_and_preserves_destination_padding(
 }
 
 #[test]
+fn first_read_layout_transition_is_visible_to_later_attachment_loads() {
+    let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
+        return;
+    };
+    let validation = cache.device.validation_monitor();
+    let make_image = |cache: &mut VulkanResidency, format, aspect| {
+        let (allocation, bytes) = backing_allocation(cache, 4096, 4096, 0x7b);
+        let description = NativeImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            format,
+            extent: vk::Extent3D {
+                width: 8,
+                height: 8,
+                depth: 1,
+            },
+            mip_levels: 1,
+            array_layers: 1,
+            samples: vk::SampleCountFlags::TYPE_1,
+            usage: vk::ImageUsageFlags::SAMPLED
+                | if aspect == vk::ImageAspectFlags::COLOR {
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT
+                } else {
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                },
+            flags: vk::ImageCreateFlags::empty(),
+        };
+        let plane = ImagePlane {
+            depth_slice: 0,
+            offset: 0,
+            row_pitch: 32,
+            mip_level: 0,
+            array_layer: 0,
+            aspect,
+            extent: description.extent,
+            block_extent: vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+            bytes_per_block: 4,
+        };
+        let id = cache
+            .image_for_device_write(
+                crate::residency::tests::image_geometry(bytes.clone(), description, &[plane]),
+                description,
+                vec![plane],
+            )
+            .unwrap();
+        (id, bytes, allocation)
+    };
+    let (color, bytes, _color_allocation) = make_image(
+        &mut cache,
+        vk::Format::R8G8B8A8_UNORM,
+        vk::ImageAspectFlags::COLOR,
+    );
+    let (depth, _, _depth_allocation) = make_image(
+        &mut cache,
+        vk::Format::D32_SFLOAT,
+        vk::ImageAspectFlags::DEPTH,
+    );
+    // Establish a read-only first use. The transition itself writes the image,
+    // even though there is no data writer in its access history.
+    let layout = shader_attachment_layout(cache.image(depth).unwrap().description.usage);
+    cache
+        .image_access_subresources(
+            depth,
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                .level_count(1)
+                .layer_count(1),
+            AccessScope::new(
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+            ),
+            layout,
+        )
+        .unwrap();
+    cache.barriers.emit(&mut cache.device);
+    let mut state = GraphicsState::color(vk::Format::R8G8B8A8_UNORM);
+    state.depth_format = vk::Format::D32_SFLOAT;
+    state.depth_test = true;
+    state.depth_compare = vk::CompareOp::ALWAYS;
+    let pipeline = compiler(&cache)
+        .request(PipelineRecipe::Graphics {
+            shader: solid_artifact(),
+            state: state.clone(),
+        })
+        .unwrap();
+    let program = cache.prepare_program(pipeline, &[]).unwrap();
+    let graphics = cache
+        .prepare_graphics(program, GraphicsParameters::new(state, area().extent))
+        .unwrap();
+    let targets = cache
+        .prepare_targets(RenderingTargets {
+            area: area(),
+            colors: Box::new([Some(RenderAttachment::color(
+                color,
+                0,
+                AttachmentLoad::Load,
+                AttachmentStore::Store,
+            ))]),
+            depth: Some(RenderAttachment {
+                source: AttachmentSource::Canonical {
+                    image: depth,
+                    plane: 0,
+                },
+                load: vk::AttachmentLoadOp::LOAD,
+                store: vk::AttachmentStoreOp::STORE,
+                clear: vk::ClearValue::default(),
+            }),
+            stencil: None,
+        })
+        .unwrap();
+    let prepared = cache
+        .prepare_draw(graphics, targets, Box::new([]), None)
+        .unwrap();
+    cache
+        .draw(
+            &prepared,
+            Draw::Direct {
+                vertices: 3,
+                instances: 1,
+                first_vertex: 0,
+                first_instance: 0,
+            },
+            &[1f32, 0., 0., 1.]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    cache.flush().unwrap();
+    let pixels = cpu_read(&mut cache, &bytes);
+    assert_eq!(&pixels[..8 * 8 * 4], &[255, 0, 0, 255].repeat(8 * 8));
+    drop(prepared);
+    drop(cache);
+    validation.check().unwrap();
+}
+
+#[test]
 fn sampled_read_only_depth_preserves_producer_and_has_no_attachment_writes() {
     for api in [ApiPreference::Auto, ApiPreference::Compatibility12] {
         exercise_read_only_depth(api);
@@ -4031,7 +4170,7 @@ fn sampled_color_attachment_uses_native_feedback_layout() {
 }
 
 #[test]
-fn replacement_draw_into_undefined_color_needs_no_load_and_preserves_unwritten_bytes() {
+fn partial_color_target_preserves_defined_texels_across_replacement_and_blended_draws() {
     let Some(mut cache) = cache(ApiPreference::Auto, 16 * 1024 * 1024) else {
         return;
     };
@@ -4152,6 +4291,67 @@ fn replacement_draw_into_undefined_color_needs_no_load_and_preserves_unwritten_b
             .require_image_initialized(image, plane, area())
             .is_err()
     );
+    // Blending reads only the scissored left half of the defined region. LOAD
+    // preserves those texels without requiring the unused right half to exist.
+    let mut state = GraphicsState::color(vk::Format::R8G8B8A8_UNORM);
+    let blend = &mut Arc::make_mut(&mut state.colors)[0].1;
+    blend.enabled = true;
+    blend.src_color = vk::BlendFactor::ONE;
+    blend.dst_color = vk::BlendFactor::ONE;
+    blend.write_mask = vk::ColorComponentFlags::G;
+    let pipeline = compiler(&cache)
+        .request(PipelineRecipe::Graphics {
+            shader: solid_artifact(),
+            state: state.clone(),
+        })
+        .unwrap();
+    let program = cache.prepare_program(pipeline, &[]).unwrap();
+    let mut parameters = GraphicsParameters::new(state, area().extent);
+    parameters.scissors[0] = vk::Rect2D {
+        offset: Default::default(),
+        extent: vk::Extent2D {
+            width: 2,
+            height: 8,
+        },
+    };
+    let graphics = cache.prepare_graphics(program, parameters).unwrap();
+    let targets = cache
+        .prepare_targets(RenderingTargets {
+            area: area(),
+            colors: Box::new([Some(RenderAttachment::color(
+                image,
+                0,
+                AttachmentLoad::Load,
+                AttachmentStore::Store,
+            ))]),
+            depth: None,
+            stencil: None,
+        })
+        .unwrap();
+    let blended = cache
+        .prepare_draw(graphics, targets, Box::new([]), None)
+        .unwrap();
+    cache
+        .draw(
+            &blended,
+            Draw::Direct {
+                vertices: 3,
+                instances: 1,
+                first_vertex: 0,
+                first_instance: 0,
+            },
+            &[0f32, 1., 0., 1.]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    assert_eq!(cache.statistics().cpu_uploaded_bytes, 0);
+    assert!(
+        cache
+            .require_image_initialized(image, plane, area())
+            .is_err()
+    );
     cache.flush().unwrap();
     let output = cpu_read(&mut cache, &bytes);
     let mut expected = vec![0xa5; 4096];
@@ -4159,7 +4359,7 @@ fn replacement_draw_into_undefined_color_needs_no_load_and_preserves_unwritten_b
         for pixel in 0..4 {
             expected[32 + row * 48 + pixel * 4..36 + row * 48 + pixel * 4].copy_from_slice(
                 if pixel < 2 {
-                    &[255, 0, 0, 255]
+                    &[255, 255, 0, 255]
                 } else {
                     &[0, 255, 0, 255]
                 },

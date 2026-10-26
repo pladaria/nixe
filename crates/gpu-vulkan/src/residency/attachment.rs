@@ -8,7 +8,6 @@ pub(super) struct AttachmentEntry {
     pub state: sync::AccessState,
     pub layout: vk::ImageLayout,
     pub aspects: vk::ImageAspectFlags,
-    pub undefined: Vec<vk::Rect2D>,
     pub last_use: Option<WorkTicket>,
 }
 impl VulkanResidency {
@@ -86,13 +85,6 @@ impl VulkanResidency {
                 aspects,
                 state: Default::default(),
                 layout: vk::ImageLayout::UNDEFINED,
-                undefined: vec![vk::Rect2D {
-                    offset: Default::default(),
-                    extent: vk::Extent2D {
-                        width: description.extent.width,
-                        height: description.extent.height,
-                    },
-                }],
                 last_use: None,
             }),
         };
@@ -141,6 +133,14 @@ impl VulkanResidency {
             } else {
                 dependency.unwrap().source
             };
+            let destination = if entry.layout != layout && !scope.writes() {
+                AccessScope::new(
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                )
+            } else {
+                scope
+            };
             let aspect = entry.aspects;
             self.barriers.queue_image(
                 vk::ImageMemoryBarrier2::default()
@@ -148,8 +148,8 @@ impl VulkanResidency {
                     .new_layout(layout)
                     .src_stage_mask(source.stages)
                     .src_access_mask(source.access)
-                    .dst_stage_mask(scope.stages)
-                    .dst_access_mask(scope.access)
+                    .dst_stage_mask(destination.stages)
+                    .dst_access_mask(destination.access)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(entry.view.image.handle)
@@ -164,21 +164,5 @@ impl VulkanResidency {
         entry.layout = layout;
         entry.last_use = Some(work);
         Ok(entry.view.image.handle)
-    }
-    pub(super) fn attachment_discarded(&mut self, id: AttachmentId, rect: vk::Rect2D) {
-        self.attachments[id.slot]
-            .entry
-            .as_mut()
-            .unwrap()
-            .undefined
-            .push(rect);
-    }
-    pub(super) fn attachment_defined(&mut self, id: AttachmentId, rect: vk::Rect2D) {
-        let entry = self.attachments[id.slot].entry.as_mut().unwrap();
-        entry.undefined = entry
-            .undefined
-            .drain(..)
-            .flat_map(|r| transfers::subtract_rect(r, rect))
-            .collect();
     }
 }

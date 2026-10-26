@@ -470,20 +470,28 @@ impl VulkanResidency {
                 if let Some(dependency) = dependency {
                     self.barriers.memory_dependency(dependency);
                 }
-            } else if cell.layout != layout || dependency.is_some() {
-                let source = if cell.layout != layout {
-                    preceding
+            } else {
+                // The transition itself can write memory even when the first
+                // consumer only reads. Make it visible to later consumers too,
+                // as in the native texture cache's stable-layout initialization.
+                // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L3154-L3181
+                // https://docs.vulkan.org/spec/latest/chapters/synchronization.html#synchronization-image-layout-transitions
+                let destination = if scope.writes() {
+                    scope
                 } else {
-                    dependency.map_or_else(AccessScope::default, |d| d.source)
+                    AccessScope::new(
+                        vk::PipelineStageFlags2::ALL_COMMANDS,
+                        vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                    )
                 };
                 self.barriers.images.push(
                     vk::ImageMemoryBarrier2::default()
                         .old_layout(cell.layout)
                         .new_layout(layout)
-                        .src_stage_mask(source.stages)
-                        .src_access_mask(source.access)
-                        .dst_stage_mask(scope.stages)
-                        .dst_access_mask(scope.access)
+                        .src_stage_mask(preceding.stages)
+                        .src_access_mask(preceding.access)
+                        .dst_stage_mask(destination.stages)
+                        .dst_access_mask(destination.access)
                         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .image(entry.native.handle)

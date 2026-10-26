@@ -383,6 +383,7 @@ impl NativeGpuExecution {
             // Attachment load/store coverage follows the guest surface clip, not
             // allocation alignment or a per-draw scissor. Keep viewport coordinates
             // independent and retain scopes across dynamic scissor changes.
+            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1197-L1208
             // https://docs.vulkan.org/spec/latest/chapters/renderpass.html#renderpass-renderarea
             let mut area = state.parameters.render_area;
             // An empty guest clip is enforced by its empty scissor. Vulkan still

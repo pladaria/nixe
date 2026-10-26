@@ -257,7 +257,7 @@ impl VulkanResidency {
                 self.image(id)?.discarded
             );
             return Err(VulkanError::InvalidResource(
-                "image read/attachment LOAD consumes undefined or discarded texels; an actual producer is required",
+                "image read consumes undefined or discarded texels; an actual producer is required",
             ));
         }
         Ok(())
@@ -626,18 +626,6 @@ pub(super) fn full_rect(p: ImagePlane) -> vk::Rect2D {
             height: p.extent.height,
         },
     }
-}
-pub(super) fn contains_rect(outer: vk::Rect2D, inner: vk::Rect2D) -> bool {
-    let end = |r: vk::Rect2D| {
-        [
-            i64::from(r.offset.x) + i64::from(r.extent.width),
-            i64::from(r.offset.y) + i64::from(r.extent.height),
-        ]
-    };
-    outer.offset.x <= inner.offset.x
-        && outer.offset.y <= inner.offset.y
-        && end(outer)[0] >= end(inner)[0]
-        && end(outer)[1] >= end(inner)[1]
 }
 pub(super) fn intersects(a: vk::Rect2D, b: vk::Rect2D) -> bool {
     a.offset.x < b.offset.x + b.extent.width as i32

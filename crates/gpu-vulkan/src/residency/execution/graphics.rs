@@ -788,109 +788,41 @@ impl VulkanResidency {
         } else {
             None
         };
-        let mut color_loads = None::<Vec<vk::RenderingAttachmentInfo<'static>>>;
-        {
-            for a in prepared.targets.attachments() {
-                match a.description.source {
-                    AttachmentSource::Canonical { image, .. } => {
-                        if a.description.load == vk::AttachmentLoadOp::LOAD {
-                            let replacement = if a.plane.aspect == vk::ImageAspectFlags::COLOR
-                                && !empty
-                                && !self.image(image)?.discarded.is_empty()
-                            {
-                                self.invalidate_cpu_resources(&[])?;
-                                prepared
-                                    .targets
-                                    .colors
-                                    .iter()
-                                    .position(|color| {
-                                        color.as_ref().is_some_and(|color| std::ptr::eq(color, a))
-                                    })
-                                    .filter(|&index| {
-                                        let state = &graphics.parameters.state;
-                                        let blend = &state.colors[index].1;
-                                        !state.logic_enabled
-                                            && !blend.enabled
-                                            && blend.write_mask
-                                                == (vk::ColorComponentFlags::R
-                                                    | vk::ColorComponentFlags::G
-                                                    | vk::ColorComponentFlags::B
-                                                    | vk::ColorComponentFlags::A)
-                                    })
-                            } else {
-                                None
-                            };
-                            // LOAD preserves existing texels; it does not mean the
-                            // guest reads the destination. Replacement draws can
-                            // write an incompletely initialized target. Keep LOAD
-                            // when it preserves defined texels; discard only an
-                            // entirely undefined render area.
-                            // https://docs.vulkan.org/refpages/latest/refpages/source/VkAttachmentLoadOp.html
-                            let discard = replacement.filter(|_| {
-                                self.image(image).unwrap().discarded.iter().any(
-                                    |&(plane, undefined)| {
-                                        self.image(image).unwrap().planes[plane] == a.plane
-                                            && transfers::contains_rect(
-                                                undefined,
-                                                prepared.targets.area,
-                                            )
-                                    },
-                                )
-                            });
-                            if let Some(index) = discard {
-                                color_loads.get_or_insert_with(|| {
-                                    prepared.targets.native_colors.to_vec()
-                                })[index]
-                                    .load_op = vk::AttachmentLoadOp::DONT_CARE;
-                            } else if replacement.is_none() {
-                                self.ensure_image_initialized(
-                                    image,
-                                    a.plane,
-                                    prepared.targets.area,
-                                )?;
-                            }
-                        } else {
-                            // CLEAR and DONT_CARE do not consume the previous texels.
-                            // Keep undefined/dirty coverage outside the actual write.
-                            self.invalidate_cpu_resources(&[])?;
-                        }
-                        if !read_only_attachment(a, &graphics.parameters.state)
-                            && (!empty || a.description.load == vk::AttachmentLoadOp::CLEAR)
-                        {
-                            let entry = self.image(image)?;
-                            let incomplete = a.description.load == vk::AttachmentLoadOp::LOAD
-                                && entry.discarded.iter().any(|&(index, rect)| {
-                                    entry.planes[index] == a.plane
-                                        && transfers::intersects(rect, prepared.targets.area)
-                                });
-                            let regions = if incomplete {
-                                preserved_draw_rects(
-                                    prepared.targets.area,
-                                    entry.discarded.iter().filter_map(|&(index, rect)| {
-                                        (entry.planes[index] == a.plane).then_some(rect)
-                                    }),
-                                    &graphics.parameters.scissors,
-                                )
-                            } else {
-                                vec![prepared.targets.area]
-                            };
-                            for rect in regions {
-                                writers.push(self.prepare_image_rect(image, a.plane, rect)?);
-                            }
-                        }
-                    }
-                    AttachmentSource::ResidentOnly(id) => {
-                        if a.description.load == vk::AttachmentLoadOp::LOAD
-                            && self
-                                .attachment(id)?
-                                .undefined
-                                .iter()
-                                .any(|r| transfers::intersects(*r, prepared.targets.area))
-                        {
-                            return Err(VulkanError::InvalidResource(
-                                "attachment LOAD consumes undefined or discarded samples",
-                            ));
-                        }
+        for a in prepared.targets.attachments() {
+            if let AttachmentSource::Canonical { image, .. } = a.description.source {
+                if a.description.load == vk::AttachmentLoadOp::LOAD {
+                    // LOAD preserves prior contents, including undefined texels
+                    // outside the draw's actual fragment coverage. Prepare current
+                    // memory/aliases without requiring a fully authored render area.
+                    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h#L2504-L2523
+                    // https://docs.vulkan.org/refpages/latest/refpages/source/VkAttachmentLoadOp.html
+                    self.ensure_image(image)?;
+                } else {
+                    // CLEAR and DONT_CARE do not consume the previous texels.
+                    self.invalidate_cpu_resources(&[])?;
+                }
+                if !read_only_attachment(a, &graphics.parameters.state)
+                    && (!empty || a.description.load == vk::AttachmentLoadOp::CLEAR)
+                {
+                    let entry = self.image(image)?;
+                    let incomplete = a.description.load == vk::AttachmentLoadOp::LOAD
+                        && entry.discarded.iter().any(|&(index, rect)| {
+                            entry.planes[index] == a.plane
+                                && transfers::intersects(rect, prepared.targets.area)
+                        });
+                    let regions = if incomplete {
+                        preserved_draw_rects(
+                            prepared.targets.area,
+                            entry.discarded.iter().filter_map(|&(index, rect)| {
+                                (entry.planes[index] == a.plane).then_some(rect)
+                            }),
+                            &graphics.parameters.scissors,
+                        )
+                    } else {
+                        vec![prepared.targets.area]
+                    };
+                    for rect in regions {
+                        writers.push(self.prepare_image_rect(image, a.plane, rect)?);
                     }
                 }
             }
@@ -1002,9 +934,7 @@ impl VulkanResidency {
                     let mut info = vk::RenderingInfo::default()
                         .render_area(targets.area)
                         .layer_count(1)
-                        .color_attachments(
-                            color_loads.as_deref().unwrap_or(&targets.native_colors),
-                        );
+                        .color_attachments(&targets.native_colors);
                     if let Some(depth) = &targets.native_depth {
                         info = info.depth_attachment(depth);
                     }
@@ -1125,15 +1055,7 @@ impl VulkanResidency {
                         self.mark_image_discarded(image, a.plane, prepared.targets.area);
                     }
                 }
-                AttachmentSource::ResidentOnly(id) => {
-                    if a.description.store == vk::AttachmentStoreOp::DONT_CARE
-                        || empty && a.description.load == vk::AttachmentLoadOp::DONT_CARE
-                    {
-                        self.attachment_discarded(id, prepared.targets.area);
-                    } else {
-                        self.attachment_defined(id, prepared.targets.area);
-                    }
-                }
+                AttachmentSource::ResidentOnly(_) => {}
             }
         }
         self.device.work_ticket()

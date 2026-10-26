@@ -203,7 +203,7 @@ impl WindowFrontend {
         options: nixe_gpu_vulkan::DeviceOptions,
     ) -> Result<(nixe_gpu_vulkan::VulkanDevice, PresentationClient), WindowError> {
         let mut attributes = WindowAttributes::default()
-            .with_title("Nixe — Vulkan native")
+            .with_title("Nixe - Vulkan")
             .with_inner_size(LogicalSize::new(1280., 720.))
             .with_min_inner_size(LogicalSize::new(320., 180.));
         if let Some(state) = self.application.initial_window_state {
@@ -238,7 +238,7 @@ impl WindowFrontend {
             let _ = proxy.send_event(FrontendEvent::FrameAvailable);
         }));
         self.application.presenter = Some(Presenter {
-            common: PresenterState::new(window, "Vulkan native"),
+            common: PresenterState::new(window, "Vulkan"),
             client: client.clone(),
             pending: None,
             size: [size.width, size.height],

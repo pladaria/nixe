@@ -23,8 +23,8 @@ impl NativeFailure {
         match self {
             Self::Compilation(error) => VulkanError::Compilation(error.to_string().into()),
             Self::Vulkan { operation, result } => VulkanError::vk(operation, result),
-            Self::Panicked => VulkanError::InvalidResource("Vulkan native scheduler panicked"),
-            Self::Stopped => VulkanError::InvalidResource("Vulkan native scheduler stopped"),
+            Self::Panicked => VulkanError::InvalidResource("Vulkan scheduler panicked"),
+            Self::Stopped => VulkanError::InvalidResource("Vulkan scheduler stopped"),
         }
     }
     pub fn device_lost(&self) -> bool {
