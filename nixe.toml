@@ -62,6 +62,8 @@ file_system_access_log = true
 # Emulated output layout. Only stereo (2.0) is currently implemented.
 [audio]
 output = "stereo"
+# Host volume: 0 mutes output, 100 is full volume. Defaults to 100.
+volume = 10
 
 [video]
 # Synchronize host presentation to the monitor. Defaults to true when omitted.

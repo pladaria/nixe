@@ -62,6 +62,9 @@ impl PreparedStateId {
 pub trait GpuExecution: Send + 'static {
     type Commands: Send + 'static;
     type ImageRequest: Send + 'static;
+    /// Mark graphics command consumption, before frontend decoding. Repeated
+    /// calls belong to the current image until acquire_presentable_image.
+    fn begin_frame_work(&mut self) {}
     /// Host control is serviced by the same concrete owner, outside draw loops.
     fn bind_host_wakeup(
         &mut self,
@@ -139,6 +142,7 @@ pub trait GpuExecution: Send + 'static {
     fn acquire_presentable_image(
         &mut self,
         request: Self::ImageRequest,
+        swap_interval: u32,
     ) -> Result<ResidentImage, BackendRuntimeError>;
     /// Drains accepted host uses; cancels unaccepted work without guest success.
     fn teardown(&mut self) -> Result<(), BackendRuntimeError>;
@@ -218,6 +222,7 @@ impl GpuExecution for std::convert::Infallible {
     fn acquire_presentable_image(
         &mut self,
         _request: Self::ImageRequest,
+        _swap_interval: u32,
     ) -> Result<ResidentImage, BackendRuntimeError> {
         match *self {}
     }

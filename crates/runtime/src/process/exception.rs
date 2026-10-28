@@ -3,39 +3,14 @@ use super::*;
 const MAX_EXIT_STACK_FRAMES: usize = 32;
 
 impl RunnableProcess {
-    /// Routes and atomically applies one supervisor-call decision.
-    ///
-    /// A normal handler must return [`ExceptionResume::Next`]; this method then
-    /// advances past the SVC exactly once. Retry is explicit, suspension keeps
-    /// its selected continuation non-runnable, and faults retain the SVC source
-    /// for deterministic diagnostics.
-    pub fn route_supervisor_call<D: ExceptionDispatcher>(
-        &mut self,
-        stop: &ExecutionStop,
-        dispatcher: &mut D,
-    ) -> Result<ExceptionHandlingResult<D::Fault>, ExceptionRouteError> {
-        let other_live = self
-            .threads
-            .iter()
-            .any(|(id, thread)| *id != self.main_thread_id && thread.exit.is_none());
-        self.route_supervisor_call_for(
-            self.main_thread_id,
-            nixe_scheduler::VirtualCpuId::new(0),
-            stop,
-            dispatcher,
-            other_live,
-        )
-    }
-
     /// Routes an exception to the explicit thread and vCPU from a completed
     /// scheduler lease.
-    pub fn route_supervisor_call_for<D: ExceptionDispatcher>(
+    pub(crate) fn route_supervisor_call_for<D: ExceptionDispatcher>(
         &mut self,
         thread_id: nixe_scheduler::GuestThreadId,
         vcpu: nixe_scheduler::VirtualCpuId,
         stop: &ExecutionStop,
         dispatcher: &mut D,
-        other_live: bool,
     ) -> Result<ExceptionHandlingResult<D::Fault>, ExceptionRouteError> {
         let request = stop
             .exception_dispatch_request()
@@ -56,7 +31,7 @@ impl RunnableProcess {
             self.with_exception_context(thread_id, vcpu, request.source(), |context| {
                 dispatcher.dispatch(context, request)
             })?;
-        self.apply_supervisor_call_outcome(thread_id, request.source(), other_live, outcome)
+        self.apply_supervisor_call_outcome(thread_id, request.source(), outcome)
     }
 
     pub(crate) fn resume_supervisor_call_for<F>(
@@ -64,11 +39,10 @@ impl RunnableProcess {
         thread_id: nixe_scheduler::GuestThreadId,
         vcpu: nixe_scheduler::VirtualCpuId,
         source: LocationDescriptor,
-        other_live: bool,
         continuation: impl FnOnce(&mut ExceptionDispatchContext<'_>) -> ExceptionDispatchOutcome<F>,
     ) -> Result<ExceptionHandlingResult<F>, ExceptionRouteError> {
         let outcome = self.with_exception_context(thread_id, vcpu, source, continuation)?;
-        self.apply_supervisor_call_outcome(thread_id, source, other_live, outcome)
+        self.apply_supervisor_call_outcome(thread_id, source, outcome)
     }
 
     fn with_exception_context<T>(
@@ -82,11 +56,11 @@ impl RunnableProcess {
             .threads
             .get_mut(thread_id)
             .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-        let handle = thread.handle;
-        let object = thread.object.clone();
+        let object = thread.object();
         let process = ExceptionProcessContext::new(
             ExceptionProcessMetadata {
                 process_id: self.process_id,
+                initial_ideal_vcpu: self.initial_ideal_vcpu,
                 cpu: self.cpu,
                 address_space_limit: self.address_space.exclusive_limit(),
                 memory_layout: self.memory_layout,
@@ -95,14 +69,16 @@ impl RunnableProcess {
                 thread_policy: self.thread_policy,
             },
             ExceptionProcessResources {
+                scheduler: &self.scheduler,
                 memory: &self.memory,
                 mounts: &self.mounts,
                 handles: &self.handles,
                 address_waits: &self.address_waits,
             },
         );
+        let tls_base = thread.tls_base;
         let thread =
-            ExceptionThreadContext::new(thread_id, vcpu, object, handle, thread.state_mut());
+            ExceptionThreadContext::new(thread_id, vcpu, object, thread.state_mut(), tls_base);
         let mut context = ExceptionDispatchContext::new(source, process, thread);
         Ok(operation(&mut context))
     }
@@ -111,7 +87,6 @@ impl RunnableProcess {
         &mut self,
         thread_id: nixe_scheduler::GuestThreadId,
         source: LocationDescriptor,
-        other_live: bool,
         outcome: ExceptionDispatchOutcome<F>,
     ) -> Result<ExceptionHandlingResult<F>, ExceptionRouteError> {
         match outcome {
@@ -161,42 +136,50 @@ impl RunnableProcess {
                         .state_mut(),
                     source,
                 )?;
-                let context = self
-                    .thread(thread_id)
+                self.thread_mut(thread_id)
                     .ok_or(ExceptionRouteError::UnknownThread(thread_id))?
-                    .state()
-                    .register_context();
-                let frames = self.capture_exit_stack_frames(thread_id, &context);
-                let exit = ProcessExit {
-                    cause: match reason {
-                        ExceptionTerminationReason::Break {
-                            reason,
-                            info,
-                            size,
-                            payload,
-                        } => ProcessExitCause::GuestBreak {
-                            reason,
-                            info,
-                            size,
-                            payload,
-                        },
-                        ExceptionTerminationReason::Requested => match scope {
-                            ExceptionTerminationScope::CurrentThread => {
-                                ProcessExitCause::LastThreadExited
-                            }
-                            ExceptionTerminationScope::Process => {
-                                ProcessExitCause::ProcessRequested
-                            }
-                        },
-                    },
+                    .exit = Some(ThreadExit {
+                    requested_scope: scope,
                     exit_code,
                     source: Some(source),
-                    thread_id: thread_id.get(),
-                    context: Some(Box::new(context)),
-                    frames,
-                };
-                let terminate_process = scope == ExceptionTerminationScope::Process || !other_live;
+                });
+                let last_thread = self.finish_thread(thread_id);
+                let terminate_process = scope == ExceptionTerminationScope::Process || last_thread;
                 if terminate_process {
+                    let context = self
+                        .thread(thread_id)
+                        .ok_or(ExceptionRouteError::UnknownThread(thread_id))?
+                        .state()
+                        .register_context();
+                    let frames = self.capture_exit_stack_frames(thread_id, &context);
+                    let exit = ProcessExit {
+                        cause: match reason {
+                            ExceptionTerminationReason::Break {
+                                reason,
+                                info,
+                                size,
+                                payload,
+                            } => ProcessExitCause::GuestBreak {
+                                reason,
+                                info,
+                                size,
+                                payload,
+                            },
+                            ExceptionTerminationReason::Requested => match scope {
+                                ExceptionTerminationScope::CurrentThread => {
+                                    ProcessExitCause::LastThreadExited
+                                }
+                                ExceptionTerminationScope::Process => {
+                                    ProcessExitCause::ProcessRequested
+                                }
+                            },
+                        },
+                        exit_code,
+                        source: Some(source),
+                        thread_id: thread_id.get(),
+                        context: Some(Box::new(context)),
+                        frames,
+                    };
                     nixe_scheduler::transition_process(
                         &mut self.lifecycle,
                         nixe_scheduler::ProcessLifecycle::Terminating,
@@ -209,15 +192,6 @@ impl RunnableProcess {
                     .expect("a terminating process may exit");
                     self.process_exit = Some(exit);
                 }
-                let thread = self
-                    .thread_mut(thread_id)
-                    .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-                thread.exit = Some(ThreadExit {
-                    requested_scope: scope,
-                    exit_code,
-                    source: Some(source),
-                });
-                thread.object.signal();
                 Ok(ExceptionHandlingResult::Terminated {
                     scope,
                     exit_code,
@@ -233,17 +207,13 @@ impl RunnableProcess {
                         .state_mut(),
                     source,
                 )?;
-                if !other_live {
+                if self.finish_thread(thread_id) {
                     nixe_scheduler::transition_process(
                         &mut self.lifecycle,
                         nixe_scheduler::ProcessLifecycle::Faulted,
                     )
                     .expect("a live process may fault");
                 }
-                self.thread_mut(thread_id)
-                    .ok_or(ExceptionRouteError::UnknownThread(thread_id))?
-                    .object
-                    .signal();
                 Ok(ExceptionHandlingResult::Fault(fault))
             }
         }

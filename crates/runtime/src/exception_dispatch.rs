@@ -10,6 +10,7 @@ use nixe_cpu::location::LocationDescriptor;
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_memory::GuestVirtualAddress;
 use nixe_scheduler::{GuestThreadId, VirtualCpuId};
+use std::sync::Arc;
 
 use crate::{
     AddressWaitRegistry, HandleTable, ProcessMemoryLayout, ProcessMountNamespace, ThreadObject,
@@ -63,6 +64,7 @@ impl std::fmt::Debug for GuestBreakPayload {
 pub use nixe_cpu::execution::ExceptionDispatchRequest;
 
 pub(crate) struct ExceptionProcessResources<'a> {
+    pub scheduler: &'a std::sync::OnceLock<std::sync::Arc<nixe_scheduler::SchedulerState>>,
     pub memory: &'a std::sync::Arc<ProcessMemory>,
     pub mounts: &'a std::sync::Arc<ProcessMountNamespace>,
     pub handles: &'a std::sync::Arc<HandleTable>,
@@ -85,10 +87,8 @@ pub enum ExceptionResume {
 
 /// Runtime object whose lifetime an exception handler requests to end.
 ///
-/// Keeping this distinction in the backend-independent contract lets a future
-/// multi-thread scheduler remove only the calling thread. The current
-/// single-thread process model converts `CurrentThread` into process exit when
-/// that thread is the last runnable thread.
+/// A current-thread exit ends the process only when its last started thread
+/// terminates. Paused or waiting started threads continue to keep it alive.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExceptionTerminationScope {
     CurrentThread,
@@ -167,7 +167,9 @@ pub enum ExceptionHandlingResult<F> {
 /// exposes guest-domain identities and service boundaries without leaking raw
 /// host pointers or coupling dispatch to native CPU internals.
 pub struct ExceptionProcessContext<'a> {
+    scheduler: &'a std::sync::OnceLock<std::sync::Arc<nixe_scheduler::SchedulerState>>,
     process_id: u64,
+    initial_ideal_vcpu: VirtualCpuId,
     cpu: ProcessCpuContext,
     address_space_limit: u64,
     memory_layout: ProcessMemoryLayout,
@@ -183,6 +185,7 @@ pub struct ExceptionProcessContext<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct ExceptionProcessMetadata {
     pub process_id: u64,
+    pub initial_ideal_vcpu: VirtualCpuId,
     pub cpu: ProcessCpuContext,
     pub address_space_limit: u64,
     pub memory_layout: ProcessMemoryLayout,
@@ -207,7 +210,9 @@ impl<'a> ExceptionProcessContext<'a> {
         resources: ExceptionProcessResources<'a>,
     ) -> Self {
         Self {
+            scheduler: resources.scheduler,
             process_id: metadata.process_id,
+            initial_ideal_vcpu: metadata.initial_ideal_vcpu,
             cpu: metadata.cpu,
             address_space_limit: metadata.address_space_limit,
             memory_layout: metadata.memory_layout,
@@ -225,6 +230,11 @@ impl<'a> ExceptionProcessContext<'a> {
     #[must_use]
     pub const fn process_id(&self) -> u64 {
         self.process_id
+    }
+
+    #[must_use]
+    pub const fn initial_ideal_vcpu(&self) -> VirtualCpuId {
+        self.initial_ideal_vcpu
     }
 
     /// Returns the first address outside the process user address space.
@@ -310,6 +320,13 @@ impl<'a> ExceptionProcessContext<'a> {
         self.address_waits
     }
 
+    /// The canonical scheduling owner shared with native cores and kernel waits.
+    pub fn scheduler(&self) -> &std::sync::Arc<nixe_scheduler::SchedulerState> {
+        self.scheduler
+            .get()
+            .expect("kernel dispatch requires a registered process")
+    }
+
     /// Borrows the immutable mounts and internally synchronized handle table.
     ///
     /// Platform IPC adapters need both resources for an atomic service lookup
@@ -321,10 +338,10 @@ impl<'a> ExceptionProcessContext<'a> {
 
 /// Current guest thread visible while runtime policy handles an exception.
 pub struct ExceptionThreadContext<'a> {
+    tls_base: GuestVirtualAddress,
     id: GuestThreadId,
     vcpu: VirtualCpuId,
-    object: ThreadObject,
-    handle: u32,
+    object: Arc<ThreadObject>,
     state: &'a mut GuestCpuState,
 }
 
@@ -332,15 +349,15 @@ impl<'a> ExceptionThreadContext<'a> {
     pub(crate) const fn new(
         id: GuestThreadId,
         vcpu: VirtualCpuId,
-        object: ThreadObject,
-        handle: u32,
+        object: Arc<ThreadObject>,
         state: &'a mut GuestCpuState,
+        tls_base: GuestVirtualAddress,
     ) -> Self {
         Self {
+            tls_base,
             id,
             vcpu,
             object,
-            handle,
             state,
         }
     }
@@ -355,16 +372,14 @@ impl<'a> ExceptionThreadContext<'a> {
         self.vcpu
     }
 
-    /// Returns the runtime-owned identity of the current thread.
-    #[must_use]
-    pub fn object(&self) -> ThreadObject {
-        self.object.clone()
+    pub const fn tls_base(&self) -> GuestVirtualAddress {
+        self.tls_base
     }
 
-    /// Returns the process-local handle installed for the current thread.
+    /// Returns the runtime-owned identity of the current thread.
     #[must_use]
-    pub const fn handle(&self) -> u32 {
-        self.handle
+    pub fn object(&self) -> Arc<ThreadObject> {
+        self.object.clone()
     }
 
     /// Reads current registers through the exclusive stopped-context owner.

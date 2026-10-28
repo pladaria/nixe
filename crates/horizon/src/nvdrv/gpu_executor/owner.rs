@@ -376,7 +376,14 @@ where
                 frontend.borrow_mut().close_channel(channel);
                 return Ok(());
             }
-            GpuMessage::PresentImage { request, reply } => {
+            GpuMessage::PresentImage {
+                request,
+                swap_interval,
+                reply,
+            } => {
+                if let Some(backend) = owner.borrow().backend.borrow_mut().as_mut() {
+                    backend.begin_frame_work();
+                }
                 let result = frontend
                     .borrow_mut()
                     .lower_presentation(request)
@@ -388,10 +395,17 @@ where
                             .borrow_mut()
                             .as_mut()
                             .ok_or_else(|| Box::<str>::from("GPU backend is unavailable"))?
-                            .acquire_presentable_image(request)
+                            .acquire_presentable_image(request, swap_interval)
                             .map_err(|error| error.to_string().into_boxed_str())
                     });
-                nixe_memory::trace::event("frame_ready", 0, 0, 0);
+                if let Ok(image) = &result {
+                    nixe_memory::trace::event(
+                        "frame_ready",
+                        image.lease().producer().slot(),
+                        image.lease().image().slot,
+                        image.lease().content_version(),
+                    );
+                }
                 let error = result.as_ref().err().cloned();
                 let _ = reply.send(result);
                 return error.map_or(Ok(()), |detail| {
@@ -404,9 +418,14 @@ where
                 source,
                 reply,
             } => (
-                frontend
-                    .borrow_mut()
-                    .lower_nv12_conversion(*destination, source, transform),
+                {
+                    if let Some(backend) = owner.borrow().backend.borrow_mut().as_mut() {
+                        backend.begin_frame_work();
+                    }
+                    frontend
+                        .borrow_mut()
+                        .lower_nv12_conversion(*destination, source, transform)
+                },
                 reply,
             ),
             message => return owner.borrow_mut().service_control(message),
@@ -465,6 +484,12 @@ where
             permit,
         } = submission;
         let id = dispatch.scheduled().frontend();
+        if let Some(backend) = owner.borrow().backend.borrow_mut().as_mut() {
+            backend.begin_frame_work();
+        }
+        let _trace =
+            nixe_memory::trace::span("gpu_command_stream", id.get(), channel.id().get(), 0);
+        nixe_memory::trace::event("gpu_command_begin", id.get(), channel.id().get(), 0);
         let mut host = CommandHost {
             owner: Rc::clone(&owner),
             clock: clock.clone(),
@@ -531,6 +556,7 @@ where
             .submit(id)
             .map_err(|error| state.failure(id, error.to_string()))?;
         state.pending.push_back(PendingWork { token, work });
+        nixe_memory::trace::event("gpu_command_end", id.get(), channel.id().get(), 0);
         Ok(())
     }
     fn cancel(&mut self, cause: &Arc<MemoryError>) {

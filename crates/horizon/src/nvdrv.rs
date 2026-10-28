@@ -184,6 +184,7 @@ impl NvDrvSession {
     pub(crate) fn request_presentable_image(
         &self,
         request: PresentationImageRequest,
+        swap_interval: u32,
     ) -> Result<std::sync::mpsc::Receiver<Result<ResidentImage, Box<str>>>, Box<str>> {
         let backend = self
             .state
@@ -196,7 +197,7 @@ impl NvDrvSession {
             || Err("GPU backend is unavailable for resident presentation".into()),
             |backend| {
                 backend
-                    .request_presentable_image(request)
+                    .request_presentable_image(request, swap_interval)
                     .map_err(|error| error.to_string().into_boxed_str())
             },
         )

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -46,6 +46,8 @@ pub enum ExternalEvent {
     HostPause(bool),
     /// Wakes the host coordinator without making a guest thread runnable.
     HostService(ExternalEventSource),
+    /// The last reference to a canonical thread queued its actual finalization.
+    ThreadRetirement,
     Wake {
         source: ExternalEventSource,
         token: WakeToken,
@@ -65,6 +67,8 @@ struct EventPublication {
     next_sequence: Mutex<u64>,
     pending: AtomicUsize,
     capacity: usize,
+    retired_threads: Mutex<VecDeque<(nixe_scheduler::ProcessId, nixe_scheduler::GuestThreadId)>>,
+    retirement_pending: AtomicBool,
 }
 
 impl EventPublication {
@@ -147,6 +151,48 @@ impl std::fmt::Debug for ExternalWaitGroup {
 }
 
 impl ExternalEventSender {
+    // Destruction queues actual finalization, not a guessed reference-count test.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_auto_object.h#L151-L163
+    pub(crate) fn retire_thread(
+        &self,
+        process: nixe_scheduler::ProcessId,
+        thread: nixe_scheduler::GuestThreadId,
+    ) {
+        let first = {
+            let mut retired = self.publication.retired_threads.lock().unwrap();
+            let first = retired.is_empty();
+            retired.push_back((process, thread));
+            self.publication
+                .retirement_pending
+                .store(true, Ordering::Release);
+            first
+        };
+        if first {
+            match self.submit(ExternalEvent::ThreadRetirement) {
+                Ok(()) | Err(ExternalEventSendError::Full | ExternalEventSendError::Closed) => {}
+                Err(_) => self.overflowed.store(true, Ordering::Release),
+            }
+            // Full ingress already guarantees a wake; the actual work remains
+            // queued and is consumed on that ingress, rather than being lost.
+        }
+    }
+
+    pub(crate) fn take_retired_thread(
+        &self,
+    ) -> Option<(nixe_scheduler::ProcessId, nixe_scheduler::GuestThreadId)> {
+        if !self.publication.retirement_pending.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut retired = self.publication.retired_threads.lock().unwrap();
+        let next = retired.pop_front();
+        if retired.is_empty() {
+            self.publication
+                .retirement_pending
+                .store(false, Ordering::Release);
+        }
+        next
+    }
+
     /// Coalescing is owned by the producer's mailbox. Overflow is reported by
     /// the coordinator instead of silently losing a host service notification.
     pub fn notify_host_service(&self, source: ExternalEventSource) {
@@ -256,7 +302,7 @@ pub(crate) enum CoordinatorEvent {
 }
 
 pub(crate) struct ExternalEventInbox {
-    sender: ExternalEventSender,
+    pub(crate) sender: ExternalEventSender,
     receiver: Receiver<CoordinatorEvent>,
 }
 
@@ -277,6 +323,8 @@ impl ExternalEventInbox {
                     next_sequence: Mutex::new(1),
                     pending: AtomicUsize::new(0),
                     capacity,
+                    retired_threads: Mutex::default(),
+                    retirement_pending: AtomicBool::new(false),
                 }),
                 wait_groups: Arc::new(Mutex::new(HashMap::new())),
                 overflowed: Arc::new(AtomicBool::new(false)),
@@ -343,6 +391,62 @@ impl Error for ExternalEventSendError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canonical_destruction_coalesces_and_preserves_every_finalization_when_ingress_is_full() {
+        use super::*;
+        use nixe_scheduler::{GuestThreadId, ProcessId};
+        for full in [false, true] {
+            let inbox = ExternalEventInbox::bounded(1, 1).unwrap();
+            let sender = inbox.sender();
+            if full {
+                sender
+                    .submit(ExternalEvent::HostService(ExternalEventSource::Input))
+                    .unwrap();
+            }
+            std::thread::scope(|scope| {
+                for worker in 0..4 {
+                    let sender = sender.clone();
+                    scope.spawn(move || {
+                        for i in 0..512 {
+                            let object = crate::ThreadObject::new(worker * 512 + i + 1);
+                            object.bind_retirement(ProcessId::new(7), sender.clone());
+                            drop(object);
+                        }
+                    });
+                }
+            });
+            let Some(CoordinatorEvent::External(event)) = inbox.try_recv().unwrap() else {
+                panic!("missing coalesced ingress");
+            };
+            assert_eq!(
+                event.event,
+                if full {
+                    ExternalEvent::HostService(ExternalEventSource::Input)
+                } else {
+                    ExternalEvent::ThreadRetirement
+                }
+            );
+            inbox.consume_external();
+            assert!(inbox.try_recv().unwrap().is_none());
+            let mut retired = std::collections::BTreeSet::new();
+            while let Some((process, thread)) = sender.take_retired_thread() {
+                assert_eq!(process, ProcessId::new(7));
+                assert!(retired.insert(thread));
+            }
+            assert_eq!(retired.len(), 2048);
+            let object = crate::ThreadObject::new(2049);
+            object.bind_retirement(ProcessId::new(7), sender.clone());
+            drop(object);
+            assert!(
+                matches!(inbox.try_recv().unwrap(), Some(CoordinatorEvent::External(event)) if event.event == ExternalEvent::ThreadRetirement)
+            );
+            assert_eq!(
+                sender.take_retired_thread(),
+                Some((ProcessId::new(7), GuestThreadId::new(2049)))
+            );
+        }
+    }
+
     use super::*;
     use crate::EventObject;
     use nixe_scheduler::{GuestThreadId, WakeGeneration};

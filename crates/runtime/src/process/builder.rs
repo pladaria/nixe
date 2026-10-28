@@ -101,9 +101,9 @@ impl ProcessBuilder {
             .map_or_else(crate::HandleTable::new, |size| {
                 crate::HandleTable::with_capacity_limit(usize::from(size))
             });
-        let main_thread_object = crate::ThreadObject::new(1);
+        let main_thread_object = Arc::new(crate::ThreadObject::new(1));
         let main_thread_handle = handles
-            .insert(main_thread_object.clone())
+            .insert_object(crate::HandleObject::from_arc(main_thread_object.clone()))
             .map_err(|error| {
                 ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
             })?;
@@ -234,7 +234,8 @@ impl ProcessBuilder {
             // The coordinator replaces this process-local provisional identity
             // with a runtime-global identity before scheduler publication.
             id: nixe_scheduler::GuestThreadId::new(1),
-            object: main_thread_object,
+            object: Arc::downgrade(&main_thread_object),
+            running_reference: Some(main_thread_object),
             exit: None,
             state: Some(state),
             handle: main_thread_handle,
@@ -267,9 +268,11 @@ impl ProcessBuilder {
         )
         .map_err(|error| ProcessBuildError::new(ProcessBuildStage::CpuInitialization, error))?;
         let process = RunnableProcess {
+            scheduler: std::sync::OnceLock::new(),
             process_id: self.config.process_id,
             lifecycle: nixe_scheduler::ProcessLifecycle::Running,
             process_exit: None,
+            num_running_threads: 1,
             cpu,
             address_space,
             memory_layout,

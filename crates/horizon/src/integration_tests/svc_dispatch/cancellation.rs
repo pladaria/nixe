@@ -1,4 +1,5 @@
 use super::*;
+use nixe_scheduler::IdealCore;
 
 #[test]
 fn pending_cancellation_survives_polling_and_is_consumed_by_one_wait() {
@@ -53,7 +54,8 @@ fn cancellation_wakes_another_waiting_thread_and_releases_its_deadline() {
     let main = process.main_thread_id();
     process
         .coordinator_mut()
-        .migrate_thread(main, Some(core), affinity.clone())
+        .scheduler()
+        .migrate(main, IdealCore::Core(core), affinity)
         .unwrap();
     let child = process
         .coordinator_mut()

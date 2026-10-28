@@ -117,6 +117,7 @@ enum GpuMessage {
     Submission(GpuQueuedSubmission),
     PresentImage {
         request: PresentationImageRequest,
+        swap_interval: u32,
         reply: mpsc::SyncSender<Result<ResidentImage, Box<str>>>,
     },
     Wake,
@@ -466,7 +467,7 @@ impl NvDrvGpuExecutor {
                 boundary: None,
             });
         };
-        nixe_memory::trace::detail_event("gpu_submission_queued", frontend.get(), 0, 0);
+        nixe_memory::trace::event("gpu_submission_queued", frontend.get(), 0, 0);
         sender
             .send(GpuMessage::Submission(GpuQueuedSubmission {
                 submission,
@@ -580,6 +581,7 @@ impl NvDrvGpuExecutor {
     pub(super) fn request_presentable_image(
         &self,
         request: PresentationImageRequest,
+        swap_interval: u32,
     ) -> Result<mpsc::Receiver<Result<ResidentImage, Box<str>>>, GpuExecutorFailure> {
         self.require_healthy()?;
         let sender = self
@@ -595,7 +597,11 @@ impl NvDrvGpuExecutor {
             })?;
         let (reply, result) = mpsc::sync_channel(1);
         sender
-            .send(GpuMessage::PresentImage { request, reply })
+            .send(GpuMessage::PresentImage {
+                request,
+                swap_interval,
+                reply,
+            })
             .map_err(|_| {
                 self.failure().unwrap_or(GpuExecutorFailure {
                     memory_cause: None,

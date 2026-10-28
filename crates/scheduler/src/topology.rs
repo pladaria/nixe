@@ -12,7 +12,7 @@ pub struct PriorityRange {
 
 impl PriorityRange {
     pub fn new(highest: i32, lowest: i32) -> Result<Self, MachineSchedulerProfileError> {
-        if highest > lowest {
+        if highest < 0 || lowest > 63 || highest > lowest {
             return Err(MachineSchedulerProfileError::InvalidPriorityRange { highest, lowest });
         }
         Ok(Self { highest, lowest })
@@ -89,6 +89,9 @@ impl MachineSchedulerProfile {
         if vcpus.is_empty() {
             return Err(MachineSchedulerProfileError::EmptyTopology);
         }
+        if let Some(core) = vcpus.iter().find(|core| core.id().get() >= 64) {
+            return Err(MachineSchedulerProfileError::InvalidVirtualCpu(core.id()));
+        }
         vcpus.sort_by_key(VirtualCpuDescriptor::id);
         if let Some(duplicate) = vcpus
             .windows(2)
@@ -153,7 +156,10 @@ impl MachineSchedulerProfile {
 
     pub fn all_cores(&self) -> CoreSet {
         CoreSet {
-            cores: self.vcpus.iter().map(VirtualCpuDescriptor::id).collect(),
+            bits: self
+                .vcpus
+                .iter()
+                .fold(0, |mask, core| mask | (1 << core.id().get())),
         }
     }
 
@@ -165,9 +171,9 @@ impl MachineSchedulerProfile {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct CoreSet {
-    cores: Arc<[VirtualCpuId]>,
+    pub(crate) bits: u64,
 }
 
 impl CoreSet {
@@ -175,44 +181,62 @@ impl CoreSet {
     where
         I: IntoIterator<Item = VirtualCpuId>,
     {
-        let mut cores: Vec<_> = cores.into_iter().collect();
-        cores.sort_unstable();
-        cores.dedup();
-        if cores.is_empty() {
+        let mut bits = 0;
+        for core in cores {
+            if !profile.contains(core) {
+                return Err(CoreSetError::UnknownVirtualCpu(core));
+            }
+            bits |= 1 << core.get();
+        }
+        if bits == 0 {
             return Err(CoreSetError::Empty);
         }
-        if let Some(core) = cores.iter().find(|core| !profile.contains(**core)) {
-            return Err(CoreSetError::UnknownVirtualCpu(*core));
-        }
-        Ok(Self {
-            cores: cores.into(),
-        })
+        Ok(Self { bits })
     }
 
     #[must_use]
-    pub fn contains(&self, id: VirtualCpuId) -> bool {
-        self.cores.binary_search(&id).is_ok()
+    pub const fn contains(self, id: VirtualCpuId) -> bool {
+        id.get() < 64 && self.bits & (1 << id.get()) != 0
     }
 
     #[must_use]
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = VirtualCpuId> + '_ {
-        self.cores.iter().copied()
+    pub const fn iter(&self) -> CoreIterator {
+        CoreIterator(self.bits)
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.cores.len()
+    pub const fn len(&self) -> usize {
+        self.bits.count_ones() as usize
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.cores.is_empty()
+    pub const fn is_empty(&self) -> bool {
+        self.bits == 0
     }
 }
+
+pub struct CoreIterator(u64);
+impl Iterator for CoreIterator {
+    type Item = VirtualCpuId;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.0 == 0 {
+            return None;
+        }
+        let core = self.0.trailing_zeros();
+        self.0 &= self.0 - 1;
+        Some(VirtualCpuId::new(core))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.0.count_ones() as usize;
+        (len, Some(len))
+    }
+}
+impl ExactSizeIterator for CoreIterator {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MachineSchedulerProfileError {
     EmptyTopology,
+    InvalidVirtualCpu(VirtualCpuId),
     DuplicateVirtualCpu(VirtualCpuId),
     InvalidPriorityRange { highest: i32, lowest: i32 },
     InvalidPreemptionPolicy,
@@ -221,6 +245,10 @@ pub enum MachineSchedulerProfileError {
 impl Display for MachineSchedulerProfileError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidVirtualCpu(id) => write!(
+                formatter,
+                "virtual CPU {id} exceeds the 64-bit affinity mask"
+            ),
             Self::EmptyTopology => formatter.write_str("machine topology has no virtual CPUs"),
             Self::DuplicateVirtualCpu(id) => {
                 write!(formatter, "duplicate virtual CPU identity {id}")
@@ -298,7 +326,7 @@ mod tests {
                 VirtualCpuDescriptor::new(VirtualCpuId::new(9), 1),
                 VirtualCpuDescriptor::new(VirtualCpuId::new(2), 0),
             ],
-            PriorityRange::new(-4, 12).unwrap(),
+            PriorityRange::new(0, 12).unwrap(),
         )
         .unwrap();
         assert!(profile.contains(VirtualCpuId::new(9)));

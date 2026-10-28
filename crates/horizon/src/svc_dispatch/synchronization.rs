@@ -17,6 +17,69 @@ pub(super) struct ReplyReceiveWait {
 }
 
 impl HorizonSvcDispatcher {
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/svc/svc_synchronization.cpp#L117-L132
+    pub(super) fn synchronize_preemption_state(
+        &mut self,
+        context: &mut ExceptionDispatchContext<'_>,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        let scheduler = context.process().scheduler();
+        let thread = context.thread().id();
+        let core = context.thread().vcpu();
+        let process = ProcessId::new(context.process().process_id());
+        match scheduler.pinned_thread(process, core) {
+            Ok(pin) if pin != Some(thread) => return resume(),
+            Ok(_) => {}
+            Err(fault) => {
+                return ExceptionDispatchOutcome::Fault(HorizonSvcFault::Scheduling {
+                    operation: "SynchronizePreemptionState",
+                    fault,
+                });
+            }
+        }
+        let address = context
+            .thread()
+            .tls_base()
+            .checked_add(0x102)
+            .expect("bounded kernel TLS");
+        let unpin = move |scheduler: &nixe_scheduler::SchedulerState| match scheduler
+            .unpin_thread(thread)
+        {
+            Ok(()) => resume(),
+            Err(fault) => ExceptionDispatchOutcome::Fault(HorizonSvcFault::Scheduling {
+                operation: "SynchronizePreemptionState",
+                fault,
+            }),
+        };
+        let pending = match context
+            .process()
+            .memory()
+            .space()
+            .write_value(address, 2, 0)
+        {
+            Ok(nixe_memory::Access::Ready(())) => return unpin(scheduler),
+            Err(fault) => {
+                return ExceptionDispatchOutcome::Fault(HorizonSvcFault::MemoryAccess {
+                    immediate: 0x36,
+                    fault: std::sync::Arc::new(fault),
+                });
+            }
+            Ok(nixe_memory::Access::Pending(pending)) => pending,
+        };
+        let scheduler = scheduler.clone();
+        self.kernel_access(
+            context,
+            Ok(nixe_memory::Access::Pending(pending)),
+            move |_, _, result| match result {
+                Err(fault) => ExceptionDispatchOutcome::Fault(HorizonSvcFault::MemoryAccess {
+                    immediate: 0x36,
+                    fault,
+                }),
+                Ok(nixe_memory::AccessResult::Written) => unpin(&scheduler),
+                Ok(_) => ExceptionDispatchOutcome::Fault(runtime_fault("TLS flag completion kind")),
+            },
+        )
+    }
+
     pub(super) fn reply_and_receive(
         &mut self,
         context: &mut ExceptionDispatchContext<'_>,
@@ -347,7 +410,7 @@ impl HorizonSvcDispatcher {
         for (index, word) in words.iter_mut().enumerate() {
             *word = read_register(context.thread().state(), index as u8 + 1) as u32;
         }
-        let thread_id = context.thread().object().thread_id();
+        let thread_id = context.thread().id().get();
         if words[0] & (1 << 31) != 0
             && !self.reply_sent.contains(&thread_id)
             && let Err(error) = session.reply(SessionMessage::Light(words))
@@ -432,8 +495,8 @@ pub(super) fn get_thread_id(
     context: &mut ExceptionDispatchContext<'_>,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let handle = read_register(context.thread().state(), 1) as u32;
-    let thread_id = if handle == CURRENT_THREAD_HANDLE || handle == context.thread().handle() {
-        Some(context.thread().object().thread_id())
+    let thread_id = if handle == CURRENT_THREAD_HANDLE {
+        Some(context.thread().id().get())
     } else {
         context
             .process()
@@ -616,9 +679,6 @@ impl HorizonSvcDispatcher {
                     .lock()
                     .remove(mutex, thread);
                 self.finish_wait(thread.get(), 0x1c);
-                if let Err(fault) = self.synchronize_mutex_waits(context, vec![mutex]) {
-                    return ExceptionDispatchOutcome::Fault(fault);
-                }
                 result(context, HorizonKernelResult::TIMED_OUT);
                 return resume();
             }
@@ -643,6 +703,15 @@ impl HorizonSvcDispatcher {
         } else {
             None
         };
+        let registration = match registration.transpose() {
+            Ok(registration) => registration,
+            Err(fault) => {
+                return ExceptionDispatchOutcome::Fault(HorizonSvcFault::Scheduling {
+                    operation: "WaitProcessWideKeyAtomic",
+                    fault,
+                });
+            }
+        };
         if let Some(registration) = &registration {
             self.pending_wakes.insert(
                 thread.get(),
@@ -652,13 +721,9 @@ impl HorizonSvcDispatcher {
                 },
             );
         }
-        if let Err(fault) = self.synchronize_mutex_waits(context, vec![mutex]) {
-            return ExceptionDispatchOutcome::Fault(fault);
-        }
         let handles = context.process().handles().clone();
         let source = context.source();
         let vcpu = context.thread().vcpu();
-        let process = ProcessId::new(context.process().process_id());
         let clock = self.virtual_clock.clone();
         let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
         lifetime
@@ -666,13 +731,18 @@ impl HorizonSvcDispatcher {
             .expect("new condition release is not cancelled");
         let memory_deadline = registration.as_ref().and(deadline);
         self.start_owned_svc(context, lifetime, memory_deadline, async move {
-            let executed: Result<(), std::sync::Arc<nixe_memory::MemoryError>> = async {
+            let executed: Result<(), HorizonSvcFault> = async {
                 {
                     // Eden holds its scheduler lock across waiter selection
                     // and the userspace write. Keep that same exclusion for
                     // this word while a physical operation is pending.
                     let _operation = waits.address_operation(mutex, thread, &clock).await;
-                    let handoff = waits.lock().claim_mutex(mutex, thread);
+                    let handoff = waits.lock().claim_mutex(mutex, thread).map_err(|fault| {
+                        HorizonSvcFault::Scheduling {
+                            operation: "mutex handoff",
+                            fault,
+                        }
+                    })?;
                     let released = async {
                         if let Some(key_word) = key_word
                             && let Err(error) = key_word.write(1).await
@@ -690,32 +760,39 @@ impl HorizonSvcDispatcher {
                             nixe_runtime::AddressWaitCompletion::InvalidMemory,
                         );
                     }
-                    released?;
+                    released.map_err(|fault| HorizonSvcFault::MemoryAccess {
+                        immediate: 0x1c,
+                        fault,
+                    })?;
                 }
                 if let Some(registration) = &registration {
                     let claim = waits.lock().finish_condition_release(registration);
                     if let Some(claim) = claim {
-                        reacquire_condition_mutex(&waits, &handles, claim, &clock).await?;
+                        reacquire_condition_mutex(&waits, &handles, claim, &clock, 0x1c, thread)
+                            .await?;
                     }
                 }
                 Ok(())
             }
             .await;
             match executed {
-                Err(fault) if !fault.is_access_fault() => Err(HorizonSvcFault::MemoryAccess {
-                    immediate: 0x1c,
-                    fault,
-                }),
-                executed => Ok(memory_wait::SvcCompletion::kernel(
+                Err(HorizonSvcFault::MemoryAccess { fault, .. }) if fault.is_access_fault() => Ok(
+                    memory_wait::SvcCompletion::kernel(source, vcpu, move |dispatcher, context| {
+                        let mut state = context.process().address_waits().lock();
+                        state.remove(key, thread);
+                        state.remove(mutex, thread);
+                        drop(state);
+                        dispatcher.finish_wait(thread.get(), 0x1c);
+                        result(context, HorizonKernelResult::INVALID_CURRENT_MEMORY);
+                        resume()
+                    }),
+                ),
+                Err(fault) => Err(fault),
+                Ok(()) => Ok(memory_wait::SvcCompletion::kernel(
                     source,
                     vcpu,
                     move |dispatcher, context| {
-                        if executed.is_err() || timeout == 0 {
-                            let code = if executed.is_err() {
-                                HorizonKernelResult::INVALID_CURRENT_MEMORY
-                            } else {
-                                HorizonKernelResult::TIMED_OUT
-                            };
+                        if timeout == 0 {
                             let waits = context.process().address_waits().clone();
                             {
                                 let mut state = waits.lock();
@@ -723,14 +800,13 @@ impl HorizonSvcDispatcher {
                                 state.remove(mutex, thread);
                             }
                             dispatcher.finish_wait(thread.get(), 0x1c);
-                            result(context, code);
+                            result(context, HorizonKernelResult::TIMED_OUT);
                             resume()
                         } else {
                             dispatcher.finish_condition_call(context, key, mutex)
                         }
                     },
-                )
-                .mutex_effects(process, vec![mutex])),
+                )),
             }
         })
     }
@@ -763,6 +839,7 @@ impl HorizonSvcDispatcher {
         &mut self,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        let thread = context.thread().id();
         let key = read_register(context.thread().state(), 0) & !3;
         let count = read_register(context.thread().state(), 1) as u32 as i32;
         let limit = if count <= 0 {
@@ -781,7 +858,7 @@ impl HorizonSvcDispatcher {
                     Some(nixe_runtime::ConditionSignal::Reacquire(claim)) => claims.push(claim),
                 }
             }
-            let clear = state.next_condition(key).is_none();
+            let clear = !state.has_condition_waiters(key);
             (claims, clear)
         };
         let key_word = if clear {
@@ -793,12 +870,10 @@ impl HorizonSvcDispatcher {
         } else {
             None
         };
-        let changed: Vec<_> = claims.iter().map(|claim| claim.mutex).collect();
         let handles = context.process().handles().clone();
         let clock = self.virtual_clock.clone();
         let source = context.source();
         let vcpu = context.thread().vcpu();
-        let process = ProcessId::new(context.process().process_id());
         let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
         lifetime
             .begin()
@@ -811,10 +886,17 @@ impl HorizonSvcDispatcher {
                 && !fault.is_access_fault()
             {
                 for claim in &claims {
-                    waits.lock().finish_condition_acquire(
-                        claim,
-                        nixe_runtime::ConditionAcquire::InvalidMemory,
-                    );
+                    waits
+                        .lock()
+                        .finish_condition_acquire(
+                            claim,
+                            nixe_runtime::ConditionAcquire::InvalidMemory,
+                            thread,
+                        )
+                        .map_err(|fault| HorizonSvcFault::Scheduling {
+                            operation: "condition cancellation",
+                            fault,
+                        })?;
                 }
                 return Err(HorizonSvcFault::MemoryAccess {
                     immediate: 0x1d,
@@ -822,17 +904,11 @@ impl HorizonSvcDispatcher {
                 });
             }
             for claim in claims {
-                reacquire_condition_mutex(&waits, &handles, claim, &clock)
-                    .await
-                    .map_err(|fault| HorizonSvcFault::MemoryAccess {
-                        immediate: 0x1d,
-                        fault,
-                    })?;
+                reacquire_condition_mutex(&waits, &handles, claim, &clock, 0x1d, thread).await?;
             }
-            Ok(
-                memory_wait::SvcCompletion::kernel(source, vcpu, |_, _| resume())
-                    .mutex_effects(process, changed),
-            )
+            Ok(memory_wait::SvcCompletion::kernel(source, vcpu, |_, _| {
+                resume()
+            }))
         })
     }
 
@@ -889,7 +965,6 @@ impl HorizonSvcDispatcher {
         let clock = self.virtual_clock.clone();
         let source = context.source();
         let vcpu = context.thread().vcpu();
-        let process = ProcessId::new(context.process().process_id());
         let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
         lifetime
             .begin()
@@ -918,16 +993,30 @@ impl HorizonSvcDispatcher {
                         None => (Some(HorizonKernelResult::INVALID_HANDLE), None),
                         Some(owner) => {
                             let mut state = waits.lock();
-                            if state.owner(mutex).is_none() {
-                                state.set_owner(mutex, GuestThreadId::new(owner.thread_id()));
-                            }
-                            (None, Some(state.enqueue(mutex, thread, tag)))
+                            (
+                                None,
+                                Some(
+                                    state
+                                        .enqueue(
+                                            mutex,
+                                            GuestThreadId::new(owner.thread_id()),
+                                            thread,
+                                            tag,
+                                        )
+                                        .map_err(|fault| HorizonSvcFault::Scheduling {
+                                            operation: "ArbitrateLock",
+                                            fault,
+                                        })?,
+                                ),
+                            )
                         }
                     },
                 }
             };
-            Ok(
-                memory_wait::SvcCompletion::kernel(source, vcpu, move |dispatcher, context| {
+            Ok(memory_wait::SvcCompletion::kernel(
+                source,
+                vcpu,
+                move |dispatcher, context| {
                     if let Some(code) = code {
                         result(context, code);
                         resume()
@@ -941,9 +1030,8 @@ impl HorizonSvcDispatcher {
                         );
                         ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
                     }
-                })
-                .mutex_effects(process, vec![mutex]),
-            )
+                },
+            ))
         })
     }
 
@@ -963,7 +1051,6 @@ impl HorizonSvcDispatcher {
         let clock = self.virtual_clock.clone();
         let source = context.source();
         let vcpu = context.thread().vcpu();
-        let process = ProcessId::new(context.process().process_id());
         let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
         lifetime
             .begin()
@@ -971,7 +1058,12 @@ impl HorizonSvcDispatcher {
         self.start_owned_svc(context, lifetime, None, async move {
             let written = {
                 let _operation = waits.address_operation(mutex, thread, &clock).await;
-                let handoff = waits.lock().claim_mutex(mutex, thread);
+                let handoff = waits.lock().claim_mutex(mutex, thread).map_err(|fault| {
+                    HorizonSvcFault::Scheduling {
+                        operation: "mutex handoff",
+                        fault,
+                    }
+                })?;
                 match word {
                     Ok(word) => complete_mutex_handoff(&waits, &handoff, &word).await,
                     Err(error) => {
@@ -995,37 +1087,15 @@ impl HorizonSvcDispatcher {
                     });
                 }
             };
-            Ok(
-                memory_wait::SvcCompletion::kernel(source, vcpu, move |_, context| {
+            Ok(memory_wait::SvcCompletion::kernel(
+                source,
+                vcpu,
+                move |_, context| {
                     result(context, code);
                     resume()
-                })
-                .mutex_effects(process, vec![mutex]),
-            )
+                },
+            ))
         })
-    }
-
-    pub(super) fn synchronize_mutex_waits(
-        &mut self,
-        context: &ExceptionDispatchContext<'_>,
-        addresses: Vec<u64>,
-    ) -> Result<(), HorizonSvcFault> {
-        let thread = context.thread().id();
-        if let Some(PendingRuntimeRequest::SynchronizeMutexWaits { addresses: pending }) =
-            self.pending_runtime_requests.get_mut(&thread)
-        {
-            for address in addresses {
-                if !pending.contains(&address) {
-                    pending.push(address);
-                }
-            }
-            return Ok(());
-        }
-        self.queue_runtime_request(
-            thread,
-            PendingRuntimeRequest::SynchronizeMutexWaits { addresses },
-            "mutex priority handoff",
-        )
     }
 }
 
@@ -1069,7 +1139,9 @@ async fn reacquire_condition_mutex(
     handles: &HandleTable,
     claim: nixe_runtime::ConditionClaim,
     clock: &nixe_runtime::VirtualClock,
-) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
+    immediate: u32,
+    current: GuestThreadId,
+) -> Result<(), HorizonSvcFault> {
     use nixe_runtime::ConditionAcquire;
     let _operation = waits
         .address_operation(claim.mutex, claim.thread, clock)
@@ -1103,17 +1175,30 @@ async fn reacquire_condition_mutex(
     .await;
     match outcome {
         Ok(outcome) => {
-            waits.lock().finish_condition_acquire(&claim, outcome);
+            waits
+                .lock()
+                .finish_condition_acquire(&claim, outcome, current)
+                .map_err(|fault| HorizonSvcFault::Scheduling {
+                    operation: "condition mutex acquisition",
+                    fault,
+                })?;
             Ok(())
         }
         Err(error) => {
             waits
                 .lock()
-                .finish_condition_acquire(&claim, ConditionAcquire::InvalidMemory);
+                .finish_condition_acquire(&claim, ConditionAcquire::InvalidMemory, current)
+                .map_err(|fault| HorizonSvcFault::Scheduling {
+                    operation: "condition cancellation",
+                    fault,
+                })?;
             if error.is_access_fault() {
                 Ok(())
             } else {
-                Err(error)
+                Err(HorizonSvcFault::MemoryAccess {
+                    immediate,
+                    fault: error,
+                })
             }
         }
     }

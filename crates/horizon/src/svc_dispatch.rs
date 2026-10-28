@@ -60,6 +60,8 @@ impl HorizonKernelResult {
     pub const OUT_OF_SESSIONS: Self = Self(0x0e01);
     pub const THREAD_TERMINATING: Self = Self(0x7601);
     pub const INVALID_HANDLE: Self = Self(0xe401);
+    pub const INVALID_PRIORITY: Self = Self(0xe001);
+    pub const INVALID_CORE_ID: Self = Self(0xe201);
     pub const INVALID_POINTER: Self = Self(0xe601);
     pub const INVALID_ADDRESS: Self = Self(0xcc01);
     pub const INVALID_SIZE: Self = Self(0xca01);
@@ -92,6 +94,8 @@ impl HorizonKernelResult {
             Self::OUT_OF_SESSIONS => "OutOfSessions",
             Self::THREAD_TERMINATING => "ThreadTerminating",
             Self::INVALID_HANDLE => "InvalidHandle",
+            Self::INVALID_PRIORITY => "InvalidPriority",
+            Self::INVALID_CORE_ID => "InvalidCoreId",
             Self::INVALID_POINTER => "InvalidPointer",
             Self::INVALID_ADDRESS => "InvalidAddress",
             Self::INVALID_SIZE => "InvalidSize",
@@ -143,6 +147,10 @@ pub enum HorizonSvcFault {
         immediate: u32,
         fault: Box<HorizonIpcFault>,
     },
+    Scheduling {
+        operation: &'static str,
+        fault: nixe_scheduler::SchedulerError,
+    },
     InternalRuntime {
         operation: &'static str,
     },
@@ -186,7 +194,7 @@ impl HorizonSvcFault {
                 .is_access_fault()
                 .then_some(HorizonKernelResult::INVALID_POINTER),
             Self::Ipc { fault, .. } => fault.guest_result(),
-            Self::InternalRuntime { .. } => None,
+            Self::InternalRuntime { .. } | Self::Scheduling { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
         }
     }
@@ -219,6 +227,9 @@ impl Display for HorizonSvcFault {
             ),
             Self::Ipc { immediate, fault } => {
                 write!(formatter, "Horizon SVC {immediate:#x} {fault}")
+            }
+            Self::Scheduling { operation, fault } => {
+                write!(formatter, "Horizon scheduling {operation} failed: {fault}")
             }
             Self::InternalRuntime { operation } => {
                 write!(
@@ -304,42 +315,28 @@ enum PendingRuntimeRequest {
         core_id: i32,
     },
     StartThread {
-        object_id: u64,
+        thread: std::sync::Arc<ThreadObject>,
     },
     CancelSynchronization {
-        object_id: u64,
+        thread: std::sync::Arc<ThreadObject>,
     },
     GetThreadPriority {
-        object_id: u64,
+        thread: std::sync::Arc<ThreadObject>,
     },
     SetThreadPriority {
-        object_id: u64,
+        thread: std::sync::Arc<ThreadObject>,
         priority: i32,
     },
     GetThreadCoreMask {
-        object_id: u64,
-    },
-    SetThreadCoreMask {
-        object_id: u64,
-        ideal_core: i32,
-        affinity_mask: u64,
+        thread: std::sync::Arc<ThreadObject>,
     },
     SleepThread {
         nanoseconds: i64,
     },
-    SetThreadActivity {
-        object_id: u64,
-        paused: bool,
-    },
     GetThreadContext {
-        object_id: u64,
+        thread: std::sync::Arc<ThreadObject>,
+        guard: nixe_scheduler::ThreadPropertyGuard,
         ranges: Vec<nixe_memory::AllocationRange>,
-    },
-    SynchronizeMutexWaits {
-        addresses: Vec<u64>,
-    },
-    ReapThread {
-        object_id: u64,
     },
     RegisterAddressWait {
         address: u64,
@@ -676,7 +673,6 @@ impl HorizonSvcDispatcher {
         let Some(request) = self.pending_runtime_requests.remove(&thread_id) else {
             return Ok(None);
         };
-        let mut fully_handled = true;
         match request {
             PendingRuntimeRequest::RegisterAddressWait {
                 address,
@@ -685,23 +681,15 @@ impl HorizonSvcDispatcher {
                 source,
                 vcpu,
             } => {
-                let priority = coordinator
-                    .scheduler()
-                    .thread(thread_id)
-                    .ok_or_else(|| runtime_fault("WaitForAddress thread priority"))?
-                    .effective_priority;
                 let event = {
                     let mut state = coordinator
                         .process(process_id)
                         .ok_or_else(|| runtime_fault("WaitForAddress process"))?
                         .address_waits()
                         .lock();
-                    let queue = state.priority_waits_mut();
-                    let event = queue
-                        .enqueue(address, thread_id, priority, deadline)
-                        .ok_or_else(|| runtime_fault("WaitForAddress duplicate registration"))?;
-                    queue.begin_check(thread_id);
-                    event
+                    state
+                        .enqueue_address_wait(address, thread_id, deadline)
+                        .ok_or_else(|| runtime_fault("WaitForAddress duplicate registration"))?
                 };
                 self.pending_wakes.insert(
                     thread_id.get(),
@@ -711,9 +699,8 @@ impl HorizonSvcDispatcher {
                     },
                 );
                 let token = coordinator
-                    .register_wait(thread_id, nixe_scheduler::Readiness::Pending)
-                    .map_err(|_| runtime_fault("address comparison registration"))?
-                    .ok_or_else(|| runtime_fault("address comparison generation"))?;
+                    .register_wait(thread_id)
+                    .map_err(|_| runtime_fault("address comparison registration"))?;
                 let handling = coordinator
                     .resume_supervisor_call(token, vcpu, source, |context| {
                         self.start_address_wait_check(context, address, check)
@@ -778,7 +765,8 @@ impl HorizonSvcDispatcher {
                 );
                 self.finish_create_thread(coordinator, process_id, thread_id, result)?;
             }
-            PendingRuntimeRequest::StartThread { object_id } => {
+            PendingRuntimeRequest::StartThread { thread } => {
+                let object_id = thread.thread_id();
                 let result = coordinator.start_thread(object_id);
                 let code = match result {
                     Ok(_) => HorizonKernelResult::SUCCESS,
@@ -803,7 +791,8 @@ impl HorizonSvcDispatcher {
                     |_| {},
                 )?;
             }
-            PendingRuntimeRequest::CancelSynchronization { object_id } => {
+            PendingRuntimeRequest::CancelSynchronization { thread } => {
+                let object_id = thread.thread_id();
                 let info = coordinator
                     .thread_scheduling_info(object_id)
                     .map_err(|_| runtime_fault("CancelSynchronization target"))?;
@@ -833,10 +822,11 @@ impl HorizonSvcDispatcher {
                     |_| {},
                 )?;
             }
-            PendingRuntimeRequest::GetThreadPriority { object_id } => {
+            PendingRuntimeRequest::GetThreadPriority { thread } => {
+                let object_id = thread.thread_id();
                 let info = coordinator.thread_scheduling_info(object_id);
                 let (code, priority) = match info {
-                    Ok(info) => (HorizonKernelResult::SUCCESS, Some(info.base_priority)),
+                    Ok(info) => (HorizonKernelResult::SUCCESS, Some(info.effective_priority)),
                     Err(nixe_runtime::ThreadOperationError::InvalidHandle) => {
                         (HorizonKernelResult::INVALID_HANDLE, None)
                     }
@@ -855,12 +845,10 @@ impl HorizonSvcDispatcher {
                     },
                 )?;
             }
-            PendingRuntimeRequest::SetThreadPriority {
-                object_id,
-                priority,
-            } => {
+            PendingRuntimeRequest::SetThreadPriority { thread, priority } => {
+                let object_id = thread.thread_id();
                 let code = map_thread_operation(
-                    coordinator.set_thread_priority(object_id, priority),
+                    coordinator.set_thread_priority(Some(thread_id), object_id, priority),
                     "SetThreadPriority",
                 )?;
                 finish_pending_caller(
@@ -872,7 +860,8 @@ impl HorizonSvcDispatcher {
                     |_| {},
                 )?;
             }
-            PendingRuntimeRequest::GetThreadCoreMask { object_id } => {
+            PendingRuntimeRequest::GetThreadCoreMask { thread } => {
+                let object_id = thread.thread_id();
                 let info = coordinator.thread_scheduling_info(object_id);
                 let (code, values) = match info {
                     Ok(info) => {
@@ -903,96 +892,22 @@ impl HorizonSvcDispatcher {
                     },
                 )?;
             }
-            PendingRuntimeRequest::SetThreadCoreMask {
-                object_id,
-                ideal_core,
-                affinity_mask,
-            } => {
-                let mut cores = Vec::new();
-                for descriptor in coordinator.scheduler().profile().vcpus() {
-                    if 1_u64
-                        .checked_shl(descriptor.id().get())
-                        .is_some_and(|bit| affinity_mask & bit != 0)
-                    {
-                        cores.push(descriptor.id());
-                    }
-                }
-                let represented = cores.iter().fold(0_u64, |mask, vcpu| {
-                    mask | 1_u64.checked_shl(vcpu.get()).unwrap_or(0)
-                });
-                let code = if represented != affinity_mask || cores.is_empty() {
-                    HorizonKernelResult::OUT_OF_RANGE
-                } else {
-                    let affinity = coordinator
-                        .scheduler()
-                        .profile()
-                        .core_set(cores)
-                        .map_err(|_| runtime_fault("SetThreadCoreMask"))?;
-                    let ideal = if ideal_core == -1 {
-                        None
-                    } else if let Ok(core) = u32::try_from(ideal_core) {
-                        Some(VirtualCpuId::new(core))
-                    } else {
-                        finish_pending_caller(
-                            coordinator,
-                            process_id,
-                            thread_id,
-                            "SetThreadCoreMask",
-                            HorizonKernelResult::OUT_OF_RANGE,
-                            |_| {},
-                        )?;
-                        return Ok(Some(nixe_runtime::ExceptionHandlingResult::Resumed));
-                    };
-                    map_thread_operation(
-                        coordinator.set_thread_affinity(object_id, ideal, affinity),
-                        "SetThreadCoreMask",
-                    )?
-                };
-                finish_pending_caller(
-                    coordinator,
-                    process_id,
-                    thread_id,
-                    "SetThreadCoreMask",
-                    code,
-                    |_| {},
-                )?;
-            }
             PendingRuntimeRequest::SleepThread { nanoseconds } => {
                 coordinator
                     .sleep_thread(thread_id, nanoseconds)
                     .map_err(|_| runtime_fault("SleepThread"))?;
             }
-            PendingRuntimeRequest::SetThreadActivity { object_id, paused } => {
-                let info = coordinator
-                    .thread_scheduling_info(object_id)
-                    .map_err(|error| match error {
-                        nixe_runtime::ThreadOperationError::InvalidHandle => {
-                            runtime_fault("SetThreadActivity")
-                        }
-                        _ => runtime_fault("SetThreadActivity"),
-                    })?;
-                let code = if info.thread == thread_id {
-                    HorizonKernelResult::INVALID_STATE
-                } else {
-                    map_thread_operation(
-                        coordinator.set_thread_activity(object_id, paused),
-                        "SetThreadActivity",
-                    )?
-                };
-                finish_pending_caller(
-                    coordinator,
-                    process_id,
-                    thread_id,
-                    "SetThreadActivity",
-                    code,
-                    |_| {},
-                )?;
-            }
-            PendingRuntimeRequest::GetThreadContext { object_id, ranges } => {
+            PendingRuntimeRequest::GetThreadContext {
+                thread,
+                ranges,
+                guard,
+            } => {
+                let object_id = thread.thread_id();
                 let info = coordinator
                     .thread_scheduling_info(object_id)
                     .map_err(|_| runtime_fault("GetThreadContext3"))?;
-                if info.thread == thread_id || !info.paused {
+                // The immutable owner/self checks ran before acquiring the lock.
+                if !info.paused {
                     finish_pending_caller(
                         coordinator,
                         process_id,
@@ -1002,10 +917,20 @@ impl HorizonSvcDispatcher {
                         |_| {},
                     )?;
                 } else {
-                    let state = coordinator
-                        .thread_cpu_state(object_id)
-                        .map_err(|_| runtime_fault("GetThreadContext3"))?;
-                    let bytes = encode_thread_context(&state);
+                    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_thread.cpp#L918-L949
+                    let bytes = if matches!(
+                        info.lifecycle,
+                        nixe_scheduler::ThreadLifecycle::Exited
+                            | nixe_scheduler::ThreadLifecycle::Faulted
+                    ) {
+                        vec![0; 0x320]
+                    } else {
+                        let state = coordinator
+                            .thread_cpu_state(object_id)
+                            .map_err(|_| runtime_fault("GetThreadContext3"))?;
+                        encode_thread_context(&state)
+                    };
+                    drop(guard);
                     self.write_runtime_output(
                         coordinator,
                         process_id,
@@ -1016,30 +941,8 @@ impl HorizonSvcDispatcher {
                     )?;
                 }
             }
-            PendingRuntimeRequest::SynchronizeMutexWaits { addresses } => {
-                coordinator
-                    .synchronize_mutex_waits(process_id, &addresses)
-                    .map_err(|_| runtime_fault("mutex priority handoff"))?;
-                fully_handled = false;
-            }
-            PendingRuntimeRequest::ReapThread { object_id } => {
-                self.cancellable_waits.remove(&object_id);
-                self.cancelled_waits.remove(&object_id);
-                self.pending_wait_cancellations.remove(&object_id);
-                coordinator
-                    .reap_thread(object_id)
-                    .map_err(|_| runtime_fault("CloseHandle thread reaping"))?;
-                finish_pending_caller(
-                    coordinator,
-                    process_id,
-                    thread_id,
-                    "CloseHandle thread reaping",
-                    HorizonKernelResult::SUCCESS,
-                    |_| {},
-                )?;
-            }
         }
-        Ok(fully_handled.then_some(nixe_runtime::ExceptionHandlingResult::Resumed))
+        Ok(Some(nixe_runtime::ExceptionHandlingResult::Resumed))
     }
 
     fn finish_create_thread(
@@ -1157,7 +1060,7 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x13 => map_shared_memory(context),
             0x14 => unmap_shared_memory(context),
             0x15 => create_transfer_memory(context),
-            0x16 => close_handle(self, context),
+            0x16 => close_handle(context),
             0x17 => reset_signal(context),
             0x18 => self.wait_synchronization(context),
             0x19 => self.cancel_synchronization(context),
@@ -1178,6 +1081,7 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
             0x33 => self.get_thread_context(context),
             0x34 => self.wait_for_address(context),
             0x35 => self.signal_to_address(context),
+            0x36 => self.synchronize_preemption_state(context),
             0x40 => create_session(context),
             0x41 => accept_session(context),
             0x42 => self.reply_and_receive_light(context),
@@ -1203,8 +1107,8 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
 const fn svc_support(immediate: u32) -> HorizonSvcSupport {
     match immediate {
         0x04 | 0x05 | 0x07 | 0x08 | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x0e | 0x0f | 0x10
-        | 0x13 | 0x14 | 0x15 | 0x16 | 0x19 | 0x25 | 0x27 | 0x32 | 0x34 | 0x35 | 0x40 | 0x41
-        | 0x45 | 0x70 | 0x71 | 0x72 => HorizonSvcSupport::Complete,
+        | 0x13 | 0x14 | 0x15 | 0x16 | 0x19 | 0x25 | 0x27 | 0x32 | 0x34 | 0x35 | 0x36 | 0x40
+        | 0x41 | 0x45 | 0x70 | 0x71 | 0x72 => HorizonSvcSupport::Complete,
         0x01 | 0x02 | 0x03 | 0x06 | 0x11 | 0x12 | 0x17 | 0x18 | 0x1a | 0x1b | 0x1c | 0x1d
         | 0x20 | 0x21 | 0x22 | 0x24 | 0x26 | 0x29 | 0x33 | 0x42 | 0x43 | 0x44 => {
             HorizonSvcSupport::Partial
@@ -1302,7 +1206,7 @@ fn thread_tls(state: &GuestCpuState) -> GuestVirtualAddress {
 fn session_request_owner(context: &ExceptionDispatchContext<'_>) -> SessionRequestOwner {
     SessionRequestOwner {
         process_id: context.process().process_id(),
-        thread_id: context.thread().object().thread_id(),
+        thread_id: context.thread().id().get(),
     }
 }
 
@@ -1429,7 +1333,6 @@ fn read_wait_timeout(state: &GuestCpuState) -> i64 {
 }
 
 fn close_handle(
-    dispatcher: &mut HorizonSvcDispatcher,
     context: &mut ExceptionDispatchContext<'_>,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let handle = read_register(context.thread().state(), 0) as u32;
@@ -1442,25 +1345,9 @@ fn close_handle(
         result(context, HorizonKernelResult::INVALID_HANDLE);
         return resume();
     };
-    let reap = (object.strong_count() == 1)
-        .then(|| object.downcast_ref::<ThreadObject>())
-        .flatten()
-        .filter(|thread| thread.is_signalled())
-        .map(|thread| thread.thread_id());
-    let caller = context.thread().id();
-    let Some(object_id) = reap else {
-        result(context, HorizonKernelResult::SUCCESS);
-        return resume();
-    };
-    if let Err(fault) = dispatcher.queue_runtime_request(
-        caller,
-        PendingRuntimeRequest::ReapThread { object_id },
-        "CloseHandle thread reaping",
-    ) {
-        return ExceptionDispatchOutcome::Fault(fault);
-    }
+    drop(object);
     result(context, HorizonKernelResult::SUCCESS);
-    ExceptionDispatchOutcome::Suspend(ExceptionResume::Next)
+    resume()
 }
 
 fn event_signal(

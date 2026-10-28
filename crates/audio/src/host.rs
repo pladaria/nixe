@@ -14,6 +14,7 @@ struct HostState {
     active: bool,
     paused: bool,
     layout: ChannelLayout,
+    gain: f32,
     next_id: u64,
     streams: HashMap<u64, NativeStream>,
 }
@@ -26,13 +27,14 @@ pub struct HostAudioRuntime {
 }
 
 impl HostAudioRuntime {
-    pub fn new(sdl: &sdl3::Sdl, layout: ChannelLayout) -> Result<Self, AudioError> {
+    pub fn new(sdl: &sdl3::Sdl, layout: ChannelLayout, gain: f32) -> Result<Self, AudioError> {
         let audio = sdl.audio().map_err(error)?;
         Ok(Self {
             state: Arc::new(Mutex::new(HostState {
                 active: true,
                 paused: false,
                 layout,
+                gain,
                 next_id: 0,
                 streams: HashMap::new(),
             })),
@@ -140,6 +142,7 @@ impl AudioBackend for HostAudioBackend {
         if !state.active {
             return Err(AudioError("SDL audio subsystem has been shut down".into()));
         }
+        feed.lock().host_gain = state.gain;
         let format = feed.format();
         // A guest PCM stream and the renderer's selected output layout are
         // independent. SDL converts each stream to the physical device layout.
@@ -287,7 +290,8 @@ mod tests {
         ));
         let sdl = sdl3::init().unwrap();
         let gamepads = sdl.gamepad().unwrap();
-        let runtime = HostAudioRuntime::new(&sdl, ChannelLayout::Stereo).unwrap();
+        verify_host_volume(&sdl);
+        let runtime = HostAudioRuntime::new(&sdl, ChannelLayout::Stereo, 1.0).unwrap();
         verify_callback_pitch_and_channels();
         let backend = runtime.backend();
         assert_eq!(backend.output_layout().unwrap(), ChannelLayout::Stereo);
@@ -378,6 +382,30 @@ mod tests {
         drop(surviving);
         // Closing audio did not shut down SDL's independently held input subsystem.
         gamepads.gamepads().unwrap();
+    }
+
+    fn verify_host_volume(sdl: &sdl3::Sdl) {
+        for (gain, expected) in [(0.0, [0, 0]), (0.1, [6553, -6553]), (1.0, [32767, -32768])] {
+            let runtime = HostAudioRuntime::new(sdl, ChannelLayout::Stereo, gain).unwrap();
+            let backend = runtime.backend();
+            backend.set_paused(true).unwrap();
+            for tag in 0..2 {
+                let output =
+                    AudioOutput::open(backend.as_ref(), PcmFormat::STEREO_48KHZ, Arc::new(|_| {}))
+                        .unwrap();
+                output.append(tag, vec![32767, -32768]).unwrap();
+                output.set_volume(2.0).unwrap();
+                output.start().unwrap();
+                // SDL is paused so this pull exclusively consumes the real
+                // feed initialized by the host backend, including at mute.
+                let mut samples = [1; 2];
+                output.feed.render(&mut samples);
+                assert_eq!(samples, expected);
+                assert_eq!(output.volume().unwrap(), 2.0);
+                assert_eq!(output.played_frames().unwrap(), 1);
+                assert_eq!(output.released(1).unwrap(), [tag]);
+            }
+        }
     }
 
     // Pull through the production callback and SDL's actual converter without

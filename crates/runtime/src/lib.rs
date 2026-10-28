@@ -14,13 +14,12 @@ mod module_memory;
 mod process;
 mod process_mount;
 mod transactional_directory;
-mod virtual_time;
 pub use transactional_directory::{DirectoryWriteLease, TransactionalDirectory};
 
 pub use address_wait::{
     AddressOperationGuard, AddressSignalTargets, AddressWaitCompletion, AddressWaitRegistry,
     AddressWaitResult, ConditionAcquire, ConditionClaim, ConditionSignal, ConditionWait,
-    MutexHandoff, PriorityAddressWaitQueue,
+    MutexHandoff,
 };
 pub use coordinator::{
     CoordinatorDrainReport, CoordinatorError, CoordinatorExecution, CoordinatorResourceCounts,
@@ -52,6 +51,7 @@ pub use launch_plan::{
 pub use launcher::{LaunchError, LaunchStage, Launcher, LauncherInput};
 pub use module_memory::{InstallStage, ModuleInstallError, install_prepared_module};
 pub use nixe_scheduler::{ProcessLifecycle, ThreadLifecycle};
+pub use nixe_scheduler::{VirtualClock, VirtualClockMode};
 pub use process::{
     ExecutionReport, ExecutionStop, GuestStackFrame, GuestThread, ProcessAddressSpace,
     ProcessBuildConfig, ProcessBuildError, ProcessBuildStage, ProcessBuilder,
@@ -61,7 +61,6 @@ pub use process::{
     ThreadExit, ThreadTable, ThreadTableError,
 };
 pub use process_mount::ProcessMountNamespace;
-pub use virtual_time::{VirtualClock, VirtualClockMode};
 
 /// Exclusive saved/native register owner carried by guest scheduler leases.
 pub use nixe_cpu_jit::ThreadState as GuestCpuState;

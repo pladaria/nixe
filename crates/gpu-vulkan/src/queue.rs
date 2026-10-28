@@ -7,7 +7,7 @@ use ash::vk;
 pub(crate) mod progress;
 pub(crate) mod staging;
 pub(crate) use staging::Slice;
-#[cfg(feature = "performance-counters")]
+mod frame_metrics;
 mod timing;
 use nixe_gpu::{BackendInstanceId, BackendSubmissionToken};
 use std::{
@@ -73,8 +73,8 @@ pub(crate) fn align_up(value: u64, alignment: u64) -> Option<u64> {
 }
 
 pub(crate) struct Slot {
-    #[cfg(feature = "performance-counters")]
     timing: Option<timing::Queries>,
+    frame: Option<u64>,
     #[cfg(feature = "binding-probe")]
     owner: Arc<DeviceOwner>,
     pub native: Arc<crate::dispatch::CommandSlot>,
@@ -111,13 +111,11 @@ pub(crate) struct Slot {
 }
 impl Slot {
     fn new(native: Arc<crate::dispatch::CommandSlot>) -> Result<Self, VulkanError> {
-        #[cfg(any(feature = "performance-counters", feature = "binding-probe"))]
         let owner = Arc::clone(native.owner());
-        #[cfg(feature = "performance-counters")]
         let family = native.family();
         let slot = Self {
-            #[cfg(feature = "performance-counters")]
             timing: timing::Queries::new(Arc::clone(&owner), family)?,
+            frame: None,
             native,
             #[cfg(feature = "binding-probe")]
             owner,
@@ -180,6 +178,8 @@ pub struct RecordingStatistics {
     pub draw_calls: u64,
 }
 pub(crate) struct QueueState {
+    pub frame_metrics: frame_metrics::Recorder,
+    calibration: Option<timing::Calibration>,
     recording_handle: crate::dispatch::RecordingHandle,
     pub(crate) progress: Arc<progress::SubmissionProgress>,
     pub statistics: RecordingStatistics,
@@ -217,10 +217,13 @@ impl QueueState {
         let mut kind = vk::SemaphoreTypeCreateInfo::default()
             .semaphore_type(vk::SemaphoreType::TIMELINE)
             .initial_value(0);
+        let calibration = timing::Calibration::new(&owner)?;
         let info = vk::SemaphoreCreateInfo::default().push_next(&mut kind);
         let timeline = unsafe { owner.device.create_semaphore(&info, None) }
             .map_err(|e| VulkanError::vk("vkCreateSemaphore(owner timeline)", e))?;
         let state = Self {
+            frame_metrics: frame_metrics::Recorder::new(),
+            calibration,
             recording_handle: _dispatch.recording_handle(),
             progress: Arc::new(progress::SubmissionProgress::default()),
             staging: staging::StagingPool::new(Arc::clone(&owner)),
@@ -302,7 +305,6 @@ impl QueueState {
     fn reclaim_known(&mut self) -> Result<(), VulkanError> {
         let completed = self.progress.completed();
         if completed > self.completed {
-            #[cfg(feature = "performance-counters")]
             self.retire_timings(completed)?;
             self.reclaim(completed);
         }
@@ -317,7 +319,6 @@ impl QueueState {
         let completed = unsafe { self.owner.device.get_semaphore_counter_value(self.timeline) }
             .map_err(|e| self.error("vkGetSemaphoreCounterValue", e))?;
         if completed.min(submitted) > self.completed {
-            #[cfg(feature = "performance-counters")]
             self.retire_timings(completed.min(submitted))?;
             self.progress.observe_completed(completed.min(submitted));
             self.reclaim(completed.min(submitted));
@@ -344,22 +345,55 @@ impl QueueState {
             WorkStatus::Pending
         })
     }
-    #[cfg(feature = "performance-counters")]
     fn retire_timings(&mut self, completed: u64) -> Result<(), VulkanError> {
         for &index in &self.in_flight {
             let slot = &mut self.slots[index];
             if slot.tick > completed {
                 break;
             }
-            if let Some(timing) = &mut slot.timing {
-                timing.retire()?;
+            let interval = if let Some(timing) = &mut slot.timing {
+                timing.retire(slot.tick, self.calibration.as_ref())?
+            } else {
+                None
+            };
+            if let Some(frame) = slot.frame.take() {
+                self.frame_metrics
+                    .retire(frame, interval, self.calibration.as_ref());
             }
+        }
+        if self
+            .frame_metrics
+            .pending_tick
+            .is_some_and(|tick| tick <= completed)
+        {
+            self.frame_metrics.pending_tick = None;
         }
         Ok(())
     }
+    pub fn begin_frame_work(&mut self, dispatch: &mut crate::dispatch::Dispatch) {
+        self.frame_metrics.begin_cpu();
+        // Host uploads or coherency work may already occupy an unsubmitted
+        // command slot. Attribute that shared submission without splitting it.
+        if let Some(index) = self.recording {
+            let slot = &mut self.slots[index];
+            if slot.frame.is_none() {
+                slot.frame = self.frame_metrics.begin_submission();
+                if let Some(timing) = &mut slot.timing {
+                    timing.enable(dispatch);
+                }
+            }
+        }
+    }
+    pub fn end_frame(&mut self, producer: u64, swap_interval: u32) {
+        self.frame_metrics
+            .end_cpu(producer, swap_interval, self.calibration.as_ref());
+        if producer <= self.completed {
+            self.frame_metrics.pending_tick = None;
+        }
+    }
     fn reclaim(&mut self, completed: u64) {
         if completed > self.completed {
-            nixe_gpu::trace::detail_event("queue_complete", completed, self.completed, 0);
+            nixe_gpu::trace::event("queue_complete", completed, self.completed, 0);
         }
         self.completed = self.completed.max(completed);
         while let Some(&index) = self.in_flight.front() {
@@ -442,9 +476,12 @@ impl QueueState {
             self.timeline,
         )?;
         let slot = &mut self.slots[index];
-        #[cfg(feature = "performance-counters")]
+        slot.frame = self.frame_metrics.begin_submission();
         if let Some(timing) = &mut slot.timing {
-            timing.begin(dispatch);
+            timing.begin(
+                dispatch,
+                slot.frame.is_some() || cfg!(feature = "performance-counters"),
+            );
         }
         slot.tick = tick;
         #[cfg(feature = "binding-probe")]
@@ -559,7 +596,6 @@ impl QueueState {
         self.end_rendering(dispatch);
         let slot = &self.slots[index];
         let tick = slot.tick;
-        #[cfg(feature = "performance-counters")]
         {
             let slot = &mut self.slots[index];
             if let Some(timing) = &mut slot.timing {
@@ -581,7 +617,7 @@ impl QueueState {
         // Capture native parameters now. The worker closes and submits this
         // command buffer in FIFO order while the owner prepares following work.
         // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_scheduler.cpp
-        nixe_gpu::trace::detail_event("queue_schedule", tick, 0, 0);
+        nixe_gpu::trace::event("queue_schedule", tick, 0, 0);
         let result = dispatch.submit(crate::dispatch::QueueSubmission {
             queue,
             waits: waits
@@ -684,7 +720,6 @@ impl QueueState {
         }
         match result {
             Ok(()) => {
-                #[cfg(feature = "performance-counters")]
                 self.retire_timings(ticket.tick)?;
                 self.progress.observe_completed(ticket.tick);
                 self.reclaim(ticket.tick);
@@ -737,6 +772,7 @@ impl QueueState {
                 .values(&values);
             match unsafe { self.owner.device.wait_semaphores(&info, u64::MAX) } {
                 Ok(()) => {
+                    self.retire_timings(submitted)?;
                     self.progress.observe_completed(submitted);
                     self.reclaim(submitted);
                 }

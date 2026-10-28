@@ -31,49 +31,52 @@ impl RuntimeCoordinator {
             .get(&process_id)
             .ok_or(ThreadCreateError::Internal)?
             .validate_thread_request(&request)?;
-        let (id, next_thread_id) = self
-            .thread_ids
-            .candidate()
-            .ok_or(ThreadCreateError::IdentityExhausted)?;
-        let creation = self
+        let id = self
+            .scheduler
+            .create_thread(ScheduledThreadConfig {
+                process: process_id,
+                base_priority: request.priority,
+                ideal_vcpu: request.ideal_vcpu,
+                affinity: request.affinity,
+            })
+            .map_err(|error| match error {
+                SchedulerError::ThreadIdExhausted => ThreadCreateError::IdentityExhausted,
+                _ => ThreadCreateError::Internal,
+            })?;
+        match self
             .processes
             .get_mut(&process_id)
-            .expect("the process was validated")
-            .commit_created_thread(id, &request)?;
-        let registration =
-            self.scheduler
-                .apply(SchedulerCommand::Register(ScheduledThreadConfig {
-                    process: process_id,
-                    thread: id,
-                    base_priority: request.priority,
-                    effective_priority: request.priority,
-                    ideal_vcpu: request.ideal_vcpu,
-                    affinity: request.affinity,
-                }));
-        if registration.is_err() {
-            self.processes
-                .get_mut(&process_id)
-                .expect("the process was validated")
-                .rollback_created_thread(id);
-            return Err(ThreadCreateError::Internal);
+            .expect("validated process")
+            .commit_created_thread(id, &request, self.inbox.sender())
+        {
+            Ok(creation) => Ok(creation),
+            Err(error) => {
+                self.scheduler
+                    .unregister(id)
+                    .expect("created thread has no register owner");
+                Err(error)
+            }
         }
-        self.thread_ids.commit(next_thread_id);
-        Ok(creation)
     }
 
     /// Starts exactly one process-local thread object. Created threads are
     /// published to the ready queue in one coordinator transaction.
     pub fn start_thread(&mut self, object_id: u64) -> Result<GuestThreadId, ThreadOperationError> {
         let thread = GuestThreadId::new(object_id);
-        if self
+        let info = self
             .scheduler
             .thread(thread)
-            .is_none_or(|thread| thread.lifecycle != nixe_scheduler::ThreadLifecycle::Created)
-        {
+            .ok_or(ThreadOperationError::InvalidState)?;
+        if info.lifecycle != nixe_scheduler::ThreadLifecycle::Created {
             return Err(ThreadOperationError::InvalidState);
         }
+        let runtime = self
+            .processes
+            .get_mut(&info.process)
+            .ok_or(ThreadOperationError::Internal)?;
+        runtime.start_thread(thread)?;
         self.scheduler
-            .apply(SchedulerCommand::MakeReady(thread))
+            .make_ready(thread)
             .map_err(|_| ThreadOperationError::Internal)?;
         Ok(thread)
     }
@@ -116,268 +119,17 @@ impl RuntimeCoordinator {
 
     pub fn set_thread_priority(
         &mut self,
+        caller: Option<GuestThreadId>,
         object_id: u64,
         priority: i32,
     ) -> Result<(), ThreadOperationError> {
-        let info = self.thread_scheduling_info(object_id)?;
-        if !self.scheduler.profile().priorities().contains(priority) {
-            return Err(ThreadOperationError::InvalidState);
-        }
-        self.processes
-            .get(
-                &self
-                    .scheduler
-                    .thread(info.thread)
-                    .ok_or(ThreadOperationError::InvalidHandle)?
-                    .process,
-            )
-            .ok_or(ThreadOperationError::Internal)?
-            .validate_thread_policy(priority, &info.affinity)
-            .map_err(|_| ThreadOperationError::InvalidState)?;
         self.scheduler
-            .apply(SchedulerCommand::SetPriority {
-                thread: info.thread,
-                priority,
-            })
-            .map_err(|_| ThreadOperationError::Internal)?;
-        self.preempt_running_thread(info.thread);
-        self.recompute_effective_priorities()
-            .map_err(|_| ThreadOperationError::Internal)?;
-        // SetPriority also replaces the scheduler's effective priority, so
-        // recomputation may see no subsequent change to notify the wait queue.
-        let view = self
-            .scheduler
-            .thread(info.thread)
-            .ok_or(ThreadOperationError::Internal)?;
-        self.processes
-            .get_mut(&view.process)
-            .ok_or(ThreadOperationError::Internal)?
-            .address_waits()
-            .lock()
-            .change_priority(info.thread, view.effective_priority);
-        Ok(())
-    }
-
-    pub fn set_thread_affinity(
-        &mut self,
-        object_id: u64,
-        ideal_vcpu: Option<VirtualCpuId>,
-        affinity: CoreSet,
-    ) -> Result<(), ThreadOperationError> {
-        let info = self.thread_scheduling_info(object_id)?;
-        let owner_process = self
-            .scheduler
-            .thread(info.thread)
-            .ok_or(ThreadOperationError::InvalidHandle)?
-            .process;
-        self.processes
-            .get(&owner_process)
-            .ok_or(ThreadOperationError::Internal)?
-            .validate_thread_policy(info.base_priority, &affinity)
-            .map_err(|_| ThreadOperationError::InvalidState)?;
-        self.migrate_thread(info.thread, ideal_vcpu, affinity)
-            .map_err(|_| ThreadOperationError::InvalidState)
-    }
-
-    pub fn set_thread_activity(
-        &mut self,
-        object_id: u64,
-        paused: bool,
-    ) -> Result<(), ThreadOperationError> {
-        let info = self.thread_scheduling_info(object_id)?;
-        if info.lifecycle == nixe_scheduler::ThreadLifecycle::Running {
-            self.quiesce().map_err(|_| ThreadOperationError::Internal)?;
-        }
-        self.scheduler
-            .apply(SchedulerCommand::SetActivity {
-                thread: info.thread,
-                paused,
-            })
-            .map(|_| ())
-            .map_err(|_| ThreadOperationError::InvalidState)
-    }
-
-    pub fn inherit_thread_priority(
-        &mut self,
-        owner_object_id: u64,
-        waiter_object_id: u64,
-        donation_key: u64,
-    ) -> Result<(), ThreadOperationError> {
-        let owner = self.thread_scheduling_info(owner_object_id)?;
-        let waiter = self.thread_scheduling_info(waiter_object_id)?;
-        self.priority_donations.insert(PriorityDonation {
-            owner: owner.thread,
-            waiter: waiter.thread,
-            key: donation_key,
-        });
-        self.recompute_effective_priorities()
-            .map_err(|_| ThreadOperationError::InvalidState)
-    }
-
-    pub fn restore_thread_priority(
-        &mut self,
-        object_id: u64,
-        donation_key: u64,
-    ) -> Result<(), ThreadOperationError> {
-        let info = self.thread_scheduling_info(object_id)?;
-        self.priority_donations
-            .retain(|donation| donation.owner != info.thread || donation.key != donation_key);
-        self.recompute_effective_priorities()
-            .map_err(|_| ThreadOperationError::InvalidState)
-    }
-
-    /// Rebuild donations only for mutexes whose ownership/wait lists changed.
-    /// Called by the exception dispatcher after one complete serialized handoff.
-    pub fn synchronize_mutex_waits(
-        &mut self,
-        process_id: ProcessId,
-        addresses: &[u64],
-    ) -> Result<(), ThreadOperationError> {
-        let process = self
-            .processes
-            .get(&process_id)
-            .ok_or(ThreadOperationError::Internal)?;
-        let waits = process.address_waits().lock();
-        let previous_count = self.priority_donations.len();
-        self.priority_donations.retain(|donation| {
-            !addresses.contains(&donation.key)
-                || self
-                    .scheduler
-                    .thread(donation.owner)
-                    .is_none_or(|owner| owner.process != process_id)
-                || (waits.owner(donation.key) == Some(donation.owner)
-                    && waits
-                        .pending_threads(donation.key)
-                        .any(|waiter| waiter == donation.waiter))
-        });
-        let mut changed = self.priority_donations.len() != previous_count;
-        for address in addresses {
-            if let Some(owner) = waits.owner(*address) {
-                for waiter in waits.pending_threads(*address) {
-                    changed |= self.priority_donations.insert(PriorityDonation {
-                        owner,
-                        waiter,
-                        key: *address,
-                    });
-                }
-            }
-        }
-        drop(waits);
-        // An uncontended lock handoff changes no donation edge. Keep the
-        // established priorities without rebuilding every process's graph.
-        if changed {
-            self.recompute_effective_priorities()
-                .map_err(|_| ThreadOperationError::Internal)?;
-        }
-        // New waiters may have unchanged scheduler priorities. Initialize them
-        // too, rather than relying only on priority-change notifications.
-        let process = self
-            .processes
-            .get_mut(&process_id)
-            .ok_or(ThreadOperationError::Internal)?;
-        let scheduler = &self.scheduler;
-        process
-            .address_waits()
-            .lock()
-            .refresh_mutex_priorities(|thread| {
-                scheduler
-                    .thread(thread)
-                    .expect("registered mutex waiter")
-                    .effective_priority
-            });
-        Ok(())
-    }
-
-    pub fn reap_thread(&mut self, object_id: u64) -> Result<(), ThreadOperationError> {
-        let thread = GuestThreadId::new(object_id);
-        let view = self
-            .scheduler
-            .thread(thread)
-            .ok_or(ThreadOperationError::InvalidHandle)?;
-        if !matches!(
-            view.lifecycle,
-            nixe_scheduler::ThreadLifecycle::Exited | nixe_scheduler::ThreadLifecycle::Faulted
-        ) {
-            return Err(ThreadOperationError::InvalidState);
-        }
-        let process_id = view.process;
-        self.scheduler
-            .apply(SchedulerCommand::Unregister(thread))
-            .map_err(|_| ThreadOperationError::Internal)?;
-        self.processes
-            .get_mut(&process_id)
-            .ok_or(ThreadOperationError::Internal)?
-            .reap_exited_thread(thread)
-            .map_err(|_| ThreadOperationError::Internal)
-    }
-
-    fn preempt_running_thread(&self, thread: GuestThreadId) {
-        if let Some(lease) = self
-            .scheduler
-            .active_leases()
-            .find(|lease| lease.thread == thread)
-        {
-            self.processes[&lease.process].request_vcpu_safepoint(lease.vcpu);
-        }
-    }
-
-    pub(super) fn recompute_effective_priorities(&mut self) -> Result<(), SchedulerError> {
-        let mut priorities = BTreeMap::new();
-        for process in self.processes.values() {
-            for (thread, _) in process.threads().iter() {
-                let view = self
-                    .scheduler
-                    .thread(*thread)
-                    .ok_or(SchedulerError::UnknownThread(*thread))?;
-                if !matches!(
-                    view.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Exited
-                        | nixe_scheduler::ThreadLifecycle::Faulted
-                ) {
-                    priorities.insert(*thread, view.base_priority);
-                }
-            }
-        }
-        for _ in 0..priorities.len() {
-            let mut changed = false;
-            for donation in &self.priority_donations {
-                let Some(waiter) = priorities.get(&donation.waiter).copied() else {
-                    continue;
-                };
-                let Some(owner) = priorities.get_mut(&donation.owner) else {
-                    continue;
-                };
-                if waiter < *owner {
-                    *owner = waiter;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        for (thread, priority) in priorities {
-            let view = self
-                .scheduler
-                .thread(thread)
-                .ok_or(SchedulerError::UnknownThread(thread))?;
-            if view.effective_priority != priority {
-                self.scheduler
-                    .apply(SchedulerCommand::SetEffectivePriority { thread, priority })?;
-                self.preempt_running_thread(thread);
-                let process_id = self
-                    .scheduler
-                    .thread(thread)
-                    .expect("thread exists")
-                    .process;
-                self.processes
-                    .get_mut(&process_id)
-                    .expect("thread owns a process")
-                    .address_waits()
-                    .lock()
-                    .change_priority(thread, priority);
-            }
-        }
+            .set_priority(GuestThreadId::new(object_id), priority, caller)
+            .map_err(|error| match error {
+                SchedulerError::UnknownThread(_) => ThreadOperationError::InvalidHandle,
+                SchedulerError::InvalidPriority(_) => ThreadOperationError::InvalidState,
+                _ => ThreadOperationError::Internal,
+            })?;
         Ok(())
     }
 
@@ -387,8 +139,14 @@ impl RuntimeCoordinator {
         current: GuestThreadId,
         exit_code: u64,
     ) -> Result<(), CoordinatorRouteError> {
-        self.quiesce()
-            .map_err(|error| CoordinatorRouteError::Coordinator(Box::new(error)))?;
+        if self
+            .scheduler
+            .active_leases()
+            .any(|lease| lease.process == process_id)
+        {
+            self.quiesce()
+                .map_err(|error| CoordinatorRouteError::Coordinator(Box::new(error)))?;
+        }
         self.completed_executions
             .retain(|execution| execution.lease.process != process_id);
         let targets: Vec<_> = self
@@ -410,20 +168,9 @@ impl RuntimeCoordinator {
             })
             .collect();
         for thread in targets {
-            self.release_wait_resources(thread);
-            self.processes
-                .get_mut(&process_id)
-                .expect("the process was validated")
-                .address_waits()
-                .lock()
-                .release_thread(thread);
-            self.priority_donations
-                .retain(|donation| donation.owner != thread && donation.waiter != thread);
+            self.finalize_thread_waits(process_id, thread);
             self.scheduler
-                .apply(SchedulerCommand::Terminate {
-                    thread,
-                    faulted: false,
-                })
+                .terminate(thread, false)
                 .map_err(CoordinatorRouteError::Scheduler)?;
             self.processes
                 .get_mut(&process_id)
@@ -434,30 +181,6 @@ impl RuntimeCoordinator {
                     crate::ExceptionTerminationScope::Process,
                 );
         }
-        self.recompute_effective_priorities()
-            .map_err(CoordinatorRouteError::Scheduler)?;
-        Ok(())
-    }
-
-    /// Applies migration after returning any in-flight register owner.
-    pub fn migrate_thread(
-        &mut self,
-        thread: GuestThreadId,
-        ideal_vcpu: Option<VirtualCpuId>,
-        affinity: CoreSet,
-    ) -> Result<(), CoordinatorError> {
-        if self
-            .scheduler
-            .thread(thread)
-            .is_some_and(|view| view.lifecycle == nixe_scheduler::ThreadLifecycle::Running)
-        {
-            self.quiesce()?;
-        }
-        self.scheduler.apply(SchedulerCommand::Migrate {
-            thread,
-            ideal_vcpu,
-            affinity,
-        })?;
         Ok(())
     }
 }

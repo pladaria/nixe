@@ -186,7 +186,6 @@ impl Dispatch {
     pub fn dispatch_work(&mut self) -> Result<(), VulkanError> {
         self.recorder.flush_chunks()
     }
-    #[cfg(feature = "performance-counters")]
     pub fn begin_submission_timing(&mut self, pool: vk::QueryPool) {
         self.recorder.record(move |ctx| {
             unsafe {

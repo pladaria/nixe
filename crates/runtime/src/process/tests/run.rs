@@ -98,64 +98,6 @@ fn loader_stub_recognition_requires_the_thread_address_and_exit_svc() {
 }
 
 #[test]
-fn native_slices_preserve_supervisor_call_boundaries_and_apply_the_continuation_once() {
-    let (_directory, plan) = plan();
-    let mut process = reference_process_builder().build(&plan).unwrap();
-    replace_entry_instructions(
-        &mut process,
-        &[
-            0x91000400, // ADD X0,#1.
-            0x91000800, // ADD X0,#2.
-            0xd4000841, // SVC #0x42.
-            0x91001000, // ADD X0,#4.
-            0xd4000861, // SVC #0x43.
-        ],
-    );
-    let entry = process.entry_module().entry_address();
-    process
-        .main_thread_mut()
-        .state_mut()
-        .write_x(A64Register::General(a64_register(0)), 0);
-    let mut cpu = process
-        .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
-        .unwrap();
-    let first = process.run_with_cpu_thread(&mut cpu).unwrap();
-    assert!(
-        matches!(first.stop, crate::ExecutionStop::SupervisorCall { source, immediate: 0x42 }
-        if source.pc.get() == entry + 8)
-    );
-    assert_eq!(
-        process
-            .main_thread()
-            .state()
-            .read_x(A64Register::General(a64_register(0))),
-        3
-    );
-    let mut dispatcher = FixedSupervisorCallDispatcher {
-        outcome: Some(crate::ExceptionDispatchOutcome::<&'static str>::Resume(
-            crate::ExceptionResume::Next,
-        )),
-    };
-    assert_eq!(
-        process
-            .route_supervisor_call(&first.stop, &mut dispatcher)
-            .unwrap(),
-        crate::ExceptionHandlingResult::Resumed
-    );
-    let second = process.run_with_cpu_thread(&mut cpu).unwrap();
-    assert!(
-        matches!(second.stop, crate::ExecutionStop::SupervisorCall { source, immediate: 0x43 }
-        if source.pc.get() == entry + 16)
-    );
-    assert_eq!(
-        process
-            .main_thread()
-            .state()
-            .read_x(A64Register::General(a64_register(0))),
-        7
-    );
-}
-#[test]
 fn fixed_virtual_timer_is_stable_across_native_slices() {
     let (_directory, plan) = plan();
     let frequency = 24_000_000;

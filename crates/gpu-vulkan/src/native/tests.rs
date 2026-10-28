@@ -26,6 +26,125 @@ fn finish_next(
     execution.completion(Some(Duration::from_secs(5)))
 }
 
+#[test]
+fn frame_metrics_follow_resident_producers_and_publish_after_asynchronous_completion() {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let monitor = device.validation_monitor();
+    let families = unsafe {
+        device
+            .owner
+            .instance
+            .instance
+            .get_physical_device_queue_family_properties(device.owner.physical)
+    };
+    let timestamps =
+        families[device.queues().graphics_compute_family as usize].timestamp_valid_bits != 0;
+    let correlated = if cfg!(target_os = "linux") && device.owner.calibrated_timestamps {
+        let calibration = ash::ext::calibrated_timestamps::Instance::new(
+            &device.owner.instance.entry,
+            &device.owner.instance.instance,
+        );
+        unsafe { calibration.get_physical_device_calibrateable_time_domains(device.owner.physical) }
+            .unwrap()
+            .contains(&vk::TimeDomainEXT::CLOCK_MONOTONIC)
+    } else {
+        false
+    };
+    let mut execution = NativeGpuExecution::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+        device,
+        ShaderNamespace {
+            guest: *b"frame-time-test!",
+            isa: 1,
+        },
+        CacheConfiguration::default(),
+        8 * 1024 * 1024,
+    )
+    .unwrap();
+    let metrics = execution.frame_metrics();
+    let (wake, wakes) = std::sync::mpsc::channel();
+    execution
+        .bind_host_wakeup(Arc::new(move || {
+            let _ = wake.send(());
+        }))
+        .unwrap();
+    let (_allocation, mapping) = backing_allocation(&execution.residency, 4096, 4096, 0x51);
+    for frame in 1..=4 {
+        if frame == 1 {
+            // A host/coherency operation may leave a shared slot open before
+            // guest command consumption begins. Metrics must not split it.
+            execution.residency.device_mut().begin_recording().unwrap();
+        }
+        let started = Instant::now();
+        execution.begin_frame_work();
+        let image = execution
+            .acquire_presentable_image(
+                NativePresentationImage {
+                    inputs: mapping.pin(0, mapping.bytes()).unwrap(),
+                    planes: Arc::from([GuestImagePlane {
+                        depth_slice: 0,
+                        mip_level: 0,
+                        array_layer: 0,
+                        aspect: GuestImageAspect::Color,
+                        footprint: crate::residency::tests::plane_geometry(
+                            Arc::clone(&mapping),
+                            [4, 4],
+                            16,
+                            4,
+                        ),
+                        row_pitch: 16,
+                        bytes_per_block: 4,
+                    }]),
+                    extent: [4, 4],
+                    format: PresentationImageFormat::Rgba8,
+                    allow_canonical_import: true,
+                },
+                (frame % 3) as u32,
+            )
+            .unwrap();
+        let producer = image.lease().producer().slot();
+        assert_eq!(execution.residency.device().scheduled_tick(), producer);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let sample = loop {
+            execution.progress().unwrap();
+            if let Some(sample) = metrics.read_since(frame - 1, 1).samples.first().copied() {
+                break sample;
+            }
+            execution.arm_completion_wakeup().unwrap();
+            wakes
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+        };
+        assert_eq!(sample.sequence, frame);
+        assert_eq!(sample.producer, producer);
+        assert_eq!(sample.swap_interval, (frame % 3) as u32);
+        assert!(!sample.cpu.is_zero());
+        assert_eq!(sample.gpu.is_some(), timestamps);
+        assert_eq!(sample.total.is_some(), timestamps && correlated);
+        assert_eq!(sample.clock_error.is_some(), timestamps && correlated);
+        if let (Some(total), Some(error)) = (sample.total, sample.clock_error) {
+            assert!(total <= started.elapsed() + error);
+            assert!(sample.gpu.unwrap() <= total + error);
+        }
+        assert!(
+            sample
+                .total
+                .is_none_or(|total| total <= Duration::from_secs(5))
+        );
+        assert_eq!(
+            execution.residency.device().scheduled_tick(),
+            producer,
+            "reading metrics must not submit native work"
+        );
+    }
+    execution.teardown().unwrap();
+    drop(execution);
+    assert_eq!(metrics.read_since(0, 10).samples.len(), 4);
+    monitor.check().unwrap();
+}
+
 fn captured_vertex_fragment(
     configuration: &nixe_gpu::shader_compilation::Configuration,
 ) -> Arc<GuestShaderCode> {

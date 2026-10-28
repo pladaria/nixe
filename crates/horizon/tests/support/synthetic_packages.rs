@@ -40,11 +40,11 @@ pub fn content_id(seed: u8) -> [u8; 16] {
 }
 
 pub fn program_content(id: [u8; 16], modules: &[(&str, u8)]) -> Content {
-    program_content_with_npdm_policy(id, modules, true, 1_u64 << 63)
+    program_content_with_npdm_policy(id, modules, true, 1_u64 << 63, None)
 }
 
 pub fn program_content_without_services(id: [u8; 16], modules: &[(&str, u8)]) -> Content {
-    program_content_with_npdm_policy(id, modules, false, 1_u64 << 63)
+    program_content_with_npdm_policy(id, modules, false, 1_u64 << 63, None)
 }
 
 pub fn program_content_with_fs_permissions(
@@ -52,7 +52,23 @@ pub fn program_content_with_fs_permissions(
     modules: &[(&str, u8)],
     filesystem_permissions: u64,
 ) -> Content {
-    program_content_with_npdm_policy(id, modules, true, filesystem_permissions)
+    program_content_with_npdm_policy(id, modules, true, filesystem_permissions, None)
+}
+
+pub fn program_content_with_thread_policy(
+    id: [u8; 16],
+    modules: &[(&str, u8)],
+    highest_priority: u8,
+    lowest_priority: u8,
+    min_core: u8,
+    max_core: u8,
+) -> Content {
+    let thread_info = 7
+        | u32::from(lowest_priority) << 4
+        | u32::from(highest_priority) << 10
+        | u32::from(min_core) << 16
+        | u32::from(max_core) << 24;
+    program_content_with_npdm_policy(id, modules, true, 1_u64 << 63, Some(thread_info))
 }
 
 fn program_content_with_npdm_policy(
@@ -60,12 +76,14 @@ fn program_content_with_npdm_policy(
     modules: &[(&str, u8)],
     include_services: bool,
     filesystem_permissions: u64,
+    thread_info: Option<u32>,
 ) -> Content {
     let npdm = build_npdm(
         APPLICATION_ID,
         include_services,
         filesystem_permissions,
         1 | (3 << 1),
+        thread_info,
     );
     let module_bytes = modules
         .iter()
@@ -396,6 +414,7 @@ fn build_npdm(
     include_services: bool,
     filesystem_permissions: u64,
     process_flags: u8,
+    thread_info: Option<u32>,
 ) -> Vec<u8> {
     const META: usize = 0x80;
     const ACID_HEADER: usize = 0x240;
@@ -408,11 +427,16 @@ fn build_npdm(
         &[]
     };
     let sac_size = service_access.len();
-    let kac = [
-        (0x15_u32 << 5 | 0xf).to_le_bytes(),
-        (0x40_u32 << 16 | 0x7fff).to_le_bytes(),
-    ]
-    .concat();
+    let svc_mask = if thread_info.is_some() {
+        0x00ff_ffff
+    } else {
+        0x15
+    };
+    let kac: Vec<u8> = thread_info
+        .into_iter()
+        .chain([svc_mask << 5 | 0xf, 0x40 << 16 | 0x7fff])
+        .flat_map(u32::to_le_bytes)
+        .collect();
     let fac = ACID_HEADER;
     let acid_sac = fac + FAC_SIZE;
     let acid_kac = acid_sac + sac_size;
@@ -426,8 +450,8 @@ fn build_npdm(
     let mut data = vec![0_u8; aci + aci_size];
     data[..4].copy_from_slice(b"META");
     data[0x0c] = process_flags;
-    data[0x0e] = 0x20;
-    data[0x0f] = 2;
+    data[0x0e] = thread_info.map_or(0x20, |info| ((info >> 10) & 0x3f) as u8);
+    data[0x0f] = thread_info.map_or(2, |info| ((info >> 16) & 0xff) as u8);
     put_u32(&mut data, 0x1c, 0x4000);
     data[0x20..0x2f].copy_from_slice(b"SyntheticTitle\0");
     data[0x30..0x34].copy_from_slice(b"SWTX");

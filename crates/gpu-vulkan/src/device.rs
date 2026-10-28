@@ -54,6 +54,7 @@ pub(crate) struct DeviceOwner {
     pub debug: Option<ash::ext::debug_utils::Device>,
     pub non_coherent_atom_size: u64,
     pub local_allocation_bytes: std::sync::atomic::AtomicU64,
+    pub calibrated_timestamps: bool,
 }
 impl DeviceOwner {
     pub fn name<T: Handle>(&self, handle: T, name: &str) -> Result<(), VulkanError> {
@@ -218,6 +219,10 @@ impl VulkanDevice {
             debug,
             non_coherent_atom_size: selected.profile.limits.non_coherent_atom_size,
             local_allocation_bytes: std::sync::atomic::AtomicU64::new(0),
+            calibrated_timestamps: selected
+                .features
+                .names
+                .contains(&ash::ext::calibrated_timestamps::NAME),
         });
         // The owner exists before any subsequent fallible creation, so failures
         // destroy the independent device and instance without a resource rollback layer.
@@ -306,6 +311,9 @@ impl VulkanDevice {
         // SAFETY: queries use only supported feature structures for this device.
         let mut features =
             unsafe { FeatureSet::query(&instance.instance, physical, &ext, version, maintenance) };
+        if ext.contains(ash::ext::calibrated_timestamps::NAME) {
+            features.names.push(ash::ext::calibrated_timestamps::NAME);
+        }
         let missing = profile::baseline_missing(
             version,
             features.v12.timeline_semaphore != 0,

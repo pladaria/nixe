@@ -5,7 +5,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use nixe_cpu::execution::CpuProcessId;
-use nixe_scheduler::{Lease, ProcessId, VirtualCpuId};
+use nixe_scheduler::{Lease, ProcessId, SchedulerError, SchedulerState, VirtualCpuId};
+use std::sync::Arc;
 
 use crate::process::execution::{CpuThread, VcpuExecutionState};
 use crate::{ExecutionReport, ProcessExecutionError};
@@ -28,6 +29,21 @@ pub(crate) struct WorkerResult {
     pub(super) lease: Lease,
     pub(super) execution: VcpuExecutionState,
     pub(super) outcome: Result<ExecutionReport, WorkerRunFailure>,
+    pub(super) interrupt: Result<bool, InterruptFailure>,
+}
+
+pub(super) enum InterruptFailure {
+    Stopped,
+    Memory(Arc<nixe_memory::MemoryError>),
+    Scheduler(SchedulerError),
+}
+impl From<nixe_cpu_jit::process::MemoryAccessFailure> for InterruptFailure {
+    fn from(error: nixe_cpu_jit::process::MemoryAccessFailure) -> Self {
+        match error {
+            nixe_cpu_jit::process::MemoryAccessFailure::Stopped => Self::Stopped,
+            nixe_cpu_jit::process::MemoryAccessFailure::Memory(error) => Self::Memory(error),
+        }
+    }
 }
 
 pub(super) enum WorkerRunFailure {
@@ -71,6 +87,10 @@ enum WorkerCommand {
         reply: SyncSender<usize>,
     },
     Run(WorkerRequest),
+    Interrupt {
+        request: WorkerRequest,
+        report: Box<ExecutionReport>,
+    },
     Shutdown,
 }
 
@@ -90,14 +110,16 @@ impl VcpuWorkerPool {
     pub(super) fn start(
         vcpus: impl IntoIterator<Item = VirtualCpuId>,
         completion: SyncSender<crate::external_event::CoordinatorEvent>,
+        scheduler: Arc<SchedulerState>,
     ) -> Result<Self, std::io::Error> {
         let mut workers: BTreeMap<VirtualCpuId, WorkerHandle> = BTreeMap::new();
         for vcpu in vcpus {
             let (commands, receiver) = sync_channel(1);
             let completion = completion.clone();
+            let scheduler = scheduler.clone();
             let thread = match std::thread::Builder::new()
                 .name(format!("nixe-vcpu-{}", vcpu.get()))
-                .spawn(move || worker_main(receiver, completion))
+                .spawn(move || worker_main(receiver, completion, scheduler))
             {
                 Ok(thread) => thread,
                 Err(error) => {
@@ -129,6 +151,7 @@ impl VcpuWorkerPool {
     pub(super) fn dispatch(
         &self,
         request: WorkerRequest,
+        report: Option<ExecutionReport>,
     ) -> Result<(), Box<WorkerDispatchFailure>> {
         if self.stop_requested {
             return Err(Box::new(WorkerDispatchFailure {
@@ -149,18 +172,23 @@ impl VcpuWorkerPool {
             request.lease.thread.get(),
             u64::from(vcpu.get()),
         );
-        worker
-            .commands
-            .send(WorkerCommand::Run(request))
-            .map_err(|error| {
-                let WorkerCommand::Run(request) = error.0 else {
-                    unreachable!("dispatch only sends run commands")
-                };
-                Box::new(WorkerDispatchFailure {
-                    failure: WorkerFailure::Lost(vcpu),
-                    request,
-                })
+        let command = match report {
+            Some(report) => WorkerCommand::Interrupt {
+                request,
+                report: Box::new(report),
+            },
+            None => WorkerCommand::Run(request),
+        };
+        worker.commands.send(command).map_err(|error| {
+            let request = match error.0 {
+                WorkerCommand::Run(request) | WorkerCommand::Interrupt { request, .. } => request,
+                _ => unreachable!("dispatch only sends execution commands"),
+            };
+            Box::new(WorkerDispatchFailure {
+                failure: WorkerFailure::Lost(vcpu),
+                request,
             })
+        })
     }
 
     pub(super) fn install_cpu_thread(
@@ -284,11 +312,12 @@ impl Drop for VcpuWorkerPool {
 fn worker_main(
     commands: Receiver<WorkerCommand>,
     results: SyncSender<crate::external_event::CoordinatorEvent>,
+    scheduler: Arc<SchedulerState>,
 ) -> Result<(), nixe_cpu_direct_memory::FaultRuntimeError> {
     let mut native_worker = nixe_cpu_direct_memory::NativeWorker::default();
     let mut cpu_threads = BTreeMap::new();
     while let Ok(command) = commands.recv() {
-        let mut request = match command {
+        let (mut request, report) = match command {
             WorkerCommand::Install { key, thread, reply } => {
                 let result = match cpu_threads.entry(key) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
@@ -312,7 +341,8 @@ fn worker_main(
                 let _ = reply.send(keys.len());
                 continue;
             }
-            WorkerCommand::Run(request) => request,
+            WorkerCommand::Run(request) => (request, None),
+            WorkerCommand::Interrupt { request, report } => (request, Some(*report)),
             WorkerCommand::Shutdown => break,
         };
         let run_trace = nixe_memory::trace::span(
@@ -321,13 +351,27 @@ fn worker_main(
             request.lease.thread.get(),
             u64::from(request.lease.vcpu.get()),
         );
+        let kernel_interrupt = report.is_some();
+        let mut interrupt = Ok(false);
         let run = || {
             let thread = cpu_threads.get_mut(&request.cpu_thread).ok_or(
                 ProcessExecutionError::BackendUnavailable {
                     process: request.cpu_thread.cpu_process,
                 },
             )?;
-            request.execution.run(&mut native_worker, thread)
+            let report = match report {
+                Some(report) => report,
+                None => request.execution.run(&mut native_worker, thread)?,
+            };
+            if kernel_interrupt
+                || matches!(
+                    report.stop,
+                    crate::ExecutionStop::Safepoint | crate::ExecutionStop::PendingEvent { .. }
+                )
+            {
+                interrupt = handle_interrupt(&scheduler, &request, thread).map(|()| true);
+            }
+            Ok(report)
         };
         let outcome = catch_worker_panic(run);
         drop(run_trace);
@@ -343,6 +387,7 @@ fn worker_main(
                     lease: request.lease,
                     execution: request.execution,
                     outcome,
+                    interrupt,
                 },
             ))
             .is_err()
@@ -352,6 +397,33 @@ fn worker_main(
     }
     drop(cpu_threads);
     native_worker.finish()
+}
+
+// The interrupted core keeps its native context/lease until TLS publication.
+// Device waits share the JIT process's existing stop/cancellation mechanism.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_interrupt_manager.cpp
+fn handle_interrupt(
+    scheduler: &SchedulerState,
+    request: &WorkerRequest,
+    cpu: &CpuThread,
+) -> Result<(), InterruptFailure> {
+    let tls = request.execution.tls_base;
+    if cpu
+        .read_memory(tls.checked_add(0x100).expect("bounded TLS"), 2)
+        .map_err(InterruptFailure::from)?
+        != 0
+        && scheduler
+            .pinned_thread(request.lease.process, request.lease.vcpu)
+            .map_err(InterruptFailure::Scheduler)?
+            .is_none()
+    {
+        scheduler
+            .pin_thread(request.lease.vcpu, request.lease.thread)
+            .map_err(InterruptFailure::Scheduler)?;
+        cpu.write_memory(tls.checked_add(0x102).expect("bounded TLS"), 2, 1)
+            .map_err(InterruptFailure::from)?;
+    }
+    Ok(())
 }
 
 fn catch_worker_panic(

@@ -18,7 +18,7 @@ struct Buffer {
     ranges: nixe_memory::CapturedMemory,
 }
 pub(crate) struct Request {
-    thread: nixe_runtime::ThreadObject,
+    thread: Arc<nixe_runtime::ThreadObject>,
     target: HandleObject,
     process_id: u64,
     cpu: nixe_cpu::profile::ProcessCpuContext,
@@ -161,7 +161,7 @@ impl Request {
                 crate::CURRENT_PROCESS_HANDLE => {
                     HandleObject::new(nixe_runtime::ProcessObject::new(self.process_id))
                 }
-                crate::CURRENT_THREAD_HANDLE => HandleObject::new(self.thread.clone()),
+                crate::CURRENT_THREAD_HANDLE => HandleObject::from_arc(self.thread.clone()),
                 _ => copied
                     .next()
                     .expect("real copy handles were captured in wire order"),

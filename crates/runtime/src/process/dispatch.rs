@@ -39,7 +39,7 @@ impl RunnableProcess {
     /// Marks the process exited. Resource release occurs in
     /// [`Self::try_teardown`] or when the process is dropped.
     pub(crate) fn terminate_from_host(&mut self) -> bool {
-        let thread_id = self.main_thread().object.thread_id();
+        let thread_id = self.main_thread_id.get();
         let exit = ProcessExit {
             cause: ProcessExitCause::HostRequested,
             exit_code: 0,
@@ -64,11 +64,6 @@ impl RunnableProcess {
             )
             .expect("a terminating process can exit");
             self.process_exit = Some(exit);
-            self.main_thread_mut().exit = Some(ThreadExit {
-                requested_scope: ExceptionTerminationScope::Process,
-                exit_code: 0,
-                source: None,
-            });
         }
         terminated
     }
@@ -138,6 +133,7 @@ impl RunnableProcess {
             .expect("a ready scheduler thread owns resident CPU state");
         Ok(execution::VcpuExecutionState {
             thread: state,
+            tls_base: thread.tls_base,
             virtual_clock,
             architectural_timer_frequency,
             events,
@@ -209,7 +205,7 @@ impl RunnableProcess {
         {
             // Termination is a real diagnostic consumer, unlike an ordinary SVC.
             report.context = Some(thread.state().register_context());
-            let object_thread_id = thread.object.thread_id();
+            let object_thread_id = thread.id.get();
             let exit = ProcessExit {
                 cause: ProcessExitCause::LoaderReturned,
                 exit_code: *result_code,

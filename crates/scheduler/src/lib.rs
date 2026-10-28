@@ -1,20 +1,25 @@
-//! Console-, runtime-, and engine-independent deterministic scheduling.
+//! Kernel run queues, scheduling policy, wait generations and register ownership.
 
+mod clock;
 mod identity;
 mod lifecycle;
 mod scheduler;
 mod topology;
 
-pub use identity::{GuestThreadId, ProcessId, SchedulerSequence, VirtualCpuId, WakeGeneration};
+pub use clock::{VirtualClock, VirtualClockMode};
+pub use identity::{GuestThreadId, ProcessId, VirtualCpuId, WakeGeneration};
 pub use lifecycle::{
     LifecycleTransitionError, ProcessLifecycle, ThreadLifecycle, transition_process,
-    transition_thread,
 };
 pub use scheduler::{
-    Completion, Lease, LeaseGeneration, Readiness, ScheduledThreadConfig, ScheduledThreadView,
-    SchedulerCommand, SchedulerDecision, SchedulerError, SchedulerState, WakeToken, YieldMigration,
+    Completion, IdealCore, Lease, LeaseGeneration, LockHandoff, LockKey, OrderedWaitKind,
+    ScheduledThreadConfig, ScheduledThreadView, SchedulerError, SchedulerState, Selection,
+    ThreadPropertyGuard, ThreadPropertyLock, WakeToken, YieldMigration,
 };
 pub use topology::{
     CoreSet, CoreSetError, MachineSchedulerProfile, MachineSchedulerProfileError, PriorityRange,
     VirtualCpuDescriptor,
 };
+
+#[cfg(feature = "performance-counters")]
+pub use scheduler::SchedulerStatistics;

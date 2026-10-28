@@ -379,11 +379,34 @@ impl Error for ConfigError {
 }
 
 /// Only implemented output modes can be selected; unknown layouts are errors.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AudioConfig {
     #[serde(default)]
     pub output: nixe_audio::ChannelLayout,
+    /// Host output volume in percent, from mute (0) to full volume (100).
+    #[serde(default = "default_audio_volume", deserialize_with = "audio_volume")]
+    pub volume: u8,
+}
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            output: nixe_audio::ChannelLayout::default(),
+            volume: default_audio_volume(),
+        }
+    }
+}
+const fn default_audio_volume() -> u8 {
+    100
+}
+fn audio_volume<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
+    let volume = u8::deserialize(deserializer)?;
+    if volume > 100 {
+        return Err(serde::de::Error::custom(
+            "audio.volume must be between 0 and 100",
+        ));
+    }
+    Ok(volume)
 }
 
 /// Host presentation policy, independent of guest display timing.
@@ -839,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_defaults_to_stereo_and_rejects_unimplemented_layouts() {
+    fn audio_defaults_and_validates_output_and_volume() {
         let base = r#"
             version = 2
             [library]
@@ -851,10 +874,21 @@ mod tests {
         "#;
         for suffix in ["", "\n[audio]\noutput = \"stereo\"\n"] {
             let file = TemporaryConfig::new(&format!("{base}{suffix}"));
-            assert_eq!(
-                NixeConfig::load(&file.path).unwrap().audio.output,
-                nixe_audio::ChannelLayout::Stereo
-            );
+            let config = NixeConfig::load(&file.path).unwrap();
+            assert_eq!(config.audio.output, nixe_audio::ChannelLayout::Stereo);
+            assert_eq!(config.audio.volume, 100);
+            assert_eq!(config.audio, AudioConfig::default());
+        }
+        for volume in [0, 10, 100] {
+            let file = TemporaryConfig::new(&format!("{base}\n[audio]\nvolume = {volume}\n"));
+            assert_eq!(NixeConfig::load(&file.path).unwrap().audio.volume, volume);
+        }
+        for volume in ["-1", "101", "255", "256", "0.5", "\"10\""] {
+            let file = TemporaryConfig::new(&format!("{base}\n[audio]\nvolume = {volume}\n"));
+            assert!(matches!(
+                NixeConfig::load(&file.path),
+                Err(ConfigError::Parse { .. })
+            ));
         }
         for layout in ["5.1", "surround", "automatic"] {
             let file = TemporaryConfig::new(&format!("{base}\n[audio]\noutput = {layout:?}\n"));

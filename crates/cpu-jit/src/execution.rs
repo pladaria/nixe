@@ -4,6 +4,7 @@ use crate::{
     code::{CodeCache, CodeCapture, Lookup, ResolvedCode},
     ffi,
     metrics::{Counter, Timer, record},
+    process::MemoryAccessFailure,
 };
 use nixe_cpu::execution::{ArchitecturalTimer, CpuControl};
 use nixe_cpu_direct_memory::{CapturedFault, FaultDisposition, NativeInvocation, NativeWorker};
@@ -49,7 +50,7 @@ struct Callbacks<'a> {
     process: &'a crate::process::Process,
     core: *mut c_void,
     code: Vec<CodeCapture>,
-    error: Option<MemoryError>,
+    error: Option<MemoryAccessFailure>,
 }
 struct Invocation {
     core: *mut c_void,
@@ -148,13 +149,13 @@ impl Core {
         worker: &mut NativeWorker,
         timer: &dyn ArchitecturalTimer,
         process: &crate::process::Process,
-    ) -> Result<Boundary, JitError> {
+    ) -> Result<Boundary, MemoryAccessFailure> {
         let handle = &self.handle;
         unsafe {
             ffi::nixe_dynarmic_clear_halt(handle.pointer);
         }
         let admission_timer = Timer::new(Counter::AdmissionNanoseconds);
-        let admission = self.context.enter_native().map_err(memory_error)?;
+        let admission = self.context.enter_native()?;
         drop(admission_timer);
         // A racing preemption is either consumed here or remains in the
         // native halt word. The caller must not clear Halt after this check.
@@ -171,24 +172,22 @@ impl Core {
                 fetch_fault: None,
             });
         }
-        admission
-            .synchronize_code(|range| {
-                record(Counter::InvalidationCalls, 1);
-                record(Counter::InvalidationBytes, range.bytes);
-                let _measurement = Timer::new(Counter::InvalidationNanoseconds);
-                if unsafe {
-                    ffi::nixe_dynarmic_invalidate(
-                        handle.pointer,
-                        range.start.get(),
-                        range.bytes as usize,
-                    )
-                } {
-                    Ok(())
-                } else {
-                    Err(MemoryError::Execution(ffi::error()))
-                }
-            })
-            .map_err(memory_error)?;
+        admission.synchronize_code(|range| {
+            record(Counter::InvalidationCalls, 1);
+            record(Counter::InvalidationBytes, range.bytes);
+            let _measurement = Timer::new(Counter::InvalidationNanoseconds);
+            if unsafe {
+                ffi::nixe_dynarmic_invalidate(
+                    handle.pointer,
+                    range.start.get(),
+                    range.bytes as usize,
+                )
+            } {
+                Ok(())
+            } else {
+                Err(MemoryError::Execution(ffi::error()))
+            }
+        })?;
         let space = handle.address_space();
         let mut callbacks = Callbacks {
             space,
@@ -218,7 +217,7 @@ impl Core {
         unsafe {
             worker
                 .faults()
-                .map_err(|e| JitError(e.to_string().into()))?
+                .map_err(|e| MemoryError::Execution(e.to_string().into()))?
                 .invoke_captured(
                     base..base + space.width().bytes() as usize,
                     [u64::from(mxcsr), 0],
@@ -232,19 +231,19 @@ impl Core {
                 )
         }
         .map_err(|e| {
-            memory_error(
+            MemoryAccessFailure::from(
                 self.context
                     .fail(MemoryError::Execution(e.to_string().into())),
             )
         })?;
         drop(measurement);
         if !call.ok {
-            return Err(memory_error(
+            return Err(MemoryAccessFailure::from(
                 self.context.fail(MemoryError::Execution(ffi::error())),
             ));
         }
         if let Some(error) = callbacks.error.take() {
-            return Err(memory_error(error));
+            return Err(error);
         }
         let fetch_fault = if call.exit.kind == 3
             && call.exit.detail == 9
@@ -275,9 +274,10 @@ impl Core {
                     None
                 }
                 Ok(Lookup::Ready(_)) => {
-                    return Err(JitError(
-                        "native fetch fault for executable captured code".into(),
-                    ));
+                    return Err(MemoryError::Invalid(
+                        "native fetch fault for executable captured code",
+                    )
+                    .into());
                 }
             }
         } else {
@@ -286,16 +286,17 @@ impl Core {
         let word = if call.exit.kind == 1
             || (call.exit.kind == 3 && !matches!(call.exit.detail, 3..=7 | 9))
         {
-            match callbacks
-                .cache
-                .fetch(space, &admission, GuestVirtualAddress::new(call.exit.pc))
-                .map_err(memory_error)?
-            {
+            match callbacks.cache.fetch(
+                space,
+                &admission,
+                GuestVirtualAddress::new(call.exit.pc),
+            )? {
                 Lookup::Ready(word) => Some(word),
                 Lookup::Capture(_) => {
-                    return Err(JitError(
-                        "executed exception has no retained code input".into(),
-                    ));
+                    return Err(MemoryError::Invalid(
+                        "executed exception has no retained code input",
+                    )
+                    .into());
                 }
             }
         } else {
@@ -313,9 +314,6 @@ impl Core {
             fetch_fault,
         })
     }
-}
-fn memory_error(error: MemoryError) -> JitError {
-    JitError(error.to_string().into())
 }
 unsafe extern "C" fn code(opaque: *mut c_void, address: u64, output: *mut u32) -> bool {
     record(Counter::CodeFetches, 1);
@@ -370,7 +368,7 @@ unsafe extern "C" fn memory(
     );
     let context = unsafe { &mut *opaque.cast::<Callbacks<'_>>() };
     if !matches!(bytes, 1 | 2 | 4 | 8 | 16) || operation > 2 {
-        context.error = Some(MemoryError::Invalid("invalid native memory callback"));
+        context.error = Some(MemoryError::Invalid("invalid native memory callback").into());
         return false;
     }
     if context.error.is_some() {
@@ -469,7 +467,7 @@ unsafe extern "C" fn memory(
             },
             Ok(_) => return Err(MemoryError::Invalid("unexpected native access completion")),
             Err(error) => {
-                context.error = Some(MemoryError::Execution(error.to_string().into()));
+                context.error = Some(error);
                 return Ok(false);
             }
         }
@@ -488,7 +486,7 @@ unsafe extern "C" fn memory(
         }
         Err(error) => {
             let error = context.process.fail(Arc::new(error));
-            context.error = Some(MemoryError::Execution(error.to_string().into()));
+            context.error = Some(MemoryAccessFailure::Memory(error));
             false
         }
     }

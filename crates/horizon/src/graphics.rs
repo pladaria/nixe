@@ -601,7 +601,7 @@ impl VideoSystem {
                 // the backend has established the ordered image dependency.
                 // https://source.android.com/docs/core/graphics/arch-bq-gralloc
                 let image = nvdrv
-                    .request_presentable_image(source.clone())
+                    .request_presentable_image(source.clone(), request.input.swap_interval)
                     .map_err(FramebufferError::Backend)?;
                 presentation_source = Some(source);
                 Some(PendingPresentation {
@@ -774,8 +774,15 @@ impl VideoSystem {
             if let Some(presentation) = pending.presentation {
                 let sequence = state.next_frame_sequence;
                 state.next_frame_sequence = state.next_frame_sequence.saturating_add(1);
+                let image = image.expect("a ready presentation owns its resident image");
+                nixe_memory::trace::event(
+                    "frame_producer",
+                    sequence,
+                    image.lease().producer().slot(),
+                    image.lease().content_version(),
+                );
                 let frame = Arc::new(PresentationFrame::new(
-                    image.expect("a ready presentation owns its resident image"),
+                    image,
                     presentation.crop,
                     presentation.transform,
                     sequence,
@@ -1954,6 +1961,7 @@ mod tests {
         fn acquire_presentable_image(
             &mut self,
             request: Self::ImageRequest,
+            _swap_interval: u32,
         ) -> Result<ResidentImage, BackendRuntimeError> {
             if let Some((entered, release)) = &self.preparation_gate {
                 entered.send(()).unwrap();

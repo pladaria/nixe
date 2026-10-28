@@ -58,8 +58,10 @@ fn native_waveforms_refresh_and_stop_on_retarget_and_worker_shutdown() {
     // Isolate this process from physical devices: the test must never vibrate
     // someone's real controller. SDL's virtual driver remains available.
     sdl3::hint::set("SDL_JOYSTICK_HIDAPI", "0");
-    sdl3::hint::set("SDL_JOYSTICK_LINUX_CLASSIC", "0");
-    sdl3::hint::set("SDL_JOYSTICK_LINUX_JOYSTICK", "0");
+    // Linux evdev does not have an enable/disable hint. Its enumeration uses
+    // SDL's physical VID/PID filter; the in-process virtual driver bypasses it.
+    // https://github.com/libsdl-org/SDL/blob/release-3.4.12/src/joystick/SDL_gamepad.c
+    sdl3::hint::set("SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT", "0xffff/0xffff");
     let sdl = sdl3::init().unwrap();
     let _gamepads = sdl.gamepad().unwrap();
     let effects = Box::<Effects>::default();

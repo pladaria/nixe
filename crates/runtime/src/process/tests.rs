@@ -10,22 +10,6 @@ pub(crate) fn reference_process_builder() -> ProcessBuilder {
     ProcessBuilder::new(machine, system)
 }
 
-struct FixedSupervisorCallDispatcher<F> {
-    outcome: Option<crate::ExceptionDispatchOutcome<F>>,
-}
-
-impl<F> crate::ExceptionDispatcher for FixedSupervisorCallDispatcher<F> {
-    type Fault = F;
-
-    fn dispatch(
-        &mut self,
-        _context: &mut crate::ExceptionDispatchContext<'_>,
-        _request: crate::ExceptionDispatchRequest,
-    ) -> crate::ExceptionDispatchOutcome<Self::Fault> {
-        self.outcome.take().expect("dispatcher is called once")
-    }
-}
-
 fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
@@ -191,7 +175,7 @@ pub(crate) fn synthetic_process_for_coordinator(process_id: u64) -> RunnableProc
 #[test]
 fn thread_creation_succeeds_after_heap_consumes_the_application_budget() {
     let (_directory, plan) = plan();
-    let mut process = reference_process_builder()
+    let process = reference_process_builder()
         .with_config(ProcessBuildConfig {
             physical_memory_limit: 4 * 1024 * 1024,
             ..ProcessBuildConfig::default()
@@ -222,10 +206,15 @@ fn thread_creation_succeeds_after_heap_consumes_the_application_budget() {
         ideal_vcpu: Some(core),
         affinity: profile.all_cores(),
     };
-    for id in 2..=10 {
-        process
-            .commit_created_thread(nixe_scheduler::GuestThreadId::new(id), &request)
-            .unwrap();
+    let mut coordinator = crate::RuntimeCoordinator::new(profile);
+    let registration = crate::ProcessRegistration {
+        priority: 44,
+        ideal_vcpu: Some(core),
+        affinity: coordinator.scheduler().profile().all_cores(),
+    };
+    let process = coordinator.register_process(process, registration).unwrap();
+    for _ in 2..=10 {
+        coordinator.create_thread(process, request.clone()).unwrap();
     }
     assert_eq!(memory.account().used_bytes(), memory.account().limit());
     assert_eq!(

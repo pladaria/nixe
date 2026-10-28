@@ -4,9 +4,8 @@ use std::fmt::{Display, Formatter};
 
 use nixe_cpu::execution::VcpuEventState;
 use nixe_scheduler::{
-    Completion, CoreSet, GuestThreadId, Lease, MachineSchedulerProfile, ProcessId, Readiness,
-    ScheduledThreadConfig, SchedulerCommand, SchedulerDecision, SchedulerError, SchedulerState,
-    VirtualCpuId, WakeToken,
+    Completion, CoreSet, GuestThreadId, Lease, MachineSchedulerProfile, ProcessId,
+    ScheduledThreadConfig, SchedulerError, SchedulerState, VirtualCpuId, WakeToken,
 };
 
 use crate::{
@@ -21,7 +20,7 @@ mod thread;
 mod wait;
 pub(crate) mod worker;
 
-use identity::{GuestThreadIdAllocator, ProcessIdAllocator};
+use identity::ProcessIdAllocator;
 pub use worker::WorkerFailure;
 use worker::{VcpuWorkerPool, WorkerCpuThreadKey, WorkerRequest, WorkerRunFailure};
 
@@ -50,25 +49,16 @@ pub struct CoordinatorResourceCounts {
     pub address_waiters: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct PriorityDonation {
-    owner: GuestThreadId,
-    waiter: GuestThreadId,
-    key: u64,
-}
-
 pub struct RuntimeCoordinator {
-    scheduler: SchedulerState,
+    scheduler: std::sync::Arc<SchedulerState>,
     processes: BTreeMap<ProcessId, RunnableProcess>,
     process_ids: ProcessIdAllocator,
     workers: VcpuWorkerPool,
-    thread_ids: GuestThreadIdAllocator,
     inbox: ExternalEventInbox,
     host_stop_requested: bool,
     virtual_clock: crate::VirtualClock,
     deadlines: BTreeMap<(u64, u64), WakeToken>,
     next_deadline_sequence: u64,
-    priority_donations: BTreeSet<PriorityDonation>,
     vcpu_events: BTreeMap<VirtualCpuId, VcpuEventState>,
     next_preemption_ns: Option<u64>,
     completed_executions: VecDeque<CoordinatorExecution>,
@@ -104,26 +94,30 @@ impl RuntimeCoordinator {
             .collect();
         let inbox = ExternalEventInbox::bounded(1_024, profile.vcpus().len())
             .expect("the default event capacity is non-zero");
-        let workers = VcpuWorkerPool::start(
-            profile.vcpus().iter().map(|descriptor| descriptor.id()),
-            inbox.worker_sender(),
-        )
-        .map_err(|error| CoordinatorError::WorkerStartup(error.kind()))?;
         let next_preemption_ns = profile
             .preemption_interval_ns()
             .map(|interval| virtual_clock.scheduler_time_ns().saturating_add(interval));
+        let scheduler = std::sync::Arc::new(SchedulerState::new(profile, virtual_clock.clone()));
+        let workers = VcpuWorkerPool::start(
+            scheduler
+                .profile()
+                .vcpus()
+                .iter()
+                .map(|descriptor| descriptor.id()),
+            inbox.worker_sender(),
+            scheduler.clone(),
+        )
+        .map_err(|error| CoordinatorError::WorkerStartup(error.kind()))?;
         Ok(Self {
-            scheduler: SchedulerState::new(profile),
+            scheduler,
             processes: BTreeMap::new(),
             process_ids: ProcessIdAllocator::new(),
             workers,
-            thread_ids: GuestThreadIdAllocator::new(),
             inbox,
             host_stop_requested: false,
             virtual_clock,
             deadlines: BTreeMap::new(),
             next_deadline_sequence: 1,
-            priority_donations: BTreeSet::new(),
             vcpu_events,
             next_preemption_ns,
             completed_executions: VecDeque::new(),
@@ -134,8 +128,11 @@ impl RuntimeCoordinator {
     /// Quiesces workers and releases every process, CPU backend, wait, and
     /// canonical address-space resource. Repeated shutdown calls are harmless.
     pub fn shutdown(&mut self) -> Result<(), CoordinatorError> {
-        self.quiesce()?;
         let processes: Vec<_> = self.processes.keys().copied().collect();
+        for &process in &processes {
+            self.request_process_stop(process)?;
+        }
+        self.quiesce()?;
         for process_id in processes {
             let process = self.remove_process(process_id)?;
             process
@@ -159,7 +156,7 @@ impl RuntimeCoordinator {
     }
 
     #[must_use]
-    pub const fn scheduler(&self) -> &SchedulerState {
+    pub fn scheduler(&self) -> &SchedulerState {
         &self.scheduler
     }
 
@@ -182,35 +179,39 @@ impl RuntimeCoordinator {
             .candidate()
             .ok_or(CoordinatorError::ProcessIdExhausted)?;
         process.assign_process_id(id);
-        let (thread, next_thread_id) = self
-            .thread_ids
-            .candidate()
-            .ok_or(CoordinatorError::ThreadIdExhausted)?;
-        process.assign_main_thread_id(thread)?;
-        self.scheduler
-            .apply(SchedulerCommand::Register(ScheduledThreadConfig {
-                process: id,
-                thread,
-                base_priority: registration.priority,
-                effective_priority: registration.priority,
-                ideal_vcpu: registration.ideal_vcpu,
-                affinity: registration.affinity,
-            }))?;
-        if let Err(error) = self.scheduler.apply(SchedulerCommand::MakeReady(thread)) {
+        let thread = self.scheduler.create_thread(ScheduledThreadConfig {
+            process: id,
+            base_priority: registration.priority,
+            ideal_vcpu: registration.ideal_vcpu,
+            affinity: registration.affinity,
+        })?;
+        if let Err(error) = process.assign_main_thread_id(thread) {
+            self.scheduler.unregister(thread)?;
+            return Err(error.into());
+        }
+        if let Err(error) = self.scheduler.make_ready(thread) {
             self.scheduler
-                .apply(SchedulerCommand::Unregister(thread))
+                .unregister(thread)
                 .expect("registration rollback removes an unleased created thread");
             return Err(error.into());
         }
         if let Err(error) = self.install_process_cpu_threads(id, &mut process, thread) {
             self.scheduler
-                .apply(SchedulerCommand::Unregister(thread))
+                .unregister(thread)
                 .expect("CPU thread installation rollback removes an unleased ready thread");
             return Err(error);
         }
+        process.address_waits().bind(id, self.scheduler.clone());
+        process
+            .main_thread()
+            .object()
+            .bind_retirement(id, self.inbox.sender());
+        process
+            .scheduler
+            .set(self.scheduler.clone())
+            .expect("process is registered once");
         let replaced = self.processes.insert(id, process);
         debug_assert!(replaced.is_none());
-        self.thread_ids.commit(next_thread_id);
         self.process_ids.commit(next_process_id);
         Ok(id)
     }
@@ -219,7 +220,7 @@ impl RuntimeCoordinator {
     /// CPU thread, then transfers the process solely for final resource teardown.
     /// A removed process is terminal and cannot be registered again.
     pub fn remove_process(&mut self, id: ProcessId) -> Result<RunnableProcess, CoordinatorError> {
-        self.quiesce()?;
+        self.terminate_process(id)?;
         self.completed_executions
             .retain(|execution| execution.lease.process != id);
         let threads: Vec<_> = self
@@ -240,26 +241,21 @@ impl RuntimeCoordinator {
             }
         }
         self.retire_process_cpu_threads(id)?;
-        let removed_threads: BTreeSet<_> = threads.iter().copied().collect();
-        self.priority_donations.retain(|donation| {
-            !removed_threads.contains(&donation.owner)
-                && !removed_threads.contains(&donation.waiter)
-        });
         for thread in threads {
-            self.release_wait_resources(thread);
-            self.scheduler.apply(SchedulerCommand::Unregister(thread))?;
+            self.finalize_thread_waits(id, thread);
+            self.scheduler.unregister(thread)?;
         }
         let process = self
             .processes
             .remove(&id)
             .expect("process existed throughout atomic scheduler removal");
-        self.recompute_effective_priorities()?;
         Ok(process)
     }
 
     /// Terminates every thread in a registered process through the scheduler
     /// and records a host-requested process exit without releasing resources.
     pub fn terminate_process(&mut self, id: ProcessId) -> Result<bool, CoordinatorError> {
+        let terminated = self.request_process_stop(id)?;
         self.quiesce()?;
         self.completed_executions
             .retain(|execution| execution.lease.process != id);
@@ -271,28 +267,43 @@ impl RuntimeCoordinator {
             .iter()
             .map(|(thread, _)| *thread)
             .collect();
-        let terminated = self
+        for thread in threads {
+            if self.scheduler.thread(thread).is_some_and(|view| {
+                matches!(
+                    view.lifecycle,
+                    nixe_scheduler::ThreadLifecycle::Exited
+                        | nixe_scheduler::ThreadLifecycle::Faulted
+                )
+            }) {
+                continue;
+            }
+            self.processes
+                .get_mut(&id)
+                .unwrap()
+                .terminate_thread_from_coordinator(
+                    thread,
+                    0,
+                    crate::ExceptionTerminationScope::Process,
+                );
+            self.finalize_thread_waits(id, thread);
+            self.scheduler.terminate(thread, false)?;
+        }
+        Ok(terminated)
+    }
+
+    fn request_process_stop(&mut self, id: ProcessId) -> Result<bool, CoordinatorError> {
+        let process = self
             .processes
             .get_mut(&id)
-            .expect("the process was validated")
-            .terminate_from_host();
-        if terminated {
-            for thread in threads {
-                if self.scheduler.thread(thread).is_some_and(|view| {
-                    matches!(
-                        view.lifecycle,
-                        nixe_scheduler::ThreadLifecycle::Exited
-                            | nixe_scheduler::ThreadLifecycle::Faulted
-                    )
-                }) {
-                    continue;
-                }
-                self.scheduler.apply(SchedulerCommand::Terminate {
-                    thread,
-                    faulted: false,
-                })?;
-            }
-        }
+            .ok_or(CoordinatorError::UnknownProcess(id))?;
+        let terminated = process.terminate_from_host();
+        process
+            .request_execution_stop()
+            .map_err(|fault| CoordinatorError::Execution {
+                process: id,
+                thread: process.main_thread_id(),
+                error: ProcessExecutionError::Cpu { fault },
+            })?;
         Ok(terminated)
     }
 
@@ -387,7 +398,7 @@ impl RuntimeCoordinator {
 
     /// Makes one waiting guest thread ready.
     pub fn make_thread_ready(&mut self, thread: GuestThreadId) -> Result<(), CoordinatorError> {
-        self.scheduler.apply(SchedulerCommand::MakeReady(thread))?;
+        self.scheduler.make_ready(thread)?;
         Ok(())
     }
 
@@ -435,38 +446,14 @@ impl RuntimeCoordinator {
                 },
             ));
         }
-        let other_live = self.other_live_threads(lease.process, lease.thread)?;
         let process = self
             .processes
             .get_mut(&lease.process)
             .ok_or(CoordinatorRouteError::UnknownProcess(lease.process))?;
         let result = process
-            .route_supervisor_call_for(lease.thread, lease.vcpu, stop, dispatcher, other_live)
+            .route_supervisor_call_for(lease.thread, lease.vcpu, stop, dispatcher)
             .map_err(CoordinatorRouteError::Route)?;
         self.commit_exception_result(lease.process, lease.thread, result)
-    }
-
-    fn other_live_threads(
-        &self,
-        process_id: ProcessId,
-        thread_id: GuestThreadId,
-    ) -> Result<bool, CoordinatorRouteError> {
-        Ok(self
-            .processes
-            .get(&process_id)
-            .ok_or(CoordinatorRouteError::UnknownProcess(process_id))?
-            .threads()
-            .iter()
-            .filter(|(id, _)| **id != thread_id)
-            .any(|(id, _)| {
-                self.scheduler.thread(*id).is_some_and(|thread| {
-                    !matches!(
-                        thread.lifecycle,
-                        nixe_scheduler::ThreadLifecycle::Exited
-                            | nixe_scheduler::ThreadLifecycle::Faulted
-                    )
-                })
-            }))
     }
 
     /// Resumes only the current owned kernel operation. It consumes the old
@@ -487,16 +474,15 @@ impl RuntimeCoordinator {
             return Ok(None);
         };
         let process_id = thread.process;
-        let other_live = self.other_live_threads(process_id, token.thread)?;
         self.release_wait_resources(token.thread);
         self.scheduler
-            .apply(SchedulerCommand::ContinueWait(token))
+            .continue_wait(token)
             .map_err(CoordinatorRouteError::Scheduler)?;
         let result = self
             .processes
             .get_mut(&process_id)
             .ok_or(CoordinatorRouteError::UnknownProcess(process_id))?
-            .resume_supervisor_call_for(token.thread, vcpu, source, other_live, continuation)
+            .resume_supervisor_call_for(token.thread, vcpu, source, continuation)
             .map_err(CoordinatorRouteError::Route)?;
         self.commit_exception_result(process_id, token.thread, result)
             .map(Some)
@@ -508,66 +494,26 @@ impl RuntimeCoordinator {
         thread_id: GuestThreadId,
         result: ExceptionHandlingResult<F>,
     ) -> Result<ExceptionHandlingResult<F>, CoordinatorRouteError> {
-        let command = match &result {
-            ExceptionHandlingResult::Resumed | ExceptionHandlingResult::Rejected(_) => {
-                Some(SchedulerCommand::MakeReady(thread_id))
-            }
-            ExceptionHandlingResult::Suspended => None,
-            ExceptionHandlingResult::Terminated { .. } => Some(SchedulerCommand::Terminate {
-                thread: thread_id,
-                faulted: false,
-            }),
-            ExceptionHandlingResult::Fault(_) => Some(SchedulerCommand::Terminate {
-                thread: thread_id,
-                faulted: true,
-            }),
-        };
         let terminal = matches!(
             result,
             ExceptionHandlingResult::Terminated { .. } | ExceptionHandlingResult::Fault(_)
         );
-        if let Some(command) = command {
-            self.scheduler
-                .apply(command)
-                .map_err(CoordinatorRouteError::Scheduler)?;
-        }
         if terminal {
-            self.release_wait_resources(thread_id);
-            self.processes
-                .get_mut(&process_id)
-                .expect("the terminal thread retains its owning process")
-                .address_waits()
-                .lock()
-                .release_thread(thread_id);
-            self.priority_donations
-                .retain(|donation| donation.owner != thread_id && donation.waiter != thread_id);
-            self.recompute_effective_priorities()
-                .map_err(CoordinatorRouteError::Scheduler)?;
-            let reap_unreferenced = self
-                .processes
-                .get(&process_id)
-                .and_then(|process| {
-                    (process.main_thread_id() != thread_id)
-                        .then(|| process.thread(thread_id))
-                        .flatten()
-                })
-                .is_some_and(|thread| thread.object_identity_reference_count() == 1);
-            if reap_unreferenced {
-                self.scheduler
-                    .apply(SchedulerCommand::Unregister(thread_id))
-                    .map_err(CoordinatorRouteError::Scheduler)?;
-                self.processes
-                    .get_mut(&process_id)
-                    .expect("the terminated thread retains its owning process")
-                    .reap_exited_thread(thread_id)
-                    .expect("an unreferenced terminal thread can be reaped");
-            }
+            self.finalize_thread_waits(process_id, thread_id);
         }
-        if let ExceptionHandlingResult::Terminated {
-            scope: crate::ExceptionTerminationScope::Process,
-            exit_code,
-            ..
-        } = &result
+        match &result {
+            ExceptionHandlingResult::Resumed | ExceptionHandlingResult::Rejected(_) => {
+                self.scheduler.make_ready(thread_id)
+            }
+            ExceptionHandlingResult::Suspended => Ok(()),
+            ExceptionHandlingResult::Terminated { .. } => {
+                self.scheduler.terminate(thread_id, false)
+            }
+            ExceptionHandlingResult::Fault(_) => self.scheduler.terminate(thread_id, true),
+        }
+        .map_err(CoordinatorRouteError::Scheduler)?;
+        if let ExceptionHandlingResult::Terminated { exit_code, .. } = &result
+            && self.processes[&process_id].lifecycle() == nixe_scheduler::ProcessLifecycle::Exited
         {
             self.terminate_remaining_process_threads(process_id, thread_id, *exit_code)?;
         }
@@ -587,7 +533,7 @@ impl RuntimeCoordinator {
             active_waits: self.scheduler.active_wait_count(),
             deadlines: self.deadlines.len(),
             external_watcher_groups: self.inbox.sender().watcher_group_count(),
-            priority_donations: self.priority_donations.len(),
+            priority_donations: self.scheduler.priority_donation_count(),
             address_waiters: self
                 .processes
                 .values()
@@ -597,7 +543,7 @@ impl RuntimeCoordinator {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum CoordinatorError {
     UnknownProcess(ProcessId),
     UnknownThread {
@@ -605,8 +551,11 @@ pub enum CoordinatorError {
         thread: GuestThreadId,
     },
     Scheduler(SchedulerError),
+    ThreadLocal {
+        thread: GuestThreadId,
+        fault: std::sync::Arc<nixe_memory::MemoryError>,
+    },
     InFlightLease(Lease),
-    ThreadIdExhausted,
     ProcessIdExhausted,
     DeadlineSequenceExhausted,
     ThreadTable(crate::ThreadTableError),
@@ -665,7 +614,7 @@ impl Drop for RuntimeCoordinator {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum CoordinatorRouteError {
     Coordinator(Box<CoordinatorError>),
     UnknownProcess(ProcessId),

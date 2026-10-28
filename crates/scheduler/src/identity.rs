@@ -28,6 +28,5 @@ macro_rules! identity {
 identity!(ProcessId, u64);
 identity!(GuestThreadId, u64);
 identity!(VirtualCpuId, u32);
-identity!(SchedulerSequence, u64);
 identity!(WakeGeneration, u64);
 identity!(LeaseGeneration, u64);

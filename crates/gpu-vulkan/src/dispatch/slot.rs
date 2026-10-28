@@ -32,11 +32,9 @@ impl CommandSlot {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
     }
-    #[cfg(any(feature = "performance-counters", feature = "binding-probe"))]
     pub fn owner(&self) -> &Arc<DeviceOwner> {
         &self.pool.owner
     }
-    #[cfg(feature = "performance-counters")]
     pub fn family(&self) -> u32 {
         self.pool.family
     }

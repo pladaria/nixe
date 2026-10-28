@@ -1,9 +1,264 @@
 use super::*;
+use nixe_scheduler::IdealCore;
 use nixe_scheduler::{GuestThreadId, VirtualCpuId};
 
 const WAITERS: u32 = 1 << 30;
 
-fn add_thread(process: &mut ScheduledProcess, entry: u64, priority: i32) -> (GuestThreadId, u32) {
+#[test]
+fn a_native_condition_signal_keeps_its_donated_current_owner_ahead_of_an_equal_priority_peer() {
+    let (_directory, mut process) = fixture_process(&[svc(0x1d), svc(0x10), svc(0x1c), svc(0x10)]);
+    let mut dispatcher = support::dispatcher(&process);
+    let owner = process.main_thread_id();
+    let owner_tag = process.main_thread().handle;
+    let mutex = process.main_thread().stack_bottom;
+    let key = mutex.checked_add(16).unwrap();
+    let entry = instruction_address(&process);
+    let (waiter, tag) = add_thread(&mut process, entry + 8, 30);
+    let (peer, _) = add_thread(&mut process, entry + 4, 30);
+    write_guest_bytes(&process, mutex, &tag.to_le_bytes());
+    let waiter_state = process.thread_mut(waiter).unwrap().state_mut();
+    waiter_state.write_x(x(0), mutex.get());
+    waiter_state.write_x(x(1), key.get());
+    waiter_state.write_w(x(2), tag);
+    waiter_state.write_x(x(3), 10_000_000_000);
+    state(&mut process).write_x(x(0), key.get());
+    state(&mut process).write_w(x(1), 1);
+    start(&mut process, waiter);
+    assert!(
+        matches!(dispatch_scheduled_next(&mut process, &mut dispatcher), (thread, ExceptionHandlingResult::Suspended) if thread == waiter)
+    );
+    assert_eq!(read_guest_u32(&process, mutex), 0);
+    // The signalling thread acquired the now-uncontended mutex in user code.
+    write_guest_bytes(&process, mutex, &owner_tag.to_le_bytes());
+    let execution = process
+        .coordinator_mut()
+        .run_next(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(execution.lease.thread, owner);
+    assert!(matches!(
+        execution.report.stop,
+        nixe_runtime::ExecutionStop::SupervisorCall {
+            immediate: 0x1d,
+            ..
+        }
+    ));
+    start(&mut process, peer);
+    assert_eq!(
+        process
+            .coordinator_mut()
+            .scheduler()
+            .selection(VirtualCpuId::new(0))
+            .unwrap()
+            .thread,
+        Some(peer)
+    );
+    assert!(matches!(
+        dispatcher
+            .route_scheduled_supervisor_call(
+                process.coordinator_mut(),
+                execution.lease,
+                &execution.report.stop
+            )
+            .unwrap(),
+        ExceptionHandlingResult::Resumed
+    ));
+    let scheduler = process.coordinator_mut().scheduler();
+    assert_eq!(scheduler.thread(owner).unwrap().effective_priority, 30);
+    assert_eq!(scheduler.thread(peer).unwrap().effective_priority, 30);
+    assert_eq!(
+        scheduler.selection(VirtualCpuId::new(0)).unwrap().thread,
+        Some(owner)
+    );
+}
+
+#[test]
+fn a_native_mutex_wait_on_a_foreign_thread_is_cancelled_in_the_waiters_process() {
+    let (_directory, mut process) = fixture_process(&[svc(0x0b)]);
+    let owner_process = process.scheduler_process_id();
+    let owner = process.main_thread_id();
+    let owner_object = process.main_thread().object();
+    state(&mut process).write_x(x(0), 10_000_000_000);
+    let coordinator = process.coordinator_mut();
+    let core = VirtualCpuId::new(0);
+    let affinity = coordinator.scheduler().profile().core_set([core]).unwrap();
+    coordinator
+        .scheduler()
+        .migrate(owner, IdealCore::Core(core), affinity)
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("foreign-wait.nro");
+    fs::write(&path, synthetic_nro(&[svc(0x1a), svc(0x10)])).unwrap();
+    let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
+    let mut other = support::process_builder()
+        .with_config(ProcessBuildConfig {
+            process_id: 2,
+            ..Default::default()
+        })
+        .build(&plan)
+        .unwrap();
+    let entry = other.entry_module().entry_address() + 0x80;
+    other.main_thread_mut().state_mut().set_pc(entry);
+    let handle = other
+        .handles()
+        .insert_object(nixe_runtime::HandleObject::from_arc(owner_object))
+        .unwrap();
+    let mutex = other.main_thread().stack_bottom;
+    let tag = other.main_thread().handle;
+    write_guest_bytes(&other, mutex, &(handle | WAITERS).to_le_bytes());
+    lock_arguments(
+        other.main_thread_mut().state_mut(),
+        handle,
+        mutex.get(),
+        tag,
+    );
+    let other_process = coordinator
+        .register_process(
+            other,
+            nixe_runtime::ProcessRegistration {
+                priority: 44,
+                ideal_vcpu: Some(core),
+                affinity,
+            },
+        )
+        .unwrap();
+    let foreign = coordinator.process(other_process).unwrap().main_thread_id();
+    let waits = coordinator
+        .process(other_process)
+        .unwrap()
+        .address_waits()
+        .clone();
+    let mut dispatcher = support::dispatcher(&process);
+    for expected in [owner, foreign] {
+        let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+        assert_eq!(thread, expected);
+        if thread == owner {
+            assert!(matches!(handling, ExceptionHandlingResult::Resumed));
+        } else {
+            assert!(matches!(handling, ExceptionHandlingResult::Suspended));
+        }
+        assert_eq!(
+            process
+                .coordinator_mut()
+                .scheduler()
+                .thread(thread)
+                .unwrap()
+                .lifecycle,
+            nixe_scheduler::ThreadLifecycle::Waiting
+        );
+    }
+    assert_eq!(
+        process
+            .coordinator_mut()
+            .scheduler()
+            .priority_donation_count(),
+        1
+    );
+    assert!(
+        process
+            .coordinator_mut()
+            .terminate_process(owner_process)
+            .unwrap()
+    );
+    assert_eq!(
+        waits.lock().completion(mutex.get(), foreign),
+        Some(nixe_runtime::AddressWaitCompletion::InvalidOwner)
+    );
+    assert_eq!(
+        process
+            .coordinator_mut()
+            .scheduler()
+            .priority_donation_count(),
+        0
+    );
+    process.coordinator_mut().drain_external_events().unwrap();
+    assert_eq!(
+        process
+            .coordinator_mut()
+            .scheduler()
+            .thread(foreign)
+            .unwrap()
+            .lifecycle,
+        nixe_scheduler::ThreadLifecycle::Ready
+    );
+    let report = process
+        .coordinator_mut()
+        .run_next(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    let handling = dispatcher
+        .route_scheduled_supervisor_call(
+            process.coordinator_mut(),
+            report.lease,
+            &report.report.stop,
+        )
+        .unwrap();
+    assert!(matches!(handling, ExceptionHandlingResult::Resumed));
+    assert_eq!(
+        process
+            .coordinator_mut()
+            .process(other_process)
+            .unwrap()
+            .main_thread()
+            .state()
+            .read_w(x(0)),
+        HorizonKernelResult::INVALID_STATE.raw()
+    );
+}
+
+#[test]
+fn original_owner_exit_during_handoff_keeps_the_selected_waiter_blocked_until_publication() {
+    let (_directory, mut process) = fixture_process(&[svc(0x0a), svc(0x1a)]);
+    let mut dispatcher = support::dispatcher(&process);
+    let owner = process.main_thread_id();
+    let owner_tag = process.main_thread().handle;
+    let mutex = process.main_thread().stack_bottom;
+    let entry = instruction_address(&process);
+    let (first, first_tag) = add_thread(&mut process, entry + 4, 10);
+    let (second, second_tag) = add_thread(&mut process, entry + 4, 30);
+    write_guest_bytes(&process, mutex, &(owner_tag | WAITERS).to_le_bytes());
+    for (thread, tag) in [(second, second_tag), (first, first_tag)] {
+        lock_arguments(
+            process.thread_mut(thread).unwrap().state_mut(),
+            owner_tag,
+            mutex.get(),
+            tag,
+        );
+        start(&mut process, thread);
+        assert!(
+            matches!(dispatch_scheduled_next(&mut process, &mut dispatcher),
+            (id, ExceptionHandlingResult::Suspended) if id == thread)
+        );
+    }
+    let waits = process.address_waits().clone();
+    let handoff = {
+        let mut state = waits.lock();
+        let handoff = state.claim_mutex(mutex.get(), owner).unwrap();
+        assert_eq!(handoff.next_tag, Some(first_tag));
+        assert!(handoff.more_waiters);
+        handoff
+    };
+    assert!(
+        matches!(dispatch_scheduled_next(&mut process, &mut dispatcher), (thread, ExceptionHandlingResult::Terminated { .. }) if thread == owner)
+    );
+    assert!(!waits.lock().is_signalled(mutex.get(), first));
+    assert!(!waits.lock().is_signalled(mutex.get(), second));
+    waits
+        .lock()
+        .finish_mutex_handoff(&handoff, nixe_runtime::AddressWaitCompletion::Success);
+    assert!(waits.lock().is_signalled(mutex.get(), first));
+    assert!(!waits.lock().is_signalled(mutex.get(), second));
+    assert_eq!(
+        waits.lock().completion(mutex.get(), first),
+        Some(nixe_runtime::AddressWaitCompletion::Success)
+    );
+}
+
+pub(super) fn add_thread(
+    process: &mut ScheduledProcess,
+    entry: u64,
+    priority: i32,
+) -> (GuestThreadId, u32) {
     let process_id = process.scheduler_process_id();
     let stack_top = process.main_thread().stack_top;
     // Arbitration order is a per-core contract. Keep these contenders on core
@@ -17,7 +272,8 @@ fn add_thread(process: &mut ScheduledProcess, entry: u64, priority: i32) -> (Gue
     let main = process.main_thread_id();
     process
         .coordinator_mut()
-        .migrate_thread(main, Some(VirtualCpuId::new(0)), affinity.clone())
+        .scheduler()
+        .migrate(main, IdealCore::Core(VirtualCpuId::new(0)), affinity)
         .unwrap();
     let child = process
         .coordinator_mut()
@@ -34,7 +290,10 @@ fn add_thread(process: &mut ScheduledProcess, entry: u64, priority: i32) -> (Gue
         )
         .unwrap();
     let object = process.thread(child.id).unwrap().object().clone();
-    let handle = process.handles().insert(object).unwrap();
+    let handle = process
+        .handles()
+        .insert_object(nixe_runtime::HandleObject::from_arc(object))
+        .unwrap();
     (child.id, handle)
 }
 
@@ -97,7 +356,10 @@ fn pending_release_and_acquisition(condition: bool, acquire_first: bool) {
     let mutex = process.main_thread().stack_bottom;
     let key = mutex.checked_add(12).unwrap();
     let owner_object = process.main_thread().object().clone();
-    let owner = process.handles().insert(owner_object).unwrap();
+    let owner = process
+        .handles()
+        .insert_object(nixe_runtime::HandleObject::from_arc(owner_object))
+        .unwrap();
     let entry = state(&mut process).pc() + 8;
     let (child, tag) = add_thread(&mut process, entry, 30);
     lock_arguments(
@@ -241,7 +503,10 @@ fn mutex_handoff_keeps_remaining_waiters_and_transfers_priority_before_waking() 
     let mutex = process.main_thread().stack_bottom;
     let main = process.main_thread_id();
     let main_object = process.main_thread().object().clone();
-    let owner = process.handles().insert(main_object).unwrap();
+    let owner = process
+        .handles()
+        .insert_object(nixe_runtime::HandleObject::from_arc(main_object))
+        .unwrap();
     let entry = state(&mut process).pc() + 8;
     write_guest_bytes(&process, mutex, &(owner | WAITERS).to_le_bytes());
     let mut children = Vec::new();
@@ -303,7 +568,7 @@ fn mutex_handoff_keeps_remaining_waiters_and_transfers_priority_before_waking() 
     let last_object = process.thread(last).unwrap().object().thread_id();
     process
         .coordinator_mut()
-        .set_thread_priority(last_object, 20)
+        .set_thread_priority(None, last_object, 20)
         .unwrap();
     assert_eq!(
         process
@@ -370,7 +635,10 @@ fn condition_signal_waits_for_the_held_mutex_and_preserves_the_original_deadline
     let mutex = key.checked_add(4).unwrap();
     let main = process.main_thread_id();
     let main_object = process.main_thread().object().clone();
-    let owner = process.handles().insert(main_object).unwrap();
+    let owner = process
+        .handles()
+        .insert_object(nixe_runtime::HandleObject::from_arc(main_object))
+        .unwrap();
     let entry = state(&mut process).pc() + 12;
     let (child, tag) = add_thread(&mut process, entry, 30);
     let child_state = process.thread_mut(child).unwrap().state_mut();
@@ -507,7 +775,10 @@ fn condition_signals_keep_the_key_set_until_all_waiters_reacquire_the_mutex() {
     let mutex = key.checked_add(4).unwrap();
     let main = process.main_thread_id();
     let main_object = process.main_thread().object().clone();
-    let owner = process.handles().insert(main_object).unwrap();
+    let owner = process
+        .handles()
+        .insert_object(nixe_runtime::HandleObject::from_arc(main_object))
+        .unwrap();
     let entry = state(&mut process).pc() + 16;
     let mut children = Vec::new();
     for priority in [40, 30] {

@@ -31,6 +31,7 @@ pub use thread::{
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::GuestCpuState;
 use crate::memory::ProcessMemory;
@@ -70,6 +71,7 @@ pub struct RunnableProcess {
     process_id: u64,
     lifecycle: nixe_scheduler::ProcessLifecycle,
     process_exit: Option<ProcessExit>,
+    num_running_threads: usize,
     cpu: ProcessCpuContext,
     address_space: ProcessAddressSpace,
     memory_layout: ProcessMemoryLayout,
@@ -87,6 +89,7 @@ pub struct RunnableProcess {
     mounts: std::sync::Arc<crate::ProcessMountNamespace>,
     handles: std::sync::Arc<crate::HandleTable>,
     address_waits: std::sync::Arc<crate::AddressWaitRegistry>,
+    pub(crate) scheduler: std::sync::OnceLock<std::sync::Arc<nixe_scheduler::SchedulerState>>,
     execution: execution::ProcessExecutionControl,
 }
 
@@ -157,14 +160,14 @@ impl RunnableProcess {
     pub fn main_thread(&self) -> &crate::GuestThread {
         self.threads
             .get(self.main_thread_id)
-            .expect("a runnable process always retains its main thread")
+            .expect("the main thread has not been finalized")
     }
 
     /// Returns mutable main-thread state for runtime scheduling and ABI setup.
     pub fn main_thread_mut(&mut self) -> &mut crate::GuestThread {
         self.threads
             .get_mut(self.main_thread_id)
-            .expect("a runnable process always retains its main thread")
+            .expect("the main thread has not been finalized")
     }
 
     #[must_use]
@@ -231,34 +234,22 @@ impl RunnableProcess {
         Ok(())
     }
 
-    pub(crate) fn validate_thread_policy(
-        &self,
-        priority: i32,
-        affinity: &nixe_scheduler::CoreSet,
-    ) -> Result<(), ThreadCreateError> {
-        if let Some(policy) = self.thread_policy
-            && (priority < policy.highest_priority
-                || priority > policy.lowest_priority
-                || affinity
-                    .iter()
-                    .any(|vcpu| vcpu.get() < policy.min_core || vcpu.get() > policy.max_core))
-        {
-            return Err(ThreadCreateError::PolicyDenied);
-        }
-        Ok(())
-    }
-
     pub(crate) fn commit_created_thread(
         &mut self,
         id: nixe_scheduler::GuestThreadId,
         request: &ThreadCreateRequest,
+        retirement: crate::ExternalEventSender,
     ) -> Result<ThreadCreation, ThreadCreateError> {
         let tls_base = self.thread_local.allocate(&self.memory).map_err(|error| {
             log::debug!("thread TLS allocation failed: error={error:?}");
             ThreadCreateError::ResourceLimit
         })?;
-        let object = crate::ThreadObject::new(id.get());
-        let handle = match self.handles.insert(object.clone()) {
+        let object = Arc::new(crate::ThreadObject::new(id.get()));
+        object.bind_retirement(nixe_scheduler::ProcessId::new(self.process_id), retirement);
+        let handle = match self
+            .handles
+            .insert_object(crate::HandleObject::from_arc(object.clone()))
+        {
             Ok(handle) => handle,
             Err(error) => {
                 log::debug!("thread handle allocation failed: {error}");
@@ -274,7 +265,8 @@ impl RunnableProcess {
         }
         let thread = GuestThread {
             id,
-            object,
+            object: Arc::downgrade(&object),
+            running_reference: None,
             exit: None,
             state: Some(state),
             handle,
@@ -292,14 +284,7 @@ impl RunnableProcess {
         Ok(ThreadCreation { id, handle })
     }
 
-    pub(crate) fn rollback_created_thread(&mut self, id: nixe_scheduler::GuestThreadId) {
-        if let Ok(thread) = self.threads.remove(id) {
-            let _ = self.handles.close(thread.handle);
-            self.thread_local.release(&self.memory, thread.tls_base);
-        }
-    }
-
-    pub(crate) fn reap_exited_thread(
+    pub(crate) fn retire_thread(
         &mut self,
         id: nixe_scheduler::GuestThreadId,
     ) -> Result<(), ThreadCreateError> {
@@ -320,12 +305,12 @@ impl RunnableProcess {
     ) -> Result<(), crate::ThreadTableError> {
         let old = self.main_thread_id;
         if old == id {
-            self.main_thread().object.assign_thread_id(id.get());
+            self.main_thread().object().assign_thread_id(id.get());
             return Ok(());
         }
         self.threads.rekey(old, id)?;
         self.main_thread_id = id;
-        self.main_thread().object.assign_thread_id(id.get());
+        self.main_thread().object().assign_thread_id(id.get());
         Ok(())
     }
 
@@ -346,6 +331,41 @@ impl RunnableProcess {
         self.threads.get_mut(id)
     }
 
+    pub(crate) fn start_thread(
+        &mut self,
+        id: nixe_scheduler::GuestThreadId,
+    ) -> Result<(), crate::ThreadOperationError> {
+        let thread = self
+            .threads
+            .get_mut(id)
+            .ok_or(crate::ThreadOperationError::InvalidHandle)?;
+        debug_assert!(thread.running_reference.is_none());
+        thread.running_reference = Some(
+            thread
+                .object
+                .upgrade()
+                .ok_or(crate::ThreadOperationError::InvalidHandle)?,
+        );
+        self.num_running_threads += 1;
+        Ok(())
+    }
+
+    // Count actual execution references, not retained handles or created records.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_thread.cpp#L1152-L1195
+    pub(crate) fn finish_thread(&mut self, id: nixe_scheduler::GuestThreadId) -> bool {
+        if self
+            .threads
+            .get_mut(id)
+            .expect("the terminating thread remains registered")
+            .finish()
+        {
+            self.num_running_threads -= 1;
+            self.num_running_threads == 0
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn terminate_thread_from_coordinator(
         &mut self,
         id: nixe_scheduler::GuestThreadId,
@@ -361,7 +381,7 @@ impl RunnableProcess {
             exit_code,
             source: None,
         });
-        thread.object.signal();
+        self.finish_thread(id);
     }
 
     /// Returns the immutable process-local filesystem namespace.

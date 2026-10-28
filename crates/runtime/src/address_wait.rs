@@ -1,24 +1,25 @@
 //! Console-neutral ownership for address-keyed wait queues.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
-use nixe_scheduler::GuestThreadId;
+use nixe_scheduler::{
+    GuestThreadId, LockKey, OrderedWaitKind, ProcessId, SchedulerError, SchedulerState,
+};
 
 use crate::{EventObject, ReadableEventObject, WritableEventObject};
 
-mod priority;
-pub use priority::{AddressSignalTargets, AddressWaitResult, PriorityAddressWaitQueue};
+mod arbiter;
+pub use arbiter::{AddressSignalTargets, AddressWaitResult};
 
 #[derive(Clone, Debug)]
 struct AddressWaiter {
-    thread: GuestThreadId,
+    address: u64,
     value: u32,
     lock_address: Option<u64>,
-    priority: i32,
     phase: WaitPhase,
     lock_memory: Option<nixe_memory::AllocationRange>,
     writable: WritableEventObject,
@@ -123,7 +124,7 @@ impl Drop for AddressOperationGuard {
             }
             let retired = state.operations.remove(&self.address).unwrap();
             if state.deferred_addresses.remove(&self.address) {
-                state.priority_waits.publish_deferred_timeouts(self.address);
+                state.publish_deferred_timeouts(self.address);
             }
             retired
         };
@@ -143,6 +144,13 @@ pub struct AddressWaitGuard<'a> {
     state: Option<MutexGuard<'a, AddressWaitState>>,
 }
 impl AddressWaitRegistry {
+    pub(crate) fn bind(&self, process: ProcessId, scheduler: Arc<SchedulerState>) {
+        self.lock()
+            .kernel
+            .set((process, scheduler))
+            .expect("address waits already bound");
+    }
+
     pub async fn address_operation(
         self: &Arc<Self>,
         address: u64,
@@ -200,24 +208,27 @@ impl Drop for AddressWaitGuard<'_> {
     fn drop(&mut self) {
         let mut state = self.state.take().unwrap();
         let wakes = std::mem::take(&mut state.wakes);
-        let priority_wakes = state.priority_waits.take_wakes();
         let retired = std::mem::take(&mut state.retired);
-        let priority_retired = state.priority_waits.take_retired();
+        let arbiter_retired = std::mem::take(&mut state.arbiter_retired);
         drop(state);
-        for event in wakes.into_iter().chain(priority_wakes) {
+        for event in wakes {
             event.signal();
         }
         drop(retired);
-        drop(priority_retired);
+        drop(arbiter_retired);
     }
 }
 
-/// Process-owned address wait queues and mutex ownership records.
+/// Process-owned payloads for the canonical kernel address wait queues.
 #[derive(Debug, Default)]
 pub struct AddressWaitState {
-    waiters: BTreeMap<u64, VecDeque<AddressWaiter>>,
-    owners: BTreeMap<u64, GuestThreadId>,
-    priority_waits: PriorityAddressWaitQueue,
+    kernel: OnceLock<(ProcessId, Arc<SchedulerState>)>,
+    waiters: BTreeMap<GuestThreadId, AddressWaiter>,
+    arbiter_waiters: BTreeMap<GuestThreadId, arbiter::Waiter>,
+    arbiter_deadlines: BTreeSet<(u64, GuestThreadId)>,
+    arbiter_deferred: BTreeSet<(u64, GuestThreadId)>,
+    arbiter_completed: BTreeMap<GuestThreadId, AddressWaitResult>,
+    arbiter_retired: Vec<arbiter::Waiter>,
     operations: BTreeMap<u64, AddressOperation>,
     deferred_addresses: BTreeSet<u64>,
     wakes: Vec<WritableEventObject>,
@@ -225,44 +236,37 @@ pub struct AddressWaitState {
 }
 
 impl AddressWaitState {
-    pub fn expire_address_waits(&mut self, now: u64) {
-        let operations = &self.operations;
-        let deferred = &mut self.deferred_addresses;
-        self.priority_waits.expire(now, |address| {
-            if operations.contains_key(&address) {
-                deferred.insert(address);
-                true
-            } else {
-                false
-            }
-        });
+    fn kernel(&self) -> &(ProcessId, Arc<SchedulerState>) {
+        self.kernel
+            .get()
+            .expect("process address waits must be bound before execution")
     }
-    /// Priority-ordered address signals have an independent queue namespace
-    /// from mutex ownership and condition-variable keys.
-    pub const fn priority_waits(&self) -> &PriorityAddressWaitQueue {
-        &self.priority_waits
+    fn first_ordered(&self, kind: OrderedWaitKind, address: u64) -> Option<GuestThreadId> {
+        let (process, scheduler) = self.kernel();
+        scheduler.first_ordered_waiter(*process, kind, address)
     }
-
-    pub const fn priority_waits_mut(&mut self) -> &mut PriorityAddressWaitQueue {
-        &mut self.priority_waits
-    }
-
-    #[must_use]
     pub fn contains(&self, address: u64, thread: GuestThreadId) -> bool {
         self.waiters
-            .get(&address)
-            .is_some_and(|waiters| waiters.iter().any(|waiter| waiter.thread == thread))
+            .get(&thread)
+            .is_some_and(|waiter| waiter.address == address)
     }
-
     pub fn enqueue(
         &mut self,
         address: u64,
+        owner: GuestThreadId,
         thread: GuestThreadId,
         value: u32,
-    ) -> ReadableEventObject {
-        self.enqueue_with_lock(address, thread, value, None)
+    ) -> Result<ReadableEventObject, SchedulerError> {
+        let (process, scheduler) = self.kernel();
+        scheduler.add_waiter(
+            *process,
+            LockKey::User(address),
+            owner,
+            thread,
+            Some(thread),
+        )?;
+        Ok(self.insert_waiter(address, thread, value, None))
     }
-
     pub fn enqueue_condition(
         &mut self,
         address: u64,
@@ -270,19 +274,23 @@ impl AddressWaitState {
         value: u32,
         lock: u64,
         memory: nixe_memory::AllocationRange,
-    ) -> ConditionWait {
-        let event = self.enqueue_with_lock(address, thread, value, Some(lock));
-        let waiter = self.waiters.get_mut(&address).unwrap().back_mut().unwrap();
+    ) -> Result<ConditionWait, SchedulerError> {
+        self.kernel().1.register_ordered_wait(
+            thread,
+            OrderedWaitKind::ConditionVariable,
+            address,
+        )?;
+        let event = self.insert_waiter(address, thread, value, Some(lock));
+        let waiter = self.waiters.get_mut(&thread).unwrap();
         waiter.phase = WaitPhase::Registering;
         waiter.lock_memory = Some(memory);
-        ConditionWait {
+        Ok(ConditionWait {
             key: address,
             thread,
             event,
-        }
+        })
     }
-
-    fn enqueue_with_lock(
+    fn insert_waiter(
         &mut self,
         address: u64,
         thread: GuestThreadId,
@@ -290,216 +298,92 @@ impl AddressWaitState {
         lock_address: Option<u64>,
     ) -> ReadableEventObject {
         let (writable, readable) = EventObject::create_pair();
-        self.waiters
-            .entry(address)
-            .or_default()
-            .push_back(AddressWaiter {
-                thread,
+        let previous = self.waiters.insert(
+            thread,
+            AddressWaiter {
+                address,
                 value,
                 lock_address,
-                priority: i32::MAX,
                 phase: WaitPhase::Waiting,
                 lock_memory: None,
                 writable,
-            });
+            },
+        );
+        debug_assert!(previous.is_none());
         readable
     }
-
-    #[must_use]
     pub fn is_signalled(&self, address: u64, thread: GuestThreadId) -> bool {
-        self.waiters.get(&address).is_some_and(|waiters| {
-            waiters
-                .iter()
-                .find(|waiter| waiter.thread == thread)
-                .is_some_and(|waiter| waiter.phase.completion().is_some())
-        })
+        self.completion(address, thread).is_some()
     }
-
-    #[must_use]
-    pub fn value(&self, address: u64, thread: GuestThreadId) -> Option<u32> {
-        self.waiters
-            .get(&address)?
-            .iter()
-            .find(|waiter| waiter.thread == thread)
-            .map(|waiter| waiter.value)
-    }
-
     pub fn remove(&mut self, address: u64, thread: GuestThreadId) {
-        if let Some(waiters) = self.waiters.get_mut(&address)
-            && let Some(index) = waiters.iter().position(|waiter| waiter.thread == thread)
-        {
-            self.retired.push(waiters.remove(index).unwrap());
-        }
-        if self.waiters.get(&address).is_some_and(VecDeque::is_empty) {
-            self.waiters.remove(&address);
-        }
-        self.retire_uncontended_owner(address);
-    }
-
-    pub fn change_priority(&mut self, thread: GuestThreadId, priority: i32) {
-        self.priority_waits.change_priority(thread, priority);
-        for waiters in self.waiters.values_mut() {
-            for waiter in waiters.iter_mut().filter(|waiter| waiter.thread == thread) {
-                waiter.priority = priority;
-            }
+        if self.contains(address, thread) {
+            self.kernel().1.remove_waiter(thread);
+            self.retired.push(self.waiters.remove(&thread).unwrap());
         }
     }
-
-    /// Initializes newly registered mutex/condition waiters without scanning
-    /// the process thread table or allocating a temporary priority snapshot.
-    pub fn refresh_mutex_priorities(&mut self, mut priority: impl FnMut(GuestThreadId) -> i32) {
-        for waiter in self.waiters.values_mut().flatten() {
-            waiter.priority = priority(waiter.thread);
-        }
+    pub fn has_condition_waiters(&self, address: u64) -> bool {
+        self.first_ordered(OrderedWaitKind::ConditionVariable, address)
+            .is_some()
     }
-
-    pub fn unsignalled_count(&self, address: u64) -> usize {
-        self.waiters.get(&address).map_or(0, |waiters| {
-            waiters
-                .iter()
-                .filter(|waiter| {
-                    waiter.lock_address.is_none() && waiter.phase == WaitPhase::Waiting
-                })
-                .count()
-        })
-    }
-
-    /// Select current effective priority, then FIFO among equal priorities.
-    pub fn next_waiter(&self, address: u64) -> Option<(GuestThreadId, u32)> {
-        self.waiters
-            .get(&address)?
-            .iter()
-            .enumerate()
-            .filter(|(_, waiter)| {
-                waiter.lock_address.is_none() && waiter.phase == WaitPhase::Waiting
-            })
-            .min_by_key(|(order, waiter)| (waiter.priority, *order))
-            .map(|(_, waiter)| (waiter.thread, waiter.value))
-    }
-
-    pub fn next_condition(&self, address: u64) -> Option<(GuestThreadId, u32, u64)> {
-        self.waiters
-            .get(&address)?
-            .iter()
-            .enumerate()
-            .filter(|(_, waiter)| {
-                waiter.lock_address.is_some()
-                    && matches!(waiter.phase, WaitPhase::Waiting | WaitPhase::Registering)
-            })
-            .min_by_key(|(order, waiter)| (waiter.priority, *order))
-            .map(|(_, waiter)| (waiter.thread, waiter.value, waiter.lock_address.unwrap()))
-    }
-
-    pub fn pending_threads(&self, address: u64) -> impl Iterator<Item = GuestThreadId> + '_ {
-        self.waiters
-            .get(&address)
-            .into_iter()
-            .flatten()
-            .filter(|waiter| waiter.lock_address.is_none() && waiter.phase == WaitPhase::Waiting)
-            .map(|waiter| waiter.thread)
-    }
-
     pub fn completion(&self, address: u64, thread: GuestThreadId) -> Option<AddressWaitCompletion> {
         self.waiters
-            .get(&address)?
-            .iter()
-            .find(|waiter| waiter.thread == thread)
-            .and_then(|waiter| waiter.phase.completion())
+            .get(&thread)
+            .filter(|w| w.address == address)
+            .and_then(|w| w.phase.completion())
     }
-
     pub fn signal_result(
         &mut self,
         address: u64,
         thread: GuestThreadId,
         result: AddressWaitCompletion,
     ) {
-        if let Some(waiter) = self
-            .waiters
-            .get_mut(&address)
-            .and_then(|waiters| waiters.iter_mut().find(|waiter| waiter.thread == thread))
-            && waiter.phase.completion().is_none()
-        {
-            waiter.phase = WaitPhase::Resolved(result);
-            self.wakes.push(waiter.writable.clone());
+        if self.contains(address, thread) && self.waiters[&thread].phase.completion().is_none() {
+            self.kernel().1.remove_waiter(thread);
+            self.publish_result(thread, result);
         }
-        self.retire_uncontended_owner(address);
     }
-
-    /// A pending kernel word effect keeps its target blocked until that effect
-    /// completes. Record the timer in that same wait phase rather than waking
-    /// guest code ahead of an accepted ownership write.
+    fn publish_result(&mut self, thread: GuestThreadId, result: AddressWaitCompletion) {
+        let waiter = self.waiters.get_mut(&thread).unwrap();
+        waiter.phase = WaitPhase::Resolved(result);
+        self.wakes.push(waiter.writable.clone());
+    }
+    /// Accepted guest-word effects finish before a timeout can resume guest code.
     pub fn defer_timeout(&mut self, thread: GuestThreadId) -> bool {
-        let operations = &self.operations;
-        if let Some(address) = self
-            .priority_waits
-            .defer_timeout(thread, |address| operations.contains_key(&address))
-        {
+        if let Some(address) = self.defer_arbiter_timeout(thread) {
             self.deferred_addresses.insert(address);
             return true;
         }
-        for waiter in self
-            .waiters
-            .values_mut()
-            .flatten()
-            .filter(|waiter| waiter.thread == thread)
-        {
-            let phase = match waiter.phase {
-                WaitPhase::Registering | WaitPhase::RegisteringTimedOut => {
-                    WaitPhase::RegisteringTimedOut
-                }
-                WaitPhase::ConditionSignalled | WaitPhase::ConditionSignalledTimedOut => {
-                    WaitPhase::ConditionSignalledTimedOut
-                }
-                WaitPhase::Handoff | WaitPhase::HandoffTimedOut => WaitPhase::HandoffTimedOut,
-                _ => continue,
-            };
-            waiter.phase = phase;
-            return true;
+        let Some(waiter) = self.waiters.get_mut(&thread) else {
+            return false;
+        };
+        waiter.phase = match waiter.phase {
+            WaitPhase::Registering | WaitPhase::RegisteringTimedOut => {
+                WaitPhase::RegisteringTimedOut
+            }
+            WaitPhase::ConditionSignalled | WaitPhase::ConditionSignalledTimedOut => {
+                WaitPhase::ConditionSignalledTimedOut
+            }
+            WaitPhase::Handoff | WaitPhase::HandoffTimedOut => WaitPhase::HandoffTimedOut,
+            _ => return false,
+        };
+        // A condition timed out during release must no longer be signalable.
+        if waiter.phase == WaitPhase::RegisteringTimedOut {
+            self.kernel().1.remove_waiter(thread);
         }
-        false
+        true
     }
     pub fn expire_thread_wait(&mut self, thread: GuestThreadId) -> bool {
-        let expired = self.waiters.iter_mut().find_map(|(address, waiters)| {
-            let waiter = waiters
-                .iter_mut()
-                .find(|waiter| waiter.thread == thread && waiter.phase == WaitPhase::Waiting)?;
-            waiter.phase = WaitPhase::Resolved(AddressWaitCompletion::TimedOut);
-            self.wakes.push(waiter.writable.clone());
-            Some(*address)
-        });
-        if let Some(address) = expired {
-            self.retire_uncontended_owner(address);
+        let Some(waiter) = self.waiters.get(&thread) else {
+            return false;
+        };
+        if waiter.phase != WaitPhase::Waiting {
+            return false;
         }
-        expired.is_some()
+        self.signal_result(waiter.address, thread, AddressWaitCompletion::TimedOut);
+        true
     }
-
-    /// Preserve the same event and deadline while a condition waiter reacquires
-    /// its mutex. The runtime must not wake it until ownership is transferred.
-    pub fn move_waiter(&mut self, from: u64, to: u64, thread: GuestThreadId) {
-        let waiters = self
-            .waiters
-            .get_mut(&from)
-            .expect("registered condition waiter");
-        let index = waiters
-            .iter()
-            .position(|waiter| waiter.thread == thread)
-            .unwrap();
-        let mut waiter = waiters.remove(index).unwrap();
-        waiter.lock_address = None;
-        if waiters.is_empty() {
-            self.waiters.remove(&from);
-        }
-        self.waiters.entry(to).or_default().push_back(waiter);
-    }
-
     fn condition_claim(&self, key: u64, thread: GuestThreadId) -> ConditionClaim {
-        let waiter = self
-            .waiters
-            .get(&key)
-            .unwrap()
-            .iter()
-            .find(|waiter| waiter.thread == thread)
-            .unwrap();
+        let waiter = &self.waiters[&thread];
         ConditionClaim {
             key,
             thread,
@@ -514,14 +398,9 @@ impl AddressWaitState {
         }
     }
     pub fn claim_condition(&mut self, key: u64) -> Option<ConditionSignal> {
-        let (thread, _, _) = self.next_condition(key)?;
-        let waiter = self
-            .waiters
-            .get_mut(&key)
-            .unwrap()
-            .iter_mut()
-            .find(|waiter| waiter.thread == thread)
-            .unwrap();
+        let thread = self.first_ordered(OrderedWaitKind::ConditionVariable, key)?;
+        self.kernel().1.remove_waiter(thread);
+        let waiter = self.waiters.get_mut(&thread).unwrap();
         if waiter.phase == WaitPhase::Registering {
             waiter.phase = WaitPhase::ConditionSignalled;
             Some(ConditionSignal::PendingRelease)
@@ -536,12 +415,8 @@ impl AddressWaitState {
         &mut self,
         registration: &ConditionWait,
     ) -> Option<ConditionClaim> {
-        let waiter = self
-            .waiters
-            .get_mut(&registration.key)?
-            .iter_mut()
-            .find(|waiter| waiter.thread == registration.thread)?;
-        if !registration.event.same_event(&waiter.writable) {
+        let waiter = self.waiters.get_mut(&registration.thread)?;
+        if waiter.address != registration.key || !registration.event.same_event(&waiter.writable) {
             return None;
         }
         match waiter.phase {
@@ -568,184 +443,177 @@ impl AddressWaitState {
             _ => None,
         }
     }
-    pub fn finish_condition_acquire(&mut self, claim: &ConditionClaim, outcome: ConditionAcquire) {
-        let Some(waiter) = self
-            .waiters
-            .get(&claim.key)
-            .and_then(|waiters| waiters.iter().find(|waiter| waiter.thread == claim.thread))
-        else {
-            return;
+    pub fn finish_condition_acquire(
+        &mut self,
+        claim: &ConditionClaim,
+        outcome: ConditionAcquire,
+        current: GuestThreadId,
+    ) -> Result<(), SchedulerError> {
+        let Some(waiter) = self.waiters.get(&claim.thread) else {
+            return Ok(());
         };
-        if !waiter.writable.same_event(&claim.event)
+        if waiter.address != claim.key
+            || !waiter.writable.same_event(&claim.event)
             || !matches!(
                 waiter.phase,
                 WaitPhase::Handoff | WaitPhase::HandoffTimedOut
             )
         {
-            return;
+            return Ok(());
         }
         let expired = waiter.phase == WaitPhase::HandoffTimedOut;
         match outcome {
-            ConditionAcquire::Acquired => {
-                self.signal_result(claim.key, claim.thread, AddressWaitCompletion::Success);
-            }
-            ConditionAcquire::Contended(owner) => {
-                self.set_owner(claim.mutex, owner);
-                self.move_waiter(claim.key, claim.mutex, claim.thread);
-                let waiter = self
-                    .waiters
-                    .get_mut(&claim.mutex)
-                    .unwrap()
-                    .iter_mut()
-                    .find(|waiter| waiter.thread == claim.thread)
-                    .unwrap();
+            ConditionAcquire::Contended(owner) if !expired => {
+                let (process, scheduler) = self.kernel();
+                scheduler.add_waiter(
+                    *process,
+                    LockKey::User(claim.mutex),
+                    owner,
+                    claim.thread,
+                    Some(current),
+                )?;
+                let waiter = self.waiters.get_mut(&claim.thread).unwrap();
+                waiter.address = claim.mutex;
+                waiter.lock_address = None;
                 waiter.phase = WaitPhase::Waiting;
-                if expired {
-                    self.signal_result(claim.mutex, claim.thread, AddressWaitCompletion::TimedOut);
-                }
             }
-            ConditionAcquire::InvalidOwner => {
-                self.signal_result(claim.key, claim.thread, AddressWaitCompletion::InvalidOwner)
+            ConditionAcquire::Contended(_) => {
+                let waiter = self.waiters.get_mut(&claim.thread).unwrap();
+                waiter.address = claim.mutex;
+                waiter.lock_address = None;
+                self.signal_result(claim.mutex, claim.thread, AddressWaitCompletion::TimedOut);
             }
-            ConditionAcquire::InvalidMemory => self.signal_result(
+            outcome => self.signal_result(
                 claim.key,
                 claim.thread,
-                AddressWaitCompletion::InvalidMemory,
+                match outcome {
+                    ConditionAcquire::Acquired => AddressWaitCompletion::Success,
+                    ConditionAcquire::Contended(_) => unreachable!(),
+                    ConditionAcquire::InvalidOwner => AddressWaitCompletion::InvalidOwner,
+                    ConditionAcquire::InvalidMemory => AddressWaitCompletion::InvalidMemory,
+                },
             ),
         }
+        Ok(())
     }
-
-    pub fn claim_mutex(&mut self, address: u64, owner: GuestThreadId) -> MutexHandoff {
-        let next = if self.owner(address) == Some(owner) {
-            self.next_waiter(address)
-        } else {
-            None
-        };
-        let claim = next.map(|(thread, tag)| {
+    pub fn claim_mutex(
+        &mut self,
+        address: u64,
+        owner: GuestThreadId,
+    ) -> Result<MutexHandoff, SchedulerError> {
+        let (process, scheduler) = self.kernel();
+        let handoff = scheduler.release_lock(*process, LockKey::User(address), owner)?;
+        let next = handoff.next.map(|thread| {
             let waiter = self
                 .waiters
-                .get_mut(&address)
-                .unwrap()
-                .iter_mut()
-                .find(|waiter| waiter.thread == thread)
-                .unwrap();
+                .get_mut(&thread)
+                .expect("selected mutex waiter");
             waiter.phase = WaitPhase::Handoff;
-            (thread, tag, waiter.writable.clone())
+            (thread, waiter.writable.clone())
         });
-        if self.owner(address) == Some(owner) {
-            if let Some((thread, _, _)) = &claim {
-                self.set_owner(address, *thread);
-            } else {
-                self.remove_owner(address);
-            }
-        }
-        self.retire_uncontended_owner(address);
-        MutexHandoff {
+        Ok(MutexHandoff {
             address,
-            next_tag: claim.as_ref().map(|(_, tag, _)| *tag),
-            more_waiters: self.unsignalled_count(address) != 0,
-            next: claim.map(|(thread, _, event)| (thread, event)),
-        }
+            next_tag: next.as_ref().map(|(thread, _)| self.waiters[thread].value),
+            next,
+            more_waiters: handoff.more_waiters,
+        })
     }
     pub fn finish_mutex_handoff(&mut self, claim: &MutexHandoff, result: AddressWaitCompletion) {
         let Some((thread, event)) = &claim.next else {
             return;
         };
-        if let Some(waiter) = self
-            .waiters
-            .get_mut(&claim.address)
-            .and_then(|waiters| waiters.iter_mut().find(|waiter| waiter.thread == *thread))
-            && matches!(
-                waiter.phase,
-                WaitPhase::Handoff | WaitPhase::HandoffTimedOut
-            )
-            && waiter.writable.same_event(event)
-        {
+        if self.waiters.get(thread).is_some_and(|w| {
+            w.address == claim.address
+                && matches!(w.phase, WaitPhase::Handoff | WaitPhase::HandoffTimedOut)
+                && w.writable.same_event(event)
+        }) {
             self.signal_result(claim.address, *thread, result);
         }
     }
-
-    pub fn owner(&self, address: u64) -> Option<GuestThreadId> {
-        self.owners.get(&address).copied()
-    }
-
-    pub fn set_owner(&mut self, address: u64, thread: GuestThreadId) {
-        self.owners.insert(address, thread);
-    }
-
-    pub fn remove_owner(&mut self, address: u64) -> Option<GuestThreadId> {
-        self.owners.remove(&address)
-    }
-
-    fn retire_uncontended_owner(&mut self, address: u64) {
-        // Guest code can release and reacquire an uncontended mutex without an
-        // SVC. Only blocked waiters keep kernel ownership/donation metadata.
-        if self.unsignalled_count(address) == 0 {
-            self.owners.remove(&address);
+    pub(crate) fn release_thread(&mut self, thread: GuestThreadId) {
+        self.remove_address_wait(thread);
+        if let Some(waiter) = self.waiters.get(&thread) {
+            self.remove(waiter.address, thread);
         }
     }
-
-    /// Removes one terminating thread and cancels all waits on its mutexes.
-    /// No ownership can be transferred without a guest memory handoff.
-    /// https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/kern_k_thread.cpp#L390-L415
-    pub fn release_thread(&mut self, thread: GuestThreadId) {
-        self.priority_waits.remove(thread);
-        let addresses: Vec<_> = self.waiters.keys().copied().collect();
-        for address in addresses {
-            self.remove(address, thread);
-        }
-        let owned: Vec<_> = self
-            .owners
-            .iter()
-            .filter_map(|(address, owner)| (*owner == thread).then_some(*address))
-            .collect();
-        for address in owned {
-            self.owners.remove(&address);
-            while let Some((waiter, _)) = self.next_waiter(address) {
-                self.signal_result(address, waiter, AddressWaitCompletion::InvalidOwner);
-            }
+    pub(crate) fn cancel_held_waiter(&mut self, thread: GuestThreadId) {
+        // The canonical node was detached before entering its process registry.
+        // A timeout/cancellation may resolve or remove its payload in between.
+        if self.waiters.get(&thread).is_some_and(|waiter| {
+            waiter.lock_address.is_none() && waiter.phase == WaitPhase::Waiting
+        }) {
+            self.publish_result(thread, AddressWaitCompletion::InvalidOwner);
         }
     }
-
-    #[must_use]
     pub fn waiter_count(&self) -> usize {
-        self.waiters.values().map(VecDeque::len).sum::<usize>() + self.priority_waits.len()
+        self.waiters.len() + self.arbiter_waiters.len() + self.arbiter_completed.len()
     }
 }
 
 #[cfg(test)]
-mod tests {
+fn test_registry() -> AddressWaitRegistry {
+    use nixe_scheduler::{
+        MachineSchedulerProfile, PriorityRange, ScheduledThreadConfig, VirtualCpuDescriptor,
+        VirtualCpuId,
+    };
+    let core = VirtualCpuId::new(0);
+    let scheduler = Arc::new(SchedulerState::new(
+        MachineSchedulerProfile::new(
+            vec![VirtualCpuDescriptor::new(core, 0)],
+            PriorityRange::new(0, 63).unwrap(),
+        )
+        .unwrap(),
+        crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 }),
+    ));
+    let registry = AddressWaitRegistry::default();
+    registry.bind(ProcessId::new(1), scheduler.clone());
+    for id in 1..=4 {
+        let thread = scheduler
+            .create_thread(ScheduledThreadConfig {
+                process: ProcessId::new(1),
+                base_priority: 20,
+                ideal_vcpu: Some(core),
+                affinity: scheduler.profile().core_set([core]).unwrap(),
+            })
+            .unwrap();
+        assert_eq!(thread, GuestThreadId::new(id));
+    }
+    registry
+}
+
+#[cfg(test)]
+mod finalization_tests {
     use super::*;
 
     #[test]
-    fn owner_exit_cancels_all_waiters_without_granting_ownership() {
-        let owner = GuestThreadId::new(1);
-        let waiter = GuestThreadId::new(2);
-        let owner_registry = AddressWaitRegistry::default();
-        let mut registry = owner_registry.lock();
-        registry.set_owner(0x1000, owner);
-        let wake = registry.enqueue(0x1000, waiter, 0x1234);
-        let other = GuestThreadId::new(3);
-        let other_wake = registry.enqueue(0x1000, other, 0x5678);
-        assert!(!wake.is_signalled());
-        registry.release_thread(owner);
-        drop(registry);
-        assert!(wake.is_signalled());
-        assert!(other_wake.is_signalled());
-        let mut registry = owner_registry.lock();
-        assert_eq!(
-            registry.completion(0x1000, waiter),
-            Some(AddressWaitCompletion::InvalidOwner)
-        );
-        assert_eq!(
-            registry.completion(0x1000, other),
-            Some(AddressWaitCompletion::InvalidOwner)
-        );
-        assert_eq!(registry.owner(0x1000), None);
-        assert_eq!(registry.value(0x1000, waiter), Some(0x1234));
-        registry.release_thread(waiter);
-        registry.release_thread(other);
-        assert_eq!(registry.waiter_count(), 0);
+    fn finalization_preserves_a_timeout_or_removal_that_won_after_detachment() {
+        for removed in [false, true] {
+            let registry = test_registry();
+            let owner = GuestThreadId::new(1);
+            let thread = GuestThreadId::new(2);
+            let event = registry.lock().enqueue(0x1000, owner, thread, 7).unwrap();
+            let scheduler = registry.lock().kernel().1.clone();
+            assert_eq!(
+                scheduler.take_held_waiter(owner),
+                Some((ProcessId::new(1), thread))
+            );
+            let mut state = registry.lock();
+            if removed {
+                state.remove(0x1000, thread);
+            } else {
+                state.signal_result(0x1000, thread, AddressWaitCompletion::TimedOut);
+            }
+            state.cancel_held_waiter(thread);
+            assert_eq!(
+                state.completion(0x1000, thread),
+                (!removed).then_some(AddressWaitCompletion::TimedOut)
+            );
+            assert_eq!(state.waiter_count(), usize::from(!removed));
+            drop(state);
+            if !removed {
+                assert!(event.is_signalled());
+            }
+        }
     }
 }
 
@@ -779,9 +647,12 @@ mod notification_tests {
     }
     #[test]
     fn terminal_claim_is_visible_before_waking_and_wakers_run_after_unlock() {
-        let registry = Arc::new(AddressWaitRegistry::default());
+        let registry = Arc::new(test_registry());
         let thread = GuestThreadId::new(1);
-        let event = registry.lock().enqueue(0x1000, thread, 7);
+        let event = registry
+            .lock()
+            .enqueue(0x1000, GuestThreadId::new(2), thread, 7)
+            .unwrap();
         let wake = Arc::new(Reenter {
             registry: registry.clone(),
             notifications: AtomicUsize::new(0),
@@ -817,16 +688,15 @@ mod handoff_tests {
     use super::*;
     #[test]
     fn a_final_handoff_allows_an_unobserved_fast_release_and_a_new_owner() {
-        let registry = AddressWaitRegistry::default();
+        let registry = test_registry();
         let owner = GuestThreadId::new(1);
         let next = GuestThreadId::new(2);
         let fast_owner = GuestThreadId::new(3);
         let final_waiter = GuestThreadId::new(4);
         let (event, claim) = {
             let mut state = registry.lock();
-            state.set_owner(0x1000, owner);
-            let event = state.enqueue(0x1000, next, 0x22);
-            let claim = state.claim_mutex(0x1000, owner);
+            let event = state.enqueue(0x1000, owner, next, 0x22).unwrap();
+            let claim = state.claim_mutex(0x1000, owner).unwrap();
             assert!(!claim.more_waiters);
             (event, claim)
         };
@@ -835,73 +705,40 @@ mod handoff_tests {
             .finish_mutex_handoff(&claim, AddressWaitCompletion::Success);
         assert!(event.is_signalled());
         let mut state = registry.lock();
-        assert_eq!(state.owner(0x1000), None);
         state.remove(0x1000, next);
         // The selected thread drops the lock in user code; another thread
         // acquires it there. The next kernel wait must use that actual owner.
-        state.set_owner(0x1000, fast_owner);
-        let event = state.enqueue(0x1000, final_waiter, 0x44);
-        let claim = state.claim_mutex(0x1000, fast_owner);
+        let event = state
+            .enqueue(0x1000, fast_owner, final_waiter, 0x44)
+            .unwrap();
+        let claim = state.claim_mutex(0x1000, fast_owner).unwrap();
         assert_eq!(claim.next_tag, Some(0x44));
         state.finish_mutex_handoff(&claim, AddressWaitCompletion::Success);
         drop(state);
         assert!(event.is_signalled());
     }
     #[test]
-    fn selected_owner_is_reserved_until_publication_even_if_the_unlocking_thread_exits() {
-        let registry = AddressWaitRegistry::default();
-        let owner = GuestThreadId::new(1);
-        let first = GuestThreadId::new(2);
-        let second = GuestThreadId::new(3);
-        let (first_event, second_event, claim) = {
-            let mut state = registry.lock();
-            state.set_owner(0x1000, owner);
-            let first_event = state.enqueue(0x1000, first, 0x22);
-            let second_event = state.enqueue(0x1000, second, 0x33);
-            let claim = state.claim_mutex(0x1000, owner);
-            assert_eq!(claim.next_tag, Some(0x22));
-            assert!(claim.more_waiters);
-            assert_eq!(state.owner(0x1000), Some(first));
-            assert_eq!(state.next_waiter(0x1000), Some((second, 0x33)));
-            assert_eq!(state.pending_threads(0x1000).collect::<Vec<_>>(), [second]);
-            (first_event, second_event, claim)
-        };
-        assert!(!first_event.is_signalled());
-        registry.lock().release_thread(owner);
-        assert!(!first_event.is_signalled());
-        registry
-            .lock()
-            .finish_mutex_handoff(&claim, AddressWaitCompletion::Success);
-        assert!(first_event.is_signalled());
-        assert!(!second_event.is_signalled());
-        assert_eq!(
-            registry.lock().completion(0x1000, first),
-            Some(AddressWaitCompletion::Success)
-        );
-    }
-    #[test]
     fn delayed_handoff_completion_cannot_complete_a_new_wait_on_the_same_word() {
-        let registry = AddressWaitRegistry::default();
+        let registry = test_registry();
         let owner = GuestThreadId::new(1);
         let thread = GuestThreadId::new(2);
         let claim = {
             let mut state = registry.lock();
-            state.set_owner(0x1000, owner);
-            let _old = state.enqueue(0x1000, thread, 0x22);
-            state.claim_mutex(0x1000, owner)
+            let _old = state.enqueue(0x1000, owner, thread, 0x22).unwrap();
+            state.claim_mutex(0x1000, owner).unwrap()
         };
         let next = {
             let mut state = registry.lock();
             assert!(!state.expire_thread_wait(thread));
             state.remove(0x1000, thread);
-            state.enqueue(0x1000, thread, 0x44)
+            state.enqueue(0x1000, owner, thread, 0x44).unwrap()
         };
         registry
             .lock()
             .finish_mutex_handoff(&claim, AddressWaitCompletion::Success);
         assert!(!next.is_signalled());
         assert_eq!(registry.lock().completion(0x1000, thread), None);
-        assert_eq!(registry.lock().value(0x1000, thread), Some(0x44));
+        assert_eq!(registry.lock().waiters[&thread].value, 0x44);
     }
 }
 
@@ -921,10 +758,11 @@ mod condition_tests {
         registry
             .lock()
             .enqueue_condition(0x2000, GuestThreadId::new(2), 0x22, 0x1000, memory())
+            .unwrap()
     }
     #[test]
     fn a_signal_during_release_is_consumed_once_and_reacquires_after_publication() {
-        let registry = AddressWaitRegistry::default();
+        let registry = test_registry();
         let wait = register(&registry);
         assert!(matches!(
             registry.lock().claim_condition(0x2000),
@@ -937,17 +775,17 @@ mod condition_tests {
         assert_eq!(claim.memory.bytes(), 4);
         registry
             .lock()
-            .finish_condition_acquire(&claim, ConditionAcquire::Acquired);
+            .finish_condition_acquire(&claim, ConditionAcquire::Acquired, GuestThreadId::new(1))
+            .unwrap();
         assert!(wait.event().is_signalled());
         assert_eq!(
             registry.lock().completion(0x2000, GuestThreadId::new(2)),
             Some(AddressWaitCompletion::Success)
         );
-        assert_eq!(registry.lock().owner(0x1000), None);
     }
     #[test]
     fn timeout_during_release_waits_for_the_effect_and_does_not_consume_a_later_signal() {
-        let registry = AddressWaitRegistry::default();
+        let registry = test_registry();
         let wait = register(&registry);
         assert!(registry.lock().defer_timeout(GuestThreadId::new(2)));
         assert!(!wait.event().is_signalled());
@@ -962,7 +800,7 @@ mod condition_tests {
     #[test]
     fn a_signal_before_timeout_finishes_its_atomic_attempt_before_resolving_the_target() {
         for acquired in [true, false] {
-            let registry = AddressWaitRegistry::default();
+            let registry = test_registry();
             let wait = register(&registry);
             assert!(registry.lock().finish_condition_release(&wait).is_none());
             let Some(ConditionSignal::Reacquire(claim)) = registry.lock().claim_condition(0x2000)
@@ -972,14 +810,18 @@ mod condition_tests {
             assert!(registry.lock().defer_timeout(GuestThreadId::new(2)));
             assert!(!wait.event().is_signalled());
             let owner = GuestThreadId::new(3);
-            registry.lock().finish_condition_acquire(
-                &claim,
-                if acquired {
-                    ConditionAcquire::Acquired
-                } else {
-                    ConditionAcquire::Contended(owner)
-                },
-            );
+            registry
+                .lock()
+                .finish_condition_acquire(
+                    &claim,
+                    if acquired {
+                        ConditionAcquire::Acquired
+                    } else {
+                        ConditionAcquire::Contended(owner)
+                    },
+                    GuestThreadId::new(1),
+                )
+                .unwrap();
             assert!(wait.event().is_signalled());
             if acquired {
                 assert_eq!(
@@ -991,14 +833,12 @@ mod condition_tests {
                     registry.lock().completion(0x1000, GuestThreadId::new(2)),
                     Some(AddressWaitCompletion::TimedOut)
                 );
-                assert_eq!(registry.lock().owner(0x1000), None);
-                assert_eq!(registry.lock().pending_threads(0x1000).count(), 0);
             }
         }
     }
     #[test]
     fn a_stale_condition_claim_cannot_set_the_owner_or_complete_a_replacement_wait() {
-        let registry = AddressWaitRegistry::default();
+        let registry = test_registry();
         let wait = register(&registry);
         registry.lock().finish_condition_release(&wait);
         let Some(ConditionSignal::Reacquire(claim)) = registry.lock().claim_condition(0x2000)
@@ -1009,9 +849,9 @@ mod condition_tests {
         let next = register(&registry);
         registry
             .lock()
-            .finish_condition_acquire(&claim, ConditionAcquire::Acquired);
+            .finish_condition_acquire(&claim, ConditionAcquire::Acquired, GuestThreadId::new(1))
+            .unwrap();
         assert!(!next.event().is_signalled());
-        assert_eq!(registry.lock().owner(0x1000), None);
         assert_eq!(
             registry.lock().completion(0x2000, GuestThreadId::new(2)),
             None
@@ -1031,7 +871,7 @@ mod address_operation_tests {
     }
     #[test]
     fn same_word_operations_wait_without_a_host_lock_and_disjoint_words_progress() {
-        let registry = Arc::new(AddressWaitRegistry::default());
+        let registry = Arc::new(test_registry());
         let clock = clock();
         let mut first = Box::pin(registry.address_operation(0x1000, GuestThreadId::new(1), &clock));
         let mut context = Context::from_waker(Waker::noop());
@@ -1053,13 +893,16 @@ mod address_operation_tests {
     #[test]
     fn a_conditional_signal_publishes_its_result_before_deferred_word_timeouts() {
         for succeeds in [true, false] {
-            let registry = Arc::new(AddressWaitRegistry::default());
+            let registry = Arc::new(test_registry());
             let clock = clock();
             let target = GuestThreadId::new(2);
             let event = registry
                 .lock()
-                .priority_waits_mut()
-                .enqueue(0x1000, target, 20, Some(50))
+                .enqueue_address_wait(0x1000, target, Some(50))
+                .unwrap();
+            registry
+                .lock()
+                .finish_address_check(target, 0, false)
                 .unwrap();
             let mut operation =
                 Box::pin(registry.address_operation(0x1000, GuestThreadId::new(1), &clock));
@@ -1067,21 +910,18 @@ mod address_operation_tests {
             let Poll::Ready(held) = operation.as_mut().poll(&mut context) else {
                 panic!("uncontended word operation blocked");
             };
-            let (selected, more) = registry.lock().priority_waits().signal_targets(0x1000, 1);
+            let (selected, more) = registry.lock().signal_targets(0x1000, 1);
             assert!(!more);
             clock.advance_scheduler_to(50);
             registry.lock().expire_address_waits(50);
             assert!(!event.is_signalled());
             if succeeds {
-                registry
-                    .lock()
-                    .priority_waits_mut()
-                    .complete_signal(&selected);
+                registry.lock().complete_signal(&selected);
             }
             drop(held);
             assert!(event.is_signalled());
             assert_eq!(
-                registry.lock().priority_waits_mut().take_result(target),
+                registry.lock().take_address_result(target),
                 Some(if succeeds {
                     AddressWaitResult::Signalled
                 } else {
@@ -1092,19 +932,17 @@ mod address_operation_tests {
     }
     #[test]
     fn queued_word_checks_are_not_signalled_or_resumed_before_their_accepted_access() {
-        let registry = AddressWaitRegistry::default();
+        let registry = test_registry();
         let target = GuestThreadId::new(2);
         let event = {
             let mut state = registry.lock();
-            let queue = state.priority_waits_mut();
-            let event = queue.enqueue(0x1000, target, 20, Some(50)).unwrap();
-            queue.begin_check(target);
-            event
+            state
+                .enqueue_address_wait(0x1000, target, Some(50))
+                .unwrap()
         };
         assert!(
             registry
                 .lock()
-                .priority_waits()
                 .signal_targets(0x1000, usize::MAX)
                 .0
                 .is_empty()
@@ -1113,11 +951,11 @@ mod address_operation_tests {
         assert!(!event.is_signalled());
         registry
             .lock()
-            .priority_waits_mut()
-            .finish_check(target, 50, false);
+            .finish_address_check(target, 50, false)
+            .unwrap();
         assert!(event.is_signalled());
         assert_eq!(
-            registry.lock().priority_waits_mut().take_result(target),
+            registry.lock().take_address_result(target),
             Some(AddressWaitResult::TimedOut)
         );
     }

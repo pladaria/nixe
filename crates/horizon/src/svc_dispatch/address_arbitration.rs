@@ -40,8 +40,10 @@ impl HorizonSvcDispatcher {
         let (completion, waiting) = {
             let mut state = context.process().address_waits().lock();
             state.expire_address_waits(now);
-            let waits = state.priority_waits_mut();
-            (waits.take_result(thread), waits.contains(thread))
+            (
+                state.take_address_result(thread),
+                state.contains_address_wait(thread),
+            )
         };
         if let Some(completion) = completion {
             self.finish_wait(thread.get(), 0x34);
@@ -136,23 +138,27 @@ impl HorizonSvcDispatcher {
             let now = clock.scheduler_time_ns();
             let code = {
                 let mut state = waits.lock();
-                let queue = state.priority_waits_mut();
                 match compared {
                     Ok(true) => {
-                        queue.finish_check(thread, now, check.timeout == 0);
-                        queue
-                            .take_result(thread)
+                        state
+                            .finish_address_check(thread, now, check.timeout == 0)
+                            .map_err(|fault| HorizonSvcFault::Scheduling {
+                                operation: "WaitForAddress",
+                                fault,
+                            })?;
+                        state
+                            .take_address_result(thread)
                             .map(|completion| match completion {
                                 AddressWaitResult::Signalled => HorizonKernelResult::SUCCESS,
                                 AddressWaitResult::TimedOut => HorizonKernelResult::TIMED_OUT,
                             })
                     }
                     Ok(false) => {
-                        queue.remove(thread);
+                        state.remove_address_wait(thread);
                         Some(HorizonKernelResult::INVALID_STATE)
                     }
                     Err(error) => {
-                        queue.remove(thread);
+                        state.remove_address_wait(thread);
                         if error.is_access_fault() {
                             Some(HorizonKernelResult::INVALID_CURRENT_MEMORY)
                         } else {
@@ -191,8 +197,7 @@ impl HorizonSvcDispatcher {
             .process()
             .address_waits()
             .lock()
-            .priority_waits_mut()
-            .remove(thread);
+            .remove_address_wait(thread);
         self.finish_wait(thread.get(), 0x34);
         address_word_fault(context, 0x34, error)
     }
@@ -234,7 +239,7 @@ impl HorizonSvcDispatcher {
             } else {
                 count as usize
             };
-            let (targets, more) = waits.lock().priority_waits().signal_targets(address, limit);
+            let (targets, more) = waits.lock().signal_targets(address, limit);
             let replacement = signal_replacement(kind, value, count, targets.is_empty(), more);
             let equal = if let Some(word) = word {
                 if replacement == value {
@@ -251,7 +256,7 @@ impl HorizonSvcDispatcher {
             };
             let code = match equal {
                 Ok(true) => {
-                    waits.lock().priority_waits_mut().complete_signal(&targets);
+                    waits.lock().complete_signal(&targets);
                     HorizonKernelResult::SUCCESS
                 }
                 Ok(false) => HorizonKernelResult::INVALID_STATE,

@@ -32,3 +32,6 @@ tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 x11-dl = "2.21"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

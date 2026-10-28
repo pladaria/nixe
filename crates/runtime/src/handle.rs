@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use nixe_cpu::memory::MemoryPermissions;
@@ -84,11 +84,6 @@ impl HandleObject {
     pub fn same_identity(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.value, &other.value)
     }
-
-    #[must_use]
-    pub fn strong_count(&self) -> usize {
-        Arc::strong_count(&self.value)
-    }
 }
 
 impl PartialEq for HandleObject {
@@ -111,15 +106,11 @@ impl Debug for HandleObject {
 }
 
 /// Runtime-owned thread identity.
-#[derive(Clone, Debug)]
-pub struct ThreadObject {
-    identity: Arc<ThreadIdentity>,
-}
-
 #[derive(Debug)]
-struct ThreadIdentity {
+pub struct ThreadObject {
     thread_id: AtomicU64,
     completion: EventObject,
+    retirement: OnceLock<(nixe_scheduler::ProcessId, crate::ExternalEventSender)>,
 }
 
 /// Runtime-owned process identity transported through copied pseudo-handles.
@@ -144,48 +135,64 @@ impl ThreadObject {
     #[must_use]
     pub fn new(thread_id: u64) -> Self {
         Self {
-            identity: Arc::new(ThreadIdentity {
-                thread_id: AtomicU64::new(thread_id),
-                completion: EventObject::new(),
-            }),
+            thread_id: AtomicU64::new(thread_id),
+            completion: EventObject::new(),
+            retirement: OnceLock::new(),
         }
     }
 
     #[must_use]
     pub fn thread_id(&self) -> u64 {
-        self.identity.thread_id.load(Ordering::Acquire)
+        self.thread_id.load(Ordering::Acquire)
     }
 
     pub(crate) fn assign_thread_id(&self, thread_id: u64) {
-        self.identity.thread_id.store(thread_id, Ordering::Release);
+        self.thread_id.store(thread_id, Ordering::Release);
     }
 
-    pub(crate) fn identity_reference_count(&self) -> usize {
-        Arc::strong_count(&self.identity)
+    pub(crate) fn bind_retirement(
+        &self,
+        process: nixe_scheduler::ProcessId,
+        sender: crate::ExternalEventSender,
+    ) {
+        self.retirement
+            .set((process, sender))
+            .expect("thread is registered once");
     }
 
     #[must_use]
     pub fn is_signalled(&self) -> bool {
-        self.identity.completion.is_signalled()
+        self.completion.is_signalled()
     }
 
     pub(crate) fn signal(&self) {
-        self.identity.completion.signal();
+        self.completion.signal();
     }
 
     #[must_use]
     pub fn readable_event(&self) -> ReadableEventObject {
-        ReadableEventObject(self.identity.completion.clone())
+        ReadableEventObject(self.completion.clone())
     }
 }
 
 impl PartialEq for ThreadObject {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.identity, &other.identity)
+        std::ptr::eq(self, other)
     }
 }
 
 impl Eq for ThreadObject {}
+
+impl Drop for ThreadObject {
+    fn drop(&mut self) {
+        if let Some((process, sender)) = self.retirement.get() {
+            sender.retire_thread(
+                *process,
+                nixe_scheduler::GuestThreadId::new(self.thread_id()),
+            );
+        }
+    }
+}
 /// Original owner and physical pins survive duplicated/exported transfer handles.
 #[derive(Clone)]
 pub struct TransferMemoryObject(Arc<TransferMemory>);

@@ -3,6 +3,7 @@ use crate::process::tests::{
     synthetic_instruction_process_for_coordinator, synthetic_process_for_coordinator,
     synthetic_svc_process_for_coordinator,
 };
+use nixe_scheduler::IdealCore;
 use nixe_scheduler::{PriorityRange, VirtualCpuDescriptor};
 
 fn profile() -> MachineSchedulerProfile {
@@ -30,6 +31,69 @@ fn registration(coordinator: &RuntimeCoordinator) -> ProcessRegistration {
         ideal_vcpu: Some(VirtualCpuId::new(7)),
         affinity: coordinator.scheduler().profile().all_cores(),
     }
+}
+
+#[test]
+fn native_supervisor_calls_preserve_boundaries_and_apply_the_continuation_once() {
+    let mut coordinator = RuntimeCoordinator::new(profile());
+    let mut process = synthetic_instruction_process_for_coordinator(
+        1,
+        &[
+            0x91000400, // ADD X0,#1.
+            0x91000800, // ADD X0,#2.
+            0xd4000841, // SVC #0x42.
+            0x91001000, // ADD X0,#4.
+            0xd4000861, // SVC #0x43.
+        ],
+    );
+    let entry = process.entry_module().entry_address();
+    let x0 = nixe_cpu::state::a64::A64Register::General(
+        nixe_cpu::state::a64::A64GeneralRegister::new(0).unwrap(),
+    );
+    process.main_thread_mut().state_mut().write_x(x0, 0);
+    let id = coordinator
+        .register_process(process, registration(&coordinator))
+        .unwrap();
+    let first = coordinator
+        .run_next(std::time::Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(first.report.stop, ExecutionStop::SupervisorCall { source, immediate: 0x42 }
+        if source.pc.get() == entry + 8)
+    );
+    assert_eq!(
+        coordinator
+            .process(id)
+            .unwrap()
+            .main_thread()
+            .state()
+            .read_x(x0),
+        3
+    );
+    assert_eq!(
+        coordinator
+            .route_supervisor_call(first.lease, &first.report.stop, &mut ResumeDispatcher)
+            .unwrap(),
+        ExceptionHandlingResult::Resumed
+    );
+    let second = coordinator
+        .run_next(std::time::Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(second.report.stop, ExecutionStop::SupervisorCall { source, immediate: 0x43 }
+        if source.pc.get() == entry + 16)
+    );
+    assert_eq!(
+        coordinator
+            .process(id)
+            .unwrap()
+            .main_thread()
+            .state()
+            .read_x(x0),
+        7
+    );
 }
 
 #[test]
@@ -284,10 +348,7 @@ fn one_host_worker_preserves_independent_native_processes_and_retires_either_fir
                 .unwrap();
             coordinator
                 .scheduler
-                .apply(SchedulerCommand::Yield {
-                    thread: execution.lease.thread,
-                    migration: nixe_scheduler::YieldMigration::None,
-                })
+                .yield_thread(execution.lease.thread, nixe_scheduler::YieldMigration::None)
                 .unwrap();
             assert!(matches!(
                 execution.report.stop,
@@ -424,10 +485,7 @@ fn external_wakes_are_generation_safe_and_idempotent() {
         coordinator.scheduler().thread(thread).unwrap().lifecycle,
         nixe_scheduler::ThreadLifecycle::Waiting
     );
-    let token = coordinator
-        .register_wait(thread, Readiness::Pending)
-        .unwrap()
-        .unwrap();
+    let token = coordinator.register_wait(thread).unwrap();
     let sender = coordinator.event_sender();
     let event = ExternalEvent::Wake {
         source: crate::ExternalEventSource::Device,
@@ -445,6 +503,104 @@ fn external_wakes_are_generation_safe_and_idempotent() {
 }
 
 struct ResumeDispatcher;
+
+struct FaultDispatcher;
+
+impl crate::ExceptionDispatcher for FaultDispatcher {
+    type Fault = &'static str;
+
+    fn dispatch(
+        &mut self,
+        _context: &mut crate::ExceptionDispatchContext<'_>,
+        _request: crate::ExceptionDispatchRequest,
+    ) -> crate::ExceptionDispatchOutcome<Self::Fault> {
+        crate::ExceptionDispatchOutcome::Fault("kernel operation failed")
+    }
+}
+
+#[test]
+fn last_started_thread_fault_excludes_created_and_already_faulted_threads() {
+    for started in [false, true] {
+        let mut coordinator = RuntimeCoordinator::new(profile());
+        let process = coordinator
+            .register_process(
+                synthetic_svc_process_for_coordinator(1),
+                registration(&coordinator),
+            )
+            .unwrap();
+        let child = coordinator
+            .create_thread(process, valid_thread_request(&coordinator, process))
+            .unwrap();
+        if started {
+            coordinator.start_thread(child.id.get()).unwrap();
+            coordinator
+                .scheduler()
+                .set_activity(child.id, true)
+                .unwrap();
+        }
+        let execution = coordinator
+            .run_next(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .route_supervisor_call(
+                    execution.lease,
+                    &execution.report.stop,
+                    &mut FaultDispatcher
+                )
+                .unwrap(),
+            ExceptionHandlingResult::Fault("kernel operation failed")
+        );
+        assert_eq!(
+            coordinator.process(process).unwrap().lifecycle(),
+            if started {
+                nixe_scheduler::ProcessLifecycle::Running
+            } else {
+                nixe_scheduler::ProcessLifecycle::Faulted
+            }
+        );
+        if started {
+            coordinator
+                .scheduler()
+                .set_activity(child.id, false)
+                .unwrap();
+            let execution = coordinator
+                .run_next(std::time::Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            assert_eq!(execution.lease.thread, child.id);
+            assert_eq!(
+                coordinator
+                    .route_supervisor_call(
+                        execution.lease,
+                        &execution.report.stop,
+                        &mut FaultDispatcher
+                    )
+                    .unwrap(),
+                ExceptionHandlingResult::Fault("kernel operation failed")
+            );
+            assert_eq!(
+                coordinator.process(process).unwrap().lifecycle(),
+                nixe_scheduler::ProcessLifecycle::Faulted
+            );
+        }
+        assert!(!coordinator.terminate_process(process).unwrap());
+        assert_eq!(
+            coordinator.scheduler.thread(child.id).unwrap().lifecycle,
+            if started {
+                nixe_scheduler::ThreadLifecycle::Faulted
+            } else {
+                nixe_scheduler::ThreadLifecycle::Exited
+            }
+        );
+        coordinator.shutdown().unwrap();
+        assert_eq!(
+            coordinator.resource_counts(),
+            CoordinatorResourceCounts::default()
+        );
+    }
+}
 
 #[test]
 fn immediate_svcs_do_not_time_slice_equal_priority_threads() {
@@ -497,10 +653,7 @@ fn immediate_svcs_do_not_time_slice_equal_priority_threads() {
     // Only an actual guest yield allows the same-priority peer to take over.
     coordinator
         .scheduler
-        .apply(SchedulerCommand::Yield {
-            thread: threads[0],
-            migration: nixe_scheduler::YieldMigration::None,
-        })
+        .yield_thread(threads[0], nixe_scheduler::YieldMigration::None)
         .unwrap();
     let execution = coordinator
         .run_next(std::time::Duration::from_secs(2))
@@ -609,7 +762,9 @@ fn native_residency_preserves_real_worker_switches_blocking_results_and_migratio
     state.write_x(x0, 0xbeef); // The completion writes the actual current owner.
     assert_eq!(old_snapshot.read_x(x0), blocked.get());
     assert!(coordinator.cancel_wait(token).unwrap());
-    coordinator.set_thread_priority(blocked.get(), 0).unwrap();
+    coordinator
+        .set_thread_priority(None, blocked.get(), 0)
+        .unwrap();
     let execution = coordinator
         .run_next(std::time::Duration::from_secs(2))
         .unwrap()
@@ -632,9 +787,10 @@ fn native_residency_preserves_real_worker_switches_blocking_results_and_migratio
 
     let remaining = if blocked == main { child } else { main };
     coordinator
-        .migrate_thread(
+        .scheduler()
+        .migrate(
             remaining,
-            Some(VirtualCpuId::new(3)),
+            IdealCore::Core(VirtualCpuId::new(3)),
             coordinator
                 .scheduler
                 .profile()
@@ -882,13 +1038,7 @@ fn terminal_thread_reaping_reclaims_and_reuses_its_tls_slot() {
         memory.space().write(tls, &[0xa5; 0x200]).unwrap(),
         nixe_memory::Access::Ready(())
     ));
-    coordinator
-        .scheduler
-        .apply(SchedulerCommand::Terminate {
-            thread: first.id,
-            faulted: false,
-        })
-        .unwrap();
+    coordinator.scheduler.terminate(first.id, false).unwrap();
     coordinator
         .processes
         .get_mut(&process)
@@ -904,7 +1054,7 @@ fn terminal_thread_reaping_reclaims_and_reuses_its_tls_slot() {
         .handles()
         .close(first.handle)
         .unwrap();
-    coordinator.reap_thread(first.id.get()).unwrap();
+    coordinator.drain_external_events().unwrap();
     assert!(
         coordinator
             .process(process)
@@ -955,6 +1105,74 @@ fn terminal_thread_reaping_reclaims_and_reuses_its_tls_slot() {
 }
 
 struct TerminateDispatcher(crate::ExceptionTerminationScope);
+
+#[test]
+fn last_thread_exit_retires_unstarted_children_without_interrupting_another_process() {
+    let mut coordinator = RuntimeCoordinator::new(two_core_profile());
+    let background_core = VirtualCpuId::new(3);
+    let foreground_core = VirtualCpuId::new(7);
+    let background = coordinator
+        .register_process(
+            crate::process::tests::synthetic_native_instruction_process(2, &[0x14000000]),
+            ProcessRegistration {
+                priority: 44,
+                ideal_vcpu: Some(background_core),
+                affinity: coordinator
+                    .scheduler
+                    .profile()
+                    .core_set([background_core])
+                    .unwrap(),
+            },
+        )
+        .unwrap();
+    let foreground = coordinator
+        .register_process(
+            synthetic_svc_process_for_coordinator(1),
+            ProcessRegistration {
+                priority: 44,
+                ideal_vcpu: Some(foreground_core),
+                affinity: coordinator
+                    .scheduler
+                    .profile()
+                    .core_set([foreground_core])
+                    .unwrap(),
+            },
+        )
+        .unwrap();
+    let created = coordinator
+        .create_thread(foreground, valid_thread_request(&coordinator, foreground))
+        .unwrap();
+    let execution = coordinator
+        .run_next(std::time::Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(execution.lease.process, foreground);
+    let background_lease = coordinator
+        .scheduler
+        .lease_for_vcpu(background_core)
+        .unwrap();
+    assert_eq!(background_lease.process, background);
+    coordinator
+        .route_supervisor_call(
+            execution.lease,
+            &execution.report.stop,
+            &mut TerminateDispatcher(crate::ExceptionTerminationScope::CurrentThread),
+        )
+        .unwrap();
+    assert_eq!(
+        coordinator.process(foreground).unwrap().lifecycle(),
+        nixe_scheduler::ProcessLifecycle::Exited
+    );
+    assert_eq!(
+        coordinator.scheduler.thread(created.id).unwrap().lifecycle,
+        nixe_scheduler::ThreadLifecycle::Exited
+    );
+    assert_eq!(
+        coordinator.scheduler.lease_for_vcpu(background_core),
+        Some(background_lease)
+    );
+    coordinator.shutdown().unwrap();
+}
 
 impl crate::ExceptionDispatcher for TerminateDispatcher {
     type Fault = &'static str;
@@ -1082,122 +1300,48 @@ fn priority_and_affinity_updates_use_the_machine_profile() {
         .unwrap()
         .object()
         .thread_id();
-    let main_object_id = coordinator
-        .process(process_id)
-        .unwrap()
-        .main_thread()
-        .object()
-        .thread_id();
-    coordinator.set_thread_priority(object_id, 5).unwrap();
-    coordinator
-        .inherit_thread_priority(main_object_id, object_id, 0x1000)
-        .unwrap();
-    let main_id = coordinator.process(process_id).unwrap().main_thread_id();
-    assert_eq!(
-        coordinator
-            .scheduler()
-            .thread(main_id)
-            .unwrap()
-            .effective_priority,
-        5
-    );
-    coordinator
-        .restore_thread_priority(main_object_id, 0x1000)
-        .unwrap();
+    coordinator.set_thread_priority(None, object_id, 5).unwrap();
     let affinity = coordinator
         .scheduler()
         .profile()
         .core_set([VirtualCpuId::new(7)])
         .unwrap();
     coordinator
-        .set_thread_affinity(object_id, Some(VirtualCpuId::new(7)), affinity.clone())
+        .scheduler()
+        .migrate(
+            nixe_scheduler::GuestThreadId::new(object_id),
+            IdealCore::Core(VirtualCpuId::new(7)),
+            affinity,
+        )
         .unwrap();
     let info = coordinator.thread_scheduling_info(object_id).unwrap();
     assert_eq!(info.base_priority, 5);
     assert_eq!(info.ideal_vcpu, Some(VirtualCpuId::new(7)));
     assert_eq!(info.affinity, affinity);
     assert_eq!(
-        coordinator.set_thread_priority(object_id, 64),
+        coordinator.set_thread_priority(None, object_id, 64),
         Err(ThreadOperationError::InvalidState)
     );
     coordinator.start_thread(object_id).unwrap();
-    coordinator.set_thread_activity(object_id, true).unwrap();
+    coordinator
+        .scheduler()
+        .set_activity(nixe_scheduler::GuestThreadId::new(object_id), true)
+        .unwrap();
     assert!(
         coordinator
             .thread_scheduling_info(object_id)
             .unwrap()
             .paused
     );
-    coordinator.set_thread_activity(object_id, false).unwrap();
+    coordinator
+        .scheduler()
+        .set_activity(nixe_scheduler::GuestThreadId::new(object_id), false)
+        .unwrap();
     assert!(
         !coordinator
             .thread_scheduling_info(object_id)
             .unwrap()
             .paused
-    );
-}
-
-#[test]
-fn priority_donations_are_multi_source_transitive_and_keyed() {
-    let mut coordinator = RuntimeCoordinator::new(profile());
-    let mut processes = Vec::new();
-    for seed in 1..=3 {
-        let process = coordinator
-            .register_process(
-                synthetic_process_for_coordinator(seed),
-                registration(&coordinator),
-            )
-            .unwrap();
-        let object = coordinator
-            .process(process)
-            .unwrap()
-            .main_thread()
-            .object()
-            .thread_id();
-        processes.push((process, object));
-    }
-    coordinator.set_thread_priority(processes[0].1, 40).unwrap();
-    coordinator.set_thread_priority(processes[1].1, 30).unwrap();
-    coordinator.set_thread_priority(processes[2].1, 5).unwrap();
-    coordinator
-        .inherit_thread_priority(processes[0].1, processes[1].1, 0x1000)
-        .unwrap();
-    coordinator
-        .inherit_thread_priority(processes[1].1, processes[2].1, 0x2000)
-        .unwrap();
-    assert_eq!(
-        coordinator
-            .thread_scheduling_info(processes[0].1)
-            .unwrap()
-            .effective_priority,
-        5
-    );
-    assert_eq!(
-        coordinator
-            .thread_scheduling_info(processes[1].1)
-            .unwrap()
-            .effective_priority,
-        5
-    );
-    coordinator
-        .restore_thread_priority(processes[1].1, 0x2000)
-        .unwrap();
-    assert_eq!(
-        coordinator
-            .thread_scheduling_info(processes[0].1)
-            .unwrap()
-            .effective_priority,
-        30
-    );
-    coordinator
-        .restore_thread_priority(processes[0].1, 0x1000)
-        .unwrap();
-    assert_eq!(
-        coordinator
-            .thread_scheduling_info(processes[0].1)
-            .unwrap()
-            .effective_priority,
-        40
     );
 }
 
@@ -1628,13 +1772,7 @@ fn host_termination_keeps_already_exited_guest_threads_terminal() {
         .create_thread(process, valid_thread_request(&coordinator, process))
         .unwrap();
     let main = coordinator.process(process).unwrap().main_thread_id();
-    coordinator
-        .scheduler
-        .apply(SchedulerCommand::Terminate {
-            thread: created.id,
-            faulted: false,
-        })
-        .unwrap();
+    coordinator.scheduler.terminate(created.id, false).unwrap();
     assert!(coordinator.terminate_process(process).unwrap());
     assert_eq!(
         coordinator.scheduler.thread(created.id).unwrap().lifecycle,
@@ -1734,10 +1872,7 @@ fn owned_kernel_phases_preserve_the_svc_source_and_never_schedule_a_partial_resu
         )
         .unwrap();
     let thread = execution.lease.thread;
-    let first = coordinator
-        .register_wait(thread, Readiness::Pending)
-        .unwrap()
-        .unwrap();
+    let first = coordinator.register_wait(thread).unwrap();
     let x0 = A64Register::General(A64GeneralRegister::new(0).unwrap());
     let phase = coordinator
         .resume_supervisor_call(first, execution.lease.vcpu, source, |context| {
@@ -1757,10 +1892,7 @@ fn owned_kernel_phases_preserve_the_svc_source_and_never_schedule_a_partial_resu
             .unwrap()
             .is_none()
     );
-    let second = coordinator
-        .register_wait(thread, Readiness::Pending)
-        .unwrap()
-        .unwrap();
+    let second = coordinator.register_wait(thread).unwrap();
     assert_ne!(first, second);
     let stale = coordinator
         .resume_supervisor_call(
@@ -1822,11 +1954,11 @@ fn an_accepted_mutex_handoff_keeps_the_waiter_blocked_until_its_word_is_publishe
         .unwrap()
         .address_waits()
         .clone();
-    let owner = GuestThreadId::new(0xffff);
+    let request = valid_thread_request(&coordinator, process_id);
+    let owner = coordinator.create_thread(process_id, request).unwrap().id;
     let event = {
         let mut state = waits.lock();
-        state.set_owner(0x1000, owner);
-        state.enqueue(0x1000, thread, 7)
+        state.enqueue(0x1000, owner, thread, 7).unwrap()
     };
     let token = coordinator
         .register_event_wait(
@@ -1836,7 +1968,7 @@ fn an_accepted_mutex_handoff_keeps_the_waiter_blocked_until_its_word_is_publishe
             crate::ExternalEventSource::Device,
         )
         .unwrap();
-    let claim = waits.lock().claim_mutex(0x1000, owner);
+    let claim = waits.lock().claim_mutex(0x1000, owner).unwrap();
     assert_eq!(coordinator.advance_virtual_time(50).unwrap(), 0);
     let view = coordinator.scheduler().thread(thread).unwrap();
     assert_eq!(view.active_wait, Some(token));
@@ -1922,35 +2054,131 @@ fn periodic_rotation_uses_guest_time_and_invalid_negative_sleep_does_not_yield()
     assert_eq!(first.lease.thread, threads[0]);
     coordinator.sleep_thread(threads[0], -3).unwrap();
     coordinator.advance_virtual_time(9_999_999).unwrap();
-    let SchedulerDecision::Selected(Some(lease)) = coordinator
-        .scheduler
-        .apply(SchedulerCommand::SelectNext)
-        .unwrap()
-    else {
+    let Some(lease) = coordinator.scheduler.claim(VirtualCpuId::new(7)).unwrap() else {
         panic!("ready thread")
     };
     assert_eq!(lease.thread, threads[0]);
     coordinator
         .scheduler
-        .apply(SchedulerCommand::Complete {
-            lease,
-            outcome: Completion::Ready,
-        })
+        .complete(lease, Completion::Ready)
         .unwrap();
     coordinator.advance_virtual_time(1).unwrap();
-    let SchedulerDecision::Selected(Some(lease)) = coordinator
-        .scheduler
-        .apply(SchedulerCommand::SelectNext)
-        .unwrap()
-    else {
+    let Some(lease) = coordinator.scheduler.claim(VirtualCpuId::new(7)).unwrap() else {
         panic!("rotated thread")
     };
     assert_eq!(lease.thread, threads[1]);
     coordinator
         .scheduler
-        .apply(SchedulerCommand::Complete {
-            lease,
-            outcome: Completion::Ready,
-        })
+        .complete(lease, Completion::Ready)
         .unwrap();
+}
+
+#[path = "tests/preemption.rs"]
+mod preemption;
+
+#[test]
+fn terminating_an_owner_cancels_local_and_foreign_waiters_without_touching_other_owners() {
+    let mut coordinator = RuntimeCoordinator::new(profile());
+    let owner_process = coordinator
+        .register_process(
+            synthetic_process_for_coordinator(1),
+            registration(&coordinator),
+        )
+        .unwrap();
+    let waiter_process = coordinator
+        .register_process(
+            synthetic_process_for_coordinator(2),
+            registration(&coordinator),
+        )
+        .unwrap();
+    let owner = coordinator.process(owner_process).unwrap().main_thread_id();
+    let foreign = coordinator
+        .process(waiter_process)
+        .unwrap()
+        .main_thread_id();
+    let local = coordinator
+        .create_thread(
+            owner_process,
+            valid_thread_request(&coordinator, owner_process),
+        )
+        .unwrap()
+        .id;
+    let second = coordinator
+        .create_thread(
+            waiter_process,
+            valid_thread_request(&coordinator, waiter_process),
+        )
+        .unwrap()
+        .id;
+    let other_owner = coordinator
+        .create_thread(
+            waiter_process,
+            valid_thread_request(&coordinator, waiter_process),
+        )
+        .unwrap()
+        .id;
+    let unrelated = coordinator
+        .create_thread(
+            waiter_process,
+            valid_thread_request(&coordinator, waiter_process),
+        )
+        .unwrap()
+        .id;
+    let owner_object = coordinator
+        .process(owner_process)
+        .unwrap()
+        .main_thread()
+        .object();
+    let foreign_handle = coordinator
+        .process(waiter_process)
+        .unwrap()
+        .handles()
+        .insert_object(crate::HandleObject::from_arc(owner_object))
+        .unwrap();
+    let local_waits = coordinator
+        .process(owner_process)
+        .unwrap()
+        .address_waits()
+        .clone();
+    let foreign_waits = coordinator
+        .process(waiter_process)
+        .unwrap()
+        .address_waits()
+        .clone();
+    let local_event = local_waits.lock().enqueue(0x1000, owner, local, 1).unwrap();
+    let foreign_event = foreign_waits
+        .lock()
+        .enqueue(0x2000, owner, foreign, 2)
+        .unwrap();
+    let second_event = foreign_waits
+        .lock()
+        .enqueue(0x3000, owner, second, 3)
+        .unwrap();
+    let unrelated_event = foreign_waits
+        .lock()
+        .enqueue(0x4000, other_owner, unrelated, 4)
+        .unwrap();
+    assert!(coordinator.terminate_process(owner_process).unwrap());
+    for event in [local_event, foreign_event, second_event] {
+        assert!(event.is_signalled());
+    }
+    assert!(!unrelated_event.is_signalled());
+    for (address, waiter) in [(0x2000, foreign), (0x3000, second)] {
+        assert_eq!(
+            foreign_waits.lock().completion(address, waiter),
+            Some(crate::AddressWaitCompletion::InvalidOwner)
+        );
+    }
+    assert_eq!(coordinator.scheduler.priority_donation_count(), 1);
+    coordinator.remove_process(owner_process).unwrap();
+    assert!(
+        coordinator
+            .process(waiter_process)
+            .unwrap()
+            .handles()
+            .lookup_as::<crate::ThreadObject>(foreign_handle)
+            .is_some()
+    );
+    assert!(!unrelated_event.is_signalled());
+    coordinator.shutdown().unwrap();
 }

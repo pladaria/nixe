@@ -219,6 +219,8 @@ pub enum CpuFaultKind {
     InvalidRequest,
     Internal,
     Unavailable,
+    /// Execution was cancelled by its owner without a recorded backend failure.
+    Stopped,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

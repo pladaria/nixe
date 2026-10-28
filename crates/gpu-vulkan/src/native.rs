@@ -206,6 +206,15 @@ impl NativeGpuExecution {
     pub fn device_profile(&self) -> &DeviceProfile {
         self.residency.device().profile()
     }
+    /// Retain this read-only history handle before moving execution to its owner.
+    pub fn frame_metrics(&self) -> nixe_gpu::frame_metrics::FrameMetrics {
+        self.residency
+            .device()
+            .submission
+            .frame_metrics
+            .history
+            .clone()
+    }
     pub fn cache_monitor(&self) -> CacheMonitor {
         CacheMonitor::new([
             ("shader cache", self.shaders.cache_counters()),
@@ -912,6 +921,10 @@ impl Drop for NativeGpuExecution {
 impl GpuExecution for NativeGpuExecution {
     type Commands = NativeWork;
     type ImageRequest = NativePresentationImage;
+    fn begin_frame_work(&mut self) {
+        let device = self.residency.device_mut();
+        device.submission.begin_frame_work(&mut device.dispatch);
+    }
     fn device_uuid(&self) -> Option<[u8; 16]> {
         Some(self.residency.device().profile().device_uuid)
     }
@@ -958,6 +971,13 @@ impl GpuExecution for NativeGpuExecution {
             .map(WorkTicket::tick)
             .into_iter()
             .chain(demand)
+            .chain(
+                self.residency
+                    .device()
+                    .submission
+                    .frame_metrics
+                    .pending_tick,
+            )
             .chain(
                 self.host
                     .as_ref()
@@ -1128,7 +1148,9 @@ impl GpuExecution for NativeGpuExecution {
     fn acquire_presentable_image(
         &mut self,
         request: NativePresentationImage,
+        swap_interval: u32,
     ) -> Result<ResidentImage, BackendRuntimeError> {
+        self.begin_frame_work();
         let memory = self.residency.memory().clone();
         let cpu_writes = memory
             .collect_cpu_writes()
@@ -1163,9 +1185,15 @@ impl GpuExecution for NativeGpuExecution {
             self.residency.statistics().buffer_merges,
             0,
         );
-        self.frames
+        let image = self
+            .frames
             .capture(&mut self.residency, request)
-            .map_err(runtime)
+            .map_err(runtime)?;
+        self.residency
+            .device_mut()
+            .submission
+            .end_frame(image.lease().producer().slot(), swap_interval);
+        Ok(image)
     }
     fn teardown(&mut self) -> Result<(), BackendRuntimeError> {
         let memory = self.residency.memory().clone();

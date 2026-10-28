@@ -5,7 +5,13 @@
 #[cfg(feature = "execution-trace")]
 mod capture;
 #[cfg(feature = "execution-trace")]
-pub use capture::{Span, detail_event, event, finish, span, start};
+pub use capture::{Span, active, detail_event, event, finish, span, start};
+
+#[cfg(not(feature = "execution-trace"))]
+#[inline(always)]
+pub fn active() -> bool {
+    false
+}
 
 #[cfg(not(feature = "execution-trace"))]
 pub struct Span;

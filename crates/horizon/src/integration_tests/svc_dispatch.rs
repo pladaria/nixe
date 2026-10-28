@@ -1,4 +1,5 @@
 use crate::integration_test_support as support;
+use nixe_scheduler::IdealCore;
 
 use std::fs;
 use std::time::Duration;
@@ -530,7 +531,6 @@ fn address_decrement_requires_writable_memory_even_when_its_condition_is_false()
 
 #[test]
 fn address_signal_variants_update_words_and_consume_only_selected_waiters() {
-    use nixe_scheduler::GuestThreadId;
     // kind, waiting, count, memory, compare, resulting memory, result, awakened
     let cases = [
         (0, 2, 1, 7, 99, 7, HorizonKernelResult::SUCCESS, 1),
@@ -571,22 +571,27 @@ fn address_signal_variants_update_words_and_consume_only_selected_waiters() {
         let mut dispatcher = support::dispatcher(&process);
         let address = process.main_thread().stack_bottom;
         write_guest_bytes(&process, address, &i32::to_le_bytes(initial));
+        let entry = process.entry_module().entry_address();
         let events: Vec<_> = (0..waiting)
-            .map(|index| {
-                process
-                    .address_waits()
-                    .lock()
-                    .priority_waits_mut()
-                    .enqueue(address.get(), GuestThreadId::new(100 + index), 30, None)
-                    .unwrap()
+            .map(|_| {
+                let (thread, _) = mutex::add_thread(&mut process, entry, 30);
+                let mut waits = process.address_waits().lock();
+                let event = waits
+                    .enqueue_address_wait(address.get(), thread, None)
+                    .unwrap();
+                waits.finish_address_check(thread, 0, false).unwrap();
+                event
             })
             .collect();
-        // A mutex/condition-variable waiter at the same address is independent.
-        let other =
-            process
-                .address_waits()
-                .lock()
-                .enqueue(address.get(), GuestThreadId::new(200), 0);
+        // Mutex/condition-variable keys have a distinct ordered namespace.
+        let (other_thread, _) = mutex::add_thread(&mut process, entry, 30);
+        let owner = process.main_thread_id();
+        let other = {
+            let mut waits = process.address_waits().lock();
+            waits
+                .enqueue(address.get(), owner, other_thread, 0)
+                .unwrap()
+        };
         set_address_arguments(
             state(&mut process),
             address.get(),
@@ -608,8 +613,9 @@ fn address_signal_variants_update_words_and_consume_only_selected_waiters() {
             process
                 .address_waits()
                 .lock()
-                .priority_waits()
-                .waiting_count(address.get()),
+                .signal_targets(address.get(), usize::MAX)
+                .0
+                .len(),
             waiting as usize - awakened
         );
         assert!(!other.is_signalled());
@@ -626,14 +632,7 @@ fn address_wait_timeout_preserves_the_original_deadline_and_decrements_once() {
     let (_, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
     assert!(matches!(handling, ExceptionHandlingResult::Suspended));
     assert_eq!(read_guest_u32(&process, address), u32::MAX);
-    assert_eq!(
-        process
-            .address_waits()
-            .lock()
-            .priority_waits()
-            .waiting_count(address.get()),
-        1
-    );
+    assert_eq!(process.address_waits().lock().waiter_count(), 1);
     process
         .coordinator_mut()
         .advance_virtual_time(2_000_000)
@@ -670,7 +669,8 @@ fn address_signals_wake_guest_threads_using_their_updated_effective_priorities()
     let main = process.main_thread_id();
     process
         .coordinator_mut()
-        .migrate_thread(main, Some(core), affinity.clone())
+        .scheduler()
+        .migrate(main, IdealCore::Core(core), affinity)
         .unwrap();
     let mut children = Vec::new();
     for priority in [30, 40] {
@@ -684,7 +684,7 @@ fn address_signals_wake_guest_threads_using_their_updated_effective_priorities()
                     stack_top,
                     priority,
                     ideal_vcpu: Some(nixe_scheduler::VirtualCpuId::new(0)),
-                    affinity: affinity.clone(),
+                    affinity,
                 },
             )
             .unwrap();
@@ -704,7 +704,7 @@ fn address_signals_wake_guest_threads_using_their_updated_effective_priorities()
     // Reprioritize the second waiter after both have entered their queues.
     process
         .coordinator_mut()
-        .set_thread_priority(children[1].1, 20)
+        .set_thread_priority(None, children[1].1, 20)
         .unwrap();
     // A changed word alone does not signal a wait, and a signal's successful
     // continuation does not recheck the original comparison.
@@ -6841,7 +6841,8 @@ fn break_captures_frames_on_a_guest_created_thread_stack() {
     let main = process.main_thread_id();
     process
         .coordinator_mut()
-        .migrate_thread(main, Some(core), affinity.clone())
+        .scheduler()
+        .migrate(main, IdealCore::Core(core), affinity)
         .unwrap();
     let child = process
         .coordinator_mut()
@@ -7101,6 +7102,13 @@ mod account_metadata;
 
 #[path = "svc_dispatch/mutex.rs"]
 mod mutex;
+
+#[path = "svc_dispatch/preemption.rs"]
+mod preemption;
+#[path = "svc_dispatch/thread_lifetime.rs"]
+mod thread_lifetime;
+#[path = "svc_dispatch/thread_policy.rs"]
+mod thread_policy;
 
 #[test]
 fn vibration_stop_validates_its_device_and_does_not_hide_nonzero_force() {

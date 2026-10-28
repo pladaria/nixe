@@ -519,7 +519,7 @@ impl Dispatch {
             );
         }
     }
-    #[cfg(any(test, feature = "performance-counters", feature = "binding-probe"))]
+    #[cfg(any(test, feature = "binding-probe"))]
     pub unsafe fn cmd_reset_query_pool(&mut self, pool: vk::QueryPool, first: u32, count: u32) {
         self.recorder.record(move |context| {
             context.flush_draw();
@@ -529,7 +529,6 @@ impl Dispatch {
             Ok(())
         });
     }
-    #[cfg(any(test, feature = "performance-counters"))]
     pub unsafe fn cmd_write_timestamp(
         &mut self,
         stage: vk::PipelineStageFlags,

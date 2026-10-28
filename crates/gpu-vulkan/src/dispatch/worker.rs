@@ -499,7 +499,7 @@ fn submit_native(
         });
     }
     nixe_gpu::metrics::record(nixe_gpu::metrics::Counter::HostQueueSubmissions, 1);
-    nixe_gpu::trace::detail_event("queue_submit", work.tick, 0, 0);
+    nixe_gpu::trace::event("queue_submit", work.tick, 0, 0);
     Ok(())
 }
 

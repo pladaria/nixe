@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::{Arc, Weak};
 
 use crate::GuestCpuState;
 use nixe_memory::GuestVirtualAddress;
@@ -46,10 +47,11 @@ impl Error for ThreadCreateError {}
 
 /// Runtime-owned guest thread state. Scheduler and handle identities remain
 /// stable even when the table's storage moves.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct GuestThread {
     pub(crate) id: GuestThreadId,
-    pub(crate) object: ThreadObject,
+    pub(crate) object: Weak<ThreadObject>,
+    pub(crate) running_reference: Option<Arc<ThreadObject>>,
     pub(crate) exit: Option<ThreadExit>,
     pub(crate) state: Option<GuestCpuState>,
     pub handle: u32,
@@ -68,12 +70,20 @@ impl GuestThread {
     }
 
     #[must_use]
-    pub fn object(&self) -> ThreadObject {
-        self.object.clone()
+    pub fn object(&self) -> Arc<ThreadObject> {
+        self.running_reference
+            .clone()
+            .or_else(|| self.object.upgrade())
+            .expect("a live thread operation retains its canonical object")
     }
 
-    pub(crate) fn object_identity_reference_count(&self) -> usize {
-        self.object.identity_reference_count()
+    pub(super) fn finish(&mut self) -> bool {
+        let running = self.running_reference.take();
+        let was_running = running.is_some();
+        if let Some(object) = running.or_else(|| self.object.upgrade()) {
+            object.signal();
+        }
+        was_running
     }
 
     #[must_use]
@@ -204,9 +214,11 @@ impl Error for ThreadTableError {}
 mod tests {
     use super::*;
     fn thread(id: u64) -> GuestThread {
+        let object = Arc::new(ThreadObject::new(id));
         GuestThread {
             id: GuestThreadId::new(id),
-            object: ThreadObject::new(id),
+            object: Arc::downgrade(&object),
+            running_reference: Some(object),
             exit: None,
             state: Some(GuestCpuState::default()),
             handle: 0,
@@ -221,11 +233,11 @@ mod tests {
     #[test]
     fn architectural_state_has_one_scheduler_owner() {
         let mut guest = thread(7);
-        let original = guest.clone();
+        let original = guest.state().register_context();
         let state = guest.take_state().unwrap();
         assert!(guest.take_state().is_none());
         guest.restore_state(state);
-        assert_eq!(guest, original);
+        assert_eq!(guest.state().register_context(), original);
     }
 
     #[test]
@@ -237,9 +249,8 @@ mod tests {
             Err(ThreadTableError::Duplicate(GuestThreadId::new(7)))
         );
         assert_eq!(table.len(), 1);
-        assert_eq!(
-            table.remove(GuestThreadId::new(8)),
-            Err(ThreadTableError::Missing(GuestThreadId::new(8)))
+        assert!(
+            matches!(table.remove(GuestThreadId::new(8)), Err(ThreadTableError::Missing(id)) if id == GuestThreadId::new(8))
         );
         assert_eq!(table.len(), 1);
         assert_eq!(

@@ -89,6 +89,7 @@ struct State {
     played_frames: u64,
     failure: Option<AudioError>,
     volume: f32,
+    host_gain: f32,
 }
 impl Default for State {
     fn default() -> Self {
@@ -99,6 +100,7 @@ impl Default for State {
             played_frames: 0,
             failure: None,
             volume: 1.0,
+            host_gain: 1.0,
         }
     }
 }
@@ -150,10 +152,13 @@ impl AudioFeed {
                 released = true;
             }
         }
-        if state.volume != 1.0 {
+        // Combine gains before clipping, including attenuation of amplified PCM.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/audio_core/sink/sink_stream.cpp#L32-L35
+        let volume = state.volume * state.host_gain;
+        if volume != 1.0 {
             for sample in &mut output[..written] {
-                *sample = (f32::from(*sample) * state.volume)
-                    .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                *sample =
+                    (f32::from(*sample) * volume).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
             }
         }
         #[cfg(feature = "performance-counters")]

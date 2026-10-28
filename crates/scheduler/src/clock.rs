@@ -1,4 +1,4 @@
-//! Host-independent virtual wall and monotonic clock state.
+//! Shared kernel clock for scheduling, guest time and host services.
 
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -34,7 +34,7 @@ fn pause_transition(state: u64, now: u64, paused: bool) -> u64 {
     }
 }
 
-/// One cloneable clock source shared by all services of an emulated process.
+/// One cloneable clock source shared by the scheduler and emulated services.
 ///
 /// Realtime mode samples `SystemTime` only at construction. Subsequent reads
 /// use `Instant`, so host wall-clock adjustments cannot make guest time move
@@ -107,7 +107,7 @@ impl VirtualClock {
     }
 
     /// Freezes/resumes the shared process clock, excluding host pause duration.
-    pub(crate) fn set_paused(&self, paused: bool) {
+    pub fn set_paused(&self, paused: bool) {
         let mut state = self.state.pause.load(Ordering::Acquire);
         loop {
             if (state & PAUSED != 0) == paused {
@@ -152,8 +152,7 @@ impl VirtualClock {
     }
 
     /// Advances the explicit scheduler timeline monotonically. Runtime
-    /// coordinators are the production authority; adapters use this only to
-    /// synchronize compatibility dispatch paths with that authority.
+    /// coordinators are the production authority.
     pub fn advance_scheduler_to(&self, nanoseconds: u64) {
         self.state
             .scheduler_time_ns

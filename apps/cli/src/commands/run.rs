@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use nixe_cli::library::{Library, LibraryTitleSource};
 use nixe_config::{DiagnosticsConfig, GuestLogsLevel, InitialOperationMode, TimeMode, WindowState};
+use nixe_gpu::frame_metrics::FrameMetrics;
+use nixe_gpu_vulkan::cache::CacheMonitor;
 use nixe_horizon::{
     GuestLogLevel, HorizonDiagnostics, HorizonSvcDispatcher, OperationMode, SaveDataSystem,
     SettingsEnvironment, SystemLanguage, TimeEnvironment, VideoSystem, switch_1_machine_profile,
@@ -276,7 +278,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         }
     };
     frontend = frontend.map(|frontend| frontend.with_window_state(saved_window_state));
-    let (video_system, gpu_caches) = {
+    let (video_system, gpu_diagnostics) = {
         let options = vulkan;
         let (device, native_presentation) = if let Some(frontend) = frontend.as_mut() {
             let (device, client) = frontend
@@ -314,21 +316,25 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         let maxwell = nixe_gpu_maxwell::MaxwellNativeFrontend::new(
             renderer.device_profile().shader_compiler.clone(),
         );
-        let gpu_caches = renderer.cache_monitor();
+        let gpu_diagnostics = (renderer.cache_monitor(), renderer.frame_metrics());
         let video = VideoSystem::with_gpu_frontend(
             process.memory().space().machine().clone(),
             presenter,
             renderer,
             maxwell,
         );
-        (video, gpu_caches)
+        (video, gpu_diagnostics)
     };
     let gamepad_profiles = GamepadProfiles::new(config.input.profiles.clone());
     // SDL initialization and final subsystem shutdown remain on the main thread.
     // The owners outlive guest execution in both windowed and headless modes.
     let sdl = sdl3::init().map_err(|error| format!("cannot initialize SDL: {error}"))?;
-    let audio = nixe_audio::HostAudioRuntime::new(&sdl, config.audio.output)
-        .map_err(|error| error.to_string())?;
+    let audio = nixe_audio::HostAudioRuntime::new(
+        &sdl,
+        config.audio.output,
+        f32::from(config.audio.volume) / 100.0,
+    )
+    .map_err(|error| error.to_string())?;
     let input_events = coordinator.event_sender();
     let input_owner = InputWorker::with_profiles(&sdl, gamepad_profiles, move || {
         input_events.notify_host_service(nixe_runtime::ExternalEventSource::Input);
@@ -353,7 +359,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
             video_system,
             host_input,
             audio_backend,
-            gpu_caches,
+            gpu_diagnostics,
         ));
     };
     let frontend =
@@ -372,7 +378,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
                 video_system,
                 host_input,
                 audio_backend,
-                gpu_caches,
+                gpu_diagnostics,
             )
         })
         .map_err(|error| format!("cannot start guest execution worker: {error}"))?;
@@ -548,8 +554,9 @@ fn execute_worker(
     video_system: VideoSystem,
     mut host_input: HostInputReaders,
     audio_backend: Arc<nixe_audio::HostAudioBackend>,
-    mut gpu_caches: nixe_gpu_vulkan::cache::CacheMonitor,
+    gpu_diagnostics: (CacheMonitor, FrameMetrics),
 ) -> WorkerResult {
+    let (mut gpu_caches, frame_metrics) = gpu_diagnostics;
     let registration = ProcessRegistration {
         priority: process.initial_thread_priority(),
         ideal_vcpu: Some(process.initial_ideal_vcpu()),
@@ -571,6 +578,7 @@ fn execute_worker(
         &mut host_input,
         audio_backend,
         &mut gpu_caches,
+        &frame_metrics,
     );
     log::debug!(
         "guest execution stopped after {:?}",
@@ -582,6 +590,11 @@ fn execute_worker(
             Err(original) => format!("{original}; cannot quiesce CPU workers: {error}"),
         });
     }
+    #[cfg(feature = "performance-counters")]
+    log::info!(
+        "kernel scheduler: {:?}",
+        coordinator.scheduler().statistics()
+    );
     // Stop and join GPU work while its
     // canonical memory transitions can still use the JIT coordinator. Removing
     // the process closes native admission and would reject those transitions.
@@ -677,7 +690,8 @@ fn execute(
     video_system: VideoSystem,
     host_input: &mut HostInputReaders,
     audio_backend: Arc<nixe_audio::HostAudioBackend>,
-    gpu_caches: &mut nixe_gpu_vulkan::cache::CacheMonitor,
+    gpu_caches: &mut CacheMonitor,
+    frame_metrics: &FrameMetrics,
 ) -> Result<ExecutionSummary, String> {
     let coordinator = &mut *scheduled.coordinator;
     let process_id = scheduled.process_id;
@@ -781,9 +795,9 @@ fn execute(
                 .map_or_else(EmulatedButtonState::default, |controller| {
                     controller.state.buttons
                 });
-            if log::log_enabled!(log::Level::Debug) {
+            if log::log_enabled!(log::Level::Trace) {
                 for (button, pressed) in button_transitions(active_buttons, current_buttons) {
-                    log::debug!(
+                    log::trace!(
                         "emulated button {button} {}: elapsed={elapsed:?}",
                         if pressed { "pressed" } else { "released" }
                     );
@@ -852,6 +866,24 @@ fn execute(
                         "guest CPU completion rate: completions_per_second={completions_per_second:.0}, completions={execution_completions}, elapsed={elapsed:?}"
                     );
                     log::info!("{}", gpu_caches.sample());
+                    if let Some(frame) = frame_metrics.latest() {
+                        log::info!(
+                            "frame timing: frame={} swap_interval={} cpu_ms={:.3} gpu_ms={} total_ms={}",
+                            frame.frame,
+                            frame.swap_interval,
+                            frame.cpu.as_secs_f64() * 1000.0,
+                            frame.gpu.map_or_else(
+                                || "n/a".to_owned(),
+                                |time| format!("{:.3}", time.as_secs_f64() * 1000.0),
+                            ),
+                            frame.total.map_or_else(
+                                || "n/a".to_owned(),
+                                |time| format!("{:.3}", time.as_secs_f64() * 1000.0),
+                            ),
+                        );
+                    } else {
+                        log::info!("frame timing: no completed frames");
+                    }
                     if log::log_enabled!(log::Level::Trace)
                         && let Some(process) = coordinator.process(process_id)
                     {

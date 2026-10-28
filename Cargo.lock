@@ -1397,6 +1397,7 @@ dependencies = [
  "ash-window",
  "egui",
  "gpu-allocator",
+ "libc",
  "log",
  "nixe-gpu",
  "nixe-memory",

@@ -225,6 +225,15 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
                 | "buffer_release"
                 | "vi_acquire"
                 | "frame_ready"
+                | "frame_producer"
+                | "gpu_submission_queued"
+                | "gpu_command_begin"
+                | "gpu_command_end"
+                | "gpu_execution"
+                | "gpu_calibration_error"
+                | "queue_schedule"
+                | "queue_submit"
+                | "queue_complete"
         )
     {
         return;
@@ -239,6 +248,11 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
         });
     }
 }
+#[inline]
+pub fn active() -> bool {
+    now(false).is_some()
+}
+
 #[inline]
 pub fn detail_event(name: &'static str, a: u64, b: u64, c: u64) {
     if let Some(time) = now(true) {

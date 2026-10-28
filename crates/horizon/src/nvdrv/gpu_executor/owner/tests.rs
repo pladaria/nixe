@@ -166,6 +166,7 @@ impl GpuExecution for QueueFixture {
     fn acquire_presentable_image(
         &mut self,
         _: Self::ImageRequest,
+        _: u32,
     ) -> Result<ResidentImage, BackendRuntimeError> {
         Err(BackendRuntimeError::Backend(
             "queue fixture has no images".into(),
@@ -693,6 +694,7 @@ impl GpuExecution for ControlledPreparation {
     fn acquire_presentable_image(
         &mut self,
         _: Self::ImageRequest,
+        _: u32,
     ) -> Result<ResidentImage, BackendRuntimeError> {
         unreachable!()
     }

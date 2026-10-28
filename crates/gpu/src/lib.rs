@@ -81,6 +81,7 @@ pub use view::{
 };
 
 pub mod cache_counters;
+pub mod frame_metrics;
 /// Diagnostic counters compiled only when explicitly enabled.
 pub mod metrics;
 pub use nixe_memory::trace;

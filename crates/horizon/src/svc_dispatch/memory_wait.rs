@@ -64,7 +64,6 @@ pub(super) struct KernelCompletion {
     source: nixe_cpu::location::LocationDescriptor,
     vcpu: VirtualCpuId,
     operation: KernelResume,
-    mutex_updates: Option<(ProcessId, Vec<u64>)>,
 }
 impl KernelCompletion {
     fn resume(
@@ -72,11 +71,6 @@ impl KernelCompletion {
         dispatcher: &mut HorizonSvcDispatcher,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        if let Some((_, addresses)) = self.mutex_updates
-            && let Err(fault) = dispatcher.synchronize_mutex_waits(context, addresses)
-        {
-            return ExceptionDispatchOutcome::Fault(fault);
-        }
         match self.operation {
             KernelResume::Access {
                 result,
@@ -113,15 +107,7 @@ impl SvcCompletion {
             source,
             vcpu,
             operation: KernelResume::Operation(Box::new(continuation)),
-            mutex_updates: None,
         })
-    }
-    pub(super) fn mutex_effects(mut self, process: ProcessId, addresses: Vec<u64>) -> Self {
-        let Self::Kernel(completion) = &mut self else {
-            unreachable!("kernel metadata accompanies its continuation");
-        };
-        completion.mutex_updates = Some((process, addresses));
-        self
     }
     pub(super) fn success(output1: Option<u64>) -> Self {
         Self::Return {
@@ -175,7 +161,6 @@ impl MemoryOperation {
                         result,
                         continuation: continuation.take().expect("kernel access resumes once"),
                     },
-                    mutex_updates: None,
                 }))),
             },
             Self::Owned { future, .. } => {
@@ -524,7 +509,7 @@ impl HorizonSvcDispatcher {
                 let notified = wake.clone();
                 access.set_waker(Arc::new(move || notified.wake_by_ref()));
                 let token = coordinator
-                    .register_wait(thread, nixe_scheduler::Readiness::Pending)
+                    .register_wait(thread)
                     .map_err(|_| runtime_fault("kernel output wait registration"))?;
                 self.memory_waits.insert(
                     thread,
@@ -532,7 +517,7 @@ impl HorizonSvcDispatcher {
                         process,
                         generation: wake.generation,
                         wake,
-                        token,
+                        token: Some(token),
                         operation: MemoryOperation::Write {
                             access,
                             immediate,
@@ -669,7 +654,7 @@ impl HorizonSvcDispatcher {
                 Some(deadline.saturating_sub(coordinator.virtual_time_ns())),
             )?)
         } else {
-            coordinator.register_wait(thread, nixe_scheduler::Readiness::Pending)?
+            Some(coordinator.register_wait(thread)?)
         };
         Ok(true)
     }
@@ -706,23 +691,13 @@ impl HorizonSvcDispatcher {
                 continue;
             }
             pending.wake.queued.store(false, Ordering::Release);
-            let mut completed = match pending.operation.poll(&pending.wake) {
+            let completed = match pending.operation.poll(&pending.wake) {
                 Poll::Pending => {
                     self.memory_waits.insert(thread, pending);
                     continue;
                 }
                 Poll::Ready(result) => result,
             };
-            // Started kernel effects belong to the retained process/wait owner,
-            // including when their initiating caller no longer needs a reply.
-            if let Ok(SvcCompletion::Kernel(completion)) = &mut completed
-                && let Some((process, addresses)) = completion.mutex_updates.take()
-                && coordinator.process(process).is_some()
-            {
-                coordinator
-                    .synchronize_mutex_waits(process, &addresses)
-                    .map_err(|_| runtime_fault("completed kernel ownership change"))?;
-            }
             if !current {
                 if let Err(fault) = completed
                     && fault.guest_result().is_none()

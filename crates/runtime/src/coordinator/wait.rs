@@ -1,6 +1,30 @@
 use super::*;
 
 impl RuntimeCoordinator {
+    pub(super) fn finalize_retired_threads(&mut self) -> Result<(), CoordinatorError> {
+        while let Some((process, thread)) = self.inbox.sender.take_retired_thread() {
+            let Some(view) = self.scheduler.thread(thread) else {
+                // Forced process/machine teardown already retired this identity.
+                continue;
+            };
+            debug_assert_eq!(view.process, process);
+            debug_assert!(matches!(
+                view.lifecycle,
+                nixe_scheduler::ThreadLifecycle::Created
+                    | nixe_scheduler::ThreadLifecycle::Exited
+                    | nixe_scheduler::ThreadLifecycle::Faulted
+            ));
+            self.finalize_thread_waits(process, thread);
+            self.scheduler.unregister(thread)?;
+            self.processes
+                .get_mut(&process)
+                .expect("retained thread process")
+                .retire_thread(thread)
+                .expect("canonical thread is registered");
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn event_sender(&self) -> ExternalEventSender {
         self.inbox.sender()
@@ -33,31 +57,20 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
-    /// Atomically publishes either immediate readiness or a generation-safe wait.
-    pub fn register_wait(
-        &mut self,
-        thread: GuestThreadId,
-        readiness: Readiness,
-    ) -> Result<Option<WakeToken>, CoordinatorError> {
-        let decision = self
-            .scheduler
-            .apply(SchedulerCommand::RegisterWait { thread, readiness })?;
-        match decision {
-            SchedulerDecision::ReadyImmediately(_) => Ok(None),
-            SchedulerDecision::WaitRegistered(token) => Ok(Some(token)),
-            _ => unreachable!("wait registration has a dedicated decision"),
-        }
+    /// Publishes a generation-safe wait for an operation that has actually blocked.
+    pub fn register_wait(&mut self, thread: GuestThreadId) -> Result<WakeToken, CoordinatorError> {
+        self.scheduler.register_wait(thread).map_err(Into::into)
     }
 
     /// Completes only the current generation after its owned result is installed.
     pub fn complete_wait(&mut self, token: WakeToken) -> Result<bool, CoordinatorError> {
-        self.apply_wake(token, false)
+        self.apply_wake(token)
     }
 
     /// Cancels exactly one current wait generation and releases its observers
     /// and deadline. A readiness wake which already won cannot be cancelled.
     pub fn cancel_wait(&mut self, token: WakeToken) -> Result<bool, CoordinatorError> {
-        self.apply_wake(token, true)
+        self.apply_wake(token)
     }
 
     #[must_use]
@@ -79,10 +92,11 @@ impl RuntimeCoordinator {
                 -2 => Some(nixe_scheduler::YieldMigration::Any),
                 _ => None,
             };
-            self.scheduler.apply(match migration {
-                Some(migration) => SchedulerCommand::Yield { thread, migration },
-                None => SchedulerCommand::MakeReady(thread),
-            })?;
+            if let Some(migration) = migration {
+                self.scheduler.yield_thread(thread, migration)?;
+            } else {
+                self.scheduler.make_ready(thread)?;
+            }
             return Ok(None);
         }
         let token = self.register_timed_wait(thread, Some(nanoseconds as u64))?;
@@ -105,9 +119,7 @@ impl RuntimeCoordinator {
                 .checked_add(1)
                 .ok_or(CoordinatorError::DeadlineSequenceExhausted)?;
         }
-        let token = self
-            .register_wait(thread, Readiness::Pending)?
-            .expect("a pending wait returns a wake token");
+        let token = self.register_wait(thread)?;
         if let Some(deadline) = deadline {
             self.deadlines.insert(deadline, token);
         }
@@ -131,7 +143,7 @@ impl RuntimeCoordinator {
                 .watch_readable_event(event, None, token, source)
             {
                 self.release_wait_resources(thread);
-                let _ = self.scheduler.apply(SchedulerCommand::CancelWait(token));
+                let _ = self.scheduler.finish_wait(token);
                 return Err(CoordinatorError::ExternalEvent(error));
             }
         }
@@ -170,9 +182,7 @@ impl RuntimeCoordinator {
         // Missed host callbacks do not mean guest threads actually ran intervening
         // turns. Rotate once and preserve the periodic phase, as CoreTiming does.
         self.next_preemption_ns = Some(now.saturating_add(interval - (now - deadline) % interval));
-        self.scheduler
-            .apply(SchedulerCommand::Rotate)
-            .expect("rotation is infallible");
+        self.scheduler.rotate();
     }
 
     pub(super) fn wake_due_deadlines(&mut self) -> Result<usize, CoordinatorError> {
@@ -196,22 +206,16 @@ impl RuntimeCoordinator {
             if handoff {
                 continue;
             }
-            if self.apply_wake(token, false)? {
+            if self.apply_wake(token)? {
                 // Address waits complete at timer expiry, before a later mutex
                 // unlock or condition signal can transfer ownership to them.
                 let process_id = self.scheduler.thread(token.thread).unwrap().process;
-                if self
-                    .processes
+                self.processes
                     .get_mut(&process_id)
                     .unwrap()
                     .address_waits()
                     .lock()
-                    .expire_thread_wait(token.thread)
-                {
-                    self.priority_donations
-                        .retain(|donation| donation.waiter != token.thread);
-                    self.recompute_effective_priorities()?;
-                }
+                    .expire_thread_wait(token.thread);
                 woken += 1;
             }
         }
@@ -242,7 +246,7 @@ impl RuntimeCoordinator {
             }
             crate::external_event::CoordinatorEvent::Completed(result) => {
                 self.workers.pending_results.push_back(result);
-                Ok(())
+                self.finalize_retired_threads()
             }
         }
     }
@@ -264,43 +268,48 @@ impl RuntimeCoordinator {
                 }
                 self.virtual_clock.set_paused(paused);
             }
-            ExternalEvent::HostService(_) => {}
+            ExternalEvent::HostService(_) | ExternalEvent::ThreadRetirement => {}
             ExternalEvent::Wake { token, .. } => {
-                if self.apply_wake(token, false)? {
+                if self.apply_wake(token)? {
                     report.woken += 1;
                 } else {
                     report.stale += 1;
                 }
             }
             ExternalEvent::CancelWait(token) => {
-                if self.apply_wake(token, true)? {
+                if self.apply_wake(token)? {
                     report.cancelled += 1;
                 } else {
                     report.stale += 1;
                 }
             }
         }
-        Ok(())
+        self.finalize_retired_threads()
     }
 
-    pub(super) fn apply_wake(
-        &mut self,
-        token: WakeToken,
-        cancelled: bool,
-    ) -> Result<bool, CoordinatorError> {
+    pub(super) fn apply_wake(&mut self, token: WakeToken) -> Result<bool, CoordinatorError> {
         self.release_wait_resources_if_current(token);
-        if self.scheduler.thread(token.thread).is_none() {
-            return Ok(false);
-        }
-        let command = if cancelled {
-            SchedulerCommand::CancelWait(token)
-        } else {
-            SchedulerCommand::Wake(token)
-        };
-        match self.scheduler.apply(command) {
+        match self.scheduler.finish_wait(token) {
             Ok(_) => Ok(true),
             Err(SchedulerError::StaleWake(_)) => Ok(false),
             Err(error) => Err(error.into()),
+        }
+    }
+
+    // Finalization follows the canonical held nodes into each waiter's process.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_thread.cpp#L352-L380
+    pub(super) fn finalize_thread_waits(&mut self, process: ProcessId, thread: GuestThreadId) {
+        self.scheduler.cancel_thread_property(thread);
+        self.release_wait_resources(thread);
+        self.processes[&process]
+            .address_waits()
+            .lock()
+            .release_thread(thread);
+        while let Some((process, waiter)) = self.scheduler.take_held_waiter(thread) {
+            self.processes[&process]
+                .address_waits()
+                .lock()
+                .cancel_held_waiter(waiter);
         }
     }
 

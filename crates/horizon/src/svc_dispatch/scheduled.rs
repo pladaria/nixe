@@ -90,6 +90,9 @@ impl HorizonSvcDispatcher {
         self.pending_runtime_requests.remove(&thread);
         self.cancel_memory_wait(thread);
         self.pending_wakes.remove(&thread_id);
+        self.cancellable_waits.remove(&thread_id);
+        self.cancelled_waits.remove(&thread_id);
+        self.pending_wait_cancellations.remove(&thread_id);
         self.synchronization_waits.remove(&thread_id);
         self.session_requests.remove(&thread_id);
         self.reply_waits.remove(&thread_id);

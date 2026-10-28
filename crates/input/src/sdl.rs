@@ -219,7 +219,7 @@ impl SdlInputBackend {
                 && open.gamepad.connected()
             {
                 if self.vibration_dirty {
-                    log::debug!(
+                    log::trace!(
                         "controller vibration output: device={} values={:?}",
                         open.name,
                         self.vibration.values
@@ -705,7 +705,15 @@ mod tests {
         drop(recovered);
         let reconnected = attach();
         assert_ne!(reconnected.id().0, old_instance);
-        let snapshot = backend.poll().unwrap().unwrap();
+        backend.poll().unwrap();
+        // A physical controller may precede the newly connected virtual one.
+        // Verify the reconnected device rather than assuming host enumeration order.
+        let reconnected = backend
+            .open_gamepads
+            .iter_mut()
+            .find(|open| open.joystick_id == reconnected.id())
+            .expect("reconnected device opened by poll");
+        let snapshot = controller_state(reconnected);
         assert_ne!(snapshot.id, recovered_id);
         assert_ne!(snapshot.id, controller_id);
         assert_eq!(&*snapshot.name, "Nixe hotplug test");

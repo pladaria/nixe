@@ -486,7 +486,7 @@ impl HorizonSvcDispatcher {
         let event = session.readable_event();
         event.clear();
         self.pending_wakes.insert(
-            context.thread().object().thread_id(),
+            context.thread().id().get(),
             PendingThreadWake {
                 events: vec![event],
                 deadline: None,
@@ -574,7 +574,7 @@ pub(super) fn copy_ipc_object(
         CURRENT_PROCESS_HANDLE => Ok(Some(HandleObject::new(ProcessObject::new(
             context.process().process_id(),
         )))),
-        CURRENT_THREAD_HANDLE => Ok(Some(HandleObject::new(context.thread().object()))),
+        CURRENT_THREAD_HANDLE => Ok(Some(HandleObject::from_arc(context.thread().object()))),
         _ => context
             .process()
             .handles()

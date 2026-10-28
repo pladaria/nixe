@@ -260,6 +260,7 @@ struct RuntimeTimer<'a> {
 }
 pub(crate) struct VcpuExecutionState {
     pub(crate) thread: GuestCpuState,
+    pub(crate) tls_base: GuestVirtualAddress,
     pub(crate) virtual_clock: VirtualClock,
     pub(crate) architectural_timer_frequency: u64,
     pub(crate) events: VcpuEventState,

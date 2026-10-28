@@ -32,6 +32,25 @@ pub struct Thread {
     process: Arc<Process>,
     core: Core,
 }
+#[derive(Debug)]
+pub enum MemoryAccessFailure {
+    Stopped,
+    Memory(Arc<MemoryError>),
+}
+impl std::fmt::Display for MemoryAccessFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stopped => f.write_str("JIT process stopped during a memory dependency"),
+            Self::Memory(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for MemoryAccessFailure {}
+impl From<MemoryError> for MemoryAccessFailure {
+    fn from(error: MemoryError) -> Self {
+        Self::Memory(Arc::new(error))
+    }
+}
 #[derive(Default)]
 struct Notification {
     ready: Mutex<bool>,
@@ -48,6 +67,15 @@ impl Notification {
     }
 }
 impl Process {
+    fn stopped_fault(&self) -> CpuFault {
+        if let Some(error) = self.failure.get() {
+            return crate::unavailable_state_fault(error.to_string());
+        }
+        let mut fault = crate::unavailable_state_fault("JIT process is stopping");
+        fault.kind = nixe_cpu::execution::CpuFaultKind::Stopped;
+        fault
+    }
+
     pub fn new(
         cpu: ProcessCpuContext,
         space: Arc<AddressSpace>,
@@ -129,20 +157,23 @@ impl Process {
     pub(crate) fn resolve_access(
         &self,
         access: Result<nixe_memory::Access<nixe_memory::AccessResult>, MemoryError>,
-    ) -> Result<nixe_memory::AccessResult, Arc<MemoryError>> {
-        let mut pending = match access.map_err(Arc::new)? {
+    ) -> Result<nixe_memory::AccessResult, MemoryAccessFailure> {
+        let mut pending = match access.map_err(MemoryAccessFailure::from)? {
             nixe_memory::Access::Ready(value) => return Ok(value),
             nixe_memory::Access::Pending(pending) => pending,
         };
         if let Some(result) = pending.poll() {
-            return result.map_err(|error| self.fail(error));
+            return result.map_err(|error| MemoryAccessFailure::Memory(self.fail(error)));
         }
         let notification = self.notification();
         pending.set_waker(notification.waker());
         let result = self.wait(&notification, || pending.poll());
         match result {
             Ok(value) => Ok(value),
-            Err(error) => Err(self.fail(error)),
+            Err(MemoryAccessFailure::Memory(error)) => {
+                Err(MemoryAccessFailure::Memory(self.fail(error)))
+            }
+            Err(MemoryAccessFailure::Stopped) => Err(MemoryAccessFailure::Stopped),
         }
     }
     fn notification(&self) -> Arc<Notification> {
@@ -156,17 +187,17 @@ impl Process {
         &self,
         notification: &Notification,
         mut poll: impl FnMut() -> Option<Result<T, Arc<MemoryError>>>,
-    ) -> Result<T, Arc<MemoryError>> {
+    ) -> Result<T, MemoryAccessFailure> {
         loop {
             if let Some(result) = poll() {
-                return result;
+                return result.map_err(MemoryAccessFailure::Memory);
             }
             if self.stopped.load(Ordering::Acquire) {
-                return Err(self.failure.get().cloned().unwrap_or_else(|| {
-                    Arc::new(MemoryError::Execution(
-                        "JIT process stopped during a memory dependency".into(),
-                    ))
-                }));
+                return Err(self
+                    .failure
+                    .get()
+                    .cloned()
+                    .map_or(MemoryAccessFailure::Stopped, MemoryAccessFailure::Memory));
             }
             let mut ready = notification.ready.lock().unwrap();
             if !*ready {
@@ -183,6 +214,60 @@ impl Drop for Active<'_> {
     }
 }
 impl Thread {
+    /// Kernel accesses on this core share native memory dependency cancellation.
+    pub fn read_memory(
+        &self,
+        address: GuestVirtualAddress,
+        bytes: usize,
+    ) -> Result<u128, MemoryAccessFailure> {
+        match self
+            .process
+            .space
+            .read_value(address, bytes)
+            .map_err(MemoryAccessFailure::from)?
+        {
+            nixe_memory::Access::Ready(value) => Ok(value),
+            nixe_memory::Access::Pending(pending) => {
+                match self
+                    .process
+                    .resolve_access(Ok(nixe_memory::Access::Pending(pending)))?
+                {
+                    nixe_memory::AccessResult::Read(value) => {
+                        let mut scalar = [0; 16];
+                        scalar[..value.len()].copy_from_slice(&value);
+                        Ok(u128::from_le_bytes(scalar))
+                    }
+                    _ => unreachable!("scalar read completion is checked by memory"),
+                }
+            }
+        }
+    }
+
+    pub fn write_memory(
+        &self,
+        address: GuestVirtualAddress,
+        bytes: usize,
+        value: u128,
+    ) -> Result<(), MemoryAccessFailure> {
+        match self
+            .process
+            .space
+            .write_value(address, bytes, value)
+            .map_err(MemoryAccessFailure::from)?
+        {
+            nixe_memory::Access::Ready(()) => Ok(()),
+            nixe_memory::Access::Pending(pending) => {
+                match self
+                    .process
+                    .resolve_access(Ok(nixe_memory::Access::Pending(pending)))?
+                {
+                    nixe_memory::AccessResult::Written => Ok(()),
+                    _ => unreachable!("scalar write completion is checked by memory"),
+                }
+            }
+        }
+    }
+
     pub fn control(&self) -> CpuControl {
         self.core.control()
     }
@@ -199,11 +284,15 @@ impl Thread {
         let process = &self.process;
         process.active.fetch_add(1, Ordering::AcqRel);
         let _active = Active(&process.active);
-        if !state.is_available() || process.stopped.load(Ordering::Acquire) {
+        if !state.is_available() {
             state.discard();
             return Err(crate::unavailable_state_fault(
                 "JIT process/context is unavailable",
             ));
+        }
+        if process.stopped.load(Ordering::Acquire) {
+            state.discard();
+            return Err(process.stopped_fault());
         }
         self.core
             .select_state(state)
@@ -212,7 +301,7 @@ impl Thread {
         loop {
             if process.stopped.load(Ordering::Acquire) {
                 state.discard();
-                return Err(crate::unavailable_state_fault("JIT process is stopping"));
+                return Err(process.stopped_fault());
             }
             let interrupts = events.take_pending_interrupts();
             if interrupts != 0 {
@@ -223,9 +312,14 @@ impl Thread {
             }
             let boundary = match self.core.run(worker, timer, process) {
                 Ok(boundary) => boundary,
-                Err(error) => {
-                    let error =
-                        process.fail(Arc::new(MemoryError::Execution(error.to_string().into())));
+                Err(MemoryAccessFailure::Stopped) => {
+                    // Native interruption is control flow, not a memory failure.
+                    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/arm/dynarmic/arm_dynarmic_64.cpp#L437-L439
+                    state.discard();
+                    return Err(process.stopped_fault());
+                }
+                Err(MemoryAccessFailure::Memory(error)) => {
+                    let error = process.fail(error);
                     state.discard();
                     return Err(crate::unavailable_state_fault(error.to_string()));
                 }
@@ -235,7 +329,7 @@ impl Thread {
             }
             if process.stopped.load(Ordering::Acquire) {
                 state.discard();
-                return Err(crate::unavailable_state_fault("JIT process is stopping"));
+                return Err(process.stopped_fault());
             }
             if !boundary.code.is_empty() {
                 for capture in boundary.code {
@@ -243,7 +337,7 @@ impl Thread {
                         .start(&process.space)
                         .map_err(|error| crate::fault(error.to_string(), state))?;
                     let resolved = if let Some(result) = read.poll() {
-                        result
+                        result.map_err(MemoryAccessFailure::Memory)
                     } else {
                         let notification = process.notification();
                         read.set_waker(notification.waker());
@@ -251,7 +345,17 @@ impl Thread {
                     };
                     let resolved = match resolved {
                         Ok(resolved) => resolved,
-                        Err(error) => {
+                        Err(MemoryAccessFailure::Stopped) => {
+                            let fault = match read.cancel() {
+                                Some(error) => {
+                                    crate::unavailable_state_fault(process.fail(error).to_string())
+                                }
+                                None => process.stopped_fault(),
+                            };
+                            state.discard();
+                            return Err(fault);
+                        }
+                        Err(MemoryAccessFailure::Memory(error)) => {
                             let error = process.fail(read.cancel().unwrap_or(error));
                             state.discard();
                             return Err(crate::unavailable_state_fault(error.to_string()));
