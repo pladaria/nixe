@@ -80,9 +80,8 @@ pub(in crate::engines) fn draw_state(
     use nixe_gpu::{TessellationControl, TessellationState};
     let bindings = state.shader_bindings();
     let enabled = |stage| {
-        bindings
-            .pipeline()
-            .iter()
+        (0..super::MAXWELL_PIPELINE_SHADER_COUNT)
+            .map(|i| bindings.pipeline(i))
             .any(|p| p.enabled().value() == Some(&true) && p.stage().value() == Some(&stage))
     };
     let patches = state

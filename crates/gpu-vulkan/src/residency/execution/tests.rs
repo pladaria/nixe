@@ -72,6 +72,90 @@ fn native_image_range_coalescing_preserves_mixed_scopes_and_subresource_holes() 
 }
 
 #[test]
+fn shader_view_ranges_union_overlaps_without_expanding_layers_or_writing_holes() {
+    use std::collections::BTreeMap;
+    let id = ImageId {
+        instance: nixe_gpu::BackendInstanceId::new(1),
+        slot: 0,
+        generation: 1,
+    };
+    let read = AccessScope::new(
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    );
+    let write = AccessScope::new(
+        vk::PipelineStageFlags2::COMPUTE_SHADER,
+        vk::AccessFlags2::SHADER_STORAGE_WRITE,
+    );
+    let view = |mip, levels, layer, layers, scope| Use::Image {
+        id,
+        scope,
+        range: vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(mip)
+            .level_count(levels)
+            .base_array_layer(layer)
+            .layer_count(layers),
+    };
+    let wide = view(0, 16, 0, 2048, read);
+    assert_eq!(merge_program_uses(vec![wide, wide]).len(), 1);
+
+    // Different insertion orders, nested/partial views, disjoint layers and
+    // distinct aspects must produce the exact simultaneous access union.
+    for seed in 1..65_u32 {
+        let mut state = seed;
+        let mut random = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state
+        };
+        let mut input = Vec::new();
+        let mut expected = BTreeMap::<_, AccessScope>::new();
+        for index in 0..12 {
+            let scope = if random() & 1 == 0 { read } else { write };
+            let mut usage = view(
+                random() % 4,
+                random() % 4 + 1,
+                random() % 6,
+                random() % 5 + 1,
+                scope,
+            );
+            let Use::Image { range, .. } = &mut usage else {
+                unreachable!()
+            };
+            if index % 3 == 0 {
+                range.aspect_mask = vk::ImageAspectFlags::DEPTH;
+            }
+            for mip in range.base_mip_level..range.base_mip_level + range.level_count {
+                for layer in range.base_array_layer..range.base_array_layer + range.layer_count {
+                    let access = expected
+                        .entry((range.aspect_mask.as_raw(), mip, layer))
+                        .or_default();
+                    access.stages |= scope.stages;
+                    access.access |= scope.access;
+                }
+            }
+            input.push(usage);
+        }
+        let mut actual = BTreeMap::new();
+        for usage in merge_program_uses(input) {
+            let Use::Image { range, scope, .. } = usage else {
+                unreachable!()
+            };
+            for mip in range.base_mip_level..range.base_mip_level + range.level_count {
+                for layer in range.base_array_layer..range.base_array_layer + range.layer_count {
+                    assert!(
+                        actual
+                            .insert((range.aspect_mask.as_raw(), mip, layer), scope)
+                            .is_none()
+                    );
+                }
+            }
+        }
+        assert_eq!(actual, expected, "view set {seed}");
+    }
+}
+
+#[test]
 fn null_storage_buffers_read_zero_and_discard_writes_and_atomics() {
     let Some(mut cache) = cache(ApiPreference::Auto, 8 * 1024 * 1024) else {
         return;

@@ -9,7 +9,6 @@
 //! https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/docs/hw/fifo/dma-pusher.rst#gf100-commands
 
 mod methods;
-use methods::PacketMethods;
 pub use methods::{MaxwellMethodIterator, MaxwellMethodSpan};
 mod sources;
 pub(crate) use sources::CommandStream;
@@ -175,14 +174,16 @@ impl MaxwellDecodedMethod {
 }
 
 /// A complete, syntactically validated compressed method sequence.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellDecodedMethodPacket {
     mode: MaxwellMethodPacketMode,
     header: MaxwellGpfifoSourceLocation,
     subchannel: Option<MaxwellPushbufferSubchannel>,
-    methods: PacketMethods,
+    methods: Box<[MaxwellDecodedMethod]>,
 }
 
+#[cfg(test)]
 impl MaxwellDecodedMethodPacket {
     #[must_use]
     pub const fn mode(&self) -> MaxwellMethodPacketMode {
@@ -220,6 +221,7 @@ pub enum MaxwellPushbufferControl {
     EndSegment,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) enum PacketView<'a> {
     Methods {
@@ -388,7 +390,7 @@ where
 
 #[derive(Clone, Copy)]
 struct MethodHeader {
-    source: MaxwellGpfifoSourceLocation,
+    offset: usize,
     mode: MaxwellMethodPacketMode,
     first: u32,
     count: u16,
@@ -399,14 +401,18 @@ enum Header {
     Control(MaxwellPushbufferControl),
     Methods(MethodHeader),
 }
-fn decode_header(header: MaxwellPushbufferWord) -> Result<Header, MaxwellPushbufferDecodeError> {
-    let word = header.value;
+fn decode_header(
+    word: u32,
+    offset: usize,
+    at: impl Fn() -> MaxwellGpfifoSourceLocation,
+) -> Result<Header, MaxwellPushbufferDecodeError> {
     if word == 0 {
         return Ok(Header::Control(MaxwellPushbufferControl::Nop));
     }
     let opcode = ((word >> SECONDARY_OPCODE_SHIFT) & SECONDARY_OPCODE_MASK) as u8;
     if opcode == OPCODE_GROUP_ZERO {
-        return decode_group_zero_control(header).map(Header::Control);
+        return decode_group_zero_control(MaxwellPushbufferWord::new(word, at()))
+            .map(Header::Control);
     }
     if opcode == OPCODE_END_SEGMENT {
         return Ok(Header::Control(MaxwellPushbufferControl::EndSegment));
@@ -416,7 +422,7 @@ fn decode_header(header: MaxwellPushbufferWord) -> Result<Header, MaxwellPushbuf
         .find(|encoding| encoding.opcode == opcode)
     else {
         return Err(MaxwellPushbufferDecodeError::UnknownEncoding {
-            source: header.location,
+            source: at(),
             word,
             secondary_opcode: opcode,
         });
@@ -429,17 +435,14 @@ fn decode_header(header: MaxwellPushbufferWord) -> Result<Header, MaxwellPushbuf
         encoded
     };
     if count > 0 && word & METHOD_RESERVED_BIT != 0 {
-        return Err(MaxwellPushbufferDecodeError::ReservedMethodBit {
-            source: header.location,
-            word,
-        });
+        return Err(MaxwellPushbufferDecodeError::ReservedMethodBit { source: at(), word });
     }
     let first = word & METHOD_ADDRESS_MASK;
     if count > 0 {
-        validate_method_range(header.location, mode, first, count)?;
+        validate_method_range(&at, mode, first, count)?;
     }
     Ok(Header::Methods(MethodHeader {
-        source: header.location,
+        offset,
         mode,
         first,
         count,
@@ -474,7 +477,7 @@ fn decode_group_zero_control(
 }
 
 fn validate_method_range(
-    source: MaxwellGpfifoSourceLocation,
+    source: impl Fn() -> MaxwellGpfifoSourceLocation,
     mode: MaxwellMethodPacketMode,
     first_method_dword: u32,
     count: u16,
@@ -492,7 +495,7 @@ fn validate_method_range(
     };
     if last.is_none() {
         return Err(MaxwellPushbufferDecodeError::MethodRangeOverflow {
-            source,
+            source: source(),
             mode,
             first_method: method_id(first_method_dword),
             count,

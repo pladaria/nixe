@@ -65,12 +65,12 @@ fn opus_service_negotiates_opens_and_decodes_through_all_packet_abis() {
         let mut dispatcher = support::dispatcher(&process);
         let base = process.main_thread().stack_bottom;
         write_guest_bytes(&process, base, b"sm:\0");
-        state(&mut process).write_x(x(1), base.get());
+        process.main_thread().registers().write_x(x(1), base.get());
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         ));
-        let sm = state(&mut process).read_w(x(1));
+        let sm = process.main_thread().registers().read_w(x(1));
         let mut register = [0; 256];
         put_u32(&mut register, 0, 4);
         put_u32(&mut register, 4, 10 | (1 << 31));
@@ -135,15 +135,18 @@ fn opus_service_negotiates_opens_and_decodes_through_all_packet_abis() {
                 },
             )
             .unwrap();
-        state(&mut process).write_x(x(1), work_address.get());
-        state(&mut process).write_x(x(2), work_size);
-        state(&mut process).write_w(x(3), 0);
+        process
+            .main_thread()
+            .registers()
+            .write_x(x(1), work_address.get());
+        process.main_thread().registers().write_x(x(2), work_size);
+        process.main_thread().registers().write_w(x(3), 0);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         ));
-        assert_eq!(state(&mut process).read_w(x(0)), 0);
-        let transfer = state(&mut process).read_w(x(1));
+        assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
+        let transfer = process.main_thread().registers().read_w(x(1));
         let mut opening = if multi { Vec::new() } else { params.clone() };
         opening.extend_from_slice(&(required - 1).to_le_bytes());
         assert_eq!(
@@ -283,7 +286,7 @@ fn domain_call(
 ) -> u32 {
     let tls = process.main_thread().tls_base;
     write_guest_bytes(process, tls, bytes);
-    state(process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(process, dispatcher),
         ExceptionHandlingResult::Resumed

@@ -4,21 +4,23 @@ use super::update::RendererUpdateState;
 use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 use std::{
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 
 #[derive(Debug)]
 pub(crate) struct UpdateSlot {
     value: Mutex<Option<RendererUpdateState>>,
+    available: Condvar,
     ready: ReadableEventObject,
     signal: WritableEventObject,
 }
-impl Default for UpdateSlot {
-    fn default() -> Self {
-        let (signal, ready) = EventObject::create_pair();
+impl UpdateSlot {
+    pub fn new(kernel: &Arc<nixe_scheduler::SchedulerState>) -> Self {
+        let (signal, ready) = EventObject::create_auto_reset_pair(kernel);
         signal.signal();
         Self {
             value: Mutex::new(Some(RendererUpdateState::default())),
+            available: Condvar::new(),
             ready,
             signal,
         }
@@ -44,13 +46,16 @@ impl UpdateSlot {
             self.ready.wait_async().await;
         }
     }
-    /// Only the dedicated DSP worker waits on a host event. SVCs use take().
+    /// The dedicated DSP worker sleeps on the actual state mutex; guest calls use take().
     pub fn take_blocking(self: &Arc<Self>) -> UpdateLease {
-        loop {
-            if let Some(state) = self.try_take() {
-                return state;
-            }
-            let _signalled = self.ready.wait(None);
+        let mut state = self.value.lock().unwrap();
+        while state.is_none() {
+            state = self.available.wait(state).unwrap();
+        }
+        self.ready.clear();
+        UpdateLease {
+            owner: self.clone(),
+            value: state.take(),
         }
     }
 }
@@ -72,9 +77,14 @@ impl DerefMut for UpdateLease {
 impl Drop for UpdateLease {
     fn drop(&mut self) {
         let value = self.value.take().unwrap();
-        let old = self.owner.value.lock().unwrap().replace(value);
-        assert!(old.is_none(), "renderer state has one executing owner");
-        self.owner.signal.signal();
+        let notifications = {
+            let mut state = self.owner.value.lock().unwrap();
+            let old = state.replace(value);
+            assert!(old.is_none(), "renderer state has one executing owner");
+            self.owner.signal.publish_readiness(true)
+        };
+        self.owner.available.notify_one();
+        notifications.notify();
     }
 }
 
@@ -98,7 +108,7 @@ mod tests {
     }
     #[test]
     fn returned_state_wakes_async_callers_and_cancelled_callers_do_not_own_it() {
-        let slot = Arc::new(UpdateSlot::default());
+        let slot = Arc::new(UpdateSlot::new(&crate::test_memory::kernel()));
         let mut lease = slot.try_take().unwrap();
         lease.frames = 42;
         let notifications = Arc::new(Notifications(AtomicUsize::new(0)));

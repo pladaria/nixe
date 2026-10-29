@@ -9,7 +9,7 @@ use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
 use nixe_horizon::{
     CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, GuestLogLevel, HorizonDiagnostics,
     HorizonIpcFault, HorizonIpcObject, HorizonIpcResult, HorizonKernelResult, HorizonSvcDispatcher,
-    HorizonSvcFault, HorizonSvcSupport, IpcService, OperationMode, UnsupportedServiceOperation,
+    HorizonSvcFault, IpcService, OperationMode, UnsupportedServiceOperation,
     switch_1_machine_profile,
 };
 use nixe_input::{
@@ -20,19 +20,14 @@ use nixe_memory::GuestVirtualAddress;
 use nixe_runtime::{
     EventObject, ExceptionHandlingResult, ExceptionTerminationReason, ExceptionTerminationScope,
     Launcher, LauncherInput, ProcessBuildConfig, ProcessBuilder, ProcessExitCause,
-    ProcessLifecycle, ProcessObject, ReadableEventObject, RunnableProcess, SessionMessage,
-    SessionObject, SessionRequestOwner, SessionRequestResult, SharedMemoryObject, ThreadLifecycle,
-    WritableEventObject,
+    ProcessLifecycle, ReadableEventObject, RunnableProcess, SessionMessage, SessionObject,
+    SessionRequestOwner, SharedMemoryObject, ThreadLifecycle, WritableEventObject,
 };
 use support::ScheduledProcess;
 
 // Tests that advance scheduler deadlines explicitly must not sample host time.
 fn fixed_time_dispatcher(process: &RunnableProcess) -> HorizonSvcDispatcher {
-    support::dispatcher_with_clock(
-        process,
-        OperationMode::default(),
-        nixe_runtime::VirtualClock::new(nixe_runtime::VirtualClockMode::Fixed { unix_seconds: 0 }),
-    )
+    support::dispatcher_with_mode(process, OperationMode::default())
 }
 
 fn request_owner(thread_id: u64) -> SessionRequestOwner {
@@ -40,6 +35,20 @@ fn request_owner(thread_id: u64) -> SessionRequestOwner {
         process_id: 1,
         thread_id,
     }
+}
+
+fn assert_session_peers(server: &SessionObject, client: &SessionObject) {
+    let owner = request_owner(0xfeed);
+    let message = || SessionMessage::Buffer(vec![0; 8]);
+    client.request(owner, message()).unwrap();
+    let mut received = server.receive().unwrap();
+    assert_eq!(received.take_message(), message());
+    received.complete();
+    server.reply().unwrap().reply(message()).unwrap();
+    assert_eq!(
+        crate::integration_test_support::poll_session(client, owner),
+        Ok(Some(message()))
+    );
 }
 
 fn svc(immediate: u16) -> u32 {
@@ -134,17 +143,25 @@ fn fixture_process_with_builder(
     config: ProcessBuildConfig,
     builder: ProcessBuilder,
 ) -> (tempfile::TempDir, ScheduledProcess) {
+    let (directory, process) = fixture_runnable_with_builder(instructions, config, builder);
+    (directory, ScheduledProcess::new(process))
+}
+fn fixture_runnable_with_builder(
+    instructions: &[u32],
+    config: ProcessBuildConfig,
+    builder: ProcessBuilder,
+) -> (tempfile::TempDir, RunnableProcess) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("svc.nro");
     fs::write(&path, synthetic_nro(instructions)).unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = builder
+    let process = builder
         .with_config(config)
         .build(&plan)
         .expect("synthetic NRO builds");
     let test_entry = process.entry_module().entry_address() + 0x80;
-    state(&mut process).set_pc(test_entry);
-    (directory, ScheduledProcess::new(process))
+    process.main_thread().registers().set_pc(test_entry);
+    (directory, process)
 }
 
 fn fixture_process_with_romfs(
@@ -156,11 +173,11 @@ fn fixture_process_with_romfs(
     let romfs = support::synthetic_packages::build_romfs(files);
     fs::write(&path, synthetic_nro_with_romfs(instructions, &romfs)).unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = support::process_builder()
+    let process = support::process_builder()
         .build(&plan)
         .expect("synthetic asset NRO builds");
     let test_entry = process.entry_module().entry_address() + 0x80;
-    state(&mut process).set_pc(test_entry);
+    process.main_thread().registers().set_pc(test_entry);
     (directory, ScheduledProcess::new(process))
 }
 
@@ -175,11 +192,11 @@ fn fixture_process_with_svcs(immediates: &[u8]) -> (tempfile::TempDir, Scheduled
     let path = directory.path().join("svc-state.nro");
     fs::write(&path, image).unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = support::process_builder()
+    let process = support::process_builder()
         .build(&plan)
         .expect("synthetic NRO builds");
     let test_entry = process.entry_module().entry_address() + entry_offset as u64;
-    state(&mut process).set_pc(test_entry);
+    process.main_thread().registers().set_pc(test_entry);
     (directory, ScheduledProcess::new(process))
 }
 
@@ -187,36 +204,32 @@ fn x(index: u8) -> A64Register {
     A64Register::General(A64GeneralRegister::new(index).unwrap())
 }
 
-fn state(process: &mut RunnableProcess) -> &mut nixe_runtime::GuestCpuState {
-    process.main_thread_mut().state_mut()
-}
-
 fn read_abi_register(process: &RunnableProcess, index: u8) -> u64 {
-    process.main_thread().state().read_x(x(index))
+    process.main_thread().registers().read_x(x(index))
 }
 
-fn write_abi_register(process: &mut RunnableProcess, index: u8, value: u64) {
-    process
-        .main_thread_mut()
-        .state_mut()
-        .write_x(x(index), value);
+fn write_abi_register(process: &RunnableProcess, index: u8, value: u64) {
+    process.main_thread().registers().write_x(x(index), value);
 }
 
-fn write_wait_timeout(process: &mut RunnableProcess, timeout: i64) {
+fn write_wait_timeout(process: &RunnableProcess, timeout: i64) {
     process
-        .main_thread_mut()
-        .state_mut()
+        .main_thread()
+        .registers()
         .write_x(x(3), timeout as u64);
 }
 
 fn instruction_address(process: &RunnableProcess) -> u64 {
-    process.main_thread().state().pc()
+    process.main_thread().registers().pc()
 }
 
 fn dispatch_next(
     process: &mut ScheduledProcess,
     dispatcher: &mut HorizonSvcDispatcher,
 ) -> ExceptionHandlingResult<HorizonSvcFault> {
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
     let report = process.run_slice().unwrap();
     let result = process
         .route_supervisor_call(&report.stop, dispatcher)
@@ -235,6 +248,9 @@ fn dispatch_scheduled_next(
     ExceptionHandlingResult<HorizonSvcFault>,
 ) {
     process.coordinator_mut().drain_external_events().unwrap();
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
     let execution = process
         .coordinator_mut()
         .run_next(std::time::Duration::from_secs(2))
@@ -268,18 +284,21 @@ fn query_process_info(
     dispatcher: &mut HorizonSvcDispatcher,
     info_type: u32,
 ) -> u64 {
-    state(process).write_w(x(1), info_type);
-    state(process).write_w(x(2), CURRENT_PROCESS_HANDLE);
-    state(process).write_x(x(3), 0);
+    process.main_thread().registers().write_w(x(1), info_type);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(2), CURRENT_PROCESS_HANDLE);
+    process.main_thread().registers().write_x(x(3), 0);
     assert!(matches!(
         dispatch_next(process, dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
-    state(process).read_x(x(1))
+    process.main_thread().registers().read_x(x(1))
 }
 
 #[test]
@@ -288,8 +307,8 @@ fn successful_and_rejected_calls_use_the_a64_abi() {
     let mut dispatcher = support::dispatcher(&process);
     let entry = instruction_address(&process);
     let process_id = process.process_id();
-    write_abi_register(&mut process, 1, u64::from(CURRENT_PROCESS_HANDLE));
-    write_abi_register(&mut process, 2, u64::MAX);
+    write_abi_register(&process, 1, u64::from(CURRENT_PROCESS_HANDLE));
+    write_abi_register(&process, 2, u64::MAX);
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
@@ -315,17 +334,17 @@ fn successful_and_rejected_calls_use_the_a64_abi() {
 }
 
 #[test]
-fn blocking_wait_suspends_and_retries_in_a64() {
+fn blocking_wait_completes_without_reissuing_its_supervisor_call() {
     let (_directory, mut process) = fixture_process_with_svcs(&[0x18]);
     let mut dispatcher = support::dispatcher(&process);
     let source = instruction_address(&process);
     let handles_address = GuestVirtualAddress::new(process.entry_module().image_base() + 0x2000);
-    let (writable, readable) = EventObject::create_pair();
+    let (writable, readable) = EventObject::create_pair(process.scheduler());
     let read_handle = process.handles().insert(readable).unwrap();
     write_guest_bytes(&process, handles_address, &read_handle.to_le_bytes());
-    write_abi_register(&mut process, 1, handles_address.get());
-    write_abi_register(&mut process, 2, 1);
-    write_wait_timeout(&mut process, -1);
+    write_abi_register(&process, 1, handles_address.get());
+    write_abi_register(&process, 2, 1);
+    write_wait_timeout(&process, -1);
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
@@ -335,14 +354,12 @@ fn blocking_wait_suspends_and_retries_in_a64() {
         process.main_thread_lifecycle(),
         nixe_scheduler::ThreadLifecycle::Waiting
     );
-    assert_eq!(instruction_address(&process), source);
+    assert_eq!(instruction_address(&process), source + 4);
 
     writable.signal();
-    assert!(process.resume());
-    assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Resumed
-    ));
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
     assert_eq!(
         read_abi_register(&process, 0),
         u64::from(HorizonKernelResult::SUCCESS.raw())
@@ -361,11 +378,11 @@ fn event_wait_and_close_execute_through_the_reference_engine() {
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
-    let write_handle = state(&mut process).read_w(x(1));
-    let read_handle = state(&mut process).read_w(x(2));
+    let write_handle = process.main_thread().registers().read_w(x(1));
+    let read_handle = process.main_thread().registers().read_w(x(2));
     assert!(
         process
             .handles()
@@ -379,38 +396,46 @@ fn event_wait_and_close_execute_through_the_reference_engine() {
             .is_some()
     );
 
-    state(&mut process).write_w(x(0), write_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), write_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
 
     let handles_address = process.main_thread().stack_bottom;
     write_guest_bytes(&process, handles_address, &read_handle.to_le_bytes());
-    state(&mut process).write_x(x(1), handles_address.get());
-    state(&mut process).write_w(x(2), 1);
-    state(&mut process).write_x(x(3), 0);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), handles_address.get());
+    process.main_thread().registers().write_w(x(2), 1);
+    process.main_thread().registers().write_x(x(3), 0);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
-    assert_eq!(state(&mut process).read_w(x(1)), 0);
+    assert_eq!(process.main_thread().registers().read_w(x(1)), 0);
 
-    state(&mut process).write_w(x(0), write_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), write_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert!(process.handles().lookup(write_handle).is_none());
-    assert_eq!(dispatcher.coverage().len(), 4);
 }
 
 #[test]
@@ -443,22 +468,24 @@ fn address_wait_conditions_use_signed_comparisons_and_decrement_before_zero_time
         let mut dispatcher = support::dispatcher(&process);
         let address = process.main_thread().stack_bottom;
         write_guest_bytes(&process, address, &i32::to_le_bytes(initial));
-        set_address_arguments(state(&mut process), address.get(), kind, expected, 0);
+        set_address_arguments(
+            &mut process.main_thread().registers(),
+            address.get(),
+            kind,
+            expected,
+            0,
+        );
         assert!(matches!(
             dispatch_scheduled_next(&mut process, &mut dispatcher).1,
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
-            state(&mut process).read_w(x(0)),
+            process.main_thread().registers().read_w(x(0)),
             result.raw(),
             "kind={kind} initial={initial}"
         );
         assert_eq!(read_guest_u32(&process, address), final_value as u32);
         assert_eq!(process.address_waits().lock().waiter_count(), 0);
-        assert_eq!(
-            dispatcher.coverage()[0].support,
-            HorizonSvcSupport::Complete
-        );
     }
 }
 
@@ -476,12 +503,15 @@ fn address_arbiter_validates_address_and_enum_before_memory_access() {
         ] {
             let (_directory, mut process) = fixture_process(&[svc(immediate)]);
             let mut dispatcher = support::dispatcher(&process);
-            set_address_arguments(state(&mut process), address, kind, 1, 0);
+            set_address_arguments(&mut process.main_thread().registers(), address, kind, 1, 0);
             assert!(matches!(
                 dispatch_scheduled_next(&mut process, &mut dispatcher).1,
                 ExceptionHandlingResult::Resumed
             ));
-            assert_eq!(state(&mut process).read_w(x(0)), expected.raw());
+            assert_eq!(
+                process.main_thread().registers().read_w(x(0)),
+                expected.raw()
+            );
         }
     }
     // A plain signal does not dereference an otherwise valid address.
@@ -493,12 +523,15 @@ fn address_arbiter_validates_address_and_enum_before_memory_access() {
     ] {
         let (_directory, mut process) = fixture_process(&[svc(immediate)]);
         let mut dispatcher = support::dispatcher(&process);
-        set_address_arguments(state(&mut process), 0, kind, 1, 0);
+        set_address_arguments(&mut process.main_thread().registers(), 0, kind, 1, 0);
         assert!(matches!(
             dispatch_scheduled_next(&mut process, &mut dispatcher).1,
             ExceptionHandlingResult::Resumed
         ));
-        assert_eq!(state(&mut process).read_w(x(0)), expected.raw());
+        assert_eq!(
+            process.main_thread().registers().read_w(x(0)),
+            expected.raw()
+        );
     }
 }
 
@@ -514,7 +547,13 @@ fn address_decrement_requires_writable_memory_even_when_its_condition_is_false()
             .space()
             .protect(address, 0x1000, MemoryPermissions::READ)
             .unwrap();
-        set_address_arguments(state(&mut process), address.get(), kind, 1, 0);
+        set_address_arguments(
+            &mut process.main_thread().registers(),
+            address.get(),
+            kind,
+            1,
+            0,
+        );
         assert!(matches!(
             dispatch_scheduled_next(&mut process, &mut dispatcher).1,
             ExceptionHandlingResult::Resumed
@@ -524,7 +563,10 @@ fn address_decrement_requires_writable_memory_even_when_its_condition_is_false()
         } else {
             HorizonKernelResult::INVALID_STATE
         };
-        assert_eq!(state(&mut process).read_w(x(0)), expected.raw());
+        assert_eq!(
+            process.main_thread().registers().read_w(x(0)),
+            expected.raw()
+        );
         assert_eq!(read_guest_u32(&process, address), 2);
     }
 }
@@ -533,7 +575,7 @@ fn address_decrement_requires_writable_memory_even_when_its_condition_is_false()
 fn address_signal_variants_update_words_and_consume_only_selected_waiters() {
     // kind, waiting, count, memory, compare, resulting memory, result, awakened
     let cases = [
-        (0, 2, 1, 7, 99, 7, HorizonKernelResult::SUCCESS, 1),
+        (0, 2usize, 1i32, 7, 99, 7, HorizonKernelResult::SUCCESS, 1),
         (0, 2, -1, 7, 99, 7, HorizonKernelResult::SUCCESS, 2),
         (1, 2, 1, 7, 7, 8, HorizonKernelResult::SUCCESS, 1),
         (1, 2, 0, 7, 7, 8, HorizonKernelResult::SUCCESS, 2),
@@ -575,17 +617,15 @@ fn address_signal_variants_update_words_and_consume_only_selected_waiters() {
         let events: Vec<_> = (0..waiting)
             .map(|_| {
                 let (thread, _) = mutex::add_thread(&mut process, entry, 30);
+                support::block_thread(process.scheduler(), thread);
                 let mut waits = process.address_waits().lock();
-                let event = waits
-                    .enqueue_address_wait(address.get(), thread, None)
-                    .unwrap();
-                waits.finish_address_check(thread, 0, false).unwrap();
-                event
+                waits.enqueue_address_wait(address.get(), thread).unwrap()
             })
             .collect();
         // Mutex/condition-variable keys have a distinct ordered namespace.
         let (other_thread, _) = mutex::add_thread(&mut process, entry, 30);
         let owner = process.main_thread_id();
+        support::block_thread(process.scheduler(), other_thread);
         let other = {
             let mut waits = process.address_waits().lock();
             waits
@@ -593,7 +633,7 @@ fn address_signal_variants_update_words_and_consume_only_selected_waiters() {
                 .unwrap()
         };
         set_address_arguments(
-            state(&mut process),
+            &mut process.main_thread().registers(),
             address.get(),
             kind,
             value,
@@ -603,10 +643,13 @@ fn address_signal_variants_update_words_and_consume_only_selected_waiters() {
             dispatch_scheduled_next(&mut process, &mut dispatcher).1,
             ExceptionHandlingResult::Resumed
         ));
-        assert_eq!(state(&mut process).read_w(x(0)), result.raw());
+        assert_eq!(process.main_thread().registers().read_w(x(0)), result.raw());
         assert_eq!(read_guest_u32(&process, address), final_value as u32);
         assert_eq!(
-            events.iter().filter(|event| event.is_signalled()).count(),
+            events
+                .iter()
+                .filter(|event| event.outcome().is_some())
+                .count(),
             awakened
         );
         assert_eq!(
@@ -616,9 +659,9 @@ fn address_signal_variants_update_words_and_consume_only_selected_waiters() {
                 .signal_targets(address.get(), usize::MAX)
                 .0
                 .len(),
-            waiting as usize - awakened
+            waiting - awakened
         );
-        assert!(!other.is_signalled());
+        assert!(!other.outcome().is_some());
     }
 }
 
@@ -628,7 +671,13 @@ fn address_wait_timeout_preserves_the_original_deadline_and_decrements_once() {
     let mut dispatcher = fixed_time_dispatcher(&process);
     let address = process.main_thread().stack_bottom;
     write_guest_bytes(&process, address, &0_u32.to_le_bytes());
-    set_address_arguments(state(&mut process), address.get(), 1, 1, 2_000_000);
+    set_address_arguments(
+        &mut process.main_thread().registers(),
+        address.get(),
+        1,
+        1,
+        2_000_000,
+    );
     let (_, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
     assert!(matches!(handling, ExceptionHandlingResult::Suspended));
     assert_eq!(read_guest_u32(&process, address), u32::MAX);
@@ -637,12 +686,11 @@ fn address_wait_timeout_preserves_the_original_deadline_and_decrements_once() {
         .coordinator_mut()
         .advance_virtual_time(2_000_000)
         .unwrap();
-    assert!(matches!(
-        dispatch_scheduled_next(&mut process, &mut dispatcher).1,
-        ExceptionHandlingResult::Resumed
-    ));
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::TIMED_OUT.raw()
     );
     assert_eq!(read_guest_u32(&process, address), u32::MAX);
@@ -656,9 +704,8 @@ fn address_signals_wake_guest_threads_using_their_updated_effective_priorities()
     let mut dispatcher = support::dispatcher(&process);
     let address = process.main_thread().stack_bottom;
     write_guest_bytes(&process, address, &1_u32.to_le_bytes());
-    let entry = state(&mut process).pc() + 12;
+    let entry = process.main_thread().registers().pc() + 12;
     let stack_top = process.main_thread().stack_top;
-    let process_id = process.scheduler_process_id();
     let core = nixe_scheduler::VirtualCpuId::new(0);
     let affinity = process
         .coordinator_mut()
@@ -674,24 +721,27 @@ fn address_signals_wake_guest_threads_using_their_updated_effective_priorities()
         .unwrap();
     let mut children = Vec::new();
     for priority in [30, 40] {
-        let child = process
-            .coordinator_mut()
-            .create_thread(
-                process_id,
-                nixe_runtime::ThreadCreateRequest {
-                    entry: GuestVirtualAddress::new(entry),
-                    argument: address.get(),
-                    stack_top,
-                    priority,
-                    ideal_vcpu: Some(nixe_scheduler::VirtualCpuId::new(0)),
-                    affinity,
-                },
-            )
+        let child = support::ready(process.create_thread(nixe_runtime::ThreadCreateRequest {
+            entry: GuestVirtualAddress::new(entry),
+            argument: address.get(),
+            fpcr: 0,
+            fpsr: 0,
+            stack_top,
+            priority,
+            ideal_vcpu: Some(nixe_scheduler::VirtualCpuId::new(0)),
+            affinity,
+        }))
+        .unwrap();
+        let child_state_thread = process.thread(child.id).unwrap();
+        let mut child_state = child_state_thread.registers();
+        set_address_arguments(&mut child_state, address.get(), 2, 1, u64::MAX);
+        drop(child_state);
+        let object_id = process.thread(child.id).unwrap().clone().thread_id();
+        process
+            .thread(nixe_scheduler::GuestThreadId::new(object_id))
+            .unwrap()
+            .start()
             .unwrap();
-        let child_state = process.thread_mut(child.id).unwrap().state_mut();
-        set_address_arguments(child_state, address.get(), 2, 1, u64::MAX);
-        let object_id = process.thread(child.id).unwrap().object().thread_id();
-        process.coordinator_mut().start_thread(object_id).unwrap();
         children.push((child.id, object_id));
     }
     for &(expected, _) in &children {
@@ -703,26 +753,34 @@ fn address_signals_wake_guest_threads_using_their_updated_effective_priorities()
     }
     // Reprioritize the second waiter after both have entered their queues.
     process
-        .coordinator_mut()
-        .set_thread_priority(None, children[1].1, 20)
+        .scheduler()
+        .set_priority(nixe_scheduler::GuestThreadId::new(children[1].1), 20, None)
         .unwrap();
     // A changed word alone does not signal a wait, and a signal's successful
     // continuation does not recheck the original comparison.
     write_guest_bytes(&process, address, &0_u32.to_le_bytes());
     for selected in [children[1].0, children[0].0] {
         let main = process.main_thread_id();
-        set_address_arguments(state(&mut process), address.get(), 0, 0, 1);
+        set_address_arguments(
+            &mut process.main_thread().registers(),
+            address.get(),
+            0,
+            0,
+            1,
+        );
         {
             let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
             assert_eq!(thread, main);
             assert!(matches!(handling, ExceptionHandlingResult::Resumed));
         };
-        {
-            let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
-            assert_eq!(thread, selected);
-            assert!(matches!(handling, ExceptionHandlingResult::Resumed));
-        };
-        assert_eq!(process.thread(selected).unwrap().state().read_w(x(0)), 0);
+        dispatcher
+            .poll_memory_completions(process.coordinator_mut())
+            .unwrap();
+        assert_eq!(process.thread_lifecycle(selected), ThreadLifecycle::Ready);
+        assert_eq!(
+            process.thread(selected).unwrap().registers().read_w(x(0)),
+            0
+        );
         let (exited, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
         assert_eq!(exited, selected);
         assert!(matches!(
@@ -745,37 +803,36 @@ fn process_wide_key_signal_and_zero_timeout_wait_have_exact_memory_effects() {
     let read_word = |process: &RunnableProcess, address| read_guest_u32(process, address);
 
     write_word(&process, key, 1);
-    state(&mut process).write_x(x(0), key.get());
-    state(&mut process).write_x(x(1), u64::from(u32::MAX));
+    process.main_thread().registers().write_x(x(0), key.get());
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), u64::from(u32::MAX));
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    assert_eq!(state(&mut process).read_x(x(0)), key.get());
+    assert_eq!(process.main_thread().registers().read_x(x(0)), key.get());
     assert_eq!(read_word(&process, key), 0);
 
     write_word(&process, mutex, 0x1234_5678);
-    state(&mut process).write_x(x(0), mutex.get());
-    state(&mut process).write_x(x(1), key.get() + 3); // Kernel aligns the key down.
-    state(&mut process).write_w(x(2), 0x1234_5678);
-    state(&mut process).write_x(x(3), 0);
+    process.main_thread().registers().write_x(x(0), mutex.get());
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), key.get() + 3); // Kernel aligns the key down.
+    process.main_thread().registers().write_w(x(2), 0x1234_5678);
+    process.main_thread().registers().write_x(x(3), 0);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::TIMED_OUT.raw()
     );
     assert_eq!(read_word(&process, key), 1);
     assert_eq!(read_word(&process, mutex), 0);
-    assert_eq!(dispatcher.coverage().len(), 2);
-    assert!(
-        dispatcher
-            .coverage()
-            .iter()
-            .all(|entry| entry.support == HorizonSvcSupport::Partial)
-    );
 }
 
 #[test]
@@ -787,16 +844,16 @@ fn blocking_process_wide_key_wait_releases_mutex_and_publishes_wakeup() {
     for (address, value) in [(key, 0_u32), (mutex, 0x1234_5678)] {
         write_guest_bytes(&process, address, &value.to_le_bytes());
     }
-    state(&mut process).write_x(x(0), mutex.get());
-    state(&mut process).write_x(x(1), key.get());
-    state(&mut process).write_w(x(2), 0x1234_5678);
-    state(&mut process).write_x(x(3), u64::MAX);
+    process.main_thread().registers().write_x(x(0), mutex.get());
+    process.main_thread().registers().write_x(x(1), key.get());
+    process.main_thread().registers().write_w(x(2), 0x1234_5678);
+    process.main_thread().registers().write_x(x(3), u64::MAX);
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Suspended
     ));
-    assert!(dispatcher.pending_thread_wait(1).is_some());
+    assert_eq!(process.main_thread_lifecycle(), ThreadLifecycle::Waiting);
     for (address, expected) in [(key, 1_u32), (mutex, 0)] {
         assert_eq!(read_guest_u32(&process, address), expected);
     }
@@ -807,8 +864,11 @@ fn query_memory_writes_verified_layout_and_page_info() {
     let (_directory, mut process) = fixture_process(&[svc(0x06)]);
     let output = process.main_thread().stack_bottom;
     let queried = process.entry_module().entry_address();
-    state(&mut process).write_x(x(0), output.get());
-    state(&mut process).write_x(x(2), queried);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(0), output.get());
+    process.main_thread().registers().write_x(x(2), queried);
 
     let mut dispatcher = support::dispatcher(&process);
     assert!(matches!(
@@ -816,10 +876,10 @@ fn query_memory_writes_verified_layout_and_page_info() {
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
-    assert_eq!(state(&mut process).read_w(x(1)), 0);
+    assert_eq!(process.main_thread().registers().read_w(x(1)), 0);
     let read = |offset, bytes: usize| {
         let value = process
             .memory()
@@ -839,21 +899,24 @@ fn query_memory_writes_verified_layout_and_page_info() {
 fn query_memory_returns_terminal_inaccessible_region_outside_the_address_space() {
     let (_directory, mut process) = fixture_process(&[svc(0x06), svc(0x06)]);
     let output = process.main_thread().stack_bottom;
-    let limit = process.address_space().exclusive_limit();
+    let limit = process.address_space_limit();
     let mut dispatcher = support::dispatcher(&process);
 
     for queried in [limit, u64::MAX] {
-        state(&mut process).write_x(x(0), output.get());
-        state(&mut process).write_x(x(2), queried);
+        process
+            .main_thread()
+            .registers()
+            .write_x(x(0), output.get());
+        process.main_thread().registers().write_x(x(2), queried);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
-            state(&mut process).read_w(x(0)),
+            process.main_thread().registers().read_w(x(0)),
             HorizonKernelResult::SUCCESS.raw()
         );
-        assert_eq!(state(&mut process).read_w(x(1)), 0);
+        assert_eq!(process.main_thread().registers().read_w(x(1)), 0);
 
         let read = |offset, bytes: usize| {
             let value = process
@@ -881,25 +944,31 @@ fn unsignalled_wait_times_out_or_suspends_without_becoming_a_no_op() {
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let read_handle = state(&mut process).read_w(x(2));
+    let read_handle = process.main_thread().registers().read_w(x(2));
     let handles_address = process.main_thread().stack_bottom;
     write_guest_bytes(&process, handles_address, &read_handle.to_le_bytes());
 
-    state(&mut process).write_x(x(1), handles_address.get());
-    state(&mut process).write_w(x(2), 1);
-    state(&mut process).write_x(x(3), 0);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), handles_address.get());
+    process.main_thread().registers().write_w(x(2), 1);
+    process.main_thread().registers().write_x(x(3), 0);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::TIMED_OUT.raw()
     );
 
-    state(&mut process).write_x(x(1), handles_address.get());
-    state(&mut process).write_w(x(2), 1);
-    state(&mut process).write_x(x(3), u64::MAX);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), handles_address.get());
+    process.main_thread().registers().write_w(x(2), 1);
+    process.main_thread().registers().write_x(x(3), u64::MAX);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Suspended
@@ -918,28 +987,27 @@ fn finite_event_wait_uses_virtual_deadline_then_returns_timed_out() {
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let read_handle = state(&mut process).read_w(x(2));
+    let read_handle = process.main_thread().registers().read_w(x(2));
     let handles_address = process.main_thread().stack_bottom;
     write_guest_bytes(&process, handles_address, &read_handle.to_le_bytes());
-    state(&mut process).write_x(x(1), handles_address.get());
-    state(&mut process).write_w(x(2), 1);
-    write_wait_timeout(&mut process, 2_000_000);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), handles_address.get());
+    process.main_thread().registers().write_w(x(2), 1);
+    write_wait_timeout(&process, 2_000_000);
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Suspended
     ));
-    let thread_id = process.main_thread().object().thread_id();
-    let source = dispatcher.pending_thread_wait(thread_id).unwrap();
-    assert_eq!(source.timeout(), Some(Duration::from_millis(2)));
-    dispatcher.synchronize_virtual_time(2_000_000);
-    assert!(process.resume());
-    assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Resumed
-    ));
+    assert_eq!(process.main_thread_lifecycle(), ThreadLifecycle::Waiting);
+    process.scheduler().advance_time(2_000_000);
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::TIMED_OUT.raw()
     );
 }
@@ -949,28 +1017,37 @@ fn current_id_and_session_calls_preserve_guest_domain_objects() {
     let (_directory, mut process) = fixture_process(&[svc(0x24), svc(0x25), svc(0x40)]);
     let mut dispatcher = support::dispatcher(&process);
 
-    state(&mut process).write_w(x(1), CURRENT_PROCESS_HANDLE);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(1), CURRENT_PROCESS_HANDLE);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    assert_eq!(state(&mut process).read_x(x(1)), process.process_id());
+    assert_eq!(
+        process.main_thread().registers().read_x(x(1)),
+        process.process_id()
+    );
 
-    state(&mut process).write_w(x(1), CURRENT_THREAD_HANDLE);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(1), CURRENT_THREAD_HANDLE);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    assert_eq!(state(&mut process).read_x(x(1)), 1);
+    assert_eq!(process.main_thread().registers().read_x(x(1)), 1);
 
-    state(&mut process).write_w(x(2), 0);
-    state(&mut process).write_x(x(3), 0x1234);
+    process.main_thread().registers().write_w(x(2), 0);
+    process.main_thread().registers().write_x(x(3), 0x1234);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let server_handle = state(&mut process).read_w(x(1));
-    let client_handle = state(&mut process).read_w(x(2));
+    let server_handle = process.main_thread().registers().read_w(x(1));
+    let client_handle = process.main_thread().registers().read_w(x(2));
     let server = process
         .handles()
         .lookup_as::<SessionObject>(server_handle)
@@ -979,7 +1056,7 @@ fn current_id_and_session_calls_preserve_guest_domain_objects() {
         .handles()
         .lookup_as::<SessionObject>(client_handle)
         .unwrap();
-    assert!(server.same_session(&client));
+    assert_session_peers(&server, &client);
     assert_ne!(server.endpoint(), client.endpoint());
 }
 
@@ -987,52 +1064,69 @@ fn current_id_and_session_calls_preserve_guest_domain_objects() {
 fn normal_session_request_suspends_until_the_server_replies() {
     let (_directory, mut process) = fixture_process(&[svc(0x21)]);
     let mut dispatcher = support::dispatcher(&process);
-    let (server, client) = SessionObject::create_pair();
+    let (server, client) = SessionObject::create_pair(process.scheduler());
     let client_handle = process.handles().insert(client).unwrap();
     let tls = process.main_thread().tls_base;
     let mut request = [0_u8; 0x100];
-    request[..4].copy_from_slice(&0x1122_3344_u32.to_le_bytes());
+    put_u32(&mut request, 0, 4);
+    put_u32(&mut request, 4, 1);
+    put_u32(&mut request, 8, 0x1122_3344);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), client_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), client_handle);
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Suspended
     ));
-    let SessionMessage::Buffer(received) = server.receive().unwrap() else {
+    let mut receive = server.receive().unwrap();
+    let SessionMessage::Buffer(received) = receive.take_message() else {
         panic!("normal session must carry a memory buffer")
     };
-    assert_eq!(&received[..4], &0x1122_3344_u32.to_le_bytes());
-    let mut response = vec![0_u8; 0x100];
-    response[..4].copy_from_slice(&0xaabb_ccdd_u32.to_le_bytes());
-    server.reply(SessionMessage::Buffer(response)).unwrap();
+    assert_eq!(&received[8..12], &0x1122_3344_u32.to_le_bytes());
+    receive.complete();
+    let mut response = vec![0_u8; 12];
+    put_u32(&mut response, 0, 4);
+    put_u32(&mut response, 4, 1);
+    put_u32(&mut response, 8, 0xaabb_ccdd);
+    server
+        .reply()
+        .unwrap()
+        .reply(SessionMessage::Buffer(response))
+        .unwrap();
 
-    assert!(process.resume());
-    assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Resumed
-    ));
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
-    assert_eq!(read_guest_u32(&process, tls), 0xaabb_ccdd);
+    assert_eq!(
+        read_guest_u32(&process, tls.checked_add(8).unwrap()),
+        0xaabb_ccdd
+    );
 }
 
 #[test]
 fn normal_session_reports_peer_close_without_suspending() {
     let (_directory, mut process) = fixture_process(&[svc(0x21)]);
     let mut dispatcher = support::dispatcher(&process);
-    let (server, client) = SessionObject::create_pair();
+    let (server, client) = SessionObject::create_pair(process.scheduler());
     let client_handle = process.handles().insert(client).unwrap();
     drop(server);
-    state(&mut process).write_w(x(0), client_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), client_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SESSION_CLOSED.raw()
     );
 }
@@ -1046,25 +1140,25 @@ fn cmif_session_close_preserves_the_client_handle_until_close_handle() {
     let mut close = [0_u8; 0x100];
     put_u32(&mut close, 0, 2);
     write_guest_bytes(&process, tls, &close);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
     assert!(process.handles().lookup(handle).is_some());
 
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
     assert!(process.handles().lookup(handle).is_none());
@@ -1099,7 +1193,7 @@ fn malformed_wire_messages_are_fatal_with_bounded_diagnostics() {
         let handle = service_handle(&process, IpcService::FileSystem);
         let tls = process.main_thread().tls_base;
         write_guest_bytes(&process, tls, &message);
-        state(&mut process).write_w(x(0), handle);
+        process.main_thread().registers().write_w(x(0), handle);
         let mut dispatcher = support::dispatcher(&process);
 
         assert!(
@@ -1120,7 +1214,7 @@ fn unimplemented_command_on_a_known_service_is_fatal() {
     put_u32(&mut message, 16, 0x4943_4653);
     put_u32(&mut message, 24, 999);
     write_guest_bytes(&process, tls, &message);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     let mut dispatcher = support::dispatcher(&process);
 
     assert!(
@@ -1138,9 +1232,12 @@ fn unimplemented_command_on_a_known_service_is_fatal() {
 fn normal_session_copies_input_handles_without_consuming_the_source() {
     let (_directory, mut process) = fixture_process(&[svc(0x21)]);
     let mut dispatcher = support::dispatcher(&process);
-    let (server, client) = SessionObject::create_pair();
+    let (server, client) = SessionObject::create_pair(process.scheduler());
     let client_handle = process.handles().insert(client).unwrap();
-    let source_handle = process.handles().insert(EventObject::new()).unwrap();
+    let source_handle = process
+        .handles()
+        .insert(EventObject::new(process.scheduler()))
+        .unwrap();
     let source_object = process.handles().lookup(source_handle).unwrap().clone();
     let tls = process.main_thread().tls_base;
     let mut request = [0_u8; 0x100];
@@ -1150,17 +1247,21 @@ fn normal_session_copies_input_handles_without_consuming_the_source() {
     put_u32(&mut request, 12, source_handle);
     put_u32(&mut request, 16, CURRENT_PROCESS_HANDLE);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), client_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), client_handle);
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Suspended
     ));
+    let mut receive = server.receive().unwrap();
     let SessionMessage::TransportedBuffer {
         copy_handles,
         move_handles,
         ..
-    } = server.receive().unwrap()
+    } = receive.take_message()
     else {
         panic!("copied handles must travel as retained runtime objects")
     };
@@ -1176,30 +1277,31 @@ fn normal_session_copies_input_handles_without_consuming_the_source() {
         copy_handles[1]
             .as_ref()
             .unwrap()
-            .downcast_ref::<ProcessObject>()
+            .downcast_ref::<nixe_runtime::RunnableProcess>()
             .unwrap()
             .process_id(),
         process.process_id()
     );
     assert!(process.handles().lookup(source_handle).is_some());
+    receive.complete();
 
-    let mut response = vec![0; 0x100];
+    let mut response = vec![0; 16];
     put_u32(&mut response, 0, 4);
     put_u32(&mut response, 4, 1 << 31);
     put_u32(&mut response, 8, 1 << 1);
     put_u32(&mut response, 12, source_handle);
     server
+        .reply()
+        .unwrap()
         .reply(SessionMessage::TransportedBuffer {
             bytes: response,
             copy_handles: vec![Some(source_object.clone())],
             move_handles: Vec::new(),
         })
         .unwrap();
-    assert!(process.resume());
-    assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Resumed
-    ));
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
     let received_handle = read_guest_u32(&process, GuestVirtualAddress::new(tls.get() + 12));
     assert_ne!(received_handle, source_handle);
     assert!(
@@ -1221,9 +1323,12 @@ fn normal_session_rejects_invalid_input_handle_descriptors_without_consuming_han
     for (descriptor, use_source_handle, expected) in cases {
         let (_directory, mut process) = fixture_process(&[svc(0x21)]);
         let mut dispatcher = support::dispatcher(&process);
-        let (_server, client) = SessionObject::create_pair();
+        let (_server, client) = SessionObject::create_pair(process.scheduler());
         let client_handle = process.handles().insert(client).unwrap();
-        let source_handle = process.handles().insert(EventObject::new()).unwrap();
+        let source_handle = process
+            .handles()
+            .insert(EventObject::new(process.scheduler()))
+            .unwrap();
         let tls = process.main_thread().tls_base;
         let mut request = [0_u8; 0x100];
         put_u32(&mut request, 0, 4);
@@ -1239,13 +1344,19 @@ fn normal_session_rejects_invalid_input_handle_descriptors_without_consuming_han
             },
         );
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), client_handle);
+        process
+            .main_thread()
+            .registers()
+            .write_w(x(0), client_handle);
 
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         ));
-        assert_eq!(state(&mut process).read_w(x(0)), expected.raw());
+        assert_eq!(
+            process.main_thread().registers().read_w(x(0)),
+            expected.raw()
+        );
         assert!(process.handles().lookup(source_handle).is_some());
     }
 }
@@ -1254,48 +1365,46 @@ fn normal_session_rejects_invalid_input_handle_descriptors_without_consuming_han
 fn port_svc_flow_connects_and_accepts_the_same_session() {
     let (_directory, mut process) = fixture_process(&[svc(0x70), svc(0x72), svc(0x41), svc(0x41)]);
     let mut dispatcher = support::dispatcher(&process);
-    state(&mut process).write_w(x(2), 1);
-    state(&mut process).write_w(x(3), 0);
+    process.main_thread().registers().write_w(x(2), 1);
+    process.main_thread().registers().write_w(x(3), 0);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let server_port = state(&mut process).read_w(x(1));
-    let client_port = state(&mut process).read_w(x(2));
+    let server_port = process.main_thread().registers().read_w(x(1));
+    let client_port = process.main_thread().registers().read_w(x(2));
 
-    state(&mut process).write_w(x(1), client_port);
+    process.main_thread().registers().write_w(x(1), client_port);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let client_session = state(&mut process).read_w(x(1));
+    let client_session = process.main_thread().registers().read_w(x(1));
 
-    state(&mut process).write_w(x(1), server_port);
+    process.main_thread().registers().write_w(x(1), server_port);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let server_session = state(&mut process).read_w(x(1));
-    assert!(
-        process
+    let server_session = process.main_thread().registers().read_w(x(1));
+    assert_session_peers(
+        &process
             .handles()
             .lookup_as::<SessionObject>(server_session)
-            .unwrap()
-            .same_session(
-                &process
-                    .handles()
-                    .lookup_as::<SessionObject>(client_session)
-                    .unwrap()
-            )
+            .unwrap(),
+        &process
+            .handles()
+            .lookup_as::<SessionObject>(client_session)
+            .unwrap(),
     );
 
-    state(&mut process).write_w(x(1), server_port);
+    process.main_thread().registers().write_w(x(1), server_port);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::NOT_FOUND.raw()
     );
 }
@@ -1304,54 +1413,67 @@ fn port_svc_flow_connects_and_accepts_the_same_session() {
 fn reply_and_receive_wakes_for_a_request_and_delivers_the_reply_once() {
     let (_directory, mut process) = fixture_process(&[svc(0x43), svc(0x43)]);
     let mut dispatcher = support::dispatcher(&process);
-    let (server, client) = SessionObject::create_pair();
+    let (server, client) = SessionObject::create_pair(process.scheduler());
     let server_handle = process.handles().insert(server).unwrap();
     let handles_address = process.main_thread().stack_bottom;
     write_guest_bytes(&process, handles_address, &server_handle.to_le_bytes());
-    state(&mut process).write_x(x(1), handles_address.get());
-    state(&mut process).write_w(x(2), 1);
-    state(&mut process).write_w(x(3), 0);
-    state(&mut process).write_x(x(4), u64::MAX);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), handles_address.get());
+    process.main_thread().registers().write_w(x(2), 1);
+    process.main_thread().registers().write_w(x(3), 0);
+    process.main_thread().registers().write_x(x(4), u64::MAX);
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Suspended
     ));
+    let mut incoming = vec![0x5a; 12];
+    put_u32(&mut incoming, 0, 4);
+    put_u32(&mut incoming, 4, 1);
     assert_eq!(
-        client.request(request_owner(9), SessionMessage::Buffer(vec![0x5a; 0x100])),
-        Ok(SessionRequestResult::Submitted)
+        client.request(request_owner(9), SessionMessage::Buffer(incoming)),
+        Ok(())
     );
-    assert!(process.resume());
-    assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Resumed
-    ));
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
     assert_eq!(
-        read_guest_u32(&process, process.main_thread().tls_base),
+        read_guest_u32(
+            &process,
+            process.main_thread().tls_base.checked_add(8).unwrap()
+        ),
         0x5a5a_5a5a
     );
 
     let tls = process.main_thread().tls_base;
-    let mut reply = vec![0; 0x100];
-    put_u32(&mut reply, 0, 0xa5a5_a5a5);
+    let mut reply = vec![0; 12];
+    put_u32(&mut reply, 0, 4);
+    put_u32(&mut reply, 4, 1);
+    put_u32(&mut reply, 8, 0xa5a5_a5a5);
     write_guest_bytes(&process, tls, &reply);
-    state(&mut process).write_x(x(1), handles_address.get());
-    state(&mut process).write_w(x(2), 0);
-    state(&mut process).write_w(x(3), server_handle);
-    state(&mut process).write_x(x(4), 0);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), handles_address.get());
+    process.main_thread().registers().write_w(x(2), 0);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(3), server_handle);
+    process.main_thread().registers().write_x(x(4), 0);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::TIMED_OUT.raw()
     );
     assert_eq!(
-        client.request(request_owner(9), SessionMessage::Buffer(Vec::new())),
-        Ok(SessionRequestResult::Response(SessionMessage::Buffer(
-            reply
-        )))
+        crate::integration_test_support::poll_session(&client, request_owner(9)),
+        Ok(Some(SessionMessage::Buffer(reply)))
     );
 }
 
@@ -1359,15 +1481,18 @@ fn reply_and_receive_wakes_for_a_request_and_delivers_the_reply_once() {
 fn reply_and_receive_consumes_moved_reply_handles() {
     let (_directory, mut process) = fixture_process(&[svc(0x43)]);
     let mut dispatcher = support::dispatcher(&process);
-    let (server, client) = SessionObject::create_pair();
+    let (server, client) = SessionObject::create_pair(process.scheduler());
     let server_handle = process.handles().insert(server.clone()).unwrap();
-    let source_handle = process.handles().insert(EventObject::new()).unwrap();
+    let source_handle = process
+        .handles()
+        .insert(EventObject::new(process.scheduler()))
+        .unwrap();
     let source_object = process.handles().lookup(source_handle).unwrap().clone();
     assert_eq!(
-        client.request(request_owner(7), SessionMessage::Buffer(vec![0; 0x100])),
-        Ok(SessionRequestResult::Submitted)
+        client.request(request_owner(7), SessionMessage::Buffer(vec![0; 8])),
+        Ok(())
     );
-    assert!(matches!(server.receive(), Ok(SessionMessage::Buffer(_))));
+    server.receive().unwrap().complete();
 
     let tls = process.main_thread().tls_base;
     let mut reply = [0_u8; 0x100];
@@ -1377,25 +1502,31 @@ fn reply_and_receive_consumes_moved_reply_handles() {
     put_u32(&mut reply, 12, source_handle);
     write_guest_bytes(&process, tls, &reply);
     let handles_address = process.main_thread().stack_bottom.get();
-    state(&mut process).write_x(x(1), handles_address);
-    state(&mut process).write_w(x(2), 0);
-    state(&mut process).write_w(x(3), server_handle);
-    state(&mut process).write_x(x(4), 0);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), handles_address);
+    process.main_thread().registers().write_w(x(2), 0);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(3), server_handle);
+    process.main_thread().registers().write_x(x(4), 0);
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::TIMED_OUT.raw()
     );
     assert!(process.handles().lookup(source_handle).is_none());
-    let Some(SessionRequestResult::Response(SessionMessage::TransportedBuffer {
+    let Some(SessionMessage::TransportedBuffer {
         copy_handles,
         move_handles,
         ..
-    })) = client.poll_request(request_owner(7)).unwrap()
+    }) = crate::integration_test_support::poll_session(&client, request_owner(7)).unwrap()
     else {
         panic!("reply must retain the moved object until the client receives it")
     };
@@ -1413,14 +1544,17 @@ fn reply_and_receive_consumes_moved_reply_handles() {
 fn failed_reply_still_consumes_all_moved_handles() {
     let (_directory, mut process) = fixture_process(&[svc(0x43)]);
     let mut dispatcher = support::dispatcher(&process);
-    let (server, client) = SessionObject::create_pair();
+    let (server, client) = SessionObject::create_pair(process.scheduler());
     let server_handle = process.handles().insert(server.clone()).unwrap();
-    let moved_handle = process.handles().insert(EventObject::new()).unwrap();
+    let moved_handle = process
+        .handles()
+        .insert(EventObject::new(process.scheduler()))
+        .unwrap();
     assert_eq!(
-        client.request(request_owner(8), SessionMessage::Buffer(vec![0; 0x100])),
-        Ok(SessionRequestResult::Submitted)
+        client.request(request_owner(8), SessionMessage::Buffer(vec![0; 8])),
+        Ok(())
     );
-    assert!(matches!(server.receive(), Ok(SessionMessage::Buffer(_))));
+    server.receive().unwrap().complete();
 
     let tls = process.main_thread().tls_base;
     let mut reply = [0_u8; 0x100];
@@ -1431,30 +1565,38 @@ fn failed_reply_still_consumes_all_moved_handles() {
     put_u32(&mut reply, 16, moved_handle);
     write_guest_bytes(&process, tls, &reply);
     let handles_address = process.main_thread().stack_bottom.get();
-    state(&mut process).write_x(x(1), handles_address);
-    state(&mut process).write_w(x(2), 0);
-    state(&mut process).write_w(x(3), server_handle);
-    state(&mut process).write_x(x(4), 0);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), handles_address);
+    process.main_thread().registers().write_w(x(2), 0);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(3), server_handle);
+    process.main_thread().registers().write_x(x(4), 0);
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
-        HorizonKernelResult::INVALID_HANDLE.raw()
+        process.main_thread().registers().read_w(x(0)),
+        HorizonKernelResult::TIMED_OUT.raw()
     );
     assert!(process.handles().lookup(moved_handle).is_none());
     assert_eq!(
-        client.poll_request(request_owner(8)).unwrap(),
-        Some(SessionRequestResult::Waiting)
+        crate::integration_test_support::poll_session(&client, request_owner(8)),
+        Err(nixe_runtime::SessionError::TransferFailed(
+            HorizonKernelResult::INVALID_HANDLE.raw()
+        ))
     );
 }
 
 #[test]
 fn separate_guest_processes_materialize_local_handles_across_a_wire_round_trip() {
     let (_client_directory, mut client_process) = fixture_process(&[svc(0x21), svc(0x21)]);
-    let (_server_directory, mut server_process) = fixture_process_with_builder(
+    let (_server_directory, server_process) = fixture_runnable_with_builder(
         &[svc(0x43), svc(0x43)],
         ProcessBuildConfig {
             process_id: 2,
@@ -1463,20 +1605,57 @@ fn separate_guest_processes_materialize_local_handles_across_a_wire_round_trip()
         ProcessBuilder::new(
             client_process.memory().space().machine().clone(),
             client_process.memory().system_account().clone(),
+            client_process.scheduler().clone(),
         ),
     );
+    let core = nixe_scheduler::VirtualCpuId::new(0);
+    let affinity = client_process
+        .scheduler()
+        .profile()
+        .core_set([core])
+        .unwrap();
+    client_process
+        .scheduler()
+        .migrate(
+            client_process.main_thread_id(),
+            IdealCore::Core(core),
+            affinity,
+        )
+        .unwrap();
+    let server_id = client_process
+        .coordinator_mut()
+        .register_process(
+            server_process,
+            nixe_runtime::ProcessRegistration {
+                priority: 45,
+                ideal_vcpu: Some(core),
+                affinity,
+            },
+        )
+        .unwrap();
+    let server_process = client_process
+        .coordinator_mut()
+        .process(server_id)
+        .unwrap()
+        .clone();
     let mut client_dispatcher = support::dispatcher(&client_process);
     let mut server_dispatcher = support::dispatcher(&server_process);
-    let (server, client) = SessionObject::create_pair();
+    let (server, client) = SessionObject::create_pair(client_process.scheduler());
 
     let client_session = client_process.handles().insert(client).unwrap();
-    let client_source = client_process.handles().insert(EventObject::new()).unwrap();
+    let client_source = client_process
+        .handles()
+        .insert(EventObject::new(client_process.scheduler()))
+        .unwrap();
     let client_source_object = client_process
         .handles()
         .lookup(client_source)
         .unwrap()
         .clone();
-    let _server_collision = server_process.handles().insert(EventObject::new()).unwrap();
+    let _server_collision = server_process
+        .handles()
+        .insert(EventObject::new(client_process.scheduler()))
+        .unwrap();
     let server_session = server_process.handles().insert(server).unwrap();
 
     let client_tls = client_process.main_thread().tls_base;
@@ -1486,7 +1665,10 @@ fn separate_guest_processes_materialize_local_handles_across_a_wire_round_trip()
     put_u32(&mut request, 8, 1 << 1);
     put_u32(&mut request, 12, client_source);
     write_guest_bytes(&client_process, client_tls, &request);
-    state(&mut client_process).write_w(x(0), client_session);
+    client_process
+        .main_thread()
+        .registers()
+        .write_w(x(0), client_session);
     assert!(matches!(
         dispatch_next(&mut client_process, &mut client_dispatcher),
         ExceptionHandlingResult::Suspended
@@ -1498,12 +1680,15 @@ fn separate_guest_processes_materialize_local_handles_across_a_wire_round_trip()
         server_handles,
         &server_session.to_le_bytes(),
     );
-    state(&mut server_process).write_x(x(1), server_handles.get());
-    state(&mut server_process).write_w(x(2), 1);
-    state(&mut server_process).write_w(x(3), 0);
-    state(&mut server_process).write_x(x(4), 0);
+    server_process
+        .main_thread()
+        .registers()
+        .write_x(x(1), server_handles.get());
+    server_process.main_thread().registers().write_w(x(2), 1);
+    server_process.main_thread().registers().write_w(x(3), 0);
+    server_process.main_thread().registers().write_x(x(4), 0);
     assert!(matches!(
-        dispatch_next(&mut server_process, &mut server_dispatcher),
+        dispatch_scheduled_next(&mut client_process, &mut server_dispatcher).1,
         ExceptionHandlingResult::Resumed
     ));
     let server_request_handle = read_guest_u32(
@@ -1524,7 +1709,10 @@ fn separate_guest_processes_materialize_local_handles_across_a_wire_round_trip()
     );
     assert!(client_process.handles().lookup(client_source).is_some());
 
-    let server_reply_source = server_process.handles().insert(EventObject::new()).unwrap();
+    let server_reply_source = server_process
+        .handles()
+        .insert(EventObject::new(client_process.scheduler()))
+        .unwrap();
     let server_reply_object = server_process
         .handles()
         .lookup(server_reply_source)
@@ -1537,16 +1725,22 @@ fn separate_guest_processes_materialize_local_handles_across_a_wire_round_trip()
     put_u32(&mut reply, 8, 1 << 5);
     put_u32(&mut reply, 12, server_reply_source);
     write_guest_bytes(&server_process, server_tls, &reply);
-    state(&mut server_process).write_x(x(1), server_handles.get());
-    state(&mut server_process).write_w(x(2), 0);
-    state(&mut server_process).write_w(x(3), server_session);
-    state(&mut server_process).write_x(x(4), 0);
+    server_process
+        .main_thread()
+        .registers()
+        .write_x(x(1), server_handles.get());
+    server_process.main_thread().registers().write_w(x(2), 0);
+    server_process
+        .main_thread()
+        .registers()
+        .write_w(x(3), server_session);
+    server_process.main_thread().registers().write_x(x(4), 0);
     assert!(matches!(
-        dispatch_next(&mut server_process, &mut server_dispatcher),
+        dispatch_scheduled_next(&mut client_process, &mut server_dispatcher).1,
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut server_process).read_w(x(0)),
+        server_process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::TIMED_OUT.raw()
     );
     assert!(
@@ -1556,11 +1750,9 @@ fn separate_guest_processes_materialize_local_handles_across_a_wire_round_trip()
             .is_none()
     );
 
-    assert!(client_process.resume());
-    assert!(matches!(
-        dispatch_next(&mut client_process, &mut client_dispatcher),
-        ExceptionHandlingResult::Resumed
-    ));
+    client_dispatcher
+        .poll_memory_completions(client_process.coordinator_mut())
+        .unwrap();
     let client_reply_handle = read_guest_u32(&client_process, client_tls.checked_add(12).unwrap());
     assert_ne!(client_reply_handle, server_reply_source);
     assert!(
@@ -1575,7 +1767,7 @@ fn separate_guest_processes_materialize_local_handles_across_a_wire_round_trip()
 #[test]
 fn closing_a_server_handle_wakes_a_client_in_another_guest_process() {
     let (_client_directory, mut client_process) = fixture_process(&[svc(0x21), svc(0x21)]);
-    let (_server_directory, mut server_process) = fixture_process_with_builder(
+    let (_server_directory, server_process) = fixture_runnable_with_builder(
         &[svc(0x16)],
         ProcessBuildConfig {
             process_id: 2,
@@ -1584,33 +1776,68 @@ fn closing_a_server_handle_wakes_a_client_in_another_guest_process() {
         ProcessBuilder::new(
             client_process.memory().space().machine().clone(),
             client_process.memory().system_account().clone(),
+            client_process.scheduler().clone(),
         ),
     );
+    let core = nixe_scheduler::VirtualCpuId::new(0);
+    let affinity = client_process
+        .scheduler()
+        .profile()
+        .core_set([core])
+        .unwrap();
+    client_process
+        .scheduler()
+        .migrate(
+            client_process.main_thread_id(),
+            IdealCore::Core(core),
+            affinity,
+        )
+        .unwrap();
+    let server_id = client_process
+        .coordinator_mut()
+        .register_process(
+            server_process,
+            nixe_runtime::ProcessRegistration {
+                priority: 45,
+                ideal_vcpu: Some(core),
+                affinity,
+            },
+        )
+        .unwrap();
+    let server_process = client_process
+        .coordinator_mut()
+        .process(server_id)
+        .unwrap()
+        .clone();
     let mut client_dispatcher = support::dispatcher(&client_process);
     let mut server_dispatcher = support::dispatcher(&server_process);
-    let (server, client) = SessionObject::create_pair();
+    let (server, client) = SessionObject::create_pair(client_process.scheduler());
     let server_handle = server_process.handles().insert(server).unwrap();
     let client_handle = client_process.handles().insert(client).unwrap();
 
-    state(&mut client_process).write_w(x(0), client_handle);
+    client_process
+        .main_thread()
+        .registers()
+        .write_w(x(0), client_handle);
     assert!(matches!(
         dispatch_next(&mut client_process, &mut client_dispatcher),
         ExceptionHandlingResult::Suspended
     ));
-    state(&mut server_process).write_w(x(0), server_handle);
+    server_process
+        .main_thread()
+        .registers()
+        .write_w(x(0), server_handle);
     assert!(matches!(
-        dispatch_next(&mut server_process, &mut server_dispatcher),
+        dispatch_scheduled_next(&mut client_process, &mut server_dispatcher).1,
         ExceptionHandlingResult::Resumed
     ));
     assert!(server_process.handles().lookup(server_handle).is_none());
 
-    assert!(client_process.resume());
-    assert!(matches!(
-        dispatch_next(&mut client_process, &mut client_dispatcher),
-        ExceptionHandlingResult::Resumed
-    ));
+    client_dispatcher
+        .poll_memory_completions(client_process.coordinator_mut())
+        .unwrap();
     assert_eq!(
-        state(&mut client_process).read_w(x(0)),
+        client_process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SESSION_CLOSED.raw()
     );
 }
@@ -1619,13 +1846,19 @@ fn closing_a_server_handle_wakes_a_client_in_another_guest_process() {
 fn read_only_user_buffer_is_rejected_before_session_dispatch() {
     let (_directory, mut process) = fixture_process(&[svc(0x22), svc(0x22)]);
     let mut dispatcher = support::dispatcher(&process);
-    let (server, client) = SessionObject::create_pair();
+    let (server, client) = SessionObject::create_pair(process.scheduler());
     let client_handle = process.handles().insert(client).unwrap();
     let read_only_buffer = process.entry_module().entry_address();
     let handles_before = process.handles().len();
-    state(&mut process).write_x(x(0), read_only_buffer);
-    state(&mut process).write_x(x(1), 0x1000);
-    state(&mut process).write_w(x(2), client_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(0), read_only_buffer);
+    process.main_thread().registers().write_x(x(1), 0x1000);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(2), client_handle);
     let ExceptionHandlingResult::Rejected(fault) = dispatch_next(&mut process, &mut dispatcher)
     else {
         panic!("a read-only response buffer must be rejected before dispatch")
@@ -1642,29 +1875,30 @@ fn read_only_user_buffer_is_rejected_before_session_dispatch() {
 }
 
 #[test]
-fn reply_and_receive_positive_timeout_expires_after_retry() {
+fn reply_and_receive_positive_timeout_completes_the_retained_wait() {
     let (_directory, mut process) = fixture_process(&[svc(0x43)]);
     let mut dispatcher = fixed_time_dispatcher(&process);
-    let (server, _client) = SessionObject::create_pair();
+    let (server, _client) = SessionObject::create_pair(process.scheduler());
     let server_handle = process.handles().insert(server).unwrap();
     let handles_address = process.main_thread().stack_bottom;
     write_guest_bytes(&process, handles_address, &server_handle.to_le_bytes());
-    state(&mut process).write_x(x(1), handles_address.get());
-    state(&mut process).write_w(x(2), 1);
-    state(&mut process).write_w(x(3), 0);
-    state(&mut process).write_x(x(4), 1);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), handles_address.get());
+    process.main_thread().registers().write_w(x(2), 1);
+    process.main_thread().registers().write_w(x(3), 0);
+    process.main_thread().registers().write_x(x(4), 1);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Suspended
     ));
-    dispatcher.synchronize_virtual_time(1);
-    assert!(process.resume());
-    assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Resumed
-    ));
+    process.scheduler().advance_time(1);
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::TIMED_OUT.raw()
     );
 }
@@ -1673,31 +1907,35 @@ fn reply_and_receive_positive_timeout_expires_after_retry() {
 fn light_session_uses_register_payloads_instead_of_tls() {
     let (_directory, mut process) = fixture_process(&[svc(0x20)]);
     let mut dispatcher = support::dispatcher(&process);
-    let (server, client) = SessionObject::create_light_pair();
+    let (server, client) = SessionObject::create_light_pair(process.scheduler());
     let client_handle = process.handles().insert(client).unwrap();
-    state(&mut process).write_w(x(0), client_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), client_handle);
     for index in 0..7 {
-        state(&mut process).write_w(x(index + 1), u32::from(index) + 10);
+        process
+            .main_thread()
+            .registers()
+            .write_w(x(index + 1), u32::from(index) + 10);
     }
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Suspended
     ));
     assert_eq!(
-        server.receive(),
+        server.receive_light(request_owner(2)),
         Ok(SessionMessage::Light([10, 11, 12, 13, 14, 15, 16]))
     );
     server
-        .reply(SessionMessage::Light([20, 21, 22, 23, 24, 25, 26]))
+        .reply_light(request_owner(2), [20, 21, 22, 23, 24, 25, 26])
         .unwrap();
-    assert!(process.resume());
-    assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Resumed
-    ));
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
     for index in 0..7 {
         assert_eq!(
-            state(&mut process).read_w(x(index + 1)),
+            process.main_thread().registers().read_w(x(index + 1)),
             u32::from(index) + 20
         );
     }
@@ -1707,40 +1945,52 @@ fn light_session_uses_register_payloads_instead_of_tls() {
 fn light_server_replies_once_then_waits_for_the_next_request() {
     let (_directory, mut process) = fixture_process(&[svc(0x42), svc(0x42)]);
     let mut dispatcher = support::dispatcher(&process);
-    let (server, client) = SessionObject::create_light_pair();
+    let (server, client) = SessionObject::create_light_pair(process.scheduler());
     let server_handle = process.handles().insert(server).unwrap();
     assert_eq!(
         client.request(
             request_owner(3),
             SessionMessage::Light([1, 2, 3, 4, 5, 6, 7])
         ),
-        Ok(SessionRequestResult::Submitted)
+        Ok(())
     );
-    state(&mut process).write_w(x(0), server_handle);
-    state(&mut process).write_w(x(1), 0);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), server_handle);
+    process.main_thread().registers().write_w(x(1), 0);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     for index in 0..7 {
         assert_eq!(
-            state(&mut process).read_w(x(index + 1)),
+            process.main_thread().registers().read_w(x(index + 1)),
             u32::from(index) + 1
         );
     }
 
-    state(&mut process).write_w(x(0), server_handle);
-    state(&mut process).write_w(x(1), (1 << 31) | 10);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), server_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(1), (1 << 31) | 10);
     for index in 1..7 {
-        state(&mut process).write_w(x(index + 1), u32::from(index) + 10);
+        process
+            .main_thread()
+            .registers()
+            .write_w(x(index + 1), u32::from(index) + 10);
     }
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Suspended
     ));
     assert_eq!(
-        client.request(request_owner(3), SessionMessage::Light([0; 7])),
-        Ok(SessionRequestResult::Response(SessionMessage::Light([
+        crate::integration_test_support::poll_session(&client, request_owner(3)),
+        Ok(Some(SessionMessage::Light([
             (1 << 31) | 10,
             11,
             12,
@@ -1755,46 +2005,61 @@ fn light_server_replies_once_then_waits_for_the_next_request() {
             request_owner(4),
             SessionMessage::Light([21, 22, 23, 24, 25, 26, 27])
         ),
-        Ok(SessionRequestResult::Submitted)
+        Ok(())
     );
-    assert!(process.resume());
-    assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Resumed
-    ));
-    assert_eq!(state(&mut process).read_w(x(1)), 21);
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
+    assert_eq!(process.main_thread().registers().read_w(x(1)), 21);
 }
 
 #[test]
 fn user_buffer_session_uses_the_explicit_page_aligned_message_region() {
     let (_directory, mut process) = fixture_process(&[svc(0x22)]);
     let mut dispatcher = support::dispatcher(&process);
-    let (server, client) = SessionObject::create_pair();
+    let (server, client) = SessionObject::create_pair(process.scheduler());
     let client_handle = process.handles().insert(client).unwrap();
     let buffer = process.main_thread().stack_bottom;
-    write_guest_bytes(&process, buffer, &[0x6b; 0x1000]);
-    state(&mut process).write_x(x(0), buffer.get());
-    state(&mut process).write_x(x(1), 0x1000);
-    state(&mut process).write_w(x(2), client_handle);
+    let mut command = vec![0x6b; 0x1000];
+    put_u32(&mut command, 0, 4);
+    put_u32(&mut command, 4, 1000);
+    write_guest_bytes(&process, buffer, &command);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(0), buffer.get());
+    process.main_thread().registers().write_x(x(1), 0x1000);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(2), client_handle);
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Suspended
     ));
-    let SessionMessage::Buffer(request) = server.receive().unwrap() else {
+    let mut receive = server.receive().unwrap();
+    let SessionMessage::Buffer(request) = receive.take_message() else {
         panic!("normal session must carry a memory buffer")
     };
-    assert_eq!(request.len(), 0x1000);
-    assert!(request.iter().all(|byte| *byte == 0x6b));
+    assert_eq!(request.len(), 8 + 4 * 1000);
+    assert!(request[8..].iter().all(|byte| *byte == 0x6b));
+    receive.complete();
+    let mut response = vec![0x7c; 8 + 4 * 1000];
+    put_u32(&mut response, 0, 4);
+    put_u32(&mut response, 4, 1000);
     server
-        .reply(SessionMessage::Buffer(vec![0x7c; 0x1000]))
+        .reply()
+        .unwrap()
+        .reply(SessionMessage::Buffer(response))
         .unwrap();
-    assert!(process.resume());
-    assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
-        ExceptionHandlingResult::Resumed
-    ));
-    assert_eq!(read_guest_u32(&process, buffer), 0x7c7c_7c7c);
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
+    assert_eq!(
+        read_guest_u32(&process, buffer.checked_add(8).unwrap()),
+        0x7c7c_7c7c
+    );
 }
 
 #[test]
@@ -1802,27 +2067,33 @@ fn user_buffer_session_validates_alignment_and_nonzero_size_before_the_handle() 
     let (_directory, mut process) = fixture_process(&[svc(0x22), svc(0x22)]);
     let mut dispatcher = support::dispatcher(&process);
     let buffer = process.main_thread().stack_bottom;
-    state(&mut process).write_x(x(0), buffer.get() + 1);
-    state(&mut process).write_x(x(1), 0x1000);
-    state(&mut process).write_w(x(2), u32::MAX);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(0), buffer.get() + 1);
+    process.main_thread().registers().write_x(x(1), 0x1000);
+    process.main_thread().registers().write_w(x(2), u32::MAX);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::INVALID_ADDRESS.raw()
     );
 
-    state(&mut process).write_x(x(0), buffer.get());
-    state(&mut process).write_x(x(1), 0);
-    state(&mut process).write_w(x(2), u32::MAX);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(0), buffer.get());
+    process.main_thread().registers().write_x(x(1), 0);
+    process.main_thread().registers().write_w(x(2), u32::MAX);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::INVALID_SIZE.raw()
     );
 }
@@ -1840,67 +2111,66 @@ fn named_port_registration_connection_acceptance_and_removal_share_one_port() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"test:\0");
-    state(&mut process).write_x(x(1), name.get());
-    state(&mut process).write_w(x(2), 1);
+    process.main_thread().registers().write_x(x(1), name.get());
+    process.main_thread().registers().write_w(x(2), 1);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let server_port = state(&mut process).read_w(x(1));
+    let server_port = process.main_thread().registers().read_w(x(1));
 
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let client_session = state(&mut process).read_w(x(1));
+    let client_session = process.main_thread().registers().read_w(x(1));
 
-    state(&mut process).write_w(x(1), server_port);
+    process.main_thread().registers().write_w(x(1), server_port);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let server_session = state(&mut process).read_w(x(1));
-    assert!(
-        process
+    let server_session = process.main_thread().registers().read_w(x(1));
+    assert_session_peers(
+        &process
             .handles()
             .lookup_as::<SessionObject>(server_session)
-            .unwrap()
-            .same_session(
-                &process
-                    .handles()
-                    .lookup_as::<SessionObject>(client_session)
-                    .unwrap()
-            )
+            .unwrap(),
+        &process
+            .handles()
+            .lookup_as::<SessionObject>(client_session)
+            .unwrap(),
     );
 
-    state(&mut process).write_w(x(0), server_port);
+    process.main_thread().registers().write_w(x(0), server_port);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    state(&mut process).write_x(x(1), name.get());
-    state(&mut process).write_w(x(2), 0);
+    process.main_thread().registers().write_x(x(1), name.get());
+    process.main_thread().registers().write_w(x(2), 0);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::NOT_FOUND.raw()
     );
 }
 
 #[test]
-fn unsupported_and_unknown_calls_are_fatal_and_bounded_in_coverage() {
+fn unsupported_and_unknown_calls_are_fatal() {
     let (_directory, mut process) = fixture_process(&[svc(0x23)]);
     let mut dispatcher = support::dispatcher(&process);
-    let source = state(&mut process).pc();
+    let thread = process.main_thread();
+    let source = thread.registers().pc();
     let result = dispatch_next(&mut process, &mut dispatcher);
     assert!(matches!(
         result,
@@ -1910,14 +2180,8 @@ fn unsupported_and_unknown_calls_are_fatal_and_bounded_in_coverage() {
         })
     ));
     assert_eq!(process.lifecycle(), ProcessLifecycle::Faulted);
-    assert_eq!(state(&mut process).pc(), source);
-    assert_eq!(
-        dispatcher.coverage()[0].support,
-        HorizonSvcSupport::Unsupported
-    );
-    assert_eq!(dispatcher.coverage()[0].rejected, 0);
-    assert_eq!(dispatcher.coverage()[0].resumed, 0);
-    assert_eq!(dispatcher.coverage()[0].faulted, 1);
+    assert_eq!(thread.registers().pc(), source);
+    assert!(process.handles().is_empty());
 
     let (_directory, mut process) = fixture_process(&[svc(0xff)]);
     assert!(matches!(
@@ -1925,8 +2189,6 @@ fn unsupported_and_unknown_calls_are_fatal_and_bounded_in_coverage() {
         ExceptionHandlingResult::Fault(HorizonSvcFault::Unknown(_))
     ));
     assert_eq!(process.lifecycle(), ProcessLifecycle::Faulted);
-    assert_eq!(dispatcher.unknown_calls(), 1);
-    assert_eq!(dispatcher.coverage().len(), 1);
 }
 
 #[test]
@@ -1938,12 +2200,15 @@ fn vi_layer_commands_return_complete_native_window_parcels() {
     let buffer = process.main_thread().stack_bottom;
     let tls = process.main_thread().tls_base;
     write_guest_bytes(&process, buffer, b"sm:\0");
-    state(&mut process).write_x(x(1), buffer.get());
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), buffer.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm = state(&mut process).read_w(x(1));
+    let sm = process.main_thread().registers().read_w(x(1));
 
     let mut register = [0_u8; 0x100];
     put_u32(&mut register, 0, 4);
@@ -1951,7 +2216,7 @@ fn vi_layer_commands_return_complete_native_window_parcels() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm);
+    process.main_thread().registers().write_w(x(0), sm);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -1964,7 +2229,7 @@ fn vi_layer_commands_return_complete_native_window_parcels() {
     put_u32(&mut request, 24, 1);
     request[32..36].copy_from_slice(b"vi:u");
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), sm);
+    process.main_thread().registers().write_w(x(0), sm);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -1975,7 +2240,7 @@ fn vi_layer_commands_return_complete_native_window_parcels() {
     request[32..].fill(0);
     put_u32(&mut request, 24, 0);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), root);
+    process.main_thread().registers().write_w(x(0), root);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -1983,7 +2248,7 @@ fn vi_layer_commands_return_complete_native_window_parcels() {
     let application = read_guest_u32(&process, tls.checked_add(12).unwrap());
     put_u32(&mut request, 24, 102);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), application);
+    process.main_thread().registers().write_w(x(0), application);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2009,7 +2274,7 @@ fn vi_layer_commands_return_complete_native_window_parcels() {
         }
         write_guest_bytes(&process, buffer, &[0xa5; 0x100]);
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), handle);
+        process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -2057,7 +2322,7 @@ fn vi_layer_commands_return_complete_native_window_parcels() {
     put_u32(&mut close, 24, 2021);
     put_u64(&mut close, 32, layer_id);
     write_guest_bytes(&process, tls, &close);
-    state(&mut process).write_w(x(0), application);
+    process.main_thread().registers().write_w(x(0), application);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2065,7 +2330,7 @@ fn vi_layer_commands_return_complete_native_window_parcels() {
     assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
 
     write_guest_bytes(&process, tls, &reopen);
-    state(&mut process).write_w(x(0), application);
+    process.main_thread().registers().write_w(x(0), application);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2078,7 +2343,7 @@ fn vi_layer_commands_return_complete_native_window_parcels() {
 
     put_u32(&mut close, 24, 2031);
     write_guest_bytes(&process, tls, &close);
-    state(&mut process).write_w(x(0), application);
+    process.main_thread().registers().write_w(x(0), application);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2086,7 +2351,7 @@ fn vi_layer_commands_return_complete_native_window_parcels() {
     assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
 
     write_guest_bytes(&process, tls, &reopen);
-    state(&mut process).write_w(x(0), application);
+    process.main_thread().registers().write_w(x(0), application);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2103,6 +2368,7 @@ fn nvdrv_firmware_memory_margin_uses_a_u64_input_and_no_output() {
         .handles()
         .insert(HorizonIpcObject::NvDrv(nixe_horizon::NvDrvSession::new(
             process.memory().account().machine().clone(),
+            process.scheduler(),
         )))
         .unwrap();
     let tls = process.main_thread().tls_base;
@@ -2116,13 +2382,13 @@ fn nvdrv_firmware_memory_margin_uses_a_u64_input_and_no_output() {
     for value in [0, 1, u64::MAX] {
         put_u64(&mut request, 32, value);
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), handle);
+        process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
-            state(&mut process).read_w(x(0)),
+            process.main_thread().registers().read_w(x(0)),
             HorizonKernelResult::SUCCESS.raw()
         );
         assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
@@ -2142,7 +2408,7 @@ fn nvdrv_firmware_memory_margin_uses_a_u64_input_and_no_output() {
     let mut nonzero_padding = request;
     nonzero_padding[40..48].fill(0xa5);
     write_guest_bytes(&process, tls, &nonzero_padding);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2157,7 +2423,7 @@ fn nvdrv_firmware_memory_margin_uses_a_u64_input_and_no_output() {
     put_u64(&mut unexpected_pid, 48, 1);
     for malformed in [missing_input, truncated_input, unexpected_pid] {
         write_guest_bytes(&process, tls, &malformed);
-        state(&mut process).write_w(x(0), handle);
+        process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -2178,12 +2444,12 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
     let mut register = [0_u8; 0x100];
     put_u32(&mut register, 0, 4);
@@ -2191,7 +2457,7 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2204,7 +2470,7 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
     put_u32(&mut get_service, 24, 1);
     get_service[32..35].copy_from_slice(b"hid");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2231,7 +2497,7 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
     ] {
         put_u32(&mut info, 32, actuator);
         write_guest_bytes(&process, tls, &info);
-        state(&mut process).write_w(x(0), hid_handle);
+        process.main_thread().registers().write_w(x(0), hid_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -2252,7 +2518,7 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
     ] {
         put_u32(&mut info, 32, invalid);
         write_guest_bytes(&process, tls, &info);
-        state(&mut process).write_w(x(0), hid_handle);
+        process.main_thread().registers().write_w(x(0), hid_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -2272,7 +2538,7 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
     put_send_static(&mut info_with_descriptor, 8, 0, 0);
     for malformed in [truncated_info, info_with_pid, info_with_descriptor] {
         write_guest_bytes(&process, tls, &malformed);
-        state(&mut process).write_w(x(0), hid_handle);
+        process.main_thread().registers().write_w(x(0), hid_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -2291,7 +2557,7 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
     // Stale plain-CMIF alignment slack is not semantic command input.
     create_list[32..40].fill(0xa5);
     write_guest_bytes(&process, tls, &create_list);
-    state(&mut process).write_w(x(0), hid_handle);
+    process.main_thread().registers().write_w(x(0), hid_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2319,7 +2585,7 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
     for actuator in [0x0000_0003, 0x0001_0003, 0x0000_0003] {
         put_u32(&mut activate, 32, actuator);
         write_guest_bytes(&process, tls, &activate);
-        state(&mut process).write_w(x(0), list_handle);
+        process.main_thread().registers().write_w(x(0), list_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -2328,7 +2594,7 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
     }
     put_u32(&mut activate, 32, 0x0002_0003);
     write_guest_bytes(&process, tls, &activate);
-    state(&mut process).write_w(x(0), list_handle);
+    process.main_thread().registers().write_w(x(0), list_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2341,7 +2607,7 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
     let mut truncated = activate;
     put_u32(&mut truncated, 4, 6);
     write_guest_bytes(&process, tls, &truncated);
-    state(&mut process).write_w(x(0), list_handle);
+    process.main_thread().registers().write_w(x(0), list_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2355,7 +2621,7 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
     put_u32(&mut malformed_factory, 0, 4 | (1 << 16));
     put_send_static(&mut malformed_factory, 8, 0, 0);
     write_guest_bytes(&process, tls, &malformed_factory);
-    state(&mut process).write_w(x(0), hid_handle);
+    process.main_thread().registers().write_w(x(0), hid_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2367,13 +2633,13 @@ fn hid_vibration_info_registration_and_session_lifetime_follow_the_wire_abi() {
 
     // CloseSession retains the kernel handle until CloseHandle.
     write_guest_bytes(&process, tls, &[2, 0, 0, 0, 0, 0, 0, 0]);
-    state(&mut process).write_w(x(0), list_handle);
+    process.main_thread().registers().write_w(x(0), list_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert!(process.handles().lookup(list_handle).is_some());
-    state(&mut process).write_w(x(0), list_handle);
+    process.main_thread().registers().write_w(x(0), list_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2389,12 +2655,12 @@ fn infrared_initialization_exposes_disconnected_read_only_cameras() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm = state(&mut process).read_w(x(1));
+    let sm = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
     let mut register = [0_u8; 0x100];
     put_u32(&mut register, 0, 4);
@@ -2402,7 +2668,7 @@ fn infrared_initialization_exposes_disconnected_read_only_cameras() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm);
+    process.main_thread().registers().write_w(x(0), sm);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2414,7 +2680,7 @@ fn infrared_initialization_exposes_disconnected_read_only_cameras() {
     put_u32(&mut get_service, 24, 1);
     get_service[32..35].copy_from_slice(b"irs");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm);
+    process.main_thread().registers().write_w(x(0), sm);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2437,7 +2703,7 @@ fn infrared_initialization_exposes_disconnected_read_only_cameras() {
             put_u64(&mut request, 32, aruid);
         }
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), irs);
+        process.main_thread().registers().write_w(x(0), irs);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -2471,7 +2737,7 @@ fn infrared_initialization_exposes_disconnected_read_only_cameras() {
         put_u32(&mut request, 24, 311);
         put_u32(&mut request, 32, npad);
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), irs);
+        process.main_thread().registers().write_w(x(0), irs);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -2502,12 +2768,12 @@ fn hid_activation_and_style_event_wire_contracts() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
 
     let mut register = [0_u8; 0x100];
@@ -2516,7 +2782,7 @@ fn hid_activation_and_style_event_wire_contracts() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2530,7 +2796,7 @@ fn hid_activation_and_style_event_wire_contracts() {
     put_u32(&mut get_service, 24, 1);
     get_service[32..35].copy_from_slice(b"hid");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2544,7 +2810,7 @@ fn hid_activation_and_style_event_wire_contracts() {
         activate[56] = 0xa5; // Plain CMIF alignment slack is not semantic input.
         for _ in 0..2 {
             write_guest_bytes(&process, tls, &activate);
-            state(&mut process).write_w(x(0), hid_handle);
+            process.main_thread().registers().write_w(x(0), hid_handle);
             assert!(matches!(
                 dispatch_next(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed
@@ -2553,7 +2819,7 @@ fn hid_activation_and_style_event_wire_contracts() {
         }
         put_u32(&mut activate, 4, 8 | (1 << 31));
         write_guest_bytes(&process, tls, &activate);
-        state(&mut process).write_w(x(0), hid_handle);
+        process.main_thread().registers().write_w(x(0), hid_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -2572,7 +2838,7 @@ fn hid_activation_and_style_event_wire_contracts() {
         put_u32(&mut activate_with_revision, 48, revision);
         put_u64(&mut activate_with_revision, 56, 1);
         write_guest_bytes(&process, tls, &activate_with_revision);
-        state(&mut process).write_w(x(0), hid_handle);
+        process.main_thread().registers().write_w(x(0), hid_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -2587,7 +2853,7 @@ fn hid_activation_and_style_event_wire_contracts() {
     let mut events = Vec::new();
     for _ in 0..2 {
         write_guest_bytes(&process, tls, &acquire);
-        state(&mut process).write_w(x(0), hid_handle);
+        process.main_thread().registers().write_w(x(0), hid_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -2607,7 +2873,7 @@ fn hid_activation_and_style_event_wire_contracts() {
     for id in [8, u32::MAX] {
         put_u32(&mut acquire, 48, id);
         write_guest_bytes(&process, tls, &acquire);
-        state(&mut process).write_w(x(0), hid_handle);
+        process.main_thread().registers().write_w(x(0), hid_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -2627,12 +2893,12 @@ fn hid_supported_style_set_round_trips_and_validates_get_requests() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
 
     let mut register = [0_u8; 0x100];
@@ -2641,7 +2907,7 @@ fn hid_supported_style_set_round_trips_and_validates_get_requests() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2655,7 +2921,7 @@ fn hid_supported_style_set_round_trips_and_validates_get_requests() {
     put_u32(&mut get_service, 24, 1);
     get_service[32..35].copy_from_slice(b"hid");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2669,12 +2935,12 @@ fn hid_supported_style_set_round_trips_and_validates_get_requests() {
     put_u64(&mut get, 56, u64::MAX);
     let mut send = |request: &[u8; 0x100]| {
         write_guest_bytes(&process, tls, request);
-        state(&mut process).write_w(x(0), hid_handle);
+        process.main_thread().registers().write_w(x(0), hid_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         ));
-        assert_eq!(state(&mut process).read_w(x(0)), 0);
+        assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
         (
             read_guest_u32(&process, tls.checked_add(24).unwrap()),
             read_guest_u32(&process, tls.checked_add(32).unwrap()),
@@ -2718,12 +2984,12 @@ fn hid_joy_hold_type_round_trips_and_rejects_invalid_requests_without_mutation()
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
 
     let mut register = [0_u8; 0x100];
@@ -2732,7 +2998,7 @@ fn hid_joy_hold_type_round_trips_and_rejects_invalid_requests_without_mutation()
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2746,7 +3012,7 @@ fn hid_joy_hold_type_round_trips_and_rejects_invalid_requests_without_mutation()
     put_u32(&mut get_service, 24, 1);
     get_service[32..35].copy_from_slice(b"hid");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2761,12 +3027,12 @@ fn hid_joy_hold_type_round_trips_and_rejects_invalid_requests_without_mutation()
     put_u64(&mut get, 56, u64::MAX);
     let mut send = |request: &[u8; 0x100]| {
         write_guest_bytes(&process, tls, request);
-        state(&mut process).write_w(x(0), hid_handle);
+        process.main_thread().registers().write_w(x(0), hid_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         ));
-        assert_eq!(state(&mut process).read_w(x(0)), 0);
+        assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
         (
             read_guest_u32(&process, tls.checked_add(24).unwrap()),
             u64::from_le_bytes(
@@ -2865,17 +3131,17 @@ fn shared_font_service_publishes_caller_bytes_and_returns_a_read_only_copy_handl
         process.memory().space().machine().clone(),
         OperationMode::default(),
         crate::TimeEnvironment::new(account, nixe_runtime::VirtualClock::default(), "UTC").unwrap(),
-        crate::HidSystem::new(account).unwrap(),
+        crate::HidSystem::new(account, process.scheduler()).unwrap(),
         crate::SharedFontSession::new(account, Some(directory.path().join("font.ttf"))).unwrap(),
     );
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm = state(&mut process).read_w(x(1));
+    let sm = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
     let mut register = [0; 0x100];
     put_u32(&mut register, 0, 4);
@@ -2883,7 +3149,7 @@ fn shared_font_service_publishes_caller_bytes_and_returns_a_read_only_copy_handl
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm);
+    process.main_thread().registers().write_w(x(0), sm);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2895,7 +3161,7 @@ fn shared_font_service_publishes_caller_bytes_and_returns_a_read_only_copy_handl
     put_u32(&mut request, 24, 1);
     request[32..36].copy_from_slice(b"pl:u");
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), sm);
+    process.main_thread().registers().write_w(x(0), sm);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2905,7 +3171,7 @@ fn shared_font_service_publishes_caller_bytes_and_returns_a_read_only_copy_handl
     for (command, expected) in [(1, 1), (2, 32), (3, 8), (0, 0)] {
         put_u32(&mut request, 24, command);
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), service);
+        process.main_thread().registers().write_w(x(0), service);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -2921,7 +3187,7 @@ fn shared_font_service_publishes_caller_bytes_and_returns_a_read_only_copy_handl
     put_u32(&mut request, 24, 4);
     put_u32(&mut request, 4, 8);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), service);
+    process.main_thread().registers().write_w(x(0), service);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2947,7 +3213,7 @@ fn shared_font_service_publishes_caller_bytes_and_returns_a_read_only_copy_handl
     put_u32(&mut request, 4, 9);
     put_u32(&mut request, 32, u32::MAX);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), service);
+    process.main_thread().registers().write_w(x(0), service);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -2962,7 +3228,7 @@ fn shared_font_service_publishes_caller_bytes_and_returns_a_read_only_copy_handl
 fn hid_disconnect_validates_the_npad_id_and_the_pid_payload() {
     let (_directory, mut process) = fixture_process_with_svcs(&[0x21; 4]);
     let account = process.memory().system_account();
-    let hid = crate::HidSystem::new(account).unwrap();
+    let hid = crate::HidSystem::new(account, process.scheduler()).unwrap();
     let event = hid.acquire_style_event(0x20).unwrap();
     event.clear();
     let session = process
@@ -3018,24 +3284,20 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     instructions.extend(std::iter::repeat_n(svc(0x21), 71));
     instructions.extend([svc(0x13), svc(0x14), svc(0x21)]);
     let (_directory, mut process) = fixture_process(&instructions);
-    let mut dispatcher = support::dispatcher_with_clock(
-        &process,
-        OperationMode::Console,
-        nixe_runtime::VirtualClock::default(),
-    );
+    let mut dispatcher = support::dispatcher_with_mode(&process, OperationMode::Console);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
     assert!(matches!(
         process
             .handles()
@@ -3051,7 +3313,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut query, 16, 0x4943_4653);
     put_u32(&mut query, 24, 3);
     write_guest_bytes(&process, tls, &query);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3068,7 +3330,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3082,7 +3344,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut get_service, 24, 1);
     get_service[32..40].copy_from_slice(b"fsp-srv\0");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3103,7 +3365,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
 
     get_service[32..40].copy_from_slice(b"set:sys\0");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3120,7 +3382,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     get_service[32..40].fill(0);
     get_service[32..35].copy_from_slice(b"apm");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3140,7 +3402,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut get_performance_mode, 16, 0x4943_4653);
     put_u32(&mut get_performance_mode, 24, 1);
     write_guest_bytes(&process, tls, &get_performance_mode);
-    state(&mut process).write_w(x(0), apm_handle);
+    process.main_thread().registers().write_w(x(0), apm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3150,7 +3412,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
 
     get_service[32..40].copy_from_slice(b"appletOE");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3169,7 +3431,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut convert_to_domain, 4, 8);
     put_u32(&mut convert_to_domain, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &convert_to_domain);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3186,7 +3451,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut open_proxy, 36, 1);
     put_u32(&mut open_proxy, 48, 0x4943_4653);
     write_guest_bytes(&process, tls, &open_proxy);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3203,7 +3471,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut get_self_controller, 32, 0x4943_4653);
     put_u32(&mut get_self_controller, 40, 1);
     write_guest_bytes(&process, tls, &get_self_controller);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3222,7 +3493,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
             put_u32(&mut idle_set, 40, 62);
             put_u32(&mut idle_set, 48, extension);
             write_guest_bytes(&process, tls, &idle_set);
-            state(&mut process).write_w(x(0), applet_handle);
+            process
+                .main_thread()
+                .registers()
+                .write_w(x(0), applet_handle);
             assert!(matches!(
                 dispatch_next(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed
@@ -3237,7 +3511,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
             );
         }
         write_guest_bytes(&process, tls, &idle_query);
-        state(&mut process).write_w(x(0), applet_handle);
+        process
+            .main_thread()
+            .registers()
+            .write_w(x(0), applet_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -3258,7 +3535,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     for enabled in [1, 0xff, 0] {
         set_restart_message[48] = enabled;
         write_guest_bytes(&process, tls, &set_restart_message);
-        state(&mut process).write_w(x(0), applet_handle);
+        process
+            .main_thread()
+            .registers()
+            .write_w(x(0), applet_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -3273,7 +3553,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     invalid_restart_padding[49] = 1;
     for malformed in [missing_restart_flag, invalid_restart_padding] {
         write_guest_bytes(&process, tls, &malformed);
-        state(&mut process).write_w(x(0), applet_handle);
+        process
+            .main_thread()
+            .registers()
+            .write_w(x(0), applet_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -3298,7 +3581,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut set_out_of_focus_suspending, 40, 16);
     set_out_of_focus_suspending[48] = 1;
     write_guest_bytes(&process, tls, &set_out_of_focus_suspending);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3308,7 +3594,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut malformed_suspending_policy = set_out_of_focus_suspending;
     malformed_suspending_policy[49] = 1;
     write_guest_bytes(&process, tls, &malformed_suspending_policy);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3328,7 +3617,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut malformed_lock_exit, 40, 1);
     malformed_lock_exit[48] = 1;
     write_guest_bytes(&process, tls, &malformed_lock_exit);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3347,7 +3639,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut get_launchable_event, 32, 0x4943_4653);
     put_u32(&mut get_launchable_event, 40, 9);
     write_guest_bytes(&process, tls, &get_launchable_event);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3369,7 +3664,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut get_library_applet_creator, 32, 0x4943_4653);
     put_u32(&mut get_library_applet_creator, 40, 11);
     write_guest_bytes(&process, tls, &get_library_applet_creator);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3392,7 +3690,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut create_library_applet, 48, 0x0c);
     put_u32(&mut create_library_applet, 52, 0);
     write_guest_bytes(&process, tls, &create_library_applet);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3417,7 +3718,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut get_library_applet_state_event, 32, 0x4943_4653);
     put_u32(&mut get_library_applet_state_event, 40, 0);
     write_guest_bytes(&process, tls, &get_library_applet_state_event);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3439,7 +3743,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut create_storage, 40, 10);
     put_u64(&mut create_storage, 48, 0x20);
     write_guest_bytes(&process, tls, &create_storage);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3456,7 +3763,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut open_storage, 32, 0x4943_4653);
     put_u32(&mut open_storage, 40, 0);
     write_guest_bytes(&process, tls, &open_storage);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3467,7 +3777,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut get_storage_size = open_storage;
     put_u32(&mut get_storage_size, 20, storage_accessor_object_id);
     write_guest_bytes(&process, tls, &get_storage_size);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3495,7 +3808,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u64(&mut write_storage, 64, 4);
     write_storage[0xe0..0xe8].copy_from_slice(b"storage!");
     write_guest_bytes(&process, tls, &write_storage);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3511,7 +3827,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut get_common_state, 32, 0x4943_4653);
     put_u32(&mut get_common_state, 40, 0);
     write_guest_bytes(&process, tls, &get_common_state);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3531,7 +3850,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     ] {
         put_u32(&mut boost, 48, mode);
         write_guest_bytes(&process, tls, &boost);
-        state(&mut process).write_w(x(0), applet_handle);
+        process
+            .main_thread()
+            .registers()
+            .write_w(x(0), applet_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -3546,7 +3868,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         put_u32(&mut request, 20, common_state_object_id);
         put_u32(&mut request, 40, command);
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), applet_handle);
+        process
+            .main_thread()
+            .registers()
+            .write_w(x(0), applet_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -3571,7 +3896,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut get_message_event, 32, 0x4943_4653);
     put_u32(&mut get_message_event, 40, 0);
     write_guest_bytes(&process, tls, &get_message_event);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3587,7 +3915,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut receive_message = get_message_event;
     put_u32(&mut receive_message, 40, 1);
     write_guest_bytes(&process, tls, &receive_message);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3597,7 +3928,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     assert!(!message_event.is_signalled());
 
     write_guest_bytes(&process, tls, &receive_message);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3611,7 +3945,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut get_focus_state = receive_message;
     put_u32(&mut get_focus_state, 40, 9);
     write_guest_bytes(&process, tls, &get_focus_state);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3627,7 +3964,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut get_operation_mode, 32, 0x4943_4653);
     put_u32(&mut get_operation_mode, 40, 5);
     write_guest_bytes(&process, tls, &get_operation_mode);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3640,7 +3980,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut get_common_performance_mode = get_operation_mode;
     put_u32(&mut get_common_performance_mode, 40, 6);
     write_guest_bytes(&process, tls, &get_common_performance_mode);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3651,7 +3994,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut get_resolution = get_operation_mode;
     put_u32(&mut get_resolution, 40, 60);
     write_guest_bytes(&process, tls, &get_resolution);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3663,7 +4009,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut get_application_functions = get_common_state;
     put_u32(&mut get_application_functions, 40, 20);
     write_guest_bytes(&process, tls, &get_application_functions);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3690,7 +4039,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     ] {
         dispatcher = dispatcher.with_application_language(language);
         write_guest_bytes(&process, tls, &get_desired_language);
-        state(&mut process).write_w(x(0), applet_handle);
+        process
+            .main_thread()
+            .registers()
+            .write_w(x(0), applet_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -3710,7 +4062,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut unexpected_language_input, 4, 12);
     unexpected_language_input[18..20].copy_from_slice(&24_u16.to_le_bytes());
     write_guest_bytes(&process, tls, &unexpected_language_input);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3729,7 +4084,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     ] {
         dispatcher = dispatcher.with_application_display_version(version);
         write_guest_bytes(&process, tls, &get_display_version);
-        state(&mut process).write_w(x(0), applet_handle);
+        process
+            .main_thread()
+            .registers()
+            .write_w(x(0), applet_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -3748,7 +4106,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut unexpected_version_input = unexpected_language_input;
     put_u32(&mut unexpected_version_input, 40, 23);
     write_guest_bytes(&process, tls, &unexpected_version_input);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3772,7 +4133,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut pop_preselected_user, 40, 1);
     put_u32(&mut pop_preselected_user, 48, 2);
     write_guest_bytes(&process, tls, &pop_preselected_user);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3790,7 +4154,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut open_launch_parameter, 32, 0x4943_4653);
     put_u32(&mut open_launch_parameter, 40, 0);
     write_guest_bytes(&process, tls, &open_launch_parameter);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3805,7 +4172,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         launch_parameter_accessor,
     );
     write_guest_bytes(&process, tls, &get_launch_parameter_size);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3836,7 +4206,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut read_launch_parameter, 56, 11);
     put_u64(&mut read_launch_parameter, 64, 0);
     write_guest_bytes(&process, tls, &read_launch_parameter);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3848,7 +4221,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     assert!(launch_parameter[24..].iter().all(|byte| *byte == 0));
 
     write_guest_bytes(&process, tls, &pop_preselected_user);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3872,7 +4248,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut set_terminate_result, 40, 22);
     put_u32(&mut set_terminate_result, 48, 0x2a2);
     write_guest_bytes(&process, tls, &set_terminate_result);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3882,7 +4261,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut malformed_terminate_result = set_terminate_result;
     malformed_terminate_result[52] = 1;
     write_guest_bytes(&process, tls, &malformed_terminate_result);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3895,7 +4277,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     get_service[32..40].fill(0);
     get_service[32..35].copy_from_slice(b"hid");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3920,7 +4302,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     // semantic u64 payload. The service must not treat those bytes as input.
     activate_touch_screen[56] = 0xa5;
     write_guest_bytes(&process, tls, &activate_touch_screen);
-    state(&mut process).write_w(x(0), hid_handle);
+    process.main_thread().registers().write_w(x(0), hid_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3930,7 +4312,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     let mut malformed_touch_screen_activation = activate_touch_screen;
     put_u32(&mut malformed_touch_screen_activation, 4, 8 | (1 << 31));
     write_guest_bytes(&process, tls, &malformed_touch_screen_activation);
-    state(&mut process).write_w(x(0), hid_handle);
+    process.main_thread().registers().write_w(x(0), hid_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3949,7 +4331,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut activate_npad, 32, 0x4943_4653);
     put_u32(&mut activate_npad, 40, 103);
     write_guest_bytes(&process, tls, &activate_npad);
-    state(&mut process).write_w(x(0), hid_handle);
+    process.main_thread().registers().write_w(x(0), hid_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3961,7 +4343,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut set_style, 40, 100);
     put_u32(&mut set_style, 48, 1);
     write_guest_bytes(&process, tls, &set_style);
-    state(&mut process).write_w(x(0), hid_handle);
+    process.main_thread().registers().write_w(x(0), hid_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -3976,7 +4358,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut query_hid_pointer_size, 16, 0x4943_4653);
     put_u32(&mut query_hid_pointer_size, 24, 3);
     write_guest_bytes(&process, tls, &query_hid_pointer_size);
-    state(&mut process).write_w(x(0), hid_handle);
+    process.main_thread().registers().write_w(x(0), hid_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4006,7 +4388,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         put_u32(&mut set_ids, 0xe0 + index * 4, id);
     }
     write_guest_bytes(&process, tls, &set_ids);
-    state(&mut process).write_w(x(0), hid_handle);
+    process.main_thread().registers().write_w(x(0), hid_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4019,7 +4401,7 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut create_resource, 8, 1);
     put_u32(&mut create_resource, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &create_resource);
-    state(&mut process).write_w(x(0), hid_handle);
+    process.main_thread().registers().write_w(x(0), hid_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4038,7 +4420,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut get_shared_memory, 4, 10);
     put_u32(&mut get_shared_memory, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &get_shared_memory);
-    state(&mut process).write_w(x(0), resource_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), resource_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4057,15 +4442,21 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     ));
 
     let mapping_address = process.memory_layout().alias().base();
-    state(&mut process).write_w(x(0), shared_memory_handle);
-    state(&mut process).write_x(x(1), mapping_address.get());
-    state(&mut process).write_x(x(2), 0x40000);
-    state(&mut process).write_w(x(3), 1);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), shared_memory_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), mapping_address.get());
+    process.main_thread().registers().write_x(x(2), 0x40000);
+    process.main_thread().registers().write_w(x(3), 1);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    assert_eq!(state(&mut process).read_w(x(0)), 0);
+    assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
     assert_eq!(
         read_guest_bytes(&process, mapping_address.checked_add(7).unwrap(), 1),
         [0x5a]
@@ -4146,14 +4537,20 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
         0
     );
 
-    state(&mut process).write_w(x(0), shared_memory_handle);
-    state(&mut process).write_x(x(1), mapping_address.get());
-    state(&mut process).write_x(x(2), 0x40000);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), shared_memory_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), mapping_address.get());
+    process.main_thread().registers().write_x(x(2), 0x40000);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    assert_eq!(state(&mut process).read_w(x(0)), 0);
+    assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
     assert!(
         process
             .memory()
@@ -4172,7 +4569,10 @@ fn named_sm_session_registers_client_and_returns_supported_service_handle() {
     put_u32(&mut self_exit, 32, 0x4943_4653);
     put_u32(&mut self_exit, 40, 0);
     write_guest_bytes(&process, tls, &self_exit);
-    state(&mut process).write_w(x(0), applet_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), applet_handle);
     assert!(
         matches!(dispatch_next(&mut process, &mut dispatcher), ExceptionHandlingResult::Terminated {scope, exit_code, reason} if (scope, exit_code, reason) == (ExceptionTerminationScope::Process, 0, ExceptionTerminationReason::Requested))
     );
@@ -4197,12 +4597,12 @@ fn bsd_registration_and_monitoring_share_state_between_service_sessions() {
     let name = process.main_thread().stack_bottom;
     let tls = process.main_thread().tls_base;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
 
     let mut register_sm = [0_u8; 0x100];
     put_u32(&mut register_sm, 0, 4);
@@ -4210,7 +4610,7 @@ fn bsd_registration_and_monitoring_share_state_between_service_sessions() {
     put_u32(&mut register_sm, 8, 1);
     put_u32(&mut register_sm, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register_sm);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4224,7 +4624,7 @@ fn bsd_registration_and_monitoring_share_state_between_service_sessions() {
     put_u32(&mut get_bsd, 24, 1);
     get_bsd[32..38].copy_from_slice(b"bsd:u\0");
     write_guest_bytes(&process, tls, &get_bsd);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4239,7 +4639,7 @@ fn bsd_registration_and_monitoring_share_state_between_service_sessions() {
     ));
 
     write_guest_bytes(&process, tls, &get_bsd);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4259,7 +4659,10 @@ fn bsd_registration_and_monitoring_share_state_between_service_sessions() {
     put_u32(&mut convert_primary, 4, 8);
     put_u32(&mut convert_primary, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &convert_primary);
-    state(&mut process).write_w(x(0), primary_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), primary_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4272,7 +4675,10 @@ fn bsd_registration_and_monitoring_share_state_between_service_sessions() {
     put_u32(&mut clone_primary, 16, 0x4943_4653);
     put_u32(&mut clone_primary, 24, 2);
     write_guest_bytes(&process, tls, &clone_primary);
-    state(&mut process).write_w(x(0), primary_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), primary_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4303,18 +4709,24 @@ fn bsd_registration_and_monitoring_share_state_between_service_sessions() {
             },
         )
         .unwrap();
-    state(&mut process).write_x(x(1), transfer_address.get());
-    state(&mut process).write_x(x(2), TRANSFER_SIZE);
-    state(&mut process).write_w(x(3), 0);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), transfer_address.get());
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(2), TRANSFER_SIZE);
+    process.main_thread().registers().write_w(x(3), 0);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
-    let transfer_handle = state(&mut process).read_w(x(1));
+    let transfer_handle = process.main_thread().registers().read_w(x(1));
 
     let mut register_bsd = [0_u8; 0x100];
     put_u32(&mut register_bsd, 0, 4);
@@ -4331,7 +4743,10 @@ fn bsd_registration_and_monitoring_share_state_between_service_sessions() {
     }
     put_u64(&mut register_bsd, 104, TRANSFER_SIZE);
     write_guest_bytes(&process, tls, &register_bsd);
-    state(&mut process).write_w(x(0), cloned_primary_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), cloned_primary_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4343,7 +4758,10 @@ fn bsd_registration_and_monitoring_share_state_between_service_sessions() {
     assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
     assert_eq!(read_guest_u32(&process, tls.checked_add(48).unwrap()), 0);
 
-    state(&mut process).write_w(x(0), transfer_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), transfer_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4358,7 +4776,10 @@ fn bsd_registration_and_monitoring_share_state_between_service_sessions() {
     put_u32(&mut start_monitoring, 40, 1);
     put_u64(&mut start_monitoring, 48, 0);
     write_guest_bytes(&process, tls, &start_monitoring);
-    state(&mut process).write_w(x(0), monitor_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), monitor_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4369,24 +4790,20 @@ fn bsd_registration_and_monitoring_share_state_between_service_sessions() {
 #[test]
 fn send_sync_request_uses_runtime_owned_tls_when_user_tls_diverges() {
     let (_directory, mut process) = fixture_process(&[svc(0x1f), svc(0x21)]);
-    let mut dispatcher = support::dispatcher_with_clock(
-        &process,
-        OperationMode::Console,
-        nixe_runtime::VirtualClock::default(),
-    );
+    let mut dispatcher = support::dispatcher_with_mode(&process, OperationMode::Console);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
 
     let tls = process.main_thread().tls_base;
-    assert_eq!(state(&mut process).tpidrro_el0(), tls.get());
-    state(&mut process).set_tpidr_el0(0);
+    assert_eq!(process.main_thread().registers().tpidrro_el0(), tls.get());
+    process.main_thread().registers().set_tpidr_el0(0);
 
     let mut query = [0_u8; 0x100];
     put_u32(&mut query, 0, 5);
@@ -4394,14 +4811,14 @@ fn send_sync_request_uses_runtime_owned_tls_when_user_tls_diverges() {
     put_u32(&mut query, 16, 0x4943_4653);
     put_u32(&mut query, 24, 3);
     write_guest_bytes(&process, tls, &query);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
     assert_eq!(read_guest_u32(&process, tls), 0);
@@ -4428,19 +4845,22 @@ fn user_settings_service_reports_configured_language_codes_and_region() {
     let mut dispatcher = HorizonSvcDispatcher::new_with_video_and_settings(
         OperationMode::Console,
         crate::TimeEnvironment::new(account, nixe_runtime::VirtualClock::default(), "UTC").unwrap(),
-        crate::HidSystem::new(account).unwrap(),
+        crate::HidSystem::new(account, process.scheduler()).unwrap(),
         crate::SharedFontSession::new(account, None).unwrap(),
         settings,
-        crate::VideoSystem::new(process.memory().space().machine().clone()),
+        crate::VideoSystem::new(
+            process.memory().space().machine().clone(),
+            process.scheduler(),
+        ),
     );
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
 
     let mut register = [0_u8; 0x100];
@@ -4449,7 +4869,7 @@ fn user_settings_service_reports_configured_language_codes_and_region() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4462,7 +4882,7 @@ fn user_settings_service_reports_configured_language_codes_and_region() {
     put_u32(&mut get_service, 24, 1);
     get_service[32..35].copy_from_slice(b"set");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4481,7 +4901,10 @@ fn user_settings_service_reports_configured_language_codes_and_region() {
     put_u32(&mut get_language, 4, 10);
     put_u32(&mut get_language, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &get_language);
-    state(&mut process).write_w(x(0), settings_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), settings_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4502,7 +4925,10 @@ fn user_settings_service_reports_configured_language_codes_and_region() {
         nixe_horizon::SystemLanguage::BritishEnglish as u32,
     );
     write_guest_bytes(&process, tls, &make_language);
-    state(&mut process).write_w(x(0), settings_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), settings_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4518,7 +4944,10 @@ fn user_settings_service_reports_configured_language_codes_and_region() {
     put_u32(&mut get_region, 16, 0x4943_4653);
     put_u32(&mut get_region, 24, 4);
     write_guest_bytes(&process, tls, &get_region);
-    state(&mut process).write_w(x(0), settings_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), settings_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4536,7 +4965,10 @@ fn user_settings_service_reports_configured_language_codes_and_region() {
     put_u32(&mut get_available, 32, 0x4943_4653);
     put_u32(&mut get_available, 40, 5);
     write_guest_bytes(&process, tls, &get_available);
-    state(&mut process).write_w(x(0), settings_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), settings_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4554,13 +4986,13 @@ fn sm_stops_on_an_authorized_service_without_emulator_semantics() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
 
     let mut register = [0_u8; 0x100];
@@ -4569,7 +5001,7 @@ fn sm_stops_on_an_authorized_service_without_emulator_semantics() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4582,7 +5014,7 @@ fn sm_stops_on_an_authorized_service_without_emulator_semantics() {
     put_u32(&mut get_service, 24, 1);
     get_service[32..40].copy_from_slice(b"missing\0");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
 
     assert!(
         matches!(dispatch_next(&mut process, &mut dispatcher), ExceptionHandlingResult::Fault(HorizonSvcFault::Ipc {immediate, fault}) if immediate == 0x21 && fault.to_string() == (Box::new(HorizonIpcFault::unsupported_service(
@@ -4609,12 +5041,12 @@ fn parental_control_domain_initializes_before_granting_unrestricted_communicatio
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
 
     let mut register = [0_u8; 0x100];
@@ -4623,7 +5055,7 @@ fn parental_control_domain_initializes_before_granting_unrestricted_communicatio
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4636,7 +5068,7 @@ fn parental_control_domain_initializes_before_granting_unrestricted_communicatio
     put_u32(&mut get_service, 24, 1);
     get_service[32..40].copy_from_slice(b"pctl\0\0\0\0");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4655,7 +5087,7 @@ fn parental_control_domain_initializes_before_granting_unrestricted_communicatio
     put_u32(&mut convert, 4, 8);
     put_u32(&mut convert, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &convert);
-    state(&mut process).write_w(x(0), pctl_handle);
+    process.main_thread().registers().write_w(x(0), pctl_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4673,7 +5105,7 @@ fn parental_control_domain_initializes_before_granting_unrestricted_communicatio
     put_u32(&mut create_without_initialize, 48, 0x4943_4653);
     put_u32(&mut create_without_initialize, 56, 1);
     write_guest_bytes(&process, tls, &create_without_initialize);
-    state(&mut process).write_w(x(0), pctl_handle);
+    process.main_thread().registers().write_w(x(0), pctl_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4690,7 +5122,7 @@ fn parental_control_domain_initializes_before_granting_unrestricted_communicatio
     put_u32(&mut check_communication, 32, 0x4943_4653);
     put_u32(&mut check_communication, 40, 1001);
     write_guest_bytes(&process, tls, &check_communication);
-    state(&mut process).write_w(x(0), pctl_handle);
+    process.main_thread().registers().write_w(x(0), pctl_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4703,7 +5135,7 @@ fn parental_control_domain_initializes_before_granting_unrestricted_communicatio
     let mut initialize = check_communication;
     put_u32(&mut initialize, 40, 1);
     write_guest_bytes(&process, tls, &initialize);
-    state(&mut process).write_w(x(0), pctl_handle);
+    process.main_thread().registers().write_w(x(0), pctl_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4711,7 +5143,7 @@ fn parental_control_domain_initializes_before_granting_unrestricted_communicatio
     assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
 
     write_guest_bytes(&process, tls, &check_communication);
-    state(&mut process).write_w(x(0), pctl_handle);
+    process.main_thread().registers().write_w(x(0), pctl_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4721,7 +5153,7 @@ fn parental_control_domain_initializes_before_granting_unrestricted_communicatio
     let mut restriction_enabled = check_communication;
     put_u32(&mut restriction_enabled, 40, 1031);
     write_guest_bytes(&process, tls, &restriction_enabled);
-    state(&mut process).write_w(x(0), pctl_handle);
+    process.main_thread().registers().write_w(x(0), pctl_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4752,12 +5184,12 @@ fn time_service_preserves_plain_handles_and_domain_object_lifetimes() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
 
     let mut register = [0_u8; 0x100];
@@ -4766,7 +5198,7 @@ fn time_service_preserves_plain_handles_and_domain_object_lifetimes() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4779,7 +5211,7 @@ fn time_service_preserves_plain_handles_and_domain_object_lifetimes() {
     put_u32(&mut get_service, 24, 1);
     get_service[32..40].copy_from_slice(b"time:u\0\0");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4798,7 +5230,7 @@ fn time_service_preserves_plain_handles_and_domain_object_lifetimes() {
     put_u32(&mut open_user_clock, 4, 8);
     put_u32(&mut open_user_clock, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &open_user_clock);
-    state(&mut process).write_w(x(0), time_handle);
+    process.main_thread().registers().write_w(x(0), time_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4817,7 +5249,10 @@ fn time_service_preserves_plain_handles_and_domain_object_lifetimes() {
     put_u32(&mut get_current_time, 4, 8);
     put_u32(&mut get_current_time, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &get_current_time);
-    state(&mut process).write_w(x(0), user_clock_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), user_clock_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4829,7 +5264,7 @@ fn time_service_preserves_plain_handles_and_domain_object_lifetimes() {
     put_u32(&mut convert, 4, 8);
     put_u32(&mut convert, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &convert);
-    state(&mut process).write_w(x(0), time_handle);
+    process.main_thread().registers().write_w(x(0), time_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4845,7 +5280,7 @@ fn time_service_preserves_plain_handles_and_domain_object_lifetimes() {
     put_u32(&mut open_domain_user_clock, 32, 0x4943_4653);
     put_u32(&mut open_domain_user_clock, 40, 0);
     write_guest_bytes(&process, tls, &open_domain_user_clock);
-    state(&mut process).write_w(x(0), time_handle);
+    process.main_thread().registers().write_w(x(0), time_handle);
     let handles_before_domain_child = process.handles().len();
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
@@ -4859,7 +5294,7 @@ fn time_service_preserves_plain_handles_and_domain_object_lifetimes() {
     put_u32(&mut get_clock_context, 20, user_clock_object);
     put_u32(&mut get_clock_context, 40, 2);
     write_guest_bytes(&process, tls, &get_clock_context);
-    state(&mut process).write_w(x(0), time_handle);
+    process.main_thread().registers().write_w(x(0), time_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4883,7 +5318,7 @@ fn time_service_preserves_plain_handles_and_domain_object_lifetimes() {
     put_u32(&mut calculate_monotonic_base, 40, 300);
     calculate_monotonic_base[48..80].copy_from_slice(&clock_context);
     write_guest_bytes(&process, tls, &calculate_monotonic_base);
-    state(&mut process).write_w(x(0), time_handle);
+    process.main_thread().registers().write_w(x(0), time_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4900,7 +5335,7 @@ fn time_service_preserves_plain_handles_and_domain_object_lifetimes() {
 
     calculate_monotonic_base[64] ^= 1;
     write_guest_bytes(&process, tls, &calculate_monotonic_base);
-    state(&mut process).write_w(x(0), time_handle);
+    process.main_thread().registers().write_w(x(0), time_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4916,7 +5351,7 @@ fn time_service_preserves_plain_handles_and_domain_object_lifetimes() {
     close_user_clock[16] = 2;
     put_u32(&mut close_user_clock, 20, user_clock_object);
     write_guest_bytes(&process, tls, &close_user_clock);
-    state(&mut process).write_w(x(0), time_handle);
+    process.main_thread().registers().write_w(x(0), time_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4924,7 +5359,7 @@ fn time_service_preserves_plain_handles_and_domain_object_lifetimes() {
     assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
 
     write_guest_bytes(&process, tls, &get_clock_context);
-    state(&mut process).write_w(x(0), time_handle);
+    process.main_thread().registers().write_w(x(0), time_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4943,12 +5378,12 @@ fn ssl_initialization_negotiates_a_version_and_shares_its_domain_with_clones() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
 
     let mut register = [0_u8; 0x100];
@@ -4957,7 +5392,7 @@ fn ssl_initialization_negotiates_a_version_and_shares_its_domain_with_clones() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4970,7 +5405,7 @@ fn ssl_initialization_negotiates_a_version_and_shares_its_domain_with_clones() {
     put_u32(&mut get_service, 24, 1);
     get_service[32..40].copy_from_slice(b"ssl\0\0\0\0\0");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -4990,7 +5425,7 @@ fn ssl_initialization_negotiates_a_version_and_shares_its_domain_with_clones() {
     put_u32(&mut control, 4, 8);
     put_u32(&mut control, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &control);
-    state(&mut process).write_w(x(0), ssl_handle);
+    process.main_thread().registers().write_w(x(0), ssl_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5009,7 +5444,7 @@ fn ssl_initialization_negotiates_a_version_and_shares_its_domain_with_clones() {
     put_u32(&mut set_version, 40, 5);
     put_u32(&mut set_version, 48, 1);
     write_guest_bytes(&process, tls, &set_version);
-    state(&mut process).write_w(x(0), ssl_handle);
+    process.main_thread().registers().write_w(x(0), ssl_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5025,7 +5460,7 @@ fn ssl_initialization_negotiates_a_version_and_shares_its_domain_with_clones() {
         put_u32(&mut control, 24, clone_command);
         put_u32(&mut control, 4, if clone_command == 4 { 9 } else { 8 });
         write_guest_bytes(&process, tls, &control);
-        state(&mut process).write_w(x(0), ssl_handle);
+        process.main_thread().registers().write_w(x(0), ssl_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -5042,7 +5477,10 @@ fn ssl_initialization_negotiates_a_version_and_shares_its_domain_with_clones() {
         assert_eq!(clone.interface_version(), version - 1);
         put_u32(&mut set_version, 48, version);
         write_guest_bytes(&process, tls, &set_version);
-        state(&mut process).write_w(x(0), clone_handle);
+        process
+            .main_thread()
+            .registers()
+            .write_w(x(0), clone_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -5055,7 +5493,7 @@ fn ssl_initialization_negotiates_a_version_and_shares_its_domain_with_clones() {
     put_u32(&mut set_version, 20, root_object + 1);
     put_u32(&mut set_version, 48, 1);
     write_guest_bytes(&process, tls, &set_version);
-    state(&mut process).write_w(x(0), ssl_handle);
+    process.main_thread().registers().write_w(x(0), ssl_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5069,7 +5507,7 @@ fn ssl_initialization_negotiates_a_version_and_shares_its_domain_with_clones() {
     put_u32(&mut set_version, 20, root_object);
     put_u32(&mut set_version, 40, 0); // CreateContext must not fabricate a TLS context.
     write_guest_bytes(&process, tls, &set_version);
-    state(&mut process).write_w(x(0), ssl_handle);
+    process.main_thread().registers().write_w(x(0), ssl_handle);
     assert!(
         matches!(dispatch_next(&mut process, &mut dispatcher), ExceptionHandlingResult::Fault(HorizonSvcFault::Ipc {immediate, fault}) if immediate == 0x21 && fault.to_string() == (Box::new(HorizonIpcFault::unsupported_service(
                 UnsupportedServiceOperation::Command {
@@ -5101,12 +5539,12 @@ fn network_interface_manager_creates_a_process_general_service_in_its_domain() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
 
     let mut register = [0_u8; 0x100];
@@ -5115,7 +5553,7 @@ fn network_interface_manager_creates_a_process_general_service_in_its_domain() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5128,7 +5566,7 @@ fn network_interface_manager_creates_a_process_general_service_in_its_domain() {
     put_u32(&mut get_service, 24, 1);
     get_service[32..40].copy_from_slice(b"nifm:u\0\0");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5147,7 +5585,7 @@ fn network_interface_manager_creates_a_process_general_service_in_its_domain() {
     put_u32(&mut convert, 4, 8);
     put_u32(&mut convert, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &convert);
-    state(&mut process).write_w(x(0), nifm_handle);
+    process.main_thread().registers().write_w(x(0), nifm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5166,7 +5604,7 @@ fn network_interface_manager_creates_a_process_general_service_in_its_domain() {
     put_u32(&mut create_general_service, 56, 5);
     let handles_before_child = process.handles().len();
     write_guest_bytes(&process, tls, &create_general_service);
-    state(&mut process).write_w(x(0), nifm_handle);
+    process.main_thread().registers().write_w(x(0), nifm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5185,7 +5623,7 @@ fn network_interface_manager_creates_a_process_general_service_in_its_domain() {
     put_u32(&mut request, 40, 4);
     put_u32(&mut request, 48, 2);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), nifm_handle);
+    process.main_thread().registers().write_w(x(0), nifm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5198,7 +5636,7 @@ fn network_interface_manager_creates_a_process_general_service_in_its_domain() {
     put_u32(&mut request, 20, request_object);
     put_u32(&mut request, 40, 2);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), nifm_handle);
+    process.main_thread().registers().write_w(x(0), nifm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5219,7 +5657,7 @@ fn network_interface_manager_creates_a_process_general_service_in_its_domain() {
     ] {
         put_u32(&mut request, 40, command);
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), nifm_handle);
+        process.main_thread().registers().write_w(x(0), nifm_handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -5245,7 +5683,7 @@ fn network_interface_manager_creates_a_process_general_service_in_its_domain() {
     close_general_service[16] = 2;
     put_u32(&mut close_general_service, 20, general_service_object);
     write_guest_bytes(&process, tls, &close_general_service);
-    state(&mut process).write_w(x(0), nifm_handle);
+    process.main_thread().registers().write_w(x(0), nifm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5261,7 +5699,7 @@ fn network_interface_manager_creates_a_process_general_service_in_its_domain() {
     put_u32(&mut query_closed_service, 32, 0x4943_4653);
     put_u32(&mut query_closed_service, 40, 18);
     write_guest_bytes(&process, tls, &query_closed_service);
-    state(&mut process).write_w(x(0), nifm_handle);
+    process.main_thread().registers().write_w(x(0), nifm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5285,13 +5723,13 @@ fn log_manager_opens_a_process_logger_and_accepts_structured_log_packets() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
 
     let mut register = [0_u8; 0x100];
@@ -5300,7 +5738,7 @@ fn log_manager_opens_a_process_logger_and_accepts_structured_log_packets() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5313,7 +5751,7 @@ fn log_manager_opens_a_process_logger_and_accepts_structured_log_packets() {
     put_u32(&mut get_service, 24, 1);
     get_service[32..40].copy_from_slice(b"lm\0\0\0\0\0\0");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5332,7 +5770,7 @@ fn log_manager_opens_a_process_logger_and_accepts_structured_log_packets() {
     put_u32(&mut missing_pid, 4, 8);
     put_u32(&mut missing_pid, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &missing_pid);
-    state(&mut process).write_w(x(0), lm_handle);
+    process.main_thread().registers().write_w(x(0), lm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5348,7 +5786,7 @@ fn log_manager_opens_a_process_logger_and_accepts_structured_log_packets() {
     put_u32(&mut open_logger, 8, 1);
     put_u32(&mut open_logger, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &open_logger);
-    state(&mut process).write_w(x(0), lm_handle);
+    process.main_thread().registers().write_w(x(0), lm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5387,7 +5825,10 @@ fn log_manager_opens_a_process_logger_and_accepts_structured_log_packets() {
     );
     put_u32(&mut log, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &log);
-    state(&mut process).write_w(x(0), logger_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), logger_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5408,13 +5849,13 @@ fn account_application_info_binds_the_calling_process() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm_handle = state(&mut process).read_w(x(1));
+    let sm_handle = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
 
     let mut register = [0_u8; 0x100];
@@ -5423,7 +5864,7 @@ fn account_application_info_binds_the_calling_process() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5436,7 +5877,7 @@ fn account_application_info_binds_the_calling_process() {
     put_u32(&mut get_service, 24, 1);
     get_service[32..40].copy_from_slice(b"acc:u0\0\0");
     write_guest_bytes(&process, tls, &get_service);
-    state(&mut process).write_w(x(0), sm_handle);
+    process.main_thread().registers().write_w(x(0), sm_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5455,7 +5896,10 @@ fn account_application_info_binds_the_calling_process() {
     put_u32(&mut count, 4, 8);
     put_u32(&mut count, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &count);
-    state(&mut process).write_w(x(0), account_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), account_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5470,7 +5914,10 @@ fn account_application_info_binds_the_calling_process() {
     put_u32(&mut initialize, 32, 0x4943_4653);
     put_u32(&mut initialize, 40, 100);
     write_guest_bytes(&process, tls, &initialize);
-    state(&mut process).write_w(x(0), account_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), account_handle);
 
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
@@ -5485,7 +5932,10 @@ fn account_application_info_binds_the_calling_process() {
     put_u32(&mut get_plain_manager, 24, 101);
     get_plain_manager[32..48].copy_from_slice(&1_u128.to_le_bytes());
     write_guest_bytes(&process, tls, &get_plain_manager);
-    state(&mut process).write_w(x(0), account_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), account_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5505,7 +5955,10 @@ fn account_application_info_binds_the_calling_process() {
     put_u32(&mut convert, 4, 8);
     put_u32(&mut convert, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &convert);
-    state(&mut process).write_w(x(0), account_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), account_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5523,7 +5976,10 @@ fn account_application_info_binds_the_calling_process() {
     put_u32(&mut domain_initialize, 48, 0x4943_4653);
     put_u32(&mut domain_initialize, 56, 100);
     write_guest_bytes(&process, tls, &domain_initialize);
-    state(&mut process).write_w(x(0), account_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), account_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5539,7 +5995,10 @@ fn account_application_info_binds_the_calling_process() {
     put_u32(&mut malformed_get_manager, 32, 0x4943_4653);
     put_u32(&mut malformed_get_manager, 40, 101);
     write_guest_bytes(&process, tls, &malformed_get_manager);
-    state(&mut process).write_w(x(0), account_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), account_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5560,7 +6019,10 @@ fn account_application_info_binds_the_calling_process() {
     get_domain_manager[48..64].copy_from_slice(&1_u128.to_le_bytes());
     let handles_before_domain_manager = process.handles().len();
     write_guest_bytes(&process, tls, &get_domain_manager);
-    state(&mut process).write_w(x(0), account_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), account_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5576,7 +6038,10 @@ fn account_application_info_binds_the_calling_process() {
     close_domain_manager[16] = 2;
     put_u32(&mut close_domain_manager, 20, domain_manager_object);
     write_guest_bytes(&process, tls, &close_domain_manager);
-    state(&mut process).write_w(x(0), account_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), account_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5587,7 +6052,10 @@ fn account_application_info_binds_the_calling_process() {
     put_u32(&mut query_closed_manager, 20, domain_manager_object);
     put_u32(&mut query_closed_manager, 40, 0);
     write_guest_bytes(&process, tls, &query_closed_manager);
-    state(&mut process).write_w(x(0), account_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), account_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5620,7 +6088,10 @@ fn cmif_clone_current_object_returns_an_independent_handle_to_the_shared_domain(
     put_u32(&mut convert, 4, 8);
     put_u32(&mut convert, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &convert);
-    state(&mut process).write_w(x(0), source_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), source_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5630,7 +6101,10 @@ fn cmif_clone_current_object_returns_an_independent_handle_to_the_shared_domain(
     let mut clone = convert;
     put_u32(&mut clone, 24, 2);
     write_guest_bytes(&process, tls, &clone);
-    state(&mut process).write_w(x(0), source_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), source_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5660,7 +6134,10 @@ fn cmif_clone_current_object_returns_an_independent_handle_to_the_shared_domain(
     put_u32(&mut access_log_mode, 32, 0x4943_4653);
     put_u32(&mut access_log_mode, 40, 1005);
     write_guest_bytes(&process, tls, &access_log_mode);
-    state(&mut process).write_w(x(0), cloned_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), cloned_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5671,7 +6148,10 @@ fn cmif_clone_current_object_returns_an_independent_handle_to_the_shared_domain(
     let mut query_pointer_size = convert;
     put_u32(&mut query_pointer_size, 24, 3);
     write_guest_bytes(&process, tls, &query_pointer_size);
-    state(&mut process).write_w(x(0), cloned_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), cloned_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5679,14 +6159,20 @@ fn cmif_clone_current_object_returns_an_independent_handle_to_the_shared_domain(
     assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
 
     write_guest_bytes(&process, tls, &[2, 0, 0, 0, 0, 0, 0, 0]);
-    state(&mut process).write_w(x(0), cloned_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), cloned_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert!(process.handles().lookup(cloned_handle).is_some());
 
-    state(&mut process).write_w(x(0), cloned_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), cloned_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5694,7 +6180,10 @@ fn cmif_clone_current_object_returns_an_independent_handle_to_the_shared_domain(
     assert!(process.handles().lookup(cloned_handle).is_none());
 
     write_guest_bytes(&process, tls, &query_pointer_size);
-    state(&mut process).write_w(x(0), source_handle);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), source_handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5712,12 +6201,12 @@ fn filesystem_wire_reports_attributes_and_deletes_files_in_plain_and_domain_sess
         fs::create_dir(&sd).unwrap();
         fs::write(sd.join("progress"), b"save").unwrap();
         let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-        let mut process = support::process_builder()
+        let process = support::process_builder()
             .with_sd_card_root(sd.clone())
             .build(&plan)
             .unwrap();
         let test_entry = process.entry_module().entry_address() + 0x80;
-        state(&mut process).set_pc(test_entry);
+        process.main_thread().registers().set_pc(test_entry);
         let mut process = ScheduledProcess::new(process);
         let mut dispatcher = support::dispatcher(&process);
         let fsp = service_handle(&process, IpcService::FileSystem);
@@ -5733,7 +6222,7 @@ fn filesystem_wire_reports_attributes_and_deletes_files_in_plain_and_domain_sess
             put_u32(&mut convert, 4, 8);
             put_u32(&mut convert, 16, 0x4943_4653);
             write_guest_bytes(&process, tls, &convert);
-            state(&mut process).write_w(x(0), fsp);
+            process.main_thread().registers().write_w(x(0), fsp);
             assert!(matches!(
                 dispatch_next(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed
@@ -5753,7 +6242,7 @@ fn filesystem_wire_reports_attributes_and_deletes_files_in_plain_and_domain_sess
         put_u32(&mut open, header, 0x4943_4653);
         put_u32(&mut open, header + 8, 18);
         write_guest_bytes(&process, tls, &open);
-        state(&mut process).write_w(x(0), fsp);
+        process.main_thread().registers().write_w(x(0), fsp);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -5774,7 +6263,7 @@ fn filesystem_wire_reports_attributes_and_deletes_files_in_plain_and_domain_sess
         put_u32(&mut query, header, 0x4943_4653);
         put_u32(&mut query, header + 8, 16);
         write_guest_bytes(&process, tls, &query);
-        state(&mut process).write_w(x(0), target);
+        process.main_thread().registers().write_w(x(0), target);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -5818,7 +6307,7 @@ fn filesystem_wire_reports_attributes_and_deletes_files_in_plain_and_domain_sess
             put_u32(&mut delete, header, 0x4943_4653);
             put_u32(&mut delete, header + 8, 1);
             write_guest_bytes(&process, tls, &delete);
-            state(&mut process).write_w(x(0), target);
+            process.main_thread().registers().write_w(x(0), target);
             assert!(matches!(
                 dispatch_next(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed
@@ -5858,7 +6347,10 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     put_u32(&mut convert, 4, 8);
     put_u32(&mut convert, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &convert);
-    state(&mut process).write_w(x(0), filesystem_session);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), filesystem_session);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5876,7 +6368,10 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     put_u32(&mut set_process, 48, 0x4943_4653);
     put_u32(&mut set_process, 56, 1);
     write_guest_bytes(&process, tls, &set_process);
-    state(&mut process).write_w(x(0), filesystem_session);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), filesystem_session);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5892,7 +6387,10 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     put_u32(&mut open_primary, 32, 0x4943_4653);
     put_u32(&mut open_primary, 40, 2);
     write_guest_bytes(&process, tls, &open_primary);
-    state(&mut process).write_w(x(0), filesystem_session);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), filesystem_session);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5912,7 +6410,10 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     put_u32(&mut open_file, 40, 8);
     put_u32(&mut open_file, 48, 1);
     write_guest_bytes(&process, tls, &open_file);
-    state(&mut process).write_w(x(0), filesystem_session);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), filesystem_session);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5932,7 +6433,10 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     put_u64(&mut read_file, 72, 0);
     put_u64(&mut read_file, 80, 0x20);
     write_guest_bytes(&process, tls, &read_file);
-    state(&mut process).write_w(x(0), filesystem_session);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), filesystem_session);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5959,7 +6463,10 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     put_u32(&mut open_directory, 40, 9);
     put_u32(&mut open_directory, 48, 3);
     write_guest_bytes(&process, tls, &open_directory);
-    state(&mut process).write_w(x(0), filesystem_session);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), filesystem_session);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -5976,7 +6483,10 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_romfs() {
     put_u32(&mut read_directory, 36, directory_object);
     put_u32(&mut read_directory, 48, 0x4943_4653);
     write_guest_bytes(&process, tls, &read_directory);
-    state(&mut process).write_w(x(0), filesystem_session);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), filesystem_session);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -6014,23 +6524,26 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
     let filesystem_session = service_handle(&process, IpcService::FileSystem);
     let tls = process.main_thread().tls_base;
 
-    state(&mut process).write_x(x(1), HEAP_SIZE);
+    process.main_thread().registers().write_x(x(1), HEAP_SIZE);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
-    let output_address = GuestVirtualAddress::new(state(&mut process).read_x(x(1)));
+    let output_address = GuestVirtualAddress::new(process.main_thread().registers().read_x(x(1)));
 
     let mut convert = [0_u8; 0x100];
     put_u32(&mut convert, 0, 5);
     put_u32(&mut convert, 4, 8);
     put_u32(&mut convert, 16, 0x4943_4653);
     write_guest_bytes(&process, tls, &convert);
-    state(&mut process).write_w(x(0), filesystem_session);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), filesystem_session);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -6048,7 +6561,10 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
     put_u32(&mut set_process, 48, 0x4943_4653);
     put_u32(&mut set_process, 56, 1);
     write_guest_bytes(&process, tls, &set_process);
-    state(&mut process).write_w(x(0), filesystem_session);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), filesystem_session);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -6063,7 +6579,10 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
     put_u32(&mut open_storage, 32, 0x4943_4653);
     put_u32(&mut open_storage, 40, 200);
     write_guest_bytes(&process, tls, &open_storage);
-    state(&mut process).write_w(x(0), filesystem_session);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), filesystem_session);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -6080,7 +6599,10 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
     put_u32(&mut get_size, 32, 0x4943_4653);
     put_u32(&mut get_size, 40, 4);
     write_guest_bytes(&process, tls, &get_size);
-    state(&mut process).write_w(x(0), filesystem_session);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), filesystem_session);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -6107,7 +6629,10 @@ fn filesystem_wire_domain_opens_and_reads_the_primary_storage() {
     put_u64(&mut read_storage, 64, 0);
     put_u64(&mut read_storage, 72, read_size);
     write_guest_bytes(&process, tls, &read_storage);
-    state(&mut process).write_w(x(0), filesystem_session);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), filesystem_session);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -6169,8 +6694,14 @@ fn service_handle(process: &RunnableProcess, service: IpcService) -> u32 {
 fn guest_memory_rejection_returns_a_stable_result_and_retains_the_fault() {
     let (_directory, mut process) = fixture_process(&[svc(0x06)]);
     let read_only_output = process.entry_module().entry_address();
-    state(&mut process).write_x(x(0), read_only_output);
-    state(&mut process).write_x(x(2), read_only_output);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(0), read_only_output);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(2), read_only_output);
 
     let mut dispatcher = support::dispatcher(&process);
     let handling = dispatch_next(&mut process, &mut dispatcher);
@@ -6189,7 +6720,7 @@ fn guest_memory_rejection_returns_a_stable_result_and_retains_the_fault() {
         Some(HorizonKernelResult::INVALID_POINTER)
     );
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::INVALID_POINTER.raw()
     );
     assert_eq!(process.main_thread_lifecycle(), ThreadLifecycle::Ready);
@@ -6198,22 +6729,28 @@ fn guest_memory_rejection_returns_a_stable_result_and_retains_the_fault() {
 #[test]
 fn closing_the_initial_thread_handle_does_not_destroy_the_current_thread() {
     let (_directory, mut process) = fixture_process(&[svc(0x16), svc(0x25)]);
-    let initial_handle = process.main_thread().handle;
-    state(&mut process).write_w(x(0), initial_handle);
+    let initial_handle = process.main_thread_handle();
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(0), initial_handle);
     let mut dispatcher = support::dispatcher(&process);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert!(process.handles().lookup(initial_handle).is_none());
-    assert!(!process.main_thread().object().is_signalled());
+    assert!(!process.main_thread().is_signalled());
 
-    state(&mut process).write_w(x(1), CURRENT_THREAD_HANDLE);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(1), CURRENT_THREAD_HANDLE);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    assert_eq!(state(&mut process).read_x(x(1)), 1);
+    assert_eq!(process.main_thread().registers().read_x(x(1)), 1);
 }
 
 #[test]
@@ -6239,7 +6776,8 @@ fn process_and_last_thread_exit_drive_lifecycle_and_deterministic_teardown() {
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         ));
-        let handles_before_exit = process.handles().len();
+        let main = process.main_thread();
+        assert!(!process.handles().is_empty());
         let exit_source = entry + 4;
 
         assert!(
@@ -6256,16 +6794,16 @@ fn process_and_last_thread_exit_drive_lifecycle_and_deterministic_teardown() {
             exit_source
         );
         assert_eq!(process.exit().unwrap().thread_id, 1);
-        assert_eq!(process.main_thread().exit().unwrap().requested_scope, scope);
+        assert_eq!(main.exit().unwrap().requested_scope, scope);
         assert!(process.run_slice().is_err());
-        assert!(!process.resume());
+        assert_eq!(process.main_thread_lifecycle(), ThreadLifecycle::Exited);
         assert!(!process.terminate());
 
         let teardown = process.teardown();
         assert_eq!(teardown.previous_lifecycle, ProcessLifecycle::Exited);
         assert_eq!(teardown.exit.unwrap().cause, cause);
         assert_eq!(teardown.threads_released, 1);
-        assert_eq!(teardown.handles_released, handles_before_exit);
+        assert_eq!(teardown.handles_released, 0);
         assert!(teardown.mappings_released > 0);
         assert!(teardown.physical_pages_released > 0);
     }
@@ -6276,11 +6814,11 @@ fn create_thread_commits_through_a64_abi() {
     let (_directory, mut process) = fixture_process_with_svcs(&[0x08, 0x09]);
     let entry = process.entry_module().entry_address() + 0x80;
     let stack_top = process.entry_module().entry_address() + 0x2800;
-    write_abi_register(&mut process, 1, entry);
-    write_abi_register(&mut process, 2, 0x1234_5678);
-    write_abi_register(&mut process, 3, stack_top);
-    write_abi_register(&mut process, 4, 20);
-    write_abi_register(&mut process, 5, (-2_i32) as u32 as u64);
+    write_abi_register(&process, 1, entry);
+    write_abi_register(&process, 2, 0x1234_5678);
+    write_abi_register(&process, 3, stack_top);
+    write_abi_register(&process, 4, 20);
+    write_abi_register(&process, 5, (-2_i32) as u32 as u64);
     let process_id = process.scheduler_process_id();
     let mut dispatcher = support::dispatcher(&process);
     let coordinator = process.coordinator_mut();
@@ -6293,22 +6831,16 @@ fn create_thread_commits_through_a64_abi() {
         coordinator
             .route_supervisor_call(execution.lease, &execution.report.stop, &mut dispatcher)
             .unwrap(),
-        ExceptionHandlingResult::Suspended
+        ExceptionHandlingResult::Resumed
     ));
-    assert!(
-        dispatcher
-            .apply_pending_runtime_request(coordinator, process_id, caller)
-            .unwrap()
-            .is_some()
-    );
     let process = coordinator.process(process_id).unwrap();
-    let result = process.thread(caller).unwrap().state().read_w(x(0));
+    let result = process.thread(caller).unwrap().registers().read_w(x(0));
     assert_eq!(result, HorizonKernelResult::SUCCESS.raw());
     assert_eq!(process.threads().len(), 2);
     let created = process
         .threads()
         .iter()
-        .find_map(|(id, thread)| (*id != caller).then_some(thread))
+        .find_map(|(id, thread)| (id != caller).then_some(thread))
         .unwrap();
     let created_id = created.id();
     assert_eq!(
@@ -6320,14 +6852,20 @@ fn create_thread_commits_through_a64_abi() {
         nixe_scheduler::ThreadLifecycle::Created
     );
     assert_eq!(created.stack_top.get(), stack_top);
-    assert_eq!(created.state().read_x(x(0)), 0x1234_5678);
+    assert_eq!(created.registers().read_x(x(0)), 0x1234_5678);
     assert_eq!(
         coordinator.scheduler().thread(caller).unwrap().lifecycle,
         nixe_scheduler::ThreadLifecycle::Ready
     );
-    let created_handle = created.handle;
+    let created_handle = coordinator
+        .process(process_id)
+        .unwrap()
+        .thread(caller)
+        .unwrap()
+        .registers()
+        .read_w(x(1));
     write_abi_register(
-        coordinator.process_mut(process_id).unwrap(),
+        coordinator.process(process_id).unwrap(),
         0,
         u64::from(created_handle),
     );
@@ -6340,14 +6878,8 @@ fn create_thread_commits_through_a64_abi() {
         coordinator
             .route_supervisor_call(execution.lease, &execution.report.stop, &mut dispatcher)
             .unwrap(),
-        ExceptionHandlingResult::Suspended
+        ExceptionHandlingResult::Resumed
     ));
-    assert!(
-        dispatcher
-            .apply_pending_runtime_request(coordinator, process_id, caller)
-            .unwrap()
-            .is_some()
-    );
     assert_eq!(
         coordinator
             .scheduler()
@@ -6364,24 +6896,30 @@ fn homebrew_memory_services_share_runtime_layout_and_commit_state() {
     let mut dispatcher = support::dispatcher(&process);
     let layout = process.memory_layout();
 
-    state(&mut process).write_w(x(1), 2);
-    state(&mut process).write_w(x(2), CURRENT_PROCESS_HANDLE);
-    state(&mut process).write_x(x(3), 0);
+    process.main_thread().registers().write_w(x(1), 2);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(2), CURRENT_PROCESS_HANDLE);
+    process.main_thread().registers().write_x(x(3), 0);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_x(x(1)),
+        process.main_thread().registers().read_x(x(1)),
         layout.alias().base().get()
     );
 
-    state(&mut process).write_x(x(1), 0x20_0000);
+    process.main_thread().registers().write_x(x(1), 0x20_0000);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    assert_eq!(state(&mut process).read_x(x(1)), layout.heap().base().get());
+    assert_eq!(
+        process.main_thread().registers().read_x(x(1)),
+        layout.heap().base().get()
+    );
     let heap = process.memory().query(layout.heap().base()).unwrap();
     assert_eq!(heap.bytes, 0x20_0000);
     assert_eq!(
@@ -6390,9 +6928,9 @@ fn homebrew_memory_services_share_runtime_layout_and_commit_state() {
     );
 
     let code = GuestVirtualAddress::new(process.entry_module().image_base() + 0x2000);
-    state(&mut process).write_x(x(0), code.get());
-    state(&mut process).write_x(x(1), 0x1000);
-    state(&mut process).write_w(x(2), 1);
+    process.main_thread().registers().write_x(x(0), code.get());
+    process.main_thread().registers().write_x(x(1), 0x1000);
+    process.main_thread().registers().write_w(x(2), 1);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -6409,10 +6947,19 @@ fn homebrew_memory_services_share_runtime_layout_and_commit_state() {
     );
 
     let heap_address = layout.heap().base();
-    state(&mut process).write_x(x(0), heap_address.get());
-    state(&mut process).write_x(x(1), 0x1000);
-    state(&mut process).write_w(x(2), MemoryAttributes::UNCACHED.bits());
-    state(&mut process).write_w(x(3), MemoryAttributes::UNCACHED.bits());
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(0), heap_address.get());
+    process.main_thread().registers().write_x(x(1), 0x1000);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(2), MemoryAttributes::UNCACHED.bits());
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(3), MemoryAttributes::UNCACHED.bits());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -6433,13 +6980,13 @@ fn map_memory_moves_user_access_through_one_physical_stack_alias() {
     let (_directory, mut process) = fixture_process(&[svc(0x01), svc(0x04), svc(0x06), svc(0x05)]);
     let mut dispatcher = support::dispatcher(&process);
 
-    state(&mut process).write_x(x(1), 0x20_0000);
+    process.main_thread().registers().write_x(x(1), 0x20_0000);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
 
@@ -6454,15 +7001,21 @@ fn map_memory_moves_user_access_through_one_physical_stack_alias() {
     let initial_used_memory = process.memory_accounting().used_user_physical_memory_size();
     write_guest_bytes(&process, source, &0x1122_3344_u32.to_le_bytes());
 
-    state(&mut process).write_x(x(0), destination.get());
-    state(&mut process).write_x(x(1), source.get());
-    state(&mut process).write_x(x(2), size);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(0), destination.get());
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), source.get());
+    process.main_thread().registers().write_x(x(2), size);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
     let source_mapping = process.memory().query(source).unwrap().mapping.unwrap();
@@ -6506,8 +7059,14 @@ fn map_memory_moves_user_access_through_one_physical_stack_alias() {
     );
 
     let query_output = process.main_thread().stack_bottom;
-    state(&mut process).write_x(x(0), query_output.get());
-    state(&mut process).write_x(x(2), destination.get());
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(0), query_output.get());
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(2), destination.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -6518,15 +7077,21 @@ fn map_memory_moves_user_access_through_one_physical_stack_alias() {
     );
 
     write_guest_bytes(&process, destination, &0xaabb_ccdd_u32.to_le_bytes());
-    state(&mut process).write_x(x(0), destination.get());
-    state(&mut process).write_x(x(1), source.get());
-    state(&mut process).write_x(x(2), size);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(0), destination.get());
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), source.get());
+    process.main_thread().registers().write_x(x(2), size);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
     assert_eq!(read_guest_u32(&process, source), 0xaabb_ccdd);
@@ -6551,18 +7116,18 @@ fn switch_1_application_profile_accepts_a_heap_larger_than_the_test_default() {
     let mut dispatcher = support::dispatcher(&process);
     let heap_size = 0x7000_0000;
 
-    state(&mut process).write_x(x(1), heap_size);
+    process.main_thread().registers().write_x(x(1), heap_size);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
     assert_eq!(process.heap_size(), heap_size);
     assert_eq!(
-        state(&mut process).read_x(x(1)),
+        process.main_thread().registers().read_x(x(1)),
         process.memory_layout().heap().base().get()
     );
 }
@@ -6582,50 +7147,56 @@ fn random_entropy_get_info_uses_the_invalid_handle_and_process_stable_words() {
     let mut entropy = [0_u64; 4];
 
     for (index, value) in entropy.iter_mut().enumerate() {
-        state(&mut process).write_w(x(1), 11);
-        state(&mut process).write_w(x(2), 0);
-        state(&mut process).write_x(x(3), index as u64);
+        process.main_thread().registers().write_w(x(1), 11);
+        process.main_thread().registers().write_w(x(2), 0);
+        process
+            .main_thread()
+            .registers()
+            .write_x(x(3), index as u64);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
-            state(&mut process).read_w(x(0)),
+            process.main_thread().registers().read_w(x(0)),
             HorizonKernelResult::SUCCESS.raw()
         );
-        *value = state(&mut process).read_x(x(1));
+        *value = process.main_thread().registers().read_x(x(1));
     }
 
-    state(&mut process).write_w(x(1), 11);
-    state(&mut process).write_w(x(2), 0);
-    state(&mut process).write_x(x(3), 2);
+    process.main_thread().registers().write_w(x(1), 11);
+    process.main_thread().registers().write_w(x(2), 0);
+    process.main_thread().registers().write_x(x(3), 2);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    assert_eq!(state(&mut process).read_x(x(1)), entropy[2]);
+    assert_eq!(process.main_thread().registers().read_x(x(1)), entropy[2]);
 
-    state(&mut process).write_w(x(1), 11);
-    state(&mut process).write_w(x(2), CURRENT_PROCESS_HANDLE);
-    state(&mut process).write_x(x(3), 0);
+    process.main_thread().registers().write_w(x(1), 11);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(2), CURRENT_PROCESS_HANDLE);
+    process.main_thread().registers().write_x(x(3), 0);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::INVALID_HANDLE.raw()
     );
 
-    state(&mut process).write_w(x(1), 11);
-    state(&mut process).write_w(x(2), 0);
-    state(&mut process).write_x(x(3), 4);
+    process.main_thread().registers().write_w(x(1), 11);
+    process.main_thread().registers().write_w(x(2), 0);
+    process.main_thread().registers().write_x(x(3), 4);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::INVALID_COMBINATION.raw()
     );
 }
@@ -6659,14 +7230,17 @@ fn user_exception_context_get_info_returns_process_owned_memory_separate_from_th
             HorizonKernelResult::INVALID_COMBINATION,
         ),
     ] {
-        state(&mut process).write_w(x(1), 20);
-        state(&mut process).write_w(x(2), handle);
-        state(&mut process).write_x(x(3), subtype);
+        process.main_thread().registers().write_w(x(1), 20);
+        process.main_thread().registers().write_w(x(2), handle);
+        process.main_thread().registers().write_x(x(3), subtype);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         ));
-        assert_eq!(state(&mut process).read_w(x(0)), expected.raw());
+        assert_eq!(
+            process.main_thread().registers().read_w(x(0)),
+            expected.raw()
+        );
     }
 }
 
@@ -6695,7 +7269,7 @@ fn physical_memory_get_info_views_share_incremental_process_accounting() {
     }
 
     let heap_size = 0x20_0000;
-    state(&mut process).write_x(x(1), heap_size);
+    process.main_thread().registers().write_x(x(1), heap_size);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -6727,14 +7301,14 @@ fn heap_shrinks_to_zero_and_memory_state_capabilities_are_enforced() {
     let (_directory, mut process) = fixture_process(&[svc(0x01), svc(0x01), svc(0x03)]);
     let mut dispatcher = support::dispatcher(&process);
 
-    state(&mut process).write_x(x(1), 0x20_0000);
+    process.main_thread().registers().write_x(x(1), 0x20_0000);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(process.heap_size(), 0x20_0000);
 
-    state(&mut process).write_x(x(1), 0);
+    process.main_thread().registers().write_x(x(1), 0);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -6742,10 +7316,16 @@ fn heap_shrinks_to_zero_and_memory_state_capabilities_are_enforced() {
     assert_eq!(process.heap_size(), 0);
 
     let stack = process.main_thread().stack_bottom;
-    state(&mut process).write_x(x(0), stack.get());
-    state(&mut process).write_x(x(1), 0x1000);
-    state(&mut process).write_w(x(2), MemoryAttributes::UNCACHED.bits());
-    state(&mut process).write_w(x(3), MemoryAttributes::UNCACHED.bits());
+    process.main_thread().registers().write_x(x(0), stack.get());
+    process.main_thread().registers().write_x(x(1), 0x1000);
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(2), MemoryAttributes::UNCACHED.bits());
+    process
+        .main_thread()
+        .registers()
+        .write_w(x(3), MemoryAttributes::UNCACHED.bits());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Rejected(HorizonSvcFault::MemoryMapping {fault}) if matches!(fault.as_ref(), nixe_runtime::memory::MappingError::StateMismatch)
@@ -6769,12 +7349,21 @@ fn break_retains_guest_payload_in_the_process_exit_record() {
     frame[..8].fill(0);
     frame[8..].copy_from_slice(&0x7100_5678_u64.to_le_bytes());
     write_guest_bytes(&process, caller_frame_pointer, &frame);
-    state(&mut process).write_x(x(0), 2);
-    state(&mut process).write_x(x(1), 0x1234);
-    state(&mut process).write_x(x(2), 0x40);
-    state(&mut process).write_x(x(29), frame_pointer.get());
-    state(&mut process).write_x(x(30), 0xfeed_face);
-    state(&mut process).write_x(A64Register::StackPointer, frame_pointer.get() - 0x40);
+    process.main_thread().registers().write_x(x(0), 2);
+    process.main_thread().registers().write_x(x(1), 0x1234);
+    process.main_thread().registers().write_x(x(2), 0x40);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(29), frame_pointer.get());
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(30), 0xfeed_face);
+    process
+        .main_thread()
+        .registers()
+        .write_x(A64Register::StackPointer, frame_pointer.get() - 0x40);
     let mut dispatcher = support::dispatcher(&process);
 
     assert!(
@@ -6830,7 +7419,6 @@ fn break_captures_frames_on_a_guest_created_thread_stack() {
     frame[8..].copy_from_slice(&0x7100_5678_u64.to_le_bytes());
     write_guest_bytes(&process, caller_frame_pointer, &frame);
 
-    let process_id = process.scheduler_process_id();
     let core = nixe_scheduler::VirtualCpuId::new(0);
     let affinity = process
         .coordinator_mut()
@@ -6844,28 +7432,29 @@ fn break_captures_frames_on_a_guest_created_thread_stack() {
         .scheduler()
         .migrate(main, IdealCore::Core(core), affinity)
         .unwrap();
-    let child = process
-        .coordinator_mut()
-        .create_thread(
-            process_id,
-            nixe_runtime::ThreadCreateRequest {
-                entry,
-                argument: 2,
-                stack_top,
-                priority: 20,
-                ideal_vcpu: Some(nixe_scheduler::VirtualCpuId::new(0)),
-                affinity,
-            },
-        )
-        .unwrap();
-    let thread = process.thread_mut(child.id).unwrap();
+    let child = support::ready(process.create_thread(nixe_runtime::ThreadCreateRequest {
+        entry,
+        argument: 2,
+        fpcr: 0,
+        fpsr: 0,
+        stack_top,
+        priority: 20,
+        ideal_vcpu: Some(nixe_scheduler::VirtualCpuId::new(0)),
+        affinity,
+    }))
+    .unwrap();
+    let thread = process.thread(child.id).unwrap();
     assert_eq!(thread.stack_bottom, thread.stack_top);
-    thread.state_mut().write_x(x(29), frame_pointer.get());
+    thread.registers().write_x(x(29), frame_pointer.get());
     thread
-        .state_mut()
+        .registers()
         .write_x(A64Register::StackPointer, frame_pointer.get() - 0x40);
-    let object_id = thread.object().thread_id();
-    process.coordinator_mut().start_thread(object_id).unwrap();
+    let object_id = thread.clone().thread_id();
+    process
+        .thread(nixe_scheduler::GuestThreadId::new(object_id))
+        .unwrap()
+        .start()
+        .unwrap();
     let mut dispatcher = support::dispatcher(&process);
     let (selected, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
     assert_eq!(selected, child.id);
@@ -6924,10 +7513,16 @@ fn output_debug_string_logs_exact_bytes_and_obeys_guest_log_policy() {
             pointer.checked_add(message.len() as u64).unwrap(),
             b"MUST NOT LOG",
         );
-        state(&mut process).write_x(x(0), pointer.get());
-        state(&mut process).write_x(x(1), message.len() as u64);
-        state(&mut process).write_x(x(2), 0xfeed);
-        let pc = state(&mut process).pc();
+        process
+            .main_thread()
+            .registers()
+            .write_x(x(0), pointer.get());
+        process
+            .main_thread()
+            .registers()
+            .write_x(x(1), message.len() as u64);
+        process.main_thread().registers().write_x(x(2), 0xfeed);
+        let pc = process.main_thread().registers().pc();
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -6935,11 +7530,7 @@ fn output_debug_string_logs_exact_bytes_and_obeys_guest_log_policy() {
         assert_eq!(read_abi_register(&process, 0), 0);
         assert_eq!(read_abi_register(&process, 1), message.len() as u64);
         assert_eq!(read_abi_register(&process, 2), 0xfeed);
-        assert_eq!(state(&mut process).pc(), pc + 4);
-        assert_eq!(
-            dispatcher.coverage()[0].support,
-            HorizonSvcSupport::Complete
-        );
+        assert_eq!(process.main_thread().registers().pc(), pc + 4);
         let logs = MESSAGES.with_borrow_mut(std::mem::take);
         let expected = expected_level.map_or_else(Vec::new, |level| {
             vec![
@@ -6957,8 +7548,14 @@ fn output_debug_string_logs_exact_bytes_and_obeys_guest_log_policy() {
     let mut message = vec![b'x'; 0xfff];
     message.extend_from_slice("é!".as_bytes());
     write_guest_bytes(&process, pointer, &message);
-    state(&mut process).write_x(x(0), pointer.get());
-    state(&mut process).write_x(x(1), message.len() as u64);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(0), pointer.get());
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), message.len() as u64);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -6984,8 +7581,8 @@ fn output_debug_string_validates_ranges_even_when_logs_are_disabled() {
         let (_directory, mut process) = fixture_process(&[svc(0x27)]);
         let mut dispatcher = support::dispatcher(&process)
             .with_diagnostics(HorizonDiagnostics::new(GuestLogLevel::Off, false));
-        state(&mut process).write_x(x(0), pointer);
-        state(&mut process).write_x(x(1), size);
+        process.main_thread().registers().write_x(x(0), pointer);
+        process.main_thread().registers().write_x(x(1), size);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed | ExceptionHandlingResult::Rejected(_)
@@ -7005,8 +7602,11 @@ fn output_debug_string_validates_ranges_even_when_logs_are_disabled() {
             .protect(GuestVirtualAddress::new(top - 0x1000), 0x1000, permissions)
             .unwrap();
         for size in [4, 5] {
-            state(&mut process).write_x(x(0), pointer.get());
-            state(&mut process).write_x(x(1), size);
+            process
+                .main_thread()
+                .registers()
+                .write_x(x(0), pointer.get());
+            process.main_thread().registers().write_x(x(1), size);
             assert!(matches!(
                 dispatch_next(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed | ExceptionHandlingResult::Rejected(_)
@@ -7026,9 +7626,12 @@ fn break_snapshots_a_small_readable_guest_payload() {
     let (_directory, mut process) = fixture_process(&[svc(0x26)]);
     let payload_address = process.main_thread().stack_bottom;
     write_guest_bytes(&process, payload_address, &[0x0a, 0x06, 0x00, 0x00]);
-    state(&mut process).write_x(x(0), 0);
-    state(&mut process).write_x(x(1), payload_address.get());
-    state(&mut process).write_x(x(2), 4);
+    process.main_thread().registers().write_x(x(0), 0);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), payload_address.get());
+    process.main_thread().registers().write_x(x(2), 4);
     let mut dispatcher = support::dispatcher(&process);
 
     assert!(matches!(
@@ -7053,9 +7656,9 @@ fn break_snapshots_a_small_readable_guest_payload() {
 #[test]
 fn notification_only_break_reports_success_without_terminating() {
     let (_directory, mut process) = fixture_process(&[svc(0x26)]);
-    state(&mut process).write_x(x(0), 0x8000_0002);
-    state(&mut process).write_x(x(1), 0x1234);
-    state(&mut process).write_x(x(2), 0x40);
+    process.main_thread().registers().write_x(x(0), 0x8000_0002);
+    process.main_thread().registers().write_x(x(1), 0x1234);
+    process.main_thread().registers().write_x(x(2), 0x40);
     let mut dispatcher = support::dispatcher(&process);
 
     assert!(matches!(
@@ -7063,14 +7666,11 @@ fn notification_only_break_reports_success_without_terminating() {
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
     assert_eq!(process.main_thread_lifecycle(), ThreadLifecycle::Ready);
     assert!(process.exit().is_none());
-    assert_eq!(dispatcher.coverage()[0].support, HorizonSvcSupport::Partial);
-    assert_eq!(dispatcher.coverage()[0].resumed, 1);
-    assert_eq!(dispatcher.coverage()[0].terminated, 0);
 }
 
 #[path = "svc_dispatch/auddev.rs"]
@@ -7093,6 +7693,9 @@ mod lm_domain;
 
 #[path = "svc_dispatch/cancellation.rs"]
 mod cancellation;
+
+#[path = "svc_dispatch/ipc_lifetime.rs"]
+mod ipc_lifetime;
 
 #[path = "svc_dispatch/access_log_index.rs"]
 mod access_log_index;
@@ -7124,12 +7727,12 @@ fn vibration_stop_validates_its_device_and_does_not_hide_nonzero_force() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm = state(&mut process).read_w(x(1));
+    let sm = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
     let mut register = [0; 0x100];
     put_u32(&mut register, 0, 4);
@@ -7137,7 +7740,7 @@ fn vibration_stop_validates_its_device_and_does_not_hide_nonzero_force() {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm);
+    process.main_thread().registers().write_w(x(0), sm);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -7149,7 +7752,7 @@ fn vibration_stop_validates_its_device_and_does_not_hide_nonzero_force() {
     put_u32(&mut get, 24, 1);
     get[32..35].copy_from_slice(b"hid");
     write_guest_bytes(&process, tls, &get);
-    state(&mut process).write_w(x(0), sm);
+    process.main_thread().registers().write_w(x(0), sm);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -7177,7 +7780,7 @@ fn vibration_stop_validates_its_device_and_does_not_hide_nonzero_force() {
         put_u32(&mut message, 68, reserved);
         put_u64(&mut message, 72, 1);
         write_guest_bytes(&process, tls, &message);
-        state(&mut process).write_w(x(0), handle);
+        process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -7196,7 +7799,7 @@ fn vibration_stop_validates_its_device_and_does_not_hide_nonzero_force() {
     put_u32(&mut message, 48, 3);
     put_u32(&mut message, 52, 0.5f32.to_bits());
     write_guest_bytes(&process, tls, &message);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(
         matches!(dispatch_next(&mut process, &mut dispatcher), ExceptionHandlingResult::Fault(HorizonSvcFault::Ipc {immediate, fault}) if immediate == 0x21 && fault.to_string() == (Box::new(HorizonIpcFault::unsupported_service(
                 UnsupportedServiceOperation::CommandVariant {
@@ -7216,12 +7819,12 @@ fn batched_vibration_decodes_pointer_arrays_and_rejects_invalid_inputs() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm = state(&mut process).read_w(x(1));
+    let sm = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
     let mut register = [0; 256];
     put_u32(&mut register, 0, 4);
@@ -7319,7 +7922,7 @@ fn batched_vibration_decodes_pointer_arrays_and_rejects_invalid_inputs() {
     put_u32(&mut forces, 16, 0.5f32.to_bits());
     write_guest_bytes(&process, values, &forces);
     write_guest_bytes(&process, tls, &request(8, 32));
-    state(&mut process).write_w(x(0), hid);
+    process.main_thread().registers().write_w(x(0), hid);
     assert!(
         matches!(dispatch_next(&mut process, &mut dispatcher), ExceptionHandlingResult::Fault(HorizonSvcFault::Ipc {immediate, fault}) if immediate == 0x21 && fault.to_string() == (Box::new(HorizonIpcFault::unsupported_service(
                 UnsupportedServiceOperation::CommandVariant {
@@ -7330,3 +7933,6 @@ fn batched_vibration_decodes_pointer_arrays_and_rejects_invalid_inputs() {
             ))).to_string())
     );
 }
+
+#[path = "svc_dispatch/kernel_lifecycle.rs"]
+mod kernel_lifecycle;

@@ -72,7 +72,7 @@ fn tessellation_shadow_replay_preserves_effective_source_and_channel_isolation()
     let dispatch = dispatch_method(&mut channel, 0x320 / 4, 0x201).unwrap();
     assert_eq!(
         dispatch.methods()[0].metadata().method_name(),
-        "SET_TESSELLATION_PARAMETERS"
+        "STATE_REGISTER"
     );
 
     program_three_d(&mut channel, 0x124, 2);
@@ -104,14 +104,18 @@ fn tessellation_shadow_replay_preserves_effective_source_and_channel_isolation()
 #[test]
 fn tessellation_draw_state_invalidates_without_retranslating_guest_code() {
     let mut channel = patch_channel();
+    crate::engines::tests::program_three_d(&mut channel, 0x0d78, 3);
     let shader = channel.three_d().shader_state_identity();
     let initial = channel.three_d().draw_state_identity();
     program_three_d(&mut channel, 0x320, 0x201);
+    crate::engines::tests::program_three_d(&mut channel, 0x0d78, 3);
     assert!(initial.matches(channel.three_d()));
     program_three_d(&mut channel, 0x320, 0x211);
+    crate::engines::tests::program_three_d(&mut channel, 0x0d78, 3);
     let mode_changed = channel.three_d().draw_state_identity();
     assert!(!initial.matches(channel.three_d()));
     program_three_d(&mut channel, 0x324, 0x7fc0_0042);
+    crate::engines::tests::program_three_d(&mut channel, 0x0d78, 3);
     assert!(!mode_changed.matches(channel.three_d()));
     assert!(shader.matches_code(channel.three_d()));
 }

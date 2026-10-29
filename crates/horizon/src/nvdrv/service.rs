@@ -75,7 +75,8 @@ mod tests {
 
     #[test]
     fn semantic_service_does_not_encode_horizon_wire_results() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let service = NvDrvService::new(&session);
 
         assert!(matches!(

@@ -1,23 +1,17 @@
-//! Compact arguments with provenance recorded only when its source run changes.
+//! Bounded command words. The accepted entry owns storage and diagnostic context.
 use super::*;
 use std::ops::{Bound, RangeBounds};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum PacketMethods {
-    Empty,
-    One(MaxwellDecodedMethod),
-    #[cfg(test)]
-    Fixture(Box<[MaxwellDecodedMethod]>),
-}
 #[derive(Clone, Copy)]
 enum SpanData<'a> {
-    Packet(&'a MaxwellDecodedMethodPacket),
     Live {
-        words: &'a sources::EntryWords,
-        first_method: u32,
-        source: MaxwellGpfifoSourceLocation,
+        address: nixe_memory::HostAddress,
+        stream: &'a sources::CommandStream,
         offset: usize,
+        first: u32,
     },
+    #[cfg(test)]
+    Fixture(&'a MaxwellDecodedMethodPacket),
 }
 #[derive(Clone, Copy)]
 pub struct MaxwellMethodSpan<'a> {
@@ -27,15 +21,11 @@ pub struct MaxwellMethodSpan<'a> {
     end: usize,
 }
 impl<'a> MaxwellMethodSpan<'a> {
+    #[cfg(test)]
     pub(super) fn new(packet: &'a MaxwellDecodedMethodPacket) -> Self {
-        let end = match &packet.methods {
-            PacketMethods::Empty => 0,
-            PacketMethods::One(_) => 1,
-            #[cfg(test)]
-            PacketMethods::Fixture(methods) => methods.len(),
-        };
+        let end = packet.methods.len();
         Self {
-            data: SpanData::Packet(packet),
+            data: SpanData::Fixture(packet),
             mode: packet.mode,
             begin: 0,
             end,
@@ -53,50 +43,67 @@ impl<'a> MaxwellMethodSpan<'a> {
     pub fn last(self) -> Option<MaxwellDecodedMethod> {
         self.len().checked_sub(1).and_then(|i| self.get(i))
     }
-    #[inline(always)]
+    #[inline]
+    pub(crate) fn method_at(self, index: usize) -> GpuMethodId {
+        debug_assert!(index < self.len());
+        let index = self.begin + index;
+        match self.data {
+            SpanData::Live { first, .. } => method_id(method_dword(self.mode, first, index as u16)),
+            #[cfg(test)]
+            SpanData::Fixture(packet) => packet.methods[index].method,
+        }
+    }
+    #[inline]
+    pub(crate) fn argument_at(self, index: usize) -> u32 {
+        debug_assert!(index < self.len());
+        let index = self.begin + index;
+        match self.data {
+            // SAFETY: the span is bounded when the entry is parsed; its borrow
+            // retains both the physical pin and any owned gathered storage.
+            SpanData::Live { address, .. } => unsafe { address.read_u32(index * 4) },
+            #[cfg(test)]
+            SpanData::Fixture(packet) => packet.methods[index].argument,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn mode(self) -> MaxwellMethodPacketMode {
+        if self.mode == MaxwellMethodPacketMode::IncrementOnce && self.begin > 0 {
+            MaxwellMethodPacketMode::NonIncrementing
+        } else {
+            self.mode
+        }
+    }
     pub fn get(self, index: usize) -> Option<MaxwellDecodedMethod> {
         if index >= self.len() {
             return None;
         }
-        let index = self.begin + index;
-        let SpanData::Packet(packet) = self.data else {
-            let SpanData::Live {
-                words,
-                first_method,
-                mut source,
-                offset,
-            } = self.data
-            else {
-                unreachable!()
-            };
-            source.word_offset += index as u64;
-            return Some(MaxwellDecodedMethod {
-                method: method_id(method_dword(self.mode, first_method, index as u16)),
-                argument: words.read(offset + index * 4),
-                argument_source: source,
-            });
-        };
-        Some(match &packet.methods {
-            PacketMethods::Empty => unreachable!("empty method span"),
-            PacketMethods::One(method) => *method,
+        let source = match self.data {
+            SpanData::Live { stream, offset, .. } => {
+                stream.location_at(offset + (self.begin + index) * 4)
+            }
             #[cfg(test)]
-            PacketMethods::Fixture(methods) => methods[index],
+            SpanData::Fixture(packet) => packet.methods[self.begin + index].argument_source,
+        };
+        Some(MaxwellDecodedMethod {
+            method: self.method_at(index),
+            argument: self.argument_at(index),
+            argument_source: source,
         })
     }
-    pub(crate) fn live(
-        words: &'a sources::EntryWords,
+    pub(super) fn live(
+        stream: &'a sources::CommandStream,
+        address: nixe_memory::HostAddress,
         offset: usize,
         count: usize,
-        first_method: u32,
+        first: u32,
         mode: MaxwellMethodPacketMode,
-        source: MaxwellGpfifoSourceLocation,
     ) -> Self {
         Self {
             data: SpanData::Live {
-                words,
-                first_method,
-                source,
+                address,
+                stream,
                 offset,
+                first,
             },
             mode,
             begin: 0,
@@ -105,36 +112,44 @@ impl<'a> MaxwellMethodSpan<'a> {
     }
     pub(crate) fn ram_bytes(self) -> Option<(nixe_memory::HostAddress, usize)> {
         match self.data {
-            SpanData::Live {
-                words: sources::EntryWords::Ram { address, .. },
-                offset,
-                ..
-            } => Some((*address, offset + self.begin * 4)),
-            _ => None,
+            SpanData::Live { address, .. } => Some((address, self.begin * 4)),
+            #[cfg(test)]
+            SpanData::Fixture(_) => None,
         }
     }
     pub(crate) fn gathered_bytes(self) -> Option<&'a [u8]> {
         match self.data {
-            SpanData::Live {
-                words: sources::EntryWords::Gathered(bytes),
-                offset,
-                ..
-            } => Some(&bytes[offset + self.begin * 4..offset + self.end * 4]),
-            _ => None,
+            SpanData::Live { stream, offset, .. } => {
+                stream.gathered_bytes(offset + self.begin * 4, offset + self.end * 4)
+            }
+            #[cfg(test)]
+            SpanData::Fixture(_) => None,
         }
     }
     pub(crate) fn arguments(self) -> impl ExactSizeIterator<Item = u32> + 'a {
-        (self.begin..self.end).map(move |i| match self.data {
-            SpanData::Live { words, offset, .. } => words.read(offset + i * 4),
-            SpanData::Packet(packet) => match &packet.methods {
-                PacketMethods::Empty => unreachable!(),
-                PacketMethods::One(method) => method.argument,
-                #[cfg(test)]
-                PacketMethods::Fixture(methods) => methods[i].argument,
-            },
-        })
+        (0..self.len()).map(move |index| self.argument_at(index))
     }
-    /// Last write of each distinct register, in reverse execution order.
+    pub(crate) fn append_arguments(
+        self,
+        output: &mut Vec<u32>,
+    ) -> Result<(), std::collections::TryReserveError> {
+        let count = self.len();
+        output.try_reserve(count)?;
+        match self.data {
+            SpanData::Live { address, .. } => {
+                let start = output.len();
+                // SAFETY: entry admission bounds the complete span, its borrow
+                // retains storage, and reserve established the disjoint output.
+                unsafe {
+                    address.copy_words_to(self.begin * 4, output.as_mut_ptr().add(start), count);
+                    output.set_len(start + count);
+                }
+            }
+            #[cfg(test)]
+            SpanData::Fixture(_) => output.extend(self.arguments()),
+        }
+        Ok(())
+    }
     pub(crate) fn last_writes(mut self) -> impl Iterator<Item = MaxwellDecodedMethod> + 'a {
         std::iter::from_fn(move || {
             let method = self.last()?;
@@ -162,10 +177,9 @@ impl<'a> MaxwellMethodSpan<'a> {
             "method span outside packet"
         );
         Self {
-            data: self.data,
-            mode: self.mode,
             begin: self.begin + begin,
             end: self.begin + end,
+            ..self
         }
     }
     pub fn iter(self) -> MaxwellMethodIterator<'a> {

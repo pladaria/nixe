@@ -12,7 +12,7 @@ fn filesystem_access_log_returns_version_then_program_index_in_both_transports()
     put_u32(&mut request, 16, 0x4943_4653);
     put_u32(&mut request, 24, 1011);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -24,7 +24,7 @@ fn filesystem_access_log_returns_version_then_program_index_in_both_transports()
     put_u32(&mut request, 0, 5);
     put_u32(&mut request, 24, 0);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -40,7 +40,7 @@ fn filesystem_access_log_returns_version_then_program_index_in_both_transports()
     put_u32(&mut request, 32, 0x4943_4653);
     put_u32(&mut request, 40, 1011);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -62,7 +62,7 @@ fn filesystem_session_advertises_space_for_two_aligned_pointer_paths() {
     put_u32(&mut request, 16, 0x4943_4653);
     put_u32(&mut request, 24, 3);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed

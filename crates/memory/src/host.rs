@@ -13,7 +13,9 @@ const BASE_ALIGNMENT: usize = 2 * 1024 * 1024;
 #[repr(transparent)]
 pub struct HostAddress(usize);
 impl HostAddress {
-    pub(crate) fn from_pointer(pointer: *mut u8) -> Self {
+    /// Construct an address without borrowing its storage. Dereferencing still
+    /// requires the caller to retain and admit the complete physical range.
+    pub fn from_pointer(pointer: *mut u8) -> Self {
         Self(pointer as usize)
     }
     pub fn as_ptr(self) -> *mut u8 {
@@ -26,6 +28,15 @@ impl HostAddress {
     /// at `offset`, and resolves device coherence on the command owner.
     pub unsafe fn read_u32(self, offset: usize) -> u32 {
         unsafe { crate::raw::read_value(self.as_ptr().add(offset), 4) as u32 }
+    }
+
+    /// Copy admitted command words into disjoint owned host storage.
+    ///
+    /// # Safety
+    /// The source retains `words * 4` readable bytes at `offset`. The destination
+    /// contains that many writable, aligned u32 slots and does not overlap it.
+    pub unsafe fn copy_words_to(self, offset: usize, target: *mut u32, words: usize) {
+        unsafe { crate::raw::copy_words_to_host(self.as_ptr().add(offset), target, words) }
     }
 }
 
@@ -224,5 +235,29 @@ mod tests {
                 .host_address(ArenaOffset::new(arena.capacity()), 1)
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod command_word_tests {
+    use super::HostAddress;
+
+    #[test]
+    fn bulk_copy_initializes_exactly_the_accepted_even_or_odd_word_range() {
+        let source: Vec<u32> = (0..32).map(|i| 0x1234_0000 | i).collect();
+        let address = HostAddress::from_pointer(source.as_ptr().cast_mut().cast());
+        for begin in 0..4 {
+            for count in 0..=17 {
+                let mut owned = vec![0xdead_beef; count + 2];
+                // SAFETY: both allocations remain live, are disjoint, and the
+                // requested source/destination word ranges fit their buffers.
+                unsafe {
+                    address.copy_words_to(begin * 4, owned.as_mut_ptr().add(1), count);
+                }
+                assert_eq!(&owned[1..count + 1], &source[begin..begin + count]);
+                assert_eq!(owned[0], 0xdead_beef);
+                assert_eq!(owned[count + 1], 0xdead_beef);
+            }
+        }
     }
 }

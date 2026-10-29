@@ -10,8 +10,6 @@
 //! <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L244-L247>
 //! <https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/rnndb/graph/gf100_3d.xml#L60-L68>
 
-use crate::MaxwellMethodSource;
-
 use super::{MaxwellThreeDRawValue, MaxwellThreeDRegister};
 
 /// Treatment of edges generated when polygon clipping precedes line-mode
@@ -125,128 +123,48 @@ impl MaxwellThreeDAliasedLineWidthEnable {
     }
 }
 
-/// One validated line-rasterization register transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellThreeDLineStateWrite {
-    PolygonClipGeneratedEdge {
-        value: MaxwellThreeDPolygonClipGeneratedEdge,
-        source: MaxwellMethodSource,
-    },
-    AliasedLineWidthEnable {
-        value: MaxwellThreeDAliasedLineWidthEnable,
-        source: MaxwellMethodSource,
-    },
-    AntiAliasedLineEnable {
-        value: MaxwellThreeDAntiAliasedLineEnable,
-        source: MaxwellMethodSource,
-    },
-    AliasedLineWidth {
-        value: MaxwellThreeDRawValue,
-        source: MaxwellMethodSource,
-    },
-    StippleEnable {
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    StippleParameters {
-        value: MaxwellThreeDLineStippleParameters,
-        source: MaxwellMethodSource,
-    },
-}
-
 /// Persistent line-rasterization configuration on one `MAXWELL_B` channel.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDLineState {
-    polygon_clip_generated_edge: MaxwellThreeDRegister<MaxwellThreeDPolygonClipGeneratedEdge>,
-    aliased_line_width_enable: MaxwellThreeDRegister<MaxwellThreeDAliasedLineWidthEnable>,
-    anti_aliased_line_enable: MaxwellThreeDRegister<MaxwellThreeDAntiAliasedLineEnable>,
-    aliased_line_width: MaxwellThreeDRegister<MaxwellThreeDRawValue>,
-    stipple_enable: MaxwellThreeDRegister<bool>,
-    stipple_parameters: MaxwellThreeDRegister<MaxwellThreeDLineStippleParameters>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDLineState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl Default for MaxwellThreeDLineState {
-    fn default() -> Self {
-        // Reset disables stippling and draws clip-generated polygon edges.
-        // The public Maxwell class encodes both as zero; the independently
-        // implemented register initialization retains zero for these fields
-        // and copies them into shadow RAM (not a blanket zero fallback):
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1261-L1264
-        // https://github.com/eden-emulator/mirror/blob/815325cceca948030cf476dce7c46d901e4e4df5/src/video_core/engines/maxwell_3d.cpp#L52-L135
-        Self {
-            polygon_clip_generated_edge: MaxwellThreeDRegister::verified_reset(
-                0,
-                Some(MaxwellThreeDPolygonClipGeneratedEdge::DrawLine),
-            ),
-            stipple_enable: MaxwellThreeDRegister::verified_reset(0, Some(false)),
-            aliased_line_width_enable: Default::default(),
-            anti_aliased_line_enable: Default::default(),
-            aliased_line_width: Default::default(),
-            stipple_parameters: Default::default(),
-        }
-    }
-}
-
-impl MaxwellThreeDLineState {
+impl MaxwellThreeDLineState<'_> {
     #[must_use]
-    pub const fn polygon_clip_generated_edge(
+    pub fn polygon_clip_generated_edge(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDPolygonClipGeneratedEdge> {
-        &self.polygon_clip_generated_edge
+    ) -> MaxwellThreeDRegister<MaxwellThreeDPolygonClipGeneratedEdge> {
+        self.registers.read(0x0f8c, |raw| {
+            MaxwellThreeDPolygonClipGeneratedEdge::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn aliased_line_width_enable(
+    pub fn aliased_line_width_enable(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDAliasedLineWidthEnable> {
-        &self.aliased_line_width_enable
+    ) -> MaxwellThreeDRegister<MaxwellThreeDAliasedLineWidthEnable> {
+        self.registers.read(0x020c, |raw| {
+            MaxwellThreeDAliasedLineWidthEnable::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn anti_aliased_line_enable(
+    pub fn anti_aliased_line_enable(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDAntiAliasedLineEnable> {
-        &self.anti_aliased_line_enable
+    ) -> MaxwellThreeDRegister<MaxwellThreeDAntiAliasedLineEnable> {
+        self.registers
+            .read(0x1570, MaxwellThreeDAntiAliasedLineEnable::parse)
     }
-
     #[must_use]
-    pub const fn aliased_line_width(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRawValue> {
-        &self.aliased_line_width
+    pub fn aliased_line_width(&self) -> MaxwellThreeDRegister<MaxwellThreeDRawValue> {
+        self.registers
+            .read(0x13b4, |raw| Some(MaxwellThreeDRawValue::new(raw)))
     }
-
     #[must_use]
-    pub const fn stipple_enable(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.stipple_enable
+    pub fn stipple_enable(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers
+            .read(0x166c, |raw| (raw <= 1).then_some(raw != 0))
     }
-
     #[must_use]
-    pub const fn stipple_parameters(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDLineStippleParameters> {
-        &self.stipple_parameters
-    }
-
-    pub(super) fn apply(&mut self, write: MaxwellThreeDLineStateWrite) {
-        match write {
-            MaxwellThreeDLineStateWrite::PolygonClipGeneratedEdge { value, source: _ } => {
-                self.polygon_clip_generated_edge =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDLineStateWrite::AliasedLineWidthEnable { value, source: _ } => {
-                self.aliased_line_width_enable = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDLineStateWrite::AntiAliasedLineEnable { value, source: _ } => {
-                self.anti_aliased_line_enable = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDLineStateWrite::AliasedLineWidth { value, source: _ } => {
-                self.aliased_line_width = MaxwellThreeDRegister::decoded(value.get(), value);
-            }
-            MaxwellThreeDLineStateWrite::StippleEnable { value, source: _ } => {
-                self.stipple_enable = MaxwellThreeDRegister::decoded(u32::from(value), value);
-            }
-            MaxwellThreeDLineStateWrite::StippleParameters { value, source: _ } => {
-                self.stipple_parameters = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-        }
+    pub fn stipple_parameters(&self) -> MaxwellThreeDRegister<MaxwellThreeDLineStippleParameters> {
+        self.registers
+            .read(0x1680, MaxwellThreeDLineStippleParameters::parse)
     }
 }

@@ -1,4 +1,4 @@
-//! Register admission and sparse derived-state decoding.
+//! Canonical register writes and renderer dirty domains.
 //!
 //! Ordinary writes update one authoritative raw word and dirty metadata.
 //! Execution methods retain ordered effects even when the argument is equal.
@@ -53,8 +53,8 @@ pub(super) const fn passive_action(action: MethodAction) -> bool {
         | MethodAction::SubtilingPerfKnobB
         | MethodAction::TiledCacheEnable
         | MethodAction::TiledCacheTileSize
-        | MethodAction::TiledCacheUnknownConfig(..)
-        | MethodAction::ShaderWatermarks(..)
+        | MethodAction::TiledCacheUnknownConfig
+        | MethodAction::ShaderWatermarks
         | MethodAction::L1Configuration
         | MethodAction::ColorReductionThresholdsEnable
         | MethodAction::ColorReductionThresholdsUnorm8
@@ -68,7 +68,7 @@ pub(super) const fn passive_action(action: MethodAction) -> bool {
         | MethodAction::PostZPixelShaderImask
         | MethodAction::PixelShaderInterlockControl
         | MethodAction::ConstantColorRenderingEnable
-        | MethodAction::ConstantColorRenderingComponent(..)
+        | MethodAction::ConstantColorRenderingComponent
         | MethodAction::AlphaFraction
         | MethodAction::TirMode
         | MethodAction::TirControl
@@ -78,10 +78,10 @@ pub(super) const fn passive_action(action: MethodAction) -> bool {
         | MethodAction::AlphaToCoverageOverride
         | MethodAction::AlphaToCoverageDither
         | MethodAction::HybridAntiAliasControl
-        | MethodAction::SampleLocations(..)
+        | MethodAction::SampleLocations
         | MethodAction::RasterBoundingBox
         | MethodAction::VafL2CacheControl
-        | MethodAction::RopL2CacheControl(..)
+        | MethodAction::RopL2CacheControl
         | MethodAction::ReportSemaphoreAddressUpper
         | MethodAction::ReportSemaphoreAddressLower
         | MethodAction::ReportSemaphorePayload
@@ -106,7 +106,7 @@ pub(super) const fn passive_action(action: MethodAction) -> bool {
         | MethodAction::CsaaEnable
         | MethodAction::AliasedLineWidthEnable
         | MethodAction::ActiveZCullRegion
-        | MethodAction::ZCullStorage(..)
+        | MethodAction::ZCullStorage
         | MethodAction::ZCullSubregionAllocation
         | MethodAction::ZCullSubregionAlgorithm
         | MethodAction::ZCullReportSelection
@@ -114,8 +114,8 @@ pub(super) const fn passive_action(action: MethodAction) -> bool {
         | MethodAction::ZCullRegionLocation
         | MethodAction::ZCullRegionAliquots
         | MethodAction::ZCullRegionFormat
-        | MethodAction::ZCullRegionSize(..)
-        | MethodAction::ZCullRegionPixelOffset(..)
+        | MethodAction::ZCullRegionSize
+        | MethodAction::ZCullRegionPixelOffset
         | MethodAction::ZCullSubregion
         | MethodAction::ZCullDirectionFormat
         | MethodAction::ZCullStatsEnable
@@ -184,63 +184,13 @@ pub(super) fn passive(method: GpuMethodId) -> bool {
             .unwrap_or(false)
 }
 
-pub(super) fn materialize(
-    profile: &MaxwellGpuProfile,
-    candidate: &mut MaxwellThreeDFrontendState,
-    groups: u64,
-) -> Result<(), MaxwellEngineDispatchError> {
-    while let Some(source) = candidate.pending_register(groups) {
-        if candidate.pending_returns_to_original(source) {
-            candidate.decoded_register(source.method());
-            continue;
-        }
-        let decoded = preflight_register(profile, source, candidate, true)?;
-        debug_assert!(decoded.operation.is_none() && decoded.writes_state);
-        candidate.decoded_register(source.method());
-    }
-    Ok(())
-}
-
-const fn dependency_groups(method: u32) -> u64 {
-    match method {
-        0x2390..=0x23fc | 0x2410..=0x24f0 => (1 << 0x23) | (1 << 0x15),
-        0x1b0 | 0x1b4 => 1 << 1,
-        // BEGIN/END operate the primitive sequence, not immutable draw state.
-        0x238c | 0x1614 | 0x1618 | 0x114 | 0x118 | 0x11c | 0x120 | 0x124 | 0x3400..=0x37fc => 0,
-        _ => u64::MAX,
-    }
-}
-
-static DEPENDENCY_GROUPS: [u64; 4096] = {
-    let mut groups = [0; 4096];
-    let mut index = 0;
-    while index < groups.len() {
-        groups[index] = dependency_groups(index as u32 * 4);
-        index += 1;
-    }
-    groups
-};
-
-pub(super) fn dependencies(method: GpuMethodId) -> u64 {
-    DEPENDENCY_GROUPS
-        .get((method.0 / 4) as usize)
-        .copied()
-        .unwrap_or(u64::MAX)
-}
-
 /// Complete the valid prefix of a contiguous CB data packet in one transition.
 /// The borrowed packet remains the payload; no per-word effect/source vector is built.
 pub(in crate::engines) fn constant_buffer_words(
-    profile: &MaxwellGpuProfile,
     candidate: &mut MaxwellThreeDFrontendState,
     subchannel: crate::MaxwellPushbufferSubchannel,
     words: crate::MaxwellMethodSpan<'_>,
 ) -> Result<(MaxwellThreeDInlineConstantBufferUpload, usize), MaxwellEngineDispatchError> {
-    materialize(
-        profile,
-        candidate,
-        dependencies(words.first().unwrap().method()),
-    )?;
     let first = crate::MaxwellMethodSource::decoded(words.first().unwrap(), subchannel);
     let (_, _, upload) =
         preflight_constant_buffer_load(first, candidate)?.expect("CB data aperture");
@@ -258,32 +208,28 @@ pub(in crate::engines) fn constant_buffer_words(
     let count = words.len().min((available / 4) as usize);
     debug_assert!(count != 0);
     let last = crate::MaxwellMethodSource::decoded(words.get(count - 1).unwrap(), subchannel);
-    candidate.apply(
-        MaxwellThreeDStateWrite::ShaderBinding(
-            MaxwellThreeDShaderBindingWrite::ConstantBufferLoadData {
-                value: last.argument(),
-                next_offset: offset + count as u32 * 4,
-                source: last,
-            },
-        ),
-        true,
-    );
+    candidate.apply(MaxwellThreeDStateWrite::ShaderBinding(
+        MaxwellThreeDShaderBindingWrite::ConstantBufferLoadData {
+            next_offset: offset + count as u32 * 4,
+            source: last,
+        },
+    ));
     let control = candidate.mme().shadow_ram_control().value().copied();
     for word in words.slice(..count).last_writes() {
         let source = crate::MaxwellMethodSource::decoded(word, subchannel);
         candidate.record_raw_register(source);
-        candidate.mme_mut().track_shadow_register(control, source);
+        candidate
+            .mme_mut()
+            .track_shadow_register(control, source.method(), source.argument());
     }
     Ok((upload, count))
 }
 
 pub(in crate::engines) fn embedded_words(
-    profile: &MaxwellGpuProfile,
     candidate: &mut MaxwellThreeDFrontendState,
     subchannel: crate::MaxwellPushbufferSubchannel,
     words: crate::MaxwellMethodSpan<'_>,
 ) -> Result<(MaxwellInlineToMemoryUpload, usize), MaxwellEngineDispatchError> {
-    materialize(profile, candidate, 1 << 1)?;
     let count = words.len().min(
         candidate
             .operation_state()
@@ -292,154 +238,226 @@ pub(in crate::engines) fn embedded_words(
     );
     let first = crate::MaxwellMethodSource::decoded(words.first().unwrap(), subchannel);
     let (_, _, upload) =
-        inline_to_memory::preflight(first, candidate.operation_state().inline_to_memory())?
+        inline_to_memory::preflight(first, &candidate.operation_state().inline_to_memory())?
             .expect("embedded inline data");
     let upload = upload.expect("embedded inline data produces an upload");
     debug_assert!(count != 0);
     let last = crate::MaxwellMethodSource::decoded(words.get(count - 1).unwrap(), subchannel);
-    candidate.apply(
-        MaxwellThreeDStateWrite::InlineToMemory(MaxwellThreeDInlineToMemoryStateWrite::Data {
+    candidate.apply(MaxwellThreeDStateWrite::InlineToMemory(
+        MaxwellThreeDInlineToMemoryStateWrite::Data {
             value: last.argument(),
             next_offset: upload.offset() + upload.remaining_bytes().min(count as u32 * 4),
             source: last,
-        }),
-        true,
-    );
+        },
+    ));
     candidate.record_raw_register(last);
     let control = candidate.mme().shadow_ram_control().value().copied();
-    candidate.mme_mut().track_shadow_register(control, last);
+    candidate
+        .mme_mut()
+        .track_shadow_register(control, last.method(), last.argument());
     Ok((upload, count))
+}
+
+// Renderer domains consume the canonical register bank. These flags select
+// cache keys to rebuild; they never enqueue another interpretation of methods.
+// https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/engines/maxwell_3d.cpp
+pub(super) const DRAW: u16 = 1;
+pub(super) const PARAMETERS: u16 = 2;
+pub(super) const SHADERS: u16 = 4;
+pub(super) const VERTEX: u16 = 8;
+pub(super) const INDEX: u16 = 16;
+pub(super) const COLOR: u16 = 32;
+pub(super) const DEPTH: u16 = 64;
+pub(super) const HEADERS: u16 = 128;
+pub(super) const SAMPLERS: u16 = 256;
+pub(super) const SAMPLE_MODE: u16 = 512;
+
+const fn dirty_domains(method: u32) -> u16 {
+    let mut flags = 0;
+    if output_state(method)
+        && !matches!(
+            method,
+            0x07a4 | 0x07a8 | 0x0d6c | 0x0d70 | 0x0d80..=0x0d90 | 0x0da0 | 0x10f8
+        )
+    {
+        flags |= DRAW | PARAMETERS;
+    }
+    // Vertex fetch configuration and primitive sequence state.
+    if matches!(method, 0x1120..=0x112c | 0x1160..=0x11dc | 0x1880..=0x18fc | 0x1c00..=0x1dfc | 0x1f00..=0x1ffc
+        | 0x0374 | 0x0f84 | 0x0f88 | 0x02d0 | 0x0dcc | 0x0de8 | 0x1118 | 0x1434 | 0x1438 | 0x1610
+        | 0x1618 | 0x1644 | 0x1648 | 0x164c | 0x17c8..=0x17e0 | 0x1948 | 0x1970 | 0x0320..=0x0338)
+    {
+        flags |= DRAW | PARAMETERS;
+    }
+    if matches!(method, 0x1c00..=0x1dff) {
+        if (method - 0x1c00) % 16 <= 8 {
+            flags |= VERTEX;
+        }
+        if matches!((method - 0x1c00) % 16, 4 | 8) {
+            flags &= !PARAMETERS;
+        }
+    }
+    if matches!(method, 0x1f00..=0x1ffc) {
+        flags = DRAW | VERTEX;
+    }
+    if matches!(method, 0x17c8..=0x17e0) {
+        flags |= INDEX;
+        if method != 0x17d8 {
+            flags &= !PARAMETERS;
+        }
+    }
+    if matches!(method, 0x1160..=0x11dc | 0x13ac | 0x192c | 0x1608 | 0x160c | 0x2000..=0x217c | 0x2608 | 0x1240..=0x125c)
+    {
+        flags |= SHADERS;
+    }
+    if matches!(method, 0x0800..=0x09fc) && (method - 0x0800) % 0x40 <= 0x20
+        || matches!(method, 0x19e0..=0x19fc | 0x15b8)
+    {
+        flags |= COLOR;
+    }
+    if matches!(method, 0x0fe0..=0x0ff0 | 0x1208 | 0x1228..=0x1230 | 0x179c | 0x19cc) {
+        flags |= DEPTH;
+    }
+    if method == 0x15d0 {
+        flags |= SAMPLE_MODE;
+    }
+    if matches!(method, 0x1574 | 0x1578 | 0x157c | 0x0f10 | 0x1234) {
+        flags |= HEADERS;
+    }
+    if matches!(method, 0x155c | 0x1560 | 0x1564 | 0x1234 | 0x157c) {
+        flags |= SAMPLERS;
+    }
+    if let Some(declaration) = METHODS_BY_DWORD[(method / 4) as usize]
+        && matches!(
+            declaration.action,
+            MethodAction::IteratedBlend
+                | MethodAction::IteratedBlendPassCount
+                | MethodAction::SubtilingPerfKnobA
+                | MethodAction::SubtilingPerfKnobB
+                | MethodAction::ShaderWatermarks
+                | MethodAction::L1Configuration
+                | MethodAction::ColorReductionThresholdsEnable
+                | MethodAction::ColorReductionThresholdsUnorm8
+                | MethodAction::ColorReductionThresholdsUnorm10
+                | MethodAction::ColorReductionThresholdsUnorm16
+                | MethodAction::ColorReductionThresholdsFp16
+                | MethodAction::ColorReductionThresholdsSrgb8
+                | MethodAction::ApiMandatedEarlyZ
+                | MethodAction::PostPsInitialCoverage
+                | MethodAction::PostZPixelShaderImask
+                | MethodAction::PixelShaderInterlockControl
+                | MethodAction::AlphaFraction
+                | MethodAction::RasterBoundingBox
+                | MethodAction::PointSize
+                | MethodAction::PointSpriteSelect
+                | MethodAction::PointCenterMode
+                | MethodAction::EdgeFlag
+                | MethodAction::ViewportZClip
+                | MethodAction::PsOutputSampleMaskUsage
+                | MethodAction::HybridAntiAliasControl
+                | MethodAction::TirMode
+                | MethodAction::TirControl
+                | MethodAction::TirModulation
+                | MethodAction::TirModulationFunction
+                | MethodAction::CoverageToColor
+                | MethodAction::AlphaToCoverageOverride
+                | MethodAction::AlphaToCoverageDither
+                | MethodAction::SampleLocations
+                | MethodAction::RenderEnableControl
+                | MethodAction::VisibleCallLimit
+                | MethodAction::SmTimeoutCounterBit
+                | MethodAction::ShaderExceptionsEnable
+                | MethodAction::ShaderLocalMemoryWindowBaseAddress
+                | MethodAction::ShaderLocalMemoryAddressUpper
+                | MethodAction::ShaderLocalMemoryAddressLower
+                | MethodAction::ShaderLocalMemorySizeUpper
+                | MethodAction::ShaderLocalMemorySizeLower
+                | MethodAction::ShaderLocalMemoryDefaultSizePerWarp
+                | MethodAction::CsaaEnable
+                | MethodAction::AliasedLineWidthEnable
+                | MethodAction::StreamOutputEnable
+        )
+    {
+        flags |= DRAW | PARAMETERS;
+    }
+    flags
+}
+static DIRTY_DOMAINS: [u16; 4096] = {
+    let mut domains = [0; 4096];
+    let mut index = 0;
+    while index < domains.len() {
+        domains[index] = dirty_domains(index as u32 * 4);
+        index += 1;
+    }
+    domains
+};
+pub(super) fn domains(method: GpuMethodId) -> u16 {
+    DIRTY_DOMAINS[(method.0 / 4) as usize]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::tests::{program_three_d, three_d_channel};
 
     #[test]
-    fn deferred_values_are_visible_to_mme_before_decode_and_unchanged_groups_keep_identities() {
-        let mut channel = crate::engines::tests::three_d_channel();
-        let source = crate::engines::tests::program_three_d(&mut channel, 0x1518, 0);
-        let (profile, state) = channel.three_d_with_profile_mut();
-        let before = state.operation_state().draw_state_identity();
-        for value in 1..=100 {
-            let mut method = MaxwellMethodDispatch::class_method(
-                source.emitted_by_mme(GpuMethodId(0x1518), value),
-                CLASS,
+    fn passive_configuration_is_immediately_visible_without_replaying_methods() {
+        let mut channel = three_d_channel();
+        for raw in [0, 1_f32.to_bits(), 2_f32.to_bits()] {
+            program_three_d(&mut channel, 0x1518, raw);
+            assert_eq!(channel.three_d().raster().point_size().raw(), Some(raw));
+            assert_eq!(
+                channel
+                    .three_d_mut()
+                    .raw_register_value(GpuMethodId(0x1518)),
+                Some(raw)
             );
-            assert!(write_plain_method(&mut method, state).unwrap());
         }
-        assert_eq!(state.raw_register_value(GpuMethodId(0x1518)), Some(100));
-        assert_eq!(state.operation_state().raster().point_size().raw(), Some(0));
-        assert!(state.pending_register(u64::MAX).is_some());
-        materialize(profile, state, u64::MAX).unwrap();
-        assert!(!before.matches_parameters(state.operation_state()));
-        let current = state.operation_state().draw_state_identity();
-        for _ in 0..100 {
-            let mut method = MaxwellMethodDispatch::class_method(
-                source.emitted_by_mme(GpuMethodId(0x1518), 100),
-                CLASS,
-            );
-            assert!(write_plain_method(&mut method, state).unwrap());
+    }
+
+    #[test]
+    fn noop_and_wait_do_not_decode_intermediate_configuration() {
+        let mut channel = three_d_channel();
+        program_three_d(&mut channel, 0x0a1c, 0xffff_ffff);
+        program_three_d(&mut channel, 0x20c0, 0xffff_ffff);
+        let before = channel.three_d().draw_state_identity();
+        for method in [0x100, 0x110] {
+            program_three_d(&mut channel, method, 0);
+            assert!(before.matches(channel.three_d()));
         }
-        assert!(state.pending_register(u64::MAX).is_none());
-        // An intermediate changed value restored before consumption also keeps
-        // the already decoded group and its prepared identity.
-        for value in [101, 102, 100] {
-            let mut method = MaxwellMethodDispatch::class_method(
-                source.emitted_by_mme(GpuMethodId(0x1518), value),
-                CLASS,
-            );
-            write_plain_method(&mut method, state).unwrap();
-        }
-        materialize(profile, state, u64::MAX).unwrap();
-        assert!(
-            current.matches(state.operation_state())
-                && current.matches_parameters(state.operation_state())
+        // A later complete configuration replaces intermediate bits directly.
+        program_three_d(&mut channel, 0x0a1c, 0x0302);
+        program_three_d(&mut channel, 0x20c0, 0x31);
+        assert_eq!(
+            channel
+                .three_d()
+                .fixed_function()
+                .viewport(0)
+                .snap_grid_precision()
+                .value(),
+            Some(&[2, 3])
+        );
+        assert_eq!(
+            channel
+                .three_d()
+                .shader_bindings()
+                .pipeline(3)
+                .stage()
+                .value(),
+            Some(&MaxwellShaderStage::Tessellation)
         );
     }
 
     #[test]
-    fn passive_values_are_decoded_once_when_consumed() {
-        let mut channel = crate::engines::tests::three_d_channel();
-        let source = crate::engines::tests::program_three_d(&mut channel, 0x1220, 5);
-        let (profile, state) = channel.three_d_with_profile_mut();
-        let write = |state: &mut MaxwellThreeDFrontendState, value| {
-            let mut method = MaxwellMethodDispatch::class_method(
-                source.emitted_by_mme(GpuMethodId(0x1220), value),
-                CLASS,
-            );
-            write_plain_method(&mut method, state)
-        };
-        assert!(write(state, 13).unwrap());
-        assert!(write(state, 8).unwrap());
-        assert_eq!(
-            state
-                .operation_state()
-                .render_targets()
-                .compression_threshold()
-                .raw(),
-            Some(5)
-        );
-        materialize(profile, state, u64::MAX).unwrap();
-        assert_eq!(
-            state
-                .operation_state()
-                .render_targets()
-                .compression_threshold()
-                .raw(),
-            Some(8)
-        );
-
-        assert!(write(state, 13).unwrap());
-        assert!(matches!(
-            materialize(profile, state, u64::MAX),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_COMPRESSION_THRESHOLD",
-                ..
-            }) if source.argument() == 13
-        ));
-    }
-
-    #[test]
-    fn passive_table_never_coalesces_an_execution_method_or_unknown_address() {
-        let mut channel = crate::engines::tests::three_d_channel();
-        let source = crate::engines::tests::program_three_d(&mut channel, 0x0d74, 0);
-        let (profile, state) = channel.three_d_with_profile_mut();
-        for method in (0..0x4000).step_by(4) {
-            if passive(GpuMethodId(method)) {
-                let mut recognized = false;
-                for argument in [0, 1, u32::MAX] {
-                    match preflight_register(
-                        profile,
-                        source.emitted_by_mme(GpuMethodId(method), argument),
-                        state,
-                        true,
-                    ) {
-                        Ok(decoded) => {
-                            recognized = true;
-                            assert!(
-                                decoded.operation.is_none() && decoded.writes_state,
-                                "{method:#x}"
-                            );
-                        }
-                        Err(MaxwellEngineDispatchError::UnknownMethod { .. }) => {}
-                        Err(_) => {
-                            recognized = true;
-                        }
-                    }
-                }
-                assert!(recognized, "unknown passive register {method:#x}");
-            }
-        }
-        for method in [
-            0x110, 0x118, 0x120, 0x124, 0x1300, 0x15e8, 0x15ec, 0x1614, 0x1618, 0x19d0, 0x238c,
-            0x2390, 0x2410, 0x3800,
-        ] {
-            assert!(
-                !passive(GpuMethodId(method)),
-                "execution method {method:#x}"
-            );
-        }
+    fn graphics_domains_change_at_draw_consumption_and_ignore_memory_selectors() {
+        let mut channel = three_d_channel();
+        program_three_d(&mut channel, 0x0d78, 3);
+        let before = channel.three_d().draw_state_identity();
+        program_three_d(&mut channel, 0x2380, 64);
+        program_three_d(&mut channel, 0x0d78, 3);
+        assert!(before.matches(channel.three_d()));
+        program_three_d(&mut channel, 0x1518, 2_f32.to_bits());
+        program_three_d(&mut channel, 0x0d78, 3);
+        assert!(!before.matches_parameters(channel.three_d()));
     }
 }

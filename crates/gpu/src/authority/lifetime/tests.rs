@@ -391,6 +391,10 @@ fn buffer_relocation_preserves_versions_cpu_holes_and_revalidates_readbacks() {
     authority.relocate_buffer(1, 2, NativeTick(4)).unwrap();
     assert_eq!(authority.resources[&2].modification, version.get());
     assert_eq!(authority.resources[&3].aliases, [2]);
+    assert!(authority.resources_may_overlap(2, 3));
+    assert!(authority.resources_may_overlap(3, 2));
+    assert!(!authority.resources_may_overlap(2, 1));
+    assert!(!authority.resources_may_overlap(3, 1));
     let native = authority.observe_native(3, alias).unwrap();
     assert!(observation.is_invalid());
     assert!(authority.mapping(1, 0).is_none());

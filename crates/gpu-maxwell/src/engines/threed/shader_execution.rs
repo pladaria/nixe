@@ -4,8 +4,6 @@
 //! watchdog policy. A verified field encoding does not establish its time
 //! unit or execution effect.
 
-use crate::MaxwellMethodSource;
-
 use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
 
 /// Whether API semantics require depth/stencil testing before pixel shading.
@@ -338,67 +336,61 @@ impl MaxwellThreeDShaderLocalMemoryPerWarpSize {
 ///
 /// ABI source:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L588-L604>
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDShaderLocalMemoryState {
-    address_upper: MaxwellThreeDRegister<u8>,
-    address_lower: MaxwellThreeDRegister<u32>,
-    size_upper: MaxwellThreeDRegister<u8>,
-    size_lower: MaxwellThreeDRegister<u32>,
-    default_size_per_warp: MaxwellThreeDRegister<MaxwellThreeDShaderLocalMemoryPerWarpSize>,
-    window_base_address: MaxwellThreeDRegister<u32>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDShaderLocalMemoryState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDShaderLocalMemoryState {
+impl MaxwellThreeDShaderLocalMemoryState<'_> {
     #[must_use]
-    pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.address_upper
+    pub fn address_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers.read(0x0790, |raw| {
+            (raw & !(0x0000_00ff) == 0).then_some(raw as u8)
+        })
     }
-
     #[must_use]
-    pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.address_lower
+    pub fn address_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x0794, Some)
     }
-
+    #[must_use]
+    pub fn size_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers.read(0x0798, |raw| {
+            (raw & !(0x0000_003f) == 0).then_some(raw as u8)
+        })
+    }
+    #[must_use]
+    pub fn size_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x079c, Some)
+    }
+    #[must_use]
+    pub fn default_size_per_warp(
+        &self,
+    ) -> MaxwellThreeDRegister<MaxwellThreeDShaderLocalMemoryPerWarpSize> {
+        self.registers.read(0x07a0, |raw| {
+            MaxwellThreeDShaderLocalMemoryPerWarpSize::new(raw)
+        })
+    }
+    #[must_use]
+    pub fn window_base_address(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x077c, Some)
+    }
     #[must_use]
     pub fn address(&self) -> Option<MaxwellThreeDUnresolvedAddress> {
         Some(MaxwellThreeDUnresolvedAddress::new(
-            *self.address_upper.value()?,
-            *self.address_lower.value()?,
+            *self.address_upper().value()?,
+            *self.address_lower().value()?,
         ))
     }
-
-    #[must_use]
-    pub const fn size_upper(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.size_upper
-    }
-
-    #[must_use]
-    pub const fn size_lower(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.size_lower
-    }
-
     #[must_use]
     pub fn size(&self) -> Option<u64> {
-        Some((u64::from(*self.size_upper.value()?) << 32) | u64::from(*self.size_lower.value()?))
+        Some(
+            (u64::from(*self.size_upper().value()?) << 32) | u64::from(*self.size_lower().value()?),
+        )
     }
-
-    #[must_use]
-    pub const fn default_size_per_warp(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDShaderLocalMemoryPerWarpSize> {
-        &self.default_size_per_warp
-    }
-
-    #[must_use]
-    pub const fn window_base_address(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.window_base_address
-    }
-
     pub(in crate::engines) fn region_is_partially_programmed(&self) -> bool {
-        let programmed = self.address_upper.raw().is_some()
-            || self.address_lower.raw().is_some()
-            || self.size_upper.raw().is_some()
-            || self.size_lower.raw().is_some();
+        let programmed = self.address_upper().raw().is_some()
+            || self.address_lower().raw().is_some()
+            || self.size_upper().raw().is_some()
+            || self.size_lower().raw().is_some();
         programmed && (self.address().is_none() || self.size().is_none())
     }
 }
@@ -546,297 +538,98 @@ impl MaxwellThreeDSmTimeoutCounterBit {
     }
 }
 
-/// One validated shader-execution register transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellThreeDShaderExecutionStateWrite {
-    StreamOutputEnable {
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    PixelShaderInterlockControl {
-        value: MaxwellThreeDPixelShaderInterlockControl,
-        source: MaxwellMethodSource,
-    },
-    OpportunisticEarlyZHysteresis {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    ApiMandatedEarlyZ {
-        value: MaxwellThreeDApiMandatedEarlyZ,
-        source: MaxwellMethodSource,
-    },
-    ShaderExceptionsEnable {
-        value: MaxwellThreeDShaderExceptionsEnable,
-        source: MaxwellMethodSource,
-    },
-    SubtilingPerfKnobA {
-        value: MaxwellThreeDSubtilingPerfKnobA,
-        source: MaxwellMethodSource,
-    },
-    SubtilingPerfKnobB {
-        value: MaxwellThreeDSubtilingPerfKnobB,
-        source: MaxwellMethodSource,
-    },
-    ShaderWatermarks {
-        target: MaxwellThreeDShaderWatermarkTarget,
-        value: MaxwellThreeDShaderWatermarkRange,
-        source: MaxwellMethodSource,
-    },
-    L1Configuration {
-        value: MaxwellThreeDDirectlyAddressableMemory,
-        source: MaxwellMethodSource,
-    },
-    VisibleCallLimit {
-        value: MaxwellThreeDVisibleCallLimit,
-        source: MaxwellMethodSource,
-    },
-    SmTimeoutCounterBit {
-        value: MaxwellThreeDSmTimeoutCounterBit,
-        source: MaxwellMethodSource,
-    },
-    ShaderLocalMemoryWindowBaseAddress {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    ShaderLocalMemoryAddressUpper {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    ShaderLocalMemoryAddressLower {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    ShaderLocalMemorySizeUpper {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    ShaderLocalMemorySizeLower {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    ShaderLocalMemoryDefaultSizePerWarp {
-        value: MaxwellThreeDShaderLocalMemoryPerWarpSize,
-        source: MaxwellMethodSource,
-    },
-}
-
 /// Persistent shader-execution configuration on one `MAXWELL_B` channel.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDShaderExecutionState {
-    // Capture vertex outputs to memory (transform feedback), independently
-    // of rasterization. Disabled state requires no host capture resources.
-    // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L568-L571
-    stream_output_enable: MaxwellThreeDRegister<bool>,
-    pixel_shader_interlock_control: MaxwellThreeDRegister<MaxwellThreeDPixelShaderInterlockControl>,
-    opportunistic_early_z_hysteresis: MaxwellThreeDRegister<u8>,
-    api_mandated_early_z: MaxwellThreeDRegister<MaxwellThreeDApiMandatedEarlyZ>,
-    shader_exceptions_enable: MaxwellThreeDRegister<MaxwellThreeDShaderExceptionsEnable>,
-    subtiling_perf_knob_a: MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobA>,
-    subtiling_perf_knob_b: MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobB>,
-    vtg_warp_watermarks: MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange>,
-    ps_warp_watermarks: MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange>,
-    ps_register_watermarks: MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange>,
-    l1_configuration: MaxwellThreeDRegister<MaxwellThreeDDirectlyAddressableMemory>,
-    visible_call_limit: MaxwellThreeDRegister<MaxwellThreeDVisibleCallLimit>,
-    sm_timeout_counter_bit: MaxwellThreeDRegister<MaxwellThreeDSmTimeoutCounterBit>,
-    shader_local_memory: MaxwellThreeDShaderLocalMemoryState,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDShaderExecutionState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDShaderExecutionState {
+impl<'a> MaxwellThreeDShaderExecutionState<'a> {
     #[must_use]
-    pub const fn stream_output_enable(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.stream_output_enable
-    }
-
-    #[must_use]
-    pub const fn pixel_shader_interlock_control(
+    pub fn pixel_shader_interlock_control(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDPixelShaderInterlockControl> {
-        &self.pixel_shader_interlock_control
+    ) -> MaxwellThreeDRegister<MaxwellThreeDPixelShaderInterlockControl> {
+        self.registers.read(0x1224, |raw| {
+            MaxwellThreeDPixelShaderInterlockControl::parse(raw)
+        })
     }
-
-    /// Area threshold for opportunistic early-depth scheduling. This selects
-    /// a GM20B performance heuristic rather than API-mandated test ordering;
-    /// the host driver may choose early tests only when semantically safe.
-    /// The late-Z encoding likewise uses ordinary late depth/stencil semantics.
-    /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L220-L242
     #[must_use]
-    pub const fn opportunistic_early_z_hysteresis(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.opportunistic_early_z_hysteresis
+    pub fn opportunistic_early_z_hysteresis(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers
+            .read(0x0204, |raw| (raw & !(0x1f) == 0).then_some(raw as u8))
     }
-
     #[must_use]
-    pub const fn api_mandated_early_z(
+    pub fn api_mandated_early_z(&self) -> MaxwellThreeDRegister<MaxwellThreeDApiMandatedEarlyZ> {
+        self.registers
+            .read(0x0210, MaxwellThreeDApiMandatedEarlyZ::parse)
+    }
+    #[must_use]
+    pub fn shader_exceptions_enable(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDApiMandatedEarlyZ> {
-        &self.api_mandated_early_z
+    ) -> MaxwellThreeDRegister<MaxwellThreeDShaderExceptionsEnable> {
+        self.registers.read(0x1528, |raw| {
+            MaxwellThreeDShaderExceptionsEnable::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn shader_exceptions_enable(
+    pub fn subtiling_perf_knob_a(&self) -> MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobA> {
+        self.registers.read(0x0360, |raw| {
+            Some(MaxwellThreeDSubtilingPerfKnobA::parse(raw))
+        })
+    }
+    #[must_use]
+    pub fn subtiling_perf_knob_b(&self) -> MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobB> {
+        self.registers
+            .read(0x0364, MaxwellThreeDSubtilingPerfKnobB::new)
+    }
+    #[must_use]
+    pub fn l1_configuration(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDShaderExceptionsEnable> {
-        &self.shader_exceptions_enable
+    ) -> MaxwellThreeDRegister<MaxwellThreeDDirectlyAddressableMemory> {
+        self.registers.read(0x0308, |raw| {
+            MaxwellThreeDDirectlyAddressableMemory::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn subtiling_perf_knob_a(
+    pub fn visible_call_limit(&self) -> MaxwellThreeDRegister<MaxwellThreeDVisibleCallLimit> {
+        self.registers
+            .read(0x0d64, MaxwellThreeDVisibleCallLimit::parse)
+    }
+    #[must_use]
+    pub fn sm_timeout_counter_bit(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobA> {
-        &self.subtiling_perf_knob_a
+    ) -> MaxwellThreeDRegister<MaxwellThreeDSmTimeoutCounterBit> {
+        self.registers
+            .read(0x0de4, MaxwellThreeDSmTimeoutCounterBit::new)
     }
-
     #[must_use]
-    pub const fn subtiling_perf_knob_b(
+    pub fn stream_output_enable(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers
+            .read(0x02e4, |raw| (raw <= 1).then_some(raw != 0))
+    }
+    #[must_use]
+    pub fn vtg_warp_watermarks(&self) -> MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange> {
+        self.registers.read(0x0f98, |raw| {
+            Some(MaxwellThreeDShaderWatermarkRange::parse(raw))
+        })
+    }
+    #[must_use]
+    pub fn ps_warp_watermarks(&self) -> MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange> {
+        self.registers.read(0x1450, |raw| {
+            Some(MaxwellThreeDShaderWatermarkRange::parse(raw))
+        })
+    }
+    #[must_use]
+    pub fn ps_register_watermarks(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDSubtilingPerfKnobB> {
-        &self.subtiling_perf_knob_b
+    ) -> MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange> {
+        self.registers.read(0x1454, |raw| {
+            Some(MaxwellThreeDShaderWatermarkRange::parse(raw))
+        })
     }
-
     #[must_use]
-    pub const fn vtg_warp_watermarks(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange> {
-        &self.vtg_warp_watermarks
-    }
-
-    #[must_use]
-    pub const fn ps_warp_watermarks(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange> {
-        &self.ps_warp_watermarks
-    }
-
-    #[must_use]
-    pub const fn ps_register_watermarks(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDShaderWatermarkRange> {
-        &self.ps_register_watermarks
-    }
-
-    #[must_use]
-    pub const fn l1_configuration(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDDirectlyAddressableMemory> {
-        &self.l1_configuration
-    }
-
-    #[must_use]
-    pub const fn visible_call_limit(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDVisibleCallLimit> {
-        &self.visible_call_limit
-    }
-
-    #[must_use]
-    pub const fn sm_timeout_counter_bit(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDSmTimeoutCounterBit> {
-        &self.sm_timeout_counter_bit
-    }
-
-    #[must_use]
-    pub const fn shader_local_memory(&self) -> &MaxwellThreeDShaderLocalMemoryState {
-        &self.shader_local_memory
-    }
-
-    pub(super) fn apply(&mut self, write: MaxwellThreeDShaderExecutionStateWrite) {
-        match write {
-            MaxwellThreeDShaderExecutionStateWrite::StreamOutputEnable { value, source: _ } => {
-                self.stream_output_enable = MaxwellThreeDRegister::decoded(u32::from(value), value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::PixelShaderInterlockControl {
-                value,
-                source: _,
-            } => {
-                self.pixel_shader_interlock_control =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::OpportunisticEarlyZHysteresis {
-                value,
-                source: _,
-            } => {
-                self.opportunistic_early_z_hysteresis =
-                    MaxwellThreeDRegister::decoded(u32::from(value), value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::ApiMandatedEarlyZ { value, source: _ } => {
-                self.api_mandated_early_z = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::ShaderExceptionsEnable { value, source: _ } => {
-                self.shader_exceptions_enable = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobA { value, source: _ } => {
-                self.subtiling_perf_knob_a = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobB { value, source: _ } => {
-                self.subtiling_perf_knob_b = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::ShaderWatermarks {
-                target,
-                value,
-                source: _,
-            } => {
-                let register = match target {
-                    MaxwellThreeDShaderWatermarkTarget::VertexTessellationGeometryWarps => {
-                        &mut self.vtg_warp_watermarks
-                    }
-                    MaxwellThreeDShaderWatermarkTarget::PixelWarps => &mut self.ps_warp_watermarks,
-                    MaxwellThreeDShaderWatermarkTarget::PixelRegisters => {
-                        &mut self.ps_register_watermarks
-                    }
-                };
-                *register = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::L1Configuration { value, source: _ } => {
-                self.l1_configuration = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::VisibleCallLimit { value, source: _ } => {
-                self.visible_call_limit = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::SmTimeoutCounterBit { value, source: _ } => {
-                self.sm_timeout_counter_bit = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryWindowBaseAddress {
-                value,
-                source: _,
-            } => {
-                self.shader_local_memory.window_base_address =
-                    MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryAddressUpper {
-                value,
-                source: _,
-            } => {
-                self.shader_local_memory.address_upper =
-                    MaxwellThreeDRegister::decoded(u32::from(value), value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryAddressLower {
-                value,
-                source: _,
-            } => {
-                self.shader_local_memory.address_lower =
-                    MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemorySizeUpper {
-                value,
-                source: _,
-            } => {
-                self.shader_local_memory.size_upper =
-                    MaxwellThreeDRegister::decoded(u32::from(value), value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemorySizeLower {
-                value,
-                source: _,
-            } => {
-                self.shader_local_memory.size_lower = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryDefaultSizePerWarp {
-                value,
-                source: _,
-            } => {
-                self.shader_local_memory.default_size_per_warp =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
+    pub fn shader_local_memory(&self) -> MaxwellThreeDShaderLocalMemoryState<'a> {
+        MaxwellThreeDShaderLocalMemoryState {
+            registers: self.registers,
         }
     }
 }

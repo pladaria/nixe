@@ -231,6 +231,7 @@ pub(crate) fn dispatch_semantic_object(
 }
 
 pub(crate) fn dispatch_session(
+    kernel: &std::sync::Arc<nixe_scheduler::SchedulerState>,
     mounts: &ProcessMountNamespace,
 
     session: &IpcSession,
@@ -367,7 +368,7 @@ pub(crate) fn dispatch_session(
             Ok(IpcResponse::None)
         }
         (IpcService::AddOnContent, IpcRequest::GetAddOnContentListChangedEvent) => {
-            let (_writable, readable) = EventObject::create_pair();
+            let (_writable, readable) = EventObject::create_pair(kernel);
             Ok(IpcResponse::Event(readable))
         }
         (
@@ -1109,14 +1110,17 @@ mod tests {
         std::fs::write(&path, nro).unwrap();
         let plan = Launcher::build(LauncherInput::new(path)).unwrap();
         let machine = crate::test_memory::machine();
-        let process =
-            ProcessBuilder::new(machine.clone(), machine.account(16 * 1024 * 1024).unwrap())
-                .with_config(nixe_runtime::ProcessBuildConfig {
-                    physical_memory_limit: 16 * 1024 * 1024,
-                    ..Default::default()
-                })
-                .build(&plan)
-                .unwrap();
+        let process = ProcessBuilder::new(
+            machine.clone(),
+            machine.account(16 * 1024 * 1024).unwrap(),
+            crate::test_memory::kernel(),
+        )
+        .with_config(nixe_runtime::ProcessBuildConfig {
+            physical_memory_limit: 16 * 1024 * 1024,
+            ..Default::default()
+        })
+        .build(&plan)
+        .unwrap();
         (directory, process)
     }
 
@@ -1130,7 +1134,7 @@ mod tests {
             TransactionalDirectory::open(base.clone(), 4).unwrap(),
         ));
         let filesystem = HostDirectoryFileSystem::from_save(volume.clone());
-        let (mounts, _) = process.mounts_and_handles();
+        let mounts = process.mounts();
         assert!(matches!(
             dispatch_host_filesystem(
                 mounts,
@@ -1221,7 +1225,7 @@ mod tests {
         std::fs::create_dir_all(base.join("data/slot")).unwrap();
         std::fs::write(base.join("data/slot/progress"), b"save").unwrap();
         std::fs::write(base.join("data/settings"), b"keep").unwrap();
-        let (mounts, _) = process.mounts_and_handles();
+        let mounts = process.mounts();
         for commit in [false, true] {
             let volume = Arc::new(std::sync::Mutex::new(
                 TransactionalDirectory::open(base.clone(), 8).unwrap(),
@@ -1317,7 +1321,7 @@ mod tests {
             TransactionalDirectory::open(base.clone(), 4).unwrap(),
         ));
         let filesystem = HostDirectoryFileSystem::from_save(volume.clone());
-        let (mounts, _) = process.mounts_and_handles();
+        let mounts = process.mounts();
         dispatch_host_filesystem(
             mounts,
             &filesystem,
@@ -1361,7 +1365,7 @@ mod tests {
         ));
         let filesystem = HostDirectoryFileSystem::from_save(volume);
         std::os::unix::fs::symlink(&outside, filesystem.resolve_new("/link").unwrap()).unwrap();
-        let (mounts, _) = process.mounts_and_handles();
+        let mounts = process.mounts();
         assert!(matches!(
             dispatch_host_filesystem(
                 mounts,

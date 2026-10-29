@@ -1,7 +1,7 @@
 //! Horizon output-session lifetime and kernel event ownership.
 
 use nixe_audio::{AudioBackend, AudioError, AudioOutput, PcmFormat};
-use nixe_runtime::{EventObject, ExternalEventSource, ReadableEventObject};
+use nixe_runtime::{EventObject, ReadableEventObject};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
@@ -19,11 +19,12 @@ pub struct AudioOutSession {
 
 impl AudioOutSession {
     pub(crate) fn open(
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
         backend: &dyn AudioBackend,
         format: PcmFormat,
         devices: Arc<crate::audio_device::AudioDeviceState>,
     ) -> Result<Self, AudioError> {
-        let (signal, event) = EventObject::create_pair_with_source(ExternalEventSource::Device);
+        let (signal, event) = EventObject::create_pair(kernel);
         let output = AudioOutput::open(
             backend,
             format,

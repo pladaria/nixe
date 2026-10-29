@@ -1,33 +1,27 @@
 //! Deterministic process-local handles and extensible runtime objects.
 
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, Weak};
 
 use nixe_cpu::memory::MemoryPermissions;
 use nixe_memory::GuestVirtualAddress;
 use nixe_memory::{Access, Allocation, MemoryError};
 
-mod event;
 mod port;
 mod session;
-pub(crate) use event::EventWatchRegistration;
-pub use event::{
-    EventFuture, EventObject, EventWaitOutcome, ReadableEventObject, WritableEventObject,
+pub use nixe_scheduler::{
+    EventFuture, EventNotifications, EventObject, ReadableEventObject, WritableEventObject,
 };
 use port::PortState;
 pub use port::{PortEndpoint, PortError, PortObject};
 pub use session::{
     MAX_SESSION_REQUESTS, SessionEndpoint, SessionError, SessionMessage, SessionObject,
-    SessionRequestOwner, SessionRequestResult,
+    SessionReceive, SessionRequest, SessionRequestOwner, SessionResponse,
 };
 
-const FIRST_HANDLE: u32 = 1;
-const LAST_HANDLE: u32 = 0x7fff_ffff;
 /// Type-erased value retained by a process handle.
 ///
 /// The blanket implementation lets platform layers add object types without
@@ -70,6 +64,12 @@ impl HandleObject {
         value.downcast::<T>().ok()
     }
 
+    /// Selects a concrete owner by consuming the already retained reference.
+    pub fn into_arc<T: Any + Send + Sync>(self) -> Option<Arc<T>> {
+        let value: Arc<dyn Any + Send + Sync> = self.value;
+        value.downcast::<T>().ok()
+    }
+
     #[must_use]
     pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
         self.value.as_ref().as_any().downcast_ref()
@@ -105,94 +105,6 @@ impl Debug for HandleObject {
     }
 }
 
-/// Runtime-owned thread identity.
-#[derive(Debug)]
-pub struct ThreadObject {
-    thread_id: AtomicU64,
-    completion: EventObject,
-    retirement: OnceLock<(nixe_scheduler::ProcessId, crate::ExternalEventSender)>,
-}
-
-/// Runtime-owned process identity transported through copied pseudo-handles.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ProcessObject {
-    process_id: u64,
-}
-
-impl ProcessObject {
-    #[must_use]
-    pub const fn new(process_id: u64) -> Self {
-        Self { process_id }
-    }
-
-    #[must_use]
-    pub const fn process_id(self) -> u64 {
-        self.process_id
-    }
-}
-
-impl ThreadObject {
-    #[must_use]
-    pub fn new(thread_id: u64) -> Self {
-        Self {
-            thread_id: AtomicU64::new(thread_id),
-            completion: EventObject::new(),
-            retirement: OnceLock::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn thread_id(&self) -> u64 {
-        self.thread_id.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn assign_thread_id(&self, thread_id: u64) {
-        self.thread_id.store(thread_id, Ordering::Release);
-    }
-
-    pub(crate) fn bind_retirement(
-        &self,
-        process: nixe_scheduler::ProcessId,
-        sender: crate::ExternalEventSender,
-    ) {
-        self.retirement
-            .set((process, sender))
-            .expect("thread is registered once");
-    }
-
-    #[must_use]
-    pub fn is_signalled(&self) -> bool {
-        self.completion.is_signalled()
-    }
-
-    pub(crate) fn signal(&self) {
-        self.completion.signal();
-    }
-
-    #[must_use]
-    pub fn readable_event(&self) -> ReadableEventObject {
-        ReadableEventObject(self.completion.clone())
-    }
-}
-
-impl PartialEq for ThreadObject {
-    fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self, other)
-    }
-}
-
-impl Eq for ThreadObject {}
-
-impl Drop for ThreadObject {
-    fn drop(&mut self) {
-        if let Some((process, sender)) = self.retirement.get() {
-            sender.retire_thread(
-                *process,
-                nixe_scheduler::GuestThreadId::new(self.thread_id()),
-            );
-        }
-    }
-}
 /// Original owner and physical pins survive duplicated/exported transfer handles.
 #[derive(Clone)]
 pub struct TransferMemoryObject(Arc<TransferMemory>);
@@ -338,7 +250,6 @@ pub enum HandleError {
     Exhausted,
     AllocationFailed,
     Closed,
-    IdentityExhausted,
     InvalidHandle(u32),
     InvalidRange,
     BackingAccess,
@@ -349,7 +260,6 @@ impl Display for HandleError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Closed => formatter.write_str("process handle table is closed"),
-            Self::IdentityExhausted => formatter.write_str("handle reservation identity exhausted"),
             Self::Exhausted => formatter.write_str("process handle table is exhausted"),
             Self::AllocationFailed => formatter.write_str("runtime object allocation failed"),
             Self::InvalidHandle(handle) => write!(formatter, "invalid process handle {handle:#x}"),
@@ -379,9 +289,9 @@ mod tests {
     }
 
     #[test]
-    fn allocation_duplicate_transfer_and_close_preserve_object_lifetime() {
+    fn allocation_duplicate_and_close_preserve_object_lifetime() {
         let source = HandleTable::new();
-        let event = EventObject::new();
+        let event = EventObject::new(&crate::process::tests::test_kernel());
         let first = source.insert(event.clone()).unwrap();
         let duplicate = source.duplicate(first).unwrap();
         event.signal();
@@ -392,12 +302,14 @@ mod tests {
                 .is_signalled()
         );
 
-        let destination = HandleTable::new();
-        let transferred = source.transfer_to(&destination, duplicate).unwrap();
-        assert!(source.lookup(duplicate).is_none());
-        assert!(destination.lookup_as::<EventObject>(transferred).is_some());
         let closed = source.close(first).unwrap();
         assert!(closed.is::<EventObject>());
+        assert!(
+            source
+                .lookup_as::<EventObject>(duplicate)
+                .unwrap()
+                .is_signalled()
+        );
         assert!(matches!(
             source.close(first),
             Err(HandleError::InvalidHandle(handle)) if handle == first
@@ -405,39 +317,42 @@ mod tests {
     }
 
     #[test]
-    fn readable_event_sleeps_for_signal_or_deadline_without_polling() {
-        let (writable, readable) = EventObject::create_pair();
-        let signaler = std::thread::spawn(move || writable.signal());
-        assert_eq!(readable.wait(None), EventWaitOutcome::Signalled);
-        signaler.join().unwrap();
-
-        readable.clear();
-        assert_eq!(
-            readable.wait(Some(Duration::from_millis(1))),
-            EventWaitOutcome::TimedOut
-        );
-    }
-
-    #[test]
-    fn allocation_reuses_the_lowest_closed_handle() {
+    fn a_reused_slot_does_not_revive_a_closed_handle() {
         let handles = HandleTable::new();
-        let first = handles.insert(ThreadObject::new(1)).unwrap();
-        let second = handles.insert(ThreadObject::new(2)).unwrap();
-        assert_eq!((first, second), (1, 2));
-        handles.close(first).unwrap();
-        assert_eq!(handles.insert(ThreadObject::new(3)).unwrap(), first);
+        let first = handles
+            .insert(EventObject::new(&crate::process::tests::test_kernel()))
+            .unwrap();
+        let retained = handles.close(first).unwrap();
+        let replacement = handles
+            .insert(EventObject::new(&crate::process::tests::test_kernel()))
+            .unwrap();
+        assert_ne!(replacement, first);
+        assert!(handles.lookup(first).is_none());
+        assert!(
+            !handles
+                .lookup(replacement)
+                .unwrap()
+                .same_identity(&retained)
+        );
     }
 
     #[test]
     fn capacity_limit_counts_live_handles_and_allows_reuse_after_close() {
         let handles = HandleTable::with_capacity_limit(1);
-        let first = handles.insert(ThreadObject::new(1)).unwrap();
+        let first = handles
+            .insert(EventObject::new(&crate::process::tests::test_kernel()))
+            .unwrap();
         assert_eq!(
-            handles.insert(ThreadObject::new(2)),
+            handles.insert(EventObject::new(&crate::process::tests::test_kernel())),
             Err(HandleError::Exhausted)
         );
         handles.close(first).unwrap();
-        assert_eq!(handles.insert(ThreadObject::new(3)).unwrap(), first);
+        let replacement = handles
+            .insert(EventObject::new(&crate::process::tests::test_kernel()))
+            .unwrap();
+        assert_ne!(replacement, first);
+        assert!(handles.lookup(first).is_none());
+        assert_eq!(handles.len(), 1);
     }
 
     #[test]
@@ -543,39 +458,44 @@ mod tests {
 
     #[test]
     fn session_transports_one_in_flight_request_and_reply_per_owner() {
-        let (server, client) = SessionObject::create_pair();
-        let initial_generation = server.wake_generation();
-        let request = SessionMessage::Buffer(vec![1, 2, 3]);
+        let (server, client) = SessionObject::create_pair(&crate::process::tests::test_kernel());
         assert_eq!(
-            client.request(owner(7), request.clone()),
-            Ok(SessionRequestResult::Submitted)
+            client.request(owner(7), SessionMessage::Buffer(vec![1, 2, 3])),
+            Ok(())
         );
         assert!(server.is_signalled());
-        assert!(server.wake_generation() > initial_generation);
-        assert_eq!(server.receive(), Ok(request));
+        let mut receive = server.receive().unwrap();
         assert_eq!(
-            client.request(owner(7), SessionMessage::Buffer(Vec::new())),
-            Ok(SessionRequestResult::Waiting)
+            receive.take_message(),
+            SessionMessage::Buffer(vec![1, 2, 3])
         );
-        let response = SessionMessage::Buffer(vec![4, 5]);
-        server.reply(response.clone()).unwrap();
+        receive.complete();
+        assert_eq!(
+            crate::process::tests::poll_session(&client, owner(7)),
+            Ok(None)
+        );
+        server
+            .reply()
+            .unwrap()
+            .reply(SessionMessage::Buffer(vec![4, 5]))
+            .unwrap();
         assert!(client.is_signalled());
         assert_eq!(
-            client.request(owner(7), SessionMessage::Buffer(Vec::new())),
-            Ok(SessionRequestResult::Response(response))
+            crate::process::tests::poll_session(&client, owner(7)),
+            Ok(Some(SessionMessage::Buffer(vec![4, 5])))
         );
     }
 
     #[test]
     fn session_queue_is_bounded_and_peer_close_wakes_the_other_endpoint() {
-        let (server, client) = SessionObject::create_pair();
+        let (server, client) = SessionObject::create_pair(&crate::process::tests::test_kernel());
         for thread_id in 0..MAX_SESSION_REQUESTS as u64 {
             assert_eq!(
                 client.request(
                     owner(thread_id),
                     SessionMessage::Buffer(vec![thread_id as u8])
                 ),
-                Ok(SessionRequestResult::Submitted)
+                Ok(())
             );
         }
         assert_eq!(
@@ -592,17 +512,25 @@ mod tests {
 
     #[test]
     fn port_enforces_limits_and_accepts_the_matching_server_endpoint() {
-        let (server_port, client_port) = PortObject::create_pair(1, false);
-        let initial_generation = server_port.wake_generation();
+        let (server_port, client_port) =
+            PortObject::create_pair(&crate::process::tests::test_kernel(), 1, false);
         let client_session = client_port.connect().unwrap();
         assert!(server_port.is_signalled());
-        assert!(server_port.wake_generation() > initial_generation);
         assert!(matches!(
             client_port.connect(),
             Err(PortError::SessionLimit)
         ));
         let server_session = server_port.accept().unwrap();
-        assert!(server_session.same_session(&client_session));
+        let message = || SessionMessage::Buffer(vec![0; 8]);
+        client_session.request(owner(1), message()).unwrap();
+        let mut received = server_session.receive().unwrap();
+        assert_eq!(received.take_message(), message());
+        received.complete();
+        server_session.reply().unwrap().reply(message()).unwrap();
+        assert_eq!(
+            crate::process::tests::poll_session(&client_session, owner(1)),
+            Ok(Some(message()))
+        );
         assert_eq!(server_session.endpoint(), SessionEndpoint::Server);
         assert_eq!(client_session.endpoint(), SessionEndpoint::Client);
         drop(server_session);
@@ -612,7 +540,8 @@ mod tests {
 
     #[test]
     fn light_session_rejects_buffer_messages() {
-        let (_server, client) = SessionObject::create_light_pair();
+        let (_server, client) =
+            SessionObject::create_light_pair(&crate::process::tests::test_kernel());
         assert_eq!(
             client.request(owner(1), SessionMessage::Buffer(Vec::new())),
             Err(SessionError::MessageKindMismatch)

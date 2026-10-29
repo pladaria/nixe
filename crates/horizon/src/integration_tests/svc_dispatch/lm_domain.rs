@@ -32,7 +32,7 @@ fn logger_domain_shares_child_objects_with_clones_and_closes_them_independently(
     put_u32(&mut control, 16, 0x4943_4653);
     put_u32(&mut control, 20, 1);
     write_guest_bytes(&process, tls, &control);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -40,7 +40,7 @@ fn logger_domain_shares_child_objects_with_clones_and_closes_them_independently(
     assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
 
     write_guest_bytes(&process, tls, &domain_request(1, false));
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -51,7 +51,7 @@ fn logger_domain_shares_child_objects_with_clones_and_closes_them_independently(
     );
 
     write_guest_bytes(&process, tls, &domain_request(1, true));
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -67,7 +67,7 @@ fn logger_domain_shares_child_objects_with_clones_and_closes_them_independently(
 
     put_u32(&mut control, 24, 2);
     write_guest_bytes(&process, tls, &control);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -92,7 +92,7 @@ fn logger_domain_shares_child_objects_with_clones_and_closes_them_independently(
     put_u32(&mut log, 36, logger);
     put_u32(&mut log, 48, 0x4943_4653);
     write_guest_bytes(&process, tls, &log);
-    state(&mut process).write_w(x(0), clone);
+    process.main_thread().registers().write_w(x(0), clone);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -106,14 +106,14 @@ fn logger_domain_shares_child_objects_with_clones_and_closes_them_independently(
     close[16] = 2;
     put_u32(&mut close, 20, logger);
     write_guest_bytes(&process, tls, &close);
-    state(&mut process).write_w(x(0), clone);
+    process.main_thread().registers().write_w(x(0), clone);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
     write_guest_bytes(&process, tls, &log);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed

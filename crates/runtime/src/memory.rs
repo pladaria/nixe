@@ -280,6 +280,12 @@ impl ProcessMemory {
     ) -> Result<(), MappingError> {
         let end = self.end(start, bytes)?;
         let mut regions = self.regions.lock().unwrap();
+        // Closing the address space already releases its mappings. Retained
+        // kernel objects may finish their destruction after that close.
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         Self::covered(&regions, start.get(), end, |mapping| {
             if mapping == expected {
                 Ok(())

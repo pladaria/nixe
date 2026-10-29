@@ -17,8 +17,8 @@ registers are authoritative in Dynarmic and bridge TLS storage. The reusable
 boxed save area is inaccessible while native/unavailable; its old bytes are not
 a current snapshot. No scalar overlay or duplicated authoritative context exists.
 
-`GuestThread.state` owns the value between scheduler leases. Dispatch moves it
-into `VcpuExecutionState`; the table contains `None` until validated reconciliation.
+`ThreadObject` owns the value between scheduler leases. Dispatch moves it
+into `VcpuExecutionState`; its register slot contains `None` until validated reconciliation.
 Only the holder may read/write registers. Worker native entry exclusively borrows
 that owner synchronously, so callbacks and other threads cannot obtain it while
 execution is active. After return, the coordinator can access the stopped native

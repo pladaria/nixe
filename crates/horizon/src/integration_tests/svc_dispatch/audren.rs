@@ -32,16 +32,16 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     }
     let events = process.coordinator_mut().event_sender();
     let mut dispatcher = support::dispatcher(&process)
-        .with_memory_completions(events)
+        .with_input_completions(events)
         .with_audio_backend(std::sync::Arc::new(Backend));
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let sm = state(&mut process).read_w(x(1));
+    let sm = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
     let mut register = [0; 256];
     put_u32(&mut register, 0, 4);
@@ -49,7 +49,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     put_u32(&mut register, 8, 1);
     put_u32(&mut register, 32, 0x4943_4653);
     write_guest_bytes(&process, tls, &register);
-    state(&mut process).write_w(x(0), sm);
+    process.main_thread().registers().write_w(x(0), sm);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -61,7 +61,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     put_u32(&mut request, 24, 1);
     request[32..40].copy_from_slice(b"audren:u");
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), sm);
+    process.main_thread().registers().write_w(x(0), sm);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -99,7 +99,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
         put_u32(&mut request, 4, words);
         request[80..84].copy_from_slice(&revision);
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), manager);
+        process.main_thread().registers().write_w(x(0), manager);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -116,7 +116,8 @@ fn exercise_renderer(revision: u32, work_size: u32) {
             assert_eq!(read_guest_u32(&process, tls.checked_add(36).unwrap()), 0);
         }
     }
-    // Create actual kernel transfer memory and pass the owner pseudo-handle.
+    // Create actual kernel transfer memory. Exercise both a pseudo-handle and
+    // a regular copied handle to the same process object across revisions.
     let work_address = process.memory_layout().heap().base();
     process
         .memory()
@@ -133,18 +134,24 @@ fn exercise_renderer(revision: u32, work_size: u32) {
         )
         .unwrap();
     write_guest_bytes(&process, work_address, &vec![0xcc; work_size as usize]);
-    state(&mut process).write_x(x(1), work_address.get());
-    state(&mut process).write_x(x(2), u64::from(work_size));
-    state(&mut process).write_w(x(3), 0);
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(1), work_address.get());
+    process
+        .main_thread()
+        .registers()
+        .write_x(x(2), u64::from(work_size));
+    process.main_thread().registers().write_w(x(3), 0);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
-        state(&mut process).read_w(x(0)),
+        process.main_thread().registers().read_w(x(0)),
         HorizonKernelResult::SUCCESS.raw()
     );
-    let transfer = state(&mut process).read_w(x(1));
+    let transfer = process.main_thread().registers().read_w(x(1));
     let parameters: Vec<_> = request[32..84].to_vec();
     request.fill(0xa5);
     put_u32(&mut request, 0, 4);
@@ -152,7 +159,17 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     put_u32(&mut request, 8, 5); // PID + two copied handles.
     put_u64(&mut request, 12, 0);
     put_u32(&mut request, 20, transfer);
-    put_u32(&mut request, 24, CURRENT_PROCESS_HANDLE);
+    let owner = if revision == 7 {
+        CURRENT_PROCESS_HANDLE
+    } else {
+        process
+            .handles()
+            .insert_object(nixe_runtime::HandleObject::from_arc(std::sync::Arc::clone(
+                &process,
+            )))
+            .unwrap()
+    };
+    put_u32(&mut request, 24, owner);
     put_u32(&mut request, 32, 0x4943_4653);
     put_u32(&mut request, 36, 0);
     put_u32(&mut request, 40, 0);
@@ -171,7 +188,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
         put_u32(&mut request, 20, handle);
         put_u64(&mut request, 104, u64::from(size));
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), manager);
+        process.main_thread().registers().write_w(x(0), manager);
         let outcome = dispatch_next(&mut process, &mut dispatcher);
         if handle == 0xdead {
             assert!(matches!(
@@ -179,7 +196,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
                 ExceptionHandlingResult::Rejected(HorizonSvcFault::Ipc { .. })
             ));
             assert_eq!(
-                state(&mut process).read_w(x(0)),
+                process.main_thread().registers().read_w(x(0)),
                 HorizonKernelResult::INVALID_HANDLE.raw()
             );
             continue;
@@ -221,7 +238,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     for (command, expected) in [(0, 48000), (1, 240), (2, 30), (3, 1), (9, 100)] {
         put_u32(&mut request, 24, command);
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), renderer);
+        process.main_thread().registers().write_w(x(0), renderer);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -236,7 +253,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
         put_u32(&mut request, 24, command);
         put_u32(&mut request, 32, 80);
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), renderer);
+        process.main_thread().registers().write_w(x(0), renderer);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -248,7 +265,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     }
     put_u32(&mut request, 24, 7);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), renderer);
+    process.main_thread().registers().write_w(x(0), renderer);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -308,7 +325,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     ] {
         put_receive_buffer(&mut request, 20, output_address.get(), size as u64);
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), renderer);
+        process.main_thread().registers().write_w(x(0), renderer);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -350,7 +367,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     put_u32(&mut request, 64, 0x4943_4653);
     put_u32(&mut request, 72, 10);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), renderer);
+    process.main_thread().registers().write_w(x(0), renderer);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -364,7 +381,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
         put_u32(&mut request, 16, 0x4943_4653);
         put_u32(&mut request, 24, command);
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), renderer);
+        process.main_thread().registers().write_w(x(0), renderer);
         let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
         assert!(matches!(
             handling,

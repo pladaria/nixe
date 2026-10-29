@@ -82,12 +82,13 @@ pub(in crate::ipc_wire) async fn dispatch_system_settings(
             if usize::from(descriptor.size) < FIRMWARE_VERSION_SIZE {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
-            write_bytes(
-                process,
-                GuestVirtualAddress::new(descriptor.address),
-                &emulated_firmware_version(),
-            )
-            .await?;
+            process
+                .write(
+                    &process.receive_statics()[0],
+                    0,
+                    &emulated_firmware_version(),
+                )
+                .await?;
             log::debug!("set:sys returned emulated firmware version 1.0.0");
             Ok((
                 encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
@@ -135,11 +136,7 @@ pub(in crate::ipc_wire) async fn dispatch_user_settings(
                             && hipc.receive_buffers.is_empty()
                             && descriptors[0].size > 0 =>
                     {
-                        BufferDescriptor {
-                            address: descriptors[0].address,
-                            size: u64::from(descriptors[0].size),
-                            mode: BufferMode::Normal,
-                        }
+                        &process.receive_statics()[0]
                     }
                     _ => {
                         return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
@@ -149,10 +146,9 @@ pub(in crate::ipc_wire) async fn dispatch_user_settings(
                     match hipc.receive_buffers.as_slice() {
                         [descriptor]
                             if descriptor.size > 0
-                                && descriptor.mode != BufferMode::Invalid
                                 && matches!(hipc.receive_statics, ReceiveStatics::None) =>
                         {
-                            *descriptor
+                            &process.receive_buffers()[0]
                         }
                         _ => {
                             return cmif_error(

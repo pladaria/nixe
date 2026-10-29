@@ -5,6 +5,7 @@ use super::message::MessageError;
 #[derive(Clone, Debug)]
 pub(crate) enum IpcWireError {
     Cancelled,
+    Kernel(crate::HorizonKernelResult),
     SystemMemory(std::sync::Arc<nixe_memory::MemoryError>),
     Handle(nixe_runtime::HandleError),
     GuestAccess {
@@ -56,6 +57,7 @@ impl HorizonIpcFault {
         use crate::HorizonKernelResult as Result;
         use nixe_runtime::HandleError;
         match &self.0 {
+            IpcWireError::Kernel(result) => Some(*result),
             IpcWireError::Cancelled => Some(Result::THREAD_TERMINATING),
             IpcWireError::Handle(HandleError::InvalidHandle(_)) => Some(Result::INVALID_HANDLE),
             IpcWireError::Handle(HandleError::Exhausted) => Some(Result::OUT_OF_HANDLES),
@@ -74,6 +76,7 @@ impl HorizonIpcFault {
 impl std::fmt::Display for HorizonIpcFault {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
+            IpcWireError::Kernel(result) => write!(formatter, "IPC transport rejected: {result:?}"),
             IpcWireError::Cancelled => formatter.write_str("IPC caller terminated"),
             IpcWireError::SystemMemory(error) => {
                 write!(formatter, "system shared-memory access failed: {error}")

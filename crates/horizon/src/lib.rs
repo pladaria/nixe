@@ -82,8 +82,7 @@ pub use svc::{
 };
 pub use svc_dispatch::{
     CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonKernelResult,
-    HorizonScheduledDispatchError, HorizonSvcCoverageEntry, HorizonSvcDispatcher, HorizonSvcFault,
-    HorizonSvcSupport, MAX_WAIT_HANDLES, PendingThreadWait,
+    HorizonScheduledDispatchError, HorizonSvcDispatcher, HorizonSvcFault, MAX_WAIT_HANDLES,
 };
 
 #[cfg(test)]

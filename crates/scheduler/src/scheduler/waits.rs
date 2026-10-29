@@ -120,11 +120,30 @@ impl State {
         }
     }
 
+    pub(super) fn insert_ordered_wait(
+        &mut self,
+        index: Index,
+        kind: OrderedWaitKind,
+        address: u64,
+    ) -> Result<(), SchedulerError> {
+        if self.slots[index].waiting_on.is_some() {
+            return Err(SchedulerError::DuplicateWait(self.slots[index].id));
+        }
+        let membership = Membership::Ordered(kind, address);
+        self.slots[index].waiting_on = Some(membership);
+        self.insert_wait_node(index, membership);
+        Ok(())
+    }
+
     pub(super) fn begin_wait(
         &mut self,
         index: Index,
         profile: &MachineSchedulerProfile,
-    ) -> Result<WakeToken, SchedulerError> {
+        kernel: std::sync::Weak<SchedulerState>,
+    ) -> Result<Arc<KernelWait>, SchedulerError> {
+        if self.closed {
+            return Err(SchedulerError::KernelStopped);
+        }
         if self.slots[index].lifecycle != ThreadLifecycle::Waiting {
             return Err(self.invalid(index));
         }
@@ -140,8 +159,13 @@ impl State {
             generation: crate::WakeGeneration::new(self.wake_generation),
         };
         self.remove_queued(index, profile);
-        self.slots[index].wait = Some(token);
-        Ok(token)
+        #[cfg(feature = "performance-counters")]
+        {
+            self.slots[index].resolved_at_ns = None;
+        }
+        let wait = Arc::new(KernelWait::new(token, kernel));
+        self.slots[index].wait = Some(wait.clone());
+        Ok(wait)
     }
     fn lock(&self, index: Index) -> &Lock {
         self.locks[slot_index(index)]
@@ -476,10 +500,15 @@ impl SchedulerState {
         process: ProcessId,
         key: LockKey,
         owner: GuestThreadId,
-    ) -> Result<LockHandoff, SchedulerError> {
+    ) -> Result<(LockHandoff, Option<WaitEffect>), SchedulerError> {
         self.edit(|state| {
             let owner = state.slots.index(owner)?;
-            Ok(state.release_lock(process, key, owner, &self.profile))
+            let handoff = state.release_lock(process, key, owner, &self.profile);
+            let effect = handoff
+                .next
+                .and_then(|thread| state.slots.index(thread).ok())
+                .and_then(|index| state.claim_wait_effect(index));
+            Ok((handoff, effect))
         })
     }
     pub fn remove_waiter(&self, thread: GuestThreadId) -> bool {
@@ -493,21 +522,46 @@ impl SchedulerState {
         })
         .expect("removing a waiter cannot fail")
     }
-    pub fn register_ordered_wait(
-        &self,
+    pub fn begin_mutex_wait(
+        self: &Arc<Self>,
+        process: ProcessId,
+        key: LockKey,
+        owner: GuestThreadId,
+        thread: GuestThreadId,
+    ) -> Result<Arc<KernelWait>, SchedulerError> {
+        self.edit(|state| {
+            let index = state.slots.index(thread)?;
+            let owner = state.slots.index(owner)?;
+            let wait = if let Some(wait) = &state.slots[index].wait {
+                wait.clone()
+            } else {
+                state.begin_wait(index, &self.profile, Arc::downgrade(self))?
+            };
+            state.add_waiter(process, key, owner, index, &self.profile, Some(thread))?;
+            Ok(wait)
+        })
+    }
+    pub fn begin_ordered_wait(
+        self: &Arc<Self>,
         thread: GuestThreadId,
         kind: OrderedWaitKind,
         address: u64,
-    ) -> Result<(), SchedulerError> {
+        atomic_effect: bool,
+    ) -> Result<(Arc<KernelWait>, Option<WaitEffect>), SchedulerError> {
         self.edit(|state| {
             let index = state.slots.index(thread)?;
-            if state.slots[index].waiting_on.is_some() {
-                return Err(SchedulerError::DuplicateWait(thread));
-            }
-            let membership = Membership::Ordered(kind, address);
-            state.slots[index].waiting_on = Some(membership);
-            state.insert_wait_node(index, membership);
-            Ok(())
+            let wait = if let Some(wait) = &state.slots[index].wait {
+                wait.clone()
+            } else {
+                state.begin_wait(index, &self.profile, Arc::downgrade(self))?
+            };
+            state.insert_ordered_wait(index, kind, address)?;
+            let effect = atomic_effect.then(|| {
+                state
+                    .claim_wait_effect(index)
+                    .expect("unresolved atomic wait")
+            });
+            Ok((wait, effect))
         })
     }
     pub fn first_ordered_waiter(
@@ -547,6 +601,41 @@ impl SchedulerState {
         .map(|index| state.slots[index].id)
         .collect()
     }
+    pub fn claim_ordered_waiters(
+        &self,
+        process: ProcessId,
+        kind: OrderedWaitKind,
+        address: u64,
+        count: usize,
+        unlink: bool,
+    ) -> (Vec<(GuestThreadId, WaitEffect)>, bool) {
+        self.edit(|state| {
+            let mut claims = Vec::new();
+            let mut node = state.processes.get(&process).and_then(|process| {
+                process.ordered[kind as usize].lower_bound(&state.slots, address)
+            });
+            while let Some(index) = node.filter(|&index| {
+                state.slots[index].waiting_on == Some(Membership::Ordered(kind, address))
+            }) {
+                if claims.len() == count {
+                    break;
+                }
+                node = WaitTree::next(&state.slots, index);
+                if let Some(effect) = state.claim_wait_effect(index) {
+                    claims.push((state.slots[index].id, effect));
+                    if unlink {
+                        state.remove_waiter(index, &self.profile, None);
+                    }
+                }
+            }
+            let more = node.is_some_and(|index| {
+                state.slots[index].waiting_on == Some(Membership::Ordered(kind, address))
+            });
+            Ok((claims, more))
+        })
+        .expect("claiming ordered waiters")
+    }
+
     pub fn priority_donation_count(&self) -> usize {
         self.state
             .lock()

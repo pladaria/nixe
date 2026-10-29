@@ -58,10 +58,9 @@ pub(super) fn transfer(
     let result = packets
         .into_iter()
         .try_for_each(|packet| {
-            crate::test_memory::ready(stream_maxwell_engine_packet(
+            crate::test_memory::ready(stream_maxwell_engine_entry(
                 channel,
-                FrontendSubmissionId::new(3),
-                packet,
+                &mut crate::pushbuffer::packet::CommandStream::fixture(packet),
                 None,
                 &mut mme,
                 &mut parameters,
@@ -71,6 +70,7 @@ pub(super) fn transfer(
         .map_err(|error| match error {
             MaxwellEngineStreamError::Dispatch(error) => *error,
             MaxwellEngineStreamError::Consumer(never) => match never {},
+            MaxwellEngineStreamError::Decode(error) => panic!("invalid command fixture: {error}"),
         });
     (writes, spans, result)
 }
@@ -101,8 +101,8 @@ fn constant_buffer_packet_modes_preserve_bytes_and_only_update_one_cursor() {
         assert_eq!(a.1, 1);
         assert_eq!(b.1, values.len());
         assert_eq!(
-            fast.three_d().shader_bindings().constant_buffer_load(),
-            scalar.three_d().shader_bindings().constant_buffer_load()
+            fast.three_d().shader_bindings().constant_buffer_offset(),
+            scalar.three_d().shader_bindings().constant_buffer_offset()
         );
         assert_eq!(
             fast.three_d_mut().raw_register_value(GpuMethodId(0x2390)),
@@ -126,8 +126,8 @@ fn constant_buffer_excess_reports_exact_first_word_and_preserves_valid_prefix() 
         matches!(a.2, Err(MaxwellEngineDispatchError::InvalidMethodEncoding {source,..}) if source.location().word_offset==3 && source.argument()==3)
     );
     assert_eq!(
-        fast.three_d().shader_bindings().constant_buffer_load(),
-        scalar.three_d().shader_bindings().constant_buffer_load()
+        fast.three_d().shader_bindings().constant_buffer_offset(),
+        scalar.three_d().shader_bindings().constant_buffer_offset()
     );
 }
 
@@ -237,10 +237,9 @@ fn packed_inline_indices_are_owned_by_each_end_and_do_not_require_guest_index_st
         non_incrementing_packet_on_subchannel(0, 0x1300 / 4, &[0x08070605, 0x0c0b0a09]),
         packet(0x1614 / 4, 0),
     ] {
-        crate::test_memory::ready(stream_maxwell_engine_packet(
+        crate::test_memory::ready(stream_maxwell_engine_entry(
             &mut channel,
-            FrontendSubmissionId::new(3),
-            packet.packets()[0].view(),
+            &mut crate::pushbuffer::packet::CommandStream::fixture(packet.packets()[0].view()),
             None,
             &mut mme,
             &mut parameters,

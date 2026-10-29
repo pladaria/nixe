@@ -450,13 +450,15 @@ mod tests {
             data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
         let transfer = transfer(&vec![0; 4096]);
-        let session = run(AudioRendererManagerSession::default().open(
-            RendererParameters::decode(&data),
-            transfer,
-            4096,
-            1,
-            1,
-        ))
+        let session = run(
+            AudioRendererManagerSession::new(&crate::test_memory::kernel()).open(
+                RendererParameters::decode(&data),
+                transfer,
+                4096,
+                1,
+                1,
+            ),
+        )
         .unwrap()
         .unwrap();
         {
@@ -529,10 +531,12 @@ mod tests {
             execution_mode: 0,
         };
         let transfer = transfer(&vec![0; 4096]);
-        let session =
-            run(AudioRendererManagerSession::default().open(parameters, transfer, 4096, 1, 1))
-                .unwrap()
-                .unwrap();
+        let session = run(
+            AudioRendererManagerSession::new(&crate::test_memory::kernel())
+                .open(parameters, transfer, 4096, 1, 1),
+        )
+        .unwrap()
+        .unwrap();
         let mut sink = [0; 0x140];
         sink[0] = 1;
         sink[1] = 1;

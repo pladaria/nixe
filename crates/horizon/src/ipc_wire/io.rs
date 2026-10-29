@@ -1,15 +1,14 @@
 //! Checked CMIF response encoding, scalar decoding, and guest-memory access.
 
-use crate::ipc_wire::request::Request;
-use nixe_memory::GuestVirtualAddress;
+use crate::ipc_wire::request::{Buffer, Request};
 
 use super::IpcWireError;
-use super::message::{BufferDescriptor, CmifResponse, HipcRequest, ReceiveStatics};
+use super::message::{CmifResponse, HipcRequest, ReceiveStatics};
 use crate::HorizonIpcResult;
 
 pub(super) async fn write_descriptor_bytes(
     process: &Request,
-    descriptor: BufferDescriptor,
+    descriptor: &Buffer,
     bytes: &[u8],
 ) -> Result<(), IpcWireError> {
     if u64::try_from(bytes.len())
@@ -20,7 +19,7 @@ pub(super) async fn write_descriptor_bytes(
             "service response exceeds its output descriptor",
         ));
     }
-    write_bytes(process, GuestVirtualAddress::new(descriptor.address), bytes).await
+    process.write(descriptor, 0, bytes).await
 }
 
 pub(super) fn has_ipc_descriptors(hipc: &HipcRequest<'_>) -> bool {
@@ -124,40 +123,6 @@ pub(super) fn decode_service_name(encoded: &[u8]) -> Option<&[u8]> {
     }
 }
 
-pub(crate) async fn read_bytes(
-    process: &Request,
-    start: GuestVirtualAddress,
-    output: &mut [u8],
-) -> Result<(), IpcWireError> {
-    process.read(start, output).await
-}
-pub(crate) async fn write_bytes(
-    process: &Request,
-    start: GuestVirtualAddress,
-    bytes: &[u8],
-) -> Result<(), IpcWireError> {
-    process.write(start, bytes).await
-}
-pub(crate) fn validate_writable_ram_range(
-    process: &Request,
-    start: GuestVirtualAddress,
-    bytes: usize,
-) -> Result<(), IpcWireError> {
-    process.validate_write(start, bytes)
-}
-pub(super) async fn write_response(
-    process: &Request,
-    start: GuestVirtualAddress,
-    capacity: usize,
-    response: &[u8],
-) -> Result<(), IpcWireError> {
-    if response.len() > capacity {
-        return Err(IpcWireError::Internal(
-            "encoded response exceeds its accepted command buffer",
-        ));
-    }
-    process.write(start, response).await
-}
 #[cfg(test)]
 mod tests {
     use super::*;

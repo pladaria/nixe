@@ -11,8 +11,6 @@
 //! <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2864-L2888>
 //! <https://github.com/envytools/envytools/blob/f102b82381f3f11cee113d16374c87091db039d9/rnndb/graph/gf100_3d.xml#L831-L838>
 
-use crate::MaxwellMethodSource;
-
 use super::MaxwellThreeDRegister;
 
 /// Dither footprint consumed by alpha-to-coverage, not polygon-line smoothing.
@@ -499,219 +497,94 @@ impl MaxwellThreeDCsaaEnable {
     }
 }
 
-/// One validated coverage-sampling register transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellThreeDCoverageStateWrite {
-    AlphaToCoverageDither {
-        value: MaxwellThreeDAlphaToCoverageDither,
-        source: MaxwellMethodSource,
-    },
-    PostPsInitialCoverage {
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    PostZPixelShaderImask {
-        value: MaxwellThreeDPostZPixelShaderImask,
-        source: MaxwellMethodSource,
-    },
-    TirMode {
-        value: MaxwellThreeDTirMode,
-        source: MaxwellMethodSource,
-    },
-    TirControl {
-        value: MaxwellThreeDTirControl,
-        source: MaxwellMethodSource,
-    },
-    TirModulation {
-        value: MaxwellThreeDTirModulationComponentSelect,
-        source: MaxwellMethodSource,
-    },
-    TirModulationFunction {
-        value: MaxwellThreeDTirModulationFunction,
-        source: MaxwellMethodSource,
-    },
-    CoverageToColor {
-        value: MaxwellThreeDCoverageToColor,
-        source: MaxwellMethodSource,
-    },
-    AlphaToCoverageOverride {
-        value: MaxwellThreeDAlphaToCoverageOverride,
-        source: MaxwellMethodSource,
-    },
-    SampleLocations {
-        group: u8,
-        value: MaxwellThreeDSampleLocationGroup,
-        source: MaxwellMethodSource,
-    },
-    HybridAntiAliasControl {
-        value: MaxwellThreeDHybridAntiAliasControl,
-        source: MaxwellMethodSource,
-    },
-    PsOutputSampleMaskUsage {
-        value: MaxwellThreeDPsOutputSampleMaskUsage,
-        source: MaxwellMethodSource,
-    },
-    CsaaEnable {
-        value: MaxwellThreeDCsaaEnable,
-        source: MaxwellMethodSource,
-    },
-}
-
 /// Persistent coverage-sampling configuration on one `MAXWELL_B` channel.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDCoverageState {
-    alpha_to_coverage_dither: MaxwellThreeDRegister<MaxwellThreeDAlphaToCoverageDither>,
-    post_ps_initial_coverage: MaxwellThreeDRegister<bool>,
-    post_z_pixel_shader_imask: MaxwellThreeDRegister<MaxwellThreeDPostZPixelShaderImask>,
-    tir_mode: MaxwellThreeDRegister<MaxwellThreeDTirMode>,
-    tir_control: MaxwellThreeDRegister<MaxwellThreeDTirControl>,
-    tir_modulation: MaxwellThreeDRegister<MaxwellThreeDTirModulationComponentSelect>,
-    tir_modulation_function: MaxwellThreeDRegister<MaxwellThreeDTirModulationFunction>,
-    coverage_to_color: MaxwellThreeDRegister<MaxwellThreeDCoverageToColor>,
-    alpha_to_coverage_override: MaxwellThreeDRegister<MaxwellThreeDAlphaToCoverageOverride>,
-    sample_locations: [MaxwellThreeDRegister<MaxwellThreeDSampleLocationGroup>;
-        MAXWELL_SAMPLE_LOCATION_GROUP_COUNT],
-    hybrid_anti_alias_control: MaxwellThreeDRegister<MaxwellThreeDHybridAntiAliasControl>,
-    ps_output_sample_mask_usage: MaxwellThreeDRegister<MaxwellThreeDPsOutputSampleMaskUsage>,
-    csaa_enable: MaxwellThreeDRegister<MaxwellThreeDCsaaEnable>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDCoverageState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDCoverageState {
+impl MaxwellThreeDCoverageState<'_> {
     #[must_use]
-    pub const fn alpha_to_coverage_dither(
+    pub fn alpha_to_coverage_dither(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDAlphaToCoverageDither> {
-        &self.alpha_to_coverage_dither
+    ) -> MaxwellThreeDRegister<MaxwellThreeDAlphaToCoverageDither> {
+        self.registers
+            .read(0x12e0, MaxwellThreeDAlphaToCoverageDither::parse)
     }
-
-    /// Whether post-shader coverage starts from the pre-shader mask. False
-    /// retains normal post-shader coverage; true needs distinct lowering only
-    /// when the shader or alpha test changes the mask.
-    /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1817-L1820
     #[must_use]
-    pub const fn post_ps_initial_coverage(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.post_ps_initial_coverage
+    pub fn post_ps_initial_coverage(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers
+            .read(0x1138, |raw| (raw <= 1).then_some(raw != 0))
     }
-
     #[must_use]
-    pub const fn post_z_pixel_shader_imask(
+    pub fn post_z_pixel_shader_imask(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDPostZPixelShaderImask> {
-        &self.post_z_pixel_shader_imask
+    ) -> MaxwellThreeDRegister<MaxwellThreeDPostZPixelShaderImask> {
+        self.registers
+            .read(0x0f1c, MaxwellThreeDPostZPixelShaderImask::parse)
     }
-
     #[must_use]
-    pub const fn tir_mode(&self) -> &MaxwellThreeDRegister<MaxwellThreeDTirMode> {
-        &self.tir_mode
+    pub fn tir_mode(&self) -> MaxwellThreeDRegister<MaxwellThreeDTirMode> {
+        self.registers.read(0x0fb4, MaxwellThreeDTirMode::parse)
     }
-
     #[must_use]
-    pub const fn tir_control(&self) -> &MaxwellThreeDRegister<MaxwellThreeDTirControl> {
-        &self.tir_control
+    pub fn tir_control(&self) -> MaxwellThreeDRegister<MaxwellThreeDTirControl> {
+        self.registers.read(0x1130, MaxwellThreeDTirControl::parse)
     }
-
     #[must_use]
-    pub const fn tir_modulation(
+    pub fn tir_modulation(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDTirModulationComponentSelect> {
-        &self.tir_modulation
+    ) -> MaxwellThreeDRegister<MaxwellThreeDTirModulationComponentSelect> {
+        self.registers.read(0x0fd4, |raw| {
+            MaxwellThreeDTirModulationComponentSelect::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn tir_modulation_function(
+    pub fn tir_modulation_function(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDTirModulationFunction> {
-        &self.tir_modulation_function
+    ) -> MaxwellThreeDRegister<MaxwellThreeDTirModulationFunction> {
+        self.registers
+            .read(0x0fd8, MaxwellThreeDTirModulationFunction::parse)
     }
-
     #[must_use]
-    pub const fn coverage_to_color(&self) -> &MaxwellThreeDRegister<MaxwellThreeDCoverageToColor> {
-        &self.coverage_to_color
+    pub fn coverage_to_color(&self) -> MaxwellThreeDRegister<MaxwellThreeDCoverageToColor> {
+        self.registers
+            .read(0x11f8, MaxwellThreeDCoverageToColor::parse)
     }
-
     #[must_use]
-    pub const fn alpha_to_coverage_override(
+    pub fn alpha_to_coverage_override(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDAlphaToCoverageOverride> {
-        &self.alpha_to_coverage_override
+    ) -> MaxwellThreeDRegister<MaxwellThreeDAlphaToCoverageOverride> {
+        self.registers.read(0x16b4, |raw| {
+            MaxwellThreeDAlphaToCoverageOverride::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn sample_locations(
+    pub fn hybrid_anti_alias_control(
         &self,
-    ) -> &[MaxwellThreeDRegister<MaxwellThreeDSampleLocationGroup>;
-         MAXWELL_SAMPLE_LOCATION_GROUP_COUNT] {
-        &self.sample_locations
+    ) -> MaxwellThreeDRegister<MaxwellThreeDHybridAntiAliasControl> {
+        self.registers.read(0x0754, |raw| {
+            MaxwellThreeDHybridAntiAliasControl::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn hybrid_anti_alias_control(
+    pub fn ps_output_sample_mask_usage(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDHybridAntiAliasControl> {
-        &self.hybrid_anti_alias_control
+    ) -> MaxwellThreeDRegister<MaxwellThreeDPsOutputSampleMaskUsage> {
+        self.registers.read(0x0300, |raw| {
+            MaxwellThreeDPsOutputSampleMaskUsage::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn ps_output_sample_mask_usage(
+    pub fn csaa_enable(&self) -> MaxwellThreeDRegister<MaxwellThreeDCsaaEnable> {
+        self.registers.read(0x15b4, MaxwellThreeDCsaaEnable::parse)
+    }
+    #[must_use]
+    pub fn sample_locations(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDPsOutputSampleMaskUsage> {
-        &self.ps_output_sample_mask_usage
-    }
-
-    #[must_use]
-    pub const fn csaa_enable(&self) -> &MaxwellThreeDRegister<MaxwellThreeDCsaaEnable> {
-        &self.csaa_enable
-    }
-
-    pub(super) fn apply(&mut self, write: MaxwellThreeDCoverageStateWrite) {
-        match write {
-            MaxwellThreeDCoverageStateWrite::AlphaToCoverageDither { value, source: _ } => {
-                self.alpha_to_coverage_dither = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDCoverageStateWrite::PostPsInitialCoverage { value, source: _ } => {
-                self.post_ps_initial_coverage =
-                    MaxwellThreeDRegister::decoded(u32::from(value), value);
-            }
-            MaxwellThreeDCoverageStateWrite::PostZPixelShaderImask { value, source: _ } => {
-                self.post_z_pixel_shader_imask = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDCoverageStateWrite::TirMode { value, source: _ } => {
-                self.tir_mode = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDCoverageStateWrite::TirControl { value, source: _ } => {
-                self.tir_control = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDCoverageStateWrite::TirModulation { value, source: _ } => {
-                self.tir_modulation = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDCoverageStateWrite::TirModulationFunction { value, source: _ } => {
-                self.tir_modulation_function = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDCoverageStateWrite::CoverageToColor { value, source: _ } => {
-                self.coverage_to_color = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDCoverageStateWrite::AlphaToCoverageOverride { value, source: _ } => {
-                self.alpha_to_coverage_override =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDCoverageStateWrite::SampleLocations {
-                group,
-                value,
-                source: _,
-            } => {
-                self.sample_locations[group as usize] =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDCoverageStateWrite::HybridAntiAliasControl { value, source: _ } => {
-                self.hybrid_anti_alias_control = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDCoverageStateWrite::PsOutputSampleMaskUsage { value, source: _ } => {
-                self.ps_output_sample_mask_usage =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDCoverageStateWrite::CsaaEnable { value, source: _ } => {
-                self.csaa_enable = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-        }
+        index: usize,
+    ) -> MaxwellThreeDRegister<MaxwellThreeDSampleLocationGroup> {
+        self.registers.read(0x11e0 + index as u32 * 4, |raw| {
+            Some(MaxwellThreeDSampleLocationGroup::parse(raw))
+        })
     }
 }

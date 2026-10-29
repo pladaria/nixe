@@ -1,9 +1,8 @@
 //! CMIF session-control commands shared by Horizon services.
 
 use crate::ipc_wire::request::Request;
-use nixe_memory::GuestVirtualAddress;
 
-use super::io::{encode_response, write_response};
+use super::io::encode_response;
 use super::message::CmifRequest;
 use super::{IpcWireError, unsupported_service_command};
 use crate::{HorizonIpcObject, HorizonIpcResult};
@@ -35,8 +34,6 @@ impl CmifControlCommand {
 /// commands which must continue through service dispatch.
 pub(super) async fn dispatch_control(
     process: &mut Request,
-    address: GuestVirtualAddress,
-    size: usize,
     handle: u32,
     target: &HorizonIpcObject,
     request: &CmifRequest<'_>,
@@ -56,59 +53,31 @@ pub(super) async fn dispatch_control(
             CmifControlCommand::ConvertCurrentObjectToDomain,
             HorizonIpcObject::PlayReport(session),
         ) => {
-            write_domain_conversion(
-                process,
-                address,
-                size,
-                request.token,
-                session.domain.convert(),
-            )
-            .await?;
+            write_domain_conversion(process, request.token, session.domain.convert()).await?;
         }
         (
             CmifControlCommand::ConvertCurrentObjectToDomain,
             HorizonIpcObject::OpusManager(session),
         ) => {
-            write_domain_conversion(
-                process,
-                address,
-                size,
-                request.token,
-                session.domain.convert(),
-            )
-            .await?;
+            write_domain_conversion(process, request.token, session.domain.convert()).await?;
         }
         (
             CmifControlCommand::ConvertCurrentObjectToDomain,
             HorizonIpcObject::OpusDecoder(session),
         ) => {
-            write_domain_conversion(
-                process,
-                address,
-                size,
-                request.token,
-                session.domain.convert(),
-            )
-            .await?;
+            write_domain_conversion(process, request.token, session.domain.convert()).await?;
         }
         (
             CmifControlCommand::ConvertCurrentObjectToDomain,
             HorizonIpcObject::ErrorContextWriter(session),
         ) => {
-            write_domain_conversion(
-                process,
-                address,
-                size,
-                request.token,
-                session.domain.convert(),
-            )
-            .await?;
+            write_domain_conversion(process, request.token, session.domain.convert()).await?;
         }
         (
             CmifControlCommand::CloneCurrentObject | CmifControlCommand::CloneCurrentObjectEx,
             HorizonIpcObject::ErrorContextWriter(_),
         ) => {
-            install_clone(process, address, size, request.token, target.clone()).await?;
+            install_clone(process, request.token, target.clone()).await?;
         }
 
         (
@@ -116,7 +85,7 @@ pub(super) async fn dispatch_control(
             HorizonIpcObject::LogManager(manager),
         ) => {
             let object_id = manager.convert_to_domain();
-            write_domain_conversion(process, address, size, request.token, object_id).await?;
+            write_domain_conversion(process, request.token, object_id).await?;
             log::debug!("lm converted to domain with root object {object_id:#x}");
         }
         (
@@ -125,8 +94,6 @@ pub(super) async fn dispatch_control(
         ) => {
             install_clone(
                 process,
-                address,
-                size,
                 request.token,
                 HorizonIpcObject::LogManager(manager.clone()),
             )
@@ -138,7 +105,7 @@ pub(super) async fn dispatch_control(
             // ID follow its pinned CMIF implementation:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/service.h#L250-L266
             let object_id = applet.convert_to_domain();
-            write_domain_conversion(process, address, size, request.token, object_id).await?;
+            write_domain_conversion(process, request.token, object_id).await?;
             log::debug!("appletOE converted to domain with root object {object_id:#x}");
         }
         (
@@ -146,7 +113,7 @@ pub(super) async fn dispatch_control(
             HorizonIpcObject::SemanticService(service),
         ) => {
             let object_id = service.convert_to_domain();
-            write_domain_conversion(process, address, size, request.token, object_id).await?;
+            write_domain_conversion(process, request.token, object_id).await?;
             log::debug!(
                 "{:?} converted to domain with root object {object_id:#x}",
                 String::from_utf8_lossy(service.service().name())
@@ -160,12 +127,12 @@ pub(super) async fn dispatch_control(
             // create IParentalControlService. Keep that real domain boundary:
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/pctl.c#L20-L24
             let object_id = factory.convert_to_domain();
-            write_domain_conversion(process, address, size, request.token, object_id).await?;
+            write_domain_conversion(process, request.token, object_id).await?;
             log::debug!("pctl converted to domain with root object {object_id:#x}");
         }
         (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Time(service)) => {
             let object_id = service.convert_to_domain();
-            write_domain_conversion(process, address, size, request.token, object_id).await?;
+            write_domain_conversion(process, request.token, object_id).await?;
             log::debug!("time:u converted to domain with root object {object_id:#x}");
         }
         (
@@ -173,22 +140,22 @@ pub(super) async fn dispatch_control(
             HorizonIpcObject::NetworkInterface(manager),
         ) => {
             let object_id = manager.convert_to_domain();
-            write_domain_conversion(process, address, size, request.token, object_id).await?;
+            write_domain_conversion(process, request.token, object_id).await?;
             log::debug!("nifm:u converted to domain with root object {object_id:#x}");
         }
         (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Account(account)) => {
             let object_id = account.convert_to_domain();
-            write_domain_conversion(process, address, size, request.token, object_id).await?;
+            write_domain_conversion(process, request.token, object_id).await?;
             log::debug!("acc:u0 converted to domain with root object {object_id:#x}");
         }
         (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Bsd(session)) => {
             let object_id = session.convert_to_domain();
-            write_domain_conversion(process, address, size, request.token, object_id).await?;
+            write_domain_conversion(process, request.token, object_id).await?;
             log::debug!("bsd:u converted to domain with root object {object_id:#x}");
         }
         (CmifControlCommand::ConvertCurrentObjectToDomain, HorizonIpcObject::Ssl(session)) => {
             let object_id = session.convert_to_domain();
-            write_domain_conversion(process, address, size, request.token, object_id).await?;
+            write_domain_conversion(process, request.token, object_id).await?;
             log::debug!("ssl converted to domain with root object {object_id:#x}");
         }
         (
@@ -199,8 +166,6 @@ pub(super) async fn dispatch_control(
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/ssl.c
             install_clone(
                 process,
-                address,
-                size,
                 request.token,
                 HorizonIpcObject::Ssl(session.clone()),
             )
@@ -215,8 +180,6 @@ pub(super) async fn dispatch_control(
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/cmif.h#L308-L337
             let cloned_handle = install_clone(
                 process,
-                address,
-                size,
                 request.token,
                 HorizonIpcObject::SemanticService(service.clone()),
             )
@@ -230,14 +193,7 @@ pub(super) async fn dispatch_control(
             CmifControlCommand::CloneCurrentObject | CmifControlCommand::CloneCurrentObjectEx,
             HorizonIpcObject::Vi(vi),
         ) => {
-            install_clone(
-                process,
-                address,
-                size,
-                request.token,
-                HorizonIpcObject::Vi(vi.clone()),
-            )
-            .await?;
+            install_clone(process, request.token, HorizonIpcObject::Vi(vi.clone())).await?;
         }
         (
             CmifControlCommand::CloneCurrentObject | CmifControlCommand::CloneCurrentObjectEx,
@@ -253,8 +209,6 @@ pub(super) async fn dispatch_control(
                     ))?;
             install_clone(
                 process,
-                address,
-                size,
                 request.token,
                 HorizonIpcObject::NvDrv(cloned_session),
             )
@@ -266,8 +220,6 @@ pub(super) async fn dispatch_control(
         ) => {
             install_clone(
                 process,
-                address,
-                size,
                 request.token,
                 HorizonIpcObject::ParentalControl(factory.clone()),
             )
@@ -279,8 +231,6 @@ pub(super) async fn dispatch_control(
         ) => {
             let cloned_handle = install_clone(
                 process,
-                address,
-                size,
                 request.token,
                 HorizonIpcObject::Bsd(session.clone()),
             )
@@ -298,7 +248,7 @@ pub(super) async fn dispatch_control(
             | HorizonIpcObject::PlayReport(_)
             | HorizonIpcObject::AudioDevice(_),
         ) => {
-            install_clone(process, address, size, request.token, target.clone()).await?;
+            install_clone(process, request.token, target.clone()).await?;
         }
         (CmifControlCommand::QueryPointerBufferSize, _) => {
             // HID has pointer-only inputs (not auto-select), including the
@@ -330,7 +280,7 @@ pub(super) async fn dispatch_control(
                 &pointer_buffer_size.to_le_bytes(),
                 None,
             )?;
-            write_response(process, address, size, &response).await?;
+            process.write_response(&response).await?;
         }
         _ => return unsupported_service_command("CMIF control", request.command_id),
     }
@@ -339,8 +289,6 @@ pub(super) async fn dispatch_control(
 
 async fn write_domain_conversion(
     process: &mut Request,
-    address: GuestVirtualAddress,
-    size: usize,
     token: u32,
     object_id: u32,
 ) -> Result<(), IpcWireError> {
@@ -350,13 +298,11 @@ async fn write_domain_conversion(
         &object_id.to_le_bytes(),
         None,
     )?;
-    write_response(process, address, size, &response).await
+    process.write_response(&response).await
 }
 
 async fn install_clone(
     process: &mut Request,
-    address: GuestVirtualAddress,
-    size: usize,
     token: u32,
     object: HorizonIpcObject,
 ) -> Result<u32, IpcWireError> {
@@ -364,6 +310,6 @@ async fn install_clone(
         .return_handle(object)
         .map_err(IpcWireError::Handle)?;
     let response = encode_response(token, HorizonIpcResult::SUCCESS, &[], Some(handle))?;
-    write_response(process, address, size, &response).await?;
+    process.write_response(&response).await?;
     Ok(handle)
 }

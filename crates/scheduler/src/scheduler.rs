@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub use crate::identity::LeaseGeneration;
 use crate::{
@@ -216,7 +216,13 @@ struct Thread {
     last_scheduled: u64,
     yield_generation: Option<u64>,
     lease: Option<Lease>,
-    wait: Option<WakeToken>,
+    wait: Option<Arc<KernelWait>>,
+    wait_waker: Option<std::task::Waker>,
+    #[cfg(feature = "performance-counters")]
+    resolved_at_ns: Option<u64>,
+    wait_nodes: Vec<events::EventWaitNode>,
+    cancellable: bool,
+    pending_cancel: bool,
     last_vcpu: Option<VirtualCpuId>,
     waiting_on: Option<waits::Membership>,
     held: Option<Index>,
@@ -229,6 +235,9 @@ struct Thread {
 }
 
 impl Thread {
+    fn wait_token(&self) -> Option<WakeToken> {
+        self.wait.as_ref().map(|wait| wait.token())
+    }
     fn suspended(&self) -> bool {
         self.paused && self.pinned_core.is_none() && self.kernel_waiters == 0
     }
@@ -345,7 +354,10 @@ struct State {
     wake_generation: u64,
     locks: Vec<waits::LockSlot>,
     free_lock: Option<Index>,
-    deferred_wakers: Vec<(std::task::Waker, bool)>,
+    deferred_wakers: events::EventNotifications,
+    events: events::EventTable,
+    timer_invalidated: bool,
+    closed: bool,
     #[cfg(feature = "performance-counters")]
     statistics: SchedulerStatistics,
 }
@@ -357,15 +369,19 @@ struct State {
 pub struct SchedulerState {
     profile: MachineSchedulerProfile,
     state: Mutex<State>,
+    clock: crate::VirtualClock,
+    timers: timer::Timers,
 }
 
 impl SchedulerState {
     #[must_use]
-    pub fn new(profile: MachineSchedulerProfile, clock: crate::VirtualClock) -> Self {
+    pub fn new(profile: MachineSchedulerProfile, clock: crate::VirtualClock) -> Arc<Self> {
         let cores = (0..profile.vcpus().len())
             .map(|_| Core::default())
             .collect();
-        Self {
+        Arc::new(Self {
+            timers: timer::Timers::new(clock.clone(), profile.preemption_interval_ns().is_some()),
+            clock: clock.clone(),
             profile,
             state: Mutex::new(State {
                 slots: Slots::default(),
@@ -378,11 +394,14 @@ impl SchedulerState {
                 wake_generation: 0,
                 locks: Vec::new(),
                 free_lock: None,
-                deferred_wakers: Vec::new(),
+                deferred_wakers: events::EventNotifications::default(),
+                events: events::EventTable::default(),
+                timer_invalidated: false,
+                closed: false,
                 #[cfg(feature = "performance-counters")]
                 statistics: SchedulerStatistics::default(),
             }),
-        }
+        })
     }
 
     #[must_use]
@@ -394,6 +413,15 @@ impl SchedulerState {
         &self,
         operation: impl FnOnce(&mut State) -> Result<T, SchedulerError>,
     ) -> Result<T, SchedulerError> {
+        let (result, notifications) = self.edit_deferred(operation);
+        notifications.notify();
+        result
+    }
+
+    fn edit_deferred<T>(
+        &self,
+        operation: impl FnOnce(&mut State) -> Result<T, SchedulerError>,
+    ) -> (Result<T, SchedulerError>, events::EventNotifications) {
         #[cfg(feature = "performance-counters")]
         let waiting = std::time::Instant::now();
         let mut state = self.state.lock().expect("scheduler lock poisoned");
@@ -408,13 +436,12 @@ impl SchedulerState {
             state.statistics.lock_held_ns += acquired.elapsed().as_nanos() as u64;
         }
         let wakers = std::mem::take(&mut state.deferred_wakers);
+        let timer_changed = std::mem::take(&mut state.timer_invalidated);
         drop(state);
-        for (waker, notify) in wakers {
-            if notify {
-                waker.wake();
-            }
+        if timer_changed {
+            self.timers.invalidate();
         }
-        result
+        (result, wakers)
     }
 
     fn core(&self, id: VirtualCpuId) -> Result<usize, SchedulerError> {
@@ -470,6 +497,12 @@ impl SchedulerState {
                 yield_generation: None,
                 lease: None,
                 wait: None,
+                wait_waker: None,
+                #[cfg(feature = "performance-counters")]
+                resolved_at_ns: None,
+                wait_nodes: Vec::new(),
+                cancellable: false,
+                pending_cancel: false,
                 last_vcpu: None,
                 waiting_on: None,
                 held: None,
@@ -536,16 +569,31 @@ impl SchedulerState {
             affinity: thread.config.affinity,
             last_vcpu: thread.last_vcpu,
             paused: thread.paused,
-            active_wait: thread.wait,
+            active_wait: thread.wait_token(),
+        })
+    }
+
+    /// Start an initialized thread exactly once before any core may claim it.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_thread.cpp#L1152-L1185
+    pub fn start_thread(&self, id: GuestThreadId) -> Result<(), SchedulerError> {
+        self.edit(|state| {
+            let index = state.slots.index(id)?;
+            if state.slots[index].lifecycle != ThreadLifecycle::Created {
+                return Err(state.invalid(index));
+            }
+            state.slots[index].lifecycle = ThreadLifecycle::Ready;
+            if !state.slots[index].suspended() {
+                state.enqueue(index, &self.profile);
+            }
+            Ok(())
         })
     }
 
     pub fn make_ready(&self, id: GuestThreadId) -> Result<(), SchedulerError> {
-        self.edit(|state| {
+        let retired = self.edit(|state| {
             let index = state.slots.index(id)?;
             let thread = &state.slots[index];
             if thread.lease.is_some()
-                || thread.wait.is_some()
                 || matches!(
                     thread.lifecycle,
                     ThreadLifecycle::Exited | ThreadLifecycle::Faulted
@@ -553,12 +601,19 @@ impl SchedulerState {
             {
                 return Err(state.invalid(index));
             }
+            state.resolve_wait(index, WaitOutcome::Ready, &self.profile);
+            let wait = state.slots[index].wait.take();
+            let nodes = std::mem::take(&mut state.slots[index].wait_nodes);
+            #[cfg(feature = "performance-counters")]
+            state.record_ready_latency(index);
             state.slots[index].lifecycle = ThreadLifecycle::Ready;
             if !state.slots[index].suspended() && !state.slots[index].queued {
                 state.enqueue(index, &self.profile);
             }
-            Ok(())
-        })
+            Ok((wait, nodes))
+        })?;
+        drop(retired);
+        Ok(())
     }
 
     pub fn claim(&self, vcpu: VirtualCpuId) -> Result<Option<Lease>, SchedulerError> {
@@ -704,7 +759,7 @@ impl SchedulerState {
             .slots
             .entries
             .iter()
-            .filter_map(|slot| slot.thread.as_ref().and_then(|thread| thread.wait))
+            .filter_map(|slot| slot.thread.as_ref().and_then(Thread::wait_token))
             .collect::<Vec<_>>()
             .into_iter()
     }
@@ -744,44 +799,79 @@ impl SchedulerState {
         }
     }
 
-    pub fn register_wait(&self, id: GuestThreadId) -> Result<WakeToken, SchedulerError> {
+    // Keep cancellation and readiness under the same canonical scheduler lock.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_thread.cpp#L784-L795
+    pub fn cancel_synchronization(&self, id: GuestThreadId) -> Result<bool, SchedulerError> {
         self.edit(|state| {
             let index = state.slots.index(id)?;
-            state.begin_wait(index, &self.profile)
+            if state.slots[index].lifecycle == ThreadLifecycle::Waiting
+                && state.slots[index].cancellable
+            {
+                state.slots[index].cancellable = false;
+                state.resolve_wait(index, WaitOutcome::Cancelled, &self.profile);
+                Ok(true)
+            } else {
+                state.slots[index].pending_cancel = true;
+                Ok(false)
+            }
+        })
+    }
+
+    pub fn register_wait(
+        self: &Arc<Self>,
+        id: GuestThreadId,
+    ) -> Result<Arc<KernelWait>, SchedulerError> {
+        self.edit(|state| {
+            let index = state.slots.index(id)?;
+            if let Some(wait) = &state.slots[index].wait {
+                return Ok(wait.clone());
+            }
+            state.begin_wait(index, &self.profile, Arc::downgrade(self))
         })
     }
 
     pub fn finish_wait(&self, token: WakeToken) -> Result<(), SchedulerError> {
-        self.edit(|state| {
+        let retired = self.edit(|state| {
             let index = state
                 .slots
                 .index(token.thread)
                 .map_err(|_| SchedulerError::StaleWake(token))?;
-            if state.slots[index].wait != Some(token) {
+            if state.slots[index].wait_token() != Some(token) {
                 return Err(SchedulerError::StaleWake(token));
             }
             debug_assert!(
                 state.slots[index].kernel_waker.is_none(),
                 "kernel results must be installed before guest wake"
             );
-            state.slots[index].wait = None;
+            state.resolve_wait(index, WaitOutcome::Ready, &self.profile);
+            let wait = state.slots[index].wait.take();
+            let nodes = std::mem::take(&mut state.slots[index].wait_nodes);
+            state.slots[index].cancellable = false;
+            #[cfg(feature = "performance-counters")]
+            state.record_ready_latency(index);
             state.slots[index].lifecycle = ThreadLifecycle::Ready;
             if !state.slots[index].suspended() {
                 state.enqueue(index, &self.profile);
             }
-            Ok(())
-        })
+            Ok((wait, nodes))
+        })?;
+        drop(retired);
+        Ok(())
     }
 
     pub fn continue_wait(&self, token: WakeToken) -> Result<(), SchedulerError> {
-        self.edit(|state| {
+        let retired = self.edit(|state| {
             let index = state.slots.index(token.thread)?;
-            if state.slots[index].wait != Some(token) {
+            if state.slots[index].wait_token() != Some(token) {
                 return Err(SchedulerError::StaleWake(token));
             }
-            state.slots[index].wait = None;
-            Ok(())
-        })
+            state.resolve_wait(index, WaitOutcome::Ready, &self.profile);
+            let wait = state.slots[index].wait.take();
+            let nodes = std::mem::take(&mut state.slots[index].wait_nodes);
+            Ok((wait, nodes))
+        })?;
+        drop(retired);
+        Ok(())
     }
 
     pub fn migrate(
@@ -858,7 +948,7 @@ impl SchedulerState {
     }
 
     pub fn terminate(&self, id: GuestThreadId, faulted: bool) -> Result<(), SchedulerError> {
-        self.edit(|state| {
+        let retired = self.edit(|state| {
             let index = state.slots.index(id)?;
             if state.slots[index].lease.is_some() {
                 return Err(SchedulerError::ThreadLeased(id));
@@ -870,7 +960,9 @@ impl SchedulerState {
                 return Err(state.invalid(index));
             }
             state.remove_queued(index, &self.profile);
-            state.slots[index].wait = None;
+            state.resolve_wait(index, WaitOutcome::Terminated, &self.profile);
+            let wait = state.slots[index].wait.take();
+            let nodes = std::mem::take(&mut state.slots[index].wait_nodes);
             state.slots[index].lifecycle = if faulted {
                 ThreadLifecycle::Faulted
             } else {
@@ -880,8 +972,10 @@ impl SchedulerState {
             state.detach_donations(index, &self.profile);
             state.unpin(index, &self.profile);
             state.changed(index);
-            Ok(())
-        })
+            Ok((wait, nodes))
+        })?;
+        drop(retired);
+        Ok(())
     }
 
     pub fn pinned_thread(
@@ -1305,16 +1399,17 @@ impl State {
 }
 
 impl SchedulerState {
-    pub fn rotate(&self) {
+    pub fn rotate(&self) -> bool {
         self.edit(|state| {
             for (core, descriptor) in self.profile.vcpus().iter().enumerate() {
                 if let Some(priority) = descriptor.rotation_priority() {
                     state.rotate(core, priority, &self.profile);
                 }
             }
-            Ok(())
+            state.select_threads(&self.profile);
+            Ok(state.wake_mask != 0)
         })
-        .expect("rotation cannot fail");
+        .expect("rotation cannot fail")
     }
 
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_scheduler.cpp#L677-L878
@@ -1418,14 +1513,25 @@ impl SchedulerState {
     }
 }
 
+mod events;
+mod kernel_wait;
 mod property;
+mod timer;
 mod wait_tree;
 mod waits;
+pub use events::{
+    EventFuture, EventNotifications, EventObject, ReadableEventObject, WaitStart,
+    WritableEventObject,
+};
+pub use kernel_wait::{KernelWait, WaitEffect, WaitOutcome, WaitPhase};
 pub use property::{ThreadPropertyGuard, ThreadPropertyLock};
+pub use timer::{Deadline, TimerStopped};
 pub use waits::{LockHandoff, OrderedWaitKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulerError {
+    ForeignSynchronizationObject,
+    KernelStopped,
     UnknownThread(GuestThreadId),
     UnknownVirtualCpu(VirtualCpuId),
     InvalidPriority(i32),
@@ -1469,6 +1575,10 @@ pub struct SchedulerStatistics {
     pub migrations: u64,
     pub core_reselections: u64,
     pub cached_yields: u64,
+    pub waits_resolved: u64,
+    pub waits_made_runnable: u64,
+    pub resolution_to_runnable_ns: u64,
+    pub maximum_resolution_to_runnable_ns: u64,
 }
 
 #[cfg(feature = "performance-counters")]
@@ -1480,3 +1590,21 @@ impl SchedulerState {
             .statistics
     }
 }
+
+#[cfg(feature = "performance-counters")]
+impl State {
+    fn record_ready_latency(&mut self, index: Index) {
+        if let Some(resolved) = self.slots[index].resolved_at_ns.take() {
+            let elapsed = self.clock.scheduler_time_ns().saturating_sub(resolved);
+            self.statistics.waits_made_runnable += 1;
+            self.statistics.resolution_to_runnable_ns += elapsed;
+            self.statistics.maximum_resolution_to_runnable_ns = self
+                .statistics
+                .maximum_resolution_to_runnable_ns
+                .max(elapsed);
+        }
+    }
+}
+
+#[cfg(feature = "performance-counters")]
+pub use timer::TimerStatistics;

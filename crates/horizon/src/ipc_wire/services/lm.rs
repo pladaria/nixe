@@ -173,7 +173,8 @@ pub(in crate::ipc_wire) async fn dispatch_logger(
                     HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                 );
             }
-            let (address, size) = one_auto_select_input(hipc)?;
+            let buffer = one_auto_select_input(process, hipc)?;
+            let size = buffer.size as usize;
             if size > MAX_LOG_PACKET_BYTES {
                 return Err(IpcWireError::Malformed(
                     "ILogger packet exceeds the bounded diagnostic payload",
@@ -181,7 +182,7 @@ pub(in crate::ipc_wire) async fn dispatch_logger(
             }
             let mut bytes = vec![0; size];
             if size != 0 {
-                read_bytes(process, GuestVirtualAddress::new(address), &mut bytes).await?;
+                process.read(buffer, 0, &mut bytes).await?;
             }
 
             // Nintendo's logger returns success when the packet body is

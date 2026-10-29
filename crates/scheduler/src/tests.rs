@@ -1,7 +1,7 @@
 use super::*;
 use crate::{PriorityRange, VirtualClock, VirtualClockMode, VirtualCpuDescriptor};
 
-fn scheduler(cores: u32) -> SchedulerState {
+fn scheduler(cores: u32) -> std::sync::Arc<SchedulerState> {
     SchedulerState::new(
         MachineSchedulerProfile::new(
             (0..cores)
@@ -93,7 +93,7 @@ fn kernel_handoff_transfers_suspend_deferral_to_the_new_owner() {
     let next = add(&s, 1, 10, Some(0), &[0]);
     let lease = s.claim(VirtualCpuId::new(0)).unwrap().unwrap();
     s.complete(lease, Completion::Waiting).unwrap();
-    let next_wait = s.register_wait(next).unwrap();
+    let next_wait = s.register_wait(next).unwrap().token();
     s.set_activity(next, true).unwrap();
     let last = add(&s, 1, 15, Some(0), &[0]);
     let lease = s.claim(VirtualCpuId::new(0)).unwrap().unwrap();
@@ -106,8 +106,8 @@ fn kernel_handoff_transfers_suspend_deferral_to_the_new_owner() {
     s.set_activity(owner, true).unwrap();
     assert_eq!(selected(&s, 0), Some(owner));
     let handoff = s.release_lock(ProcessId::new(1), key, owner).unwrap();
-    assert_eq!(handoff.next, Some(next));
-    assert!(handoff.more_waiters);
+    assert_eq!(handoff.0.next, Some(next));
+    assert!(handoff.0.more_waiters);
     assert_eq!(
         s.thread(owner).unwrap().lifecycle,
         ThreadLifecycle::Suspended
@@ -557,7 +557,7 @@ fn wake_generation_and_reused_slot_reject_stale_completions() {
         },
     )
     .unwrap();
-    let token = s.register_wait(a).unwrap();
+    let token = s.register_wait(a).unwrap().token();
     s.finish_wait(token).unwrap();
     assert_eq!(s.finish_wait(token), Err(SchedulerError::StaleWake(token)));
     s.terminate(a, false).unwrap();
@@ -580,7 +580,7 @@ fn paused_waiter_wakes_without_becoming_runnable_until_resumed() {
         },
     )
     .unwrap();
-    let token = s.register_wait(a).unwrap();
+    let token = s.register_wait(a).unwrap().token();
     s.set_activity(a, true).unwrap();
     s.finish_wait(token).unwrap();
     assert_eq!(selected(&s, 0), None);
@@ -604,7 +604,7 @@ fn selected_changes_produce_targeted_wake_masks() {
 
 #[test]
 fn simultaneous_claims_have_one_register_owner() {
-    let s = std::sync::Arc::new(scheduler(1));
+    let s = scheduler(1);
     add(&s, 1, 20, Some(0), &[0]);
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let workers: Vec<_> = (0..2)
@@ -717,7 +717,7 @@ fn priority_changes_only_keep_the_calling_thread_at_the_front() {
 
 #[test]
 fn competing_wait_completions_claim_one_generation() {
-    let s = std::sync::Arc::new(scheduler(1));
+    let s = scheduler(1);
     let a = add(&s, 1, 20, Some(0), &[0]);
     s.complete(
         lease(&s, 0),
@@ -726,7 +726,7 @@ fn competing_wait_completions_claim_one_generation() {
         },
     )
     .unwrap();
-    let token = s.register_wait(a).unwrap();
+    let token = s.register_wait(a).unwrap().token();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let workers: Vec<_> = (0..2)
         .map(|_| {
@@ -854,7 +854,7 @@ fn lock_handoff_preserves_remaining_fifo_and_donations() {
     donate(&s, owner, first, address).unwrap();
     let result = s.release_lock(ProcessId::new(1), key, owner).unwrap();
     assert_eq!(
-        result,
+        result.0,
         LockHandoff {
             next: Some(second),
             more_waiters: true
@@ -862,7 +862,10 @@ fn lock_handoff_preserves_remaining_fifo_and_donations() {
     );
     assert_eq!(s.thread(owner).unwrap().effective_priority, 40);
     assert_eq!(
-        s.release_lock(ProcessId::new(1), key, second).unwrap().next,
+        s.release_lock(ProcessId::new(1), key, second)
+            .unwrap()
+            .0
+            .next,
         Some(first)
     );
     assert_eq!(s.priority_donation_count(), 0);
@@ -878,8 +881,16 @@ fn priority_inheritance_reorders_the_actual_condition_or_arbiter_node() {
         let a = add(&s, 1, 40, Some(0), &[0]);
         let b = add(&s, 1, 20, Some(0), &[0]);
         let donor = add(&s, 1, 5, Some(0), &[0]);
-        s.register_ordered_wait(a, kind, 0x200).unwrap();
-        s.register_ordered_wait(b, kind, 0x200).unwrap();
+        s.edit(|state| {
+            let index = state.slots.index(a)?;
+            state.insert_ordered_wait(index, kind, 0x200)
+        })
+        .unwrap();
+        s.edit(|state| {
+            let index = state.slots.index(b)?;
+            state.insert_ordered_wait(index, kind, 0x200)
+        })
+        .unwrap();
         assert_eq!(
             s.first_ordered_waiter(ProcessId::new(1), kind, 0x200),
             Some(b)
@@ -905,3 +916,54 @@ fn priority_inheritance_reorders_the_actual_condition_or_arbiter_node() {
 
 #[path = "tests/property.rs"]
 mod property;
+
+#[test]
+fn cancellation_after_a_resolved_wait_applies_only_to_the_next_wait() {
+    for cancel_first in [false, true] {
+        let scheduler = scheduler(1);
+        let thread = scheduler
+            .create_thread(ScheduledThreadConfig {
+                process: ProcessId::new(1),
+                base_priority: 20,
+                ideal_vcpu: Some(VirtualCpuId::new(0)),
+                affinity: scheduler.profile().all_cores(),
+            })
+            .unwrap();
+        scheduler.make_ready(thread).unwrap();
+        let lease = scheduler.claim(VirtualCpuId::new(0)).unwrap().unwrap();
+        scheduler
+            .complete(
+                lease,
+                Completion::KernelCall {
+                    interrupt_handled: false,
+                },
+            )
+            .unwrap();
+        let wait = match scheduler.wait_on_objects(thread, &[], None, true).unwrap() {
+            WaitStart::Pending(wait) => wait,
+            _ => panic!("unsignalled wait"),
+        };
+        let token = wait.token();
+        if cancel_first {
+            assert!(scheduler.cancel_synchronization(thread).unwrap());
+            scheduler.finish_wait(token).unwrap();
+        } else {
+            scheduler.finish_wait(token).unwrap();
+            assert!(!scheduler.cancel_synchronization(thread).unwrap());
+        }
+        let lease = scheduler.claim(VirtualCpuId::new(0)).unwrap().unwrap();
+        scheduler
+            .complete(
+                lease,
+                Completion::KernelCall {
+                    interrupt_handled: false,
+                },
+            )
+            .unwrap();
+        match scheduler.wait_on_objects(thread, &[], None, true).unwrap() {
+            WaitStart::Pending(_) => assert!(cancel_first),
+            WaitStart::Ready(WaitOutcome::Cancelled) => assert!(!cancel_first),
+            _ => panic!("unexpected cancellation result"),
+        }
+    }
+}

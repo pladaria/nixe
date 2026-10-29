@@ -85,7 +85,7 @@ pub(super) async fn stream_packet<E>(
                 )
                 .map_err(MaxwellEngineStreamError::dispatch)?;
             }
-            let (upload, count) = threed::constant_buffer_words(profile, state, subchannel, data)
+            let (upload, count) = threed::constant_buffer_words(state, subchannel, data)
                 .map_err(MaxwellEngineStreamError::dispatch)?;
             consume(MaxwellEngineEvent {
                 instances: None,
@@ -118,8 +118,8 @@ pub(super) async fn stream_packet<E>(
     while cursor < data.len() {
         let tail = data.slice(cursor..);
         let (operation, count) = if class == threed::CLASS {
-            let (profile, state) = channel.three_d_with_profile_mut();
-            let (upload, count) = threed::embedded_words(profile, state, subchannel, tail)
+            let (_, state) = channel.three_d_with_profile_mut();
+            let (upload, count) = threed::embedded_words(state, subchannel, tail)
                 .map_err(MaxwellEngineStreamError::dispatch)?;
             (PendingEngineOperation::InlineToMemory(upload), count)
         } else if class == compute::CLASS {

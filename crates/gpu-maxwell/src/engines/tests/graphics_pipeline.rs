@@ -114,7 +114,8 @@ fn notification_address_state_arms_a_single_following_no_operation() {
             .is_empty()
     );
     assert!(dispatch_method(&mut channel, 0x010c / 4, 1).is_err());
-    assert!(dispatch_method(&mut channel, 0x0104 / 4, 0x100).is_err());
+    program_three_d(&mut channel, 0x0104, 0x100);
+    assert!(dispatch_method(&mut channel, 0x010c / 4, 0).is_err());
 }
 
 #[test]
@@ -144,484 +145,16 @@ fn pending_notification_rejects_unimplemented_completions_and_context_switches()
 }
 
 #[test]
-fn z_compression_selector_is_typed_depth_state_without_an_operation() {
-    let mut channel = three_d_channel();
-    let color_before = channel.three_d().render_targets().color().clone();
-    let two_d_before = channel.two_d().clone();
-
-    for (argument, expected) in [
-        (0, MaxwellThreeDZCompressionMode::Disabled),
-        (1, MaxwellThreeDZCompressionMode::Enabled),
-    ] {
-        let dispatch = dispatch_method(&mut channel, 0x19cc / 4, argument).unwrap();
-        let register = channel
-            .three_d()
-            .render_targets()
-            .depth_stencil()
-            .compression();
-
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_Z_COMPRESSION"
-        );
-
-        assert!(dispatch.operations().is_empty());
-
-        assert_eq!(register.raw(), Some(argument));
-        assert_eq!(register.value().copied(), Some(expected));
-
-        assert_eq!(expected.raw(), argument);
-        assert_eq!(channel.three_d().render_targets().color(), &color_before);
-        assert_eq!(channel.two_d(), &two_d_before);
-    }
-
-    let resources = fixture_bindings(
-        channel.three_d(),
-        resource_address_space().memory(),
-        &mut crate::test_memory::apply,
-    )
-    .unwrap();
-    assert!(resources.resources().next().is_none());
-}
-
-#[test]
-fn invalid_z_compression_values_are_rejected_atomically() {
-    let mut channel = three_d_channel();
-
-    for argument in [2, 3, u32::MAX] {
-        let frontend_before = channel.frontend();
-        let two_d_before = channel.two_d().clone();
-        let three_d_before = channel.three_d().clone();
-        let decoded = packet(0x19cc / 4, argument);
-
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_Z_COMPRESSION",
-                reason: "reserved bits are set",
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel.frontend(), frontend_before);
-        assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
-    }
-}
-
-#[test]
-fn color_compression_selectors_are_typed_and_isolated_per_target() {
-    for target in 0..MAXWELL_COLOR_TARGET_COUNT as u8 {
-        let mut channel = three_d_channel();
-        let depth_before = channel.three_d().render_targets().depth_stencil().clone();
-        let two_d_before = channel.two_d().clone();
-
-        for state in channel.three_d().render_targets().color().iter() {
-            let compression = state.compression();
-
-            assert_eq!(compression.raw(), Some(0));
-            assert_eq!(
-                compression.value().copied(),
-                Some(MaxwellThreeDColorCompressionMode::Disabled)
-            );
-        }
-        for index in 0..MAXWELL_COLOR_TARGET_COUNT {
-            let raw = channel
-                .three_d_mut()
-                .raw_register_value(GpuMethodId(0x19e0 + index as u32 * 4))
-                .expect("color compression reset must be visible to MME");
-
-            assert_eq!(Some(raw), Some(0));
-            assert_eq!(Some(&raw).copied(), Some(0));
-        }
-
-        for (argument, expected) in [
-            (0, MaxwellThreeDColorCompressionMode::Disabled),
-            (1, MaxwellThreeDColorCompressionMode::Enabled),
-        ] {
-            let method = 0x19e0 + u32::from(target) * 4;
-            let dispatch = dispatch_method(&mut channel, method / 4, argument).unwrap();
-            let targets = channel.three_d().render_targets().color();
-            let register = targets[target as usize].compression();
-
-            assert_eq!(
-                dispatch.methods()[0].metadata().method_name(),
-                "SET_COLOR_COMPRESSION"
-            );
-
-            assert!(dispatch.operations().is_empty());
-
-            assert_eq!(register.raw(), Some(argument));
-            assert_eq!(register.value().copied(), Some(expected));
-
-            assert_eq!(expected.raw(), argument);
-            for (other, state) in targets.iter().enumerate() {
-                if other != target as usize {
-                    let compression = state.compression();
-
-                    assert_eq!(compression.raw(), Some(0));
-                    assert_eq!(
-                        compression.value().copied(),
-                        Some(MaxwellThreeDColorCompressionMode::Disabled)
-                    );
-                }
-            }
-            assert_eq!(
-                channel.three_d().render_targets().depth_stencil(),
-                &depth_before
-            );
-            assert_eq!(channel.two_d(), &two_d_before);
-        }
-
-        let resources = fixture_bindings(
-            channel.three_d(),
-            resource_address_space().memory(),
-            &mut crate::test_memory::apply,
-        )
-        .unwrap();
-        assert!(resources.resources().next().is_none());
-    }
-}
-
-#[test]
-fn invalid_color_compression_values_are_rejected_atomically() {
-    for target in 0..MAXWELL_COLOR_TARGET_COUNT as u8 {
-        for argument in [2, 3, u32::MAX] {
-            let mut channel = three_d_channel();
-            let frontend_before = channel.frontend();
-            let two_d_before = channel.two_d().clone();
-            let three_d_before = channel.three_d().clone();
-            let method = 0x19e0 + u32::from(target) * 4;
-            let decoded = packet(method / 4, argument);
-
-            assert!(matches!(
-                dispatch_first(&mut channel, &decoded),
-                Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                    source,
-                    method_name: "SET_COLOR_COMPRESSION",
-                    reason: "reserved bits are set",
-                }) if source.argument() == argument && source.method() == GpuMethodId(method)
-            ));
-            assert_eq!(channel.frontend(), frontend_before);
-            assert_eq!(channel.two_d(), &two_d_before);
-            assert_eq!(channel.three_d(), &three_d_before);
-        }
-    }
-}
-
-#[test]
-fn zero_bandwidth_clear_masks_preserve_independent_state_without_gpu_work() {
-    let mut channel = three_d_channel();
-    let targets = channel.three_d().render_targets();
-    assert_eq!(targets.color_zero_bandwidth_clear().value(), None);
-    assert_eq!(targets.depth_zero_bandwidth_clear().value(), None);
-    let draw_identity = channel.three_d().draw_state_identity();
-    let resource_identities = [
-        MaxwellThreeDResourceRole::ColorTarget(0),
-        MaxwellThreeDResourceRole::DepthStencilTarget,
-    ]
-    .map(|role| channel.three_d().resource_state_identity(role));
-    let two_d = channel.two_d().clone();
-    for (method, name) in [
-        (0x07a4, "SET_COLOR_ZERO_BANDWIDTH_CLEAR"),
-        (0x07a8, "SET_Z_ZERO_BANDWIDTH_CLEAR"),
-    ] {
-        for mask in [0x7ff8, 0, 0x7fff, 1, 0x4000] {
-            let before = channel.three_d().render_targets().clone();
-            let dispatch = dispatch_method(&mut channel, method / 4, mask).unwrap();
-            assert!(dispatch.ordered_operations().is_empty());
-            assert_eq!(dispatch.methods()[0].metadata().method_name(), name);
-            let targets = channel.three_d().render_targets();
-            let register = if method == 0x07a4 {
-                assert_eq!(
-                    targets.depth_zero_bandwidth_clear(),
-                    before.depth_zero_bandwidth_clear()
-                );
-                targets.color_zero_bandwidth_clear()
-            } else {
-                assert_eq!(
-                    targets.color_zero_bandwidth_clear(),
-                    before.color_zero_bandwidth_clear()
-                );
-                targets.depth_zero_bandwidth_clear()
-            };
-            assert_eq!(register.raw(), Some(mask));
-            assert_eq!(register.value(), Some(&(mask as u16)));
-
-            assert!(draw_identity.matches(channel.three_d()));
-            assert!(
-                resource_identities
-                    .iter()
-                    .all(|identity| identity.matches(channel.three_d()))
-            );
-            assert_eq!(channel.two_d(), &two_d);
-        }
-    }
-}
-
-#[test]
-fn compression_threshold_is_typed_source_preserving_nonsemantic_policy() {
-    let mut channel = three_d_channel();
-    let two_d_before = channel.two_d().clone();
-
-    for (argument, expected, samples) in [
-        (0, MaxwellThreeDCompressionThreshold::Samples0, 0),
-        (1, MaxwellThreeDCompressionThreshold::Samples1, 1),
-        (2, MaxwellThreeDCompressionThreshold::Samples2, 2),
-        (3, MaxwellThreeDCompressionThreshold::Samples4, 4),
-        (4, MaxwellThreeDCompressionThreshold::Samples8, 8),
-        (5, MaxwellThreeDCompressionThreshold::Samples16, 16),
-        (6, MaxwellThreeDCompressionThreshold::Samples32, 32),
-        (7, MaxwellThreeDCompressionThreshold::Samples64, 64),
-        (8, MaxwellThreeDCompressionThreshold::Samples128, 128),
-        (9, MaxwellThreeDCompressionThreshold::Samples256, 256),
-        (10, MaxwellThreeDCompressionThreshold::Samples512, 512),
-        (11, MaxwellThreeDCompressionThreshold::Samples1024, 1024),
-        (12, MaxwellThreeDCompressionThreshold::Samples2048, 2048),
-    ] {
-        let dispatch = dispatch_method(&mut channel, 0x1220 / 4, argument).unwrap();
-        let method = &dispatch.methods()[0];
-        let register = channel.three_d().render_targets().compression_threshold();
-
-        assert_eq!(method.metadata().method_name(), "SET_COMPRESSION_THRESHOLD");
-
-        assert!(dispatch.operations().is_empty());
-
-        assert_eq!(register.raw(), Some(argument));
-        assert_eq!(register.value().copied(), Some(expected));
-
-        assert_eq!(expected.raw(), argument);
-        assert_eq!(expected.sample_count(), samples);
-        assert_eq!(channel.two_d(), &two_d_before);
-    }
-
-    let resources = fixture_bindings(
-        channel.three_d(),
-        resource_address_space().memory(),
-        &mut crate::test_memory::apply,
-    )
-    .unwrap();
-    assert!(resources.resources().next().is_none());
-}
-
-#[test]
-fn color_target_selection_retains_all_fields_for_counts_zero_through_eight() {
-    let mut channel = three_d_channel();
-    let targets = [7, 0, 6, 1, 5, 2, 4, 3];
-
-    for count in 0..=8 {
-        let argument = color_target_selection_raw(count, targets);
-        let dispatch = dispatch_method(&mut channel, 0x121c / 4, argument).unwrap();
-        let register = channel.three_d().render_targets().color_target_selection();
-        let selection = register.value().copied().unwrap();
-
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_CT_SELECT"
-        );
-        assert!(dispatch.operations().is_empty());
-
-        assert_eq!(register.raw(), Some(argument));
-
-        assert_eq!(selection.target_count(), count);
-        assert_eq!(selection.targets(), targets);
-        assert_eq!(selection.active_targets(), &targets[..usize::from(count)]);
-        assert_eq!(selection.raw(), argument);
-    }
-}
-
-#[test]
-fn render_target_layer_is_typed_source_preserving_and_consumer_scoped() {
-    let mut channel = three_d_channel();
-
-    for (argument, layer, control, fixed_layering, geometry_layering) in [
-        (
-            0,
-            0,
-            MaxwellThreeDRenderTargetLayerControl::Fixed,
-            false,
-            false,
-        ),
-        (
-            0xffff,
-            u16::MAX,
-            MaxwellThreeDRenderTargetLayerControl::Fixed,
-            true,
-            true,
-        ),
-        (
-            0x0001_0000,
-            0,
-            MaxwellThreeDRenderTargetLayerControl::GeometryShader,
-            false,
-            true,
-        ),
-        (
-            0x0001_ffff,
-            u16::MAX,
-            MaxwellThreeDRenderTargetLayerControl::GeometryShader,
-            false,
-            true,
-        ),
-    ] {
-        let dispatch = dispatch_method(&mut channel, 0x15cc / 4, argument).unwrap();
-        let value = MaxwellThreeDRenderTargetLayer::new(layer, control);
-        let register = channel.three_d().render_targets().render_target_layer();
-
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_RT_LAYER"
-        );
-
-        assert!(dispatch.operations().is_empty());
-        assert_eq!(value.layer(), layer);
-        assert_eq!(value.control(), control);
-        assert_eq!(value.raw(), argument);
-        assert_eq!(value.affects_draw_layering(false), fixed_layering);
-        assert_eq!(value.affects_draw_layering(true), geometry_layering);
-
-        assert_eq!(register.raw(), Some(argument));
-        assert_eq!(register.value(), Some(&value));
-    }
-
-    program_three_d(&mut channel, 0x15cc, 0);
-    program_three_d(&mut channel, 0x20c0, 0x41);
-    program_three_d(&mut channel, 0x15cc, 0x0001_0000);
-}
-
-#[test]
-fn render_target_layer_reserved_bits_and_failed_packet_keeps_valid_prefix() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x15cc, 0);
-
-    for argument in [0x0002_0000, 0x8000_0000, u32::MAX] {
-        let frontend_before = channel.frontend();
-        let two_d_before = channel.two_d().clone();
-        let three_d_before = channel.three_d().clone();
-        let decoded = packet(0x15cc / 4, argument);
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_RT_LAYER",
-                ..
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel.frontend(), frontend_before);
-        assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
-    }
-
-    let frontend_before = channel.frontend();
-    let two_d_before = channel.two_d().clone();
-    let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x15cc / 4, &[1, 0x10]);
-    assert!(matches!(
-        dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-            source,
-            method_name: "SET_ANTI_ALIAS",
-            ..
-        }) if source.method() == GpuMethodId(0x15d0)
-    ));
-    assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
-    assert_ne!(channel.three_d(), &three_d_before);
-}
-
-#[test]
-fn malformed_color_target_selection_and_failed_packet_keeps_valid_prefix() {
-    let mut channel = three_d_channel();
-    let valid = color_target_selection_raw(2, [1, 0, 7, 6, 5, 4, 3, 2]);
-    program_three_d(&mut channel, 0x121c, valid);
-
-    for argument in [9, 15, 0x1000_0000, u32::MAX] {
-        let frontend_before = channel.frontend();
-        let two_d_before = channel.two_d().clone();
-        let three_d_before = channel.three_d().clone();
-        let decoded = packet(0x121c / 4, argument);
-
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_CT_SELECT",
-                ..
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel.frontend(), frontend_before);
-        assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
-    }
-
-    let frontend_before = channel.frontend();
-    let two_d_before = channel.two_d().clone();
-    let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x121c / 4, &[1, 13]);
-    assert!(matches!(
-        dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-            source,
-            method_name: "SET_COMPRESSION_THRESHOLD",
-            ..
-        }) if source.method() == GpuMethodId(0x1220)
-    ));
-    assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
-    assert_ne!(channel.three_d(), &three_d_before);
-}
-
-#[test]
-fn three_d_register_write_applies_immediately() {
-    let mut channel = three_d_channel();
-    let decoded = packet(0x1518 / 4, 0x3fc0_0000);
-    let before = channel.three_d().clone();
-
-    dispatch_first(&mut channel, &decoded).unwrap();
-
-    assert_eq!(
-        channel.three_d().raster().point_size().raw(),
-        Some(0x3fc0_0000)
-    );
-    assert_eq!(
-        channel.three_d().raster().point_size().value().copied(),
-        Some(MaxwellThreeDPointSize::from_bits(0x3fc0_0000))
-    );
-
-    assert_ne!(channel.three_d(), &before);
-}
-
-#[test]
-fn enumerated_register_values_are_checked_before_state_changes() {
-    let mut channel = three_d_channel();
-    dispatch_method(&mut channel, 0x0d7c / 4, 1).unwrap();
-    assert_eq!(
-        channel.three_d().viewport().z_clip_range().value().copied(),
-        Some(MaxwellThreeDViewportZClipRange::ZeroToPositiveW)
-    );
-
-    let before = channel.three_d().clone();
-    let invalid = packet(0x0d7c / 4, 2);
-    assert!(matches!(
-        dispatch_first(&mut channel, &invalid),
-        Err(MaxwellEngineDispatchError::InvalidMethodValue {
-            defined_mask: 1,
-            ..
-        })
-    ));
-    assert_eq!(channel.three_d(), &before);
-}
-
-#[test]
 fn render_target_state_distinguishes_unset_disabled_ready_and_profile_unavailable() {
     let mut channel = three_d_channel();
     assert_eq!(
-        channel.three_d().render_targets().color()[0].readiness(true),
-        MaxwellThreeDAttachmentReadiness::Unprogrammed
+        channel.three_d().render_targets().color(0).readiness(true),
+        MaxwellThreeDAttachmentReadiness::Disabled
     );
 
     dispatch_method(&mut channel, 0x0810 / 4, 0).unwrap();
     assert_eq!(
-        channel.three_d().render_targets().color()[0].readiness(true),
+        channel.three_d().render_targets().color(0).readiness(true),
         MaxwellThreeDAttachmentReadiness::Disabled
     );
 
@@ -631,7 +164,7 @@ fn render_target_state_distinguishes_unset_disabled_ready_and_profile_unavailabl
         &[0, 0x0080_0000, 1280, 720, 0xd5, 0, 1, 0, 0],
     )
     .unwrap();
-    let target = &channel.three_d().render_targets().color()[0];
+    let target = &channel.three_d().render_targets().color(0);
     assert_eq!(
         target.readiness(true),
         MaxwellThreeDAttachmentReadiness::Ready
@@ -642,19 +175,6 @@ fn render_target_state_distinguishes_unset_disabled_ready_and_profile_unavailabl
     );
     assert_eq!(target.address_lower().value(), Some(&0x0080_0000));
     assert_eq!(target.format().raw(), Some(0xd5));
-}
-
-#[test]
-fn malformed_render_target_layout_is_rejected_before_application() {
-    let mut channel = three_d_channel();
-
-    let malformed_layout = packet(0x0814 / 4, 0x1001);
-    let before = channel.three_d().clone();
-    assert!(matches!(
-        dispatch_first(&mut channel, &malformed_layout),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding { .. })
-    ));
-    assert_eq!(channel.three_d(), &before);
 }
 
 #[test]
@@ -704,7 +224,7 @@ fn clear_and_fixed_function_state_preserve_typed_values_and_sources() {
         ))
     );
     assert_eq!(
-        state.fixed_function().color_mask()[0].value(),
+        state.fixed_function().color_mask(0).value(),
         Some(&MaxwellThreeDColorMask {
             red: true,
             green: false,
@@ -722,334 +242,11 @@ fn clear_and_fixed_function_state_preserve_typed_values_and_sources() {
         ))
     );
     assert_eq!(
-        state.fixed_function().per_target_blend()[0][1].value(),
+        state.fixed_function().per_target_blend(0, 1).value(),
         Some(&MaxwellThreeDFixedFunctionValue::BlendOp(
             MaxwellThreeDBlendOp::Add
         ))
     );
-}
-
-#[test]
-fn clear_surface_control_is_typed_source_preserving_and_pipeline_neutral() {
-    let mut channel = three_d_channel();
-    let two_d_before = channel.two_d().clone();
-
-    for combination in 0_u32..16 {
-        let argument = (combination & 1)
-            | ((combination & 2) << 3)
-            | ((combination & 4) << 6)
-            | ((combination & 8) << 9);
-        let dispatch = dispatch_method(&mut channel, 0x10f8 / 4, argument).unwrap();
-        let method = dispatch.methods()[0];
-        let register = channel.three_d().render_targets().clear().surface_control();
-        let value = register.value().copied().unwrap();
-
-        assert_eq!(method.metadata().method_name(), "SET_CLEAR_SURFACE_CONTROL");
-
-        assert!(dispatch.operations().is_empty());
-        assert_eq!(value.raw(), argument);
-        assert_eq!(value.respect_stencil_mask(), combination & 1 != 0);
-        assert_eq!(value.use_clear_rect(), combination & 2 != 0);
-        assert_eq!(value.use_scissor_zero(), combination & 4 != 0);
-        assert_eq!(value.use_viewport_clip_zero(), combination & 8 != 0);
-
-        assert_eq!(register.raw(), Some(argument));
-
-        assert_eq!(channel.two_d(), &two_d_before);
-    }
-}
-
-#[test]
-fn clear_surface_control_reserved_bits_and_failed_packet_keeps_valid_prefix() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x10f8, 0x1111);
-
-    for argument in [2, 0x20, 0x200, 0x2000, 0x8000_0000, u32::MAX] {
-        let frontend_before = channel.frontend();
-        let two_d_before = channel.two_d().clone();
-        let three_d_before = channel.three_d().clone();
-        let decoded = packet(0x10f8 / 4, argument);
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_CLEAR_SURFACE_CONTROL",
-                reason: "reserved control bits are set",
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel.frontend(), frontend_before);
-        assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
-    }
-
-    let frontend_before = channel.frontend();
-    let two_d_before = channel.two_d().clone();
-    let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x10f8 / 4, &[0, 0, 0]);
-    assert!(matches!(
-        dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
-            if source.method() == GpuMethodId(0x1100)
-    ));
-    assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
-    assert_ne!(channel.three_d(), &three_d_before);
-}
-
-#[test]
-fn malformed_scissor_suffix_keeps_valid_prefix_before_failure() {
-    let mut channel = three_d_channel();
-    let decoded = incrementing_packet(0x0e00 / 4, &[1, (100 << 16) | 5, (10 << 16) | 20]);
-    let before = channel.three_d().clone();
-    assert!(matches!(
-        dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding { .. })
-    ));
-    assert_ne!(channel.three_d(), &before);
-}
-
-#[test]
-fn window_clip_type_is_typed_and_rejects_unknown_values_atomically() {
-    let mut channel = three_d_channel();
-
-    for (argument, expected) in [
-        (0, MaxwellThreeDWindowClipType::Inclusive),
-        (1, MaxwellThreeDWindowClipType::Exclusive),
-        (2, MaxwellThreeDWindowClipType::ClipAll),
-    ] {
-        dispatch_method(&mut channel, 0x1950 / 4, argument).unwrap();
-        let register = channel
-            .three_d()
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::WindowClipType);
-
-        assert_eq!(expected.raw(), argument);
-        assert_eq!(register.raw(), Some(argument));
-        assert_eq!(
-            register.value(),
-            Some(&MaxwellThreeDFixedFunctionValue::WindowClipType(expected))
-        );
-    }
-
-    for argument in [3, 0x8000_0000, u32::MAX] {
-        let frontend_before = channel.frontend();
-        let two_d_before = channel.two_d().clone();
-        let three_d_before = channel.three_d().clone();
-        let decoded = packet(0x1950 / 4, argument);
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_WINDOW_CLIP_TYPE",
-                reason: "unknown window clip type",
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel.frontend(), frontend_before);
-        assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
-    }
-}
-
-#[test]
-fn window_clip_packet_programs_all_eight_typed_source_preserving_pairs() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x1950, 0);
-    program_three_d(&mut channel, 0x194c, 0);
-    assert_eq!(
-        channel
-            .three_d()
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::WindowClipType)
-            .value(),
-        Some(&MaxwellThreeDFixedFunctionValue::WindowClipType(
-            MaxwellThreeDWindowClipType::Inclusive
-        ))
-    );
-    let arguments = std::array::from_fn::<_, 16, _>(|word| {
-        let region = word / 2;
-        let minimum = (region * 10 + word % 2) as u32;
-        let maximum = minimum + 100;
-        (maximum << 16) | minimum
-    });
-    let dispatch = dispatch_incrementing(&mut channel, 0x0d00 / 4, &arguments).unwrap();
-
-    assert_eq!(dispatch.methods().len(), 16);
-    assert!(dispatch.operations().is_empty());
-    for (region_index, region) in channel
-        .three_d()
-        .fixed_function()
-        .window_clip()
-        .iter()
-        .enumerate()
-    {
-        for (vertical, register, word) in [
-            (false, region.horizontal(), region_index * 2),
-            (true, region.vertical(), region_index * 2 + 1),
-        ] {
-            let method = dispatch.methods()[word];
-            let expected = MaxwellThreeDRectangle {
-                min: (region_index * 10 + usize::from(vertical)) as u16,
-                max: (region_index * 10 + usize::from(vertical) + 100) as u16,
-            };
-            let method_name = if vertical {
-                "SET_WINDOW_CLIP_VERTICAL"
-            } else {
-                "SET_WINDOW_CLIP_HORIZONTAL"
-            };
-
-            assert_eq!(method.metadata().method_name(), method_name);
-
-            assert_eq!(register.raw(), Some(arguments[word]));
-            assert_eq!(register.value(), Some(&expected));
-        }
-    }
-}
-
-#[test]
-fn malformed_window_clip_rectangle_keeps_valid_prefix_before_failure() {
-    let mut channel = three_d_channel();
-    let valid = incrementing_packet(0x0d00 / 4, &[0; 16]);
-    dispatch_first(&mut channel, &valid).unwrap();
-    let frontend_before = channel.frontend();
-    let two_d_before = channel.two_d().clone();
-    let three_d_before = channel.three_d().clone();
-    let mut arguments = [0; 16];
-    arguments[9] = (1 << 16) | 2;
-    let malformed = incrementing_packet(0x0d00 / 4, &arguments);
-
-    assert!(matches!(
-        dispatch_first(&mut channel, &malformed),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-            source,
-            method_name: "SET_WINDOW_CLIP_VERTICAL",
-            reason: "rectangle minimum exceeds maximum",
-        }) if source.method() == GpuMethodId(0x0d24)
-    ));
-    assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
-}
-
-#[test]
-fn clip_id_test_enable_is_typed_source_preserving_and_atomic() {
-    let mut channel = three_d_channel();
-    let two_d_before = channel.two_d().clone();
-    let window_clip_before = channel.three_d().fixed_function().window_clip().to_owned();
-
-    for (argument, expected) in [
-        (0, MaxwellThreeDClipIdTestEnable::Disabled),
-        (1, MaxwellThreeDClipIdTestEnable::Enabled),
-    ] {
-        let dispatch = dispatch_method(&mut channel, 0x197c / 4, argument).unwrap();
-        let method = dispatch.methods()[0];
-        let register = channel
-            .three_d()
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::ClipIdTestEnable);
-        let value = MaxwellThreeDFixedFunctionValue::ClipIdTestEnable(expected);
-
-        assert_eq!(method.metadata().method_name(), "SET_CLIP_ID_TEST");
-
-        assert!(dispatch.operations().is_empty());
-        assert_eq!(expected.raw(), argument);
-
-        assert_eq!(register.raw(), Some(argument));
-        assert_eq!(register.value(), Some(&value));
-
-        assert_eq!(
-            channel.three_d().fixed_function().window_clip(),
-            &window_clip_before
-        );
-        assert_eq!(channel.two_d(), &two_d_before);
-    }
-
-    for argument in [2, 3, 0x8000_0000, u32::MAX] {
-        let frontend_before = channel.frontend();
-        let two_d_before = channel.two_d().clone();
-        let three_d_before = channel.three_d().clone();
-        let decoded = packet(0x197c / 4, argument);
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_CLIP_ID_TEST",
-                reason: "expected boolean 0 or 1",
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel.frontend(), frontend_before);
-        assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
-    }
-
-    let frontend_before = channel.frontend();
-    let two_d_before = channel.two_d().clone();
-    let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x197c / 4, &[0, 0]);
-    assert!(matches!(
-        dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
-            if source.method() == GpuMethodId(0x1980)
-    ));
-    assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
-    assert_ne!(channel.three_d(), &three_d_before);
-}
-
-#[test]
-fn viewport_scale_offset_enable_is_typed_source_preserving_and_atomic() {
-    let mut channel = three_d_channel();
-
-    for (argument, expected) in [
-        (0, MaxwellThreeDViewportScaleOffsetEnable::Disabled),
-        (1, MaxwellThreeDViewportScaleOffsetEnable::Enabled),
-    ] {
-        let dispatch = dispatch_method(&mut channel, 0x192c / 4, argument).unwrap();
-        let method = dispatch.methods()[0];
-        let register = channel
-            .three_d()
-            .fixed_function()
-            .register(MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable);
-        let value = MaxwellThreeDFixedFunctionValue::ViewportScaleOffsetEnable(expected);
-
-        assert_eq!(method.metadata().method_name(), "SET_VIEWPORT_SCALE_OFFSET");
-
-        assert!(dispatch.operations().is_empty());
-        assert_eq!(expected.raw(), argument);
-
-        assert_eq!(register.raw(), Some(argument));
-        assert_eq!(register.value(), Some(&value));
-    }
-
-    for argument in [2, 3, 0x8000_0000, u32::MAX] {
-        let frontend_before = channel.frontend();
-        let two_d_before = channel.two_d().clone();
-        let three_d_before = channel.three_d().clone();
-        let decoded = packet(0x192c / 4, argument);
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_VIEWPORT_SCALE_OFFSET",
-                reason: "expected boolean 0 or 1",
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel.frontend(), frontend_before);
-        assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
-    }
-
-    let frontend_before = channel.frontend();
-    let two_d_before = channel.two_d().clone();
-    let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x192c / 4, &[0, 0]);
-    assert!(matches!(
-        dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
-            if source.method() == GpuMethodId(0x1930)
-    ));
-    assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
-    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -1328,7 +525,8 @@ fn mme_replay_restores_firmware_color_target_selection_after_temporary_override(
 
 #[test]
 fn shadow_replay_restores_each_color_descriptor_field_to_verified_firmware_values() {
-    let mut channel = three_d_channel();
+    let mut channel = channel();
+    bind_three_d(&mut channel);
     for target in 0..8 {
         for (offset, expected) in [
             (0, 0),
@@ -1538,7 +736,7 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
         assert_eq!(Some(raw), Some(header));
         assert_eq!(Some(&raw), Some(&header));
 
-        let binding = &channel.three_d().shader_bindings().pipeline()[pipeline];
+        let binding = &channel.three_d().shader_bindings().pipeline(pipeline);
 
         assert_eq!(binding.enabled().raw(), Some(header));
         assert_eq!(binding.enabled().value(), Some(&(header & 1 != 0)));
@@ -1570,40 +768,6 @@ fn mme_reads_pipeline_header_and_binding_resets_and_writes_override_one_slot() {
     dispatch_method(&mut channel, (0x3800 + u32::from(macro_index) * 8) / 4, 0).unwrap();
 
     assert_eq!(channel.three_d(), &before_call);
-
-    let before_invalid = channel.three_d().clone();
-    let invalid = packet(0x20c0 / 4, 2);
-    assert!(matches!(
-        dispatch_first(&mut channel, &invalid),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-            source,
-            method_name: "SET_PIPELINE_SHADER",
-            ..
-        }) if source.method() == GpuMethodId(0x20c0)
-    ));
-    assert_eq!(channel.three_d(), &before_invalid);
-
-    program_three_d(&mut channel, 0x20c0, 0x41);
-    let raw = channel
-        .three_d_mut()
-        .raw_register_value(GpuMethodId(0x20c0))
-        .unwrap();
-    assert_eq!(Some(raw), Some(0x41));
-    let binding = &channel.three_d().shader_bindings().pipeline()[3];
-
-    assert_eq!(binding.enabled().value(), Some(&true));
-
-    assert_eq!(binding.stage().value(), Some(&MaxwellShaderStage::Geometry));
-    assert_eq!(binding.group().value(), Some(&2));
-    assert_eq!(binding.effective_group(), Some(2));
-    assert!(
-        channel.three_d().shader_bindings().stage_visibility(2)
-            [MaxwellShaderStage::Geometry as usize]
-    );
-    program_three_d(&mut channel, 0x20d0, 6);
-    let binding = &channel.three_d().shader_bindings().pipeline()[3];
-
-    assert_eq!(binding.effective_group(), Some(6));
 }
 
 #[test]
@@ -1793,10 +957,10 @@ fn mme_reset_tracking_preserves_a_complete_color_target_across_passthrough_and_r
         program_three_d(&mut channel, method, argument);
     }
     assert_eq!(
-        channel.three_d().render_targets().color()[0].readiness(true),
+        channel.three_d().render_targets().color(0).readiness(true),
         MaxwellThreeDAttachmentReadiness::Ready
     );
-    let layer = channel.three_d().render_targets().color()[0].layer();
+    let layer = channel.three_d().render_targets().color(0).layer();
 
     assert_eq!(layer.value(), Some(&0));
     assert_eq!(
@@ -1811,7 +975,7 @@ fn mme_reset_tracking_preserves_a_complete_color_target_across_passthrough_and_r
         program_three_d(&mut channel, method, 0);
     }
     assert_ne!(
-        channel.three_d().render_targets().color()[0].readiness(true),
+        channel.three_d().render_targets().color(0).readiness(true),
         MaxwellThreeDAttachmentReadiness::Ready
     );
 
@@ -1820,7 +984,7 @@ fn mme_reset_tracking_preserves_a_complete_color_target_across_passthrough_and_r
         program_three_d(&mut channel, method, u32::MAX);
     }
     assert_eq!(
-        channel.three_d().render_targets().color()[0].readiness(true),
+        channel.three_d().render_targets().color(0).readiness(true),
         MaxwellThreeDAttachmentReadiness::Ready
     );
     for (method, argument) in initial {
@@ -1876,7 +1040,7 @@ fn mme_shadow_replay_uses_the_verified_window_origin_reset() {
     assert_eq!(source.argument(), 0);
     assert_eq!(
         dispatch.methods()[0].metadata().method_name(),
-        "SET_WINDOW_ORIGIN"
+        "STATE_REGISTER"
     );
     let window_origin = channel
         .three_d()
@@ -2292,82 +1456,6 @@ fn mme_finite_loop_may_emit_more_than_the_old_host_budget() {
 }
 
 #[test]
-fn vertex_assembly_controls_are_typed_source_preserving_and_isolated() {
-    let mut channel = three_d_channel();
-    let input_before = channel.three_d().vertex_input().clone();
-    let two_d_before = channel.two_d().clone();
-
-    let dispatch = dispatch_method(&mut channel, 0x1610 / 4, 0x0e).unwrap();
-    let defaults = channel
-        .three_d()
-        .vertex_input()
-        .assembly()
-        .attribute_defaults();
-    let value = *defaults.value().unwrap();
-
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "SET_ATTRIBUTE_DEFAULT"
-    );
-
-    assert_eq!(defaults.raw(), Some(0x0e));
-
-    assert_eq!(
-        value.color_front_diffuse(),
-        MaxwellThreeDAttributeDefaultVector::Vector0001
-    );
-    assert_eq!(
-        value.color_front_specular(),
-        MaxwellThreeDAttributeDefaultVector::Vector0001
-    );
-    assert_eq!(
-        value.generic_vector(),
-        MaxwellThreeDAttributeDefaultVector::Vector0001
-    );
-    assert_eq!(
-        value.fixed_function_texture(),
-        MaxwellThreeDAttributeDefaultVector::Vector0001
-    );
-    assert_eq!(
-        value.dx9_color0(),
-        MaxwellThreeDAttributeDefaultVector::Vector0001
-    );
-    assert_eq!(
-        value.dx9_color1_to_color15(),
-        MaxwellThreeDAttributeDefaultVector::Vector0000
-    );
-    assert_eq!(
-        channel
-            .three_d()
-            .vertex_input()
-            .assembly()
-            .vertex_id_uses_array_start(),
-        input_before.assembly().vertex_id_uses_array_start()
-    );
-
-    let dispatch = dispatch_method(&mut channel, 0x164c / 4, 0x1000).unwrap();
-    let input = channel.three_d().vertex_input();
-    let vertex_id = input.assembly().vertex_id_uses_array_start();
-
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "SET_DA_OUTPUT"
-    );
-
-    assert_eq!(vertex_id.raw(), Some(0x1000));
-    assert_eq!(
-        vertex_id.value(),
-        Some(&MaxwellThreeDVertexIdUsesArrayStart::Enabled)
-    );
-
-    assert_eq!(input.streams(), input_before.streams());
-    assert_eq!(input.attributes(), input_before.attributes());
-    assert_eq!(input.index(), input_before.index());
-    assert_eq!(input.primitive(), input_before.primitive());
-    assert_eq!(channel.two_d(), &two_d_before);
-}
-
-#[test]
 fn vertex_assembly_controls_update_typed_state() {
     let mut channel = three_d_channel();
 
@@ -2416,16 +1504,16 @@ fn vertex_stream_attributes_and_begin_state_remain_unresolved_and_typed() {
     }
 
     let input = channel.three_d().vertex_input();
-    let stream = &input.streams()[0];
+    let stream = &input.streams(0);
     assert_eq!(stream.address().unwrap().get(), 0x2000);
     assert_eq!(stream.limit().unwrap().get(), 0x20ff);
     assert_eq!(stream.format().value().unwrap().stride(), 16);
     assert!(stream.format().value().unwrap().enabled());
-    let attribute = input.attributes()[0].value().unwrap();
+    let attribute = input.attributes(0).value().copied().unwrap();
     assert!(attribute.enabled());
     assert_eq!(attribute.stream(), 0);
     assert_eq!(attribute.component_widths().unwrap().byte_size(), 16);
-    assert!(!input.attributes()[1].value().unwrap().enabled());
+    assert!(!input.attributes(1).value().unwrap().enabled());
     assert_eq!(input.primitive().vertex_array_start().value(), Some(&7));
     assert_eq!(input.primitive().begin().value().unwrap().topology(), 4);
     assert_eq!(input.primitive().topology().value().unwrap().raw(), 4);
@@ -2534,18 +1622,6 @@ fn begin_instance_modes_reset_advance_and_preserve_the_instance_sequence() {
 }
 
 #[test]
-fn malformed_vertex_suffix_preserves_applied_prefix() {
-    let mut channel = three_d_channel();
-    let malformed = incrementing_packet(0x1c00 / 4, &[0x1010, 0, 0x2000, 1, 0x2000]);
-    let before = channel.three_d().clone();
-    assert!(matches!(
-        dispatch_first(&mut channel, &malformed),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding { .. })
-    ));
-    assert_ne!(channel.three_d(), &before);
-}
-
-#[test]
 fn vertex_stream_ranges_may_be_reprogrammed_across_packets_before_consumption() {
     let mut channel = three_d_channel();
 
@@ -2566,7 +1642,7 @@ fn vertex_stream_ranges_may_be_reprogrammed_across_packets_before_consumption() 
 
     dispatch_incrementing(&mut channel, 0x1f00 / 4, &[0, 0x0941_6fbf]).unwrap();
 
-    let stream = &channel.three_d().vertex_input().streams()[0];
+    let stream = &channel.three_d().vertex_input().streams(0);
     assert_eq!(
         stream.address().map(|address| address.get()),
         Some(0x0941_3000)
@@ -2619,7 +1695,7 @@ fn program_region_is_source_preserving_and_only_active_for_shader_pipelines() {
     let region = channel.three_d().shader_bindings().program_region();
     assert_eq!(
         lower_dispatch.methods()[0].metadata().method_name(),
-        "SET_PROGRAM_REGION_B"
+        "STATE_REGISTER"
     );
 
     assert!(region.address().is_none());
@@ -2629,7 +1705,7 @@ fn program_region_is_source_preserving_and_only_active_for_shader_pipelines() {
     let region = channel.three_d().shader_bindings().program_region();
     assert_eq!(
         upper_dispatch.methods()[0].metadata().method_name(),
-        "SET_PROGRAM_REGION_A"
+        "STATE_REGISTER"
     );
     assert_eq!(region.address_upper().raw(), Some(4));
 
@@ -2655,7 +1731,7 @@ fn spa_version_is_shared_source_preserving_and_only_active_for_shader_pipelines(
     let value = *register.value().unwrap();
     let _: MaxwellComputeSpaVersion = value;
 
-    assert_eq!(method.metadata().method_name(), "SET_SPA_VERSION");
+    assert_eq!(method.metadata().method_name(), "STATE_REGISTER");
 
     assert!(dispatch.operations().is_empty());
     assert_eq!(value.major(), 5);
@@ -2671,95 +1747,13 @@ fn spa_version_is_shared_source_preserving_and_only_active_for_shader_pipelines(
 }
 
 #[test]
-fn spa_version_reserved_bits_and_failed_packet_keeps_valid_prefix() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x0310, 0x0503);
-
-    for argument in [0x1_0000, 0x8000_0000, u32::MAX] {
-        let frontend_before = channel.frontend();
-        let two_d_before = channel.two_d().clone();
-        let three_d_before = channel.three_d().clone();
-        let decoded = packet(0x0310 / 4, argument);
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_SPA_VERSION",
-                reason: "reserved bits are set",
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel.frontend(), frontend_before);
-        assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
-    }
-
-    let frontend_before = channel.frontend();
-    let two_d_before = channel.two_d().clone();
-    let three_d_before = channel.three_d().clone();
-    let decoded = non_incrementing_packet_on_subchannel(0, 0x0310 / 4, &[0x0503, 0x1_0000]);
-    assert!(matches!(
-        dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding { source, .. })
-            if source.method() == GpuMethodId(0x0310)
-                && source.argument() == 0x1_0000
-    ));
-    assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
-}
-
-#[test]
-fn invalid_program_region_upper_and_failed_packet_keeps_valid_prefix() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x1608, 4);
-    program_three_d(&mut channel, 0x160c, 0);
-
-    for argument in [0x100, 0x8000_0000, u32::MAX] {
-        let frontend_before = channel.frontend();
-        let two_d_before = channel.two_d().clone();
-        let three_d_before = channel.three_d().clone();
-        let decoded = packet(0x1608 / 4, argument);
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_PROGRAM_REGION_A",
-                ..
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel.frontend(), frontend_before);
-        assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
-    }
-
-    let frontend_before = channel.frontend();
-    let two_d_before = channel.two_d().clone();
-    let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x1608 / 4, &[5, 0x1000, 0x40]);
-    assert!(matches!(
-        dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-            source,
-            method_name: "SET_ATTRIBUTE_DEFAULT",
-            ..
-        }) if source.method() == GpuMethodId(0x1610)
-    ));
-    assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
-    assert_ne!(channel.three_d(), &three_d_before);
-}
-
-#[test]
 fn vertex_stream_substitute_address_is_typed_source_preserving_and_pipeline_neutral() {
     let mut channel = three_d_channel();
     let two_d_before = channel.two_d().clone();
 
     let lower_dispatch = dispatch_method(&mut channel, 0x0f88 / 4, 0x082c_3000).unwrap();
     let lower_method = lower_dispatch.methods()[0];
-    assert_eq!(
-        lower_method.metadata().method_name(),
-        "SET_VERTEX_STREAM_SUBSTITUTE_B"
-    );
+    assert_eq!(lower_method.metadata().method_name(), "STATE_REGISTER");
 
     let substitute = channel.three_d().vertex_input().stream_substitute();
     assert!(substitute.address().is_none());
@@ -2767,54 +1761,13 @@ fn vertex_stream_substitute_address_is_typed_source_preserving_and_pipeline_neut
 
     let upper_dispatch = dispatch_method(&mut channel, 0x0f84 / 4, 0x7f).unwrap();
     let upper_method = upper_dispatch.methods()[0];
-    assert_eq!(
-        upper_method.metadata().method_name(),
-        "SET_VERTEX_STREAM_SUBSTITUTE_A"
-    );
+    assert_eq!(upper_method.metadata().method_name(), "STATE_REGISTER");
 
     let substitute = channel.three_d().vertex_input().stream_substitute();
     assert_eq!(substitute.address_upper().raw(), Some(0x7f));
 
     assert_eq!(substitute.address().unwrap().get(), 0x7f_082c_3000);
     assert_eq!(channel.two_d(), &two_d_before);
-}
-
-#[test]
-fn invalid_vertex_stream_substitute_upper_and_failed_packet_keeps_valid_prefix() {
-    let mut channel = three_d_channel();
-    program_three_d(&mut channel, 0x0f84, 4);
-    program_three_d(&mut channel, 0x0f88, 0x1000);
-
-    for argument in [0x100, 0x8000_0000, u32::MAX] {
-        let frontend_before = channel.frontend();
-        let two_d_before = channel.two_d().clone();
-        let three_d_before = channel.three_d().clone();
-        let decoded = incrementing_packet(0x0f84 / 4, &[argument, 0x082c_3000]);
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_VERTEX_STREAM_SUBSTITUTE_A",
-                ..
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel.frontend(), frontend_before);
-        assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
-    }
-
-    let frontend_before = channel.frontend();
-    let two_d_before = channel.two_d().clone();
-    let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x0f84 / 4, &[0, 0x082c_3000, 0, 0, 0]);
-    assert!(matches!(
-        dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
-            if source.method() == GpuMethodId(0x0f94)
-    ));
-    assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
-    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -2856,7 +1809,7 @@ fn tessellation_lod_family_is_source_preserving() {
         let dispatch = dispatch_method(&mut channel, method / 4, argument).unwrap();
         assert_eq!(
             dispatch.methods()[0].metadata().method_name(),
-            "SET_TESSELLATION_LOD"
+            "STATE_REGISTER"
         );
 
         let register = channel.three_d().shader_bindings().tessellation_lod(level);
@@ -2891,10 +1844,7 @@ fn render_target_index_offset_is_typed_source_preserving_and_conditionally_depen
             .render_targets()
             .render_target_index_offset();
 
-        assert_eq!(
-            method.metadata().method_name(),
-            "SET_OFFSET_RENDER_TARGET_INDEX"
-        );
+        assert_eq!(method.metadata().method_name(), "STATE_REGISTER");
 
         assert!(dispatch.operations().is_empty());
         assert_eq!(expected.raw(), argument);
@@ -2904,42 +1854,6 @@ fn render_target_index_offset_is_typed_source_preserving_and_conditionally_depen
         assert_eq!(register.value().copied(), Some(expected));
 
         assert_eq!(channel.two_d(), &two_d_before);
-    }
-
-    for argument in [2, 3, 0x8000_0000, u32::MAX] {
-        let frontend_before = channel.frontend();
-        let two_d_before = channel.two_d().clone();
-        let three_d_before = channel.three_d().clone();
-        let decoded = packet(0x11f0 / 4, argument);
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_OFFSET_RENDER_TARGET_INDEX",
-                ..
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel.frontend(), frontend_before);
-        assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
-    }
-}
-
-#[test]
-fn opportunistic_early_z_threshold_retains_sources_and_rejects_reserved_encodings() {
-    let mut channel = three_d_channel();
-    for raw in (0..=19).chain([31]) {
-        let dispatch = dispatch_method(&mut channel, 0x204 / 4, raw).unwrap();
-        let register = channel
-            .three_d()
-            .shader_execution()
-            .opportunistic_early_z_hysteresis();
-        assert_eq!(register.value(), Some(&(raw as u8)));
-
-        assert!(dispatch.ordered_operations().is_empty());
-    }
-    for raw in [20, 30, 32, u32::MAX] {
-        assert!(dispatch_method(&mut channel, 0x204 / 4, raw).is_err());
     }
 }
 
@@ -3063,6 +1977,108 @@ fn native_draw_fixture() -> NativeDrawFixture {
         shaders,
         vertex,
         fragment_header: header,
+    }
+}
+
+#[test]
+fn native_draw_color_masks_apply_before_the_common_selector_is_programmed() {
+    use crate::execution::MaxwellFrontend;
+    use nixe_gpu::{ColorWriteMask, native::NativeCommand};
+    let NativeDrawFixture {
+        space, mut channel, ..
+    } = native_draw_fixture();
+    let mut frontend = crate::MaxwellNativeFrontend::new(Default::default());
+    for (raw, expected) in [
+        (0, ColorWriteMask::new(false, false, false, false)),
+        (0x1111, ColorWriteMask::new(true, true, true, true)),
+        (0x101, ColorWriteMask::new(true, false, true, false)),
+        (0, ColorWriteMask::new(false, false, false, false)),
+    ] {
+        program_three_d(&mut channel, 0x1a00, raw);
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let draw = &dispatch.operations()[0];
+        let work = frontend
+            .lower_three_d(
+                draw.state(),
+                draw.trigger(),
+                space.memory(),
+                FrontendSubmissionId::new(1),
+                None,
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
+        let NativeCommand::Draw { state, .. } = work.command else {
+            panic!("expected draw")
+        };
+        assert_eq!(state.parameters.color_outputs[0].write_mask, expected);
+    }
+}
+
+#[test]
+fn native_draw_routes_color_masks_once_into_fragment_output_order() {
+    use crate::execution::MaxwellFrontend;
+    use nixe_gpu::{ColorWriteMask, native::NativeCommand};
+    let NativeDrawFixture {
+        space, mut channel, ..
+    } = native_draw_fixture();
+    let color = &channel.three_d().render_targets().color(0);
+    let address = (u64::from(*color.address_upper().value().unwrap()) << 32)
+        | u64::from(*color.address_lower().value().unwrap());
+    let mut frontend = crate::MaxwellNativeFrontend::new(Default::default());
+    program_three_d(&mut channel, 0x0f90, 0);
+    for (method, raw) in [
+        (0x1340, 0x8006),
+        (0x1344, 0x4302),
+        (0x1348, 0x4303),
+        (0x134c, 0x8006),
+        (0x1350, 2),
+        (0x1358, 1),
+    ] {
+        program_three_d(&mut channel, method, raw);
+    }
+    for target in [3, 7, 0, 3] {
+        program_color_target(&mut channel, target, address, 0xd5);
+        program_three_d(
+            &mut channel,
+            0x121c,
+            color_target_selection_raw(1, [target, 0, 1, 2, 4, 5, 6, 7]),
+        );
+        let raw = if target == 0 { 0x1111 } else { 0 };
+        program_three_d(&mut channel, 0x1a00 + u32::from(target) * 4, raw);
+        program_three_d(
+            &mut channel,
+            0x1360 + u32::from(target) * 4,
+            u32::from(target != 0),
+        );
+        let dispatch = dispatch_method(&mut channel, 0x0d78 / 4, 3).unwrap();
+        let draw = &dispatch.operations()[0];
+        let work = frontend
+            .lower_three_d(
+                draw.state(),
+                draw.trigger(),
+                space.memory(),
+                FrontendSubmissionId::new(1),
+                None,
+                &mut crate::test_memory::access(space.memory().machine()),
+            )
+            .unwrap();
+        let NativeCommand::Draw { state, .. } = work.command else {
+            panic!("expected draw")
+        };
+        assert_eq!(state.parameters.color_outputs.len(), 1);
+        assert_eq!(
+            state.parameters.color_outputs[0].blend.is_some(),
+            target != 0
+        );
+        assert_eq!(
+            state.parameters.color_outputs[0].write_mask,
+            if target == 0 {
+                ColorWriteMask::new(true, true, true, true)
+            } else {
+                ColorWriteMask::new(false, false, false, false)
+            },
+            "physical target {target} feeds fragment output zero"
+        );
     }
 }
 

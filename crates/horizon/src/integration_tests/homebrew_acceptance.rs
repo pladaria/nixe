@@ -2,9 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
-use nixe_horizon::{
-    DirectoryEntryKind, HorizonSvcSupport, IpcRequest, IpcResponse, IpcResultCode, IpcService,
-};
+use nixe_horizon::{DirectoryEntryKind, IpcRequest, IpcResponse, IpcResultCode, IpcService};
 use nixe_runtime::{
     ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput, ProcessExitCause,
     ProcessLifecycle,
@@ -76,7 +74,8 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
     .unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
     let mut process = ScheduledProcess::new(support::process_builder().build(&plan).unwrap());
-    let state = process.main_thread().state();
+    let state_thread = process.main_thread();
+    let state = state_thread.registers();
     assert_ne!(
         state.read_x(A64Register::General(A64GeneralRegister::new(0).unwrap())),
         0
@@ -89,6 +88,7 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
         state.read_x(A64Register::General(A64GeneralRegister::new(30).unwrap())),
         process.main_thread().loader_return.unwrap().get()
     );
+    drop(state);
 
     let mut dispatcher = support::dispatcher(&process);
     let first = process.run_slice().unwrap();
@@ -118,13 +118,8 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
         process.exit().unwrap().cause,
         ProcessExitCause::LoaderReturned
     );
-    assert_eq!(dispatcher.coverage().len(), 1);
-    assert_eq!(dispatcher.coverage()[0].immediate, 0x10);
-    assert_eq!(
-        dispatcher.coverage()[0].support,
-        HorizonSvcSupport::Complete
-    );
 
+    assert_eq!(dispatcher.svc_calls(), 1);
     let teardown = process.teardown();
     assert_eq!(teardown.previous_lifecycle, ProcessLifecycle::Exited);
     assert!(teardown.threads_released > 0);
@@ -151,6 +146,7 @@ fn configured_sd_card_exposes_bounded_host_files_without_following_symlinks() {
     );
     let fsp = crate::IpcSession::new(IpcService::FileSystem);
     let IpcResponse::Object(filesystem) = crate::ipc::dispatch_session(
+        process.scheduler(),
         process.mounts(),
         &fsp,
         IpcRequest::OpenSdCardFileSystem,
@@ -399,6 +395,7 @@ fn launched_nro_overlay_does_not_require_a_host_sd_card_directory() {
     let process = ScheduledProcess::new(support::process_builder().build(&plan).unwrap());
     let fsp = crate::IpcSession::new(IpcService::FileSystem);
     let IpcResponse::Object(filesystem) = crate::ipc::dispatch_session(
+        process.scheduler(),
         process.mounts(),
         &fsp,
         IpcRequest::OpenSdCardFileSystem,
@@ -441,15 +438,17 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
     let mut process = ScheduledProcess::new(support::process_builder().build(&plan).unwrap());
     let mut dispatcher = support::dispatcher(&process);
 
+    let mut completed = std::collections::BTreeSet::new();
     loop {
         let report = process.run_slice().unwrap();
         match &report.stop {
-            ExecutionStop::SupervisorCall { .. } => {
+            ExecutionStop::SupervisorCall { immediate, .. } => {
                 let outcome = process
                     .route_supervisor_call(&report.stop, &mut dispatcher)
                     .unwrap();
                 match outcome {
                     ExceptionHandlingResult::Resumed => {
+                        completed.insert(*immediate);
                         if dispatcher.video_system().active_layer_count() > 0 {
                             break;
                         }
@@ -464,23 +463,10 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
         }
     }
 
-    let coverage = dispatcher.coverage();
-    for immediate in [0x01, 0x02, 0x03, 0x06, 0x13, 0x29] {
+    for immediate in [0x01, 0x02, 0x03, 0x06, 0x13, 0x29, 0x1f, 0x21] {
         assert!(
-            coverage.iter().any(|entry| {
-                entry.immediate == immediate && entry.support != HorizonSvcSupport::Unsupported
-            }),
-            "libnx did not exercise required SVC {immediate:#x}"
-        );
-    }
-    for immediate in [0x1f, 0x21] {
-        assert!(
-            coverage.iter().any(|entry| {
-                entry.immediate == immediate
-                    && entry.support != HorizonSvcSupport::Unsupported
-                    && entry.resumed > 0
-            }),
-            "missing supported successful SVC {immediate:#x}; coverage={coverage:?}"
+            completed.contains(&immediate),
+            "libnx did not complete required SVC {immediate:#x}"
         );
     }
 }

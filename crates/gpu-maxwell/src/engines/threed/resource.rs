@@ -551,7 +551,7 @@ fn resolve_binding(
     };
     match role {
         R::VertexStream(slot) => {
-            let stream = &state.vertex_input().streams()[slot as usize];
+            let stream = &state.vertex_input().streams(slot as usize);
             if stream.format().value().is_some_and(|f| f.enabled()) {
                 let address = stream
                     .address()
@@ -613,7 +613,7 @@ fn resolve_binding(
         }
         R::ConstantBuffer { group, slot } => {
             builder.constant_buffer(
-                bindings,
+                &bindings,
                 group,
                 slot,
                 match size {
@@ -667,11 +667,11 @@ fn resolve_binding(
                     .secondary
                     .and_then(|(slot, _, _)| texture_cbuf(texture, slot)),
             )?;
-            builder.sampler_pool(bindings)?;
+            builder.sampler_pool(&bindings)?;
             builder.sampler(bindings.sampler_binding().value().copied(), texture, handle)?;
         }
         R::ColorTarget(slot) => {
-            let target = &state.render_targets().color()[slot as usize];
+            let target = &state.render_targets().color(slot as usize);
             match target.readiness(true) {
                 MaxwellThreeDAttachmentReadiness::Unprogrammed
                 | MaxwellThreeDAttachmentReadiness::Disabled => (),
@@ -679,7 +679,7 @@ fn resolve_binding(
                 _ => return Err(MaxwellThreeDResourceError::IncompleteState { role }),
             }
         }
-        R::DepthStencilTarget => builder.depth_target(state.render_targets().depth_stencil())?,
+        R::DepthStencilTarget => builder.depth_target(&state.render_targets().depth_stencil())?,
         R::TextureHeaders | R::Samplers | R::BlitSource | R::BlitDestination => {
             return Err(MaxwellThreeDResourceError::IncompleteState { role });
         }
@@ -2071,14 +2071,14 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         let maximum = if bindings.sampler_binding().value()
             == Some(&MaxwellThreeDSamplerBindingMode::ViaTextureHeader)
         {
-            bindings.texture_headers().maximum_index().value()
+            bindings.texture_headers().maximum_index().value().copied()
         } else {
-            bindings.samplers().maximum_index().value()
+            bindings.samplers().maximum_index().value().copied()
         };
         self.descriptor_pool(
             MaxwellThreeDResourceRole::Samplers,
             bindings.samplers().address().map(|a| a.get()),
-            maximum.copied(),
+            maximum,
         )
     }
 
@@ -3965,7 +3965,7 @@ mod tests {
             let mut builder =
                 super::ResourceBuilder::new(space.memory(), None, &mut retained, &mut access);
             builder
-                .sampler_pool(channel.three_d().shader_bindings())
+                .sampler_pool(&channel.three_d().shader_bindings())
                 .unwrap();
             assert!(builder.resources.is_empty());
             let table = &builder.retained_backings.descriptor_tables

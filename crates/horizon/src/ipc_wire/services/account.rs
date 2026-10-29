@@ -190,7 +190,9 @@ async fn dispatch_account_root(
             }
             let mut users = [0; 128];
             users[..16].copy_from_slice(&session.user().id().encode());
-            write_bytes(process, GuestVirtualAddress::new(pointer.address), &users).await?;
+            process
+                .write(&process.receive_statics()[0], 0, &users)
+                .await?;
             account_response(session, request.token, HorizonIpcResult::SUCCESS)
         }
         // Account registration requires a system profile-creation UI. Nixe

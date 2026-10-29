@@ -9,25 +9,20 @@ use crate::audio_device::{ACTIVE_DEVICE, DEVICE_NAMES, OUTPUT_NAMES};
 
 const NAME_SIZE: usize = 0x100;
 
-fn output(hipc: &HipcRequest<'_>, auto: bool) -> Result<(u64, usize), IpcWireError> {
+fn output<'a>(
+    process: &'a Request,
+    hipc: &HipcRequest<'_>,
+    auto: bool,
+) -> Result<&'a Buffer, IpcWireError> {
     if auto {
-        return one_auto_select_output(hipc);
+        return one_auto_select_output(process, hipc);
     }
-    let [descriptor] = hipc.receive_buffers.as_slice() else {
+    let [_] = hipc.receive_buffers.as_slice() else {
         return Err(IpcWireError::Malformed(
             "audio device requires one output buffer",
         ));
     };
-    if descriptor.mode == BufferMode::Invalid {
-        return Err(IpcWireError::Malformed(
-            "audio device output mapping mode is invalid",
-        ));
-    }
-    Ok((
-        descriptor.address,
-        usize::try_from(descriptor.size)
-            .map_err(|_| IpcWireError::Malformed("audio device output size overflows"))?,
-    ))
+    Ok(&process.receive_buffers()[0])
 }
 
 pub(in crate::ipc_wire) async fn dispatch_audio_device(
@@ -69,21 +64,17 @@ pub(in crate::ipc_wire) async fn dispatch_audio_device(
         return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
     }
     if input {
-        let (address, size) = if auto {
-            one_auto_select_input(hipc)?
+        let buffer = if auto {
+            one_auto_select_input(process, hipc)?
         } else {
-            let descriptor = one_send_buffer(hipc)?;
-            (
-                descriptor.address,
-                usize::try_from(descriptor.size)
-                    .map_err(|_| IpcWireError::Malformed("audio device input size overflows"))?,
-            )
+            one_send_buffer(process, hipc)?
         };
+        let size = buffer.size as usize;
         if size < NAME_SIZE {
             return cmif_error(request.token, HorizonIpcResult::AUDIO_INSUFFICIENT_BUFFER);
         }
         let mut name = [0; NAME_SIZE];
-        read_bytes(process, GuestVirtualAddress::new(address), &mut name).await?;
+        process.read(buffer, 0, &mut name).await?;
         let Some(end) = name.iter().position(|&byte| byte == 0) else {
             return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_ARGUMENT);
         };
@@ -116,7 +107,8 @@ pub(in crate::ipc_wire) async fn dispatch_audio_device(
         );
     }
     if has_output {
-        let (address, size) = output(hipc, auto)?;
+        let buffer = output(process, hipc, auto)?;
+        let size = buffer.size as usize;
         let listing = matches!(command, 0 | 6 | 14);
         let names = if listing {
             if command == 14 {
@@ -137,12 +129,7 @@ pub(in crate::ipc_wire) async fn dispatch_audio_device(
             data[start..start + name.len()].copy_from_slice(name.as_bytes());
         }
         if count != 0 {
-            write_bytes(
-                process,
-                GuestVirtualAddress::new(address),
-                &data[..count * NAME_SIZE],
-            )
-            .await?;
+            process.write(buffer, 0, &data[..count * NAME_SIZE]).await?;
         }
         let count_bytes = (count as u32).to_le_bytes();
         return semantic_success(

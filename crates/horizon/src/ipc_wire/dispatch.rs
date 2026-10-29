@@ -4,10 +4,9 @@
 //! module validates the command buffer in the current thread's TLS and bridges
 //! decoded messages into the service manager and semantic service objects.
 
-use super::io::{read_bytes, write_response};
 use super::message::{
-    COMMAND_BUFFER_SIZE, CmifRequest, DomainRequest, HipcRequest, TIPC_COMMAND_CLOSE,
-    TIPC_COMMAND_REQUEST_BASE, TipcRequest,
+    CmifRequest, DomainRequest, HipcRequest, TIPC_COMMAND_CLOSE, TIPC_COMMAND_REQUEST_BASE,
+    TipcRequest,
 };
 use super::services;
 use super::services::content::{dispatch_plain_object, dispatch_service};
@@ -15,7 +14,6 @@ use super::services::fsp::object_name;
 use super::services::semantic_service_name;
 use super::{IpcWireError, UnsupportedServiceOperation};
 use crate::ipc_wire::request::Request;
-use nixe_memory::GuestVirtualAddress;
 
 use crate::object::{NetworkInterfaceObject, TimeObject};
 use crate::{
@@ -156,14 +154,8 @@ impl HorizonIpcObject {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "keep wire metadata, service environment and the owned service turn explicit"
-)]
 pub(crate) async fn send_sync_request_from_buffer(
     process: &mut Request,
-    address: GuestVirtualAddress,
-    size: usize,
     handle: u32,
     initial_operation_mode: OperationMode,
     time_environment: &TimeEnvironment,
@@ -174,22 +166,12 @@ pub(crate) async fn send_sync_request_from_buffer(
         "ipc_dispatch",
         host_systems.caller_thread_id,
         u64::from(handle),
-        size as u64,
+        process.command_size() as u64,
     );
     let Some(target) = process.target().downcast::<HorizonIpcObject>() else {
         return Ok(SyncRequestResult::InvalidHandle);
     };
-    if size < COMMAND_BUFFER_SIZE {
-        return Err(IpcWireError::Malformed(
-            "IPC message buffer is smaller than the TLS command buffer",
-        ));
-    }
-    let mut buffer = Vec::new();
-    buffer
-        .try_reserve_exact(size)
-        .map_err(|_| IpcWireError::HostResourceExhausted("allocating the IPC command buffer"))?;
-    buffer.resize(size, 0);
-    read_bytes(process, address, &mut buffer).await?;
+    let buffer = process.read_command().await?;
     let hipc = HipcRequest::decode(&buffer).map_err(|error| IpcWireError::Malformed(error.0))?;
     process.accept_descriptors(&hipc)?;
     // Eden locks the shared service handler while handling a request. Keep
@@ -245,7 +227,7 @@ pub(crate) async fn send_sync_request_from_buffer(
             time_environment,
             host_systems,
         )?;
-        write_response(process, address, size, &response).await?;
+        process.write_response(&response).await?;
         process.publish_handles()?;
         return Ok(SyncRequestResult::Success);
     }
@@ -303,7 +285,7 @@ pub(crate) async fn send_sync_request_from_buffer(
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/service.h#L195-L209
         return Ok(trace_completion(SyncRequestResult::Success));
     }
-    if super::control::dispatch_control(process, address, size, handle, &target, &request).await? {
+    if super::control::dispatch_control(process, handle, &target, &request).await? {
         process.publish_handles()?;
         return Ok(trace_completion(SyncRequestResult::Success));
     }
@@ -498,7 +480,7 @@ pub(crate) async fn send_sync_request_from_buffer(
             response.len(),
         );
     }
-    write_response(process, address, size, &response).await?;
+    process.write_response(&response).await?;
     process.publish_handles()?;
     let outcome = if applet_exit_requested {
         SyncRequestResult::AppletExitRequested
@@ -531,8 +513,11 @@ mod tests {
         };
 
         assert_eq!(
-            HorizonIpcObject::NvDrv(NvDrvSession::new(crate::test_memory::machine()))
-                .diagnostic_name(&request),
+            HorizonIpcObject::NvDrv(NvDrvSession::new(
+                crate::test_memory::machine(),
+                &crate::test_memory::kernel()
+            ))
+            .diagnostic_name(&request),
             "nvdrv"
         );
         assert_eq!(

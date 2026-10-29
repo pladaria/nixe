@@ -1,7 +1,6 @@
 //! Wire decoding for the `aoc:u` add-on-content service.
 
 use crate::ipc_wire::IpcWireError;
-use crate::ipc_wire::buffer::one_receive_buffer;
 use crate::ipc_wire::io::{has_ipc_descriptors_other_than_pid, request_u32, request_u64};
 use crate::ipc_wire::message::{CmifRequest, HipcRequest};
 use crate::{IpcRequest, MAX_IPC_LIST_ENTRIES};
@@ -77,7 +76,16 @@ pub(in crate::ipc_wire) fn decode_root_request(
                 .ok_or(IpcWireError::Malformed(
                     "aoc:u list request omits its entry count",
                 ))?;
-            let descriptor = one_receive_buffer(hipc)?;
+            let [descriptor] = hipc.receive_buffers.as_slice() else {
+                return Err(IpcWireError::Malformed(
+                    "aoc:u list requires one output buffer",
+                ));
+            };
+            if descriptor.size == 0 {
+                return Err(IpcWireError::Malformed(
+                    "aoc:u list output buffer is invalid",
+                ));
+            }
             let capacity = usize::try_from(descriptor.size / 4)
                 .map_err(|_| IpcWireError::Malformed("aoc:u output buffer is too large"))?;
             Ok(Some(IpcRequest::ListIndexedAddOnContent {

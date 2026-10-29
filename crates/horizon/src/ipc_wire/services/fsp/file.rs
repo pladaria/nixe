@@ -1,10 +1,9 @@
 //! `IFile` wire command decoding.
 
 use crate::ipc_wire::request::Request;
-use nixe_memory::GuestVirtualAddress;
 
 use crate::ipc_wire::buffer::{one_receive_buffer, one_send_buffer};
-use crate::ipc_wire::io::{read_bytes, request_u32, request_u64};
+use crate::ipc_wire::io::{request_u32, request_u64};
 use crate::ipc_wire::message::{CmifRequest, HipcRequest};
 use crate::ipc_wire::{IpcWireError, UnsupportedServiceOperation};
 use crate::{IpcRequest, MAX_IPC_READ_BYTES, SemanticIpcObject};
@@ -32,7 +31,7 @@ pub(super) async fn decode(
                 .ok_or(IpcWireError::Malformed(
                     "file read request size is out of range",
                 ))?;
-            let descriptor = one_receive_buffer(hipc)?;
+            let descriptor = one_receive_buffer(process, hipc)?;
             let capacity = usize::try_from(descriptor.size)
                 .map_err(|_| IpcWireError::Malformed("file output buffer is too large"))?;
             Ok(Some(IpcRequest::ReadFile {
@@ -68,7 +67,7 @@ pub(super) async fn decode(
             }
             let requested = usize::try_from(requested)
                 .map_err(|_| IpcWireError::Malformed("file write request size is out of range"))?;
-            let descriptor = one_send_buffer(hipc)?;
+            let descriptor = one_send_buffer(process, hipc)?;
             let capacity = usize::try_from(descriptor.size)
                 .map_err(|_| IpcWireError::Malformed("file input buffer is too large"))?;
             if requested > capacity {
@@ -77,12 +76,7 @@ pub(super) async fn decode(
                 ));
             }
             let mut data = vec![0; requested];
-            read_bytes(
-                process,
-                GuestVirtualAddress::new(descriptor.address),
-                &mut data,
-            )
-            .await?;
+            process.read(descriptor, 0, &mut data).await?;
             Ok(Some(IpcRequest::WriteFile {
                 offset,
                 data,

@@ -6,7 +6,8 @@ pub(super) fn validate(state: &MaxwellThreeDState) -> Result<(), MaxwellLowering
         == Some(&V::SampleMode(
             super::super::threed::MaxwellThreeDSampleMode::Samples2x2,
         ));
-    for (group, register) in state.coverage().sample_locations().iter().enumerate() {
+    for group in 0..4 {
+        let register = state.coverage().sample_locations(group);
         let Some(value) = register.value().copied() else {
             if four {
                 return Err(MaxwellLoweringError::IncompleteDraw(
@@ -41,7 +42,8 @@ pub(super) fn validate(state: &MaxwellThreeDState) -> Result<(), MaxwellLowering
     let control = state
         .fixed_function()
         .register(R::SampleMaskControl)
-        .value();
+        .value()
+        .copied();
     if matches!(control, Some(V::Mask(value)) if value & 0x10 != 0) {
         return Err(MaxwellLoweringError::UnsupportedMultisampleState(
             "color-target sample masking",

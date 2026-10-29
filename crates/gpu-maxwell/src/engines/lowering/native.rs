@@ -195,12 +195,13 @@ impl MaxwellNativeFrontend {
         }
         let mut source: GraphicsSourceKey = [None; crate::MAXWELL_PIPELINE_SHADER_COUNT];
         let mut requests = Vec::new();
-        for (index, pipeline) in state.shader_bindings().pipeline().iter().enumerate() {
+        for (index, source_slot) in source.iter_mut().enumerate() {
+            let pipeline = state.shader_bindings().pipeline(index);
             if pipeline.enabled().value() != Some(&true) {
                 continue;
             }
             let request = crate::recompiler::graphics_request(state, index).map_err(compilation)?;
-            source[index] = Some((
+            *source_slot = Some((
                 request.metadata.stage,
                 request.address,
                 pipeline.effective_group(),
@@ -492,7 +493,7 @@ impl MaxwellNativeFrontend {
             if selection.is_none() {
                 selection = Some(lowering(select_draw_attachments(state, &resources))?);
             }
-            let selection = selection.as_mut().unwrap();
+            let selection = selection.as_ref().unwrap();
             let (tessellation, raster) = lowering(validate_consumed_state(state, trigger))?;
             if state.shader_execution().stream_output_enable().value() == Some(&true) {
                 return Err(Error::Lowering(
@@ -500,17 +501,17 @@ impl MaxwellNativeFrontend {
                 ));
             }
             let raster = raster.unwrap();
-            selection.color_outputs =
-                lowering(color::draw_color_outputs(state, &resources, selection))?;
+            let color_outputs = lowering(color::draw_color_outputs(state, &resources, selection))?;
             lowering(validate_draw_iterated_blend_state(state, selection))?;
             lowering(validate_draw_logic_op_state(state, selection))?;
             let mut vertices = Vec::new();
             for stream in consumed_vertex_streams(state) {
-                let s = &state.vertex_input().streams()[stream as usize];
+                let s = &state.vertex_input().streams(stream as usize);
                 let format = s
                     .format()
                     .value()
                     .filter(|f| f.enabled())
+                    .copied()
                     .ok_or_else(|| compilation("consumed vertex stream is disabled"))?;
                 let instanced = s.instanced().value().copied().unwrap_or(false);
                 if instanced && s.frequency().value().copied().unwrap_or(1) != 1 {
@@ -521,11 +522,8 @@ impl MaxwellNativeFrontend {
                         },
                     ));
                 }
-                let attributes = state
-                    .vertex_input()
-                    .attributes()
-                    .iter()
-                    .enumerate()
+                let attributes = (0..32)
+                    .map(|location| (location, state.vertex_input().attributes(location)))
                     .filter_map(|(location, attr)| {
                         attr.value()
                             .filter(|a| {
@@ -649,11 +647,7 @@ impl MaxwellNativeFrontend {
                 scissor: lowering(draw_scissor(state, &resources, selection))?,
                 depth,
                 stencil: lowering(draw_stencil_test_state(state))?,
-                color_outputs: selection
-                    .colors
-                    .iter()
-                    .map(|(target, _)| selection.color_outputs[*target as usize])
-                    .collect(),
+                color_outputs,
                 blend_constants,
                 alpha_test: lowering(draw_alpha_test_state(state))?,
                 tessellation,
@@ -1067,7 +1061,8 @@ impl MaxwellFrontend for MaxwellNativeFrontend {
                     ));
                 }
                 let mut color = [0.; 4];
-                for (out, c) in color.iter_mut().zip(clear.color()) {
+                for (index, out) in color.iter_mut().enumerate() {
+                    let c = clear.color(index);
                     *out = f32::from_bits(
                         c.value()
                             .ok_or_else(|| compilation("missing clear color"))?
@@ -1552,6 +1547,7 @@ mod producer_tests {
         }
         let mut frontend = MaxwellNativeFrontend::new(Default::default());
         frontend.bind_channel(crate::MaxwellChannelId::new(1));
+        crate::engines::tests::program_three_d(&mut channel, 0x0d78, 3);
         frontend
             .ensure_code(
                 channel.three_d(),
@@ -1561,6 +1557,7 @@ mod producer_tests {
             .unwrap();
         let code = Arc::clone(&frontend.channel.code.as_ref().unwrap().code);
         frontend.bind_channel(crate::MaxwellChannelId::new(2));
+        crate::engines::tests::program_three_d(&mut channel, 0x0d78, 3);
         frontend
             .ensure_code(channel.three_d(), space.memory(), &mut |_, _| {
                 panic!("shared capture should be current")
@@ -1572,6 +1569,7 @@ mod producer_tests {
         ));
         frontend.close_channel(crate::MaxwellChannelId::new(2));
         frontend.bind_channel(crate::MaxwellChannelId::new(2));
+        crate::engines::tests::program_three_d(&mut channel, 0x0d78, 3);
         frontend
             .ensure_code(channel.three_d(), space.memory(), &mut |_, _| {
                 panic!("closing a channel must not evict shared code")
@@ -1583,6 +1581,7 @@ mod producer_tests {
         ));
         assert_eq!(frontend.statistics.shader_captures, 1);
         frontend.bind_channel(crate::MaxwellChannelId::new(1));
+        crate::engines::tests::program_three_d(&mut channel, 0x0d78, 3);
         frontend
             .ensure_code(channel.three_d(), space.memory(), &mut |_, _| {
                 panic!("switching back must preserve the channel's current code")
@@ -1619,6 +1618,7 @@ mod producer_tests {
         let interface = Arc::clone(&frontend.channel.code.as_ref().unwrap().interface);
         assert_eq!(first.stages.len(), 2);
         crate::engines::tests::program_three_d(&mut channel, 0x2044, 0x200);
+        crate::engines::tests::program_three_d(&mut channel, 0x0d78, 3);
         frontend
             .ensure_code(
                 channel.three_d(),
@@ -1631,6 +1631,7 @@ mod producer_tests {
             &frontend.channel.code.as_ref().unwrap().code
         ));
         crate::engines::tests::program_three_d(&mut channel, 0x2044, 0x100);
+        crate::engines::tests::program_three_d(&mut channel, 0x0d78, 3);
         frontend
             .ensure_code(
                 channel.three_d(),
@@ -1655,6 +1656,7 @@ mod producer_tests {
                 (address + 0x154, (word >> 32) as u32),
             ],
         );
+        crate::engines::tests::program_three_d(&mut channel, 0x0d78, 3);
         frontend
             .ensure_code(
                 channel.three_d(),

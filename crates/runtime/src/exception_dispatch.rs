@@ -5,16 +5,12 @@
 //! execution loop applies. Dispatch does not access native CPU internals.
 
 use crate::GuestCpuState;
-use crate::memory::ProcessMemory;
 use nixe_cpu::location::LocationDescriptor;
-use nixe_cpu::profile::ProcessCpuContext;
 use nixe_memory::GuestVirtualAddress;
 use nixe_scheduler::{GuestThreadId, VirtualCpuId};
 use std::sync::Arc;
 
-use crate::{
-    AddressWaitRegistry, HandleTable, ProcessMemoryLayout, ProcessMountNamespace, ThreadObject,
-};
+use crate::ThreadObject;
 
 /// Maximum number of guest bytes retained from a fatal break payload.
 pub const MAX_GUEST_BREAK_PAYLOAD_BYTES: usize = 32;
@@ -63,14 +59,6 @@ impl std::fmt::Debug for GuestBreakPayload {
 
 pub use nixe_cpu::execution::ExceptionDispatchRequest;
 
-pub(crate) struct ExceptionProcessResources<'a> {
-    pub scheduler: &'a std::sync::OnceLock<std::sync::Arc<nixe_scheduler::SchedulerState>>,
-    pub memory: &'a std::sync::Arc<ProcessMemory>,
-    pub mounts: &'a std::sync::Arc<ProcessMountNamespace>,
-    pub handles: &'a std::sync::Arc<HandleTable>,
-    pub address_waits: &'a std::sync::Arc<AddressWaitRegistry>,
-}
-
 /// Guest continuation selected after handling an exception.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExceptionResume {
@@ -78,8 +66,6 @@ pub enum ExceptionResume {
     ///
     /// For a supervisor call this advances by the four-byte A64 encoding width.
     Next,
-    /// Continue at an explicit guest location selected by runtime policy.
-    At(LocationDescriptor),
     /// Execute the faulting instruction again after the blocking condition has
     /// been resolved.
     Retry,
@@ -161,187 +147,12 @@ pub enum ExceptionHandlingResult<F> {
     Fault(F),
 }
 
-/// Process resources visible while runtime policy handles an exception.
-///
-/// This is a borrowed runtime view rather than a backend-owned object. It
-/// exposes guest-domain identities and service boundaries without leaking raw
-/// host pointers or coupling dispatch to native CPU internals.
-pub struct ExceptionProcessContext<'a> {
-    scheduler: &'a std::sync::OnceLock<std::sync::Arc<nixe_scheduler::SchedulerState>>,
-    process_id: u64,
-    initial_ideal_vcpu: VirtualCpuId,
-    cpu: ProcessCpuContext,
-    address_space_limit: u64,
-    memory_layout: ProcessMemoryLayout,
-    process_local_region: GuestVirtualAddress,
-    random_entropy: [u64; 4],
-    thread_policy: Option<crate::process::ThreadPolicy>,
-    memory: &'a std::sync::Arc<ProcessMemory>,
-    mounts: &'a std::sync::Arc<ProcessMountNamespace>,
-    handles: &'a std::sync::Arc<HandleTable>,
-    address_waits: &'a std::sync::Arc<AddressWaitRegistry>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct ExceptionProcessMetadata {
-    pub process_id: u64,
-    pub initial_ideal_vcpu: VirtualCpuId,
-    pub cpu: ProcessCpuContext,
-    pub address_space_limit: u64,
-    pub memory_layout: ProcessMemoryLayout,
-    pub process_local_region: GuestVirtualAddress,
-    pub random_entropy: [u64; 4],
-    pub thread_policy: Option<crate::process::ThreadPolicy>,
-}
-
-impl<'a> ExceptionProcessContext<'a> {
-    #[must_use]
-    pub fn allowed_core_mask(&self) -> Option<u64> {
-        self.thread_policy?.allowed_core_mask()
-    }
-
-    #[must_use]
-    pub fn allowed_priority_mask(&self) -> Option<u64> {
-        self.thread_policy?.allowed_priority_mask()
-    }
-
-    pub(crate) const fn new(
-        metadata: ExceptionProcessMetadata,
-        resources: ExceptionProcessResources<'a>,
-    ) -> Self {
-        Self {
-            scheduler: resources.scheduler,
-            process_id: metadata.process_id,
-            initial_ideal_vcpu: metadata.initial_ideal_vcpu,
-            cpu: metadata.cpu,
-            address_space_limit: metadata.address_space_limit,
-            memory_layout: metadata.memory_layout,
-            process_local_region: metadata.process_local_region,
-            random_entropy: metadata.random_entropy,
-            thread_policy: metadata.thread_policy,
-            memory: resources.memory,
-            mounts: resources.mounts,
-            handles: resources.handles,
-            address_waits: resources.address_waits,
-        }
-    }
-
-    /// Returns the runtime-owned guest process identity.
-    #[must_use]
-    pub const fn process_id(&self) -> u64 {
-        self.process_id
-    }
-
-    #[must_use]
-    pub const fn initial_ideal_vcpu(&self) -> VirtualCpuId {
-        self.initial_ideal_vcpu
-    }
-
-    /// Returns the first address outside the process user address space.
-    #[must_use]
-    pub const fn address_space_limit(&self) -> u64 {
-        self.address_space_limit
-    }
-
-    /// Returns the runtime-owned virtual regions reported by process-query APIs.
-    #[must_use]
-    pub const fn memory_layout(&self) -> ProcessMemoryLayout {
-        self.memory_layout
-    }
-
-    #[must_use]
-    pub const fn user_exception_context_address(&self) -> GuestVirtualAddress {
-        self.process_local_region
-    }
-
-    /// Returns one of the four immutable entropy words assigned at process creation.
-    #[must_use]
-    pub const fn random_entropy(&self, index: usize) -> Option<u64> {
-        if index < self.random_entropy.len() {
-            Some(self.random_entropy[index])
-        } else {
-            None
-        }
-    }
-
-    pub fn heap_size(&self) -> u64 {
-        self.memory.heap_size()
-    }
-    pub fn total_user_physical_memory_size(&self) -> u64 {
-        self.memory.accounting().total_user_physical_memory_size()
-    }
-    pub fn used_user_physical_memory_size(&self) -> u64 {
-        self.memory.accounting().used_user_physical_memory_size()
-    }
-    pub fn total_non_system_user_physical_memory_size(&self) -> u64 {
-        self.memory
-            .accounting()
-            .total_non_system_user_physical_memory_size()
-    }
-    pub fn used_non_system_user_physical_memory_size(&self) -> u64 {
-        self.memory
-            .accounting()
-            .used_non_system_user_physical_memory_size()
-    }
-    pub fn total_system_resource_size(&self) -> u64 {
-        self.memory.accounting().total_system_resource_size()
-    }
-    pub fn used_system_resource_size(&self) -> u64 {
-        self.memory.accounting().used_system_resource_size()
-    }
-
-    /// Returns the immutable CPU profile and address-space identity of the
-    /// current process.
-    #[must_use]
-    pub const fn cpu(&self) -> ProcessCpuContext {
-        self.cpu
-    }
-
-    /// Returns the current process's canonical execution memory.
-    #[must_use]
-    pub const fn memory(&self) -> &std::sync::Arc<ProcessMemory> {
-        self.memory
-    }
-
-    /// Returns the current process filesystem namespace.
-    #[must_use]
-    pub const fn mounts(&self) -> &std::sync::Arc<ProcessMountNamespace> {
-        self.mounts
-    }
-
-    /// Returns the current process handle table.
-    #[must_use]
-    pub const fn handles(&self) -> &std::sync::Arc<HandleTable> {
-        self.handles
-    }
-
-    #[must_use]
-    pub const fn address_waits(&self) -> &std::sync::Arc<AddressWaitRegistry> {
-        self.address_waits
-    }
-
-    /// The canonical scheduling owner shared with native cores and kernel waits.
-    pub fn scheduler(&self) -> &std::sync::Arc<nixe_scheduler::SchedulerState> {
-        self.scheduler
-            .get()
-            .expect("kernel dispatch requires a registered process")
-    }
-
-    /// Borrows the immutable mounts and internally synchronized handle table.
-    ///
-    /// Platform IPC adapters need both resources for an atomic service lookup
-    /// without making the generic runtime depend on a console protocol.
-    pub fn mounts_and_handles(&self) -> (&ProcessMountNamespace, &HandleTable) {
-        (self.mounts, self.handles)
-    }
-}
-
 /// Current guest thread visible while runtime policy handles an exception.
 pub struct ExceptionThreadContext<'a> {
     tls_base: GuestVirtualAddress,
     id: GuestThreadId,
     vcpu: VirtualCpuId,
-    object: Arc<ThreadObject>,
+    object: &'a Arc<ThreadObject>,
     state: &'a mut GuestCpuState,
 }
 
@@ -349,7 +160,7 @@ impl<'a> ExceptionThreadContext<'a> {
     pub(crate) const fn new(
         id: GuestThreadId,
         vcpu: VirtualCpuId,
-        object: Arc<ThreadObject>,
+        object: &'a Arc<ThreadObject>,
         state: &'a mut GuestCpuState,
         tls_base: GuestVirtualAddress,
     ) -> Self {
@@ -376,10 +187,12 @@ impl<'a> ExceptionThreadContext<'a> {
         self.tls_base
     }
 
-    /// Returns the runtime-owned identity of the current thread.
+    /// Borrows the current thread already retained by this dispatch. Operations
+    /// that outlive the call explicitly retain their own reference.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/svc/svc_synchronization.cpp#L66-L67
     #[must_use]
-    pub fn object(&self) -> Arc<ThreadObject> {
-        self.object.clone()
+    pub const fn object(&self) -> &'a Arc<ThreadObject> {
+        self.object
     }
 
     /// Reads current registers through the exclusive stopped-context owner.
@@ -397,14 +210,14 @@ impl<'a> ExceptionThreadContext<'a> {
 /// Complete current process/thread view supplied to runtime exception policy.
 pub struct ExceptionDispatchContext<'a> {
     source: LocationDescriptor,
-    process: ExceptionProcessContext<'a>,
+    process: &'a Arc<crate::RunnableProcess>,
     thread: ExceptionThreadContext<'a>,
 }
 
 impl<'a> ExceptionDispatchContext<'a> {
     pub(crate) const fn new(
         source: LocationDescriptor,
-        process: ExceptionProcessContext<'a>,
+        process: &'a Arc<crate::RunnableProcess>,
         thread: ExceptionThreadContext<'a>,
     ) -> Self {
         Self {
@@ -421,12 +234,8 @@ impl<'a> ExceptionDispatchContext<'a> {
     }
 
     #[must_use]
-    pub const fn process(&self) -> &ExceptionProcessContext<'a> {
-        &self.process
-    }
-
-    pub const fn process_mut(&mut self) -> &mut ExceptionProcessContext<'a> {
-        &mut self.process
+    pub const fn process(&self) -> &'a Arc<crate::RunnableProcess> {
+        self.process
     }
 
     #[must_use]
@@ -451,19 +260,6 @@ pub enum ExceptionRouteError {
         requested: LocationDescriptor,
         current: LocationDescriptor,
     },
-    CurrentThreadUnavailable {
-        handle: u32,
-    },
-    ContinuationProfileMismatch {
-        source: LocationDescriptor,
-        target: LocationDescriptor,
-    },
-    InvalidContinuationTarget {
-        target: LocationDescriptor,
-    },
-    ContinuationAddressOverflow {
-        source: LocationDescriptor,
-    },
 }
 
 impl std::fmt::Display for ExceptionRouteError {
@@ -482,24 +278,6 @@ impl std::fmt::Display for ExceptionRouteError {
             Self::SourceMismatch { requested, current } => write!(
                 formatter,
                 "exception source does not identify the current instruction: requested=[{requested}] current=[{current}]"
-            ),
-            Self::CurrentThreadUnavailable { handle } => write!(
-                formatter,
-                "current thread handle {handle:#x} is absent or has the wrong object type"
-            ),
-            Self::ContinuationProfileMismatch { source, target } => write!(
-                formatter,
-                "exception continuation changes the immutable CPU profile: source=[{source}] target=[{target}]"
-            ),
-            Self::InvalidContinuationTarget { target } => {
-                write!(
-                    formatter,
-                    "invalid exception continuation target [{target}]"
-                )
-            }
-            Self::ContinuationAddressOverflow { source } => write!(
-                formatter,
-                "exception continuation overflows the guest address after source [{source}]"
             ),
         }
     }
@@ -541,16 +319,6 @@ mod tests {
         assert_eq!(request.source(), source());
         assert_eq!(request.kind(), ExceptionKind::SupervisorCall);
         assert_eq!(request.syndrome(), Some(0x2a));
-    }
-
-    #[test]
-    fn suspended_dispatch_retains_retry_or_explicit_resume_intent() {
-        let retry: ExceptionDispatchOutcome<()> =
-            ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry);
-        let resume: ExceptionDispatchOutcome<()> =
-            ExceptionDispatchOutcome::Suspend(ExceptionResume::At(source()));
-
-        assert_ne!(retry, resume);
     }
 
     #[test]

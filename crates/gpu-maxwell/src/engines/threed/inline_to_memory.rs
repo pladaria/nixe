@@ -6,8 +6,6 @@
 //! the captured B197 meaning.
 //! <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L109-L186>
 
-use nixe_gpu::GpuMethodId;
-
 use super::{MaxwellThreeDRegister, MaxwellThreeDStateWrite};
 use crate::MaxwellMethodSource;
 use crate::engines::{
@@ -54,202 +52,105 @@ impl MaxwellThreeDInlineToMemoryLaunch {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PendingTransfer {
-    address: MaxwellInlineToMemoryAddress,
-    byte_length: u32,
-    next_offset: u32,
+pub(super) struct PendingTransfer {
+    pub(super) address: MaxwellInlineToMemoryAddress,
+    pub(super) byte_length: u32,
+    pub(super) next_offset: u32,
 }
 
 /// Persistent embedded upload setup and stream cursor.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDInlineToMemoryState {
-    line_length: MaxwellThreeDRegister<u32>,
-    line_count: MaxwellThreeDRegister<u32>,
-    address_upper: MaxwellThreeDRegister<u8>,
-    address_lower: MaxwellThreeDRegister<u32>,
-    pitch: MaxwellThreeDRegister<u32>,
-    block_size: MaxwellThreeDRegister<u32>,
-    width: MaxwellThreeDRegister<u32>,
-    height: MaxwellThreeDRegister<u32>,
-    depth: MaxwellThreeDRegister<u32>,
-    layer: MaxwellThreeDRegister<u32>,
-    origin_x: MaxwellThreeDRegister<u32>,
-    origin_y: MaxwellThreeDRegister<u32>,
-    launch: MaxwellThreeDRegister<MaxwellThreeDInlineToMemoryLaunch>,
-    last_data: MaxwellThreeDRegister<u32>,
-    pending: Option<PendingTransfer>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDInlineToMemoryState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
+    pub(super) pending: &'a Option<PendingTransfer>,
 }
-
-impl Default for MaxwellThreeDInlineToMemoryState {
-    fn default() -> Self {
-        // Public Maxwell implementations independently initialize the class
-        // register file to zero. These layout registers therefore have real
-        // zero reset values, unlike size/address fields which remain required
-        // here before a transfer can be consumed.
-        // <https://source.hodakov.me/hdkv/yuzu/src/commit/8a674958a730a36dbcc43910412521420a804c69/src/video_core/engines/maxwell_3d.cpp#L37-L42>
-        // <https://git.axenov.dev/Museum/ryujinx/src/commit/ec3e848d7998038ce22c41acdbf81032bf47991f/Ryujinx.Graphics.Device/DeviceState.cs#L16-L30>
-        Self {
-            line_length: Default::default(),
-            line_count: Default::default(),
-            address_upper: Default::default(),
-            address_lower: Default::default(),
-            pitch: MaxwellThreeDRegister::verified_reset(0, Some(0)),
-            block_size: MaxwellThreeDRegister::verified_reset(0, Some(0)),
-            width: MaxwellThreeDRegister::verified_reset(0, Some(0)),
-            height: MaxwellThreeDRegister::verified_reset(0, Some(0)),
-            depth: MaxwellThreeDRegister::verified_reset(0, Some(0)),
-            layer: MaxwellThreeDRegister::verified_reset(0, Some(0)),
-            origin_x: MaxwellThreeDRegister::verified_reset(0, Some(0)),
-            origin_y: MaxwellThreeDRegister::verified_reset(0, Some(0)),
-            launch: Default::default(),
-            last_data: Default::default(),
-            pending: None,
-        }
-    }
-}
-
-impl MaxwellThreeDInlineToMemoryState {
+impl MaxwellThreeDInlineToMemoryState<'_> {
     #[must_use]
-    pub const fn line_length(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.line_length
+    pub fn line_length(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(LINE_LENGTH_IN, Some)
     }
-
     #[must_use]
-    pub const fn line_count(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.line_count
+    pub fn line_count(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(LINE_COUNT, Some)
     }
-
     #[must_use]
-    pub const fn launch(&self) -> &MaxwellThreeDRegister<MaxwellThreeDInlineToMemoryLaunch> {
-        &self.launch
+    pub fn address_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers
+            .read(OFFSET_OUT_UPPER, |raw| u8::try_from(raw).ok())
     }
-
     #[must_use]
-    pub const fn last_data(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.last_data
+    pub fn address_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(OFFSET_OUT, Some)
     }
-
-    pub(super) fn apply(&mut self, write: MaxwellThreeDInlineToMemoryStateWrite) {
-        match write {
-            MaxwellThreeDInlineToMemoryStateWrite::LineLength { value, source: _ } => {
-                self.line_length = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDInlineToMemoryStateWrite::LineCount { value, source: _ } => {
-                self.line_count = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDInlineToMemoryStateWrite::AddressUpper { value, source: _ } => {
-                self.address_upper = MaxwellThreeDRegister::decoded(u32::from(value), value);
-            }
-            MaxwellThreeDInlineToMemoryStateWrite::AddressLower { value, source: _ } => {
-                self.address_lower = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDInlineToMemoryStateWrite::Pitch { value, source: _ } => {
-                self.pitch = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDInlineToMemoryStateWrite::BlockSize { value, source: _ } => {
-                self.block_size = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDInlineToMemoryStateWrite::Width { value, source: _ } => {
-                self.width = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDInlineToMemoryStateWrite::Height { value, source: _ } => {
-                self.height = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDInlineToMemoryStateWrite::Depth { value, source: _ } => {
-                self.depth = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDInlineToMemoryStateWrite::Layer { value, source: _ } => {
-                self.layer = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDInlineToMemoryStateWrite::OriginX { value, source: _ } => {
-                self.origin_x = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDInlineToMemoryStateWrite::OriginY { value, source: _ } => {
-                self.origin_y = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDInlineToMemoryStateWrite::Launch {
-                value,
-                address,
-                byte_length,
-                source,
-            } => {
-                self.launch = MaxwellThreeDRegister::decoded(source.argument(), value);
-                self.pending = (byte_length != 0).then_some(PendingTransfer {
-                    address,
-                    byte_length,
-                    next_offset: 0,
-                });
-            }
-            MaxwellThreeDInlineToMemoryStateWrite::Data {
-                value,
-                next_offset,
-                source: _,
-            } => {
-                self.last_data = MaxwellThreeDRegister::decoded(value, value);
-                self.pending = self.pending.and_then(|pending| {
-                    (next_offset != pending.byte_length).then_some(PendingTransfer {
-                        next_offset,
-                        ..pending
-                    })
-                });
-            }
-        }
+    #[must_use]
+    pub fn pitch(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(PITCH_OUT, Some)
+    }
+    #[must_use]
+    pub fn block_size(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers
+            .read(SET_DST_BLOCK_SIZE, |raw| (raw & !0xfff == 0).then_some(raw))
+    }
+    #[must_use]
+    pub fn width(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(SET_DST_WIDTH, Some)
+    }
+    #[must_use]
+    pub fn height(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(SET_DST_HEIGHT, Some)
+    }
+    #[must_use]
+    pub fn depth(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(SET_DST_DEPTH, Some)
+    }
+    #[must_use]
+    pub fn layer(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(SET_DST_LAYER, Some)
+    }
+    #[must_use]
+    pub fn origin_x(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(SET_DST_ORIGIN_BYTES_X, |raw| {
+            (raw <= 0xfffff).then_some(raw)
+        })
+    }
+    #[must_use]
+    pub fn origin_y(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(SET_DST_ORIGIN_SAMPLES_Y, |raw| {
+            (raw <= 0xffff).then_some(raw)
+        })
+    }
+    #[must_use]
+    pub fn last_data(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(LOAD_INLINE_DATA, Some)
+    }
+    #[must_use]
+    pub fn launch(&self) -> MaxwellThreeDRegister<MaxwellThreeDInlineToMemoryLaunch> {
+        self.registers.read(LAUNCH_DMA, |raw| {
+            (raw & !0x1051 == 0).then_some(MaxwellThreeDInlineToMemoryLaunch {
+                layout: if raw & 1 == 0 {
+                    MaxwellThreeDInlineToMemoryLayout::BlockLinear
+                } else {
+                    MaxwellThreeDInlineToMemoryLayout::Pitch
+                },
+                completion: if raw & 0x10 == 0 {
+                    MaxwellThreeDInlineToMemoryCompletion::FlushDisabled
+                } else {
+                    MaxwellThreeDInlineToMemoryCompletion::FlushOnly
+                },
+                system_memory_barrier_disabled: raw & 0x40 != 0,
+            })
+        })
+    }
+    pub(super) fn pending_words(&self) -> usize {
+        self.pending
+            .map_or(0, |p| (p.byte_length - p.next_offset).div_ceil(4) as usize)
     }
 }
 
 /// One checked transition in the embedded upload register family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDInlineToMemoryStateWrite {
-    LineLength {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    LineCount {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    AddressUpper {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    AddressLower {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    Pitch {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    BlockSize {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    Width {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    Height {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    Depth {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    Layer {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    OriginX {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    OriginY {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
     Launch {
-        value: MaxwellThreeDInlineToMemoryLaunch,
         address: MaxwellInlineToMemoryAddress,
         byte_length: u32,
         source: MaxwellMethodSource,
@@ -289,67 +190,11 @@ pub(super) fn preflight(
     source: MaxwellMethodSource,
     state: &MaxwellThreeDInlineToMemoryState,
 ) -> PreflightResult {
-    let raw = source.argument();
-    let write = match source.method().0 {
-        LINE_LENGTH_IN => MaxwellThreeDInlineToMemoryStateWrite::LineLength { value: raw, source },
-        LINE_COUNT => MaxwellThreeDInlineToMemoryStateWrite::LineCount { value: raw, source },
-        OFFSET_OUT_UPPER if raw <= 0xff => MaxwellThreeDInlineToMemoryStateWrite::AddressUpper {
-            value: raw as u8,
-            source,
-        },
-        OFFSET_OUT_UPPER => {
-            return Err(invalid(
-                source,
-                "OFFSET_OUT_UPPER",
-                "address upper exceeds its eight-bit field",
-            ));
-        }
-        OFFSET_OUT => MaxwellThreeDInlineToMemoryStateWrite::AddressLower { value: raw, source },
-        PITCH_OUT => MaxwellThreeDInlineToMemoryStateWrite::Pitch { value: raw, source },
-        SET_DST_BLOCK_SIZE if raw & !0x0000_0fff == 0 => {
-            MaxwellThreeDInlineToMemoryStateWrite::BlockSize { value: raw, source }
-        }
-        SET_DST_BLOCK_SIZE => {
-            return Err(invalid(
-                source,
-                "SET_DST_BLOCK_SIZE",
-                "block-size fields set undefined bits",
-            ));
-        }
-        SET_DST_WIDTH => MaxwellThreeDInlineToMemoryStateWrite::Width { value: raw, source },
-        SET_DST_HEIGHT => MaxwellThreeDInlineToMemoryStateWrite::Height { value: raw, source },
-        SET_DST_DEPTH => MaxwellThreeDInlineToMemoryStateWrite::Depth { value: raw, source },
-        SET_DST_LAYER => MaxwellThreeDInlineToMemoryStateWrite::Layer { value: raw, source },
-        SET_DST_ORIGIN_BYTES_X if raw <= 0x000f_ffff => {
-            MaxwellThreeDInlineToMemoryStateWrite::OriginX { value: raw, source }
-        }
-        SET_DST_ORIGIN_BYTES_X => {
-            return Err(invalid(
-                source,
-                "SET_DST_ORIGIN_BYTES_X",
-                "origin exceeds its twenty-bit field",
-            ));
-        }
-        SET_DST_ORIGIN_SAMPLES_Y if raw <= 0xffff => {
-            MaxwellThreeDInlineToMemoryStateWrite::OriginY { value: raw, source }
-        }
-        SET_DST_ORIGIN_SAMPLES_Y => {
-            return Err(invalid(
-                source,
-                "SET_DST_ORIGIN_SAMPLES_Y",
-                "origin exceeds its sixteen-bit field",
-            ));
-        }
-        LAUNCH_DMA => return preflight_launch(source, state),
-        LOAD_INLINE_DATA => return preflight_data(source, state),
-        _ => return Ok(None),
-    };
-    let name = method_name(source.method()).expect("recognized embedded inline method has a name");
-    Ok(Some((
-        MaxwellThreeDStateWrite::InlineToMemory(write),
-        name,
-        None,
-    )))
+    match source.method().0 {
+        LAUNCH_DMA => preflight_launch(source, state),
+        LOAD_INLINE_DATA => preflight_data(source, state),
+        _ => Ok(None),
+    }
 }
 
 fn preflight_launch(
@@ -376,11 +221,11 @@ fn preflight_launch(
         ));
     }
     let line_length = *state
-        .line_length
+        .line_length()
         .value()
         .ok_or_else(|| invalid(source, "LAUNCH_DMA", "launch requires LINE_LENGTH_IN"))?;
     let line_count = *state
-        .line_count
+        .line_count()
         .value()
         .ok_or_else(|| invalid(source, "LAUNCH_DMA", "launch requires LINE_COUNT"))?;
     if line_length != 0 && line_count > 1 {
@@ -392,11 +237,11 @@ fn preflight_launch(
     }
     let byte_length = line_length * line_count;
     let upper = *state
-        .address_upper
+        .address_upper()
         .value()
         .ok_or_else(|| invalid(source, "LAUNCH_DMA", "launch requires OFFSET_OUT_UPPER"))?;
     let lower = *state
-        .address_lower
+        .address_lower()
         .value()
         .ok_or_else(|| invalid(source, "LAUNCH_DMA", "launch requires OFFSET_OUT"))?;
     let address = MaxwellInlineToMemoryAddress::new(u32::from(upper), lower).ok_or_else(|| {
@@ -413,34 +258,21 @@ fn preflight_launch(
     {
         return Err(invalid(source, "LAUNCH_DMA", "destination range overflows"));
     }
-    let layout = if raw & 1 == 0 {
-        if byte_length != 0
-            && (line_length > 64
-                || state.block_size.value() != Some(&0)
-                || state.layer.value() != Some(&0)
-                || state.origin_x.value() != Some(&0)
-                || state.origin_y.value() != Some(&0))
-        {
-            return Err(invalid(
-                source,
-                "LAUNCH_DMA",
-                "only one contiguous row of the first block-linear GOB is implemented",
-            ));
-        }
-        MaxwellThreeDInlineToMemoryLayout::BlockLinear
-    } else {
-        MaxwellThreeDInlineToMemoryLayout::Pitch
-    };
+    if raw & 1 == 0
+        && byte_length != 0
+        && (line_length > 64
+            || state.block_size().value() != Some(&0)
+            || state.layer().value() != Some(&0)
+            || state.origin_x().value() != Some(&0)
+            || state.origin_y().value() != Some(&0))
+    {
+        return Err(invalid(
+            source,
+            "LAUNCH_DMA",
+            "only one contiguous row of the first block-linear GOB is implemented",
+        ));
+    }
     let write = MaxwellThreeDInlineToMemoryStateWrite::Launch {
-        value: MaxwellThreeDInlineToMemoryLaunch {
-            layout,
-            completion: if raw & 0x10 == 0 {
-                MaxwellThreeDInlineToMemoryCompletion::FlushDisabled
-            } else {
-                MaxwellThreeDInlineToMemoryCompletion::FlushOnly
-            },
-            system_memory_barrier_disabled: raw & 0x40 != 0,
-        },
         address,
         byte_length,
         source,
@@ -456,7 +288,7 @@ fn preflight_data(
     source: MaxwellMethodSource,
     state: &MaxwellThreeDInlineToMemoryState,
 ) -> PreflightResult {
-    let pending = state.pending.ok_or_else(|| {
+    let pending = (*state.pending).ok_or_else(|| {
         invalid(
             source,
             "LOAD_INLINE_DATA",
@@ -483,26 +315,6 @@ fn preflight_data(
     )))
 }
 
-fn method_name(method: GpuMethodId) -> Option<&'static str> {
-    Some(match method.0 {
-        LINE_LENGTH_IN => "LINE_LENGTH_IN",
-        LINE_COUNT => "LINE_COUNT",
-        OFFSET_OUT_UPPER => "OFFSET_OUT_UPPER",
-        OFFSET_OUT => "OFFSET_OUT",
-        PITCH_OUT => "PITCH_OUT",
-        SET_DST_BLOCK_SIZE => "SET_DST_BLOCK_SIZE",
-        SET_DST_WIDTH => "SET_DST_WIDTH",
-        SET_DST_HEIGHT => "SET_DST_HEIGHT",
-        SET_DST_DEPTH => "SET_DST_DEPTH",
-        SET_DST_LAYER => "SET_DST_LAYER",
-        SET_DST_ORIGIN_BYTES_X => "SET_DST_ORIGIN_BYTES_X",
-        SET_DST_ORIGIN_SAMPLES_Y => "SET_DST_ORIGIN_SAMPLES_Y",
-        LAUNCH_DMA => "LAUNCH_DMA",
-        LOAD_INLINE_DATA => "LOAD_INLINE_DATA",
-        _ => return None,
-    })
-}
-
 fn invalid(
     source: MaxwellMethodSource,
     method_name: &'static str,
@@ -512,14 +324,5 @@ fn invalid(
         source,
         method_name,
         reason,
-    }
-}
-
-impl MaxwellThreeDInlineToMemoryState {
-    pub(super) fn pending_words(&self) -> usize {
-        self.pending.map_or(0, |p| {
-            let remaining = p.byte_length - p.next_offset;
-            (remaining / 4 + u32::from(remaining % 4 != 0)) as usize
-        })
     }
 }

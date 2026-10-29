@@ -38,23 +38,22 @@ fn a_registered_affinity_pin_wait_survives_sleep_until_actual_unpin() {
         tls.checked_add(0x100).unwrap(),
         &0x0001_0002u32.to_le_bytes(),
     );
-    let registers = process.thread_mut(target).unwrap().state_mut();
+    let registers_thread = process.thread(target).unwrap();
+    let mut registers = registers_thread.registers();
     registers.write_x(x(0), 1_000_000_000);
     registers.write_x(x(2), gate.get());
-    state(&mut process).write_w(x(0), handle);
-    state(&mut process).write_x(x(1), 1);
-    state(&mut process).write_x(x(2), 2);
-    process
-        .coordinator_mut()
-        .start_thread(target.get())
-        .unwrap();
+    drop(registers);
+    process.main_thread().registers().write_w(x(0), handle);
+    process.main_thread().registers().write_x(x(1), 1);
+    process.main_thread().registers().write_x(x(2), 2);
+    process.thread(target).unwrap().start().unwrap();
     process
         .coordinator_mut()
         .scheduler()
         .pin_thread(VirtualCpuId::new(0), target)
         .unwrap();
     let mut dispatcher = fixed_time_dispatcher(&process)
-        .with_memory_completions(process.coordinator_mut().event_sender());
+        .with_input_completions(process.coordinator_mut().event_sender());
     let (thread, handling) = next_call(&mut process, &mut dispatcher);
     assert_eq!(thread, caller);
     assert!(matches!(handling, ExceptionHandlingResult::Suspended));
@@ -98,7 +97,7 @@ fn a_registered_affinity_pin_wait_survives_sleep_until_actual_unpin() {
             .is_none()
     );
     assert_eq!(read_abi_register(&process, 0), 0);
-    assert_eq!(process.main_thread().state().pc(), entry + 4);
+    assert_eq!(process.main_thread().registers().pc(), entry + 4);
     assert_eq!(read_guest_u32(&process, tls.checked_add(0x100).unwrap()), 0);
     process.coordinator_mut().shutdown().unwrap();
 }
@@ -135,7 +134,7 @@ fn a_suspended_final_property_owner_keeps_its_operation_pending_until_resumed() 
         let gate = process.main_thread().stack_bottom;
         let buffer = gate.checked_add(0x800).unwrap();
         let tls = process.main_thread().tls_base;
-        let handle = process.main_thread().handle;
+        let handle = process.main_thread_handle();
         let (first, _) = super::super::mutex::add_thread(&mut process, entry + 28, 30);
         let (second, second_handle) = super::super::mutex::add_thread(&mut process, entry + 36, 20);
         let (controller, _) = super::super::mutex::add_thread(&mut process, entry + 44, 10);
@@ -146,7 +145,7 @@ fn a_suspended_final_property_owner_keeps_its_operation_pending_until_resumed() 
             .profile()
             .core_set([core1])
             .unwrap();
-        let (writable, readable) = nixe_runtime::EventObject::create_pair();
+        let (writable, readable) = nixe_runtime::EventObject::create_pair(process.scheduler());
         let event = process.handles().insert(readable).unwrap();
         write_guest_bytes(&process, buffer, &event.to_le_bytes());
         write_guest_bytes(
@@ -164,13 +163,15 @@ fn a_suspended_final_property_owner_keeps_its_operation_pending_until_resumed() 
                 .scheduler()
                 .migrate(thread, IdealCore::Core(core1), affinity)
                 .unwrap();
-            let registers = process.thread_mut(thread).unwrap().state_mut();
+            let registers_thread = process.thread(thread).unwrap();
+            let mut registers = registers_thread.registers();
             registers.write_w(x(0), argument);
             registers.write_x(x(1), activity);
             registers.write_x(x(4), buffer.get());
             registers.write_x(x(5), buffer.get() + 4);
+            drop(registers);
         }
-        state(&mut process).write_x(x(2), gate.get());
+        process.main_thread().registers().write_x(x(2), gate.get());
         write_guest_bytes(
             &process,
             tls.checked_add(0x100).unwrap(),
@@ -182,12 +183,9 @@ fn a_suspended_final_property_owner_keeps_its_operation_pending_until_resumed() 
             .pin_thread(VirtualCpuId::new(0), target)
             .unwrap();
         let mut dispatcher = fixed_time_dispatcher(&process)
-            .with_memory_completions(process.coordinator_mut().event_sender());
+            .with_input_completions(process.coordinator_mut().event_sender());
         for (thread, blocks) in [(first, true), (second, true), (controller, false)] {
-            process
-                .coordinator_mut()
-                .start_thread(thread.get())
-                .unwrap();
+            process.thread(thread).unwrap().start().unwrap();
             let (caller, handling) = next_call(&mut process, &mut dispatcher);
             assert_eq!(caller, thread);
             assert_eq!(
@@ -232,14 +230,20 @@ fn a_suspended_final_property_owner_keeps_its_operation_pending_until_resumed() 
                 .unwrap();
         } else {
             writable.signal();
+            dispatcher
+                .poll_memory_completions(process.coordinator_mut())
+                .unwrap();
+            assert_eq!(
+                process.thread(controller).unwrap().registers().pc(),
+                entry + 64
+            );
             let (caller, handling) = next_call(&mut process, &mut dispatcher);
             assert_eq!(caller, controller);
             assert!(matches!(handling, ExceptionHandlingResult::Resumed));
-            assert_eq!(process.thread(controller).unwrap().state().pc(), entry + 64);
-            let (caller, handling) = next_call(&mut process, &mut dispatcher);
-            assert_eq!(caller, controller);
-            assert!(matches!(handling, ExceptionHandlingResult::Resumed));
-            assert_eq!(process.thread(controller).unwrap().state().read_x(x(0)), 0);
+            assert_eq!(
+                process.thread(controller).unwrap().registers().read_x(x(0)),
+                0
+            );
             dispatcher
                 .poll_memory_completions(process.coordinator_mut())
                 .unwrap();
@@ -248,8 +252,8 @@ fn a_suspended_final_property_owner_keeps_its_operation_pending_until_resumed() 
             assert!(!second_info.paused);
             assert!(second_info.active_wait.is_none());
             assert!(!scheduler.thread(target).unwrap().paused);
-            assert_eq!(process.thread(second).unwrap().state().read_x(x(0)), 0);
-            assert_eq!(process.thread(second).unwrap().state().pc(), entry + 40);
+            assert_eq!(process.thread(second).unwrap().registers().read_x(x(0)), 0);
+            assert_eq!(process.thread(second).unwrap().registers().pc(), entry + 40);
         }
         process.coordinator_mut().shutdown().unwrap();
     }

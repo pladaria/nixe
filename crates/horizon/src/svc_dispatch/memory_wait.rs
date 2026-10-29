@@ -1,4 +1,4 @@
-//! Memory-dependent SVCs leave an owned operation and resume after the SVC.
+//! Accepted kernel waits own their resources and cancel with the caller.
 use super::*;
 use std::{
     collections::VecDeque,
@@ -12,29 +12,64 @@ use std::{
 };
 
 #[derive(Debug, Default)]
-pub(super) struct MemoryCompletions(Mutex<VecDeque<(GuestThreadId, u64)>>);
-struct MemoryWake {
+pub(super) struct SvcCompletions(Mutex<VecDeque<(GuestThreadId, u64)>>);
+pub(super) struct SvcWait {
     thread: GuestThreadId,
     generation: u64,
     queued: AtomicBool,
-    inbox: Arc<MemoryCompletions>,
-    events: Option<nixe_runtime::ExternalEventSender>,
+    inbox: Arc<SvcCompletions>,
+    owner: Arc<nixe_runtime::RunnableProcess>,
+    caller: Arc<ThreadObject>,
+    process_generation: u64,
+    state: Mutex<WaitState>,
 }
-impl Wake for MemoryWake {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
+#[derive(Default)]
+struct WaitState {
+    operation: Option<MemoryOperation>,
+    wait: Option<Arc<nixe_scheduler::KernelWait>>,
+}
+impl std::fmt::Debug for SvcWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SvcWait")
+            .field("thread", &self.thread)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
     }
-    fn wake_by_ref(self: &Arc<Self>) {
+}
+impl nixe_runtime::ThreadWait for SvcWait {
+    fn cancel(&self) {
+        let cancelled = {
+            let mut state = self.state.lock().unwrap();
+            state.wait = None;
+            match &state.operation {
+                Some(operation) if operation.cancel() => None,
+                _ => state.operation.take(),
+            }
+        };
+        // Release request turns, pins and unpublished handles outside the wait lock.
+        drop(cancelled);
+        self.enqueue();
+    }
+}
+impl SvcWait {
+    fn enqueue(&self) {
         if !self.queued.swap(true, Ordering::AcqRel) {
             self.inbox
                 .0
                 .lock()
                 .unwrap()
                 .push_back((self.thread, self.generation));
-            if let Some(events) = &self.events {
-                events.notify_host_service(nixe_runtime::ExternalEventSource::Device);
-            }
+            self.owner.notify_kernel_completion();
         }
+    }
+}
+
+impl Wake for SvcWait {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.enqueue();
     }
 }
 type AccessContinuation = Box<
@@ -117,7 +152,7 @@ impl SvcCompletion {
     }
 }
 
-enum MemoryOperation {
+pub(super) enum MemoryOperation {
     Access {
         access: nixe_memory::PendingAccess,
         source: nixe_cpu::location::LocationDescriptor,
@@ -127,7 +162,7 @@ enum MemoryOperation {
     Owned {
         future: Pin<Box<dyn Future<Output = Result<SvcCompletion, HorizonSvcFault>> + Send>>,
         lifetime: Arc<crate::ipc_wire::operation::CallLifetime>,
-        deadline: Option<u64>,
+        wait: Option<Arc<nixe_scheduler::KernelWait>>,
     },
     Heap(nixe_runtime::memory::HeapResize),
     Write {
@@ -139,13 +174,15 @@ enum MemoryOperation {
 impl MemoryOperation {
     fn cancel(&self) -> bool {
         if let Self::Owned { lifetime, .. } = self {
-            lifetime.cancel();
-            lifetime.started()
+            lifetime.cancel()
         } else {
             false
         }
     }
-    fn poll(&mut self, wake: &Arc<MemoryWake>) -> Poll<Result<SvcCompletion, HorizonSvcFault>> {
+    fn poll(
+        &mut self,
+        wake: Option<&Arc<SvcWait>>,
+    ) -> Poll<Result<SvcCompletion, HorizonSvcFault>> {
         match self {
             Self::Access {
                 access,
@@ -164,13 +201,17 @@ impl MemoryOperation {
                 }))),
             },
             Self::Owned { future, .. } => {
-                let waker = Waker::from(Arc::clone(wake));
-                future.as_mut().poll(&mut Context::from_waker(&waker))
+                let waker = wake.map(|wake| Waker::from(Arc::clone(wake)));
+                future.as_mut().poll(&mut Context::from_waker(
+                    waker.as_ref().unwrap_or(Waker::noop()),
+                ))
             }
             Self::Heap(heap) => {
-                let waker = Waker::from(Arc::clone(wake));
+                let waker = wake.map(|wake| Waker::from(Arc::clone(wake)));
                 Pin::new(heap)
-                    .poll(&mut Context::from_waker(&waker))
+                    .poll(&mut Context::from_waker(
+                        waker.as_ref().unwrap_or(Waker::noop()),
+                    ))
                     .map(|result| {
                         result
                             .map(|base| SvcCompletion::success(Some(base.get())))
@@ -202,22 +243,6 @@ impl MemoryOperation {
         }
     }
 }
-pub(super) struct PendingMemory {
-    process: ProcessId,
-    generation: u64,
-    wake: Arc<MemoryWake>,
-    token: Option<nixe_scheduler::WakeToken>,
-    operation: MemoryOperation,
-}
-impl std::fmt::Debug for PendingMemory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingMemory")
-            .field("process", &self.process)
-            .field("generation", &self.generation)
-            .field("token", &self.token)
-            .finish_non_exhaustive()
-    }
-}
 impl HorizonSvcDispatcher {
     pub(super) fn read_svc_input(
         &mut self,
@@ -242,41 +267,6 @@ impl HorizonSvcDispatcher {
         {
             Ok(nixe_memory::Access::Ready(())) => {
                 continuation(self, context, output.into_boxed_slice())
-            }
-            Err(fault) => reject(
-                context,
-                HorizonSvcFault::MemoryAccess {
-                    immediate,
-                    fault: Arc::new(fault),
-                },
-            ),
-            Ok(nixe_memory::Access::Pending(access)) => {
-                self.defer_svc_read(context, immediate, access, continuation)
-            }
-        }
-    }
-
-    pub(super) fn read_svc_capture(
-        &mut self,
-        context: &mut ExceptionDispatchContext<'_>,
-        immediate: u32,
-        ranges: Vec<nixe_memory::AllocationRange>,
-        continuation: impl FnOnce(
-            &mut HorizonSvcDispatcher,
-            &mut ExceptionDispatchContext<'_>,
-            Box<[u8]>,
-        ) -> ExceptionDispatchOutcome<HorizonSvcFault>
-        + Send
-        + 'static,
-    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let count = ranges.iter().map(|range| range.bytes() as usize).sum();
-        let mut bytes = vec![0; count];
-        let machine = context.process().memory().account().machine();
-        match nixe_memory::CapturedMemory::new(ranges)
-            .and_then(|ranges| machine.read_captured_into(&ranges, 0, &mut bytes))
-        {
-            Ok(nixe_memory::Access::Ready(())) => {
-                continuation(self, context, bytes.into_boxed_slice())
             }
             Err(fault) => reject(
                 context,
@@ -331,19 +321,13 @@ impl HorizonSvcDispatcher {
         + Send
         + 'static,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let mut access = match access {
+        let access = match access {
             Ok(nixe_memory::Access::Ready(result)) => {
                 return continuation(self, context, Ok(result));
             }
             Err(error) => return continuation(self, context, Err(Arc::new(error))),
             Ok(nixe_memory::Access::Pending(access)) => access,
         };
-        let wake = match self.memory_wake(context.thread().id()) {
-            Ok(wake) => wake,
-            Err(fault) => return ExceptionDispatchOutcome::Fault(fault),
-        };
-        let notified = wake.clone();
-        access.set_waker(Arc::new(move || notified.wake_by_ref()));
         let source = context.source();
         let vcpu = context.thread().vcpu();
         self.start_memory_operation(
@@ -354,35 +338,65 @@ impl HorizonSvcDispatcher {
                 vcpu,
                 continuation: Some(Box::new(continuation)),
             },
-            wake,
         )
+    }
+
+    pub(super) fn finish_wait_start(
+        &mut self,
+        context: &mut ExceptionDispatchContext<'_>,
+        start: Result<nixe_scheduler::WaitStart, nixe_scheduler::SchedulerError>,
+        continuation: impl FnOnce(
+            &mut HorizonSvcDispatcher,
+            &mut ExceptionDispatchContext<'_>,
+            nixe_scheduler::WaitOutcome,
+        ) -> ExceptionDispatchOutcome<HorizonSvcFault>
+        + Send
+        + 'static,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        let wait = match start {
+            Ok(nixe_scheduler::WaitStart::Ready(outcome)) => {
+                return continuation(self, context, outcome);
+            }
+            Ok(nixe_scheduler::WaitStart::Pending(wait)) => wait,
+            Err(fault) => {
+                return ExceptionDispatchOutcome::Fault(HorizonSvcFault::Scheduling {
+                    operation: "kernel object wait",
+                    fault,
+                });
+            }
+        };
+        let source = context.source();
+        let vcpu = context.thread().vcpu();
+        let owned = wait.clone();
+        self.start_owned_svc(context, Arc::default(), Some(wait), async move {
+            let outcome = owned.wait().await;
+            Ok(SvcCompletion::kernel(
+                source,
+                vcpu,
+                move |dispatcher, context| continuation(dispatcher, context, outcome),
+            ))
+        })
     }
 
     pub(super) fn start_owned_svc(
         &mut self,
         context: &mut ExceptionDispatchContext<'_>,
         lifetime: Arc<crate::ipc_wire::operation::CallLifetime>,
-        deadline: Option<u64>,
+        wait: Option<Arc<nixe_scheduler::KernelWait>>,
         operation: impl Future<Output = Result<SvcCompletion, HorizonSvcFault>> + Send + 'static,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let wake = match self.memory_wake(context.thread().id()) {
-            Ok(wake) => wake,
-            Err(fault) => return ExceptionDispatchOutcome::Fault(fault),
-        };
         self.start_memory_operation(
             context,
             MemoryOperation::Owned {
                 future: Box::pin(operation),
                 lifetime,
-                deadline,
+                wait,
             },
-            wake,
         )
     }
     #[must_use]
-    pub fn with_memory_completions(mut self, events: nixe_runtime::ExternalEventSender) -> Self {
-        self.hid_system.set_completion_events(events.clone());
-        self.memory_events = Some(events);
+    pub fn with_input_completions(self, events: nixe_runtime::ExternalEventSender) -> Self {
+        self.hid_system.set_completion_events(events);
         self
     }
     pub(super) fn set_heap_size(
@@ -397,136 +411,112 @@ impl HorizonSvcDispatcher {
             result(context, HorizonKernelResult::INVALID_SIZE);
             return resume();
         }
-        let wake = match self.memory_wake(context.thread().id()) {
-            Ok(wake) => wake,
-            Err(fault) => return ExceptionDispatchOutcome::Fault(fault),
-        };
         let operation = MemoryOperation::Heap(context.process().memory().resize_heap(bytes));
-        self.start_memory_operation(context, operation, wake)
+        self.start_memory_operation(context, operation)
     }
-    fn memory_wake(&mut self, thread: GuestThreadId) -> Result<Arc<MemoryWake>, HorizonSvcFault> {
-        if self.memory_waits.contains_key(&thread) {
+    fn new_svc_wait(
+        &mut self,
+        owner: Arc<nixe_runtime::RunnableProcess>,
+        caller: Arc<ThreadObject>,
+        process_generation: u64,
+    ) -> Result<Arc<SvcWait>, HorizonSvcFault> {
+        let thread = caller.id();
+        if self.svc_waits.contains_key(&thread) {
             return Err(runtime_fault("duplicate memory continuation"));
         }
         self.next_memory_generation = self
             .next_memory_generation
             .checked_add(1)
             .ok_or_else(|| runtime_fault("memory continuation identity exhausted"))?;
-        Ok(Arc::new(MemoryWake {
+        Ok(Arc::new(SvcWait {
             thread,
             generation: self.next_memory_generation,
             queued: AtomicBool::new(false),
             inbox: Arc::clone(&self.memory_completions),
-            events: self.memory_events.clone(),
+            process_generation,
+            owner,
+            caller,
+            state: Mutex::default(),
         }))
     }
     fn start_memory_operation(
         &mut self,
         context: &mut ExceptionDispatchContext<'_>,
         mut operation: MemoryOperation,
-        wake: Arc<MemoryWake>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        match operation.poll(&wake) {
-            Poll::Ready(Ok(SvcCompletion::Kernel(read))) => read.resume(self, context),
-            Poll::Ready(Ok(SvcCompletion::ExitProcess { .. })) => {
-                terminate(ExceptionTerminationScope::Process)
+        // Preserve the admission generation even if the first poll races exit.
+        let process_generation = context.process().generation();
+        // Ordinary operations finish on the caller before acquiring wait state.
+        // Device accesses already returned Pending and install their observer below.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/svc/svc_physical_memory.cpp#L14-L30
+        if matches!(
+            operation,
+            MemoryOperation::Owned { .. } | MemoryOperation::Heap(_)
+        ) && let Poll::Ready(completed) = operation.poll(None)
+        {
+            if let MemoryOperation::Owned {
+                wait: Some(wait), ..
+            } = &operation
+                && let Err(fault) = context.process().scheduler().continue_wait(wait.token())
+            {
+                return ExceptionDispatchOutcome::Fault(HorizonSvcFault::Scheduling {
+                    operation: "inline wait completion",
+                    fault,
+                });
             }
-            Poll::Ready(Ok(SvcCompletion::Return { code, output1 })) => {
+            return self.finish_memory_operation(context, completed);
+        }
+        let wake = match self.new_svc_wait(
+            context.process().clone(),
+            context.thread().object().clone(),
+            process_generation,
+        ) {
+            Ok(wake) => wake,
+            Err(fault) => return ExceptionDispatchOutcome::Fault(fault),
+        };
+        if let MemoryOperation::Access { access, .. } | MemoryOperation::Write { access, .. } =
+            &mut operation
+        {
+            let notified = wake.clone();
+            access.set_waker(Arc::new(move || notified.wake_by_ref()));
+        }
+        match operation.poll(Some(&wake)) {
+            Poll::Ready(completed) => {
+                if let MemoryOperation::Owned {
+                    wait: Some(wait), ..
+                } = &operation
+                    && let Err(fault) = context.process().scheduler().continue_wait(wait.token())
+                {
+                    return ExceptionDispatchOutcome::Fault(HorizonSvcFault::Scheduling {
+                        operation: "inline wait completion",
+                        fault,
+                    });
+                }
+                self.finish_memory_operation(context, completed)
+            }
+            Poll::Pending => {
+                wake.state.lock().unwrap().operation = Some(operation);
+                self.install_svc_wait(wake);
+                ExceptionDispatchOutcome::Suspend(ExceptionResume::Next)
+            }
+        }
+    }
+    fn finish_memory_operation(
+        &mut self,
+        context: &mut ExceptionDispatchContext<'_>,
+        completed: Result<SvcCompletion, HorizonSvcFault>,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        match completed {
+            Ok(SvcCompletion::Kernel(read)) => read.resume(self, context),
+            Ok(SvcCompletion::ExitProcess { .. }) => terminate(ExceptionTerminationScope::Process),
+            Ok(SvcCompletion::Return { code, output1 }) => {
                 result(context, code);
                 if let Some(value) = output1 {
                     write_register(context.thread_mut().state_mut(), 1, value);
                 }
                 resume()
             }
-            Poll::Ready(Err(fault)) => reject(context, fault),
-            Poll::Pending => {
-                if self.memory_events.is_none() {
-                    return ExceptionDispatchOutcome::Fault(runtime_fault(
-                        "memory completion ingress is not installed",
-                    ));
-                }
-                self.memory_waits.insert(
-                    context.thread().id(),
-                    PendingMemory {
-                        process: ProcessId::new(context.process().process_id()),
-                        generation: wake.generation,
-                        wake,
-                        token: None,
-                        operation,
-                    },
-                );
-                ExceptionDispatchOutcome::Suspend(ExceptionResume::Next)
-            }
-        }
-    }
-    pub(super) fn write_runtime_output(
-        &mut self,
-        coordinator: &mut nixe_runtime::RuntimeCoordinator,
-        process: ProcessId,
-        thread: GuestThreadId,
-        immediate: u32,
-        ranges: Vec<nixe_memory::AllocationRange>,
-        bytes: &[u8],
-    ) -> Result<(), HorizonSvcFault> {
-        let machine = coordinator
-            .process(process)
-            .ok_or_else(|| runtime_fault("kernel output process"))?
-            .memory()
-            .account()
-            .machine()
-            .clone();
-        match nixe_memory::CapturedMemory::new(ranges)
-            .and_then(|ranges| machine.write_captured(&ranges, 0, bytes))
-        {
-            Ok(nixe_memory::Access::Ready(())) => finish_pending_caller(
-                coordinator,
-                process,
-                thread,
-                "kernel memory output",
-                HorizonKernelResult::SUCCESS,
-                |_| {},
-            ),
-            Err(fault) => {
-                let fault = HorizonSvcFault::MemoryAccess {
-                    immediate,
-                    fault: Arc::new(fault),
-                };
-                if let Some(code) = fault.guest_result() {
-                    finish_pending_caller(
-                        coordinator,
-                        process,
-                        thread,
-                        "kernel memory output",
-                        code,
-                        |_| {},
-                    )
-                } else {
-                    Err(fault)
-                }
-            }
-            Ok(nixe_memory::Access::Pending(mut access)) => {
-                let wake = self.memory_wake(thread)?;
-                let notified = wake.clone();
-                access.set_waker(Arc::new(move || notified.wake_by_ref()));
-                let token = coordinator
-                    .register_wait(thread)
-                    .map_err(|_| runtime_fault("kernel output wait registration"))?;
-                self.memory_waits.insert(
-                    thread,
-                    PendingMemory {
-                        process,
-                        generation: wake.generation,
-                        wake,
-                        token: Some(token),
-                        operation: MemoryOperation::Write {
-                            access,
-                            immediate,
-                            output1: None,
-                        },
-                    },
-                );
-                Ok(())
-            }
+            Err(fault) => reject(context, fault),
         }
     }
     pub(super) fn write_svc_output(
@@ -538,13 +528,7 @@ impl HorizonSvcDispatcher {
         output1: Option<u64>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         match context.process().memory().space().write(address, bytes) {
-            Ok(nixe_memory::Access::Ready(())) => {
-                result(context, HorizonKernelResult::SUCCESS);
-                if let Some(value) = output1 {
-                    write_register(context.thread_mut().state_mut(), 1, value);
-                }
-                resume()
-            }
+            Ok(access) => self.finish_svc_write(context, immediate, access, output1),
             Err(fault) => reject(
                 context,
                 HorizonSvcFault::MemoryAccess {
@@ -552,23 +536,31 @@ impl HorizonSvcDispatcher {
                     fault: Arc::new(fault),
                 },
             ),
-            Ok(nixe_memory::Access::Pending(mut access)) => {
-                let wake = match self.memory_wake(context.thread().id()) {
-                    Ok(wake) => wake,
-                    Err(fault) => return ExceptionDispatchOutcome::Fault(fault),
-                };
-                let notified = Arc::clone(&wake);
-                access.set_waker(Arc::new(move || notified.wake_by_ref()));
-                self.start_memory_operation(
-                    context,
-                    MemoryOperation::Write {
-                        access,
-                        immediate,
-                        output1,
-                    },
-                    wake,
-                )
+        }
+    }
+    pub(super) fn finish_svc_write(
+        &mut self,
+        context: &mut ExceptionDispatchContext<'_>,
+        immediate: u32,
+        access: nixe_memory::Access<()>,
+        output1: Option<u64>,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        match access {
+            nixe_memory::Access::Ready(()) => {
+                result(context, HorizonKernelResult::SUCCESS);
+                if let Some(value) = output1 {
+                    write_register(context.thread_mut().state_mut(), 1, value);
+                }
+                resume()
             }
+            nixe_memory::Access::Pending(access) => self.start_memory_operation(
+                context,
+                MemoryOperation::Write {
+                    access,
+                    immediate,
+                    output1,
+                },
+            ),
         }
     }
     pub(super) fn query_memory(
@@ -627,39 +619,35 @@ impl HorizonSvcDispatcher {
         bytes[24..28].copy_from_slice(&permissions.to_le_bytes());
         self.write_svc_output(context, immediate, output, &bytes, Some(0))
     }
-    pub(super) fn cancel_memory_wait(&mut self, thread: GuestThreadId) {
-        if let Some(mut pending) = self.memory_waits.remove(&thread)
-            && pending.operation.cancel()
-        {
-            pending.token = None;
-            pending.wake.wake_by_ref();
-            self.memory_waits.insert(thread, pending);
-        }
+    fn install_svc_wait(&mut self, wait: Arc<SvcWait>) {
+        let kernel: Arc<dyn nixe_runtime::ThreadWait> = wait.clone();
+        wait.caller.set_wait(Arc::downgrade(&kernel));
+        assert!(self.svc_waits.insert(wait.thread, wait).is_none());
     }
+
     pub(super) fn register_memory_wait(
         &mut self,
         coordinator: &mut nixe_runtime::RuntimeCoordinator,
         thread: GuestThreadId,
     ) -> Result<bool, nixe_runtime::CoordinatorError> {
-        let Some(pending) = self.memory_waits.get_mut(&thread) else {
+        let Some(wait) = self.svc_waits.get(&thread) else {
             return Ok(false);
         };
-        pending.token = if let MemoryOperation::Owned {
-            deadline: Some(deadline),
-            ..
-        } = &pending.operation
-        {
-            Some(coordinator.register_timed_wait(
-                thread,
-                Some(deadline.saturating_sub(coordinator.virtual_time_ns())),
-            )?)
-        } else {
-            Some(coordinator.register_wait(thread)?)
+        let mut state = wait.state.lock().unwrap();
+        let Some(operation) = &state.operation else {
+            return Ok(false);
         };
+        let wait = if let MemoryOperation::Owned {
+            wait: Some(wait), ..
+        } = operation
+        {
+            wait.clone()
+        } else {
+            coordinator.scheduler().register_wait(thread)?
+        };
+        wait.commit();
+        state.wait = Some(wait);
         Ok(true)
-    }
-    pub fn next_service_deadline(&self) -> Option<Duration> {
-        self.service_scheduling.next_deadline()
     }
 
     /// Called by the execution owner after ingress and before dispatching guest
@@ -668,36 +656,55 @@ impl HorizonSvcDispatcher {
         &mut self,
         coordinator: &mut nixe_runtime::RuntimeCoordinator,
     ) -> Result<(), HorizonSvcFault> {
-        self.service_scheduling.poll_deadlines();
         let ready = std::mem::take(&mut *self.memory_completions.0.lock().unwrap());
         for (thread, generation) in ready {
-            let Some(mut pending) = self.memory_waits.remove(&thread) else {
+            let Some(pending) = self.svc_waits.remove(&thread) else {
                 continue;
             };
             if pending.generation != generation {
-                self.memory_waits.insert(thread, pending);
+                self.svc_waits.insert(thread, pending);
                 continue;
             }
-            let current = pending.token.is_some_and(|token| {
-                coordinator
-                    .thread_scheduling_info(thread.get())
-                    .is_ok_and(|view| {
-                        view.process == pending.process
+            pending.queued.store(false, Ordering::Release);
+            let mut state = pending.state.lock().unwrap();
+            let current = pending.process_generation == pending.owner.generation()
+                && state.wait.as_ref().is_some_and(|wait| {
+                    let token = wait.token();
+                    coordinator.scheduler().thread(thread).is_some_and(|view| {
+                        view.process.get() == pending.owner.process_id()
                             && view.active_wait == Some(token)
                             && view.lifecycle == nixe_scheduler::ThreadLifecycle::Waiting
                     })
-            });
-            if !current && !pending.operation.cancel() {
-                continue;
-            }
-            pending.wake.queued.store(false, Ordering::Release);
-            let completed = match pending.operation.poll(&pending.wake) {
+                });
+            let completed = match state.operation.as_mut() {
+                None => {
+                    drop(state);
+                    continue;
+                }
+                Some(operation) => {
+                    if !current && !operation.cancel() {
+                        let cancelled = state.operation.take();
+                        drop(state);
+                        pending.caller.clear_wait();
+                        drop(cancelled);
+                        continue;
+                    }
+                    operation.poll(Some(&pending))
+                }
+            };
+            let completed = match completed {
                 Poll::Pending => {
-                    self.memory_waits.insert(thread, pending);
+                    drop(state);
+                    self.svc_waits.insert(thread, pending);
                     continue;
                 }
                 Poll::Ready(result) => result,
             };
+            let operation = state.operation.take();
+            let token = state.wait.as_ref().map(|wait| wait.token());
+            drop(state);
+            pending.caller.clear_wait();
+            drop(operation);
             if !current {
                 if let Err(fault) = completed
                     && fault.guest_result().is_none()
@@ -706,11 +713,9 @@ impl HorizonSvcDispatcher {
                 }
                 continue;
             }
-            let token = pending
-                .token
-                .expect("current memory continuation has its wait token");
+            let token = token.expect("current SVC has its wait token");
+            let process = ProcessId::new(pending.owner.process_id());
             if let Ok(SvcCompletion::Kernel(read)) = completed {
-                self.synchronize_virtual_time(coordinator.virtual_time_ns());
                 let handling = coordinator
                     .resume_supervisor_call(token, read.vcpu, read.source, |context| {
                         read.resume(self, context)
@@ -718,7 +723,7 @@ impl HorizonSvcDispatcher {
                     .map_err(|_| runtime_fault("kernel access continuation"))?
                     .ok_or_else(|| runtime_fault("kernel access continuation generation"))?;
                 let handling = self
-                    .finish_scheduled_call(coordinator, pending.process, thread, handling)
+                    .finish_scheduled_call(coordinator, process, thread, handling)
                     .map_err(|_| runtime_fault("kernel access continuation scheduling"))?;
                 if let nixe_runtime::ExceptionHandlingResult::Fault(fault) = handling {
                     return Err(fault);
@@ -737,7 +742,7 @@ impl HorizonSvcDispatcher {
                         })
                         .map_err(|_| runtime_fault("IPC process exit"))?
                         .ok_or_else(|| runtime_fault("IPC process exit generation"))?;
-                    self.finish_scheduled_call(coordinator, pending.process, thread, handling)
+                    self.finish_scheduled_call(coordinator, process, thread, handling)
                         .map_err(|_| runtime_fault("IPC process exit cleanup"))?;
                     continue;
                 }
@@ -748,14 +753,12 @@ impl HorizonSvcDispatcher {
                     (code, None)
                 }
             };
-            let state = coordinator
-                .process_mut(pending.process)
-                .and_then(|process| process.thread_mut(thread))
-                .map(nixe_runtime::GuestThread::state_mut)
-                .ok_or_else(|| runtime_fault("memory continuation caller"))?;
-            write_register(state, 0, u64::from(code.raw()));
-            if let Some(value) = output1 {
-                write_register(state, 1, value);
+            {
+                let mut state = pending.caller.registers();
+                write_register(&mut state, 0, u64::from(code.raw()));
+                if let Some(value) = output1 {
+                    write_register(&mut state, 1, value);
+                }
             }
             if !coordinator
                 .complete_wait(token)

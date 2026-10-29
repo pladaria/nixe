@@ -1,4 +1,5 @@
 use super::prelude::*;
+use crate::ipc_wire::message::ReceiveStaticDescriptor;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NvDrvCommand {
@@ -82,19 +83,14 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
         }
 
         NvDrvCommand::Open => {
-            let descriptor = one_send_buffer(hipc)?;
+            let descriptor = one_send_buffer(process, hipc)?;
             let size = usize::try_from(descriptor.size)
                 .map_err(|_| IpcWireError::Malformed("nvdrv device path is too large"))?;
             if size == 0 || size > 0x100 {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let mut path = vec![0_u8; size];
-            read_bytes(
-                process,
-                GuestVirtualAddress::new(descriptor.address),
-                &mut path,
-            )
-            .await?;
+            process.read(descriptor, 0, &mut path).await?;
             let (fd, error) = match service.open(&path, process.process_id()) {
                 Ok(fd) => (fd.raw(), crate::nvdrv::NV_SUCCESS),
                 Err(NvDrvServiceError::DriverResult(error)) => (0, error),
@@ -136,13 +132,10 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let mut input = vec![0_u8; input_size];
-            if let Some(input_descriptor) = buffers.input {
-                read_bytes(
-                    process,
-                    GuestVirtualAddress::new(input_descriptor.address),
-                    &mut input,
-                )
-                .await?;
+            if buffers.input.is_some() {
+                process
+                    .read(&process.send_buffers()[0], 0, &mut input)
+                    .await?;
             }
             log::trace!(
                 "nvdrv ioctl input: fd={fd:#010x} request={ioctl:#010x} input-size={} input-prefix={:02x?}",
@@ -158,13 +151,10 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let mut additional_input = vec![0_u8; additional_input_size];
-            if let Some(input_descriptor) = buffers.additional_input {
-                read_bytes(
-                    process,
-                    GuestVirtualAddress::new(input_descriptor.address),
-                    &mut additional_input,
-                )
-                .await?;
+            if buffers.additional_input.is_some() {
+                process
+                    .read(&process.send_buffers()[1], 0, &mut additional_input)
+                    .await?;
             }
             let response = loop {
                 let response = service
@@ -237,11 +227,17 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
                     &input[..input.len().min(64)],
                 );
             }
-            if let Some(output_descriptor) = buffers.output {
-                write_descriptor_bytes(process, output_descriptor, &response.output).await?;
+            if buffers.output.is_some() {
+                write_descriptor_bytes(process, &process.receive_buffers()[0], &response.output)
+                    .await?;
             }
-            if let Some(output) = buffers.additional_output {
-                write_descriptor_bytes(process, output, &response.additional_output).await?;
+            if buffers.additional_output.is_some() {
+                write_descriptor_bytes(
+                    process,
+                    &process.receive_buffers()[1],
+                    &response.additional_output,
+                )
+                .await?;
             }
             Ok((
                 encode_response(
@@ -273,14 +269,15 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             };
             if hipc.copy_handles.len() != 2
-                || hipc.copy_handles[0] != crate::CURRENT_PROCESS_HANDLE
-                || process.copy_handle::<TransferMemoryObject>(1).is_none()
+                || process
+                    .copy_handle::<nixe_runtime::RunnableProcess>(0)
+                    .is_none_or(|owner| owner.process_id() != process.process_id())
             {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
-            let transfer = process
-                .copy_handle::<TransferMemoryObject>(1)
-                .expect("validated transfer memory");
+            let Some(transfer) = process.copy_handle::<TransferMemoryObject>(1) else {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            };
             if u64::from(transfer_size) > transfer.size() || transfer_size == 0 {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
@@ -411,11 +408,16 @@ struct NvIoctlBuffers {
 }
 
 fn nv_ioctl_buffers(hipc: &HipcRequest<'_>, request: u32) -> Result<NvIoctlBuffers, IpcWireError> {
+    let ReceiveStatics::Entries(pointers) = &hipc.receive_statics else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv ioctl requires one output auto-select pointer",
+        ));
+    };
     nv_ioctl_buffer_descriptors(
         &hipc.send_statics,
         &hipc.send_buffers,
         &hipc.receive_buffers,
-        &hipc.receive_statics,
+        pointers,
         request,
     )
 }
@@ -424,7 +426,7 @@ fn nv_ioctl_buffer_descriptors(
     send_statics: &[SendStaticDescriptor],
     send_buffers: &[BufferDescriptor],
     receive_buffers: &[BufferDescriptor],
-    receive_statics: &ReceiveStatics,
+    receive_statics: &[ReceiveStaticDescriptor],
     request: u32,
 ) -> Result<NvIoctlBuffers, IpcWireError> {
     let [input] = send_buffers else {
@@ -442,12 +444,7 @@ fn nv_ioctl_buffer_descriptors(
             "nvdrv ioctl requires exactly one input auto-select pointer",
         ));
     };
-    let ReceiveStatics::Entries(output_pointers) = receive_statics else {
-        return Err(IpcWireError::Malformed(
-            "nvdrv ioctl requires one output auto-select pointer",
-        ));
-    };
-    let [output_pointer] = output_pointers.as_slice() else {
+    let [output_pointer] = receive_statics else {
         return Err(IpcWireError::Malformed(
             "nvdrv ioctl requires exactly one output auto-select pointer",
         ));
@@ -469,9 +466,6 @@ fn nv_ioctl_buffer_descriptors(
                   present_error: &'static str,
                   absent_error: &'static str|
      -> Result<Option<BufferDescriptor>, IpcWireError> {
-        if descriptor.mode == BufferMode::Invalid {
-            return Err(IpcWireError::Malformed(present_error));
-        }
         if present {
             if descriptor.size != encoded_size || (encoded_size != 0 && descriptor.address == 0) {
                 return Err(IpcWireError::Malformed(present_error));
@@ -505,11 +499,16 @@ fn nv_ioctl_buffer_descriptors(
 }
 
 fn nv_ioctl2_buffers(hipc: &HipcRequest<'_>, request: u32) -> Result<NvIoctlBuffers, IpcWireError> {
+    let ReceiveStatics::Entries(pointers) = &hipc.receive_statics else {
+        return Err(IpcWireError::Malformed(
+            "nvdrv Ioctl2 requires one output auto-select pointer",
+        ));
+    };
     nv_ioctl2_buffer_descriptors(
         &hipc.send_statics,
         &hipc.send_buffers,
         &hipc.receive_buffers,
-        &hipc.receive_statics,
+        pointers,
         request,
     )
 }
@@ -518,7 +517,7 @@ fn nv_ioctl2_buffer_descriptors(
     send_statics: &[SendStaticDescriptor],
     send_buffers: &[BufferDescriptor],
     receive_buffers: &[BufferDescriptor],
-    receive_statics: &ReceiveStatics,
+    receive_statics: &[ReceiveStaticDescriptor],
     request: u32,
 ) -> Result<NvIoctlBuffers, IpcWireError> {
     let [input, additional_input] = send_buffers else {
@@ -536,12 +535,7 @@ fn nv_ioctl2_buffer_descriptors(
             "nvdrv Ioctl2 requires exactly two input auto-select pointers",
         ));
     };
-    let ReceiveStatics::Entries(output_pointers) = receive_statics else {
-        return Err(IpcWireError::Malformed(
-            "nvdrv Ioctl2 requires one output auto-select pointer",
-        ));
-    };
-    let [output_pointer] = output_pointers.as_slice() else {
+    let [output_pointer] = receive_statics else {
         return Err(IpcWireError::Malformed(
             "nvdrv Ioctl2 requires exactly one output auto-select pointer",
         ));
@@ -555,9 +549,7 @@ fn nv_ioctl2_buffer_descriptors(
             "nvdrv Ioctl2 pointer buffers exceed the advertised zero pointer-buffer size",
         ));
     }
-    if additional_input.mode == BufferMode::Invalid
-        || (additional_input.size != 0 && additional_input.address == 0)
-    {
+    if additional_input.size != 0 && additional_input.address == 0 {
         return Err(IpcWireError::Malformed(
             "nvdrv Ioctl2 additional input buffer is invalid",
         ));
@@ -567,7 +559,7 @@ fn nv_ioctl2_buffer_descriptors(
         &[*input_pointer],
         &[*input],
         &[*output],
-        &ReceiveStatics::Entries(vec![*output_pointer]),
+        std::slice::from_ref(output_pointer),
         request,
     )?;
     Ok(NvIoctlBuffers {
@@ -597,7 +589,6 @@ fn nv_ioctl3_buffers(hipc: &HipcRequest<'_>, request: u32) -> Result<NvIoctlBuff
         ));
     };
     if inline_pointer.size != 0
-        || inline.mode == BufferMode::Invalid
         || inline.size > 0x10000
         || (inline.size != 0 && inline.address == 0)
     {
@@ -609,7 +600,7 @@ fn nv_ioctl3_buffers(hipc: &HipcRequest<'_>, request: u32) -> Result<NvIoctlBuff
         &hipc.send_statics,
         &hipc.send_buffers,
         &[*output],
-        &ReceiveStatics::Entries(vec![*output_pointer]),
+        std::slice::from_ref(output_pointer),
         request,
     )?;
     buffers.additional_output = Some(*inline);
@@ -619,7 +610,7 @@ fn nv_ioctl3_buffers(hipc: &HipcRequest<'_>, request: u32) -> Result<NvIoctlBuff
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc_wire::message::ReceiveStaticDescriptor;
+    use crate::ipc_wire::message::BufferMode;
 
     fn buffer(address: u64, size: u64) -> BufferDescriptor {
         BufferDescriptor {
@@ -642,10 +633,10 @@ mod tests {
             }],
             &[input],
             &[output],
-            &ReceiveStatics::Entries(vec![ReceiveStaticDescriptor {
+            &[ReceiveStaticDescriptor {
                 address: 0,
                 size: 0,
-            }]),
+            }],
             request,
         )
     }
@@ -679,7 +670,7 @@ mod tests {
                     &[input_pointer],
                     &[input],
                     &[output],
-                    &ReceiveStatics::Entries(vec![output_pointer]),
+                    &[output_pointer],
                     0xc028_4702,
                 )
             };
@@ -751,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn ioctl_still_validates_active_buffers_and_descriptor_modes() {
+    fn ioctl_still_validates_active_buffer_sizes_and_addresses() {
         for input in [
             buffer(0, 40),
             buffer(0x1000, 0),
@@ -768,12 +759,6 @@ mod tests {
         ] {
             assert!(ioctl_descriptors(buffer(0x2000, 0), output, 0x8004_4701).is_err());
         }
-        let invalid = BufferDescriptor {
-            mode: BufferMode::Invalid,
-            ..buffer(0x2000, 0)
-        };
-        assert!(ioctl_descriptors(invalid, buffer(0x1000, 4), 0x8004_4701).is_err());
-        assert!(ioctl_descriptors(buffer(0x1000, 40), invalid, 0x4028_4109).is_err());
     }
 
     #[test]
@@ -796,10 +781,10 @@ mod tests {
                 ],
                 &[input, additional],
                 &[buffer(0x1000, 0)],
-                &ReceiveStatics::Entries(vec![ReceiveStaticDescriptor {
+                &[ReceiveStaticDescriptor {
                     address: 0,
                     size: 0
-                }]),
+                }],
                 0x4028_4109,
             ))
             .unwrap(),
@@ -838,7 +823,7 @@ mod tests {
                 pointers,
                 &[input, additional],
                 &[output],
-                &ReceiveStatics::Entries(vec![output_pointer]),
+                &[output_pointer],
                 0xc018_481b,
             )
         };

@@ -1,6 +1,6 @@
 //! ZBC registrations and kernel events for `/dev/nvhost-ctrl-gpu`.
 
-use nixe_runtime::{EventObject, ExternalEventSource, ReadableEventObject, WritableEventObject};
+use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 
 use super::{
     NV_BAD_PARAMETER, NV_OVERFLOW, diagnostics::NvDrvCallError, input_u32, require_input_size,
@@ -125,10 +125,10 @@ pub(super) struct NvHostControlGpuEvents {
 }
 
 impl NvHostControlGpuEvents {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(kernel: &std::sync::Arc<nixe_scheduler::SchedulerState>) -> Self {
         Self {
-            error: EventObject::create_pair_with_source(ExternalEventSource::GpuCompletion),
-            semaphore: EventObject::create_pair_with_source(ExternalEventSource::GpuCompletion),
+            error: EventObject::create_pair(kernel),
+            semaphore: EventObject::create_pair(kernel),
         }
     }
 
@@ -153,7 +153,8 @@ mod tests {
 
     #[test]
     fn control_gpu_events_preserve_identity_and_descriptor_lifetimes() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let other_fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
@@ -166,7 +167,6 @@ mod tests {
         let other = session.query_event(other_fd, 2, 1).unwrap().0.unwrap();
         for event in [&semaphore, &copy, &error, &other] {
             assert!(!event.is_signalled());
-            assert_eq!(event.source(), Some(ExternalEventSource::GpuCompletion));
         }
         // Exercise the retained kernel pair to verify that QueryEvent copies
         // the same event, while different IDs and descriptors remain distinct.

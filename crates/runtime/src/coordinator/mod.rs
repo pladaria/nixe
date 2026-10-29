@@ -4,14 +4,14 @@ use std::fmt::{Display, Formatter};
 
 use nixe_cpu::execution::VcpuEventState;
 use nixe_scheduler::{
-    Completion, CoreSet, GuestThreadId, Lease, MachineSchedulerProfile, ProcessId,
-    ScheduledThreadConfig, SchedulerError, SchedulerState, VirtualCpuId, WakeToken,
+    Completion, CoreSet, GuestThreadId, Lease, ProcessId, ScheduledThreadConfig, SchedulerError,
+    SchedulerState, VirtualCpuId, WakeToken,
 };
 
 use crate::{
     ExceptionDispatcher, ExceptionHandlingResult, ExceptionRouteError, ExecutionReport,
     ExecutionStop, ExternalEvent, ExternalEventInbox, ExternalEventSendError, ExternalEventSender,
-    ProcessExecutionError, RunnableProcess, ThreadCreateError, ThreadCreateRequest, ThreadCreation,
+    ProcessExecutionError, RunnableProcess,
 };
 
 mod execution;
@@ -31,62 +31,38 @@ pub struct ProcessRegistration {
     pub affinity: CoreSet,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ThreadOperationError {
-    InvalidHandle,
-    InvalidState,
-    Internal,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CoordinatorResourceCounts {
     pub processes: usize,
     pub scheduled_threads: usize,
     pub active_waits: usize,
     pub deadlines: usize,
-    pub external_watcher_groups: usize,
     pub priority_donations: usize,
     pub address_waiters: usize,
 }
 
 pub struct RuntimeCoordinator {
     scheduler: std::sync::Arc<SchedulerState>,
-    processes: BTreeMap<ProcessId, RunnableProcess>,
+    processes: BTreeMap<ProcessId, std::sync::Arc<RunnableProcess>>,
     process_ids: ProcessIdAllocator,
     workers: VcpuWorkerPool,
     inbox: ExternalEventInbox,
     host_stop_requested: bool,
     virtual_clock: crate::VirtualClock,
-    deadlines: BTreeMap<(u64, u64), WakeToken>,
-    next_deadline_sequence: u64,
     vcpu_events: BTreeMap<VirtualCpuId, VcpuEventState>,
-    next_preemption_ns: Option<u64>,
     completed_executions: VecDeque<CoordinatorExecution>,
     deferred_events: VecDeque<crate::SequencedExternalEvent>,
 }
 
 impl RuntimeCoordinator {
     #[must_use]
-    pub fn new(profile: MachineSchedulerProfile) -> Self {
-        Self::with_virtual_clock(
-            profile,
-            crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 }),
-        )
+    pub fn new(scheduler: std::sync::Arc<SchedulerState>) -> Self {
+        Self::try_new(scheduler).expect("kernel worker construction failed")
     }
 
-    #[must_use]
-    pub fn with_virtual_clock(
-        profile: MachineSchedulerProfile,
-        virtual_clock: crate::VirtualClock,
-    ) -> Self {
-        Self::try_with_virtual_clock(profile, virtual_clock)
-            .expect("vCPU worker construction failed")
-    }
-
-    pub fn try_with_virtual_clock(
-        profile: MachineSchedulerProfile,
-        virtual_clock: crate::VirtualClock,
-    ) -> Result<Self, CoordinatorError> {
+    pub fn try_new(scheduler: std::sync::Arc<SchedulerState>) -> Result<Self, CoordinatorError> {
+        let profile = scheduler.profile();
+        let virtual_clock = scheduler.clock().clone();
         let vcpu_events = profile
             .vcpus()
             .iter()
@@ -94,11 +70,10 @@ impl RuntimeCoordinator {
             .collect();
         let inbox = ExternalEventInbox::bounded(1_024, profile.vcpus().len())
             .expect("the default event capacity is non-zero");
-        let next_preemption_ns = profile
-            .preemption_interval_ns()
-            .map(|interval| virtual_clock.scheduler_time_ns().saturating_add(interval));
-        let scheduler = std::sync::Arc::new(SchedulerState::new(profile, virtual_clock.clone()));
-        let workers = VcpuWorkerPool::start(
+        scheduler
+            .start_timers(std::task::Waker::from(std::sync::Arc::new(inbox.sender())))
+            .map_err(|error| CoordinatorError::TimerStartup(error.kind()))?;
+        let workers = match VcpuWorkerPool::start(
             scheduler
                 .profile()
                 .vcpus()
@@ -106,8 +81,13 @@ impl RuntimeCoordinator {
                 .map(|descriptor| descriptor.id()),
             inbox.worker_sender(),
             scheduler.clone(),
-        )
-        .map_err(|error| CoordinatorError::WorkerStartup(error.kind()))?;
+        ) {
+            Ok(workers) => workers,
+            Err(error) => {
+                let _ = scheduler.stop_timers();
+                return Err(CoordinatorError::WorkerStartup(error.kind()));
+            }
+        };
         Ok(Self {
             scheduler,
             processes: BTreeMap::new(),
@@ -116,10 +96,7 @@ impl RuntimeCoordinator {
             inbox,
             host_stop_requested: false,
             virtual_clock,
-            deadlines: BTreeMap::new(),
-            next_deadline_sequence: 1,
             vcpu_events,
-            next_preemption_ns,
             completed_executions: VecDeque::new(),
             deferred_events: VecDeque::new(),
         })
@@ -128,45 +105,33 @@ impl RuntimeCoordinator {
     /// Quiesces workers and releases every process, CPU backend, wait, and
     /// canonical address-space resource. Repeated shutdown calls are harmless.
     pub fn shutdown(&mut self) -> Result<(), CoordinatorError> {
+        self.finalize_retired_threads()?;
         let processes: Vec<_> = self.processes.keys().copied().collect();
         for &process in &processes {
             self.request_process_stop(process)?;
         }
         self.quiesce()?;
         for process_id in processes {
-            let process = self.remove_process(process_id)?;
-            process
-                .try_teardown()
-                .map_err(|failure| CoordinatorError::ProcessTeardown {
-                    process: process_id,
-                    failure,
-                })?;
+            self.remove_process(process_id)?;
         }
-        let waiting_threads: Vec<_> = self
-            .scheduler
-            .active_waits()
-            .map(|token| token.thread)
-            .collect();
-        for thread in waiting_threads {
-            self.release_wait_resources(thread);
-        }
-        self.deadlines.clear();
+        self.finalize_retired_threads()?;
         self.host_stop_requested = true;
-        self.workers.shutdown().map_err(CoordinatorError::Worker)
+        let workers = self.workers.shutdown().map_err(CoordinatorError::Worker);
+        let timers = self
+            .scheduler
+            .stop_timers()
+            .map_err(|_| CoordinatorError::TimerWorkerFailed);
+        workers.and(timers)
     }
 
     #[must_use]
-    pub fn scheduler(&self) -> &SchedulerState {
+    pub fn scheduler(&self) -> &std::sync::Arc<SchedulerState> {
         &self.scheduler
     }
 
     #[must_use]
-    pub fn process(&self, id: ProcessId) -> Option<&RunnableProcess> {
+    pub fn process(&self, id: ProcessId) -> Option<&std::sync::Arc<RunnableProcess>> {
         self.processes.get(&id)
-    }
-
-    pub fn process_mut(&mut self, id: ProcessId) -> Option<&mut RunnableProcess> {
-        self.processes.get_mut(&id)
     }
 
     pub fn register_process(
@@ -174,6 +139,9 @@ impl RuntimeCoordinator {
         mut process: RunnableProcess,
         registration: ProcessRegistration,
     ) -> Result<ProcessId, CoordinatorError> {
+        if !std::sync::Arc::ptr_eq(process.scheduler(), &self.scheduler) {
+            return Err(CoordinatorError::ForeignKernel);
+        }
         let (id, next_process_id) = self
             .process_ids
             .candidate()
@@ -195,7 +163,7 @@ impl RuntimeCoordinator {
                 .expect("registration rollback removes an unleased created thread");
             return Err(error.into());
         }
-        if let Err(error) = self.install_process_cpu_threads(id, &mut process, thread) {
+        if let Err(error) = self.install_process_cpu_threads(id, &process, thread) {
             self.scheduler
                 .unregister(thread)
                 .expect("CPU thread installation rollback removes an unleased ready thread");
@@ -203,23 +171,27 @@ impl RuntimeCoordinator {
         }
         process.address_waits().bind(id, self.scheduler.clone());
         process
-            .main_thread()
-            .object()
-            .bind_retirement(id, self.inbox.sender());
+            .events
+            .set(self.inbox.sender())
+            .expect("process registers once");
+        let process = std::sync::Arc::new(process);
+        process.main_thread().bind_owner(&process);
         process
-            .scheduler
-            .set(self.scheduler.clone())
-            .expect("process is registered once");
+            .main_thread()
+            .bind_retirement(id, self.inbox.sender());
         let replaced = self.processes.insert(id, process);
         debug_assert!(replaced.is_none());
         self.process_ids.commit(next_process_id);
         Ok(id)
     }
 
-    /// Stops a process execution domain, quiesces and drops every worker-owned
-    /// CPU thread, then transfers the process solely for final resource teardown.
-    /// A removed process is terminal and cannot be registered again.
-    pub fn remove_process(&mut self, id: ProcessId) -> Result<RunnableProcess, CoordinatorError> {
+    /// Retires native contexts and closes a process. Exported kernel objects
+    /// retain their identities until their last handle or pending operation ends.
+    pub fn remove_process(
+        &mut self,
+        id: ProcessId,
+    ) -> Result<crate::ProcessTeardownReport, CoordinatorError> {
+        self.finalize_retired_threads()?;
         self.terminate_process(id)?;
         self.completed_executions
             .retain(|execution| execution.lease.process != id);
@@ -228,9 +200,7 @@ impl RuntimeCoordinator {
             .get(&id)
             .ok_or(CoordinatorError::UnknownProcess(id))?
             .threads()
-            .iter()
-            .map(|(thread, _)| *thread)
-            .collect();
+            .ids();
         for thread in &threads {
             let view = self
                 .scheduler
@@ -243,58 +213,34 @@ impl RuntimeCoordinator {
         self.retire_process_cpu_threads(id)?;
         for thread in threads {
             self.finalize_thread_waits(id, thread);
-            self.scheduler.unregister(thread)?;
         }
         let process = self
             .processes
             .remove(&id)
             .expect("process existed throughout atomic scheduler removal");
-        Ok(process)
+        let report = process
+            .try_teardown()
+            .map_err(|failure| CoordinatorError::ProcessTeardown {
+                process: id,
+                failure,
+            });
+        self.finalize_retired_threads()?;
+        report
     }
 
     /// Terminates every thread in a registered process through the scheduler
-    /// and records a host-requested process exit without releasing resources.
+    /// and closes owned handles. Native/memory retirement remains separate.
     pub fn terminate_process(&mut self, id: ProcessId) -> Result<bool, CoordinatorError> {
         let terminated = self.request_process_stop(id)?;
-        self.quiesce()?;
-        self.completed_executions
-            .retain(|execution| execution.lease.process != id);
-        let threads: Vec<_> = self
-            .processes
-            .get(&id)
-            .ok_or(CoordinatorError::UnknownProcess(id))?
-            .threads()
-            .iter()
-            .map(|(thread, _)| *thread)
-            .collect();
-        for thread in threads {
-            if self.scheduler.thread(thread).is_some_and(|view| {
-                matches!(
-                    view.lifecycle,
-                    nixe_scheduler::ThreadLifecycle::Exited
-                        | nixe_scheduler::ThreadLifecycle::Faulted
-                )
-            }) {
-                continue;
-            }
-            self.processes
-                .get_mut(&id)
-                .unwrap()
-                .terminate_thread_from_coordinator(
-                    thread,
-                    0,
-                    crate::ExceptionTerminationScope::Process,
-                );
-            self.finalize_thread_waits(id, thread);
-            self.scheduler.terminate(thread, false)?;
-        }
+        self.quiesce_process(id)?;
+        self.finish_process_termination(id)?;
         Ok(terminated)
     }
 
     fn request_process_stop(&mut self, id: ProcessId) -> Result<bool, CoordinatorError> {
         let process = self
             .processes
-            .get_mut(&id)
+            .get(&id)
             .ok_or(CoordinatorError::UnknownProcess(id))?;
         let terminated = process.terminate_from_host();
         process
@@ -310,7 +256,7 @@ impl RuntimeCoordinator {
     fn install_process_cpu_threads(
         &mut self,
         process_id: ProcessId,
-        process: &mut RunnableProcess,
+        process: &RunnableProcess,
         thread: GuestThreadId,
     ) -> Result<(), CoordinatorError> {
         let key = WorkerCpuThreadKey {
@@ -349,7 +295,7 @@ impl RuntimeCoordinator {
     fn rollback_process_cpu_threads(
         &mut self,
         process_id: ProcessId,
-        process: &mut RunnableProcess,
+        process: &RunnableProcess,
         installed: &[VirtualCpuId],
     ) {
         let _ = process.request_execution_stop();
@@ -369,7 +315,7 @@ impl RuntimeCoordinator {
             .ok_or(CoordinatorError::UnknownProcess(process_id))?
             .main_thread_id();
         self.processes
-            .get_mut(&process_id)
+            .get(&process_id)
             .expect("the validated process remains registered")
             .request_execution_stop()
             .map_err(|fault| CoordinatorError::Execution {
@@ -390,15 +336,9 @@ impl RuntimeCoordinator {
                 .map_err(CoordinatorError::Worker)?;
         }
         self.processes
-            .get_mut(&process_id)
+            .get(&process_id)
             .expect("the stopped process remains registered")
             .complete_cpu_thread_retirement();
-        Ok(())
-    }
-
-    /// Makes one waiting guest thread ready.
-    pub fn make_thread_ready(&mut self, thread: GuestThreadId) -> Result<(), CoordinatorError> {
-        self.scheduler.make_ready(thread)?;
         Ok(())
     }
 
@@ -448,12 +388,12 @@ impl RuntimeCoordinator {
         }
         let process = self
             .processes
-            .get_mut(&lease.process)
+            .get(&lease.process)
             .ok_or(CoordinatorRouteError::UnknownProcess(lease.process))?;
-        let result = process
+        let (thread, result) = process
             .route_supervisor_call_for(lease.thread, lease.vcpu, stop, dispatcher)
             .map_err(CoordinatorRouteError::Route)?;
-        self.commit_exception_result(lease.process, lease.thread, result)
+        self.commit_exception_result(lease.process, thread, result)
     }
 
     /// Resumes only the current owned kernel operation. It consumes the old
@@ -474,26 +414,26 @@ impl RuntimeCoordinator {
             return Ok(None);
         };
         let process_id = thread.process;
-        self.release_wait_resources(token.thread);
         self.scheduler
             .continue_wait(token)
             .map_err(CoordinatorRouteError::Scheduler)?;
-        let result = self
+        let (thread, result) = self
             .processes
-            .get_mut(&process_id)
+            .get(&process_id)
             .ok_or(CoordinatorRouteError::UnknownProcess(process_id))?
             .resume_supervisor_call_for(token.thread, vcpu, source, continuation)
             .map_err(CoordinatorRouteError::Route)?;
-        self.commit_exception_result(process_id, token.thread, result)
+        self.commit_exception_result(process_id, thread, result)
             .map(Some)
     }
 
     fn commit_exception_result<F>(
         &mut self,
         process_id: ProcessId,
-        thread_id: GuestThreadId,
+        thread: std::sync::Arc<crate::ThreadObject>,
         result: ExceptionHandlingResult<F>,
     ) -> Result<ExceptionHandlingResult<F>, CoordinatorRouteError> {
+        let thread_id = thread.id();
         let terminal = matches!(
             result,
             ExceptionHandlingResult::Terminated { .. } | ExceptionHandlingResult::Fault(_)
@@ -512,10 +452,21 @@ impl RuntimeCoordinator {
             ExceptionHandlingResult::Fault(_) => self.scheduler.terminate(thread_id, true),
         }
         .map_err(CoordinatorRouteError::Scheduler)?;
-        if let ExceptionHandlingResult::Terminated { exit_code, .. } = &result
-            && self.processes[&process_id].lifecycle() == nixe_scheduler::ProcessLifecycle::Exited
-        {
-            self.terminate_remaining_process_threads(process_id, thread_id, *exit_code)?;
+        if terminal {
+            // Publish completion after native ownership and the architectural
+            // continuation have been released, as FinishTermination does:
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_thread.cpp#L428-L447
+            thread.signal();
+        }
+        if terminal {
+            if self.processes[&process_id].lifecycle()
+                == nixe_scheduler::ProcessLifecycle::Terminating
+            {
+                self.quiesce_process(process_id)
+                    .map_err(|error| CoordinatorRouteError::Coordinator(Box::new(error)))?;
+            }
+            self.finish_process_termination(process_id)
+                .map_err(|error| CoordinatorRouteError::Coordinator(Box::new(error)))?;
         }
         Ok(result)
     }
@@ -531,8 +482,7 @@ impl RuntimeCoordinator {
             processes: self.processes.len(),
             scheduled_threads: self.scheduler.thread_count(),
             active_waits: self.scheduler.active_wait_count(),
-            deadlines: self.deadlines.len(),
-            external_watcher_groups: self.inbox.sender().watcher_group_count(),
+            deadlines: self.scheduler.deadline_count(),
             priority_donations: self.scheduler.priority_donation_count(),
             address_waiters: self
                 .processes
@@ -545,6 +495,10 @@ impl RuntimeCoordinator {
 
 #[derive(Clone, Debug)]
 pub enum CoordinatorError {
+    ForeignKernel,
+    MissingContinuation(GuestThreadId),
+    TimerStartup(std::io::ErrorKind),
+    TimerWorkerFailed,
     UnknownProcess(ProcessId),
     UnknownThread {
         process: ProcessId,
@@ -557,7 +511,6 @@ pub enum CoordinatorError {
     },
     InFlightLease(Lease),
     ProcessIdExhausted,
-    DeadlineSequenceExhausted,
     ThreadTable(crate::ThreadTableError),
     Execution {
         process: ProcessId,
@@ -604,12 +557,15 @@ impl Error for CoordinatorError {}
 
 impl Drop for RuntimeCoordinator {
     fn drop(&mut self) {
-        let _ = self.shutdown();
-        if !self.host_stop_requested {
+        if self.shutdown().is_err() {
             for process in self.processes.values() {
                 process.request_execution_safepoint();
             }
             let _ = self.workers.shutdown();
+            let _ = self.scheduler.stop_timers();
+            for process in self.processes.values() {
+                let _ = process.try_teardown();
+            }
         }
     }
 }
@@ -641,9 +597,6 @@ pub struct CoordinatorExecution {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CoordinatorDrainReport {
     pub received: usize,
-    pub woken: usize,
-    pub cancelled: usize,
-    pub stale: usize,
     pub first_sequence: Option<crate::ExternalEventSequence>,
     pub last_sequence: Option<crate::ExternalEventSequence>,
 }

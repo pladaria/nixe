@@ -324,6 +324,9 @@ mod tests {
         authority.register(1, vec![full.clone()]).unwrap();
         authority.register(2, vec![reused.clone()]).unwrap();
         authority.register(3, vec![full.clone()]).unwrap();
+        assert!(authority.resources_may_overlap(1, 2));
+        assert!(authority.resources_may_overlap(2, 1));
+        assert!(!authority.resources[&1].aliases.contains(&2));
         let first = authority.create_writer(1, full.clone()).unwrap();
         authority.record_write(first, NativeTick(1)).unwrap();
         let retained = authority.observe_native(3, full.clone()).unwrap();
@@ -379,6 +382,8 @@ mod tests {
         }
         authority.unregister(3).unwrap();
         assert_eq!(authority.resources[&1].aliases, [2]);
+        assert!(!authority.resources_may_overlap(1, 3));
+        assert!(!authority.resources_may_overlap(2, 3));
         authority.register(4, vec![full.clone()]).unwrap();
         let writer = authority.create_writer(1, full.clone()).unwrap();
         authority.record_write(writer, NativeTick(1)).unwrap();

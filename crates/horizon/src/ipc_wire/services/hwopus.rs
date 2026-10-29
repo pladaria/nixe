@@ -75,12 +75,9 @@ pub(in crate::ipc_wire) async fn dispatch_opus_manager(
             return opus_error(&request, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
         }
         pointed.resize(parameter_size, 0);
-        read_bytes(
-            process,
-            GuestVirtualAddress::new(descriptor.address),
-            &mut pointed,
-        )
-        .await?;
+        process
+            .read(&process.send_statics()[0], 0, &mut pointed)
+            .await?;
         pointed.as_slice()
     } else {
         &request.data[..parameter_size]
@@ -196,34 +193,24 @@ async fn dispatch_decode(
     if multi != session.state.params.streams.is_some() {
         return opus_error(&request, BAD_ARGUMENT);
     }
-    let input = one_send_buffer(hipc)?;
+    let input = one_send_buffer(process, hipc)?;
     if context {
         // SetContext's input is unused by the service. The host decoder is
         // already resident; there is no ADSP mapping to restore.
         return semantic_success(request.token, request.domain.is_some(), &[], &[], &[], None);
     }
-    let output = one_receive_buffer(hipc)?;
+    let output = one_receive_buffer(process, hipc)?;
     if input.size <= 8 {
         return opus_error(&request, INPUT_TOO_SMALL);
     }
     let mut header = [0; 8];
-    read_bytes(
-        process,
-        GuestVirtualAddress::new(input.address),
-        &mut header,
-    )
-    .await?;
+    process.read(input, 0, &mut header).await?;
     let size = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
     if size > session.state.params.input_capacity() || size as u64 > input.size - 8 {
         return opus_error(&request, BUFFER_TOO_SMALL);
     }
     let mut packet = vec![0; size];
-    read_bytes(
-        process,
-        GuestVirtualAddress::new(input.address + 8),
-        &mut packet,
-    )
-    .await?;
+    process.read(input, 8, &mut packet).await?;
     let (pcm, samples, time) =
         match session
             .state

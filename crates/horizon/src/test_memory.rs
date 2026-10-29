@@ -113,3 +113,10 @@ pub(crate) fn process(machine: Machine) -> ProcessMemory {
     )
     .unwrap()
 }
+
+pub(crate) fn kernel() -> std::sync::Arc<nixe_scheduler::SchedulerState> {
+    nixe_scheduler::SchedulerState::new(
+        crate::switch_1_scheduler_profile(),
+        nixe_runtime::VirtualClock::new(nixe_runtime::VirtualClockMode::Fixed { unix_seconds: 0 }),
+    )
+}

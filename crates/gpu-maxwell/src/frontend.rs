@@ -2,7 +2,7 @@
 
 use std::fmt::{Display, Formatter};
 
-use crate::engines::{MaxwellEngineStreamError, stream_maxwell_engine_packet};
+use crate::engines::{MaxwellEngineStreamError, stream_maxwell_engine_entry};
 use crate::execution::{MaxwellCommandEffects, MaxwellFrontend};
 use crate::pushbuffer::packet::CommandStream;
 pub use crate::pushbuffer::packet::MaxwellCommandSourceScratch;
@@ -34,7 +34,7 @@ impl Display for MaxwellFrontendDispatchError {
 impl std::error::Error for MaxwellFrontendDispatchError {}
 
 /// Fetch each entry and consume engine effects in order. Packet continuation
-/// survives entry fetches; control work runs at effects and bounded word quanta.
+/// survives entry fetches; control work runs at effects and entry boundaries.
 pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellCommandHost>(
     dispatch: &MaxwellFrontendDispatch,
     channel: &mut MaxwellGpuChannel,
@@ -60,7 +60,6 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
     let mut mme_methods = None;
     let mut mme_parameters = effects.take_mme_scratch();
     let mut stream = CommandStream::default();
-    let mut quantum = 0;
     let mut any = false;
     let execution_error = |error| MaxwellFrontendDispatchError::Execution(Box::new(error));
     let result = async {
@@ -80,14 +79,10 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
             {
                 break;
             }
-            let (packet, words) = stream
-                .next(submission, 4096 - quantum)
-                .map_err(MaxwellFrontendDispatchError::PacketDecode)?;
             any = true;
-            stream_maxwell_engine_packet(
+            stream_maxwell_engine_entry(
                 channel,
-                frontend,
-                packet,
+                &mut stream,
                 #[cfg(test)]
                 None,
                 &mut mme_methods,
@@ -103,12 +98,11 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
                     MaxwellFrontendDispatchError::EngineDispatch(error)
                 }
                 MaxwellEngineStreamError::Consumer(error) => error,
+                MaxwellEngineStreamError::Decode(error) => {
+                    MaxwellFrontendDispatchError::PacketDecode(error)
+                }
             })?;
-            quantum += words;
-            if quantum >= 4096 {
-                effects.control().map_err(execution_error)?;
-                quantum = 0;
-            }
+            effects.control().map_err(execution_error)?;
         }
         stream
             .finish(sources)
@@ -139,7 +133,7 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
         );
     }
     effects.finish().map_err(execution_error)?;
-    // A short list is also a control boundary; many short lists must not reset
-    // the fairness quantum without ever servicing a waiting CPU request.
+    // Every completed list services waiting control requests, including lists
+    // containing only passive register programming.
     host.control().map_err(execution_error)
 }

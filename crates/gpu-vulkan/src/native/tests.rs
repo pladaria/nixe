@@ -977,6 +977,14 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     assert_eq!(execution.statistics.prepared_draws, 1);
     assert_eq!(execution.statistics.draws, 32);
     assert_eq!(execution.statistics.warm_draws, 31);
+    let graphics_key = GraphicsKey::new(&state, execution.device_profile().dynamic_state.base);
+    let retained_push = match &execution.graphics[&graphics_key] {
+        Graphics::Ready {
+            parameters: Some((_, _, push)),
+            ..
+        } => Arc::clone(push),
+        _ => unreachable!(),
+    };
     let bytes = cpu_read(&mut execution.residency, &backing);
     assert!(bytes.chunks_exact(4).all(|p| p == [0, 255, 0, 255]));
     assert_eq!(
@@ -1041,6 +1049,11 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let second = consume(&mut execution, &final_segment)
         .and_then(|()| execution.submit(final_segment.frontend))
         .unwrap();
+    assert!(matches!(
+        &execution.graphics[&graphics_key],
+        Graphics::Ready { parameters: Some((_, _, push)), .. }
+            if !Arc::ptr_eq(push, &retained_push)
+    ));
     assert!(execution.statistics.reused_vertex_selections > selections);
     assert_ne!(first, second);
     let a = finish_next(&mut execution).unwrap().unwrap();
@@ -1132,7 +1145,11 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let selections = execution.statistics.reused_vertex_selections;
     let scopes = execution.recording_statistics().rendering_scopes;
     let mut sent = Vec::new();
-    for (index, current) in [&other, &state, &clipped].into_iter().enumerate() {
+    let mut rebound = (*state).clone();
+    rebound.identity = PreparedStateId::new(13, 1);
+    let rebound = Arc::new(rebound);
+    let mut retained_push = None;
+    for (index, current) in [&rebound, &other, &state, &clipped].into_iter().enumerate() {
         let submission = NativeWork {
             frontend: FrontendSubmissionId::new(10 + index as u64),
             command: NativeCommand::Draw {
@@ -1151,6 +1168,22 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
                 .and_then(|()| execution.submit(submission.frontend))
                 .unwrap(),
         );
+        let Graphics::Ready {
+            parameters: Some((_, _, push)),
+            ..
+        } = &execution.graphics[&graphics_key]
+        else {
+            unreachable!()
+        };
+        if index == 0 {
+            retained_push = Some(Arc::clone(push));
+        } else {
+            assert_eq!(
+                Arc::ptr_eq(push, retained_push.as_ref().unwrap()),
+                index != 3,
+                "buffer bindings retain native parameters; scissor changes replace them"
+            );
+        }
     }
     assert_eq!(
         execution.recording_statistics().rendering_scopes - scopes,

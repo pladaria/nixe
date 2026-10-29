@@ -44,17 +44,17 @@ fn sm_registration_and_service_handles_work_across_tipc_and_cmif() {
             let mut dispatcher = support::dispatcher(&process);
             let name = process.main_thread().stack_bottom;
             write_guest_bytes(&process, name, b"sm:\0");
-            state(&mut process).write_x(x(1), name.get());
+            process.main_thread().registers().write_x(x(1), name.get());
             assert!(matches!(
                 dispatch_next(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed
             ));
-            let sm_handle = state(&mut process).read_w(x(1));
+            let sm_handle = process.main_thread().registers().read_w(x(1));
             let tls = process.main_thread().tls_base;
             let get = sm_request(tipc_get, 1, false, b"set:sys\0");
 
             write_guest_bytes(&process, tls, &get);
-            state(&mut process).write_w(x(0), sm_handle);
+            process.main_thread().registers().write_w(x(0), sm_handle);
             assert!(matches!(
                 dispatch_next(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed
@@ -72,12 +72,12 @@ fn sm_registration_and_service_handles_work_across_tipc_and_cmif() {
                 if tipc_register { &[] } else { &[0; 8] },
             );
             write_guest_bytes(&process, tls, &register);
-            state(&mut process).write_w(x(0), sm_handle);
+            process.main_thread().registers().write_w(x(0), sm_handle);
             assert!(matches!(
                 dispatch_next(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed
             ));
-            assert_eq!(state(&mut process).read_w(x(0)), 0);
+            assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
             assert_eq!(
                 read_guest_u32(
                     &process,
@@ -87,7 +87,7 @@ fn sm_registration_and_service_handles_work_across_tipc_and_cmif() {
             );
 
             write_guest_bytes(&process, tls, &get);
-            state(&mut process).write_w(x(0), sm_handle);
+            process.main_thread().registers().write_w(x(0), sm_handle);
             assert!(matches!(
                 dispatch_next(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed
@@ -125,19 +125,19 @@ fn sm_registration_and_service_handles_work_across_tipc_and_cmif() {
             let mut close = [0; 0x100];
             put_u32(&mut close, 0, 15);
             write_guest_bytes(&process, tls, &close);
-            state(&mut process).write_w(x(0), sm_handle);
+            process.main_thread().registers().write_w(x(0), sm_handle);
             assert!(matches!(
                 dispatch_next(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed
             ));
-            assert_eq!(state(&mut process).read_w(x(0)), 0);
+            assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
             assert!(process.handles().lookup(sm_handle).is_some());
-            state(&mut process).write_w(x(0), sm_handle);
+            process.main_thread().registers().write_w(x(0), sm_handle);
             assert!(matches!(
                 dispatch_next(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed
             ));
-            assert_eq!(state(&mut process).read_w(x(0)), 0);
+            assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
             assert!(process.handles().lookup(sm_handle).is_none());
             assert!(process.handles().lookup(service).is_some());
         }
@@ -150,24 +150,24 @@ fn tipc_register_client_requires_a_sent_pid() {
     let mut dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
-    state(&mut process).write_x(x(1), name.get());
+    process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
     ));
-    let handle = state(&mut process).read_w(x(1));
+    let handle = process.main_thread().registers().read_w(x(1));
     let tls = process.main_thread().tls_base;
     for request in [
         sm_request(true, 0, false, &[]),
         sm_request(true, 1, false, b"set:sys\0"),
     ] {
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), handle);
+        process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         ));
-        assert_eq!(state(&mut process).read_w(x(0)), 0);
+        assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
         assert_eq!(
             read_guest_u32(
                 &process,

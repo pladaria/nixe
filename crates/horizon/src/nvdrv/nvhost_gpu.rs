@@ -65,9 +65,8 @@ struct NvHostGpuErrorEvent {
 }
 
 impl NvHostGpuErrorEvent {
-    fn new(channel_id: u64) -> Self {
-        let (writable, readable) =
-            EventObject::create_pair_with_source(nixe_runtime::ExternalEventSource::GpuCompletion);
+    fn new(kernel: &Arc<nixe_scheduler::SchedulerState>, channel_id: u64) -> Self {
+        let (writable, readable) = EventObject::create_pair(kernel);
         Self {
             source: GraphicsEventSource::GpuChannelError { channel_id },
             _writable: writable,
@@ -82,6 +81,7 @@ impl NvHostGpuErrorEvent {
 /// Horizon descriptor lifetimes onto those frontend objects.
 #[derive(Debug)]
 pub(super) struct NvHostGpu {
+    kernel: Arc<nixe_scheduler::SchedulerState>,
     channels: BTreeMap<NvDrvFileDescriptor, MaxwellChannelConfiguration>,
     error_events: BTreeMap<NvDrvFileDescriptor, NvHostGpuErrorEvent>,
     next_frontend_submission: u64,
@@ -110,8 +110,9 @@ struct NvHostGpuSubmissionState<'a> {
 }
 
 impl NvHostGpu {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(kernel: &Arc<nixe_scheduler::SchedulerState>) -> Self {
         Self {
+            kernel: kernel.clone(),
             channels: BTreeMap::new(),
             error_events: BTreeMap::new(),
             next_frontend_submission: 1,
@@ -123,7 +124,7 @@ impl NvHostGpu {
         let previous_channel = self.channels.insert(fd, channel);
         let previous_event = self
             .error_events
-            .insert(fd, NvHostGpuErrorEvent::new(channel_id));
+            .insert(fd, NvHostGpuErrorEvent::new(&self.kernel, channel_id));
         debug_assert!(previous_channel.is_none());
         debug_assert!(previous_event.is_none());
     }

@@ -7,19 +7,10 @@
 
 use super::address_word::{AddressWord, address_word_fault};
 use super::*;
-use nixe_runtime::AddressWaitResult;
 
 // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/include/mesosphere/kern_k_memory_layout.hpp
 const KERNEL_ADDRESS_START: u64 = 0u64.wrapping_sub(1 << 39);
 const KERNEL_ADDRESS_END: u64 = 0u64.wrapping_sub(0x20_0000);
-
-#[derive(Debug)]
-pub(super) struct AddressWaitCheck {
-    word: AddressWord,
-    kind: u32,
-    value: i32,
-    timeout: i64,
-}
 
 impl HorizonSvcDispatcher {
     pub(super) fn wait_for_address(
@@ -34,32 +25,6 @@ impl HorizonSvcDispatcher {
             result(context, code);
             return resume();
         }
-
-        let thread = context.thread().id();
-        let now = self.virtual_time_ns();
-        let (completion, waiting) = {
-            let mut state = context.process().address_waits().lock();
-            state.expire_address_waits(now);
-            (
-                state.take_address_result(thread),
-                state.contains_address_wait(thread),
-            )
-        };
-        if let Some(completion) = completion {
-            self.finish_wait(thread.get(), 0x34);
-            result(
-                context,
-                match completion {
-                    AddressWaitResult::Signalled => HorizonKernelResult::SUCCESS,
-                    AddressWaitResult::TimedOut => HorizonKernelResult::TIMED_OUT,
-                },
-            );
-            return resume();
-        }
-        if waiting {
-            return ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry);
-        }
-
         let permissions = if kind == 1 {
             MemoryPermissions::READ_WRITE
         } else {
@@ -67,65 +32,33 @@ impl HorizonSvcDispatcher {
         };
         let word = match AddressWord::capture(context, address, permissions) {
             Ok(word) => word,
-            Err(error) => return self.fail_address_wait_check(context, std::sync::Arc::new(error)),
+            Err(error) => return address_word_fault(context, 0x34, std::sync::Arc::new(error)),
         };
-        let deadline = (timeout > 0).then(|| now.saturating_add(timeout as u64));
-        self.suspend_for_runtime_request(
-            thread,
-            PendingRuntimeRequest::RegisterAddressWait {
-                address,
-                deadline,
-                check: AddressWaitCheck {
-                    word,
-                    kind,
-                    value,
-                    timeout,
-                },
-                source: context.source(),
-                vcpu: context.thread().vcpu(),
-            },
-            "WaitForAddress",
-        )
-    }
-
-    pub(super) fn start_address_wait_check(
-        &mut self,
-        context: &mut ExceptionDispatchContext<'_>,
-        address: u64,
-        check: AddressWaitCheck,
-    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let thread = context.thread().id();
         let waits = context.process().address_waits().clone();
-        let clock = self.virtual_clock.clone();
-        let source = context.source();
-        let vcpu = context.thread().vcpu();
-        let deadline = self
-            .pending_wakes
-            .get(&thread.get())
-            .and_then(|wait| wait.deadline);
+        let kernel = context.process().scheduler().clone();
+        let thread = context.thread().id();
+        let deadline = (timeout > 0).then(|| self.virtual_time_ns().saturating_add(timeout as u64));
         let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
         let running = lifetime.clone();
-        self.start_owned_svc(context, lifetime, deadline, async move {
-            let turn = waits.address_operation(address, thread, &clock).await;
+        self.start_owned_svc(context, lifetime, None, async move {
+            let turn = waits.address_operation(address, thread).await;
             running
                 .begin()
                 .map_err(|_| runtime_fault("WaitForAddress cancelled before its word operation"))?;
             let compared: Result<bool, std::sync::Arc<nixe_memory::MemoryError>> = async {
-                let mut observed = check.word.read_owned().await?;
+                let mut observed = word.read_owned().await?;
                 loop {
-                    let matches = if check.kind == 2 {
-                        observed as i32 == check.value
+                    if !(if kind == 2 {
+                        observed as i32 == value
                     } else {
-                        (observed as i32) < check.value
-                    };
-                    if !matches {
+                        (observed as i32) < value
+                    }) {
                         return Ok(false);
                     }
-                    if check.kind != 1 {
+                    if kind != 1 {
                         return Ok(true);
                     }
-                    let (previous, written) = check
-                        .word
+                    let (previous, written) = word
                         .compare_exchange_owned(observed, observed.wrapping_sub(1))
                         .await?;
                     if written {
@@ -135,71 +68,53 @@ impl HorizonSvcDispatcher {
                 }
             }
             .await;
-            let now = clock.scheduler_time_ns();
-            let code = {
-                let mut state = waits.lock();
-                match compared {
-                    Ok(true) => {
-                        state
-                            .finish_address_check(thread, now, check.timeout == 0)
-                            .map_err(|fault| HorizonSvcFault::Scheduling {
-                                operation: "WaitForAddress",
-                                fault,
-                            })?;
-                        state
-                            .take_address_result(thread)
-                            .map(|completion| match completion {
-                                AddressWaitResult::Signalled => HorizonKernelResult::SUCCESS,
-                                AddressWaitResult::TimedOut => HorizonKernelResult::TIMED_OUT,
-                            })
-                    }
-                    Ok(false) => {
-                        state.remove_address_wait(thread);
-                        Some(HorizonKernelResult::INVALID_STATE)
-                    }
-                    Err(error) => {
-                        state.remove_address_wait(thread);
-                        if error.is_access_fault() {
-                            Some(HorizonKernelResult::INVALID_CURRENT_MEMORY)
-                        } else {
-                            return Err(HorizonSvcFault::MemoryAccess {
-                                immediate: 0x34,
-                                fault: error,
-                            });
-                        }
-                    }
+            let immediate = match compared {
+                Ok(false) => Some(HorizonKernelResult::INVALID_STATE),
+                Ok(true) if timeout == 0 => Some(HorizonKernelResult::TIMED_OUT),
+                Ok(true) => None,
+                Err(error) if error.is_access_fault() => {
+                    Some(HorizonKernelResult::INVALID_CURRENT_MEMORY)
+                }
+                Err(fault) => {
+                    return Err(HorizonSvcFault::MemoryAccess {
+                        immediate: 0x34,
+                        fault,
+                    });
                 }
             };
+            if let Some(code) = immediate {
+                return Ok(memory_wait::SvcCompletion::Return {
+                    code,
+                    output1: None,
+                });
+            }
+            let wait = {
+                let mut state = waits.lock();
+                state
+                    .enqueue_address_wait(address, thread)
+                    .map_err(|fault| HorizonSvcFault::Scheduling {
+                        operation: "WaitForAddress",
+                        fault,
+                    })?
+            };
+            if let Some(deadline) = deadline {
+                kernel.arm_deadline(&wait, deadline);
+            }
             drop(turn);
-            Ok(super::memory_wait::SvcCompletion::kernel(
-                source,
-                vcpu,
-                move |dispatcher, context| {
-                    if let Some(code) = code {
-                        dispatcher.finish_wait(thread.get(), 0x34);
-                        result(context, code);
-                        resume()
-                    } else {
-                        ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
-                    }
-                },
-            ))
+            let outcome = wait.wait().await;
+            waits.lock().remove_address_wait(thread);
+            let code = if outcome == nixe_scheduler::WaitOutcome::TimedOut {
+                HorizonKernelResult::TIMED_OUT
+            } else if outcome == nixe_scheduler::WaitOutcome::Terminated {
+                HorizonKernelResult::CANCELLED
+            } else {
+                HorizonKernelResult::SUCCESS
+            };
+            Ok(memory_wait::SvcCompletion::Return {
+                code,
+                output1: None,
+            })
         })
-    }
-
-    fn fail_address_wait_check(
-        &mut self,
-        context: &mut ExceptionDispatchContext<'_>,
-        error: std::sync::Arc<nixe_memory::MemoryError>,
-    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let thread = context.thread().id();
-        context
-            .process()
-            .address_waits()
-            .lock()
-            .remove_address_wait(thread);
-        self.finish_wait(thread.get(), 0x34);
-        address_word_fault(context, 0x34, error)
     }
 
     pub(super) fn signal_to_address(
@@ -223,14 +138,13 @@ impl HorizonSvcDispatcher {
             }
         };
         let waits = context.process().address_waits().clone();
-        let clock = self.virtual_clock.clone();
         let thread = context.thread().id();
         let source = context.source();
         let vcpu = context.thread().vcpu();
         let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
         let running = lifetime.clone();
         self.start_owned_svc(context, lifetime, None, async move {
-            let turn = waits.address_operation(address, thread, &clock).await;
+            let turn = waits.address_operation(address, thread).await;
             running.begin().map_err(|_| {
                 runtime_fault("SignalToAddress cancelled before its word operation")
             })?;

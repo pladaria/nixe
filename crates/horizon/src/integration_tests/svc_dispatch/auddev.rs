@@ -29,7 +29,9 @@ fn modern_output_names_round_trip_volume_without_changing_the_legacy_port_list()
         let mut dispatcher = support::dispatcher(&process).with_audio_backend(backend);
         let manager = process
             .handles()
-            .insert(HorizonIpcObject::AudioRendererManager(Default::default()))
+            .insert(HorizonIpcObject::AudioRendererManager(
+                crate::AudioRendererManagerSession::new(process.scheduler()),
+            ))
             .unwrap();
         let mut params = [0; 16];
         params[..4].copy_from_slice(b"REV;"); // REV11, device API v2.
@@ -152,7 +154,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         let (_dir, mut process) = fixture_process_with_svcs(&[0x21; 100]);
         let backend = Arc::new(Backend(AtomicBool::new(true)));
         let mut dispatcher = support::dispatcher(&process).with_audio_backend(backend.clone());
-        let manager = nixe_horizon::AudioRendererManagerSession::default();
+        let manager = nixe_horizon::AudioRendererManagerSession::new(process.scheduler());
         let manager_handle = process
             .handles()
             .insert(HorizonIpcObject::AudioRendererManager(manager.clone()))
@@ -554,7 +556,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         backend.0.store(false, Ordering::Relaxed);
         let request = command(5, &[], None, None, false, false);
         write_guest_bytes(&process, process.main_thread().tls_base, &request);
-        state(&mut process).write_w(x(0), cloned);
+        process.main_thread().registers().write_w(x(0), cloned);
         let failure = dispatch_next(&mut process, &mut dispatcher);
         assert!(matches!(failure, ExceptionHandlingResult::Fault(_)));
         assert!(format!("{failure:?}").contains("shut down"));

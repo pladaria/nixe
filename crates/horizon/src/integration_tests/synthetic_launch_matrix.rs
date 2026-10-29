@@ -38,6 +38,7 @@ fn effective_npdm_service_policy_denies_unlisted_runtime_services() {
         let session = crate::IpcSession::new(service);
         assert!(matches!(
             crate::ipc::dispatch_session(
+                process.scheduler(),
                 process.mounts(),
                 &session,
                 IpcRequest::SetCurrentProcess,
@@ -66,9 +67,9 @@ fn effective_npdm_service_policy_denies_unlisted_runtime_services() {
             crate::IpcSession::new(IpcService::FileSystem),
         ))
         .unwrap();
-    let transferred = permitted
+    let transferred = process
         .handles()
-        .transfer_to(process.handles(), session)
+        .insert_object(permitted.handles().close(session).unwrap())
         .unwrap();
     let object = process
         .handles()
@@ -79,6 +80,7 @@ fn effective_npdm_service_policy_denies_unlisted_runtime_services() {
     };
     assert!(matches!(
         crate::ipc::dispatch_session(
+            process.scheduler(),
             process.mounts(),
             session,
             IpcRequest::SetCurrentProcess,
@@ -121,6 +123,7 @@ fn current_process_content_does_not_require_general_mount_permission() {
     let process = build_process(&directory, 0);
     let session = crate::IpcSession::new(IpcService::FileSystem);
     let IpcResponse::Object(filesystem) = crate::ipc::dispatch_session(
+        process.scheduler(),
         process.mounts(),
         &session,
         IpcRequest::OpenPrimaryFileSystem,
@@ -153,6 +156,7 @@ fn current_process_content_does_not_require_general_mount_permission() {
     };
 
     let IpcResponse::Object(storage) = crate::ipc::dispatch_session(
+        process.scheduler(),
         process.mounts(),
         &session,
         IpcRequest::OpenPrimaryStorage,
@@ -206,6 +210,7 @@ fn public_add_ons_remain_visible_and_readable_without_content_owner_permissions(
         let service = crate::IpcSession::new(IpcService::AddOnContent);
         {
             let IpcResponse::Size(value) = crate::ipc::dispatch_session(
+                process.scheduler(),
                 process.mounts(),
                 &service,
                 IpcRequest::GetAddOnContentCount,
@@ -217,6 +222,7 @@ fn public_add_ons_remain_visible_and_readable_without_content_owner_permissions(
             assert_eq!(value, 1);
         };
         let IpcResponse::AddOnContentEntries(entries) = crate::ipc::dispatch_session(
+            process.scheduler(),
             process.mounts(),
             &service,
             IpcRequest::ListAddOnContent {
@@ -230,6 +236,7 @@ fn public_add_ons_remain_visible_and_readable_without_content_owner_permissions(
         };
         assert_eq!(entries[0].title_id.get(), FIRST_DLC_ID);
         let IpcResponse::Object(filesystem) = crate::ipc::dispatch_session(
+            process.scheduler(),
             process.mounts(),
             &service,
             IpcRequest::OpenAddOnContent {
@@ -268,6 +275,7 @@ fn public_add_ons_remain_visible_and_readable_without_content_owner_permissions(
         };
         assert!(matches!(
             crate::ipc::dispatch_session(
+                process.scheduler(),
                 process.mounts(),
                 &service,
                 IpcRequest::OpenAddOnContent {
@@ -441,8 +449,7 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
         .unwrap();
     assert_eq!(&second_content_bytes, b"second");
 
-    let mut process = support::process_builder().build(&plan).unwrap();
-    assert_eq!(process.handles().capacity_limit(), 0x40);
+    let process = support::process_builder().build(&plan).unwrap();
     assert_eq!(process.mounts().add_ons().len(), 2);
     assert_eq!(process.modules().len(), 4);
     assert!(
@@ -460,23 +467,42 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
         .mapping
         .unwrap();
     assert_eq!(entry_mapping.kind, nixe_runtime::memory::MemoryKind::Code);
-    let state = process.main_thread().state();
+    let state_thread = process.main_thread();
+    let state = state_thread.registers();
     assert_eq!(state.read_x(A64Register::General(x(0))), 0);
-    assert_eq!(
-        state.read_x(A64Register::General(x(1))),
-        u64::from(process.main_thread().handle)
-    );
-    exercise_read_only_ipc(&mut process);
-    let _ = process.try_teardown().unwrap();
+    let handle = state.read_x(A64Register::General(x(1))) as u32;
+    assert!(std::sync::Arc::ptr_eq(
+        &process
+            .handles()
+            .lookup_as::<nixe_runtime::ThreadObject>(handle)
+            .unwrap(),
+        &state_thread
+    ));
+    drop(state);
+    exercise_read_only_ipc(&process);
+    for _ in process.handles().len()..0x40 {
+        process
+            .handles()
+            .insert(nixe_runtime::EventObject::new(process.scheduler()))
+            .unwrap();
+    }
+    assert!(matches!(
+        process
+            .handles()
+            .insert(nixe_runtime::EventObject::new(process.scheduler())),
+        Err(nixe_runtime::HandleError::Exhausted)
+    ));
+    drop(process);
 }
 
 fn x(index: u8) -> nixe_cpu::state::a64::A64GeneralRegister {
     nixe_cpu::state::a64::A64GeneralRegister::new(index).unwrap()
 }
 
-fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {
+fn exercise_read_only_ipc(process: &nixe_runtime::RunnableProcess) {
     let filesystem_session = crate::IpcSession::new(IpcService::FileSystem);
     let IpcResponse::Object(primary) = crate::ipc::dispatch_session(
+        &crate::test_memory::kernel(),
         process.mounts(),
         &filesystem_session,
         IpcRequest::OpenPrimaryFileSystem,
@@ -563,6 +589,7 @@ fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {
     let add_on_session = crate::IpcSession::new(IpcService::AddOnContent);
     {
         let IpcResponse::Size(value) = crate::ipc::dispatch_session(
+            &crate::test_memory::kernel(),
             process.mounts(),
             &add_on_session,
             IpcRequest::GetAddOnContentCount,
@@ -574,6 +601,7 @@ fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {
         assert_eq!(value, 2);
     };
     let IpcResponse::AddOnContentEntries(entries) = crate::ipc::dispatch_session(
+        &crate::test_memory::kernel(),
         process.mounts(),
         &add_on_session,
         IpcRequest::ListAddOnContent {
@@ -591,6 +619,7 @@ fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {
     assert_eq!(entries[0].mount_count, 1);
     assert!(matches!(
         crate::ipc::dispatch_session(
+            &crate::test_memory::kernel(),
             process.mounts(),
             &add_on_session,
             IpcRequest::PrepareAddOnContent {
@@ -601,6 +630,7 @@ fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {
         Err(IpcResultCode::PATH_NOT_FOUND)
     ));
     let IpcResponse::Event(add_on_event) = crate::ipc::dispatch_session(
+        &crate::test_memory::kernel(),
         process.mounts(),
         &add_on_session,
         IpcRequest::GetAddOnContentListChangedEvent,
@@ -612,6 +642,7 @@ fn exercise_read_only_ipc(process: &mut nixe_runtime::RunnableProcess) {
     assert!(!add_on_event.is_signalled());
 
     let IpcResponse::Object(add_on_filesystem) = crate::ipc::dispatch_session(
+        &crate::test_memory::kernel(),
         process.mounts(),
         &add_on_session,
         IpcRequest::OpenAddOnContent {

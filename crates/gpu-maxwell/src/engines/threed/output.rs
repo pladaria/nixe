@@ -1,11 +1,7 @@
 //! Typed fixed-function output state for `MAXWELL_B`.
 
-use crate::MaxwellMethodSource;
-
 use super::render_targets::{MaxwellThreeDRawValue, MaxwellThreeDRectangle};
-use super::state::{
-    MAXWELL_THREE_D_POLYGON_MODE_RESET, MAXWELL_THREE_D_WINDOW_ORIGIN_RESET, MaxwellThreeDRegister,
-};
+use super::state::MaxwellThreeDRegister;
 
 pub const MAXWELL_VIEWPORT_COUNT: usize = 16;
 pub const MAXWELL_SCISSOR_COUNT: usize = 16;
@@ -569,47 +565,44 @@ impl MaxwellThreeDBlendZeroTimesAnythingIsZero {
 }
 
 /// Format, arithmetic, and optimization controls shared by blend paths.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDBlendControlState {
-    per_format_enable: MaxwellThreeDRegister<MaxwellThreeDBlendPerFormatEnable>,
-    float_pixel_kill_enable: MaxwellThreeDRegister<MaxwellThreeDBlendFloatPixelKillEnable>,
-    zero_times_anything_is_zero: MaxwellThreeDRegister<MaxwellThreeDBlendZeroTimesAnythingIsZero>,
-    iterated_blend: MaxwellThreeDRegister<MaxwellThreeDIteratedBlend>,
-    iterated_blend_pass_count: MaxwellThreeDRegister<MaxwellThreeDIteratedBlendPassCount>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDBlendControlState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDBlendControlState {
+impl MaxwellThreeDBlendControlState<'_> {
     #[must_use]
-    pub const fn per_format_enable(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDBlendPerFormatEnable> {
-        &self.per_format_enable
+    pub fn per_format_enable(&self) -> MaxwellThreeDRegister<MaxwellThreeDBlendPerFormatEnable> {
+        self.registers
+            .read(0x1140, MaxwellThreeDBlendPerFormatEnable::parse)
     }
-
     #[must_use]
-    pub const fn float_pixel_kill_enable(
+    pub fn float_pixel_kill_enable(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDBlendFloatPixelKillEnable> {
-        &self.float_pixel_kill_enable
+    ) -> MaxwellThreeDRegister<MaxwellThreeDBlendFloatPixelKillEnable> {
+        self.registers.read(0x0fdc, |raw| {
+            MaxwellThreeDBlendFloatPixelKillEnable::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn zero_times_anything_is_zero(
+    pub fn zero_times_anything_is_zero(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDBlendZeroTimesAnythingIsZero> {
-        &self.zero_times_anything_is_zero
+    ) -> MaxwellThreeDRegister<MaxwellThreeDBlendZeroTimesAnythingIsZero> {
+        self.registers.read(0x19c0, |raw| {
+            MaxwellThreeDBlendZeroTimesAnythingIsZero::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn iterated_blend(&self) -> &MaxwellThreeDRegister<MaxwellThreeDIteratedBlend> {
-        &self.iterated_blend
+    pub fn iterated_blend(&self) -> MaxwellThreeDRegister<MaxwellThreeDIteratedBlend> {
+        self.registers
+            .read(0x0dd0, MaxwellThreeDIteratedBlend::parse)
     }
-
     #[must_use]
-    pub const fn iterated_blend_pass_count(
+    pub fn iterated_blend_pass_count(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDIteratedBlendPassCount> {
-        &self.iterated_blend_pass_count
+    ) -> MaxwellThreeDRegister<MaxwellThreeDIteratedBlendPassCount> {
+        self.registers.read(0x0dd4, |raw| {
+            (raw <= 0xff).then_some(MaxwellThreeDIteratedBlendPassCount::new(raw as u8))
+        })
     }
 }
 
@@ -764,7 +757,6 @@ pub enum MaxwellThreeDFixedFunctionRegister {
     BlendPerTargetEnable,
     AntiAliasEnable,
     AlphaToCoverageEnable,
-    AlphaToOneEnable,
     SampleMode,
     RasterSampleMode,
     SampleMaskControl,
@@ -828,13 +820,6 @@ pub enum MaxwellThreeDFixedFunctionRegister {
     PixelShaderSaturate,
 }
 
-impl MaxwellThreeDFixedFunctionRegister {
-    const COUNT: usize = Self::PixelShaderSaturate as usize + 1;
-    const fn index(self) -> usize {
-        self as usize
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MaxwellThreeDFixedFunctionValue {
     Boolean(bool),
@@ -893,37 +878,10 @@ impl MaxwellThreeDClipAxis {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDViewportTransformState {
-    scale: [MaxwellThreeDRegister<MaxwellThreeDRawValue>; 3],
-    offset: [MaxwellThreeDRegister<MaxwellThreeDRawValue>; 3],
-    clip_horizontal: MaxwellThreeDRegister<MaxwellThreeDClipAxis>,
-    clip_vertical: MaxwellThreeDRegister<MaxwellThreeDClipAxis>,
-    clip_min_z: MaxwellThreeDRegister<MaxwellThreeDRawValue>,
-    clip_max_z: MaxwellThreeDRegister<MaxwellThreeDRawValue>,
-    coordinate_swizzle: MaxwellThreeDRegister<MaxwellThreeDViewportCoordinateSwizzle>,
-    snap_grid_precision: MaxwellThreeDRegister<[u8; 2]>,
-}
-
-impl Default for MaxwellThreeDViewportTransformState {
-    fn default() -> Self {
-        Self {
-            scale: Default::default(),
-            offset: Default::default(),
-            clip_horizontal: Default::default(),
-            clip_vertical: Default::default(),
-            clip_min_z: MaxwellThreeDRegister::verified_reset(
-                VIEWPORT_CLIP_MIN_Z_RESET,
-                Some(MaxwellThreeDRawValue::new(VIEWPORT_CLIP_MIN_Z_RESET)),
-            ),
-            clip_max_z: MaxwellThreeDRegister::verified_reset(
-                VIEWPORT_CLIP_MAX_Z_RESET,
-                Some(MaxwellThreeDRawValue::new(VIEWPORT_CLIP_MAX_Z_RESET)),
-            ),
-            coordinate_swizzle: Default::default(),
-            snap_grid_precision: Default::default(),
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDViewportTransformState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
+    index: usize,
 }
 
 /// One signed source component selected by viewport coordinate swizzling.
@@ -1007,530 +965,444 @@ impl MaxwellThreeDViewportCoordinateSwizzle {
     }
 }
 
-impl MaxwellThreeDViewportTransformState {
+impl MaxwellThreeDViewportTransformState<'_> {
     #[must_use]
-    pub const fn scale(&self) -> &[MaxwellThreeDRegister<MaxwellThreeDRawValue>; 3] {
-        &self.scale
+    pub fn scale(&self, axis: usize) -> MaxwellThreeDRegister<MaxwellThreeDRawValue> {
+        self.registers.read(
+            (0x0a00 + self.index as u32 * 0x20) + axis as u32 * 4,
+            |raw| Some(MaxwellThreeDRawValue::new(raw)),
+        )
     }
     #[must_use]
-    pub const fn offset(&self) -> &[MaxwellThreeDRegister<MaxwellThreeDRawValue>; 3] {
-        &self.offset
+    pub fn offset(&self, axis: usize) -> MaxwellThreeDRegister<MaxwellThreeDRawValue> {
+        self.registers.read(
+            0x0a00 + self.index as u32 * 0x20 + 12 + axis as u32 * 4,
+            |raw| Some(MaxwellThreeDRawValue::new(raw)),
+        )
     }
     #[must_use]
-    pub const fn clip_horizontal(&self) -> &MaxwellThreeDRegister<MaxwellThreeDClipAxis> {
-        &self.clip_horizontal
+    pub fn clip_horizontal(&self) -> MaxwellThreeDRegister<MaxwellThreeDClipAxis> {
+        self.registers
+            .read(0x0c00 + self.index as u32 * 0x10, |raw| {
+                Some(MaxwellThreeDClipAxis::parse(raw))
+            })
     }
     #[must_use]
-    pub const fn clip_vertical(&self) -> &MaxwellThreeDRegister<MaxwellThreeDClipAxis> {
-        &self.clip_vertical
+    pub fn clip_vertical(&self) -> MaxwellThreeDRegister<MaxwellThreeDClipAxis> {
+        self.registers
+            .read(0x0c00 + self.index as u32 * 0x10 + 4, |raw| {
+                Some(MaxwellThreeDClipAxis::parse(raw))
+            })
     }
     #[must_use]
-    pub const fn clip_min_z(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRawValue> {
-        &self.clip_min_z
+    pub fn clip_min_z(&self) -> MaxwellThreeDRegister<MaxwellThreeDRawValue> {
+        self.registers
+            .read(0x0c00 + self.index as u32 * 0x10 + 8, |raw| {
+                Some(MaxwellThreeDRawValue::new(raw))
+            })
     }
     #[must_use]
-    pub const fn clip_max_z(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRawValue> {
-        &self.clip_max_z
+    pub fn clip_max_z(&self) -> MaxwellThreeDRegister<MaxwellThreeDRawValue> {
+        self.registers
+            .read(0x0c00 + self.index as u32 * 0x10 + 12, |raw| {
+                Some(MaxwellThreeDRawValue::new(raw))
+            })
     }
-    /// Additional X/Y snap-grid precision bits. Zero uses the ordinary grid.
-    /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L837-L839
     #[must_use]
-    pub const fn snap_grid_precision(&self) -> &MaxwellThreeDRegister<[u8; 2]> {
-        &self.snap_grid_precision
-    }
-
-    #[must_use]
-    pub const fn coordinate_swizzle(
+    pub fn coordinate_swizzle(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDViewportCoordinateSwizzle> {
-        &self.coordinate_swizzle
+    ) -> MaxwellThreeDRegister<MaxwellThreeDViewportCoordinateSwizzle> {
+        self.registers
+            .read(0x0a18 + self.index as u32 * 0x20, |raw| {
+                MaxwellThreeDViewportCoordinateSwizzle::parse(raw)
+            })
+    }
+    #[must_use]
+    pub fn snap_grid_precision(&self) -> MaxwellThreeDRegister<[u8; 2]> {
+        self.registers
+            .read(0x0a1c + self.index as u32 * 0x20, |raw| {
+                (raw & !0x1f1f == 0).then_some([(raw & 31) as u8, ((raw >> 8) & 31) as u8])
+            })
     }
 }
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDScissorState {
-    enable: MaxwellThreeDRegister<bool>,
-    horizontal: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
-    vertical: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
-}
-
-/// One source-preserving horizontal/vertical window-clip rectangle pair.
-///
-/// The eight pairs and their packed 16-bit minimum/maximum fields are defined
-/// by NVIDIA's pinned public class header:
-/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L855-L861>
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDWindowClipState {
-    horizontal: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
-    vertical: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
-}
-
-impl MaxwellThreeDWindowClipState {
-    #[must_use]
-    pub const fn horizontal(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRectangle> {
-        &self.horizontal
-    }
-
-    #[must_use]
-    pub const fn vertical(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRectangle> {
-        &self.vertical
-    }
-}
-impl MaxwellThreeDScissorState {
-    #[must_use]
-    pub const fn enable(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.enable
-    }
-    #[must_use]
-    pub const fn horizontal(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRectangle> {
-        &self.horizontal
-    }
-    #[must_use]
-    pub const fn vertical(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRectangle> {
-        &self.vertical
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDFixedFunctionState {
-    surface_clip_horizontal: MaxwellThreeDRegister<MaxwellThreeDClipAxis>,
-    surface_clip_vertical: MaxwellThreeDRegister<MaxwellThreeDClipAxis>,
-    viewport: [MaxwellThreeDViewportTransformState; MAXWELL_VIEWPORT_COUNT],
-    scissor: [MaxwellThreeDScissorState; MAXWELL_SCISSOR_COUNT],
-    window_clip: [MaxwellThreeDWindowClipState; MAXWELL_WINDOW_CLIP_COUNT],
-    registers: [MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue>;
-        MaxwellThreeDFixedFunctionRegister::COUNT],
-    single_rop_control: MaxwellThreeDRegister<MaxwellThreeDSingleRopControl>,
-    blend_enable: [MaxwellThreeDRegister<bool>; 8],
-    color_mask: [MaxwellThreeDRegister<MaxwellThreeDColorMask>; 8],
-    per_target_blend: [[MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue>; 7]; 8],
-    blend_controls: MaxwellThreeDBlendControlState,
-}
-impl Default for MaxwellThreeDFixedFunctionState {
-    fn default() -> Self {
-        let mut registers = std::array::from_fn(|_| Default::default());
-        for register in [
-            MaxwellThreeDFixedFunctionRegister::FrontPolygonMode,
-            MaxwellThreeDFixedFunctionRegister::BackPolygonMode,
-        ] {
-            registers[register.index()] = MaxwellThreeDRegister::verified_reset(
-                MAXWELL_THREE_D_POLYGON_MODE_RESET,
-                Some(MaxwellThreeDFixedFunctionValue::PolygonMode(
-                    MaxwellThreeDPolygonMode::Fill,
-                )),
-            );
-        }
-        registers[MaxwellThreeDFixedFunctionRegister::WindowOrigin.index()] =
-            MaxwellThreeDRegister::verified_reset(
-                MAXWELL_THREE_D_WINDOW_ORIGIN_RESET,
-                Some(MaxwellThreeDFixedFunctionValue::Mask(
-                    MAXWELL_THREE_D_WINDOW_ORIGIN_RESET,
-                )),
-            );
-        // Initialized channel-context encodings share the raw lookup used by
-        // MME shadow reads; provenance and firmware table hash live in state.rs.
-        for (register, method, value) in [
-            (
-                MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable,
-                0x192c,
-                MaxwellThreeDFixedFunctionValue::ViewportScaleOffsetEnable(
-                    MaxwellThreeDViewportScaleOffsetEnable::Enabled,
-                ),
-            ),
-            (
-                MaxwellThreeDFixedFunctionRegister::ViewportClipControl,
-                0x193c,
-                MaxwellThreeDFixedFunctionValue::ClipControl(
-                    MaxwellThreeDViewportClipControl::parse(0x2c1c).unwrap(),
-                ),
-            ),
-            (
-                MaxwellThreeDFixedFunctionRegister::BlendSeparateAlpha,
-                0x133c,
-                MaxwellThreeDFixedFunctionValue::Boolean(true),
-            ),
-            (
-                MaxwellThreeDFixedFunctionRegister::FrontFace,
-                0x191c,
-                MaxwellThreeDFixedFunctionValue::FrontFace(MaxwellThreeDFrontFace::Clockwise),
-            ),
-            (
-                MaxwellThreeDFixedFunctionRegister::CullEnable,
-                0x1918,
-                MaxwellThreeDFixedFunctionValue::Boolean(false),
-            ),
-            (
-                MaxwellThreeDFixedFunctionRegister::CullFace,
-                0x1920,
-                MaxwellThreeDFixedFunctionValue::CullFace(MaxwellThreeDCullFace::Back),
-            ),
-        ] {
-            let raw =
-                super::state::verified_raw_register_reset(nixe_gpu::GpuMethodId(method)).unwrap();
-            registers[register.index()] = MaxwellThreeDRegister::verified_reset(raw, Some(value));
-        }
-        Self {
-            surface_clip_horizontal: Default::default(),
-            surface_clip_vertical: Default::default(),
-            viewport: std::array::from_fn(|_| Default::default()),
-            scissor: std::array::from_fn(|_| Default::default()),
-            window_clip: std::array::from_fn(|_| Default::default()),
-            registers,
-            single_rop_control: {
-                let raw = super::state::verified_raw_register_reset(nixe_gpu::GpuMethodId(0x135c))
-                    .unwrap();
-                MaxwellThreeDRegister::verified_reset(
-                    raw,
-                    MaxwellThreeDSingleRopControl::parse(raw),
-                )
-            },
-            blend_enable: std::array::from_fn(|index| {
-                let raw = super::state::verified_raw_register_reset(nixe_gpu::GpuMethodId(
-                    0x1360 + index as u32 * 4,
-                ))
-                .unwrap();
-                MaxwellThreeDRegister::verified_reset(raw, Some(false))
-            }),
-            color_mask: std::array::from_fn(|index| {
-                let raw = super::state::verified_raw_register_reset(nixe_gpu::GpuMethodId(
-                    0x1a00 + index as u32 * 4,
-                ))
-                .unwrap();
-                MaxwellThreeDRegister::verified_reset(raw, MaxwellThreeDColorMask::parse(raw))
-            }),
-            per_target_blend: std::array::from_fn(|_| {
-                let mut blend = std::array::from_fn(|_| Default::default());
-                blend[0] = MaxwellThreeDRegister::verified_reset(
-                    BLEND_SEPARATE_ALPHA_RESET,
-                    Some(MaxwellThreeDFixedFunctionValue::Boolean(true)),
-                );
-                blend
-            }),
-            blend_controls: Default::default(),
-        }
-    }
-}
-impl MaxwellThreeDFixedFunctionState {
-    #[must_use]
-    pub const fn surface_clip_horizontal(&self) -> &MaxwellThreeDRegister<MaxwellThreeDClipAxis> {
-        &self.surface_clip_horizontal
-    }
-
-    #[must_use]
-    pub const fn surface_clip_vertical(&self) -> &MaxwellThreeDRegister<MaxwellThreeDClipAxis> {
-        &self.surface_clip_vertical
-    }
-
-    #[must_use]
-    pub const fn viewport(&self) -> &[MaxwellThreeDViewportTransformState; MAXWELL_VIEWPORT_COUNT] {
-        &self.viewport
-    }
-    #[must_use]
-    pub const fn scissor(&self) -> &[MaxwellThreeDScissorState; MAXWELL_SCISSOR_COUNT] {
-        &self.scissor
-    }
-    #[must_use]
-    pub const fn window_clip(&self) -> &[MaxwellThreeDWindowClipState; MAXWELL_WINDOW_CLIP_COUNT] {
-        &self.window_clip
-    }
-    #[must_use]
-    pub const fn register(
-        &self,
-        register: MaxwellThreeDFixedFunctionRegister,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue> {
-        &self.registers[register.index()]
-    }
-    #[must_use]
-    pub const fn blend_enable(&self) -> &[MaxwellThreeDRegister<bool>; 8] {
-        &self.blend_enable
-    }
-    #[must_use]
-    pub const fn single_rop_control(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDSingleRopControl> {
-        &self.single_rop_control
-    }
-    #[must_use]
-    pub const fn color_mask(&self) -> &[MaxwellThreeDRegister<MaxwellThreeDColorMask>; 8] {
-        &self.color_mask
-    }
-    #[must_use]
-    pub const fn per_target_blend(
-        &self,
-    ) -> &[[MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue>; 7]; 8] {
-        &self.per_target_blend
-    }
-    #[must_use]
-    pub const fn blend_controls(&self) -> &MaxwellThreeDBlendControlState {
-        &self.blend_controls
-    }
-
-    pub(super) fn apply(&mut self, write: MaxwellThreeDFixedFunctionWrite) {
-        let source = write.source();
-        let raw = source.argument();
-        match write {
-            MaxwellThreeDFixedFunctionWrite::SurfaceClip {
-                vertical, value, ..
-            } => {
-                let register = if vertical {
-                    &mut self.surface_clip_vertical
-                } else {
-                    &mut self.surface_clip_horizontal
-                };
-                *register = MaxwellThreeDRegister::decoded(raw, value);
-            }
-            MaxwellThreeDFixedFunctionWrite::ViewportFloat {
-                viewport,
-                field,
-                value,
-                ..
-            } => {
-                let target = &mut self.viewport[viewport as usize];
-                match field {
-                    0..=2 => {
-                        target.scale[field as usize] = MaxwellThreeDRegister::decoded(raw, value)
-                    }
-                    3..=5 => {
-                        target.offset[(field - 3) as usize] =
-                            MaxwellThreeDRegister::decoded(raw, value)
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            MaxwellThreeDFixedFunctionWrite::ViewportClip {
-                viewport,
-                vertical,
-                value,
-                ..
-            } => {
-                if vertical {
-                    self.viewport[viewport as usize].clip_vertical =
-                        MaxwellThreeDRegister::decoded(raw, value)
-                } else {
-                    self.viewport[viewport as usize].clip_horizontal =
-                        MaxwellThreeDRegister::decoded(raw, value)
-                }
-            }
-            MaxwellThreeDFixedFunctionWrite::ViewportDepth {
-                viewport,
-                maximum,
-                value,
-                ..
-            } => {
-                if maximum {
-                    self.viewport[viewport as usize].clip_max_z =
-                        MaxwellThreeDRegister::decoded(raw, value)
-                } else {
-                    self.viewport[viewport as usize].clip_min_z =
-                        MaxwellThreeDRegister::decoded(raw, value)
-                }
-            }
-            MaxwellThreeDFixedFunctionWrite::ViewportSnapGridPrecision {
-                viewport, value, ..
-            } => {
-                self.viewport[viewport as usize].snap_grid_precision =
-                    MaxwellThreeDRegister::decoded(raw, value);
-            }
-            MaxwellThreeDFixedFunctionWrite::ViewportCoordinateSwizzle {
-                viewport, value, ..
-            } => {
-                self.viewport[viewport as usize].coordinate_swizzle =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDFixedFunctionWrite::ScissorEnable { scissor, value, .. } => {
-                self.scissor[scissor as usize].enable = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDFixedFunctionWrite::ScissorRectangle {
-                scissor,
-                vertical,
-                value,
-                ..
-            } => {
-                if vertical {
-                    self.scissor[scissor as usize].vertical =
-                        MaxwellThreeDRegister::decoded(raw, value)
-                } else {
-                    self.scissor[scissor as usize].horizontal =
-                        MaxwellThreeDRegister::decoded(raw, value)
-                }
-            }
-            MaxwellThreeDFixedFunctionWrite::WindowClipRectangle {
-                region,
-                vertical,
-                value,
-                ..
-            } => {
-                if vertical {
-                    self.window_clip[region as usize].vertical =
-                        MaxwellThreeDRegister::decoded(raw, value)
-                } else {
-                    self.window_clip[region as usize].horizontal =
-                        MaxwellThreeDRegister::decoded(raw, value)
-                }
-            }
-            MaxwellThreeDFixedFunctionWrite::Register {
-                register, value, ..
-            } => self.registers[register.index()] = MaxwellThreeDRegister::decoded(raw, value),
-            MaxwellThreeDFixedFunctionWrite::SingleRopControl { value, .. } => {
-                self.single_rop_control = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDFixedFunctionWrite::BlendEnable { target, value, .. } => {
-                self.blend_enable[target as usize] = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDFixedFunctionWrite::ColorMask { target, value, .. } => {
-                self.color_mask[target as usize] = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDFixedFunctionWrite::BlendState {
-                target,
-                field,
-                value,
-                ..
-            } => {
-                self.per_target_blend[target as usize][field as usize] =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDFixedFunctionWrite::BlendPerFormatEnable { value, .. } => {
-                self.blend_controls.per_format_enable = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDFixedFunctionWrite::BlendFloatPixelKillEnable { value, .. } => {
-                self.blend_controls.float_pixel_kill_enable =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDFixedFunctionWrite::BlendZeroTimesAnythingIsZero { value, .. } => {
-                self.blend_controls.zero_times_anything_is_zero =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDFixedFunctionWrite::IteratedBlend { value, .. } => {
-                self.blend_controls.iterated_blend = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDFixedFunctionWrite::IteratedBlendPassCount { value, .. } => {
-                self.blend_controls.iterated_blend_pass_count =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellThreeDFixedFunctionWrite {
-    SurfaceClip {
-        vertical: bool,
-        value: MaxwellThreeDClipAxis,
-        source: MaxwellMethodSource,
-    },
-    ViewportFloat {
-        viewport: u8,
-        field: u8,
-        value: MaxwellThreeDRawValue,
-        source: MaxwellMethodSource,
-    },
-    ViewportClip {
-        viewport: u8,
-        vertical: bool,
-        value: MaxwellThreeDClipAxis,
-        source: MaxwellMethodSource,
-    },
-    ViewportDepth {
-        viewport: u8,
-        maximum: bool,
-        value: MaxwellThreeDRawValue,
-        source: MaxwellMethodSource,
-    },
-    ViewportSnapGridPrecision {
-        viewport: u8,
-        value: [u8; 2],
-        source: MaxwellMethodSource,
-    },
-    ViewportCoordinateSwizzle {
-        viewport: u8,
-        value: MaxwellThreeDViewportCoordinateSwizzle,
-        source: MaxwellMethodSource,
-    },
-    ScissorEnable {
-        scissor: u8,
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    ScissorRectangle {
-        scissor: u8,
-        vertical: bool,
-        value: MaxwellThreeDRectangle,
-        source: MaxwellMethodSource,
-    },
-    WindowClipRectangle {
-        region: u8,
-        vertical: bool,
-        value: MaxwellThreeDRectangle,
-        source: MaxwellMethodSource,
-    },
-    Register {
-        register: MaxwellThreeDFixedFunctionRegister,
-        value: MaxwellThreeDFixedFunctionValue,
-        source: MaxwellMethodSource,
-    },
-    SingleRopControl {
-        value: MaxwellThreeDSingleRopControl,
-        source: MaxwellMethodSource,
-    },
-    BlendEnable {
-        target: u8,
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    ColorMask {
-        target: u8,
-        value: MaxwellThreeDColorMask,
-        source: MaxwellMethodSource,
-    },
-    BlendState {
-        target: u8,
-        field: u8,
-        value: MaxwellThreeDFixedFunctionValue,
-        source: MaxwellMethodSource,
-    },
-    BlendPerFormatEnable {
-        value: MaxwellThreeDBlendPerFormatEnable,
-        source: MaxwellMethodSource,
-    },
-    BlendFloatPixelKillEnable {
-        value: MaxwellThreeDBlendFloatPixelKillEnable,
-        source: MaxwellMethodSource,
-    },
-    BlendZeroTimesAnythingIsZero {
-        value: MaxwellThreeDBlendZeroTimesAnythingIsZero,
-        source: MaxwellMethodSource,
-    },
-    IteratedBlend {
-        value: MaxwellThreeDIteratedBlend,
-        source: MaxwellMethodSource,
-    },
-    IteratedBlendPassCount {
-        value: MaxwellThreeDIteratedBlendPassCount,
-        source: MaxwellMethodSource,
-    },
+pub struct MaxwellThreeDScissorState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
+    index: usize,
 }
-impl MaxwellThreeDFixedFunctionWrite {
-    pub(super) const fn source(self) -> MaxwellMethodSource {
-        match self {
-            Self::SurfaceClip { source, .. }
-            | Self::ViewportFloat { source, .. }
-            | Self::ViewportClip { source, .. }
-            | Self::ViewportDepth { source, .. }
-            | Self::ViewportCoordinateSwizzle { source, .. }
-            | Self::ViewportSnapGridPrecision { source, .. }
-            | Self::ScissorEnable { source, .. }
-            | Self::ScissorRectangle { source, .. }
-            | Self::WindowClipRectangle { source, .. }
-            | Self::Register { source, .. }
-            | Self::SingleRopControl { source, .. }
-            | Self::BlendEnable { source, .. }
-            | Self::ColorMask { source, .. }
-            | Self::BlendState { source, .. }
-            | Self::BlendPerFormatEnable { source, .. }
-            | Self::BlendFloatPixelKillEnable { source, .. }
-            | Self::BlendZeroTimesAnythingIsZero { source, .. }
-            | Self::IteratedBlend { source, .. }
-            | Self::IteratedBlendPassCount { source, .. } => source,
+impl MaxwellThreeDScissorState<'_> {
+    #[must_use]
+    pub fn enable(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers
+            .read(0x0e00 + self.index as u32 * 0x10, |raw| {
+                (raw <= 1).then_some(raw != 0)
+            })
+    }
+    #[must_use]
+    pub fn horizontal(&self) -> MaxwellThreeDRegister<MaxwellThreeDRectangle> {
+        self.registers
+            .read(0x0e00 + self.index as u32 * 0x10 + 4, |raw| {
+                super::rectangle(raw)
+            })
+    }
+    #[must_use]
+    pub fn vertical(&self) -> MaxwellThreeDRegister<MaxwellThreeDRectangle> {
+        self.registers
+            .read(0x0e00 + self.index as u32 * 0x10 + 8, |raw| {
+                super::rectangle(raw)
+            })
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDWindowClipState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
+    index: usize,
+}
+impl MaxwellThreeDWindowClipState<'_> {
+    #[must_use]
+    pub fn horizontal(&self) -> MaxwellThreeDRegister<MaxwellThreeDRectangle> {
+        self.registers
+            .read(0x0d00 + self.index as u32 * 8, super::rectangle)
+    }
+    #[must_use]
+    pub fn vertical(&self) -> MaxwellThreeDRegister<MaxwellThreeDRectangle> {
+        self.registers
+            .read(0x0d00 + self.index as u32 * 8 + 4, |raw| {
+                super::rectangle(raw)
+            })
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDFixedFunctionState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
+}
+impl<'a> MaxwellThreeDFixedFunctionState<'a> {
+    #[must_use]
+    pub fn surface_clip_horizontal(&self) -> MaxwellThreeDRegister<MaxwellThreeDClipAxis> {
+        self.registers
+            .read(0x0ff4, |raw| Some(MaxwellThreeDClipAxis::parse(raw)))
+    }
+    #[must_use]
+    pub fn surface_clip_vertical(&self) -> MaxwellThreeDRegister<MaxwellThreeDClipAxis> {
+        self.registers
+            .read(0x0ff8, |raw| Some(MaxwellThreeDClipAxis::parse(raw)))
+    }
+    #[must_use]
+    pub fn viewport(&self, index: usize) -> MaxwellThreeDViewportTransformState<'a> {
+        MaxwellThreeDViewportTransformState {
+            registers: self.registers,
+            index,
+        }
+    }
+    #[must_use]
+    pub fn scissor(&self, index: usize) -> MaxwellThreeDScissorState<'a> {
+        MaxwellThreeDScissorState {
+            registers: self.registers,
+            index,
+        }
+    }
+    #[must_use]
+    pub fn window_clip(&self, index: usize) -> MaxwellThreeDWindowClipState<'a> {
+        MaxwellThreeDWindowClipState {
+            registers: self.registers,
+            index,
+        }
+    }
+    #[must_use]
+    pub fn register(
+        &self,
+        register: MaxwellThreeDFixedFunctionRegister,
+    ) -> MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue> {
+        use MaxwellThreeDFixedFunctionRegister as R;
+        use MaxwellThreeDFixedFunctionValue as V;
+        match register {
+            R::RasterEnable => self
+                .registers
+                .read(0x037c, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::FrontPolygonMode => self.registers.read(0x0dac, |raw| {
+                MaxwellThreeDPolygonMode::parse(raw).map(V::PolygonMode)
+            }),
+            R::BackPolygonMode => self.registers.read(0x0db0, |raw| {
+                MaxwellThreeDPolygonMode::parse(raw).map(V::PolygonMode)
+            }),
+            R::PolygonOffsetPointEnable => self
+                .registers
+                .read(0x0dc0, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::PolygonOffsetLineEnable => self
+                .registers
+                .read(0x0dc4, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::PolygonOffsetFillEnable => self
+                .registers
+                .read(0x0dc8, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::WindowOffsetX => self
+                .registers
+                .read(0x0df8, |raw| (raw & !0x1ffff == 0).then_some(V::Mask(raw))),
+            R::WindowOffsetY => self
+                .registers
+                .read(0x0dfc, |raw| (raw & !0x3ffff == 0).then_some(V::Mask(raw))),
+            R::BackStencilReference => self
+                .registers
+                .read(0x0f54, |raw| (raw & !0xff == 0).then_some(V::Mask(raw))),
+            R::BackStencilWriteMask => self
+                .registers
+                .read(0x0f58, |raw| (raw & !0xff == 0).then_some(V::Mask(raw))),
+            R::BackStencilCompareMask => self
+                .registers
+                .read(0x0f5c, |raw| (raw & !0xff == 0).then_some(V::Mask(raw))),
+            R::SingleColorTargetWriteControl => self
+                .registers
+                .read(0x0f90, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::DepthBoundsMin => self.registers.read(0x0f9c, |raw| {
+                Some(V::FloatBits(MaxwellThreeDRawValue::new(raw)))
+            }),
+            R::DepthBoundsMax => self.registers.read(0x0fa0, |raw| {
+                Some(V::FloatBits(MaxwellThreeDRawValue::new(raw)))
+            }),
+            R::SampleMaskControl => self
+                .registers
+                .read(0x0fa4, |raw| (raw & !0x11 == 0).then_some(V::Mask(raw))),
+            R::RasterSampleMode => self.registers.read(0x0fb8, |raw| {
+                MaxwellThreeDSampleMode::parse(raw)
+                    .map(V::SampleMode)
+                    .filter(|value| {
+                        matches!(
+                            value,
+                            V::SampleMode(
+                                MaxwellThreeDSampleMode::Samples1x1
+                                    | MaxwellThreeDSampleMode::Samples2x2
+                                    | MaxwellThreeDSampleMode::Samples4x2D3D
+                                    | MaxwellThreeDSampleMode::Samples2x1D3D
+                                    | MaxwellThreeDSampleMode::Samples4x4
+                            )
+                        )
+                    })
+            }),
+            R::SampleMask0 => self
+                .registers
+                .read(0x0fbc, |raw| (raw & !0xffff == 0).then_some(V::Mask(raw))),
+            R::SampleMask1 => self
+                .registers
+                .read(0x0fc0, |raw| (raw & !0xffff == 0).then_some(V::Mask(raw))),
+            R::SampleMask2 => self
+                .registers
+                .read(0x0fc4, |raw| (raw & !0xffff == 0).then_some(V::Mask(raw))),
+            R::SampleMask3 => self
+                .registers
+                .read(0x0fc8, |raw| (raw & !0xffff == 0).then_some(V::Mask(raw))),
+            R::DepthTestEnable => self
+                .registers
+                .read(0x12cc, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::ShadeMode => self.registers.read(0x12d4, |raw| {
+                MaxwellThreeDShadeMode::parse(raw).map(V::ShadeMode)
+            }),
+            R::BlendPerTargetEnable => self
+                .registers
+                .read(0x12e4, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::DepthWriteEnable => self
+                .registers
+                .read(0x12e8, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::AlphaTestEnable => self
+                .registers
+                .read(0x12ec, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::DepthCompare => self.registers.read(0x130c, |raw| {
+                MaxwellThreeDCompareOp::parse(raw).map(V::Compare)
+            }),
+            R::AlphaTestReference => self.registers.read(0x1310, |raw| {
+                Some(V::FloatBits(MaxwellThreeDRawValue::new(raw)))
+            }),
+            R::AlphaTestFunction => self.registers.read(0x1314, |raw| {
+                MaxwellThreeDCompareOp::parse(raw).map(V::Compare)
+            }),
+            R::BlendConstantRed => self.registers.read(0x131c, |raw| {
+                Some(V::FloatBits(MaxwellThreeDRawValue::new(raw)))
+            }),
+            R::BlendConstantGreen => self.registers.read(0x1320, |raw| {
+                Some(V::FloatBits(MaxwellThreeDRawValue::new(raw)))
+            }),
+            R::BlendConstantBlue => self.registers.read(0x1324, |raw| {
+                Some(V::FloatBits(MaxwellThreeDRawValue::new(raw)))
+            }),
+            R::BlendConstantAlpha => self.registers.read(0x1328, |raw| {
+                Some(V::FloatBits(MaxwellThreeDRawValue::new(raw)))
+            }),
+            R::BlendSeparateAlpha => self
+                .registers
+                .read(0x133c, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::BlendColorOp => self.registers.read(0x1340, |raw| {
+                MaxwellThreeDBlendOp::parse(raw).map(V::BlendOp)
+            }),
+            R::BlendColorSource => self.registers.read(0x1344, |raw| {
+                MaxwellThreeDBlendFactor::parse(raw).map(V::BlendFactor)
+            }),
+            R::BlendColorDestination => self.registers.read(0x1348, |raw| {
+                MaxwellThreeDBlendFactor::parse(raw).map(V::BlendFactor)
+            }),
+            R::BlendAlphaOp => self.registers.read(0x134c, |raw| {
+                MaxwellThreeDBlendOp::parse(raw).map(V::BlendOp)
+            }),
+            R::BlendAlphaSource => self.registers.read(0x1350, |raw| {
+                MaxwellThreeDBlendFactor::parse(raw).map(V::BlendFactor)
+            }),
+            R::BlendAlphaDestination => self.registers.read(0x1358, |raw| {
+                MaxwellThreeDBlendFactor::parse(raw).map(V::BlendFactor)
+            }),
+            R::StencilTestEnable => self
+                .registers
+                .read(0x1380, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::FrontStencilFail => self.registers.read(0x1384, |raw| {
+                MaxwellThreeDStencilOp::parse(raw).map(V::StencilOp)
+            }),
+            R::FrontStencilDepthFail => self.registers.read(0x1388, |raw| {
+                MaxwellThreeDStencilOp::parse(raw).map(V::StencilOp)
+            }),
+            R::FrontStencilPass => self.registers.read(0x138c, |raw| {
+                MaxwellThreeDStencilOp::parse(raw).map(V::StencilOp)
+            }),
+            R::FrontStencilCompare => self.registers.read(0x1390, |raw| {
+                MaxwellThreeDCompareOp::parse(raw).map(V::Compare)
+            }),
+            R::FrontStencilReference => self
+                .registers
+                .read(0x1394, |raw| (raw & !0xff == 0).then_some(V::Mask(raw))),
+            R::FrontStencilCompareMask => self
+                .registers
+                .read(0x1398, |raw| (raw & !0xff == 0).then_some(V::Mask(raw))),
+            R::FrontStencilWriteMask => self
+                .registers
+                .read(0x139c, |raw| (raw & !0xff == 0).then_some(V::Mask(raw))),
+            R::PixelShaderSaturate => self.registers.read(0x13a8, |raw| {
+                MaxwellThreeDPixelShaderSaturate::parse(raw).map(V::PixelShaderSaturate)
+            }),
+            R::WindowOrigin => self
+                .registers
+                .read(0x13ac, |raw| (raw & !0x11 == 0).then_some(V::Mask(raw))),
+            R::LineWidth => self.registers.read(0x13b0, |raw| {
+                Some(V::FloatBits(MaxwellThreeDRawValue::new(raw)))
+            }),
+            R::UserClipEnable => self
+                .registers
+                .read(0x1510, |raw| (raw & !0xff == 0).then_some(V::Mask(raw))),
+            R::AntiAliasEnable => self
+                .registers
+                .read(0x1534, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::SlopeScaleDepthBias => self.registers.read(0x156c, |raw| {
+                Some(V::FloatBits(MaxwellThreeDRawValue::new(raw)))
+            }),
+            R::TwoSidedStencilTestEnable => self
+                .registers
+                .read(0x1594, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::BackStencilFail => self.registers.read(0x1598, |raw| {
+                MaxwellThreeDStencilOp::parse(raw).map(V::StencilOp)
+            }),
+            R::BackStencilDepthFail => self.registers.read(0x159c, |raw| {
+                MaxwellThreeDStencilOp::parse(raw).map(V::StencilOp)
+            }),
+            R::BackStencilPass => self.registers.read(0x15a0, |raw| {
+                MaxwellThreeDStencilOp::parse(raw).map(V::StencilOp)
+            }),
+            R::BackStencilCompare => self.registers.read(0x15a4, |raw| {
+                MaxwellThreeDCompareOp::parse(raw).map(V::Compare)
+            }),
+            R::DepthBias => self.registers.read(0x15bc, |raw| {
+                Some(V::FloatBits(MaxwellThreeDRawValue::new(raw)))
+            }),
+            R::SampleMode => self.registers.read(0x15d0, |raw| {
+                MaxwellThreeDSampleMode::parse(raw).map(V::SampleMode)
+            }),
+            R::ProvokingVertex => self.registers.read(0x1684, |raw| {
+                MaxwellThreeDProvokingVertex::parse(raw).map(V::ProvokingVertex)
+            }),
+            R::TwoSidedLightEnable => self
+                .registers
+                .read(0x1688, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::DepthBiasClamp => self.registers.read(0x187c, |raw| {
+                Some(V::FloatBits(MaxwellThreeDRawValue::new(raw)))
+            }),
+            R::CullEnable => self
+                .registers
+                .read(0x1918, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::FrontFace => self.registers.read(0x191c, |raw| {
+                MaxwellThreeDFrontFace::parse(raw).map(V::FrontFace)
+            }),
+            R::CullFace => self.registers.read(0x1920, |raw| {
+                MaxwellThreeDCullFace::parse(raw).map(V::CullFace)
+            }),
+            R::ViewportScaleOffsetEnable => self.registers.read(0x192c, |raw| {
+                MaxwellThreeDViewportScaleOffsetEnable::parse(raw).map(V::ViewportScaleOffsetEnable)
+            }),
+            R::ViewportClipControl => self.registers.read(0x193c, |raw| {
+                MaxwellThreeDViewportClipControl::parse(raw).map(V::ClipControl)
+            }),
+            R::UserClipOperation => self.registers.read(0x1940, |raw| {
+                (raw & !0x11111111 == 0).then_some(V::Mask(raw))
+            }),
+            R::WindowClipEnable => self
+                .registers
+                .read(0x194c, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::WindowClipType => self.registers.read(0x1950, |raw| {
+                MaxwellThreeDWindowClipType::parse(raw).map(V::WindowClipType)
+            }),
+            R::ClipIdTestEnable => self.registers.read(0x197c, |raw| {
+                MaxwellThreeDClipIdTestEnable::parse(raw).map(V::ClipIdTestEnable)
+            }),
+            R::DepthBoundsEnable => self
+                .registers
+                .read(0x19bc, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::LogicOpEnable => self
+                .registers
+                .read(0x19c4, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::LogicOpFunction => self.registers.read(0x19c8, |raw| {
+                MaxwellThreeDLogicOp::parse(raw).map(V::LogicOp)
+            }),
+            R::ColorClampEnable => self
+                .registers
+                .read(0x2600, |raw| (raw <= 1).then_some(V::Boolean(raw != 0))),
+            R::AlphaToCoverageEnable => self.registers.read(0x153c, |raw| {
+                (raw & !0x11 == 0).then_some(V::AlphaControl {
+                    alpha_to_coverage: raw & 1 != 0,
+                    alpha_to_one: raw & 0x10 != 0,
+                })
+            }),
+        }
+    }
+    #[must_use]
+    pub fn blend_enable(&self, target: usize) -> MaxwellThreeDRegister<bool> {
+        self.registers.read(0x1360 + target as u32 * 4, |raw| {
+            (raw <= 1).then_some(raw != 0)
+        })
+    }
+    #[must_use]
+    pub fn color_mask(&self, target: usize) -> MaxwellThreeDRegister<MaxwellThreeDColorMask> {
+        self.registers.read(0x1a00 + target as u32 * 4, |raw| {
+            MaxwellThreeDColorMask::parse(raw)
+        })
+    }
+    #[must_use]
+    pub fn single_rop_control(&self) -> MaxwellThreeDRegister<MaxwellThreeDSingleRopControl> {
+        self.registers
+            .read(0x135c, MaxwellThreeDSingleRopControl::parse)
+    }
+    #[must_use]
+    pub fn per_target_blend(
+        &self,
+        target: usize,
+        field: usize,
+    ) -> MaxwellThreeDRegister<MaxwellThreeDFixedFunctionValue> {
+        use MaxwellThreeDFixedFunctionValue as V;
+        self.registers.read(
+            0x1e00 + target as u32 * 0x20 + field as u32 * 4,
+            |raw| match field {
+                0 => (raw <= 1).then_some(V::Boolean(raw != 0)),
+                1 | 4 => MaxwellThreeDBlendOp::parse(raw).map(V::BlendOp),
+                2 | 3 | 5 | 6 => MaxwellThreeDBlendFactor::parse(raw).map(V::BlendFactor),
+                _ => None,
+            },
+        )
+    }
+    #[must_use]
+    pub fn blend_controls(&self) -> MaxwellThreeDBlendControlState<'a> {
+        MaxwellThreeDBlendControlState {
+            registers: self.registers,
         }
     }
 }

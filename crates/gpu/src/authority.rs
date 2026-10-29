@@ -68,6 +68,7 @@ fn prune_on_insert<T>(entries: &mut Vec<T>, next: &mut usize, keep: impl FnMut(&
 }
 struct Resource<R> {
     aliases: Vec<R>,
+    overlaps: FxHashSet<R>,
     modification: u64,
     footprints: Vec<Arc<Footprint>>,
     registrations: Vec<IntervalKey>,
@@ -225,12 +226,13 @@ impl<R: Copy + Eq + Hash> Authority<R> {
         // Retain overlap relationships at registration rather than rediscovering
         // them while binding each draw's images.
         // https://github.com/eden-emulator/mirror/blob/master/src/video_core/texture_cache/image_base.h
-        let mut aliases = FxHashSet::default();
+        let mut overlaps = FxHashSet::default();
         for footprint in &footprints {
-            aliases.extend(self.candidates(footprint));
+            overlaps.extend(self.candidates(footprint));
         }
-        let aliases: Vec<_> = aliases
-            .into_iter()
+        let aliases: Vec<_> = overlaps
+            .iter()
+            .copied()
             .filter(|candidate| {
                 footprints.iter().any(|f| {
                     self.resources[candidate]
@@ -272,6 +274,7 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             resource,
             Resource {
                 aliases: aliases.clone(),
+                overlaps: overlaps.clone(),
                 modification: 0,
                 footprints,
                 registrations,
@@ -289,7 +292,22 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                 .aliases
                 .push(resource);
         }
+        for overlap in overlaps {
+            self.resources
+                .get_mut(&overlap)
+                .unwrap()
+                .overlaps
+                .insert(resource);
+        }
         Ok(())
+    }
+    /// Conservative physical relationships of registered resources. A false
+    /// result proves disjointness without traversing either resource's planes.
+    /// Native-compatible aliases remain separate from incompatible heap reuse.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/image_base.h#L118-L119
+    pub fn resources_may_overlap(&self, resource: R, other: R) -> bool {
+        let entry = &self.resources[&resource];
+        resource == other || entry.overlaps.contains(&other)
     }
     /// Cold resource interpretation lookup uses this same physical index.
     /// These are candidates only; the caller compares its complete geometry.
@@ -1414,6 +1432,13 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             self.remove_writer(id);
         }
         let entry = self.resources.remove(&resource).unwrap();
+        for overlap in entry.overlaps {
+            self.resources
+                .get_mut(&overlap)
+                .unwrap()
+                .overlaps
+                .remove(&resource);
+        }
         for alias in entry.aliases {
             self.resources
                 .get_mut(&alias)

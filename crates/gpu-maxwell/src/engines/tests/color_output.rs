@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn color_mask_selector_starts_with_independent_masks_in_live_and_shadow_state() {
+    let mut channel = three_d_channel();
+    let register = channel
+        .three_d()
+        .fixed_function()
+        .register(MaxwellThreeDFixedFunctionRegister::SingleColorTargetWriteControl);
+    assert_eq!(register.raw(), Some(0));
+    assert_eq!(
+        register.value(),
+        Some(&MaxwellThreeDFixedFunctionValue::Boolean(false))
+    );
+
+    program_three_d(&mut channel, 0x124, 3);
+    let dispatch = dispatch_method(&mut channel, 0x0f90 / 4, u32::MAX).unwrap();
+    assert_eq!(dispatch.methods()[0].method().source().argument(), 0);
+    program_three_d(&mut channel, 0x124, 0);
+    program_three_d(&mut channel, 0x0f90, 1);
+    program_three_d(&mut channel, 0x124, 3);
+    let dispatch = dispatch_method(&mut channel, 0x0f90 / 4, 0).unwrap();
+    assert_eq!(dispatch.methods()[0].method().source().argument(), 1);
+}
+
+#[test]
 fn separate_alpha_initial_state_is_consistent_across_targets_and_shadow_replay() {
     for _ in 0..2 {
         let mut channel = three_d_channel();
@@ -15,7 +38,10 @@ fn separate_alpha_initial_state_is_consistent_across_targets_and_shadow_replay()
                 )
             } else {
                 (
-                    &channel.three_d().fixed_function().per_target_blend()[target][0],
+                    channel
+                        .three_d()
+                        .fixed_function()
+                        .per_target_blend(target, 0),
                     0x1e00 + target as u32 * 0x20,
                 )
             };
@@ -48,7 +74,11 @@ fn separate_alpha_initial_state_is_consistent_across_targets_and_shadow_replay()
         for target in 0..8 {
             program_three_d(&mut channel, 0x1e00 + target * 0x20, u32::MAX);
             assert_eq!(
-                channel.three_d().fixed_function().per_target_blend()[target as usize][0].raw(),
+                channel
+                    .three_d()
+                    .fixed_function()
+                    .per_target_blend(target as usize, 0)
+                    .raw(),
                 Some(1)
             );
         }
@@ -58,7 +88,11 @@ fn separate_alpha_initial_state_is_consistent_across_targets_and_shadow_replay()
         program_three_d(&mut channel, 0x124, 3);
         program_three_d(&mut channel, 0x1e00, 0);
         assert_eq!(
-            channel.three_d().fixed_function().per_target_blend()[0][0].raw(),
+            channel
+                .three_d()
+                .fixed_function()
+                .per_target_blend(0, 0)
+                .raw(),
             Some(1)
         );
         // A tracked write must subsequently override that initial value.
@@ -67,7 +101,11 @@ fn separate_alpha_initial_state_is_consistent_across_targets_and_shadow_replay()
         program_three_d(&mut channel, 0x124, 3);
         program_three_d(&mut channel, 0x1e00, 1);
         assert_eq!(
-            channel.three_d().fixed_function().per_target_blend()[0][0].raw(),
+            channel
+                .three_d()
+                .fixed_function()
+                .per_target_blend(0, 0)
+                .raw(),
             Some(0)
         );
     }

@@ -181,7 +181,7 @@ pub(in crate::ipc_wire) fn dispatch_network_general_service(
             },
         ));
     }
-    let session = NetworkRequestSession::new();
+    let session = NetworkRequestSession::new(process.kernel());
     if is_domain {
         let Some(id) =
             manager.and_then(|m| m.insert_object(NetworkInterfaceObject::Request(session)))

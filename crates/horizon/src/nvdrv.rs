@@ -75,6 +75,7 @@ pub(crate) const NV_CONFIG_VAR_NOT_FOUND: u32 = 0x3_0006;
 
 #[derive(Debug)]
 struct NvDrvClientState {
+    kernel: Arc<nixe_scheduler::SchedulerState>,
     machine: Machine,
     initialized: bool,
     transfer_memory_size: u32,
@@ -134,13 +135,22 @@ pub struct NvDrvSession {
 
 impl NvDrvSession {
     #[must_use]
-    pub fn new(machine: Machine) -> Self {
-        Self::new_with_executor(machine.clone(), NvDrvGpuExecutor::new(machine))
+    pub fn new(machine: Machine, kernel: &Arc<nixe_scheduler::SchedulerState>) -> Self {
+        Self::new_with_executor(
+            machine.clone(),
+            kernel,
+            NvDrvGpuExecutor::new(machine, kernel),
+        )
     }
 
     /// Startup composition; neither worker erases the selected command representation.
     #[must_use]
-    pub fn with_gpu_frontend<E, L>(machine: Machine, execution: E, frontend: L) -> Self
+    pub fn with_gpu_frontend<E, L>(
+        machine: Machine,
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
+        execution: E,
+        frontend: L,
+    ) -> Self
     where
         L: nixe_gpu_maxwell::MaxwellFrontend,
         E: nixe_gpu::GpuExecution<
@@ -150,14 +160,20 @@ impl NvDrvSession {
     {
         Self::new_with_executor(
             machine.clone(),
-            NvDrvGpuExecutor::with_frontend(machine, Some(execution), frontend),
+            kernel,
+            NvDrvGpuExecutor::with_frontend(machine, kernel, Some(execution), frontend),
         )
     }
 
-    fn new_with_executor(machine: Machine, gpu_executor: NvDrvGpuExecutor) -> Self {
+    fn new_with_executor(
+        machine: Machine,
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
+        gpu_executor: NvDrvGpuExecutor,
+    ) -> Self {
         Self {
             connection_id: NvDrvSessionId::ROOT,
             state: Arc::new(Mutex::new(NvDrvClientState {
+                kernel: kernel.clone(),
                 machine,
                 initialized: false,
                 transfer_memory_size: 0,
@@ -169,8 +185,8 @@ impl NvDrvSession {
                 next_gpu_address_space_id: 1,
                 gpu_address_spaces: Arc::new(Mutex::new(BTreeMap::new())),
                 next_gpu_channel_id: 1,
-                nvhost_gpu: Arc::new(Mutex::new(NvHostGpu::new())),
-                nvhost_control: Arc::new(Mutex::new(NvHostControl::default())),
+                nvhost_gpu: Arc::new(Mutex::new(NvHostGpu::new(kernel))),
+                nvhost_control: Arc::new(Mutex::new(NvHostControl::new(kernel))),
                 nvhost_control_gpu: BTreeMap::new(),
                 zbc_tables: NvHostZbcTables::default(),
                 nvmap: NvMapObjects::default(),
@@ -338,9 +354,8 @@ impl NvDrvSession {
         state.next_fd = next_fd;
         state.devices.insert(fd, descriptor);
         if kind == NvDrvDeviceKind::HostControlGpu {
-            state
-                .nvhost_control_gpu
-                .insert(fd, NvHostControlGpuEvents::new());
+            let events = NvHostControlGpuEvents::new(&state.kernel);
+            state.nvhost_control_gpu.insert(fd, events);
         }
         if kind == NvDrvDeviceKind::HostControl {
             state
@@ -1568,7 +1583,8 @@ fn write_u64(output: &mut [u8], offset: usize, value: u64) -> Result<(), u32> {
 mod tests {
     #[test]
     fn driver_status_reports_only_the_initialized_transfer_heap() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         assert_eq!(session.status(), ([0; 32], NV_NOT_INITIALIZED));
         session.initialize(0x800000);
         let (status, result) = session.status();
@@ -1629,7 +1645,8 @@ mod tests {
 
     #[test]
     fn ioctl3_characteristics_match_ordinary_output_and_copy_complete_records() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let mut input = vec![0; 0xb0];
@@ -1672,7 +1689,8 @@ mod tests {
 
     #[test]
     fn ioctl3_tpc_masks_use_inline_output_without_a_legacy_user_pointer() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let memory = crate::test_memory::process(session.state.lock().unwrap().machine.clone());
@@ -1703,7 +1721,8 @@ mod tests {
 
     #[test]
     fn nvmap_allocation_retains_guest_address_identity() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let memory = crate::test_memory::process(session.state.lock().unwrap().machine.clone());
         let address_space = memory.space().identity();
         memory
@@ -1761,7 +1780,8 @@ mod tests {
 
     #[test]
     fn nvmap_translation_failure_does_not_publish_partial_allocation_state() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let memory = crate::test_memory::process(session.state.lock().unwrap().machine.clone());
         let address_space = memory.space().identity();
         session.initialize(0);
@@ -1799,7 +1819,8 @@ mod tests {
 
     #[test]
     fn nvmap_import_preserves_handle_identity_until_the_last_reference_is_freed() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let memory = crate::test_memory::process(session.state.lock().unwrap().machine.clone());
         let address_space = memory.space().identity();
         memory
@@ -1942,7 +1963,8 @@ mod tests {
 
     #[test]
     fn nvmap_validates_wire_fields_permissions_coverage_and_duplicate_allocation() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let memory = crate::test_memory::process(session.state.lock().unwrap().machine.clone());
         let address_space = memory.space().identity();
         memory
@@ -2143,7 +2165,8 @@ mod tests {
 
     #[test]
     fn cloned_sessions_aliases_imports_ownership_and_teardown_are_coherent() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let clone = session.clone_connection().unwrap();
         let memory = crate::test_memory::process(session.state.lock().unwrap().machine.clone());
         let address_space = memory.space().identity();
@@ -2283,7 +2306,8 @@ mod tests {
             (foreign_caller_param.to_vec(), NV_BAD_PARAMETER)
         );
 
-        let foreign = NvDrvSession::new(crate::test_memory::machine());
+        let foreign =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         foreign.set_aruid(6, 0x66);
         foreign.initialize(0);
         let foreign_fd = foreign.open(b"/dev/nvmap", 6).unwrap();
@@ -2326,7 +2350,8 @@ mod tests {
 
     #[test]
     fn ctrl_config_query_reports_retail_config_unavailability() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl", 1).unwrap();
         let mut input = [0; 0x183];
@@ -2345,7 +2370,8 @@ mod tests {
 
     #[test]
     fn ctrl_gpu_time_uses_shared_virtual_nanoseconds() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let clock = nixe_runtime::VirtualClock::new(nixe_runtime::VirtualClockMode::Fixed {
@@ -2387,7 +2413,8 @@ mod tests {
 
     #[test]
     fn ctrl_gpu_discovery_ioctls_encode_exact_switch_1_bytes() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let mut input = vec![0_u8; 0xb0];
@@ -2457,7 +2484,8 @@ mod tests {
 
     #[test]
     fn ctrl_gpu_discovery_rejects_malformed_sizes_and_invalid_arguments() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
 
@@ -2509,7 +2537,8 @@ mod tests {
 
     #[test]
     fn ctrl_gpu_zbc_registrations_are_shared_deduplicated_and_queryable() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
         let other_fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
@@ -2649,7 +2678,8 @@ mod tests {
 
     #[test]
     fn missing_emulator_semantics_are_distinct_from_driver_results() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
 
         assert!(matches!(
@@ -2707,7 +2737,8 @@ mod tests {
 
     #[test]
     fn teardown_releases_nvdrv_state_and_is_idempotent() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let map_fd = session.open(b"/dev/nvmap", 1).unwrap();
         let _gpu_fd = session.open(b"/dev/nvhost-ctrl-gpu", 1).unwrap();
@@ -2731,7 +2762,8 @@ mod tests {
 
     #[test]
     fn host_clone_preserves_connection_without_allocating_guest_state() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let clone = session.clone();
 
         assert_eq!(clone.connection_id(), session.connection_id());
@@ -2743,7 +2775,8 @@ mod tests {
 
     #[test]
     fn cloned_connections_share_client_identity_and_descriptor_table() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let clone = session.clone_connection().unwrap();
 
         assert_ne!(clone.connection_id(), session.connection_id());
@@ -2775,7 +2808,8 @@ mod tests {
 
     #[test]
     fn as_gpu_descriptors_own_distinct_profile_bound_address_spaces() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let clone = session.clone_connection().unwrap();
         session.initialize(0);
 
@@ -2822,7 +2856,8 @@ mod tests {
     fn gpu_channel_user_data_round_trips_all_bits_and_follows_channel_lifetime() {
         const SET: u32 = 0x4008_4714;
         const GET: u32 = 0x8008_4715;
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let clone = session.clone_connection().unwrap();
         let fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
@@ -2877,7 +2912,8 @@ mod tests {
 
     #[test]
     fn gpu_error_notifier_ignores_legacy_buffer_fields_and_uses_nonzero_enable() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
         let other_fd = session.open(b"/dev/nvhost-gpu", 1).unwrap();
@@ -2934,7 +2970,8 @@ mod tests {
 
     #[test]
     fn libnx_gpu_channel_creation_retains_typed_frontend_state() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let nvmap_fd = session.open(b"/dev/nvmap", 1).unwrap();
         let as_fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
@@ -3113,7 +3150,8 @@ mod tests {
             (false, true, true),
             (true, true, true),
         ] {
-            let session = NvDrvSession::new(crate::test_memory::machine());
+            let session =
+                NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
             session.initialize(0);
             let nvmap_fd = session.open(b"/dev/nvmap", 1).unwrap();
             let control_fd = session.open(b"/dev/nvhost-ctrl", 1).unwrap();
@@ -3293,7 +3331,8 @@ mod tests {
 
     #[test]
     fn gpfifo_pending_close_and_process_teardown_preserve_no_false_progress() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let nvmap_fd = session.open(b"/dev/nvmap", 1).unwrap();
         let control_fd = session.open(b"/dev/nvhost-ctrl", 1).unwrap();
@@ -3483,7 +3522,8 @@ mod tests {
 
     #[test]
     fn as_gpu_initialization_and_region_query_encode_exact_switch_bytes() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
         let mut initialize = [0_u8; 40];
@@ -3516,7 +3556,8 @@ mod tests {
 
     #[test]
     fn as_gpu_reservations_allocate_and_free_exact_ranges() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
         let mut initialize = [0_u8; 40];
@@ -3585,7 +3626,8 @@ mod tests {
 
     #[test]
     fn as_gpu_maps_aligned_nvmap_extent_without_changing_logical_size() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let memory = crate::test_memory::process(session.state.lock().unwrap().machine.clone());
         let cpu_space = memory.space().identity();
         let cpu_address = GuestVirtualAddress::new(0x20_0000);
@@ -3761,7 +3803,8 @@ mod tests {
 
     #[test]
     fn as_gpu_maps_aliases_and_unmaps_retained_nvmap_ranges() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let memory = crate::test_memory::process(session.state.lock().unwrap().machine.clone());
         let cpu_address_space = memory.space().identity();
         let cpu_address = GuestVirtualAddress::new(0x20_0000);
@@ -4001,7 +4044,8 @@ mod tests {
 
     #[test]
     fn as_gpu_sparse_remap_is_owned_and_atomic() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let memory = crate::test_memory::process(session.state.lock().unwrap().machine.clone());
         let cpu_address_space = memory.space().identity();
         let cpu_address = GuestVirtualAddress::new(0x40_0000);
@@ -4119,7 +4163,8 @@ mod tests {
 
     #[test]
     fn as_gpu_rejects_malformed_or_invalid_operations_without_partial_state() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
 
@@ -4199,7 +4244,8 @@ mod tests {
 
     #[test]
     fn teardown_from_one_connection_invalidates_the_shared_client() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let clone = session.clone_connection().unwrap();
         session.initialize(0);
         let _fd = clone.open(b"/dev/nvmap", 11).unwrap();
@@ -4220,7 +4266,8 @@ mod tests {
 
     #[test]
     fn opened_descriptor_records_typed_owner_permission_and_lifecycle() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.set_aruid(42, 0x1234);
         session.initialize(0);
 
@@ -4239,7 +4286,8 @@ mod tests {
 
     #[test]
     fn host_control_events_follow_descriptor_lifetime_and_waits_do_not_complete_early() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         session.initialize(0);
         let fd = session.open(b"/dev/nvhost-ctrl", 17).unwrap();
 
@@ -4270,7 +4318,8 @@ mod tests {
 
     #[test]
     fn canonical_memory_failure_carries_fd_allocation_and_validation_reason() {
-        let session = NvDrvSession::new(crate::test_memory::machine());
+        let session =
+            NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
         let memory = crate::test_memory::process(session.state.lock().unwrap().machine.clone());
         let address_space = memory.space().identity();
         session.initialize(0);

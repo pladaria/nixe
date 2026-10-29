@@ -1,7 +1,6 @@
 //! `IDirectory` wire command decoding.
 
 use crate::ipc_wire::IpcWireError;
-use crate::ipc_wire::buffer::one_receive_buffer;
 use crate::ipc_wire::message::{CmifRequest, HipcRequest};
 use crate::{IpcRequest, MAX_IPC_LIST_ENTRIES};
 
@@ -20,7 +19,16 @@ pub(super) async fn decode(
         // through one map-alias output buffer:
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/fs.c#L1043-L1051
         DirectoryCommand::Read => {
-            let descriptor = one_receive_buffer(hipc)?;
+            let [descriptor] = hipc.receive_buffers.as_slice() else {
+                return Err(IpcWireError::Malformed(
+                    "service command requires exactly one output buffer",
+                ));
+            };
+            if descriptor.size == 0 {
+                return Err(IpcWireError::Malformed(
+                    "service command requires a nonempty output buffer",
+                ));
+            }
             let capacity = usize::try_from(descriptor.size)
                 .ok()
                 .map(|size| size / FS_DIRECTORY_ENTRY_SIZE)

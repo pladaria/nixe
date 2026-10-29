@@ -147,6 +147,7 @@ async fn dispatch_command(
         let mounts = process.mounts();
         match &target {
             Target::Root => crate::ipc::dispatch_session(
+                process.kernel(),
                 mounts,
                 session.expect("a content-service root belongs to a session"),
                 decoded,

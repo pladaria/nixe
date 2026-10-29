@@ -71,6 +71,13 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             ));
         }
         let entry = self.resources.remove(&source).unwrap();
+        for overlap in &entry.overlaps {
+            self.resources
+                .get_mut(overlap)
+                .unwrap()
+                .overlaps
+                .remove(&source);
+        }
         for alias in &entry.aliases {
             self.resources
                 .get_mut(alias)

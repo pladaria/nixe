@@ -69,22 +69,21 @@ pub(in crate::ipc_wire) async fn dispatch_play_report(
     {
         return reply(HorizonIpcResult::CMIF_INVALID_IN_HEADER);
     }
-    let mapped = &hipc.send_buffers[0];
     let pointer = &hipc.send_statics[0];
-    if mapped.mode == BufferMode::Invalid || pointer.index != 0 {
+    if pointer.index != 0 {
         return reply(HorizonIpcResult::CMIF_INVALID_IN_HEADER);
     }
     let mut parts = [Vec::new(), Vec::new()];
-    for (part, (address, size)) in parts.iter_mut().zip([
-        (mapped.address, mapped.size),
-        (pointer.address, u64::from(pointer.size)),
-    ]) {
-        let size = usize::try_from(size)
+    for (part, buffer) in parts
+        .iter_mut()
+        .zip([&process.send_buffers()[0], &process.send_statics()[0]])
+    {
+        let size = usize::try_from(buffer.size)
             .map_err(|_| IpcWireError::Malformed("play report size overflows"))?;
         part.try_reserve_exact(size)
             .map_err(|_| IpcWireError::HostResourceExhausted("reading a play report"))?;
         part.resize(size, 0);
-        read_bytes(process, GuestVirtualAddress::new(address), part).await?;
+        process.read(buffer, 0, part).await?;
     }
     let path = session
         .save(

@@ -4,6 +4,7 @@ mod buffer;
 mod control;
 mod dispatch;
 mod error;
+pub(crate) mod handles;
 mod io;
 pub(crate) mod message;
 mod named_port;

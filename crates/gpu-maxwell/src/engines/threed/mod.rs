@@ -2,19 +2,15 @@
 
 mod bindings;
 mod color_reduction;
-mod constant_color;
-mod counters;
 mod coverage;
 pub(super) mod draw;
 mod falcon;
 mod inline_to_memory;
-mod instrumentation;
-mod l2_cache;
 mod line;
 mod mme;
 mod operations;
 mod output;
-mod registers;
+pub(in crate::engines) mod registers;
 mod render_enable;
 mod render_targets;
 mod resource;
@@ -22,45 +18,35 @@ mod shader_execution;
 pub(super) mod state;
 pub(super) use registers::{constant_buffer_words, embedded_words};
 pub(super) mod tessellation;
-mod tiled_cache;
 mod vertex;
 pub use tessellation::{MaxwellTessellationModeError, MaxwellThreeDTessellationMode};
-mod zcull;
 
 pub use super::lowering::{MaxwellLoweringError, MaxwellThreeDOperationTrigger};
 pub use bindings::{
     MAXWELL_BIND_GROUP_COUNT, MAXWELL_CONSTANT_BUFFER_SLOT_COUNT, MAXWELL_PIPELINE_SHADER_COUNT,
     MAXWELL_TESSELLATION_LOD_COUNT, MaxwellShaderStage, MaxwellThreeDBindGroupState,
-    MaxwellThreeDConstantBufferBinding, MaxwellThreeDConstantBufferLoadState,
-    MaxwellThreeDConstantBufferSelectorState, MaxwellThreeDDescriptorPoolState,
-    MaxwellThreeDInlineConstantBufferUpload, MaxwellThreeDPipelineBindingState,
-    MaxwellThreeDProgramRegionState, MaxwellThreeDSamplerBindingMode,
-    MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite, MaxwellThreeDTessellationLod,
+    MaxwellThreeDConstantBufferBinding, MaxwellThreeDConstantBufferSelectorState,
+    MaxwellThreeDDescriptorPoolState, MaxwellThreeDInlineConstantBufferUpload,
+    MaxwellThreeDPipelineBindingState, MaxwellThreeDProgramRegionState,
+    MaxwellThreeDSamplerBindingMode, MaxwellThreeDShaderBindingState,
+    MaxwellThreeDShaderBindingWrite, MaxwellThreeDTessellationLod,
 };
 pub use color_reduction::{
     MaxwellThreeDColorReductionFp16Threshold, MaxwellThreeDColorReductionSrgb8Threshold,
-    MaxwellThreeDColorReductionState, MaxwellThreeDColorReductionStateWrite,
-    MaxwellThreeDColorReductionThresholdsEnable, MaxwellThreeDColorReductionThresholdsFp16,
-    MaxwellThreeDColorReductionThresholdsSrgb8, MaxwellThreeDColorReductionThresholdsUnorm8,
-    MaxwellThreeDColorReductionThresholdsUnorm10, MaxwellThreeDColorReductionThresholdsUnorm16,
-    MaxwellThreeDUnorm8,
-};
-pub use constant_color::{
-    MaxwellThreeDConstantColorComponent, MaxwellThreeDConstantColorRenderingState,
-    MaxwellThreeDConstantColorRenderingStateWrite, MaxwellThreeDConstantColorValue,
-};
-pub use counters::{
-    MaxwellThreeDCounterState, MaxwellThreeDCounterStateWrite, MaxwellThreeDZPassPixelCountEnable,
+    MaxwellThreeDColorReductionState, MaxwellThreeDColorReductionThresholdsEnable,
+    MaxwellThreeDColorReductionThresholdsFp16, MaxwellThreeDColorReductionThresholdsSrgb8,
+    MaxwellThreeDColorReductionThresholdsUnorm8, MaxwellThreeDColorReductionThresholdsUnorm10,
+    MaxwellThreeDColorReductionThresholdsUnorm16, MaxwellThreeDUnorm8,
 };
 pub use coverage::{
     MAXWELL_SAMPLE_LOCATION_GROUP_COUNT, MAXWELL_SAMPLE_LOCATIONS_PER_GROUP,
     MaxwellThreeDAlphaToCoverageDither, MaxwellThreeDAlphaToCoverageOverride,
-    MaxwellThreeDCoverageState, MaxwellThreeDCoverageStateWrite, MaxwellThreeDCoverageToColor,
-    MaxwellThreeDCsaaEnable, MaxwellThreeDHybridAntiAliasCentroid,
-    MaxwellThreeDHybridAntiAliasControl, MaxwellThreeDPostZPixelShaderImask,
-    MaxwellThreeDPsOutputSampleMaskUsage, MaxwellThreeDSampleLocation,
-    MaxwellThreeDSampleLocationGroup, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
-    MaxwellThreeDTirModulationComponentSelect, MaxwellThreeDTirModulationFunction,
+    MaxwellThreeDCoverageState, MaxwellThreeDCoverageToColor, MaxwellThreeDCsaaEnable,
+    MaxwellThreeDHybridAntiAliasCentroid, MaxwellThreeDHybridAntiAliasControl,
+    MaxwellThreeDPostZPixelShaderImask, MaxwellThreeDPsOutputSampleMaskUsage,
+    MaxwellThreeDSampleLocation, MaxwellThreeDSampleLocationGroup, MaxwellThreeDTirControl,
+    MaxwellThreeDTirMode, MaxwellThreeDTirModulationComponentSelect,
+    MaxwellThreeDTirModulationFunction,
 };
 pub use falcon::{
     MaxwellThreeDFalconError, MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconRegister,
@@ -71,13 +57,9 @@ pub use inline_to_memory::{
     MaxwellThreeDInlineToMemoryLayout, MaxwellThreeDInlineToMemoryState,
     MaxwellThreeDInlineToMemoryStateWrite,
 };
-pub use instrumentation::{
-    MaxwellThreeDInstrumentationState, MaxwellThreeDInstrumentationStateWrite,
-    MaxwellThreeDInstrumentationValue,
-};
 pub use line::{
     MaxwellThreeDAliasedLineWidthEnable, MaxwellThreeDAntiAliasedLineEnable,
-    MaxwellThreeDLineState, MaxwellThreeDLineStateWrite, MaxwellThreeDLineStippleParameters,
+    MaxwellThreeDLineState, MaxwellThreeDLineStippleParameters,
     MaxwellThreeDPolygonClipGeneratedEdge,
 };
 pub use mme::{
@@ -93,20 +75,15 @@ pub use operations::{
     MaxwellThreeDDecompressSurface, MaxwellThreeDFlushPendingWrites,
     MaxwellThreeDReportSemaphoreControl, MaxwellThreeDReportSemaphoreOperation,
     MaxwellThreeDReportSemaphorePipelineLocation, MaxwellThreeDReportSemaphoreState,
-    MaxwellThreeDReportSemaphoreStateWrite, MaxwellThreeDReportSemaphoreStructureSize,
-    MaxwellThreeDReportSemaphoreWrite, MaxwellThreeDShaderCacheInvalidation,
-    MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationPlan,
-    MaxwellThreeDSynchronizationTrigger, MaxwellThreeDSyncpointCondition,
-    MaxwellThreeDSyncpointIncrement, MaxwellThreeDTextureCacheInvalidation,
-    MaxwellThreeDTextureCacheLines, MaxwellThreeDTextureCacheTarget,
-    MaxwellThreeDTiledCacheFlushMode, lower_maxwell_three_d_synchronization,
+    MaxwellThreeDReportSemaphoreStructureSize, MaxwellThreeDReportSemaphoreWrite,
+    MaxwellThreeDShaderCacheInvalidation, MaxwellThreeDSynchronizationError,
+    MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationTrigger,
+    MaxwellThreeDSyncpointCondition, MaxwellThreeDSyncpointIncrement,
+    MaxwellThreeDTextureCacheInvalidation, MaxwellThreeDTextureCacheLines,
+    MaxwellThreeDTextureCacheTarget, MaxwellThreeDTiledCacheFlushMode,
+    lower_maxwell_three_d_synchronization,
 };
 
-pub use l2_cache::{
-    MaxwellThreeDL2CacheEvictionPolicy, MaxwellThreeDL2CacheState, MaxwellThreeDL2CacheStateWrite,
-    MaxwellThreeDRopL2CacheRequest, MaxwellThreeDSystemMemoryVolatile,
-    MaxwellThreeDVafL2CacheControl,
-};
 pub use output::{
     MAXWELL_SCISSOR_COUNT, MAXWELL_VIEWPORT_COUNT, MAXWELL_WINDOW_CLIP_COUNT,
     MaxwellThreeDBlendControlState, MaxwellThreeDBlendFactor,
@@ -114,20 +91,18 @@ pub use output::{
     MaxwellThreeDBlendPerFormatEnable, MaxwellThreeDBlendZeroTimesAnythingIsZero,
     MaxwellThreeDClipAxis, MaxwellThreeDClipIdTestEnable, MaxwellThreeDColorMask,
     MaxwellThreeDCompareOp, MaxwellThreeDCullFace, MaxwellThreeDFixedFunctionRegister,
-    MaxwellThreeDFixedFunctionState, MaxwellThreeDFixedFunctionValue,
-    MaxwellThreeDFixedFunctionWrite, MaxwellThreeDFrontFace, MaxwellThreeDIteratedBlend,
-    MaxwellThreeDIteratedBlendPassCount, MaxwellThreeDLogicOp, MaxwellThreeDPixelShaderClampRange,
-    MaxwellThreeDPixelShaderSaturate, MaxwellThreeDPolygonMode, MaxwellThreeDProvokingVertex,
-    MaxwellThreeDSampleMode, MaxwellThreeDScissorState, MaxwellThreeDShadeMode,
-    MaxwellThreeDSingleRopControl, MaxwellThreeDStencilOp, MaxwellThreeDViewportClipControl,
-    MaxwellThreeDViewportCoordinateSwizzle, MaxwellThreeDViewportScaleOffsetEnable,
-    MaxwellThreeDViewportSwizzleComponent, MaxwellThreeDViewportTransformState,
-    MaxwellThreeDWindowClipState, MaxwellThreeDWindowClipType,
+    MaxwellThreeDFixedFunctionState, MaxwellThreeDFixedFunctionValue, MaxwellThreeDFrontFace,
+    MaxwellThreeDIteratedBlend, MaxwellThreeDIteratedBlendPassCount, MaxwellThreeDLogicOp,
+    MaxwellThreeDPixelShaderClampRange, MaxwellThreeDPixelShaderSaturate, MaxwellThreeDPolygonMode,
+    MaxwellThreeDProvokingVertex, MaxwellThreeDSampleMode, MaxwellThreeDScissorState,
+    MaxwellThreeDShadeMode, MaxwellThreeDSingleRopControl, MaxwellThreeDStencilOp,
+    MaxwellThreeDViewportClipControl, MaxwellThreeDViewportCoordinateSwizzle,
+    MaxwellThreeDViewportScaleOffsetEnable, MaxwellThreeDViewportSwizzleComponent,
+    MaxwellThreeDViewportTransformState, MaxwellThreeDWindowClipState, MaxwellThreeDWindowClipType,
 };
 pub use render_enable::{
     MaxwellThreeDConditionalLoadConstantBuffer, MaxwellThreeDRenderEnableMode,
     MaxwellThreeDRenderEnableOverride, MaxwellThreeDRenderEnableState,
-    MaxwellThreeDRenderEnableStateWrite,
 };
 pub use render_targets::{
     MAXWELL_COLOR_TARGET_COUNT, MaxwellThreeDAttachmentReadiness, MaxwellThreeDClearState,
@@ -139,8 +114,7 @@ pub use render_targets::{
     MaxwellThreeDImageLayout, MaxwellThreeDRawValue, MaxwellThreeDRectangle,
     MaxwellThreeDRenderTargetIndexOffset, MaxwellThreeDRenderTargetLayer,
     MaxwellThreeDRenderTargetLayerControl, MaxwellThreeDRenderTargetState,
-    MaxwellThreeDRenderTargetWrite, MaxwellThreeDSeparateFragmentData,
-    MaxwellThreeDZCompressionMode,
+    MaxwellThreeDSeparateFragmentData, MaxwellThreeDZCompressionMode,
 };
 pub(crate) use resource::{ComputeTextures, MaxwellThreeDResolvedResourceCache};
 pub use resource::{
@@ -156,11 +130,11 @@ pub use shader_execution::{
     MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDPixelShaderInterlockControl,
     MaxwellThreeDPixelShaderInterlockFragmentOrder, MaxwellThreeDPixelShaderInterlockMode,
     MaxwellThreeDPixelShaderInterlockTileSize, MaxwellThreeDShaderExceptionsEnable,
-    MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderExecutionStateWrite,
-    MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderLocalMemoryState,
-    MaxwellThreeDShaderWatermarkRange, MaxwellThreeDShaderWatermarkTarget,
-    MaxwellThreeDSmTimeoutCounterBit, MaxwellThreeDSubtilingPerfKnobA,
-    MaxwellThreeDSubtilingPerfKnobB, MaxwellThreeDVisibleCallLimit,
+    MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderLocalMemoryPerWarpSize,
+    MaxwellThreeDShaderLocalMemoryState, MaxwellThreeDShaderWatermarkRange,
+    MaxwellThreeDShaderWatermarkTarget, MaxwellThreeDSmTimeoutCounterBit,
+    MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
+    MaxwellThreeDVisibleCallLimit,
 };
 pub use state::{
     MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT, MaxwellThreeDAlphaFraction,
@@ -172,10 +146,6 @@ pub use state::{
     MaxwellThreeDViewportPixelCenter, MaxwellThreeDViewportState, MaxwellThreeDViewportZClipRange,
 };
 pub(crate) use state::{MaxwellThreeDFrontendState, MaxwellThreeDResourceStateIdentity};
-pub use tiled_cache::{
-    MaxwellThreeDTiledCacheState, MaxwellThreeDTiledCacheStateWrite,
-    MaxwellThreeDTiledCacheTileSize, MaxwellThreeDTiledCacheUnknownConfig,
-};
 pub use vertex::{
     MAXWELL_THREE_D_PRIMITIVE_AREA_MAX, MAXWELL_VERTEX_ATTRIBUTE_COUNT,
     MAXWELL_VERTEX_STREAM_COUNT, MaxwellThreeDAttributeDefaultVector,
@@ -190,14 +160,6 @@ pub use vertex::{
     MaxwellThreeDVertexStreamFormat, MaxwellThreeDVertexStreamState,
     MaxwellThreeDVertexStreamSubstituteState,
 };
-pub use zcull::{
-    MaxwellThreeDZCullAxis, MaxwellThreeDZCullBounds, MaxwellThreeDZCullCriterion,
-    MaxwellThreeDZCullDepthFormat, MaxwellThreeDZCullDirectionFormat, MaxwellThreeDZCullEnable,
-    MaxwellThreeDZCullRegionFormat, MaxwellThreeDZCullRegionId, MaxwellThreeDZCullRegionLocation,
-    MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite, MaxwellThreeDZCullStatsEnable,
-    MaxwellThreeDZCullStencilFunction, MaxwellThreeDZCullSubregion,
-    MaxwellThreeDZCullSubregionAlgorithm, MaxwellThreeDZCullSubregionAllocation,
-};
 
 use nixe_gpu::{GpuClassId, GpuMethodId};
 
@@ -210,7 +172,7 @@ use super::{
 };
 use crate::{
     MaxwellAamVersion, MaxwellAamVersionRange, MaxwellGpuProfile, MaxwellMethodDispatch,
-    MaxwellShaderProgramHeaderVersion, MaxwellShaderProgramHeaderVersionRange, MaxwellSpaVersion,
+    MaxwellShaderProgramHeaderVersion, MaxwellShaderProgramHeaderVersionRange,
 };
 
 pub(super) const CLASS: GpuClassId = GpuClassId(0xb197);
@@ -310,9 +272,9 @@ enum MethodAction {
     SubtilingPerfKnobB,
     TiledCacheEnable,
     TiledCacheTileSize,
-    TiledCacheUnknownConfig(u8),
+    TiledCacheUnknownConfig,
     TiledCacheFlush,
-    ShaderWatermarks(MaxwellThreeDShaderWatermarkTarget),
+    ShaderWatermarks,
     L1Configuration,
     ColorReductionThresholdsEnable,
     ColorReductionThresholdsUnorm8,
@@ -326,7 +288,7 @@ enum MethodAction {
     PostZPixelShaderImask,
     PixelShaderInterlockControl,
     ConstantColorRenderingEnable,
-    ConstantColorRenderingComponent(MaxwellThreeDConstantColorComponent),
+    ConstantColorRenderingComponent,
     AlphaFraction,
     TirMode,
     TirControl,
@@ -336,12 +298,12 @@ enum MethodAction {
     AlphaToCoverageOverride,
     AlphaToCoverageDither,
     HybridAntiAliasControl,
-    SampleLocations(u8),
+    SampleLocations,
     RasterBoundingBox,
     CheckSphVersion,
     CheckAamVersion,
     VafL2CacheControl,
-    RopL2CacheControl(MaxwellThreeDRopL2CacheRequest),
+    RopL2CacheControl,
     ReportSemaphoreAddressUpper,
     ReportSemaphoreAddressLower,
     ReportSemaphorePayload,
@@ -375,7 +337,7 @@ enum MethodAction {
     CsaaEnable,
     AliasedLineWidthEnable,
     ActiveZCullRegion,
-    ZCullStorage(usize),
+    ZCullStorage,
     ZCullSubregionAllocation,
     ZCullSubregionAlgorithm,
     ZCullReportSelection,
@@ -383,8 +345,8 @@ enum MethodAction {
     ZCullRegionLocation,
     ZCullRegionAliquots,
     ZCullRegionFormat,
-    ZCullRegionSize(MaxwellThreeDZCullAxis),
-    ZCullRegionPixelOffset(MaxwellThreeDZCullAxis),
+    ZCullRegionSize,
+    ZCullRegionPixelOffset,
     ZCullSubregion,
     ZCullDirectionFormat,
     ZCullMaintenance,
@@ -488,25 +450,25 @@ methods!(
         0x0f44,
         "SET_CONSTANT_COLOR_RENDERING_RED",
         u32::MAX,
-        MethodAction::ConstantColorRenderingComponent(MaxwellThreeDConstantColorComponent::Red)
+        MethodAction::ConstantColorRenderingComponent
     ),
     SET_CONSTANT_COLOR_RENDERING_GREEN => (
         0x0f48,
         "SET_CONSTANT_COLOR_RENDERING_GREEN",
         u32::MAX,
-        MethodAction::ConstantColorRenderingComponent(MaxwellThreeDConstantColorComponent::Green)
+        MethodAction::ConstantColorRenderingComponent
     ),
     SET_CONSTANT_COLOR_RENDERING_BLUE => (
         0x0f4c,
         "SET_CONSTANT_COLOR_RENDERING_BLUE",
         u32::MAX,
-        MethodAction::ConstantColorRenderingComponent(MaxwellThreeDConstantColorComponent::Blue)
+        MethodAction::ConstantColorRenderingComponent
     ),
     SET_CONSTANT_COLOR_RENDERING_ALPHA => (
         0x0f50,
         "SET_CONSTANT_COLOR_RENDERING_ALPHA",
         u32::MAX,
-        MethodAction::ConstantColorRenderingComponent(MaxwellThreeDConstantColorComponent::Alpha)
+        MethodAction::ConstantColorRenderingComponent
     ),
     SET_OPPORTUNISTIC_EARLY_Z_HYSTERESIS => (0x0204, "SET_OPPORTUNISTIC_EARLY_Z_HYSTERESIS", 0x1f, MethodAction::OpportunisticEarlyZHysteresis),
     SET_API_MANDATED_EARLY_Z => (
@@ -544,25 +506,25 @@ methods!(
         0x0f68,
         "SET_TILED_CACHE_UNKNOWN_CONFIG_0",
         u32::MAX,
-        MethodAction::TiledCacheUnknownConfig(0)
+        MethodAction::TiledCacheUnknownConfig
     ),
     SET_TILED_CACHE_UNKNOWN_CONFIG_1 => (
         0x0f6c,
         "SET_TILED_CACHE_UNKNOWN_CONFIG_1",
         u32::MAX,
-        MethodAction::TiledCacheUnknownConfig(1)
+        MethodAction::TiledCacheUnknownConfig
     ),
     SET_TILED_CACHE_UNKNOWN_CONFIG_2 => (
         0x1108,
         "SET_TILED_CACHE_UNKNOWN_CONFIG_2",
         u32::MAX,
-        MethodAction::TiledCacheUnknownConfig(2)
+        MethodAction::TiledCacheUnknownConfig
     ),
     SET_TILED_CACHE_UNKNOWN_CONFIG_3 => (
         0x0f70,
         "SET_TILED_CACHE_UNKNOWN_CONFIG_3",
         u32::MAX,
-        MethodAction::TiledCacheUnknownConfig(3)
+        MethodAction::TiledCacheUnknownConfig
     ),
     // NVIDIA's public class header omits this trigger; the pinned deko3d
     // definition documents method 0x0f80 and both allocated values.
@@ -583,21 +545,19 @@ methods!(
         0x0f98,
         "SET_VTG_WARP_WATERMARKS",
         u32::MAX,
-        MethodAction::ShaderWatermarks(
-            MaxwellThreeDShaderWatermarkTarget::VertexTessellationGeometryWarps
-        )
+        MethodAction::ShaderWatermarks
     ),
     SET_PS_WARP_WATERMARKS => (
         0x1450,
         "SET_PS_WARP_WATERMARKS",
         u32::MAX,
-        MethodAction::ShaderWatermarks(MaxwellThreeDShaderWatermarkTarget::PixelWarps)
+        MethodAction::ShaderWatermarks
     ),
     SET_PS_REGISTER_WATERMARKS => (
         0x1454,
         "SET_PS_REGISTER_WATERMARKS",
         u32::MAX,
-        MethodAction::ShaderWatermarks(MaxwellThreeDShaderWatermarkTarget::PixelRegisters)
+        MethodAction::ShaderWatermarks
     ),
     SET_L2_CACHE_CONTROL_FOR_VAF_REQUESTS => (
         0x1000,
@@ -735,25 +695,25 @@ methods!(
         0x11e0,
         "SAMPLE_LOCATIONS(0)",
         u32::MAX,
-        MethodAction::SampleLocations(0)
+        MethodAction::SampleLocations
     ),
     SAMPLE_LOCATIONS_1 => (
         0x11e4,
         "SAMPLE_LOCATIONS(1)",
         u32::MAX,
-        MethodAction::SampleLocations(1)
+        MethodAction::SampleLocations
     ),
     SAMPLE_LOCATIONS_2 => (
         0x11e8,
         "SAMPLE_LOCATIONS(2)",
         u32::MAX,
-        MethodAction::SampleLocations(2)
+        MethodAction::SampleLocations
     ),
     SAMPLE_LOCATIONS_3 => (
         0x11ec,
         "SAMPLE_LOCATIONS(3)",
         u32::MAX,
-        MethodAction::SampleLocations(3)
+        MethodAction::SampleLocations
     ),
     SET_RASTER_BOUNDING_BOX => (
         0x02ec,
@@ -819,19 +779,19 @@ methods!(
         0x0218,
         "SET_L2_CACHE_CONTROL_FOR_ROP_PREFETCH_READ_REQUESTS",
         0x0000_0030,
-        MethodAction::RopL2CacheControl(MaxwellThreeDRopL2CacheRequest::PrefetchRead)
+        MethodAction::RopL2CacheControl
     ),
     SET_L2_CACHE_CONTROL_FOR_ROP_NONINTERLOCKED_READ_REQUESTS => (
         0x10fc,
         "SET_L2_CACHE_CONTROL_FOR_ROP_NONINTERLOCKED_READ_REQUESTS",
         0x0000_0030,
-        MethodAction::RopL2CacheControl(MaxwellThreeDRopL2CacheRequest::NoninterlockedRead)
+        MethodAction::RopL2CacheControl
     ),
     SET_L2_CACHE_CONTROL_FOR_ROP_INTERLOCKED_READ_REQUESTS => (
         0x1290,
         "SET_L2_CACHE_CONTROL_FOR_ROP_INTERLOCKED_READ_REQUESTS",
         0x0000_0030,
-        MethodAction::RopL2CacheControl(MaxwellThreeDRopL2CacheRequest::InterlockedRead)
+        MethodAction::RopL2CacheControl
     ),
     INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI => (
         0x1288,
@@ -881,13 +841,13 @@ methods!(
         0x12d8,
         "SET_L2_CACHE_CONTROL_FOR_ROP_NONINTERLOCKED_WRITE_REQUESTS",
         0x0000_0030,
-        MethodAction::RopL2CacheControl(MaxwellThreeDRopL2CacheRequest::NoninterlockedWrite)
+        MethodAction::RopL2CacheControl
     ),
     SET_L2_CACHE_CONTROL_FOR_ROP_INTERLOCKED_WRITE_REQUESTS => (
         0x12dc,
         "SET_L2_CACHE_CONTROL_FOR_ROP_INTERLOCKED_WRITE_REQUESTS",
         0x0000_0030,
-        MethodAction::RopL2CacheControl(MaxwellThreeDRopL2CacheRequest::InterlockedWrite)
+        MethodAction::RopL2CacheControl
     ),
     SET_REPORT_SEMAPHORE_A => (
         0x1b00,
@@ -1045,10 +1005,10 @@ methods!(
     ),
     // Hierarchical depth cache backing, separate from the depth attachment.
     // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L639-L649
-    SET_ZCULL_STORAGE_A => (0x07e8, "SET_ZCULL_STORAGE_A", 0xff, MethodAction::ZCullStorage(0)),
-    SET_ZCULL_STORAGE_B => (0x07ec, "SET_ZCULL_STORAGE_B", u32::MAX, MethodAction::ZCullStorage(1)),
-    SET_ZCULL_STORAGE_C => (0x07f0, "SET_ZCULL_STORAGE_C", 0xff, MethodAction::ZCullStorage(2)),
-    SET_ZCULL_STORAGE_D => (0x07f4, "SET_ZCULL_STORAGE_D", u32::MAX, MethodAction::ZCullStorage(3)),
+    SET_ZCULL_STORAGE_A => (0x07e8, "SET_ZCULL_STORAGE_A", 0xff, MethodAction::ZCullStorage),
+    SET_ZCULL_STORAGE_B => (0x07ec, "SET_ZCULL_STORAGE_B", u32::MAX, MethodAction::ZCullStorage),
+    SET_ZCULL_STORAGE_C => (0x07f0, "SET_ZCULL_STORAGE_C", 0xff, MethodAction::ZCullStorage),
+    SET_ZCULL_STORAGE_D => (0x07f4, "SET_ZCULL_STORAGE_D", u32::MAX, MethodAction::ZCullStorage),
     SET_ZCULL_REGION_ALIQUOTS => (
         0x07e4, "SET_ZCULL_REGION_ALIQUOTS", 0xffff, MethodAction::ZCullRegionAliquots
     ),
@@ -1057,27 +1017,27 @@ methods!(
     ),
     SET_ZCULL_REGION_SIZE_A => (
         0x07c0, "SET_ZCULL_REGION_SIZE_A", 0xffff,
-        MethodAction::ZCullRegionSize(MaxwellThreeDZCullAxis::Width)
+        MethodAction::ZCullRegionSize
     ),
     SET_ZCULL_REGION_SIZE_B => (
         0x07c4, "SET_ZCULL_REGION_SIZE_B", 0xffff,
-        MethodAction::ZCullRegionSize(MaxwellThreeDZCullAxis::Height)
+        MethodAction::ZCullRegionSize
     ),
     SET_ZCULL_REGION_SIZE_C => (
         0x07c8, "SET_ZCULL_REGION_SIZE_C", 0xffff,
-        MethodAction::ZCullRegionSize(MaxwellThreeDZCullAxis::Depth)
+        MethodAction::ZCullRegionSize
     ),
     SET_ZCULL_REGION_PIXEL_OFFSET_A => (
         0x15fc, "SET_ZCULL_REGION_PIXEL_OFFSET_A", 0xffff,
-        MethodAction::ZCullRegionPixelOffset(MaxwellThreeDZCullAxis::Width)
+        MethodAction::ZCullRegionPixelOffset
     ),
     SET_ZCULL_REGION_PIXEL_OFFSET_B => (
         0x1600, "SET_ZCULL_REGION_PIXEL_OFFSET_B", 0xffff,
-        MethodAction::ZCullRegionPixelOffset(MaxwellThreeDZCullAxis::Height)
+        MethodAction::ZCullRegionPixelOffset
     ),
     SET_ZCULL_REGION_PIXEL_OFFSET_C => (
         0x07cc, "SET_ZCULL_REGION_PIXEL_OFFSET_C", 0xffff,
-        MethodAction::ZCullRegionPixelOffset(MaxwellThreeDZCullAxis::Depth)
+        MethodAction::ZCullRegionPixelOffset
     ),
     // Allocation layout and policy are cache optimization state, not attachments.
     // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L351-L378
@@ -1323,28 +1283,6 @@ pub(super) fn preflight(
     Ok(AppliedMethod::new(method, prepared.metadata, operation))
 }
 
-#[cfg(test)]
-pub(in crate::engines) fn materialize_state(
-    profile: &MaxwellGpuProfile,
-    candidate: &mut MaxwellThreeDFrontendState,
-) -> Result<(), MaxwellEngineDispatchError> {
-    registers::materialize(profile, candidate, u64::MAX)
-}
-
-#[cfg(test)]
-pub(in crate::engines) fn inspect_state_metadata(
-    profile: &MaxwellGpuProfile,
-    source: crate::MaxwellMethodSource,
-    snapshot: &mut MaxwellThreeDFrontendState,
-) -> MaxwellEngineMethodMetadata {
-    snapshot.pending_notification = None;
-    preflight_register(profile, source, snapshot, false)
-        .map(|decoded| decoded.metadata)
-        .unwrap_or_else(|_| {
-            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), "STATE_REGISTER")
-        })
-}
-
 fn lower_pending_operation(
     operation: Option<PendingOperation>,
     _state: &MaxwellThreeDFrontendState,
@@ -1399,16 +1337,19 @@ fn preflight_with_shadow(
         .map_err(|error| MaxwellEngineDispatchError::MmeShadowRam { source, error })?;
 
     method.set_effective_argument(effective_argument);
-    registers::materialize(profile, candidate, registers::dependencies(source.method()))?;
     let effective_source = method.source();
-    let changed = candidate.raw_register_value(source.method()) != Some(effective_argument);
-    let prepared = preflight_register(profile, effective_source, candidate, changed)?;
+    let prepared = preflight_register(profile, effective_source, candidate)?;
     if prepared.writes_state {
         candidate.record_raw_register(effective_source);
     }
-    candidate
-        .mme_mut()
-        .track_shadow_register(shadow_control, effective_source);
+    candidate.mme_mut().track_shadow_register(
+        shadow_control,
+        effective_source.method(),
+        effective_source.argument(),
+    );
+    if matches!(prepared.operation, Some(PendingOperation::ThreeD(_))) {
+        candidate.flush_dirty();
+    }
     Ok(prepared)
 }
 
@@ -1448,10 +1389,12 @@ pub(super) fn write_plain_source(
             "pending notification requires completion of a method other than NO_OPERATION",
         ));
     }
-    candidate.defer_register(effective_source);
-    candidate
-        .mme_mut()
-        .track_shadow_register(control, effective_source);
+    candidate.write_register(source.method(), argument);
+    candidate.mme_mut().track_shadow_register(
+        control,
+        effective_source.method(),
+        effective_source.argument(),
+    );
     Ok(argument)
 }
 
@@ -1459,25 +1402,74 @@ pub(super) fn write_plain_span(
     subchannel: crate::MaxwellPushbufferSubchannel,
     words: crate::MaxwellMethodSpan<'_>,
     candidate: &mut MaxwellThreeDFrontendState,
-    mut observe: impl FnMut(crate::MaxwellMethodSource, u32),
+    #[cfg(test)] mut observe: impl FnMut(crate::MaxwellMethodSource, u32),
 ) -> Result<usize, MaxwellEngineDispatchError> {
-    let control = candidate.mme().shadow_ram_control().value().copied();
+    match candidate.mme().shadow_ram_control().value().copied() {
+        Some(MaxwellThreeDMmeShadowRamControl::MethodReplay) => write_plain_words::<true, false>(
+            subchannel,
+            words,
+            candidate,
+            #[cfg(test)]
+            &mut observe,
+        ),
+        Some(
+            MaxwellThreeDMmeShadowRamControl::MethodTrack
+            | MaxwellThreeDMmeShadowRamControl::MethodTrackWithFilter,
+        ) => write_plain_words::<false, true>(
+            subchannel,
+            words,
+            candidate,
+            #[cfg(test)]
+            &mut observe,
+        ),
+        _ => write_plain_words::<false, false>(
+            subchannel,
+            words,
+            candidate,
+            #[cfg(test)]
+            &mut observe,
+        ),
+    }
+}
+
+fn write_plain_words<const REPLAY: bool, const TRACK: bool>(
+    subchannel: crate::MaxwellPushbufferSubchannel,
+    words: crate::MaxwellMethodSpan<'_>,
+    candidate: &mut MaxwellThreeDFrontendState,
+    #[cfg(test)] observe: &mut impl FnMut(crate::MaxwellMethodSource, u32),
+) -> Result<usize, MaxwellEngineDispatchError> {
     let mut consumed = 0;
-    for decoded in words {
-        if !registers::passive(decoded.method()) {
+    for index in 0..words.len() {
+        let method = words.method_at(index);
+        if !registers::passive(method) {
             break;
         }
-        let source = crate::MaxwellMethodSource::decoded(decoded, subchannel);
-        let argument = candidate
-            .mme()
-            .resolve_shadow_argument(source.method(), source.argument())
-            .map_err(|error| MaxwellEngineDispatchError::MmeShadowRam { source, error })?;
-        let effective = source.emitted_by_mme(source.method(), argument);
-        candidate.defer_register(effective);
-        candidate
-            .mme_mut()
-            .track_shadow_register(control, effective);
-        observe(source, argument);
+        let argument = if REPLAY {
+            candidate
+                .mme()
+                .shadow_value(method)
+                .or_else(|| state::verified_raw_register_reset(method))
+                .ok_or_else(|| MaxwellEngineDispatchError::MmeShadowRam {
+                    source: crate::MaxwellMethodSource::decoded(
+                        words.get(index).unwrap(),
+                        subchannel,
+                    ),
+                    error: MaxwellThreeDMmeShadowRamError::ReplayRegisterUnavailable {
+                        method_dword: (method.0 / 4) as u16,
+                    },
+                })?
+        } else {
+            words.argument_at(index)
+        };
+        candidate.write_register(method, argument);
+        if TRACK {
+            candidate.mme_mut().write_shadow_register(method, argument);
+        }
+        #[cfg(test)]
+        observe(
+            crate::MaxwellMethodSource::decoded(words.get(index).unwrap(), subchannel),
+            argument,
+        );
         consumed += 1;
     }
     Ok(consumed)
@@ -1501,7 +1493,9 @@ pub(super) fn inline_index_words(
     let last = crate::MaxwellMethodSource::decoded(words.last().unwrap(), subchannel);
     candidate.record_raw_register(last);
     let control = candidate.mme().shadow_ram_control().value().copied();
-    candidate.mme_mut().track_shadow_register(control, last);
+    candidate
+        .mme_mut()
+        .track_shadow_register(control, last.method(), last.argument());
     Ok(())
 }
 
@@ -1600,7 +1594,6 @@ fn preflight_register(
     profile: &MaxwellGpuProfile,
     source: crate::MaxwellMethodSource,
     candidate: &mut MaxwellThreeDFrontendState,
-    changed: bool,
 ) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
     // NVIDIA's packed inline ports append low lanes first. END consumes the
     // complete stream, as in the independently reviewed public draw managers:
@@ -1629,7 +1622,6 @@ fn preflight_register(
     }
     if source.method().0 == 0x1614 && candidate.has_inline_indices() {
         checked_bool(source, "END")?;
-        registers::materialize(profile, candidate, u64::MAX)?;
         let index_count = candidate.publish_inline_indices(source)?;
         return Ok(PreparedMethod::new(
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), "END"),
@@ -1645,9 +1637,9 @@ fn preflight_register(
     let family = register_family(source.method().0);
     if family == RegisterFamily::InlineToMemory
         && let Some((write, method_name, upload)) =
-            inline_to_memory::preflight(source, candidate.operation_state().inline_to_memory())?
+            inline_to_memory::preflight(source, &candidate.operation_state().inline_to_memory())?
     {
-        candidate.apply(write, changed);
+        candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         let (operation, writes_state) = upload.map_or(state_write(), state_inline_to_memory);
@@ -1656,7 +1648,7 @@ fn preflight_register(
     if family == RegisterFamily::Mme
         && let Some((write, method_name)) = preflight_mme_state(source, candidate)?
     {
-        candidate.apply(write, changed);
+        candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         return Ok(PreparedMethod::new(metadata, None, true));
@@ -1665,7 +1657,7 @@ fn preflight_register(
         && let Some((write, method_name, upload)) =
             preflight_constant_buffer_load(source, candidate)?
     {
-        candidate.apply(write, changed);
+        candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         let (operation, writes_state) = upload.map_or(state_write(), state_inline_constant_buffer);
@@ -1674,31 +1666,13 @@ fn preflight_register(
     if family == RegisterFamily::VertexAndBinding
         && let Some((write, method_name)) = preflight_vertex_and_binding_state(source, candidate)?
     {
-        candidate.apply(write, changed);
+        candidate.apply(write);
         let metadata =
             MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
         return Ok(PreparedMethod::new(metadata, None, true));
     }
-    if let Some((write, method_name)) = preflight_output_state(source)? {
-        candidate.apply(write, changed);
-        let metadata =
-            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        let (operation, writes_state) = if let MaxwellThreeDStateWrite::RenderTarget(
-            MaxwellThreeDRenderTargetWrite::ClearSurface { value, .. },
-        ) = write
-        {
-            // A zero component mask writes no attachment. Retain the register
-            // for shadow replay without resolving or materializing resources.
-            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
-            if value.depth() || value.stencil() || value.color_mask() != 0 {
-                state_operation(MaxwellThreeDOperationTrigger::ClearSurface { source })
-            } else {
-                state_write()
-            }
-        } else {
-            state_write()
-        };
-        return Ok(PreparedMethod::new(metadata, operation, writes_state));
+    if let Some(prepared) = preflight_clear(source)? {
+        return Ok(prepared);
     }
     let Some(declaration) = (source.method().0 & 3 == 0)
         .then(|| METHODS_BY_DWORD.get((source.method().0 / 4) as usize))
@@ -1743,8 +1717,8 @@ fn preflight_register(
         | MethodAction::SubtilingPerfKnobB
         | MethodAction::TiledCacheEnable
         | MethodAction::TiledCacheTileSize
-        | MethodAction::TiledCacheUnknownConfig(..)
-        | MethodAction::ShaderWatermarks(..)
+        | MethodAction::TiledCacheUnknownConfig
+        | MethodAction::ShaderWatermarks
         | MethodAction::L1Configuration
         | MethodAction::ColorReductionThresholdsEnable
         | MethodAction::ColorReductionThresholdsUnorm8
@@ -1753,7 +1727,7 @@ fn preflight_register(
         | MethodAction::ColorReductionThresholdsFp16
         | MethodAction::ColorReductionThresholdsSrgb8
         | MethodAction::ConstantColorRenderingEnable
-        | MethodAction::ConstantColorRenderingComponent(..)
+        | MethodAction::ConstantColorRenderingComponent
         | MethodAction::OpportunisticEarlyZHysteresis
         | MethodAction::ApiMandatedEarlyZ
         | MethodAction::PostPsInitialCoverage
@@ -1762,7 +1736,7 @@ fn preflight_register(
         | MethodAction::AlphaFraction
         | MethodAction::RasterBoundingBox
         | MethodAction::VafL2CacheControl
-        | MethodAction::RopL2CacheControl(..)
+        | MethodAction::RopL2CacheControl
         | MethodAction::ReportSemaphoreAddressUpper
         | MethodAction::ReportSemaphoreAddressLower
         | MethodAction::ReportSemaphorePayload
@@ -1782,7 +1756,7 @@ fn preflight_register(
         | MethodAction::CoverageToColor
         | MethodAction::AlphaToCoverageOverride
         | MethodAction::AlphaToCoverageDither
-        | MethodAction::SampleLocations(..)
+        | MethodAction::SampleLocations
         | MethodAction::RenderEnableControl
         | MethodAction::VisibleCallLimit
         | MethodAction::SmTimeoutCounterBit
@@ -1800,11 +1774,11 @@ fn preflight_register(
         | MethodAction::ZCullReportType
         | MethodAction::ZCullSubregionAllocation
         | MethodAction::ZCullSubregionAlgorithm
-        | MethodAction::ZCullStorage(..)
+        | MethodAction::ZCullStorage
         | MethodAction::ZCullRegionLocation
         | MethodAction::ZCullRegionAliquots
-        | MethodAction::ZCullRegionSize(..)
-        | MethodAction::ZCullRegionPixelOffset(..)
+        | MethodAction::ZCullRegionSize
+        | MethodAction::ZCullRegionPixelOffset
         | MethodAction::ZCullRegionFormat
         | MethodAction::ZCullSubregion
         | MethodAction::ZCullDirectionFormat
@@ -1814,15 +1788,23 @@ fn preflight_register(
         | MethodAction::ZPassPixelCountEnable
         | MethodAction::ZCullCriterion
         | MethodAction::ZCullEnable
-        | MethodAction::ZCullBounds => {
-            if let Some(write) = decode_declared_state(source, declaration)? {
-                candidate.apply(write, changed);
-            }
-            state_write()
-        }
+        | MethodAction::ZCullBounds => unreachable!("passive method entered execution dispatch"),
         MethodAction::RenderEnableMode | MethodAction::RenderEnableOverride => {
-            if let Some(write) = decode_declared_state(source, declaration)? {
-                candidate.apply(write, changed);
+            let valid = match declaration.action {
+                MethodAction::RenderEnableMode => {
+                    MaxwellThreeDRenderEnableMode::parse(source.argument()).is_some()
+                }
+                MethodAction::RenderEnableOverride => {
+                    MaxwellThreeDRenderEnableOverride::parse(source.argument()).is_some()
+                }
+                _ => unreachable!(),
+            };
+            if !valid {
+                return Err(MaxwellEngineDispatchError::InvalidMethodValue {
+                    source,
+                    metadata: declaration.metadata,
+                    defined_mask: declaration.defined_mask,
+                });
             }
             (Some(PendingOperation::RenderCondition(source)), true)
         }
@@ -1842,6 +1824,13 @@ fn preflight_register(
                     "notification address has not been programmed",
                 ));
             };
+            if high > 0xff {
+                return Err(invalid_encoding(
+                    source,
+                    declaration.metadata.method_name(),
+                    "notification address exceeds its 40-bit field",
+                ));
+            }
             candidate.pending_notification =
                 Some(((u64::from(high) << 32) | u64::from(low), source));
             state_write()
@@ -1938,7 +1927,7 @@ fn preflight_register(
                     value,
                     source,
                 });
-            candidate.apply(write, changed);
+            candidate.apply(write);
             state_write()
         }
         MethodAction::MutableMethodControl => {
@@ -1954,7 +1943,7 @@ fn preflight_register(
                     value,
                     source,
                 });
-            candidate.apply(write, changed);
+            candidate.apply(write);
             state_write()
         }
         MethodAction::FalconFirmwareCall4 => {
@@ -1981,7 +1970,7 @@ fn preflight_register(
             let write = MaxwellThreeDStateWrite::FalconMaskedRegister(
                 MaxwellThreeDFalconMaskedRegisterWrite::new(address, value, mask, source),
             );
-            candidate.apply(write, changed);
+            candidate.apply(write);
             state_write()
         }
         MethodAction::TiledCacheFlush => {
@@ -2156,13 +2145,6 @@ fn preflight_register(
                     "index count is zero",
                 ));
             }
-            candidate.apply(
-                MaxwellThreeDStateWrite::VertexInput(MaxwellThreeDVertexInputWrite::IndexCount {
-                    value: source.argument(),
-                    source,
-                }),
-                changed,
-            );
             state_operation(MaxwellThreeDOperationTrigger::DrawIndexBuffer {
                 source,
                 index_count: source.argument(),
@@ -2181,1049 +2163,6 @@ fn preflight_register(
         operation,
         writes_state,
     ))
-}
-
-/// Pure field decoding is shared by local encoding admission and derived state.
-/// No state mirror, identity or provenance is propagated by validation alone.
-#[inline]
-fn decode_declared_state(
-    source: crate::MaxwellMethodSource,
-    declaration: &MethodDeclaration,
-) -> Result<Option<MaxwellThreeDStateWrite>, MaxwellEngineDispatchError> {
-    if source.argument() & !declaration.defined_mask != 0 {
-        return Err(MaxwellEngineDispatchError::InvalidMethodValue {
-            source,
-            metadata: declaration.metadata,
-            defined_mask: declaration.defined_mask,
-        });
-    }
-    match declaration.action {
-        MethodAction::NotifyAddress => Ok(None),
-        MethodAction::Delay => {
-            // Match the functional emulation contract of Eden and Ryujinx:
-            // retain the full register value for MME reads and shadow RAM,
-            // without a host sleep, GPU barrier, or pipeline-state change.
-            // Neither implementation models the hardware delay duration.
-            // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/engines/maxwell_3d.cpp#L301-L405
-            // https://git.axenov.dev/Museum/ryujinx/src/commit/ec3e848d7998038ce22c41acdbf81032bf47991f/Ryujinx.Graphics.Gpu/Engine/Threed/ThreedClassState.cs#L797
-            Ok(None)
-        }
-        MethodAction::VpcPerfKnob => {
-            // VPC work-distribution policy has four full-byte fields for
-            // culled small lines/triangles and nonculled lines/points/triangles.
-            // Preserve them for MME reads and replay; host work distribution
-            // is chosen by the host driver rather than Maxwell's VPC.
-            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1215-L1219
-            Ok(None)
-        }
-        MethodAction::InstrumentationHeader => {
-            let value = MaxwellThreeDInstrumentationValue::from_bits(source.argument());
-            let write = MaxwellThreeDStateWrite::Instrumentation(
-                MaxwellThreeDInstrumentationStateWrite::Header { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::InstrumentationData => {
-            let value = MaxwellThreeDInstrumentationValue::from_bits(source.argument());
-            let write = MaxwellThreeDStateWrite::Instrumentation(
-                MaxwellThreeDInstrumentationStateWrite::Data { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::IteratedBlend => {
-            let value = MaxwellThreeDIteratedBlend::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::FixedFunction(
-                MaxwellThreeDFixedFunctionWrite::IteratedBlend { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::IteratedBlendPassCount => {
-            let value = MaxwellThreeDIteratedBlendPassCount::new(source.argument() as u8);
-            let write = MaxwellThreeDStateWrite::FixedFunction(
-                MaxwellThreeDFixedFunctionWrite::IteratedBlendPassCount { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::SubtilingPerfKnobA => {
-            let value = MaxwellThreeDSubtilingPerfKnobA::parse(source.argument());
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobA { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::SubtilingPerfKnobB => {
-            let value = MaxwellThreeDSubtilingPerfKnobB::new(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::SubtilingPerfKnobB { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::TiledCacheEnable => {
-            let value = source.argument() != 0;
-            let write =
-                MaxwellThreeDStateWrite::TiledCache(MaxwellThreeDTiledCacheStateWrite::Enable {
-                    value,
-                    source,
-                });
-
-            Ok(Some(write))
-        }
-        MethodAction::TiledCacheTileSize => {
-            let value = MaxwellThreeDTiledCacheTileSize::parse(source.argument());
-            let write =
-                MaxwellThreeDStateWrite::TiledCache(MaxwellThreeDTiledCacheStateWrite::TileSize {
-                    value,
-                    source,
-                });
-
-            Ok(Some(write))
-        }
-        MethodAction::TiledCacheUnknownConfig(index) => {
-            let value = MaxwellThreeDTiledCacheUnknownConfig::from_bits(source.argument());
-            let write = MaxwellThreeDStateWrite::TiledCache(
-                MaxwellThreeDTiledCacheStateWrite::UnknownConfig {
-                    index,
-                    value,
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ShaderWatermarks(target) => {
-            let value = MaxwellThreeDShaderWatermarkRange::parse(source.argument());
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::ShaderWatermarks {
-                    target,
-                    value,
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::L1Configuration => {
-            let value = MaxwellThreeDDirectlyAddressableMemory::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::L1Configuration { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ColorReductionThresholdsEnable => {
-            let value = MaxwellThreeDColorReductionThresholdsEnable::parse(source.argument())
-                .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                })?;
-            let write = MaxwellThreeDStateWrite::ColorReduction(
-                MaxwellThreeDColorReductionStateWrite::Enable { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ColorReductionThresholdsUnorm8 => {
-            let value = MaxwellThreeDColorReductionThresholdsUnorm8::parse(source.argument())
-                .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                })?;
-            let write = MaxwellThreeDStateWrite::ColorReduction(
-                MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm8 { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ColorReductionThresholdsUnorm10 => {
-            let value = MaxwellThreeDColorReductionThresholdsUnorm10::parse(source.argument())
-                .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                })?;
-            let write = MaxwellThreeDStateWrite::ColorReduction(
-                MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm10 { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ColorReductionThresholdsUnorm16 => {
-            let value = MaxwellThreeDColorReductionThresholdsUnorm16::parse(source.argument())
-                .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                })?;
-            let write = MaxwellThreeDStateWrite::ColorReduction(
-                MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm16 { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ColorReductionThresholdsFp16 => {
-            let value = MaxwellThreeDColorReductionThresholdsFp16::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ColorReduction(
-                MaxwellThreeDColorReductionStateWrite::ThresholdsFp16 { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ColorReductionThresholdsSrgb8 => {
-            let value = MaxwellThreeDColorReductionThresholdsSrgb8::parse(source.argument())
-                .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                })?;
-            let write = MaxwellThreeDStateWrite::ColorReduction(
-                MaxwellThreeDColorReductionStateWrite::ThresholdsSrgb8 { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ConstantColorRenderingEnable => {
-            let value = source.argument() != 0;
-            let write = MaxwellThreeDStateWrite::ConstantColorRendering(
-                MaxwellThreeDConstantColorRenderingStateWrite::Enable { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ConstantColorRenderingComponent(component) => {
-            let value = MaxwellThreeDConstantColorValue::from_bits(source.argument());
-            let write = MaxwellThreeDStateWrite::ConstantColorRendering(
-                MaxwellThreeDConstantColorRenderingStateWrite::Component {
-                    component,
-                    value,
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::OpportunisticEarlyZHysteresis => {
-            let raw = source.argument();
-            if raw > 19 && raw != 31 {
-                return Err(invalid_encoding(
-                    source,
-                    "SET_OPPORTUNISTIC_EARLY_Z_HYSTERESIS",
-                    "undefined primitive-area threshold",
-                ));
-            }
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::OpportunisticEarlyZHysteresis {
-                    value: raw as u8,
-                    source,
-                },
-            );
-            Ok(Some(write))
-        }
-        MethodAction::ApiMandatedEarlyZ => {
-            let value = MaxwellThreeDApiMandatedEarlyZ::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::ApiMandatedEarlyZ { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::PostPsInitialCoverage => {
-            let write = MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::PostPsInitialCoverage {
-                    value: source.argument() != 0,
-                    source,
-                },
-            );
-            Ok(Some(write))
-        }
-        MethodAction::PostZPixelShaderImask => {
-            let value = MaxwellThreeDPostZPixelShaderImask::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::PostZPixelShaderImask { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::PixelShaderInterlockControl => {
-            let value = MaxwellThreeDPixelShaderInterlockControl::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::PixelShaderInterlockControl {
-                    value,
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::AlphaFraction => {
-            let write = MaxwellThreeDStateWrite::AlphaFraction {
-                value: MaxwellThreeDAlphaFraction::new(source.argument() as u8),
-                source,
-            };
-
-            Ok(Some(write))
-        }
-        MethodAction::RasterBoundingBox => {
-            let write = MaxwellThreeDStateWrite::RasterBoundingBox {
-                value: MaxwellThreeDRasterBoundingBox::parse(source.argument()),
-                source,
-            };
-
-            Ok(Some(write))
-        }
-        MethodAction::VafL2CacheControl => {
-            let value = MaxwellThreeDVafL2CacheControl::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write =
-                MaxwellThreeDStateWrite::L2Cache(MaxwellThreeDL2CacheStateWrite::VafControl {
-                    value,
-                    source,
-                });
-
-            Ok(Some(write))
-        }
-        MethodAction::RopL2CacheControl(request) => {
-            let value = MaxwellThreeDL2CacheEvictionPolicy::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write =
-                MaxwellThreeDStateWrite::L2Cache(MaxwellThreeDL2CacheStateWrite::RopPolicy {
-                    request,
-                    value,
-                    source,
-                });
-
-            Ok(Some(write))
-        }
-        MethodAction::ReportSemaphoreAddressUpper => {
-            let write = MaxwellThreeDStateWrite::ReportSemaphore(
-                MaxwellThreeDReportSemaphoreStateWrite::AddressUpper {
-                    value: source.argument() as u8,
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ReportSemaphoreAddressLower => {
-            let write = MaxwellThreeDStateWrite::ReportSemaphore(
-                MaxwellThreeDReportSemaphoreStateWrite::AddressLower {
-                    value: source.argument(),
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ReportSemaphorePayload => {
-            let write = MaxwellThreeDStateWrite::ReportSemaphore(
-                MaxwellThreeDReportSemaphoreStateWrite::Payload {
-                    value: source.argument(),
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::PointSize => {
-            let write = MaxwellThreeDStateWrite::PointSize {
-                value: MaxwellThreeDPointSize::from_bits(source.argument()),
-                source,
-            };
-
-            Ok(Some(write))
-        }
-        MethodAction::PointSpriteSelect => {
-            let value = MaxwellThreeDPointSpriteSelect::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::PointSpriteSelect { value, source };
-
-            Ok(Some(write))
-        }
-        MethodAction::PointCenterMode => {
-            let value = MaxwellThreeDPointCenterMode::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::PointCenterMode { value, source };
-
-            Ok(Some(write))
-        }
-        MethodAction::EdgeFlag => {
-            let value = MaxwellThreeDEdgeFlag::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::EdgeFlag { value, source };
-
-            Ok(Some(write))
-        }
-        MethodAction::ViewportZClip => {
-            let value = MaxwellThreeDViewportZClipRange::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ViewportZClip { value, source };
-
-            Ok(Some(write))
-        }
-        MethodAction::RenderEnableOverride => {
-            let value = MaxwellThreeDRenderEnableOverride::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::RenderEnable(
-                MaxwellThreeDRenderEnableStateWrite::Override { value, source },
-            );
-            Ok(Some(write))
-        }
-        MethodAction::RenderEnableAddressUpper => Ok(Some(MaxwellThreeDStateWrite::RenderEnable(
-            MaxwellThreeDRenderEnableStateWrite::AddressUpper {
-                value: source.argument() as u8,
-                source,
-            },
-        ))),
-        MethodAction::RenderEnableAddressLower => Ok(Some(MaxwellThreeDStateWrite::RenderEnable(
-            MaxwellThreeDRenderEnableStateWrite::AddressLower {
-                value: source.argument(),
-                source,
-            },
-        ))),
-        MethodAction::RenderEnableMode => {
-            let value = MaxwellThreeDRenderEnableMode::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write =
-                MaxwellThreeDStateWrite::RenderEnable(MaxwellThreeDRenderEnableStateWrite::Mode {
-                    value,
-                    source,
-                });
-
-            Ok(Some(write))
-        }
-        MethodAction::PsOutputSampleMaskUsage => {
-            let value = MaxwellThreeDPsOutputSampleMaskUsage::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::PsOutputSampleMaskUsage { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::HybridAntiAliasControl => {
-            let value = MaxwellThreeDHybridAntiAliasControl::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::HybridAntiAliasControl { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::TirMode => {
-            let value = MaxwellThreeDTirMode::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write =
-                MaxwellThreeDStateWrite::Coverage(MaxwellThreeDCoverageStateWrite::TirMode {
-                    value,
-                    source,
-                });
-
-            Ok(Some(write))
-        }
-        MethodAction::TirControl => {
-            let value = MaxwellThreeDTirControl::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write =
-                MaxwellThreeDStateWrite::Coverage(MaxwellThreeDCoverageStateWrite::TirControl {
-                    value,
-                    source,
-                });
-
-            Ok(Some(write))
-        }
-        MethodAction::TirModulation => {
-            let value = MaxwellThreeDTirModulationComponentSelect::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write =
-                MaxwellThreeDStateWrite::Coverage(MaxwellThreeDCoverageStateWrite::TirModulation {
-                    value,
-                    source,
-                });
-
-            Ok(Some(write))
-        }
-        MethodAction::TirModulationFunction => {
-            let value = MaxwellThreeDTirModulationFunction::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::TirModulationFunction { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::CoverageToColor => {
-            let value = MaxwellThreeDCoverageToColor::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::CoverageToColor { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::AlphaToCoverageOverride => {
-            let value = MaxwellThreeDAlphaToCoverageOverride::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::AlphaToCoverageOverride { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::AlphaToCoverageDither => {
-            let value = MaxwellThreeDAlphaToCoverageDither::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::AlphaToCoverageDither { value, source },
-            );
-            Ok(Some(write))
-        }
-        MethodAction::SampleLocations(group) => {
-            let value = MaxwellThreeDSampleLocationGroup::parse(source.argument());
-            let write = MaxwellThreeDStateWrite::Coverage(
-                MaxwellThreeDCoverageStateWrite::SampleLocations {
-                    group,
-                    value,
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::RenderEnableControl => {
-            let value = MaxwellThreeDConditionalLoadConstantBuffer::parse(source.argument())
-                .ok_or(MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                })?;
-            let write = MaxwellThreeDStateWrite::RenderEnable(
-                MaxwellThreeDRenderEnableStateWrite::ConditionalLoadConstantBuffer {
-                    value,
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::VisibleCallLimit => {
-            let value = MaxwellThreeDVisibleCallLimit::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::VisibleCallLimit { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::SmTimeoutCounterBit => {
-            let value = MaxwellThreeDSmTimeoutCounterBit::new(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::SmTimeoutCounterBit { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ShaderExceptionsEnable => {
-            let value = MaxwellThreeDShaderExceptionsEnable::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::ShaderExceptionsEnable { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ShaderLocalMemoryWindowBaseAddress => {
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryWindowBaseAddress {
-                    value: source.argument(),
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ShaderLocalMemoryAddressUpper => {
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryAddressUpper {
-                    value: source.argument() as u8,
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ShaderLocalMemoryAddressLower => {
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryAddressLower {
-                    value: source.argument(),
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ShaderLocalMemorySizeUpper => {
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemorySizeUpper {
-                    value: source.argument() as u8,
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ShaderLocalMemorySizeLower => {
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemorySizeLower {
-                    value: source.argument(),
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ShaderLocalMemoryDefaultSizePerWarp => {
-            let value = MaxwellThreeDShaderLocalMemoryPerWarpSize::new(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::ShaderLocalMemoryDefaultSizePerWarp {
-                    value,
-                    source,
-                },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::CsaaEnable => {
-            let value = MaxwellThreeDCsaaEnable::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write =
-                MaxwellThreeDStateWrite::Coverage(MaxwellThreeDCoverageStateWrite::CsaaEnable {
-                    value,
-                    source,
-                });
-
-            Ok(Some(write))
-        }
-        MethodAction::AliasedLineWidthEnable => {
-            let value = MaxwellThreeDAliasedLineWidthEnable::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::Line(
-                MaxwellThreeDLineStateWrite::AliasedLineWidthEnable { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ActiveZCullRegion => {
-            let value = MaxwellThreeDZCullRegionId::new(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write =
-                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::ActiveRegion {
-                    value,
-                    source,
-                });
-
-            Ok(Some(write))
-        }
-        MethodAction::ZCullReportSelection => {
-            let write =
-                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::ReportSelection {
-                    value: source.argument(),
-                    source,
-                });
-            Ok(Some(write))
-        }
-        MethodAction::ZCullReportType => {
-            if source.argument() >> 4 > 3 {
-                return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                    source,
-                    method_name: "SET_ZCULL_SUBREGION_REPORT_TYPE",
-                    reason: "reserved Z-cull report type",
-                });
-            }
-            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::ReportType {
-                value: source.argument(),
-                source,
-            });
-            Ok(Some(write))
-        }
-        MethodAction::ZCullSubregionAllocation => {
-            let value = MaxwellThreeDZCullSubregionAllocation::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodEncoding {
-                    source,
-                    method_name: "SET_ZCULL_SUBREGION_ALLOCATION",
-                    reason: "reserved Z-cull allocation format",
-                },
-            )?;
-            let write =
-                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::SubregionAllocation {
-                    value,
-                    source,
-                });
-            Ok(Some(write))
-        }
-        MethodAction::ZCullSubregionAlgorithm => {
-            let value = match source.argument() {
-                0 => MaxwellThreeDZCullSubregionAlgorithm::Static,
-                1 => MaxwellThreeDZCullSubregionAlgorithm::Adaptive,
-                _ => {
-                    return Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                        source,
-                        method_name: "ASSIGN_ZCULL_SUBREGIONS",
-                        reason: "reserved Z-cull assignment algorithm",
-                    });
-                }
-            };
-            let write =
-                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::SubregionAlgorithm {
-                    value,
-                    source,
-                });
-            Ok(Some(write))
-        }
-        MethodAction::ZCullStorage(index) => {
-            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::Storage {
-                index,
-                value: source.argument(),
-                source,
-            });
-            Ok(Some(write))
-        }
-        MethodAction::ZCullRegionLocation => {
-            let write =
-                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::RegionLocation {
-                    value: MaxwellThreeDZCullRegionLocation::parse(source.argument()),
-                    source,
-                });
-            Ok(Some(write))
-        }
-        MethodAction::ZCullRegionAliquots => {
-            let write =
-                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::RegionAliquots {
-                    value: source.argument() as u16,
-                    source,
-                });
-            Ok(Some(write))
-        }
-        MethodAction::ZCullRegionSize(axis) => {
-            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::RegionSize {
-                axis,
-                value: source.argument() as u16,
-                source,
-            });
-            Ok(Some(write))
-        }
-        MethodAction::ZCullRegionPixelOffset(axis) => {
-            let write =
-                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::RegionPixelOffset {
-                    axis,
-                    value: source.argument() as u16,
-                    source,
-                });
-            Ok(Some(write))
-        }
-        MethodAction::ZCullRegionFormat => {
-            let value = MaxwellThreeDZCullRegionFormat::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodEncoding {
-                    source,
-                    method_name: "SET_ZCULL_REGION_FORMAT",
-                    reason: "reserved Z-cull region format",
-                },
-            )?;
-            let write =
-                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::RegionFormat {
-                    value,
-                    source,
-                });
-            Ok(Some(write))
-        }
-        MethodAction::ZCullSubregion => {
-            let value = MaxwellThreeDZCullSubregion::parse(source.argument())
-                .expect("validated Z-cull subregion mask");
-            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::Subregion {
-                value,
-                source,
-            });
-            Ok(Some(write))
-        }
-        MethodAction::ZCullDirectionFormat => {
-            let value = MaxwellThreeDZCullDirectionFormat::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodEncoding {
-                    source,
-                    method_name: "SET_ZCULL_DIR_FORMAT",
-                    reason: "reserved Z-cull direction or depth format",
-                },
-            )?;
-            let write =
-                MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::DirectionFormat {
-                    value,
-                    source,
-                });
-            Ok(Some(write))
-        }
-        MethodAction::ZCullStatsEnable => {
-            let value = MaxwellThreeDZCullStatsEnable::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::StatsEnable {
-                value,
-                source,
-            });
-
-            Ok(Some(write))
-        }
-        MethodAction::StreamOutputEnable => {
-            let write = MaxwellThreeDStateWrite::ShaderExecution(
-                MaxwellThreeDShaderExecutionStateWrite::StreamOutputEnable {
-                    value: source.argument() != 0,
-                    source,
-                },
-            );
-            Ok(Some(write))
-        }
-        MethodAction::StatisticsCounterEnable => {
-            let write = MaxwellThreeDStateWrite::Counter(
-                MaxwellThreeDCounterStateWrite::StatisticsEnable {
-                    value: source.argument(),
-                    source,
-                },
-            );
-            Ok(Some(write))
-        }
-        MethodAction::ZPassPixelCountEnable => {
-            let value = MaxwellThreeDZPassPixelCountEnable::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::Counter(
-                MaxwellThreeDCounterStateWrite::ZPassPixelCountEnable { value, source },
-            );
-
-            Ok(Some(write))
-        }
-        MethodAction::ZCullCriterion => {
-            let value = MaxwellThreeDZCullCriterion::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::Criterion {
-                value,
-                source,
-            });
-
-            Ok(Some(write))
-        }
-        MethodAction::ZCullEnable => {
-            let value = MaxwellThreeDZCullEnable::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::Enable {
-                value,
-                source,
-            });
-
-            Ok(Some(write))
-        }
-        MethodAction::ZCullBounds => {
-            let value = MaxwellThreeDZCullBounds::parse(source.argument()).ok_or(
-                MaxwellEngineDispatchError::InvalidMethodValue {
-                    source,
-                    metadata: declaration.metadata,
-                    defined_mask: declaration.defined_mask,
-                },
-            )?;
-            let write = MaxwellThreeDStateWrite::ZCull(MaxwellThreeDZCullStateWrite::Bounds {
-                value,
-                source,
-            });
-
-            Ok(Some(write))
-        }
-        _ => Ok(None),
-    }
 }
 
 fn preflight_mme_state(
@@ -3387,16 +2326,13 @@ fn preflight_constant_buffer_load(
                     "data load requires a selector size",
                 )
             })?;
-            let offset = bindings
-                .constant_buffer_load()
-                .next_offset()
-                .ok_or_else(|| {
-                    invalid_encoding(
-                        source,
-                        "LOAD_CONSTANT_BUFFER",
-                        "data load requires LOAD_CONSTANT_BUFFER_OFFSET",
-                    )
-                })?;
+            let offset = bindings.constant_buffer_offset().ok_or_else(|| {
+                invalid_encoding(
+                    source,
+                    "LOAD_CONSTANT_BUFFER",
+                    "data load requires LOAD_CONSTANT_BUFFER_OFFSET",
+                )
+            })?;
             let next_offset = offset.checked_add(4).ok_or_else(|| {
                 invalid_encoding(
                     source,
@@ -3425,7 +2361,6 @@ fn preflight_constant_buffer_load(
             let upload = MaxwellThreeDInlineConstantBufferUpload::new(address, offset, raw, source);
             Ok(Some((
                 MaxwellThreeDStateWrite::ShaderBinding(B::ConstantBufferLoadData {
-                    value: raw,
                     next_offset,
                     source,
                 }),
@@ -3443,450 +2378,9 @@ fn preflight_vertex_and_binding_state(
 ) -> Result<Option<(MaxwellThreeDStateWrite, &'static str)>, MaxwellEngineDispatchError> {
     use MaxwellThreeDShaderBindingWrite as B;
     use MaxwellThreeDVertexInputWrite as V;
-
     let method = source.method().0;
     let raw = source.argument();
-
-    let vertex = if (0x1120..0x1130).contains(&method) && method & 3 == 0 {
-        Some((
-            V::AttributeSkipMask {
-                index: ((method - 0x1120) / 4) as u8,
-                value: raw,
-                source,
-            },
-            if method < 0x1128 {
-                "SET_DA_OUTPUT_ATTRIBUTE_SKIP_MASK_A"
-            } else {
-                "SET_DA_OUTPUT_ATTRIBUTE_SKIP_MASK_B"
-            },
-        ))
-    } else if (0x1160..0x11e0).contains(&method) && method & 3 == 0 {
-        let attribute = ((method - 0x1160) / 4) as u8;
-        let value = MaxwellThreeDVertexAttributeFormat::parse(raw).ok_or_else(|| {
-            invalid_encoding(
-                source,
-                "SET_VERTEX_ATTRIBUTE",
-                "invalid stream, component-width, or numerical-type encoding",
-            )
-        })?;
-        Some((
-            V::Attribute {
-                attribute,
-                value,
-                source,
-            },
-            "SET_VERTEX_ATTRIBUTE",
-        ))
-    } else if (0x1880..0x1900).contains(&method) && method & 3 == 0 {
-        let stream = ((method - 0x1880) / 4) as u8;
-        Some((
-            V::StreamInstanced {
-                stream,
-                value: checked_bool(source, "SET_VERTEX_STREAM_INSTANCE")?,
-                source,
-            },
-            "SET_VERTEX_STREAM_INSTANCE",
-        ))
-    } else if (0x1c00..0x1e00).contains(&method) {
-        let stream = ((method - 0x1c00) / 0x10) as u8;
-        let field = (method - 0x1c00) % 0x10;
-        let (write, name) = match field {
-            0 => (
-                V::StreamFormat {
-                    stream,
-                    value: MaxwellThreeDVertexStreamFormat::parse(raw).ok_or_else(|| {
-                        invalid_encoding(
-                            source,
-                            "SET_VERTEX_STREAM_FORMAT",
-                            "undefined vertex-stream format bits",
-                        )
-                    })?,
-                    source,
-                },
-                "SET_VERTEX_STREAM_FORMAT",
-            ),
-            4 if raw <= 0xff => (
-                V::StreamAddressUpper {
-                    stream,
-                    value: raw as u8,
-                    source,
-                },
-                "SET_VERTEX_STREAM_LOCATION_A",
-            ),
-            8 => (
-                V::StreamAddressLower {
-                    stream,
-                    value: raw,
-                    source,
-                },
-                "SET_VERTEX_STREAM_LOCATION_B",
-            ),
-            12 => (
-                V::StreamFrequency {
-                    stream,
-                    value: raw,
-                    source,
-                },
-                "SET_VERTEX_STREAM_FREQUENCY",
-            ),
-            4 => {
-                return Err(invalid_encoding(
-                    source,
-                    "SET_VERTEX_STREAM_LOCATION_A",
-                    "GPU address exceeds the 40-bit field",
-                ));
-            }
-            _ => return Ok(None),
-        };
-        Some((write, name))
-    } else if (0x1f00..0x2000).contains(&method) && method & 3 == 0 {
-        let stream = if method < 0x1f80 {
-            ((method - 0x1f00) / 8) as u8
-        } else {
-            16 + ((method - 0x1f80) / 8) as u8
-        };
-        let upper = method & 7 == 0;
-        if upper && raw > 0xff {
-            return Err(invalid_encoding(
-                source,
-                "SET_VERTEX_STREAM_LIMIT",
-                "GPU address exceeds the 40-bit field",
-            ));
-        }
-        Some(if upper {
-            (
-                V::StreamLimitUpper {
-                    stream,
-                    value: raw as u8,
-                    source,
-                },
-                "SET_VERTEX_STREAM_LIMIT_A",
-            )
-        } else {
-            (
-                V::StreamLimitLower {
-                    stream,
-                    value: raw,
-                    source,
-                },
-                "SET_VERTEX_STREAM_LIMIT_B",
-            )
-        })
-    } else {
-        match method {
-            0x0374 => Some((
-                V::BalancedPrimitiveWorkload {
-                    value: MaxwellThreeDBalancedPrimitiveWorkload::parse(raw).ok_or_else(|| {
-                        invalid_encoding(
-                            source,
-                            "SET_BALANCED_PRIMITIVE_WORKLOAD",
-                            "reserved bits are set",
-                        )
-                    })?,
-                    source,
-                },
-                "SET_BALANCED_PRIMITIVE_WORKLOAD",
-            )),
-            0x0f84 if raw <= 0xff => Some((
-                V::StreamSubstituteAddressUpper {
-                    value: raw as u8,
-                    source,
-                },
-                "SET_VERTEX_STREAM_SUBSTITUTE_A",
-            )),
-            0x0f84 => {
-                return Err(invalid_encoding(
-                    source,
-                    "SET_VERTEX_STREAM_SUBSTITUTE_A",
-                    "GPU address exceeds the 40-bit field",
-                ));
-            }
-            0x0f88 => Some((
-                V::StreamSubstituteAddressLower { value: raw, source },
-                "SET_VERTEX_STREAM_SUBSTITUTE_B",
-            )),
-            0x02d0 => Some((
-                V::PrimitiveCircularBufferThrottle {
-                    value: MaxwellThreeDPrimitiveCircularBufferThrottle::new(raw).ok_or_else(
-                        || {
-                            invalid_encoding(
-                                source,
-                                "SET_PRIM_CIRCULAR_BUFFER_THROTTLE",
-                                "reserved bits are set",
-                            )
-                        },
-                    )?,
-                    source,
-                },
-                "SET_PRIM_CIRCULAR_BUFFER_THROTTLE",
-            )),
-            0x0dcc if raw <= 0xff => Some((
-                V::PatchSize {
-                    value: MaxwellThreeDPatchSize::new(raw as u8),
-                    source,
-                },
-                "SET_PATCH",
-            )),
-            0x0dcc => {
-                return Err(invalid_encoding(
-                    source,
-                    "SET_PATCH",
-                    "reserved bits are set",
-                ));
-            }
-            0x0de8 => Some((
-                V::VertexArrayPrimitiveRestartEnable {
-                    value: MaxwellThreeDVertexArrayPrimitiveRestartEnable::parse(raw).ok_or_else(
-                        || {
-                            invalid_encoding(
-                                source,
-                                "SET_DA_PRIMITIVE_RESTART_VERTEX_ARRAY",
-                                "undefined boolean encoding or reserved bits",
-                            )
-                        },
-                    )?,
-                    source,
-                },
-                "SET_DA_PRIMITIVE_RESTART_VERTEX_ARRAY",
-            )),
-            0x0d74 => Some((
-                V::VertexArrayStart { value: raw, source },
-                "SET_VERTEX_ARRAY_START",
-            )),
-            // Vertex ID has its own full-width base, distinct from the global
-            // base vertex index. deko3d programs both for indexed draws.
-            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1378-L1379
-            // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/draw.mme
-            0x1118 => Some((V::VertexIdBase { value: raw, source }, "SET_VERTEX_ID_BASE")),
-            // NVIDIA publishes both global draw-index registers as complete
-            // 32-bit fields.
-            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2633-L2637
-            0x1434 => Some((
-                V::GlobalBaseVertexIndex { value: raw, source },
-                "SET_GLOBAL_BASE_VERTEX_INDEX",
-            )),
-            0x1438 => Some((
-                V::GlobalBaseInstanceIndex { value: raw, source },
-                "SET_GLOBAL_BASE_INSTANCE_INDEX",
-            )),
-            0x1610 => Some((
-                V::AttributeDefaults {
-                    value: MaxwellThreeDAttributeDefaults::parse(raw).ok_or_else(|| {
-                        invalid_encoding(
-                            source,
-                            "SET_ATTRIBUTE_DEFAULT",
-                            "reserved attribute-default bits are set",
-                        )
-                    })?,
-                    source,
-                },
-                "SET_ATTRIBUTE_DEFAULT",
-            )),
-            // NVIDIA defines END as a one-bit method immediately before BEGIN.
-            // Retaining it as a state transition closes the current primitive
-            // sequence without mutating draw snapshots captured earlier.
-            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3022-L3025
-            0x1614 => Some((
-                V::End {
-                    value: checked_bool(source, "END")?,
-                    source,
-                },
-                "END",
-            )),
-            0x1618 => Some((
-                V::Begin {
-                    value: MaxwellThreeDBegin::parse(raw).ok_or_else(|| {
-                        invalid_encoding(source, "BEGIN", "invalid topology or begin modifier")
-                    })?,
-                    source,
-                },
-                "BEGIN",
-            )),
-            0x1644 => Some((
-                V::PrimitiveRestartEnable {
-                    value: checked_bool(source, "SET_DA_PRIMITIVE_RESTART")?,
-                    source,
-                },
-                "SET_DA_PRIMITIVE_RESTART",
-            )),
-            0x1648 => Some((
-                V::PrimitiveRestartIndex { value: raw, source },
-                "SET_DA_PRIMITIVE_RESTART_INDEX",
-            )),
-            0x164c => Some((
-                V::VertexIdUsesArrayStart {
-                    value: MaxwellThreeDVertexIdUsesArrayStart::parse(raw).ok_or_else(|| {
-                        invalid_encoding(
-                            source,
-                            "SET_DA_OUTPUT",
-                            "undefined boolean encoding or reserved bits",
-                        )
-                    })?,
-                    source,
-                },
-                "SET_DA_OUTPUT",
-            )),
-            0x17c8 if raw <= 0xff => Some((
-                V::IndexAddressUpper {
-                    value: raw as u8,
-                    source,
-                },
-                "SET_INDEX_BUFFER_A",
-            )),
-            0x17cc => Some((
-                V::IndexAddressLower { value: raw, source },
-                "SET_INDEX_BUFFER_B",
-            )),
-            0x17d0 if raw <= 0xff => Some((
-                V::IndexLimitUpper {
-                    value: raw as u8,
-                    source,
-                },
-                "SET_INDEX_BUFFER_C",
-            )),
-            0x17d4 => Some((
-                V::IndexLimitLower { value: raw, source },
-                "SET_INDEX_BUFFER_D",
-            )),
-            0x17d8 => Some((
-                V::IndexElementSize {
-                    value: MaxwellThreeDIndexElementSize::parse(raw).ok_or_else(|| {
-                        invalid_encoding(source, "SET_INDEX_BUFFER_E", "invalid index element size")
-                    })?,
-                    source,
-                },
-                "SET_INDEX_BUFFER_E",
-            )),
-            0x17dc => Some((V::IndexFirst { value: raw, source }, "SET_INDEX_BUFFER_F")),
-            0x1948 => Some((
-                V::TopologyOverride {
-                    value: checked_bool(source, "SET_PRIMITIVE_TOPOLOGY_CONTROL")?,
-                    source,
-                },
-                "SET_PRIMITIVE_TOPOLOGY_CONTROL",
-            )),
-            0x1970 => Some((
-                V::Topology {
-                    value: MaxwellThreeDPrimitiveTopology::parse(raw).ok_or_else(|| {
-                        invalid_encoding(
-                            source,
-                            "SET_PRIMITIVE_TOPOLOGY",
-                            "unknown primitive topology",
-                        )
-                    })?,
-                    source,
-                },
-                "SET_PRIMITIVE_TOPOLOGY",
-            )),
-            0x17c8 | 0x17d0 => {
-                return Err(invalid_encoding(
-                    source,
-                    "SET_INDEX_BUFFER",
-                    "GPU address exceeds the 40-bit field",
-                ));
-            }
-            _ => None,
-        }
-    };
-    if let Some((write, name)) = vertex {
-        return Ok(Some((MaxwellThreeDStateWrite::VertexInput(write), name)));
-    }
-
-    let binding = if (0x1240..0x1260).contains(&method) && method.is_multiple_of(4) {
-        Some((
-            B::GeometryPassthroughMask {
-                index: ((method - 0x1240) / 4) as u8,
-                value: raw,
-                source,
-            },
-            "SET_POST_VTG_SHADER_ATTRIB_SKIP_MASK",
-        ))
-    } else if (0x2000..0x2180).contains(&method) {
-        let pipeline = ((method - 0x2000) / 0x40) as u8;
-        let field = (method - 0x2000) % 0x40;
-        match field {
-            0 if raw & !0x71 == 0 => {
-                let stage = MaxwellShaderStage::parse((raw >> 4) & 7).ok_or_else(|| {
-                    invalid_encoding(source, "SET_PIPELINE_SHADER", "unknown shader stage")
-                })?;
-                Some((
-                    B::PipelineShader {
-                        pipeline,
-                        enabled: raw & 1 != 0,
-                        stage,
-                        source,
-                    },
-                    "SET_PIPELINE_SHADER",
-                ))
-            }
-            0 => {
-                return Err(invalid_encoding(
-                    source,
-                    "SET_PIPELINE_SHADER",
-                    "undefined pipeline shader bits",
-                ));
-            }
-            // NVIDIA defines one full-width program offset and one eight-bit
-            // register count for each of the six pipeline slots.
-            // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3947-L3954
-            0x04 => Some((
-                B::PipelineProgram {
-                    pipeline,
-                    offset: raw,
-                    source,
-                },
-                "SET_PIPELINE_PROGRAM",
-            )),
-            0x0c if raw <= u32::from(u8::MAX) => Some((
-                B::PipelineRegisterCount {
-                    pipeline,
-                    count: raw as u8,
-                    source,
-                },
-                "SET_PIPELINE_REGISTER_COUNT",
-            )),
-            0x0c => {
-                return Err(invalid_encoding(
-                    source,
-                    "SET_PIPELINE_REGISTER_COUNT",
-                    "register count exceeds the eight-bit field",
-                ));
-            }
-            0x10 if raw <= 7 => Some((
-                B::PipelineGroup {
-                    pipeline,
-                    group: raw as u8,
-                    source,
-                },
-                "SET_PIPELINE_BINDING",
-            )),
-            0x10 => {
-                return Err(invalid_encoding(
-                    source,
-                    "SET_PIPELINE_BINDING",
-                    "binding group exceeds the three-bit field",
-                ));
-            }
-            _ => None,
-        }
-    } else if method == 0x0320 {
-        Some((
-            B::TessellationMode {
-                value: MaxwellThreeDTessellationMode::new(raw),
-                source,
-            },
-            "SET_TESSELLATION_PARAMETERS",
-        ))
-    } else if (0x0324..=0x0338).contains(&method) && method.is_multiple_of(4) {
-        Some((
-            B::TessellationLod {
-                level: MaxwellThreeDTessellationLod::from_index(((method - 0x0324) / 4) as u8),
-                value: raw,
-                source,
-            },
-            "SET_TESSELLATION_LOD",
-        ))
-    } else if (0x2400..0x2500).contains(&method) && (method - 0x2400) % 0x20 == 0x10 {
+    if (0x2400..0x2500).contains(&method) && (method - 0x2400) % 0x20 == 0x10 {
         let group = ((method - 0x2400) / 0x20) as u8;
         if raw & !0x1f1 != 0 {
             return Err(invalid_encoding(
@@ -3929,127 +2423,37 @@ fn preflight_vertex_and_binding_state(
         } else {
             (None, None)
         };
-        Some((
-            B::BindConstantBuffer {
+        return Ok(Some((
+            MaxwellThreeDStateWrite::ShaderBinding(B::BindConstantBuffer {
                 group,
                 slot,
                 enabled,
                 address,
                 size,
                 source,
-            },
+            }),
             "BIND_GROUP_CONSTANT_BUFFER",
-        ))
-    } else {
-        match method {
-            0x0310 => Some((
-                B::SpaVersion {
-                    value: MaxwellSpaVersion::parse(raw).ok_or_else(|| {
-                        invalid_encoding(source, "SET_SPA_VERSION", "reserved bits are set")
-                    })?,
-                    source,
-                },
-                "SET_SPA_VERSION",
-            )),
-            0x1608 if raw <= 0xff => Some((
-                B::ProgramRegionAddressUpper {
-                    value: raw as u8,
-                    source,
-                },
-                "SET_PROGRAM_REGION_A",
-            )),
-            0x1608 => {
-                return Err(invalid_encoding(
-                    source,
-                    "SET_PROGRAM_REGION_A",
-                    "GPU address exceeds the 40-bit field",
-                ));
-            }
-            0x160c => Some((
-                B::ProgramRegionAddressLower { value: raw, source },
-                "SET_PROGRAM_REGION_B",
-            )),
-            0x0f10 => Some((
-                B::MaxwellTextureHeaders {
-                    value: checked_bool(source, "SET_SELECT_MAXWELL_TEXTURE_HEADERS")?,
-                    source,
-                },
-                "SET_SELECT_MAXWELL_TEXTURE_HEADERS",
-            )),
-            0x1234 if raw <= 1 => Some((
-                B::SamplerBinding {
-                    value: if raw == 0 {
-                        MaxwellThreeDSamplerBindingMode::Independent
-                    } else {
-                        MaxwellThreeDSamplerBindingMode::ViaTextureHeader
-                    },
-                    source,
-                },
-                "SET_SAMPLER_BINDING",
-            )),
-            0x155c if raw <= 0xff => Some((
-                B::SamplerAddressUpper {
-                    value: raw as u8,
-                    source,
-                },
-                "SET_TEX_SAMPLER_POOL_A",
-            )),
-            0x1560 => Some((
-                B::SamplerAddressLower { value: raw, source },
-                "SET_TEX_SAMPLER_POOL_B",
-            )),
-            0x1564 if raw <= 0x0f_ffff => Some((
-                B::SamplerMaximumIndex { value: raw, source },
-                "SET_TEX_SAMPLER_POOL_C",
-            )),
-            0x1574 if raw <= 0xff => Some((
-                B::TextureHeaderAddressUpper {
-                    value: raw as u8,
-                    source,
-                },
-                "SET_TEX_HEADER_POOL_A",
-            )),
-            0x1578 => Some((
-                B::TextureHeaderAddressLower { value: raw, source },
-                "SET_TEX_HEADER_POOL_B",
-            )),
-            0x157c if raw <= 0x3f_ffff => Some((
-                B::TextureHeaderMaximumIndex { value: raw, source },
-                "SET_TEX_HEADER_POOL_C",
-            )),
-            0x2380 if raw <= 0x1_ffff => Some((
-                B::SelectorSize { size: raw, source },
-                "SET_CONSTANT_BUFFER_SELECTOR_A",
-            )),
-            0x2384 if raw <= 0xff => Some((
-                B::SelectorAddressUpper {
-                    value: raw as u8,
-                    source,
-                },
-                "SET_CONSTANT_BUFFER_SELECTOR_B",
-            )),
-            0x2388 => Some((
-                B::SelectorAddressLower { value: raw, source },
-                "SET_CONSTANT_BUFFER_SELECTOR_C",
-            )),
-            0x2608 if raw <= 0x1f => Some((
-                B::BindlessTextureSlot {
-                    value: raw as u8,
-                    source,
-                },
-                "SET_BINDLESS_TEXTURE",
-            )),
-            0x1234 | 0x155c | 0x1564 | 0x1574 | 0x157c | 0x2380 | 0x2384 | 0x2608 => {
-                return Err(invalid_encoding(
-                    source,
-                    "SHADER_BINDING",
-                    "argument exceeds its verified field",
-                ));
-            }
-            _ => None,
-        }
-    };
-    Ok(binding.map(|(write, name)| (MaxwellThreeDStateWrite::ShaderBinding(write), name)))
+        )));
+    }
+    Ok(match method {
+        0x1614 => Some((
+            MaxwellThreeDStateWrite::VertexInput(V::End {
+                value: checked_bool(source, "END")?,
+                source,
+            }),
+            "END",
+        )),
+        0x1618 => Some((
+            MaxwellThreeDStateWrite::VertexInput(V::Begin {
+                value: MaxwellThreeDBegin::parse(raw).ok_or_else(|| {
+                    invalid_encoding(source, "BEGIN", "invalid topology or begin modifier")
+                })?,
+                source,
+            }),
+            "BEGIN",
+        )),
+        _ => None,
+    })
 }
 
 fn invalid_encoding(
@@ -4083,1425 +2487,27 @@ fn rectangle(raw: u32) -> Option<MaxwellThreeDRectangle> {
     (value.min <= value.max).then_some(value)
 }
 
-fn preflight_output_state(
+fn preflight_clear(
     source: crate::MaxwellMethodSource,
-) -> Result<Option<(MaxwellThreeDStateWrite, &'static str)>, MaxwellEngineDispatchError> {
-    let method = source.method().0;
-    let raw = source.argument();
-
-    let line_write = match method {
-        // NVIDIA publishes these line-rasterization registers in the pinned
-        // MAXWELL_B class header.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2610-L2611
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2785-L2788
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3108-L3121
-        0x0f8c => Some((
-            MaxwellThreeDLineStateWrite::PolygonClipGeneratedEdge {
-                value: MaxwellThreeDPolygonClipGeneratedEdge::parse(raw).ok_or_else(|| {
-                    invalid_encoding(
-                        source,
-                        "SET_LINE_MODE_POLYGON_CLIP",
-                        "expected generated-edge selector 0 or 1",
-                    )
-                })?,
-                source,
-            },
-            "SET_LINE_MODE_POLYGON_CLIP",
-        )),
-        0x13b4 => Some((
-            MaxwellThreeDLineStateWrite::AliasedLineWidth {
-                value: MaxwellThreeDRawValue::new(raw),
-                source,
-            },
-            "SET_ALIASED_LINE_WIDTH_FLOAT",
-        )),
-        0x1570 => Some((
-            MaxwellThreeDLineStateWrite::AntiAliasedLineEnable {
-                value: MaxwellThreeDAntiAliasedLineEnable::parse(raw).ok_or_else(|| {
-                    invalid_encoding(source, "SET_ANTI_ALIASED_LINE", "expected boolean 0 or 1")
-                })?,
-                source,
-            },
-            "SET_ANTI_ALIASED_LINE",
-        )),
-        0x166c => Some((
-            MaxwellThreeDLineStateWrite::StippleEnable {
-                value: checked_bool(source, "SET_LINE_STIPPLE")?,
-                source,
-            },
-            "SET_LINE_STIPPLE",
-        )),
-        0x1680 => Some((
-            MaxwellThreeDLineStateWrite::StippleParameters {
-                value: MaxwellThreeDLineStippleParameters::parse(raw).ok_or_else(|| {
-                    invalid_encoding(
-                        source,
-                        "SET_LINE_STIPPLE_PARAMETERS",
-                        "reserved bits are set",
-                    )
-                })?,
-                source,
-            },
-            "SET_LINE_STIPPLE_PARAMETERS",
-        )),
-        _ => None,
-    };
-    if let Some((write, name)) = line_write {
-        return Ok(Some((MaxwellThreeDStateWrite::Line(write), name)));
+) -> Result<Option<PreparedMethod>, MaxwellEngineDispatchError> {
+    if source.method().0 != 0x19d0 {
+        return Ok(None);
     }
-
-    let point_write = match method {
-        // NVIDIA publishes the fill-via-triangle modes and conservative-raster
-        // boolean in the pinned public MAXWELL_B class header.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1822-L1840
-        0x113c => Some((
-            MaxwellThreeDStateWrite::FillViaTriangle {
-                value: MaxwellThreeDFillViaTriangleMode::parse(raw).ok_or_else(|| {
-                    invalid_encoding(source, "SET_FILL_VIA_TRIANGLE", "expected mode 0, 1, or 2")
-                })?,
-                source,
-            },
-            "SET_FILL_VIA_TRIANGLE",
-        )),
-        0x1148 => Some((
-            MaxwellThreeDStateWrite::ConservativeRaster {
-                value: MaxwellThreeDConservativeRasterEnable::parse(raw).ok_or_else(|| {
-                    invalid_encoding(source, "SET_CONSERVATIVE_RASTER", "expected boolean 0 or 1")
-                })?,
-                source,
-            },
-            "SET_CONSERVATIVE_RASTER",
-        )),
-        // NVIDIA publishes polygon smoothing, stipple enable, and all 32
-        // pattern words in its pinned public MAXWELL_B class header.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1011-L1014
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3133-L3136
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3169-L3170
-        0x0db4 => Some((
-            MaxwellThreeDStateWrite::PolygonSmoothEnable {
-                value: checked_bool(source, "SET_POLY_SMOOTH")?,
-                source,
-            },
-            "SET_POLY_SMOOTH",
-        )),
-        0x168c => Some((
-            MaxwellThreeDStateWrite::PolygonStippleEnable {
-                value: checked_bool(source, "SET_POLYGON_STIPPLE")?,
-                source,
-            },
-            "SET_POLYGON_STIPPLE",
-        )),
-        0x1700..=0x177c if method & 3 == 0 => Some((
-            MaxwellThreeDStateWrite::PolygonStipplePattern {
-                word: ((method - 0x1700) / 4) as u8,
-                value: raw,
-                source,
-            },
-            "SET_POLYGON_STIPPLE_PATTERN",
-        )),
-        // NVIDIA publishes this pixel-center selector in the pinned public
-        // MAXWELL_B class header.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3362-L3365
-        0x1924 => Some((
-            MaxwellThreeDStateWrite::ViewportPixelCenter {
-                value: MaxwellThreeDViewportPixelCenter::parse(raw).ok_or_else(|| {
-                    invalid_encoding(source, "SET_VIEWPORT_PIXEL", "expected center mode 0 or 1")
-                })?,
-                source,
-            },
-            "SET_VIEWPORT_PIXEL",
-        )),
-        0x1520 => Some((
-            MaxwellThreeDStateWrite::PointSpriteEnable {
-                value: checked_bool(source, "SET_POINT_SPRITE")?,
-                source,
-            },
-            "SET_POINT_SPRITE",
-        )),
-        0x1658 => Some((
-            MaxwellThreeDStateWrite::AntiAliasedPointEnable {
-                value: checked_bool(source, "SET_ANTI_ALIASED_POINT")?,
-                source,
-            },
-            "SET_ANTI_ALIASED_POINT",
-        )),
-        0x1910 => Some((
-            MaxwellThreeDStateWrite::AttributePointSize {
-                value: MaxwellThreeDAttributePointSize::parse(raw).ok_or_else(|| {
-                    invalid_encoding(source, "SET_ATTRIBUTE_POINT_SIZE", "reserved bits are set")
-                })?,
-                source,
-            },
-            "SET_ATTRIBUTE_POINT_SIZE",
-        )),
-        _ => None,
-    };
-    if let Some((write, name)) = point_write {
-        return Ok(Some((write, name)));
-    }
-
-    if (0x0800..0x0a00).contains(&method) {
-        let target = ((method - 0x0800) / 0x40) as u8;
-        let offset = (method - 0x0800) % 0x40;
-        if target as usize >= MAXWELL_COLOR_TARGET_COUNT {
-            return Ok(None);
-        }
-        let (write, name) = match offset {
-            0x00 if raw <= 0xff => (
-                MaxwellThreeDRenderTargetWrite::ColorAddressUpper {
-                    target,
-                    value: raw as u8,
-                    source,
-                },
-                "SET_COLOR_TARGET_A",
-            ),
-            0x04 => (
-                MaxwellThreeDRenderTargetWrite::ColorAddressLower {
-                    target,
-                    value: raw,
-                    source,
-                },
-                "SET_COLOR_TARGET_B",
-            ),
-            0x08 if raw <= 0x0fff_ffff => (
-                MaxwellThreeDRenderTargetWrite::ColorWidth {
-                    target,
-                    value: raw,
-                    source,
-                },
-                "SET_COLOR_TARGET_WIDTH",
-            ),
-            0x0c if raw <= 0x1ffff => (
-                MaxwellThreeDRenderTargetWrite::ColorHeight {
-                    target,
-                    value: raw,
-                    source,
-                },
-                "SET_COLOR_TARGET_HEIGHT",
-            ),
-            0x10 => {
-                let value = MaxwellThreeDColorTargetFormat::parse(raw).ok_or_else(|| {
-                    invalid_encoding(
-                        source,
-                        "SET_COLOR_TARGET_FORMAT",
-                        "unknown public color format",
-                    )
-                })?;
-                (
-                    MaxwellThreeDRenderTargetWrite::ColorFormat {
-                        target,
-                        value,
-                        source,
-                    },
-                    "SET_COLOR_TARGET_FORMAT",
-                )
-            }
-            0x14 if raw & !0x0001_1fff == 0 => {
-                let block_width = raw & 0xf;
-                let block_height = ((raw >> 4) & 0xf) as u8;
-                let block_depth = ((raw >> 8) & 0xf) as u8;
-                if block_width != 0 || block_height > 5 || block_depth > 5 {
-                    return Err(invalid_encoding(
-                        source,
-                        "SET_COLOR_TARGET_MEMORY",
-                        "invalid public GOB block size",
-                    ));
-                }
-                let layout = if raw & 0x1000 != 0 {
-                    if block_height != 0 || block_depth != 0 {
-                        return Err(invalid_encoding(
-                            source,
-                            "SET_COLOR_TARGET_MEMORY",
-                            "pitch layout contradicts non-unit GOB dimensions",
-                        ));
-                    }
-                    MaxwellThreeDImageLayout::PitchLinear
-                } else {
-                    MaxwellThreeDImageLayout::BlockLinear {
-                        block_height_log2: block_height,
-                        block_depth_log2: block_depth,
-                    }
-                };
-                let kind = if raw & 0x1_0000 != 0 {
-                    MaxwellThreeDImageKind::ThreeDimensional
-                } else {
-                    MaxwellThreeDImageKind::Array
-                };
-                (
-                    MaxwellThreeDRenderTargetWrite::ColorLayout {
-                        target,
-                        layout,
-                        kind,
-                        source,
-                    },
-                    "SET_COLOR_TARGET_MEMORY",
-                )
-            }
-            0x18 if raw <= 0x0fff_ffff => (
-                MaxwellThreeDRenderTargetWrite::ColorThirdDimension {
-                    target,
-                    value: raw,
-                    source,
-                },
-                "SET_COLOR_TARGET_THIRD_DIMENSION",
-            ),
-            0x1c => (
-                MaxwellThreeDRenderTargetWrite::ColorArrayPitch {
-                    target,
-                    value: raw,
-                    source,
-                },
-                "SET_COLOR_TARGET_ARRAY_PITCH",
-            ),
-            0x20 if raw <= 0xffff => (
-                MaxwellThreeDRenderTargetWrite::ColorLayer {
-                    target,
-                    value: raw as u16,
-                    source,
-                },
-                "SET_COLOR_TARGET_LAYER",
-            ),
-            0x00 | 0x08 | 0x0c | 0x14 | 0x18 | 0x20 => {
-                return Err(invalid_encoding(
-                    source,
-                    "SET_COLOR_TARGET",
-                    "reserved bits are set",
-                ));
-            }
-            _ => return Ok(None),
-        };
-        return Ok(Some((MaxwellThreeDStateWrite::RenderTarget(write), name)));
-    }
-
-    let render_write = match method {
-        0x0d6c | 0x0d70 => {
-            let value = rectangle(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    if method == 0x0d6c {
-                        "SET_CLEAR_RECT_HORIZONTAL"
-                    } else {
-                        "SET_CLEAR_RECT_VERTICAL"
-                    },
-                    "rectangle minimum exceeds maximum",
-                )
-            })?;
-            Some((
-                if method == 0x0d6c {
-                    MaxwellThreeDRenderTargetWrite::ClearHorizontal { value, source }
-                } else {
-                    MaxwellThreeDRenderTargetWrite::ClearVertical { value, source }
-                },
-                if method == 0x0d6c {
-                    "SET_CLEAR_RECT_HORIZONTAL"
-                } else {
-                    "SET_CLEAR_RECT_VERTICAL"
-                },
-            ))
-        }
-        0x0d80..=0x0d8c if method & 3 == 0 => Some((
-            MaxwellThreeDRenderTargetWrite::ClearColor {
-                component: ((method - 0x0d80) / 4) as u8,
-                value: MaxwellThreeDRawValue::new(raw),
-                source,
-            },
-            "SET_COLOR_CLEAR_VALUE",
-        )),
-        0x0d90 => Some((
-            MaxwellThreeDRenderTargetWrite::ClearDepth {
-                value: MaxwellThreeDRawValue::new(raw),
-                source,
-            },
-            "SET_Z_CLEAR_VALUE",
-        )),
-        0x0da0 if raw <= 0xff => Some((
-            MaxwellThreeDRenderTargetWrite::ClearStencil {
-                value: raw as u8,
-                source,
-            },
-            "SET_STENCIL_CLEAR_VALUE",
-        )),
-        0x0da0 => {
-            return Err(invalid_encoding(
-                source,
-                "SET_STENCIL_CLEAR_VALUE",
-                "reserved bits are set",
-            ));
-        }
-        // Preserve the legacy register independently of the explicit color surface format.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2883-L2886
-        0x15b8 if raw <= 1 => Some((
-            MaxwellThreeDRenderTargetWrite::SrgbWrite {
-                value: raw != 0,
-                source,
-            },
-            "SET_SRGB_WRITE",
-        )),
-        0x15b8 => {
-            return Err(invalid_encoding(
-                source,
-                "SET_SRGB_WRITE",
-                "reserved sRGB-write bits are set",
-            ));
-        }
-        0x0fac => {
-            let value = MaxwellThreeDSeparateFragmentData::parse(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "SET_CT_MRT_ENABLE",
-                    "undefined boolean encoding or reserved bits",
-                )
-            })?;
-            Some((
-                MaxwellThreeDRenderTargetWrite::SeparateFragmentData { value, source },
-                "SET_CT_MRT_ENABLE",
-            ))
-        }
-        0x11f0 => {
-            let value = MaxwellThreeDRenderTargetIndexOffset::parse(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "SET_OFFSET_RENDER_TARGET_INDEX",
-                    "undefined boolean encoding or reserved bits",
-                )
-            })?;
-            Some((
-                MaxwellThreeDRenderTargetWrite::RenderTargetIndexOffset { value, source },
-                "SET_OFFSET_RENDER_TARGET_INDEX",
-            ))
-        }
-        0x0fe0 if raw <= 0xff => Some((
-            MaxwellThreeDRenderTargetWrite::DepthAddressUpper {
-                value: raw as u8,
-                source,
-            },
-            "SET_ZT_A",
-        )),
-        0x0fe0 => {
-            return Err(invalid_encoding(
-                source,
-                "SET_ZT_A",
-                "reserved address bits are set",
-            ));
-        }
-        0x0fe4 => Some((
-            MaxwellThreeDRenderTargetWrite::DepthAddressLower { value: raw, source },
-            "SET_ZT_B",
-        )),
-        // Sparse depth compare applies only when the attachment is consumed.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1922-L1928
-        0x1208 if raw & !3 == 0 => Some((
-            MaxwellThreeDRenderTargetWrite::DepthSparse {
-                value: raw as u8,
-                source,
-            },
-            "SET_ZT_SPARSE",
-        )),
-        0x1208 => {
-            return Err(invalid_encoding(
-                source,
-                "SET_ZT_SPARSE",
-                "reserved sparse-depth bits are set",
-            ));
-        }
-        0x0fe8 => {
-            let value = MaxwellThreeDDepthStencilFormat::parse(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "SET_ZT_FORMAT",
-                    "unknown public depth/stencil format",
-                )
-            })?;
-            Some((
-                MaxwellThreeDRenderTargetWrite::DepthFormat { value, source },
-                "SET_ZT_FORMAT",
-            ))
-        }
-        0x0fec
-            if raw & !0x0fff == 0
-                && raw & 0xf == 0
-                && ((raw >> 4) & 0xf) <= 5
-                && ((raw >> 8) & 0xf) == 0 =>
-        {
-            Some((
-                MaxwellThreeDRenderTargetWrite::DepthLayout {
-                    value: MaxwellThreeDImageLayout::BlockLinear {
-                        block_height_log2: ((raw >> 4) & 0xf) as u8,
-                        block_depth_log2: 0,
-                    },
-                    source,
-                },
-                "SET_ZT_BLOCK_SIZE",
-            ))
-        }
-        0x0fec => {
-            return Err(invalid_encoding(
-                source,
-                "SET_ZT_BLOCK_SIZE",
-                "invalid public GOB block size",
-            ));
-        }
-        0x0ff0 => Some((
-            MaxwellThreeDRenderTargetWrite::DepthArrayPitch { value: raw, source },
-            "SET_ZT_ARRAY_PITCH",
-        )),
-        // NVIDIA's public MAXWELL_B class header defines SET_ZT_LAYER as one
-        // 16-bit array-layer offset and leaves the upper half reserved.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3180-L3181
-        0x179c if raw <= u16::MAX as u32 => Some((
-            MaxwellThreeDRenderTargetWrite::DepthLayer {
-                value: raw as u16,
-                source,
-            },
-            "SET_ZT_LAYER",
-        )),
-        0x179c => {
-            return Err(invalid_encoding(
-                source,
-                "SET_ZT_LAYER",
-                "reserved bits are set",
-            ));
-        }
-        0x1228 if raw <= 0x0fff_ffff => Some((
-            MaxwellThreeDRenderTargetWrite::DepthWidth { value: raw, source },
-            "SET_ZT_SIZE_A",
-        )),
-        0x121c => {
-            let value = MaxwellThreeDColorTargetSelection::parse(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "SET_CT_SELECT",
-                    "reserved bits are set or target count exceeds exposed selectors",
-                )
-            })?;
-            Some((
-                MaxwellThreeDRenderTargetWrite::ColorTargetSelection { value, source },
-                "SET_CT_SELECT",
-            ))
-        }
-        // Both ZBC slot-disable masks occupy bits 14:0 in NVIDIA's B197 header.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
-        0x07a4 | 0x07a8 => {
-            let name = if method == 0x07a4 {
-                "SET_COLOR_ZERO_BANDWIDTH_CLEAR"
-            } else {
-                "SET_Z_ZERO_BANDWIDTH_CLEAR"
-            };
-            if raw & !0x7fff != 0 {
-                return Err(invalid_encoding(source, name, "reserved bits are set"));
-            }
-            let value = raw as u16;
-            let write = if method == 0x07a4 {
-                MaxwellThreeDRenderTargetWrite::ColorZeroBandwidthClear { value, source }
-            } else {
-                MaxwellThreeDRenderTargetWrite::DepthZeroBandwidthClear { value, source }
-            };
-            Some((write, name))
-        }
-        0x1220 => {
-            let value = MaxwellThreeDCompressionThreshold::parse(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "SET_COMPRESSION_THRESHOLD",
-                    "sample threshold is undefined or reserved bits are set",
-                )
-            })?;
-            Some((
-                MaxwellThreeDRenderTargetWrite::CompressionThreshold { value, source },
-                "SET_COMPRESSION_THRESHOLD",
-            ))
-        }
-        0x15cc if raw & !0x0001_ffff == 0 => Some((
-            MaxwellThreeDRenderTargetWrite::RenderTargetLayer {
-                value: MaxwellThreeDRenderTargetLayer::parse(raw),
-                source,
-            },
-            "SET_RT_LAYER",
-        )),
-        0x15cc => {
-            return Err(invalid_encoding(
-                source,
-                "SET_RT_LAYER",
-                "reserved bits are set",
-            ));
-        }
-        0x1538 => {
-            let value = MaxwellThreeDDepthTargetCount::parse(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "SET_ZT_SELECT",
-                    "target count exceeds the single exposed depth/stencil target",
-                )
-            })?;
-            Some((
-                MaxwellThreeDRenderTargetWrite::DepthTargetCount { value, source },
-                "SET_ZT_SELECT",
-            ))
-        }
-        0x122c if raw <= 0x1ffff => Some((
-            MaxwellThreeDRenderTargetWrite::DepthHeight { value: raw, source },
-            "SET_ZT_SIZE_B",
-        )),
-        0x19cc => {
-            let value = MaxwellThreeDZCompressionMode::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "SET_Z_COMPRESSION", "reserved bits are set")
-            })?;
-            Some((
-                MaxwellThreeDRenderTargetWrite::DepthCompression { value, source },
-                "SET_Z_COMPRESSION",
-            ))
-        }
-        0x19e0..=0x19fc if method & 3 == 0 => {
-            let target = ((method - 0x19e0) / 4) as u8;
-            let value = MaxwellThreeDColorCompressionMode::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "SET_COLOR_COMPRESSION", "reserved bits are set")
-            })?;
-            Some((
-                MaxwellThreeDRenderTargetWrite::ColorCompression {
-                    target,
-                    value,
-                    source,
-                },
-                "SET_COLOR_COMPRESSION",
-            ))
-        }
-        0x1230 if raw & !0x1ffff == 0 => {
-            let control = if raw & 0x1_0000 != 0 {
-                MaxwellThreeDDepthArrayControl::ArraySizeIsOne
-            } else {
-                MaxwellThreeDDepthArrayControl::ThirdDimensionDefinesArraySize
-            };
-            Some((
-                MaxwellThreeDRenderTargetWrite::DepthThirdDimension {
-                    value: raw as u16,
-                    control,
-                    source,
-                },
-                "SET_ZT_SIZE_C",
-            ))
-        }
-        0x1228 | 0x122c | 0x1230 => {
-            return Err(invalid_encoding(
-                source,
-                "SET_ZT_SIZE",
-                "reserved dimension bits are set",
-            ));
-        }
-        0x10f8 => {
-            let value = MaxwellThreeDClearSurfaceControl::parse(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "SET_CLEAR_SURFACE_CONTROL",
-                    "reserved control bits are set",
-                )
-            })?;
-            Some((
-                MaxwellThreeDRenderTargetWrite::ClearSurfaceControl { value, source },
-                "SET_CLEAR_SURFACE_CONTROL",
-            ))
-        }
-        0x19d0 => {
-            let value = MaxwellThreeDClearSurface::parse(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "CLEAR_SURFACE",
-                    "invalid target, layer, or reserved bits",
-                )
-            })?;
-            Some((
-                MaxwellThreeDRenderTargetWrite::ClearSurface { value, source },
-                "CLEAR_SURFACE",
-            ))
-        }
-        _ => None,
-    };
-    if let Some((write, name)) = render_write {
-        return Ok(Some((MaxwellThreeDStateWrite::RenderTarget(write), name)));
-    }
-
-    if matches!(method, 0x0ff4 | 0x0ff8) {
-        let vertical = method == 0x0ff8;
-        let write = MaxwellThreeDFixedFunctionWrite::SurfaceClip {
-            vertical,
-            value: MaxwellThreeDClipAxis::parse(raw),
+    let value = MaxwellThreeDClearSurface::parse(source.argument()).ok_or_else(|| {
+        invalid_encoding(
             source,
-        };
-        return Ok(Some((
-            MaxwellThreeDStateWrite::FixedFunction(write),
-            if vertical {
-                "SET_SURFACE_CLIP_VERTICAL"
-            } else {
-                "SET_SURFACE_CLIP_HORIZONTAL"
-            },
-        )));
-    }
-
-    if (0x0a00..0x0c00).contains(&method) {
-        let viewport = ((method - 0x0a00) / 0x20) as u8;
-        let field = ((method - 0x0a00) % 0x20) / 4;
-        if field <= 5 {
-            let write = MaxwellThreeDFixedFunctionWrite::ViewportFloat {
-                viewport,
-                field: field as u8,
-                value: MaxwellThreeDRawValue::new(raw),
-                source,
-            };
-            return Ok(Some((
-                MaxwellThreeDStateWrite::FixedFunction(write),
-                "SET_VIEWPORT_SCALE_OR_OFFSET",
-            )));
-        }
-        if field == 7 {
-            if raw & !0x1f1f != 0 {
-                return Err(invalid_encoding(
-                    source,
-                    "SET_VIEWPORT_INCREASE_SNAP_GRID_PRECISION",
-                    "reserved precision bits are set",
-                ));
-            }
-            return Ok(Some((
-                MaxwellThreeDStateWrite::FixedFunction(
-                    MaxwellThreeDFixedFunctionWrite::ViewportSnapGridPrecision {
-                        viewport,
-                        value: [(raw & 31) as u8, ((raw >> 8) & 31) as u8],
-                        source,
-                    },
-                ),
-                "SET_VIEWPORT_INCREASE_SNAP_GRID_PRECISION",
-            )));
-        }
-        if field == 6 {
-            let value = MaxwellThreeDViewportCoordinateSwizzle::parse(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "SET_VIEWPORT_COORDINATE_SWIZZLE",
-                    "reserved bits are set",
-                )
-            })?;
-            return Ok(Some((
-                MaxwellThreeDStateWrite::FixedFunction(
-                    MaxwellThreeDFixedFunctionWrite::ViewportCoordinateSwizzle {
-                        viewport,
-                        value,
-                        source,
-                    },
-                ),
-                "SET_VIEWPORT_COORDINATE_SWIZZLE",
-            )));
-        }
-    }
-    if (0x0c00..0x0d00).contains(&method) {
-        let viewport = ((method - 0x0c00) / 0x10) as u8;
-        let field = (method - 0x0c00) % 0x10;
-        let write = match field {
-            0 | 4 => {
-                let value = MaxwellThreeDClipAxis::parse(raw);
-                MaxwellThreeDFixedFunctionWrite::ViewportClip {
-                    viewport,
-                    vertical: field == 4,
-                    value,
-                    source,
-                }
-            }
-            8 | 12 => MaxwellThreeDFixedFunctionWrite::ViewportDepth {
-                viewport,
-                maximum: field == 12,
-                value: MaxwellThreeDRawValue::new(raw),
-                source,
-            },
-            _ => return Ok(None),
-        };
-        return Ok(Some((
-            MaxwellThreeDStateWrite::FixedFunction(write),
-            "SET_VIEWPORT_CLIP",
-        )));
-    }
-    if (0x0d00..0x0d40).contains(&method) {
-        let region = ((method - 0x0d00) / 8) as u8;
-        let vertical = (method - 0x0d00) % 8 == 4;
-        let method_name = if vertical {
-            "SET_WINDOW_CLIP_VERTICAL"
-        } else {
-            "SET_WINDOW_CLIP_HORIZONTAL"
-        };
-        let value = rectangle(raw).ok_or_else(|| {
-            invalid_encoding(source, method_name, "rectangle minimum exceeds maximum")
-        })?;
-        let write = MaxwellThreeDFixedFunctionWrite::WindowClipRectangle {
-            region,
-            vertical,
-            value,
-            source,
-        };
-        return Ok(Some((
-            MaxwellThreeDStateWrite::FixedFunction(write),
-            method_name,
-        )));
-    }
-    if (0x0e00..0x0f00).contains(&method) {
-        let scissor = ((method - 0x0e00) / 0x10) as u8;
-        let field = (method - 0x0e00) % 0x10;
-        let write = match field {
-            0 => MaxwellThreeDFixedFunctionWrite::ScissorEnable {
-                scissor,
-                value: checked_bool(source, "SET_SCISSOR_ENABLE")?,
-                source,
-            },
-            4 | 8 => {
-                let value = rectangle(raw).ok_or_else(|| {
-                    invalid_encoding(source, "SET_SCISSOR", "rectangle minimum exceeds maximum")
-                })?;
-                MaxwellThreeDFixedFunctionWrite::ScissorRectangle {
-                    scissor,
-                    vertical: field == 8,
-                    value,
-                    source,
-                }
-            }
-            _ => return Ok(None),
-        };
-        return Ok(Some((
-            MaxwellThreeDStateWrite::FixedFunction(write),
-            "SET_SCISSOR",
-        )));
-    }
-    if (0x1360..0x1380).contains(&method) && method & 3 == 0 {
-        let target = ((method - 0x1360) / 4) as u8;
-        let value = checked_bool(source, "SET_BLEND")?;
-        return Ok(Some((
-            MaxwellThreeDStateWrite::FixedFunction(MaxwellThreeDFixedFunctionWrite::BlendEnable {
-                target,
-                value,
-                source,
-            }),
-            "SET_BLEND",
-        )));
-    }
-    if (0x1a00..0x1a20).contains(&method) && method & 3 == 0 {
-        let target = ((method - 0x1a00) / 4) as u8;
-        let value = MaxwellThreeDColorMask::parse(raw).ok_or_else(|| {
-            invalid_encoding(source, "SET_CT_WRITE", "reserved color-mask bits are set")
-        })?;
-        return Ok(Some((
-            MaxwellThreeDStateWrite::FixedFunction(MaxwellThreeDFixedFunctionWrite::ColorMask {
-                target,
-                value,
-                source,
-            }),
-            "SET_CT_WRITE",
-        )));
-    }
-    if (0x1e00..0x1f00).contains(&method) {
-        let target = ((method - 0x1e00) / 0x20) as u8;
-        let field = ((method - 0x1e00) % 0x20) / 4;
-        let value = match field {
-            0 => MaxwellThreeDFixedFunctionValue::Boolean(checked_bool(
-                source,
-                "SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA",
-            )?),
-            1 | 4 => MaxwellThreeDFixedFunctionValue::BlendOp(
-                MaxwellThreeDBlendOp::parse(raw).ok_or_else(|| {
-                    invalid_encoding(source, "SET_BLEND_PER_TARGET_OP", "unknown blend operation")
-                })?,
-            ),
-            2 | 3 | 5 | 6 => MaxwellThreeDFixedFunctionValue::BlendFactor(
-                MaxwellThreeDBlendFactor::parse(raw).ok_or_else(|| {
-                    invalid_encoding(
-                        source,
-                        "SET_BLEND_PER_TARGET_COEFF",
-                        "unknown blend coefficient",
-                    )
-                })?,
-            ),
-            _ => return Ok(None),
-        };
-        let write = MaxwellThreeDFixedFunctionWrite::BlendState {
-            target,
-            field: field as u8,
-            value,
-            source,
-        };
-        return Ok(Some((
-            MaxwellThreeDStateWrite::FixedFunction(write),
-            "SET_BLEND_PER_TARGET_STATE",
-        )));
-    }
-
-    let blend_control = match method {
-        0x0fdc => Some((
-            MaxwellThreeDFixedFunctionWrite::BlendFloatPixelKillEnable {
-                value: MaxwellThreeDBlendFloatPixelKillEnable::parse(raw).ok_or_else(|| {
-                    invalid_encoding(
-                        source,
-                        "SET_BLEND_OPT_CONTROL",
-                        "undefined boolean encoding or reserved bits",
-                    )
-                })?,
-                source,
-            },
-            "SET_BLEND_OPT_CONTROL",
-        )),
-        0x1140 => Some((
-            MaxwellThreeDFixedFunctionWrite::BlendPerFormatEnable {
-                value: MaxwellThreeDBlendPerFormatEnable::parse(raw).ok_or_else(|| {
-                    invalid_encoding(
-                        source,
-                        "SET_BLEND_PER_FORMAT_ENABLE",
-                        "undefined boolean encoding or reserved bits",
-                    )
-                })?,
-                source,
-            },
-            "SET_BLEND_PER_FORMAT_ENABLE",
-        )),
-        0x19c0 => Some((
-            MaxwellThreeDFixedFunctionWrite::BlendZeroTimesAnythingIsZero {
-                value: MaxwellThreeDBlendZeroTimesAnythingIsZero::parse(raw).ok_or_else(|| {
-                    invalid_encoding(
-                        source,
-                        "SET_BLEND_FLOAT_OPTION",
-                        "undefined boolean encoding or reserved bits",
-                    )
-                })?,
-                source,
-            },
-            "SET_BLEND_FLOAT_OPTION",
-        )),
-        _ => None,
+            "CLEAR_SURFACE",
+            "invalid target, layer, or reserved bits",
+        )
+    })?;
+    let (operation, writes_state) = if value.depth() || value.stencil() || value.color_mask() != 0 {
+        state_operation(MaxwellThreeDOperationTrigger::ClearSurface { source })
+    } else {
+        state_write()
     };
-    if let Some((write, name)) = blend_control {
-        return Ok(Some((MaxwellThreeDStateWrite::FixedFunction(write), name)));
-    }
-
-    use MaxwellThreeDFixedFunctionRegister as R;
-    use MaxwellThreeDFixedFunctionValue as V;
-    let fixed = match method {
-        0x135c => {
-            let value = MaxwellThreeDSingleRopControl::parse(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "SET_SINGLE_ROP_CONTROL",
-                    "undefined boolean encoding or reserved bits",
-                )
-            })?;
-            return Ok(Some((
-                MaxwellThreeDStateWrite::FixedFunction(
-                    MaxwellThreeDFixedFunctionWrite::SingleRopControl { value, source },
-                ),
-                "SET_SINGLE_ROP_CONTROL",
-            )));
-        }
-        0x037c => (
-            R::RasterEnable,
-            V::Boolean(checked_bool(source, "SET_RASTER_ENABLE")?),
-            "SET_RASTER_ENABLE",
-        ),
-        0x0dac | 0x0db0 => {
-            let value = MaxwellThreeDPolygonMode::parse(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    if method == 0x0dac {
-                        "SET_FRONT_POLYGON_MODE"
-                    } else {
-                        "SET_BACK_POLYGON_MODE"
-                    },
-                    "unknown polygon mode",
-                )
-            })?;
-            (
-                if method == 0x0dac {
-                    R::FrontPolygonMode
-                } else {
-                    R::BackPolygonMode
-                },
-                V::PolygonMode(value),
-                if method == 0x0dac {
-                    "SET_FRONT_POLYGON_MODE"
-                } else {
-                    "SET_BACK_POLYGON_MODE"
-                },
-            )
-        }
-        0x0dc0 | 0x0dc4 | 0x0dc8 => (
-            match method {
-                0x0dc0 => R::PolygonOffsetPointEnable,
-                0x0dc4 => R::PolygonOffsetLineEnable,
-                _ => R::PolygonOffsetFillEnable,
-            },
-            V::Boolean(checked_bool(source, "SET_POLY_OFFSET")?),
-            "SET_POLY_OFFSET",
-        ),
-        // These float parameters are inactive unless polygon offset is enabled
-        // for the consumed polygon mode. Validate and lower them on consumption.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2782-L2783
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2888-L2889
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3327-L3328
-        0x156c => (
-            R::SlopeScaleDepthBias,
-            V::FloatBits(MaxwellThreeDRawValue::new(raw)),
-            "SET_SLOPE_SCALE_DEPTH_BIAS",
-        ),
-        0x15bc => (
-            R::DepthBias,
-            V::FloatBits(MaxwellThreeDRawValue::new(raw)),
-            "SET_DEPTH_BIAS",
-        ),
-        0x187c => (
-            R::DepthBiasClamp,
-            V::FloatBits(MaxwellThreeDRawValue::new(raw)),
-            "SET_DEPTH_BIAS_CLAMP",
-        ),
-        0x0df8 if raw <= 0x1ffff => (R::WindowOffsetX, V::Mask(raw), "SET_WINDOW_OFFSET_X"),
-        0x0dfc if raw <= 0x3ffff => (R::WindowOffsetY, V::Mask(raw), "SET_WINDOW_OFFSET_Y"),
-        0x0df8 | 0x0dfc => {
-            return Err(invalid_encoding(
-                source,
-                "SET_WINDOW_OFFSET",
-                "reserved bits are set",
-            ));
-        }
-        0x0f54 | 0x0f58 | 0x0f5c if raw <= 0xff => (
-            match method {
-                0x0f54 => R::BackStencilReference,
-                0x0f58 => R::BackStencilWriteMask,
-                _ => R::BackStencilCompareMask,
-            },
-            V::Mask(raw),
-            "SET_BACK_STENCIL_MASK_OR_REFERENCE",
-        ),
-        0x0f54 | 0x0f58 | 0x0f5c => {
-            return Err(invalid_encoding(
-                source,
-                "SET_BACK_STENCIL_MASK_OR_REFERENCE",
-                "reserved bits are set",
-            ));
-        }
-        0x0f9c => (
-            R::DepthBoundsMin,
-            V::FloatBits(MaxwellThreeDRawValue::new(raw)),
-            "SET_DEPTH_BOUNDS_MIN",
-        ),
-        0x0fa0 => (
-            R::DepthBoundsMax,
-            V::FloatBits(MaxwellThreeDRawValue::new(raw)),
-            "SET_DEPTH_BOUNDS_MAX",
-        ),
-        0x0fa4 if raw & !0x11 == 0 => (R::SampleMaskControl, V::Mask(raw), "SET_SAMPLE_MASK"),
-        0x0fa4 => {
-            return Err(invalid_encoding(
-                source,
-                "SET_SAMPLE_MASK",
-                "reserved bits are set",
-            ));
-        }
-        0x0fb8 => {
-            let value = MaxwellThreeDSampleMode::parse(raw)
-                .filter(|value| {
-                    matches!(
-                        value,
-                        MaxwellThreeDSampleMode::Samples1x1
-                            | MaxwellThreeDSampleMode::Samples2x2
-                            | MaxwellThreeDSampleMode::Samples4x2D3D
-                            | MaxwellThreeDSampleMode::Samples2x1D3D
-                            | MaxwellThreeDSampleMode::Samples4x4
-                    )
-                })
-                .ok_or_else(|| {
-                    invalid_encoding(
-                        source,
-                        "SET_ANTI_ALIAS_RASTER",
-                        "unsupported raster sample encoding",
-                    )
-                })?;
-            (
-                R::RasterSampleMode,
-                V::SampleMode(value),
-                "SET_ANTI_ALIAS_RASTER",
-            )
-        }
-        0x0fbc..=0x0fc8 if method & 3 == 0 && raw <= 0xffff => {
-            let slot = ((method - 0x0fbc) / 4) as usize;
-            (
-                [
-                    R::SampleMask0,
-                    R::SampleMask1,
-                    R::SampleMask2,
-                    R::SampleMask3,
-                ][slot],
-                V::Mask(raw),
-                "SET_SAMPLE_MASK_QUADRANT",
-            )
-        }
-        0x0f90 => (
-            R::SingleColorTargetWriteControl,
-            V::Boolean(checked_bool(source, "SET_SINGLE_CT_WRITE_CONTROL")?),
-            "SET_SINGLE_CT_WRITE_CONTROL",
-        ),
-        0x12cc => (
-            R::DepthTestEnable,
-            V::Boolean(checked_bool(source, "SET_DEPTH_TEST")?),
-            "SET_DEPTH_TEST",
-        ),
-        0x12d4 => {
-            let value = MaxwellThreeDShadeMode::parse(raw)
-                .ok_or_else(|| invalid_encoding(source, "SET_SHADE_MODE", "unknown shade mode"))?;
-            (R::ShadeMode, V::ShadeMode(value), "SET_SHADE_MODE")
-        }
-        0x12e4 => (
-            R::BlendPerTargetEnable,
-            V::Boolean(checked_bool(source, "SET_BLEND_STATE_PER_TARGET")?),
-            "SET_BLEND_STATE_PER_TARGET",
-        ),
-        0x12e8 => (
-            R::DepthWriteEnable,
-            V::Boolean(checked_bool(source, "SET_DEPTH_WRITE")?),
-            "SET_DEPTH_WRITE",
-        ),
-        // NVIDIA's pinned MAXWELL_B header publishes the enable, IEEE-754
-        // reference bits, and all OGL/D3D comparison encodings as one family.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2155-L2158
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2195-L2215
-        0x12ec => (
-            R::AlphaTestEnable,
-            V::Boolean(checked_bool(source, "SET_ALPHA_TEST")?),
-            "SET_ALPHA_TEST",
-        ),
-        0x130c => {
-            let value = MaxwellThreeDCompareOp::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "SET_DEPTH_FUNC", "unknown compare operation")
-            })?;
-            (R::DepthCompare, V::Compare(value), "SET_DEPTH_FUNC")
-        }
-        0x1310 => (
-            R::AlphaTestReference,
-            V::FloatBits(MaxwellThreeDRawValue::new(raw)),
-            "SET_ALPHA_REF",
-        ),
-        0x1314 => {
-            let value = MaxwellThreeDCompareOp::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "SET_ALPHA_FUNC", "unknown compare operation")
-            })?;
-            (R::AlphaTestFunction, V::Compare(value), "SET_ALPHA_FUNC")
-        }
-        0x131c..=0x1328 if method & 3 == 0 => (
-            [
-                R::BlendConstantRed,
-                R::BlendConstantGreen,
-                R::BlendConstantBlue,
-                R::BlendConstantAlpha,
-            ][((method - 0x131c) / 4) as usize],
-            V::FloatBits(MaxwellThreeDRawValue::new(raw)),
-            "SET_BLEND_CONST",
-        ),
-        0x133c => (
-            R::BlendSeparateAlpha,
-            V::Boolean(checked_bool(source, "SET_BLEND_SEPARATE_FOR_ALPHA")?),
-            "SET_BLEND_SEPARATE_FOR_ALPHA",
-        ),
-        0x1340 | 0x134c => {
-            let value = MaxwellThreeDBlendOp::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "SET_BLEND_OP", "unknown blend operation")
-            })?;
-            (
-                if method == 0x1340 {
-                    R::BlendColorOp
-                } else {
-                    R::BlendAlphaOp
-                },
-                V::BlendOp(value),
-                "SET_BLEND_OP",
-            )
-        }
-        0x1344 | 0x1348 | 0x1350 | 0x1358 => {
-            let value = MaxwellThreeDBlendFactor::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "SET_BLEND_COEFF", "unknown blend coefficient")
-            })?;
-            let register = match method {
-                0x1344 => R::BlendColorSource,
-                0x1348 => R::BlendColorDestination,
-                0x1350 => R::BlendAlphaSource,
-                _ => R::BlendAlphaDestination,
-            };
-            (register, V::BlendFactor(value), "SET_BLEND_COEFF")
-        }
-        0x1380 => (
-            R::StencilTestEnable,
-            V::Boolean(checked_bool(source, "SET_STENCIL_TEST")?),
-            "SET_STENCIL_TEST",
-        ),
-        0x1594 => (
-            R::TwoSidedStencilTestEnable,
-            V::Boolean(checked_bool(source, "SET_TWO_SIDED_STENCIL_TEST")?),
-            "SET_TWO_SIDED_STENCIL_TEST",
-        ),
-        0x1384 | 0x1388 | 0x138c | 0x1598 | 0x159c | 0x15a0 => {
-            let value = MaxwellThreeDStencilOp::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "SET_STENCIL_OP", "unknown stencil operation")
-            })?;
-            let register = match method {
-                0x1384 => R::FrontStencilFail,
-                0x1388 => R::FrontStencilDepthFail,
-                0x138c => R::FrontStencilPass,
-                0x1598 => R::BackStencilFail,
-                0x159c => R::BackStencilDepthFail,
-                _ => R::BackStencilPass,
-            };
-            (register, V::StencilOp(value), "SET_STENCIL_OP")
-        }
-        0x1390 | 0x15a4 => {
-            let value = MaxwellThreeDCompareOp::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "SET_STENCIL_FUNC", "unknown compare operation")
-            })?;
-            (
-                if method == 0x1390 {
-                    R::FrontStencilCompare
-                } else {
-                    R::BackStencilCompare
-                },
-                V::Compare(value),
-                "SET_STENCIL_FUNC",
-            )
-        }
-        0x1394 | 0x1398 | 0x139c if raw <= 0xff => (
-            match method {
-                0x1394 => R::FrontStencilReference,
-                0x1398 => R::FrontStencilCompareMask,
-                _ => R::FrontStencilWriteMask,
-            },
-            V::Mask(raw),
-            "SET_STENCIL_MASK_OR_REFERENCE",
-        ),
-        0x1394 | 0x1398 | 0x139c => {
-            return Err(invalid_encoding(
-                source,
-                "SET_STENCIL_MASK_OR_REFERENCE",
-                "reserved bits are set",
-            ));
-        }
-        0x13a8 => (
-            R::PixelShaderSaturate,
-            V::PixelShaderSaturate(MaxwellThreeDPixelShaderSaturate::parse(raw).ok_or_else(
-                || invalid_encoding(source, "SET_PS_SATURATE", "reserved output bits are set"),
-            )?),
-            "SET_PS_SATURATE",
-        ),
-        0x13ac if raw & !0x11 == 0 => (R::WindowOrigin, V::Mask(raw), "SET_WINDOW_ORIGIN"),
-        0x13ac => {
-            return Err(invalid_encoding(
-                source,
-                "SET_WINDOW_ORIGIN",
-                "reserved bits are set",
-            ));
-        }
-        0x13b0 => (
-            R::LineWidth,
-            V::FloatBits(MaxwellThreeDRawValue::new(raw)),
-            "SET_LINE_WIDTH_FLOAT",
-        ),
-        0x1510 if raw <= 0xff => (R::UserClipEnable, V::Mask(raw), "SET_USER_CLIP_ENABLE"),
-        0x1510 => {
-            return Err(invalid_encoding(
-                source,
-                "SET_USER_CLIP_ENABLE",
-                "reserved clip-plane bits are set",
-            ));
-        }
-        0x1534 => (
-            R::AntiAliasEnable,
-            V::Boolean(checked_bool(source, "SET_ANTI_ALIAS_ENABLE")?),
-            "SET_ANTI_ALIAS_ENABLE",
-        ),
-        0x153c if raw & !0x11 == 0 => (
-            R::AlphaToCoverageEnable,
-            V::AlphaControl {
-                alpha_to_coverage: raw & 1 != 0,
-                alpha_to_one: raw & 0x10 != 0,
-            },
-            "SET_ANTI_ALIAS_ALPHA_CONTROL",
-        ),
-        0x153c => {
-            return Err(invalid_encoding(
-                source,
-                "SET_ANTI_ALIAS_ALPHA_CONTROL",
-                "reserved bits are set",
-            ));
-        }
-        0x15d0 => {
-            let value = MaxwellThreeDSampleMode::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "SET_ANTI_ALIAS", "unknown sample encoding")
-            })?;
-            (R::SampleMode, V::SampleMode(value), "SET_ANTI_ALIAS")
-        }
-        0x1684 => {
-            let value = MaxwellThreeDProvokingVertex::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "SET_PROVOKING_VERTEX", "expected FIRST or LAST")
-            })?;
-            (
-                R::ProvokingVertex,
-                V::ProvokingVertex(value),
-                "SET_PROVOKING_VERTEX",
-            )
-        }
-        // The adjacent fixed-function lighting selector is also a one-bit
-        // field in NVIDIA's pinned MAXWELL_B header.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3128-L3131
-        0x1688 => (
-            R::TwoSidedLightEnable,
-            V::Boolean(checked_bool(source, "SET_TWO_SIDED_LIGHT")?),
-            "SET_TWO_SIDED_LIGHT",
-        ),
-        0x1918 => (
-            R::CullEnable,
-            V::Boolean(checked_bool(source, "OGL_SET_CULL")?),
-            "OGL_SET_CULL",
-        ),
-        0x191c => {
-            let value = MaxwellThreeDFrontFace::parse(raw)
-                .ok_or_else(|| invalid_encoding(source, "OGL_SET_FRONT_FACE", "unknown winding"))?;
-            (R::FrontFace, V::FrontFace(value), "OGL_SET_FRONT_FACE")
-        }
-        0x1920 => {
-            let value = MaxwellThreeDCullFace::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "OGL_SET_CULL_FACE", "unknown cull face")
-            })?;
-            (R::CullFace, V::CullFace(value), "OGL_SET_CULL_FACE")
-        }
-        0x192c => {
-            let value = MaxwellThreeDViewportScaleOffsetEnable::parse(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "SET_VIEWPORT_SCALE_OFFSET",
-                    "expected boolean 0 or 1",
-                )
-            })?;
-            (
-                R::ViewportScaleOffsetEnable,
-                V::ViewportScaleOffsetEnable(value),
-                "SET_VIEWPORT_SCALE_OFFSET",
-            )
-        }
-        0x193c => {
-            let value = MaxwellThreeDViewportClipControl::parse(raw).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "SET_VIEWPORT_CLIP_CONTROL",
-                    "invalid clip-control fields",
-                )
-            })?;
-            (
-                R::ViewportClipControl,
-                V::ClipControl(value),
-                "SET_VIEWPORT_CLIP_CONTROL",
-            )
-        }
-        0x1940 if raw & !0x1111_1111 == 0 => {
-            (R::UserClipOperation, V::Mask(raw), "SET_USER_CLIP_OP")
-        }
-        0x1940 => {
-            return Err(invalid_encoding(
-                source,
-                "SET_USER_CLIP_OP",
-                "reserved clip operation bits are set",
-            ));
-        }
-        0x194c => (
-            R::WindowClipEnable,
-            V::Boolean(checked_bool(source, "SET_WINDOW_CLIP_ENABLE")?),
-            "SET_WINDOW_CLIP_ENABLE",
-        ),
-        0x1950 => (
-            R::WindowClipType,
-            V::WindowClipType(MaxwellThreeDWindowClipType::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "SET_WINDOW_CLIP_TYPE", "unknown window clip type")
-            })?),
-            "SET_WINDOW_CLIP_TYPE",
-        ),
-        0x197c => (
-            R::ClipIdTestEnable,
-            V::ClipIdTestEnable(MaxwellThreeDClipIdTestEnable::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "SET_CLIP_ID_TEST", "expected boolean 0 or 1")
-            })?),
-            "SET_CLIP_ID_TEST",
-        ),
-        0x19bc => (
-            R::DepthBoundsEnable,
-            V::Boolean(checked_bool(source, "SET_DEPTH_BOUNDS_TEST")?),
-            "SET_DEPTH_BOUNDS_TEST",
-        ),
-        0x19c4 => (
-            R::LogicOpEnable,
-            V::Boolean(checked_bool(source, "SET_LOGIC_OP")?),
-            "SET_LOGIC_OP",
-        ),
-        0x19c8 => (
-            R::LogicOpFunction,
-            V::LogicOp(MaxwellThreeDLogicOp::parse(raw).ok_or_else(|| {
-                invalid_encoding(source, "SET_LOGIC_OP_FUNC", "unknown logic operation")
-            })?),
-            "SET_LOGIC_OP_FUNC",
-        ),
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L4100-L4103
-        0x2600 => (
-            R::ColorClampEnable,
-            V::Boolean(checked_bool(source, "SET_COLOR_CLAMP")?),
-            "SET_COLOR_CLAMP",
-        ),
-        _ => return Ok(None),
-    };
-    let write = MaxwellThreeDFixedFunctionWrite::Register {
-        register: fixed.0,
-        value: fixed.1,
-        source,
-    };
-    Ok(Some((
-        MaxwellThreeDStateWrite::FixedFunction(write),
-        fixed.2,
+    Ok(Some(PreparedMethod::new(
+        MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), "CLEAR_SURFACE"),
+        operation,
+        writes_state,
     )))
-}
-
-#[cfg(test)]
-mod routing_tests {
-    use super::*;
-
-    #[test]
-    fn routing_covers_every_specialized_register_and_keeps_other_methods_out() {
-        let mut channel = crate::engines::tests::three_d_channel();
-        let template = crate::engines::tests::program_three_d(&mut channel, 0x0d74, 0);
-        let candidate = channel.three_d_mut();
-        for method in (0..0x4000).step_by(4) {
-            for argument in [0, 1, u32::MAX] {
-                let source = template.emitted_by_mme(GpuMethodId(method), argument);
-                let recognized = |result: Result<Option<_>, _>| !matches!(result, Ok(None));
-                let inline = !matches!(
-                    inline_to_memory::preflight(
-                        source,
-                        candidate.operation_state().inline_to_memory()
-                    ),
-                    Ok(None)
-                );
-                let mme = recognized(preflight_mme_state(source, candidate));
-                let constant =
-                    !matches!(preflight_constant_buffer_load(source, candidate), Ok(None));
-                let vertex = recognized(preflight_vertex_and_binding_state(source, candidate));
-                let expected = if inline {
-                    RegisterFamily::InlineToMemory
-                } else if mme {
-                    RegisterFamily::Mme
-                } else if constant {
-                    RegisterFamily::ConstantBuffer
-                } else if vertex {
-                    RegisterFamily::VertexAndBinding
-                } else {
-                    RegisterFamily::Other
-                };
-                assert_eq!(
-                    register_family(method),
-                    expected,
-                    "method={method:#x} argument={argument:#x}"
-                );
-            }
-        }
-        assert_eq!(register_family(u32::MAX), RegisterFamily::Other);
-        assert_eq!(register_family(0x4000), RegisterFamily::Other);
-    }
 }

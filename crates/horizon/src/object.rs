@@ -663,9 +663,9 @@ pub struct NetworkRequestSession {
 }
 
 impl NetworkRequestSession {
-    pub(crate) fn new() -> Self {
-        let (state_event, state_reader) = nixe_runtime::EventObject::create_pair();
-        let (completion_event, completion_reader) = nixe_runtime::EventObject::create_pair();
+    pub(crate) fn new(kernel: &Arc<nixe_scheduler::SchedulerState>) -> Self {
+        let (state_event, state_reader) = nixe_runtime::EventObject::create_pair(kernel);
+        let (completion_event, completion_reader) = nixe_runtime::EventObject::create_pair(kernel);
         Self {
             result: Arc::new(AtomicU32::new(
                 crate::HorizonIpcResult::NIFM_NOT_SUBMITTED.raw(),
@@ -703,7 +703,7 @@ impl NetworkRequestSession {
 mod ipc_session_tests {
     #[test]
     fn offline_network_request_completes_with_a_shared_error_and_events() {
-        let request = super::NetworkRequestSession::new();
+        let request = super::NetworkRequestSession::new(&crate::test_memory::kernel());
         let [state, completion] = request.events();
         assert!(!state.is_signalled());
         assert!(!completion.is_signalled());
@@ -1076,7 +1076,9 @@ mod infrared_tests {
             shared.remote_permissions(),
             nixe_cpu::memory::MemoryPermissions::READ
         );
-        let scheduling = Arc::new(crate::ipc_wire::operation::ServiceScheduling::default());
+        let scheduling = Arc::new(crate::ipc_wire::operation::ServiceScheduling::new(
+            &crate::test_memory::kernel(),
+        ));
         for camera in 0..9 {
             let entry =
                 crate::test_memory::run(crate::system_memory::read(&shared, camera * 0xe30, 16))
@@ -1770,8 +1772,8 @@ struct AppletFocusPolicy {
 }
 
 impl AppletMessageQueue {
-    fn new() -> Self {
-        let (writable_event, readable_event) = nixe_runtime::EventObject::create_pair();
+    fn new(kernel: &Arc<nixe_scheduler::SchedulerState>) -> Self {
+        let (writable_event, readable_event) = nixe_runtime::EventObject::create_pair(kernel);
         Self {
             writable_event,
             readable_event,
@@ -1950,14 +1952,18 @@ struct AppletDomain {
 /// than to the process handle table.
 #[derive(Clone, Debug)]
 pub struct AppletSession {
+    kernel: Arc<nixe_scheduler::SchedulerState>,
     domain: Arc<Mutex<AppletDomain>>,
 }
 
 impl AppletSession {
-    pub(crate) fn new(operation_mode: OperationMode) -> Self {
+    pub(crate) fn new(
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
+        operation_mode: OperationMode,
+    ) -> Self {
         let mut objects = BTreeMap::new();
         objects.insert(APPLET_ROOT_OBJECT_ID, AppletObject::Root);
-        let mut message_queue = AppletMessageQueue::new();
+        let mut message_queue = AppletMessageQueue::new(kernel);
         // A regular application starts in the foreground. AM publishes the
         // corresponding focus notification before client initialization so
         // official SDK code can wait for and consume the initial state.
@@ -1968,14 +1974,16 @@ impl AppletSession {
             AppletLaunchParameterKind::PreselectedUser,
             VecDeque::from([encode_preselected_user_launch_parameter(user)]),
         );
-        let (launchable_event, launchable_event_reader) = nixe_runtime::EventObject::create_pair();
+        let (launchable_event, launchable_event_reader) =
+            nixe_runtime::EventObject::create_pair(kernel);
         // Applications currently remain in the foreground throughout their
         // lifetime; no suspension interval has elapsed and this event is idle.
-        let (_, suspended_tick_event_reader) = nixe_runtime::EventObject::create_pair();
+        let (_, suspended_tick_event_reader) = nixe_runtime::EventObject::create_pair(kernel);
         // Unsupported GPU behavior stops execution before it can be reported
         // as a hardware fault. No emulated GPU error is initially present.
-        let (_, gpu_error_event_reader) = nixe_runtime::EventObject::create_pair();
+        let (_, gpu_error_event_reader) = nixe_runtime::EventObject::create_pair(kernel);
         let session = Self {
+            kernel: kernel.clone(),
             domain: Arc::new(Mutex::new(AppletDomain {
                 converted: false,
                 next_object_id: APPLET_ROOT_OBJECT_ID + 1,
@@ -2363,14 +2371,15 @@ impl AppletSession {
             .checked_add(1)
             .ok_or(CreateLibraryAppletError::DomainCapacityExhausted)?;
         let (state_changed_event, state_changed_event_reader) =
-            nixe_runtime::EventObject::create_pair();
+            nixe_runtime::EventObject::create_pair(&self.kernel);
         domain.objects.insert(
             object_id,
             AppletObject::LibraryAppletAccessor { applet_id, mode },
         );
         domain.next_object_id = next_object_id;
-        let (interactive_event, interactive_reader) = nixe_runtime::EventObject::create_pair();
-        let (output_event, output_reader) = nixe_runtime::EventObject::create_pair();
+        let (interactive_event, interactive_reader) =
+            nixe_runtime::EventObject::create_pair(&self.kernel);
+        let (output_event, output_reader) = nixe_runtime::EventObject::create_pair(&self.kernel);
         domain.active_library_applet = Some(ActiveLibraryApplet {
             object_id,
             state_changed_event,
@@ -2764,7 +2773,7 @@ mod applet_tests {
 
     #[test]
     fn completed_library_applet_signals_and_transfers_output_storage_once() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         session.convert_to_domain();
         let applet = session
             .create_library_applet(
@@ -2802,7 +2811,7 @@ mod applet_tests {
 
     #[test]
     fn cpu_boost_policy_is_shared_between_session_clones() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         let cloned = session.clone();
         assert!(!session.domain.lock().unwrap().cpu_boost_enabled);
         cloned.set_cpu_boost_enabled(true);
@@ -2813,7 +2822,7 @@ mod applet_tests {
 
     #[test]
     fn execute_next_program_exit_policy_is_shared_and_does_not_request_exit_immediately() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         assert!(
             !session
                 .domain
@@ -2839,7 +2848,7 @@ mod applet_tests {
 
     #[test]
     fn foreground_applet_has_no_suspended_ticks_or_counter_change_notification() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         let cloned = session.clone();
         assert_eq!(cloned.accumulated_suspended_ticks(), 0);
         assert!(
@@ -2860,7 +2869,7 @@ mod applet_tests {
 
     #[test]
     fn restart_message_policy_is_shared_without_generating_notifications() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         let cloned = session.clone();
         assert_eq!(session.receive_message(), Some(15));
         let event = session.message_event();
@@ -2877,7 +2886,7 @@ mod applet_tests {
 
     #[test]
     fn applet_domain_owns_bounded_child_object_ids() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         assert!(!session.is_domain());
         assert_eq!(session.operation_mode(), OperationMode::Console);
         assert_eq!(session.convert_to_domain(), APPLET_ROOT_OBJECT_ID);
@@ -2921,7 +2930,7 @@ mod applet_tests {
             OperationMode::Console.default_display_resolution(),
             (1920, 1080)
         );
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         let cloned = session.clone();
         cloned.set_operation_mode_changed_notification(true);
         cloned.set_performance_mode_changed_notification(true);
@@ -2945,7 +2954,7 @@ mod applet_tests {
 
     #[test]
     fn applet_message_event_tracks_queue_occupancy() {
-        let session = AppletSession::new(OperationMode::Handheld);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Handheld);
         let event = session.message_event();
 
         assert!(event.is_signalled());
@@ -2957,7 +2966,7 @@ mod applet_tests {
 
     #[test]
     fn applet_exit_lock_is_shared_idempotent_and_reversible() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         let cloned = session.clone();
         assert!(!session.exit_locked());
 
@@ -2972,7 +2981,7 @@ mod applet_tests {
 
     #[test]
     fn applet_termination_result_is_shared_and_last_writer_wins() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         let cloned = session.clone();
         assert!((session.termination_result()).is_none());
 
@@ -2985,7 +2994,7 @@ mod applet_tests {
 
     #[test]
     fn library_applet_launchability_event_is_shared_and_tracks_slot_availability() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         let first = session.library_applet_launchable_event();
         let second = session.clone().library_applet_launchable_event();
         assert!(first.is_signalled());
@@ -3002,7 +3011,7 @@ mod applet_tests {
 
     #[test]
     fn library_applet_creation_keeps_launch_permission_available_until_start() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         session.convert_to_domain();
         let launchable = session.library_applet_launchable_event();
 
@@ -3042,7 +3051,7 @@ mod applet_tests {
 
     #[test]
     fn applet_storage_backing_lives_until_its_last_domain_object_closes() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         session.convert_to_domain();
         let storage = session.create_storage(0x20).unwrap();
         let storage_id = match session.object(storage).unwrap() {
@@ -3064,7 +3073,7 @@ mod applet_tests {
 
     #[test]
     fn preselected_user_launch_parameter_is_stable_and_consumed_once() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         assert_eq!(session.user(), DEFAULT_USER);
         assert!(matches!(
             session.pop_launch_parameter(AppletLaunchParameterKind::PreselectedUser),
@@ -3106,7 +3115,7 @@ mod applet_tests {
 
     #[test]
     fn library_applet_input_channel_retains_storage_after_sender_close() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         session.convert_to_domain();
         let applet = session
             .create_library_applet(LibraryAppletId::Error, LibraryAppletMode::AllForeground)
@@ -3137,7 +3146,7 @@ mod applet_tests {
 
     #[test]
     fn library_applet_input_channel_rejects_non_storage_objects_atomically() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         session.convert_to_domain();
         let applet = session
             .create_library_applet(LibraryAppletId::Error, LibraryAppletMode::AllForeground)
@@ -3156,7 +3165,7 @@ mod applet_tests {
 
     #[test]
     fn applet_storage_reads_and_writes_are_bounded_and_atomic() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         session.convert_to_domain();
         let storage = session.create_storage(8).unwrap();
         let AppletObject::Storage { storage_id } = session.object(storage).unwrap() else {
@@ -3292,7 +3301,9 @@ mod time_tests {
         );
         assert_eq!(&user_context[16..], &TIME_SOURCE_ID);
 
-        let scheduling = Arc::new(crate::ipc_wire::operation::ServiceScheduling::default());
+        let scheduling = Arc::new(crate::ipc_wire::operation::ServiceScheduling::new(
+            &crate::test_memory::kernel(),
+        ));
         crate::test_memory::run(user_clock.set_current_time(1_704_067_260, &scheduling)).unwrap();
         assert_eq!(user_clock.current_time(), 1_704_067_260);
         let context = user_clock.context();

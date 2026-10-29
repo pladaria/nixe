@@ -10,7 +10,7 @@ use nixe_gpu::{
     GuestSyncpointValue, GuestTimelinePoint, ImageMemoryLayout, PresentationImageFormat,
     PresentationImageRequest, ResidentImage,
 };
-use nixe_runtime::{EventObject, ExternalEventSource, ReadableEventObject, WritableEventObject};
+use nixe_runtime::{EventObject, ReadableEventObject, WritableEventObject};
 use nixe_video::{DisplayClock, FrameCrop, FrameMailbox, FrameTransform, PresentationFrame};
 
 use crate::parcel::{ParcelError, ParcelReader, ParcelWriter};
@@ -33,9 +33,8 @@ struct ViVsyncEvent {
 }
 
 impl ViVsyncEvent {
-    fn new(display_id: u64) -> Self {
-        let (writable, readable) =
-            EventObject::create_pair_with_source(ExternalEventSource::Display);
+    fn new(kernel: &Arc<nixe_scheduler::SchedulerState>, display_id: u64) -> Self {
+        let (writable, readable) = EventObject::create_pair(kernel);
         Self {
             source: GraphicsEventSource::ViVsync { display_id },
             writable,
@@ -62,9 +61,8 @@ struct BufferQueueAvailabilityEvent {
 }
 
 impl BufferQueueAvailabilityEvent {
-    fn new(binder_id: i32) -> Self {
-        let (writable, readable) =
-            EventObject::create_pair_with_source(ExternalEventSource::Display);
+    fn new(kernel: &Arc<nixe_scheduler::SchedulerState>, binder_id: i32) -> Self {
+        let (writable, readable) = EventObject::create_pair(kernel);
         Self {
             source: GraphicsEventSource::BufferQueueAvailability { binder_id },
             writable,
@@ -218,6 +216,7 @@ struct VideoState {
 /// Cloneable process display state shared across independently opened services.
 #[derive(Clone, Debug)]
 pub struct VideoSystem {
+    kernel: Arc<nixe_scheduler::SchedulerState>,
     state: Arc<Mutex<VideoState>>,
     released_slots: Arc<Mutex<Vec<ReleasedSlot>>>,
 }
@@ -255,14 +254,18 @@ pub struct GraphicsTeardownReport {
 
 impl VideoSystem {
     #[must_use]
-    pub fn new(machine: nixe_memory::Machine) -> Self {
-        Self::with_nvdrv(None, NvDrvSession::new(machine))
+    pub fn new(
+        machine: nixe_memory::Machine,
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
+    ) -> Self {
+        Self::with_nvdrv(kernel, None, NvDrvSession::new(machine, kernel))
     }
 
     /// Composes concrete native Maxwell work with its renderer before workers start.
     #[must_use]
     pub fn with_gpu_frontend<E, L>(
         machine: nixe_memory::Machine,
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
         presenter: Option<FrameMailbox>,
         execution: E,
         frontend: L,
@@ -275,18 +278,24 @@ impl VideoSystem {
             >,
     {
         Self::with_nvdrv(
+            kernel,
             presenter,
-            NvDrvSession::with_gpu_frontend(machine, execution, frontend),
+            NvDrvSession::with_gpu_frontend(machine, kernel, execution, frontend),
         )
     }
 
-    fn with_nvdrv(presenter: Option<FrameMailbox>, nvdrv: NvDrvSession) -> Self {
+    fn with_nvdrv(
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
+        presenter: Option<FrameMailbox>,
+        nvdrv: NvDrvSession,
+    ) -> Self {
         Self {
+            kernel: kernel.clone(),
             state: Arc::new(Mutex::new(VideoState {
                 next_layer_id: 1,
                 layers: BTreeMap::new(),
                 queues: BTreeMap::new(),
-                vsync_event: ViVsyncEvent::new(DEFAULT_DISPLAY_ID),
+                vsync_event: ViVsyncEvent::new(kernel, DEFAULT_DISPLAY_ID),
                 display_clock: DisplayClock::new(60)
                     .expect("the fixed Switch display refresh is non-zero"),
                 presenter,
@@ -401,7 +410,9 @@ impl VideoSystem {
             z: 0,
         };
         state.layers.insert(id, layer.clone());
-        state.queues.insert(binder_id, BufferQueue::new(binder_id));
+        state
+            .queues
+            .insert(binder_id, BufferQueue::new(&self.kernel, binder_id));
         Some(layer)
     }
 
@@ -985,14 +996,14 @@ impl Display for FramebufferError {
 impl std::error::Error for FramebufferError {}
 
 impl BufferQueue {
-    fn new(binder_id: i32) -> Self {
+    fn new(kernel: &Arc<nixe_scheduler::SchedulerState>, binder_id: i32) -> Self {
         Self {
             connected_api: None,
             override_max_buffer_count: 0,
             weak_references: 0,
             strong_references: 0,
             slots: BTreeMap::new(),
-            available_event: BufferQueueAvailabilityEvent::new(binder_id),
+            available_event: BufferQueueAvailabilityEvent::new(kernel, binder_id),
             next_acquire_sequence: 0,
             blocked_this_advance: false,
         }
@@ -1743,7 +1754,10 @@ mod tests {
 
     #[test]
     fn display_deadline_advances_without_input_samples() {
-        let video = VideoSystem::new(Machine::new(64 * 1024 * 1024).unwrap());
+        let video = VideoSystem::new(
+            Machine::new(64 * 1024 * 1024).unwrap(),
+            &crate::test_memory::kernel(),
+        );
         let first = video.next_display_deadline();
         assert!(first > Duration::ZERO);
         assert_eq!(video.advance(first - Duration::from_nanos(1)).unwrap(), 0);
@@ -1780,7 +1794,10 @@ mod tests {
 
     fn video_with_rgba_nvmap() -> (VideoSystem, i32, GraphicBuffer) {
         let machine = Machine::new(64 * 1024 * 1024).unwrap();
-        configure_rgba_nvmap(VideoSystem::new(machine.clone()), machine)
+        configure_rgba_nvmap(
+            VideoSystem::new(machine.clone(), &crate::test_memory::kernel()),
+            machine,
+        )
     }
 
     fn rgb565_block_buffer(nvmap_id: u32) -> GraphicBuffer {
@@ -2017,14 +2034,17 @@ mod tests {
     #[test]
     fn failed_or_lost_resident_image_reply_stops_presentation() {
         for failure in [Some("image preparation failed"), None] {
-            let video = VideoSystem::new(Machine::new(64 * 1024 * 1024).unwrap());
+            let video = VideoSystem::new(
+                Machine::new(64 * 1024 * 1024).unwrap(),
+                &crate::test_memory::kernel(),
+            );
             let (sender, receiver) = std::sync::mpsc::channel();
             video
                 .state
                 .lock()
                 .unwrap()
                 .queues
-                .insert(1, BufferQueue::new(1));
+                .insert(1, BufferQueue::new(&crate::test_memory::kernel(), 1));
             video
                 .state
                 .lock()
@@ -2139,7 +2159,10 @@ mod tests {
 
     #[test]
     fn layers_have_stable_distinct_binder_objects() {
-        let video = VideoSystem::new(Machine::new(64 * 1024 * 1024).unwrap());
+        let video = VideoSystem::new(
+            Machine::new(64 * 1024 * 1024).unwrap(),
+            &crate::test_memory::kernel(),
+        );
         let first = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
         let second = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
         assert_ne!(first.id, second.id);
@@ -2149,7 +2172,10 @@ mod tests {
 
     #[test]
     fn closing_a_vi_connection_preserves_the_managed_layer_and_shared_session_ownership() {
-        let video = VideoSystem::new(Machine::new(64 * 1024 * 1024).unwrap());
+        let video = VideoSystem::new(
+            Machine::new(64 * 1024 * 1024).unwrap(),
+            &crate::test_memory::kernel(),
+        );
         let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
         let session = ViSession::new(ViObjectKind::ApplicationDisplay, video.clone());
         let cloned = session.clone();
@@ -2169,7 +2195,10 @@ mod tests {
 
     #[test]
     fn layer_geometry_and_binder_references_are_retained() {
-        let video = VideoSystem::new(Machine::new(64 * 1024 * 1024).unwrap());
+        let video = VideoSystem::new(
+            Machine::new(64 * 1024 * 1024).unwrap(),
+            &crate::test_memory::kernel(),
+        );
         let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
 
         assert!(video.set_layer_position(layer.id, 12.5, -4.0));
@@ -2188,7 +2217,10 @@ mod tests {
 
     #[test]
     fn graphics_teardown_releases_layers_queues_and_nvdrv_state() {
-        let video = VideoSystem::new(Machine::new(64 * 1024 * 1024).unwrap());
+        let video = VideoSystem::new(
+            Machine::new(64 * 1024 * 1024).unwrap(),
+            &crate::test_memory::kernel(),
+        );
         let layer = video.create_layer(DEFAULT_DISPLAY_ID).unwrap();
         let nvdrv = video.nvdrv();
         nvdrv.initialize(0);
@@ -2357,7 +2389,7 @@ mod tests {
             reader.read_i32().unwrap()
         };
         for api in 1..=4 {
-            let mut queue = BufferQueue::new(4);
+            let mut queue = BufferQueue::new(&crate::test_memory::kernel(), 4);
             assert_eq!(status(queue.transact(10, &connect(api)).unwrap(), true), 0);
             assert_eq!(queue.connected_api, Some(api));
             assert_eq!(
@@ -2384,7 +2416,7 @@ mod tests {
             );
         }
         for api in [0, 5, -1] {
-            let mut queue = BufferQueue::new(4);
+            let mut queue = BufferQueue::new(&crate::test_memory::kernel(), 4);
             assert_eq!(
                 status(queue.transact(10, &connect(api)).unwrap(), true),
                 -22
@@ -2395,7 +2427,7 @@ mod tests {
 
     #[test]
     fn set_buffer_count_limits_dequeue_and_respects_producer_ownership() {
-        let mut queue = BufferQueue::new(4);
+        let mut queue = BufferQueue::new(&crate::test_memory::kernel(), 4);
         let slot = BufferSlot {
             ownership: SlotOwnership::Free,
             buffer: GraphicBuffer {
@@ -2478,7 +2510,7 @@ mod tests {
 
     #[test]
     fn request_buffer_returns_the_registered_descriptor_only_to_its_producer() {
-        let mut queue = BufferQueue::new(4);
+        let mut queue = BufferQueue::new(&crate::test_memory::kernel(), 4);
         let request = |slot| {
             let mut writer = producer_request();
             writer.write_i32(slot);
@@ -2594,7 +2626,7 @@ mod tests {
             }]
             .into_boxed_slice(),
         };
-        let mut queue = BufferQueue::new(4);
+        let mut queue = BufferQueue::new(&crate::test_memory::kernel(), 4);
         queue.slots.insert(
             2,
             BufferSlot {
@@ -2806,6 +2838,7 @@ mod tests {
         let machine = Machine::new(64 * 1024 * 1024).unwrap();
         let video = VideoSystem::with_gpu_frontend(
             machine.clone(),
+            &crate::test_memory::kernel(),
             Some(mailbox.clone()),
             backend,
             nixe_gpu_maxwell::MaxwellNativeFrontend::new(Default::default()),

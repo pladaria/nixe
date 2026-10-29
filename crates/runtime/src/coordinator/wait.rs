@@ -2,7 +2,8 @@ use super::*;
 
 impl RuntimeCoordinator {
     pub(super) fn finalize_retired_threads(&mut self) -> Result<(), CoordinatorError> {
-        while let Some((process, thread)) = self.inbox.sender.take_retired_thread() {
+        while let Some(retired) = self.inbox.sender.take_retired_thread() {
+            let (process, thread) = (retired.process, retired.thread);
             let Some(view) = self.scheduler.thread(thread) else {
                 // Forced process/machine teardown already retired this identity.
                 continue;
@@ -14,13 +15,15 @@ impl RuntimeCoordinator {
                     | nixe_scheduler::ThreadLifecycle::Exited
                     | nixe_scheduler::ThreadLifecycle::Faulted
             ));
-            self.finalize_thread_waits(process, thread);
+            if self.processes.contains_key(&process) {
+                self.finalize_thread_waits(process, thread);
+            }
+            if let Some(owner) = retired.owner.upgrade() {
+                owner
+                    .retire_thread(thread)
+                    .expect("canonical thread is registered");
+            }
             self.scheduler.unregister(thread)?;
-            self.processes
-                .get_mut(&process)
-                .expect("retained thread process")
-                .retire_thread(thread)
-                .expect("canonical thread is registered");
         }
         Ok(())
     }
@@ -50,26 +53,14 @@ impl RuntimeCoordinator {
     /// stop and device notifications remain live; no guest work is dispatched.
     pub fn wait_while_host_paused(&mut self) -> Result<(), CoordinatorError> {
         while self.host_paused() && !self.host_stop_requested {
-            if let Some(event) = self.inbox.recv_timeout(std::time::Duration::from_secs(1))? {
-                self.accept_ingress(event, &mut CoordinatorDrainReport::default())?;
-            }
+            let event = self.inbox.recv()?;
+            self.accept_ingress(event, &mut CoordinatorDrainReport::default())?;
         }
         Ok(())
     }
 
-    /// Publishes a generation-safe wait for an operation that has actually blocked.
-    pub fn register_wait(&mut self, thread: GuestThreadId) -> Result<WakeToken, CoordinatorError> {
-        self.scheduler.register_wait(thread).map_err(Into::into)
-    }
-
     /// Completes only the current generation after its owned result is installed.
     pub fn complete_wait(&mut self, token: WakeToken) -> Result<bool, CoordinatorError> {
-        self.apply_wake(token)
-    }
-
-    /// Cancels exactly one current wait generation and releases its observers
-    /// and deadline. A readiness wake which already won cannot be cancelled.
-    pub fn cancel_wait(&mut self, token: WakeToken) -> Result<bool, CoordinatorError> {
         self.apply_wake(token)
     }
 
@@ -78,152 +69,13 @@ impl RuntimeCoordinator {
         self.virtual_clock.scheduler_time_ns()
     }
 
-    /// Suspends a caller until a monotonic scheduler deadline. Non-positive
-    /// Horizon values 0, -1 and -2 select the three explicit yield modes.
-    pub fn sleep_thread(
-        &mut self,
-        thread: GuestThreadId,
-        nanoseconds: i64,
-    ) -> Result<Option<WakeToken>, CoordinatorError> {
-        if nanoseconds <= 0 {
-            let migration = match nanoseconds {
-                0 => Some(nixe_scheduler::YieldMigration::None),
-                -1 => Some(nixe_scheduler::YieldMigration::Suggested),
-                -2 => Some(nixe_scheduler::YieldMigration::Any),
-                _ => None,
-            };
-            if let Some(migration) = migration {
-                self.scheduler.yield_thread(thread, migration)?;
-            } else {
-                self.scheduler.make_ready(thread)?;
-            }
-            return Ok(None);
-        }
-        let token = self.register_timed_wait(thread, Some(nanoseconds as u64))?;
-        Ok(Some(token))
-    }
-
-    pub fn register_timed_wait(
-        &mut self,
-        thread: GuestThreadId,
-        timeout_ns: Option<u64>,
-    ) -> Result<WakeToken, CoordinatorError> {
-        let deadline = timeout_ns.map(|timeout_ns| {
-            let deadline = self.virtual_time_ns().saturating_add(timeout_ns);
-            let sequence = self.next_deadline_sequence;
-            (deadline, sequence)
-        });
-        if deadline.is_some() {
-            self.next_deadline_sequence = self
-                .next_deadline_sequence
-                .checked_add(1)
-                .ok_or(CoordinatorError::DeadlineSequenceExhausted)?;
-        }
-        let token = self.register_wait(thread)?;
-        if let Some(deadline) = deadline {
-            self.deadlines.insert(deadline, token);
-        }
-        Ok(token)
-    }
-
-    /// Registers object readiness and its optional virtual deadline as one
-    /// coordinator-owned wait. Event observers are cancelled with the wait.
-    pub fn register_event_wait(
-        &mut self,
-        thread: GuestThreadId,
-        events: impl IntoIterator<Item = crate::ReadableEventObject>,
-        timeout_ns: Option<u64>,
-        source: crate::ExternalEventSource,
-    ) -> Result<WakeToken, CoordinatorError> {
-        let token = self.register_timed_wait(thread, timeout_ns)?;
-        for event in events {
-            if let Err(error) = self
-                .inbox
-                .sender()
-                .watch_readable_event(event, None, token, source)
-            {
-                self.release_wait_resources(thread);
-                let _ = self.scheduler.finish_wait(token);
-                return Err(CoordinatorError::ExternalEvent(error));
-            }
-        }
-        Ok(token)
-    }
-
     pub fn advance_virtual_time(&mut self, nanoseconds: u64) -> Result<usize, CoordinatorError> {
-        let target = self.virtual_time_ns().saturating_add(nanoseconds);
-        self.virtual_clock.advance_scheduler_to(target);
-        self.wake_due_deadlines()
+        Ok(self
+            .scheduler
+            .advance_time(self.virtual_time_ns().saturating_add(nanoseconds)))
     }
 
-    pub(super) fn fast_forward_to_next_deadline(&mut self) -> Result<bool, CoordinatorError> {
-        // Live audio/input/device completion follows host time. Jumping ahead
-        // would turn a pending device operation into an immediate guest timeout.
-        if self.virtual_clock.mode() == crate::VirtualClockMode::Realtime {
-            return Ok(false);
-        }
-        let Some((&(deadline, _), _)) = self.deadlines.first_key_value() else {
-            return Ok(false);
-        };
-        self.virtual_clock.advance_scheduler_to(deadline);
-        self.wake_due_deadlines()?;
-        Ok(true)
-    }
-
-    pub(super) fn service_preemption(&mut self) {
-        let Some(deadline) = self.next_preemption_ns else {
-            return;
-        };
-        let now = self.virtual_time_ns();
-        if now < deadline {
-            return;
-        }
-        let interval = self.scheduler.profile().preemption_interval_ns().unwrap();
-        // Missed host callbacks do not mean guest threads actually ran intervening
-        // turns. Rotate once and preserve the periodic phase, as CoreTiming does.
-        self.next_preemption_ns = Some(now.saturating_add(interval - (now - deadline) % interval));
-        self.scheduler.rotate();
-    }
-
-    pub(super) fn wake_due_deadlines(&mut self) -> Result<usize, CoordinatorError> {
-        self.service_preemption();
-        if self.deadlines.is_empty() {
-            return Ok(0);
-        }
-        let now = self.virtual_time_ns();
-        let mut woken = 0;
-        while let Some((&key, &token)) = self.deadlines.first_key_value() {
-            if key.0 > now {
-                break;
-            }
-            self.deadlines.remove(&key);
-            let handoff = self.scheduler.thread(token.thread).is_some_and(|thread| {
-                thread.active_wait == Some(token)
-                    && self.processes.get(&thread.process).is_some_and(|process| {
-                        process.address_waits().lock().defer_timeout(token.thread)
-                    })
-            });
-            if handoff {
-                continue;
-            }
-            if self.apply_wake(token)? {
-                // Address waits complete at timer expiry, before a later mutex
-                // unlock or condition signal can transfer ownership to them.
-                let process_id = self.scheduler.thread(token.thread).unwrap().process;
-                self.processes
-                    .get_mut(&process_id)
-                    .unwrap()
-                    .address_waits()
-                    .lock()
-                    .expire_thread_wait(token.thread);
-                woken += 1;
-            }
-        }
-        Ok(woken)
-    }
-
-    /// Drains the bounded ingress without sleeping. Late and duplicate wakeups
-    /// are counted and ignored after their generation loses the race.
+    /// Drains host ingress without sleeping; guest readiness is already kernel-owned.
     pub fn drain_external_events(&mut self) -> Result<CoordinatorDrainReport, CoordinatorError> {
         let mut report = CoordinatorDrainReport::default();
         while let Some(event) = self.deferred_events.pop_front() {
@@ -268,27 +120,17 @@ impl RuntimeCoordinator {
                 }
                 self.virtual_clock.set_paused(paused);
             }
+            ExternalEvent::HostService(crate::ExternalEventSource::Timer) => {
+                if self.scheduler.acknowledge_timer_notification() {
+                    return Err(CoordinatorError::TimerWorkerFailed);
+                }
+            }
             ExternalEvent::HostService(_) | ExternalEvent::ThreadRetirement => {}
-            ExternalEvent::Wake { token, .. } => {
-                if self.apply_wake(token)? {
-                    report.woken += 1;
-                } else {
-                    report.stale += 1;
-                }
-            }
-            ExternalEvent::CancelWait(token) => {
-                if self.apply_wake(token)? {
-                    report.cancelled += 1;
-                } else {
-                    report.stale += 1;
-                }
-            }
         }
         self.finalize_retired_threads()
     }
 
     pub(super) fn apply_wake(&mut self, token: WakeToken) -> Result<bool, CoordinatorError> {
-        self.release_wait_resources_if_current(token);
         match self.scheduler.finish_wait(token) {
             Ok(_) => Ok(true),
             Err(SchedulerError::StaleWake(_)) => Ok(false),
@@ -300,7 +142,6 @@ impl RuntimeCoordinator {
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_thread.cpp#L352-L380
     pub(super) fn finalize_thread_waits(&mut self, process: ProcessId, thread: GuestThreadId) {
         self.scheduler.cancel_thread_property(thread);
-        self.release_wait_resources(thread);
         self.processes[&process]
             .address_waits()
             .lock()
@@ -311,29 +152,5 @@ impl RuntimeCoordinator {
                 .lock()
                 .cancel_held_waiter(waiter);
         }
-    }
-
-    pub(super) fn release_wait_resources_if_current(&mut self, token: WakeToken) {
-        if self
-            .scheduler
-            .thread(token.thread)
-            .is_some_and(|thread| thread.active_wait == Some(token))
-        {
-            self.release_wait_resources(token.thread);
-        } else {
-            self.inbox.sender().cancel_watchers(token);
-        }
-    }
-
-    pub(super) fn release_wait_resources(&mut self, thread: GuestThreadId) {
-        let Some(token) = self
-            .scheduler
-            .thread(thread)
-            .and_then(|thread| thread.active_wait)
-        else {
-            return;
-        };
-        self.inbox.sender().cancel_watchers(token);
-        self.deadlines.retain(|_, candidate| *candidate != token);
     }
 }

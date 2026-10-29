@@ -361,9 +361,11 @@ mod tests {
                 }
             );
         }
+        crate::engines::tests::program_three_d(&mut channel, 0x0d78, 3);
         let shader_identity = channel.three_d().shader_state_identity();
         let draw_identity = channel.three_d().draw_state_identity();
         program_three_d(&mut channel, 0x13b0, 2_f32.to_bits());
+        crate::engines::tests::program_three_d(&mut channel, 0x0d78, 3);
         assert!(shader_identity.matches_code(channel.three_d()));
         assert!(!draw_identity.matches(channel.three_d()));
         assert_eq!(

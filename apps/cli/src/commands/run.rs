@@ -162,9 +162,9 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         },
     };
     let virtual_clock = VirtualClock::new(clock_mode);
+    let kernel = nixe_scheduler::SchedulerState::new(scheduler_profile, virtual_clock.clone());
     let coordinator =
-        RuntimeCoordinator::try_with_virtual_clock(scheduler_profile, virtual_clock.clone())
-            .map_err(|error| error.to_string())?;
+        RuntimeCoordinator::try_new(kernel.clone()).map_err(|error| error.to_string())?;
     let external_events = coordinator.event_sender();
     install_interrupt_handler(frontend_control.clone(), external_events.clone())?;
     frontend = frontend.map(|frontend| {
@@ -179,8 +179,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
     let system_memory = memory
         .account(nixe_memory::DEFAULT_RAM_BYTES)
         .map_err(|error| error.to_string())?;
-    let process_builder = ProcessBuilder::new(memory, system_memory)
-        .with_virtual_clock(virtual_clock.clone())
+    let process_builder = ProcessBuilder::new(memory, system_memory, kernel.clone())
         .with_sd_card_root(sd_card_root)
         .with_config(machine_profile.process_build_config());
     let process = process_builder
@@ -218,7 +217,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         operation_mode: initial_operation_mode,
         time: time_environment,
         settings: settings_environment,
-        hid: nixe_horizon::HidSystem::new(process.memory().system_account())
+        hid: nixe_horizon::HidSystem::new(process.memory().system_account(), &kernel)
             .map_err(|e| e.to_string())?,
         shared_fonts: nixe_horizon::SharedFontSession::new(
             process.memory().system_account(),
@@ -319,6 +318,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         let gpu_diagnostics = (renderer.cache_monitor(), renderer.frame_metrics());
         let video = VideoSystem::with_gpu_frontend(
             process.memory().space().machine().clone(),
+            &kernel,
             presenter,
             renderer,
             maxwell,
@@ -595,33 +595,31 @@ fn execute_worker(
         "kernel scheduler: {:?}",
         coordinator.scheduler().statistics()
     );
+    #[cfg(feature = "performance-counters")]
+    log::info!(
+        "kernel timers: {:?}",
+        coordinator.scheduler().timing_statistics()
+    );
     // Stop and join GPU work while its
     // canonical memory transitions can still use the JIT coordinator. Removing
     // the process closes native admission and would reject those transitions.
     let graphics_teardown = video_system.teardown();
-    let process = match coordinator.remove_process(process_id) {
-        Ok(process) => process,
+    let teardown = match coordinator.remove_process(process_id) {
+        Ok(report) => report,
+        Err(nixe_runtime::CoordinatorError::ProcessTeardown { failure, .. }) => {
+            let diagnostic = failure.to_string();
+            execution = Err(match execution {
+                Ok(_) => diagnostic,
+                Err(error) => format!("{error}; {diagnostic}"),
+            });
+            *failure.report
+        }
         Err(error) => {
-            // Stopping the backend can report an asynchronous compiler failure
-            // even after every scheduler lease has been returned. Preserve it
-            // and let the coordinator's Drop stop/join its remaining workers.
             return WorkerResult {
                 execution,
                 teardown: Err(format!("cannot remove process during teardown: {error}")),
                 graphics_teardown,
             };
-        }
-    };
-    let teardown = match process.try_teardown() {
-        Ok(report) => report,
-        Err(failure) => {
-            let diagnostic = failure.to_string();
-            let report = *failure.report;
-            execution = Err(match execution {
-                Ok(_) => diagnostic,
-                Err(error) => format!("{error}; {diagnostic}"),
-            });
-            report
         }
     };
     WorkerResult {
@@ -703,7 +701,7 @@ fn execute(
         horizon_environment.settings,
         video_system,
     )
-    .with_memory_completions(coordinator.event_sender())
+    .with_input_completions(coordinator.event_sender())
     .with_system_archives(horizon_environment.system_archives)
     .with_diagnostics(horizon_environment.diagnostics)
     .with_audio_backend(audio_backend.clone())
@@ -840,9 +838,6 @@ fn execute(
                 .saturating_sub(execution_started),
             dispatcher.next_video_deadline(),
         );
-        let host_wait = dispatcher
-            .next_service_deadline()
-            .map_or(host_wait, |deadline| deadline.min(host_wait));
         let Some(execution) = coordinator
             .run_next(host_wait)
             .map_err(|error| error.to_string())?
@@ -887,12 +882,12 @@ fn execute(
                     if log::log_enabled!(log::Level::Trace)
                         && let Some(process) = coordinator.process(process_id)
                     {
-                        for (thread, _) in process.threads().iter() {
-                            if let Ok(cpu) = coordinator.thread_cpu_state(thread.get()) {
+                        for (thread, object) in process.threads().iter() {
+                            if let Some(cpu) = object.snapshot() {
                                 log::trace!(
                                     "guest thread snapshot: id={} scheduler={:?} registers=[{}]",
                                     thread.get(),
-                                    coordinator.thread_scheduling_info(thread.get()),
+                                    coordinator.scheduler().thread(thread),
                                     cpu.register_context(),
                                 );
                             }
@@ -1099,7 +1094,7 @@ fn execution_summary(
     rejected_svc_kinds: usize,
 ) -> ExecutionSummary {
     ExecutionSummary {
-        svc_calls: dispatcher.coverage().iter().map(|entry| entry.calls).sum(),
+        svc_calls: dispatcher.svc_calls(),
         rejected_svc_kinds,
     }
 }

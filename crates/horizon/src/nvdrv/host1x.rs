@@ -627,7 +627,9 @@ mod tests {
             descriptor(1, NvDrvDeviceKind::NvMap),
         )]);
         let mut host = Host1x::default();
-        let control = Arc::new(Mutex::new(NvHostControl::default()));
+        let control = Arc::new(Mutex::new(
+            NvHostControl::new(&crate::test_memory::kernel()),
+        ));
         let mut map = [0; 20];
         write_u32(&mut map, 0, 1).unwrap();
         write_u32(&mut map, 12, handle.raw()).unwrap();

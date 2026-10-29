@@ -1,8 +1,197 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+enum MessagePart {
+    Header,
+    Special,
+    Data,
+}
+
+// Capture the emitted message, as MessageBuffer's raw-data extent does.
+// Receive lists belong to the destination and are not emitted source data.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_server_session.cpp#L584-L615
+struct MessageRead {
+    machine: nixe_memory::Machine,
+    ranges: nixe_memory::CapturedMemory,
+    header: [u8; 12],
+    bytes: Vec<u8>,
+    part: MessagePart,
+    pending: Option<nixe_memory::PendingAccess>,
+    immediate: u32,
+}
+impl MessageRead {
+    fn prefix(&self) -> usize {
+        if u32::from_le_bytes(self.header[4..8].try_into().unwrap()) >> 31 != 0 {
+            12
+        } else {
+            8
+        }
+    }
+    fn read(&mut self) -> Result<nixe_memory::Access<()>, nixe_memory::MemoryError> {
+        match self.part {
+            MessagePart::Header => {
+                self.machine
+                    .read_captured_into(&self.ranges, 0, &mut self.header[..8])
+            }
+            MessagePart::Special => {
+                self.machine
+                    .read_captured_into(&self.ranges, 8, &mut self.header[8..])
+            }
+            MessagePart::Data => {
+                let prefix = self.prefix();
+                self.machine.read_captured_into(
+                    &self.ranges,
+                    prefix as u64,
+                    &mut self.bytes[prefix..],
+                )
+            }
+        }
+    }
+    fn accept(&mut self, bytes: &[u8]) {
+        match self.part {
+            MessagePart::Header => self.header[..8].copy_from_slice(bytes),
+            MessagePart::Special => self.header[8..].copy_from_slice(bytes),
+            MessagePart::Data => {
+                let prefix = self.prefix();
+                self.bytes[prefix..].copy_from_slice(bytes);
+            }
+        }
+    }
+    fn advance(&mut self) -> Result<bool, HorizonKernelResult> {
+        match self.part {
+            MessagePart::Header if self.prefix() == 12 => {
+                self.part = MessagePart::Special;
+                Ok(false)
+            }
+            MessagePart::Header | MessagePart::Special => {
+                let prefix = self.prefix();
+                let size = HipcHeader::decode(&self.header[..prefix])
+                    .and_then(|header| header.message_size(self.ranges.bytes() as usize))
+                    .map_err(|_| HorizonKernelResult::INVALID_COMBINATION)?;
+                self.bytes = vec![0; size];
+                self.bytes[..prefix].copy_from_slice(&self.header[..prefix]);
+                self.part = MessagePart::Data;
+                Ok(size == prefix)
+            }
+            MessagePart::Data => Ok(true),
+        }
+    }
+}
+
+impl std::future::Future for MessageRead {
+    type Output = Result<Result<Vec<u8>, HorizonKernelResult>, HorizonSvcFault>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        use std::{future::Future, pin::Pin, task::Poll};
+        let message = self.get_mut();
+        loop {
+            if let Some(pending) = message.pending.as_mut() {
+                let result = match Future::poll(Pin::new(pending), context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result,
+                };
+                message.pending = None;
+                match result {
+                    Ok(nixe_memory::AccessResult::Read(bytes)) => message.accept(&bytes),
+                    Ok(_) => return Poll::Ready(Err(runtime_fault("IPC input read completion"))),
+                    Err(fault) => {
+                        return Poll::Ready(Err(HorizonSvcFault::MemoryAccess {
+                            immediate: message.immediate,
+                            fault,
+                        }));
+                    }
+                }
+            } else {
+                match message.read() {
+                    Ok(nixe_memory::Access::Ready(())) => {}
+                    Ok(nixe_memory::Access::Pending(pending)) => {
+                        message.pending = Some(pending);
+                        continue;
+                    }
+                    Err(fault) => {
+                        return Poll::Ready(Err(HorizonSvcFault::MemoryAccess {
+                            immediate: message.immediate,
+                            fault: std::sync::Arc::new(fault),
+                        }));
+                    }
+                }
+            }
+            match message.advance() {
+                Ok(true) => {
+                    return Poll::Ready(Ok(Ok(std::mem::take(&mut message.bytes))));
+                }
+                Ok(false) => {}
+                Err(code) => return Poll::Ready(Ok(Err(code))),
+            }
+        }
+    }
+}
+
+impl HorizonSvcDispatcher {
+    pub(super) fn read_svc_message(
+        &mut self,
+        context: &mut ExceptionDispatchContext<'_>,
+        immediate: u32,
+        ranges: Vec<nixe_memory::AllocationRange>,
+        continuation: impl FnOnce(
+            &mut Self,
+            &mut ExceptionDispatchContext<'_>,
+            Result<Vec<u8>, HorizonKernelResult>,
+        ) -> ExceptionDispatchOutcome<HorizonSvcFault>
+        + Send
+        + 'static,
+    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
+        let ranges = match nixe_memory::CapturedMemory::new(ranges) {
+            Ok(ranges) => ranges,
+            Err(error) => {
+                return reject(
+                    context,
+                    HorizonSvcFault::MemoryAccess {
+                        immediate,
+                        fault: std::sync::Arc::new(error),
+                    },
+                );
+            }
+        };
+        let mut message = MessageRead {
+            machine: context.process().memory().account().machine().clone(),
+            ranges,
+            header: [0; 12],
+            bytes: Vec::new(),
+            part: MessagePart::Header,
+            pending: None,
+            immediate,
+        };
+        // MessageRead is Unpin: ready RAM completes on this stack, and an
+        // actual dependency moves the same owned operation into the kernel wait.
+        match std::future::Future::poll(
+            std::pin::Pin::new(&mut message),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        ) {
+            std::task::Poll::Ready(Ok(bytes)) => continuation(self, context, bytes),
+            std::task::Poll::Ready(Err(fault)) => reject(context, fault),
+            std::task::Poll::Pending => {
+                let source = context.source();
+                let vcpu = context.thread().vcpu();
+                self.start_owned_svc(context, std::sync::Arc::default(), None, async move {
+                    let bytes = message.await?;
+                    Ok(memory_wait::SvcCompletion::kernel(
+                        source,
+                        vcpu,
+                        move |dispatcher, context| continuation(dispatcher, context, bytes),
+                    ))
+                })
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct KernelSessionRequest {
-    session: SessionObject,
+    session: std::sync::Arc<SessionObject>,
     owner: SessionRequestOwner,
     reply: Option<Vec<nixe_memory::AllocationRange>>,
     size: usize,
@@ -95,32 +284,11 @@ impl HorizonSvcDispatcher {
         context: &mut ExceptionDispatchContext<'_>,
         name: Vec<u8>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        if let Some(port) = self.named_ports.get(&name).cloned() {
-            let session = match port.connect() {
-                Ok(session) => session,
-                Err(PortError::SessionLimit) => {
-                    result(context, HorizonKernelResult::OUT_OF_SESSIONS);
-                    return resume();
-                }
-                Err(PortError::PeerClosed) => {
-                    result(context, HorizonKernelResult::PORT_CLOSED);
-                    return resume();
-                }
-                Err(PortError::WrongEndpoint | PortError::NoPendingSession) => {
-                    result(context, HorizonKernelResult::INVALID_STATE);
-                    return resume();
-                }
-            };
-            match context.process_mut().handles().insert(session) {
-                Ok(handle) => {
-                    result(context, HorizonKernelResult::SUCCESS);
-                    write_register(context.thread_mut().state_mut(), 1, u64::from(handle));
-                }
-                Err(_) => result(context, HorizonKernelResult::OUT_OF_HANDLES),
-            }
-            return resume();
+        let port = self.named_ports.lock().unwrap().get(&name).cloned();
+        if let Some(port) = port {
+            return connect_port(context, &port);
         }
-        match crate::ipc_wire::connect_to_named_port(context.process_mut(), &name) {
+        match crate::ipc_wire::connect_to_named_port(context.process(), &name) {
             NamedPortResult::Connected(handle) => {
                 result(context, HorizonKernelResult::SUCCESS);
                 write_register(context.thread_mut().state_mut(), 1, u64::from(handle));
@@ -146,33 +314,55 @@ impl HorizonSvcDispatcher {
             result(context, HorizonKernelResult::OUT_OF_RANGE);
             return resume();
         }
+        // Retain/create objects outside namespace and handle-table locks.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/svc/svc_port.cpp#L120-L175
         if max_sessions == 0 {
-            if self
-                .named_ports
-                .get(&name)
-                .is_some_and(PortObject::server_is_open)
-            {
+            let mut ports = self.named_ports.lock().unwrap();
+            if ports.get(&name).is_some_and(PortObject::server_is_open) {
+                drop(ports);
                 result(context, HorizonKernelResult::INVALID_STATE);
-            } else if self.named_ports.remove(&name).is_some() {
-                result(context, HorizonKernelResult::SUCCESS);
-                write_register(context.thread_mut().state_mut(), 1, 0);
             } else {
-                result(context, HorizonKernelResult::NOT_FOUND);
+                let removed = ports.remove(&name);
+                drop(ports);
+                result(
+                    context,
+                    if removed.is_some() {
+                        HorizonKernelResult::SUCCESS
+                    } else {
+                        HorizonKernelResult::NOT_FOUND
+                    },
+                );
+                if removed.is_some() {
+                    write_register(context.thread_mut().state_mut(), 1, 0);
+                }
+                drop(removed);
             }
             return resume();
         }
-        if self.named_ports.contains_key(&name) {
+        let (server, client) =
+            PortObject::create_pair(context.process().scheduler(), max_sessions as usize, false);
+        let handle = match context.process().handles().insert(server) {
+            Ok(handle) => handle,
+            Err(_) => {
+                result(context, HorizonKernelResult::OUT_OF_HANDLES);
+                return resume();
+            }
+        };
+        let inserted = {
+            let mut ports = self.named_ports.lock().unwrap();
+            if let std::collections::btree_map::Entry::Vacant(entry) = ports.entry(name) {
+                entry.insert(client);
+                true
+            } else {
+                false
+            }
+        };
+        if inserted {
+            result(context, HorizonKernelResult::SUCCESS);
+            write_register(context.thread_mut().state_mut(), 1, u64::from(handle));
+        } else {
+            let _ = context.process().handles().close(handle);
             result(context, HorizonKernelResult::INVALID_STATE);
-            return resume();
-        }
-        let (server, client) = PortObject::create_pair(max_sessions as usize, false);
-        match context.process_mut().handles().insert(server) {
-            Ok(handle) => {
-                self.named_ports.insert(name, client);
-                result(context, HorizonKernelResult::SUCCESS);
-                write_register(context.thread_mut().state_mut(), 1, u64::from(handle));
-            }
-            Err(_) => result(context, HorizonKernelResult::OUT_OF_HANDLES),
         }
         resume()
     }
@@ -229,28 +419,27 @@ impl HorizonSvcDispatcher {
         handle: u32,
         immediate: u32,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        if self
-            .session_requests
-            .contains_key(&context.thread().id().get())
-        {
-            return self.generic_sync_request(context, address, size, handle, immediate);
-        }
         let Some(target) = context.process().handles().lookup(handle) else {
             result(context, HorizonKernelResult::INVALID_HANDLE);
             return resume();
         };
-        if target.downcast_ref::<crate::HorizonIpcObject>().is_none() {
-            return self.generic_sync_request(context, address, size, handle, immediate);
+        if !target.is::<crate::HorizonIpcObject>() {
+            let Some(session) = target.into_arc::<SessionObject>() else {
+                result(context, HorizonKernelResult::INVALID_HANDLE);
+                return resume();
+            };
+            return self.start_session_request(context, address, size, session, immediate);
         }
         let key = crate::ipc_wire::operation::ServiceKey::Session(target.clone());
         let turn = match self.service_scheduling.enter(key) {
             Ok(turn) => turn,
             Err(error) => return ipc_fault(immediate, error),
         };
-        let mut request = crate::ipc_wire::request::Request::new(context, target);
-        if let Err(error) = request.pin_command(address, size) {
-            return ipc_fault(immediate, error);
-        }
+        let mut request =
+            match crate::ipc_wire::request::Request::new(context, target, address, size) {
+                Ok(request) => request,
+                Err(error) => return ipc_fault(immediate, error),
+            };
         let mode = self.initial_operation_mode;
         let time = self.time_environment.clone();
         let systems = crate::ipc_wire::HostSystems {
@@ -276,8 +465,6 @@ impl HorizonSvcDispatcher {
         self.start_owned_svc(context, request.lifetime(), None, async move {
             let result = crate::ipc_wire::send_sync_request_from_buffer(
                 &mut request,
-                address,
-                size,
                 handle,
                 mode,
                 &time,
@@ -312,7 +499,6 @@ impl HorizonSvcDispatcher {
             .process()
             .handles()
             .lookup_as::<SessionObject>(handle)
-            .map(std::sync::Arc::unwrap_or_clone)
         else {
             result(context, HorizonKernelResult::INVALID_HANDLE);
             return resume();
@@ -321,56 +507,34 @@ impl HorizonSvcDispatcher {
             result(context, HorizonKernelResult::INVALID_HANDLE);
             return resume();
         }
-        let owner = session_request_owner(context);
+        let request = KernelSessionRequest {
+            session,
+            owner: session_request_owner(context),
+            reply: None,
+            size: 0,
+            immediate: 0x20,
+        };
         let mut words = [0_u32; 7];
         for (index, word) in words.iter_mut().enumerate() {
             *word = read_register(context.thread().state(), index as u8 + 1) as u32;
         }
-        match session.request(owner, SessionMessage::Light(words)) {
-            Ok(SessionRequestResult::Submitted | SessionRequestResult::Waiting) => {
-                self.suspend_on_session(context, &session)
-            }
-            Ok(SessionRequestResult::Response(SessionMessage::Light(response))) => {
-                for (index, word) in response.into_iter().enumerate() {
-                    write_register(
-                        context.thread_mut().state_mut(),
-                        index as u8 + 1,
-                        u64::from(word),
-                    );
-                }
-                result(context, HorizonKernelResult::SUCCESS);
-                resume()
-            }
-            Ok(SessionRequestResult::Response(
-                SessionMessage::Buffer(_) | SessionMessage::TransportedBuffer { .. },
-            ))
-            | Err(SessionError::MessageKindMismatch) => {
-                result(context, HorizonKernelResult::INVALID_STATE);
-                resume()
-            }
+        match request
+            .session
+            .request(request.owner, SessionMessage::Light(words))
+        {
+            Ok(()) => self.poll_session_request(context, request),
             Err(error) => session_error(context, error),
         }
     }
 
-    pub(super) fn generic_sync_request(
+    fn start_session_request(
         &mut self,
         context: &mut ExceptionDispatchContext<'_>,
         address: GuestVirtualAddress,
         size: usize,
-        handle: u32,
+        session: std::sync::Arc<SessionObject>,
         immediate: u32,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        if let Some(request) = self.session_requests.remove(&context.thread().id().get()) {
-            return self.poll_session_request(context, request);
-        }
-        let Some(session) = context
-            .process()
-            .handles()
-            .lookup_as::<SessionObject>(handle)
-        else {
-            result(context, HorizonKernelResult::INVALID_HANDLE);
-            return resume();
-        };
         if session.endpoint() != SessionEndpoint::Client || session.is_light() {
             result(context, HorizonKernelResult::INVALID_HANDLE);
             return resume();
@@ -392,18 +556,25 @@ impl HorizonSvcDispatcher {
             }
         };
         let request = KernelSessionRequest {
-            session: std::sync::Arc::unwrap_or_clone(session),
+            session,
             owner: session_request_owner(context),
             reply: Some(ranges.clone()),
             size,
             immediate,
         };
-        self.read_svc_capture(
+        self.read_svc_message(
             context,
             immediate,
             ranges,
             move |dispatcher, context, bytes| {
-                let message = match capture_message_handles(context, bytes.into_vec(), false) {
+                let bytes = match bytes {
+                    Ok(bytes) => bytes,
+                    Err(code) => {
+                        result(context, code);
+                        return resume();
+                    }
+                };
+                let message = match capture_message_handles(context, bytes, false) {
                     Ok(message) => message,
                     Err(code) => {
                         result(context, code);
@@ -411,12 +582,7 @@ impl HorizonSvcDispatcher {
                     }
                 };
                 match request.session.request(request.owner, message) {
-                    Ok(SessionRequestResult::Submitted | SessionRequestResult::Waiting) => {
-                        dispatcher.poll_session_request(context, request)
-                    }
-                    Ok(SessionRequestResult::Response(response)) => {
-                        dispatcher.finish_session_response(context, request, response)
-                    }
+                    Ok(()) => dispatcher.poll_session_request(context, request),
                     Err(error) => session_error(context, error),
                 }
             },
@@ -427,48 +593,52 @@ impl HorizonSvcDispatcher {
         context: &mut ExceptionDispatchContext<'_>,
         request: KernelSessionRequest,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let event = request.session.readable_event();
-        event.clear();
-        match request.session.poll_request(request.owner) {
-            Ok(Some(SessionRequestResult::Response(response))) => {
-                self.finish_session_response(context, request, response)
-            }
-            Ok(Some(SessionRequestResult::Waiting | SessionRequestResult::Submitted)) => {
-                let thread = context.thread().id().get();
-                self.pending_wakes.insert(
-                    thread,
-                    PendingThreadWake {
-                        events: vec![event],
-                        deadline: None,
-                    },
-                );
-                self.session_requests.insert(thread, request);
-                ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
-            }
-            Ok(None) => ExceptionDispatchOutcome::Fault(runtime_fault(
-                "accepted session request disappeared",
-            )),
-            Err(error) => session_error(context, error),
-        }
+        let source = context.source();
+        let vcpu = context.thread().vcpu();
+        self.start_owned_svc(context, std::sync::Arc::default(), None, async move {
+            let response = request.session.response(request.owner).await;
+            Ok(memory_wait::SvcCompletion::kernel(
+                source,
+                vcpu,
+                move |dispatcher, context| match response {
+                    Ok(response) => dispatcher.finish_session_response(context, request, response),
+                    Err(error) => session_error(context, error),
+                },
+            ))
+        })
     }
+
     fn finish_session_response(
         &mut self,
         context: &mut ExceptionDispatchContext<'_>,
         mut request: KernelSessionRequest,
         response: SessionMessage,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let response = match materialize_message_handles(context, response) {
-            Ok(Some(response)) => response,
-            Ok(None) => return invalid_state(context),
+        if request.session.is_light() {
+            let SessionMessage::Light(words) = response else {
+                return invalid_state(context);
+            };
+            for (index, word) in words.into_iter().enumerate() {
+                write_register(
+                    context.thread_mut().state_mut(),
+                    index as u8 + 1,
+                    u64::from(word),
+                );
+            }
+            result(context, HorizonKernelResult::SUCCESS);
+            return resume();
+        }
+        let response = match materialize_message_handles(
+            context.process().handles(),
+            response,
+            request.size,
+        ) {
+            Ok(response) => response,
             Err(code) => {
                 result(context, code);
                 return resume();
             }
         };
-        if response.bytes.len() > request.size {
-            result(context, HorizonKernelResult::INVALID_SIZE);
-            return resume();
-        }
         self.write_received_message(
             context,
             request.immediate,
@@ -476,23 +646,6 @@ impl HorizonSvcDispatcher {
             response,
             None,
         )
-    }
-
-    pub(super) fn suspend_on_session(
-        &mut self,
-        context: &ExceptionDispatchContext<'_>,
-        session: &SessionObject,
-    ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let event = session.readable_event();
-        event.clear();
-        self.pending_wakes.insert(
-            context.thread().id().get(),
-            PendingThreadWake {
-                events: vec![event],
-                deadline: None,
-            },
-        );
-        ExceptionDispatchOutcome::Suspend(ExceptionResume::Retry)
     }
 }
 
@@ -510,121 +663,93 @@ pub(super) fn invalid_state(
 // https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_server_session.cpp#L572-L578
 pub(super) fn capture_message_handles(
     context: &mut ExceptionDispatchContext<'_>,
-    bytes: Vec<u8>,
+    mut bytes: Vec<u8>,
     allow_move_handles: bool,
 ) -> Result<SessionMessage, HorizonKernelResult> {
-    let Some(message) = decode_transport_header(&bytes)? else {
+    // MessageRead already validated and captured the emitted extent. Plain
+    // messages need no further header decoding before queueing or delivery.
+    if bytes[7] & 0x80 == 0 {
         return Ok(SessionMessage::Buffer(bytes));
-    };
-    if !allow_move_handles && !message.move_handles.is_empty() {
-        return Err(HorizonKernelResult::INVALID_COMBINATION);
     }
-    let mut transfer_error = None;
-    let mut copy_handles = Vec::with_capacity(message.copy_handles.len());
-    for handle in &message.copy_handles {
-        if transfer_error.is_some() {
-            copy_handles.push(None);
-            continue;
-        }
-        match copy_ipc_object(context, *handle) {
-            Ok(object) => copy_handles.push(object),
-            Err(error) => {
-                transfer_error = Some(error);
-                copy_handles.push(None);
-            }
-        }
-    }
-
-    let mut move_handles = Vec::with_capacity(message.move_handles.len());
-    for handle in &message.move_handles {
-        if *handle == 0 {
-            move_handles.push(None);
-            continue;
-        }
-        if matches!(*handle, CURRENT_PROCESS_HANDLE | CURRENT_THREAD_HANDLE) {
-            transfer_error = Some(HorizonKernelResult::INVALID_HANDLE);
-            move_handles.push(None);
-            continue;
-        }
-        match context.process_mut().handles().close(*handle) {
-            Ok(object) if transfer_error.is_none() => move_handles.push(Some(object)),
-            Ok(_) => move_handles.push(None),
-            Err(_) => {
-                transfer_error = Some(HorizonKernelResult::INVALID_HANDLE);
-                move_handles.push(None);
-            }
-        }
-    }
-    if let Some(error) = transfer_error {
-        return Err(error);
+    let header = HipcHeader::decode(&bytes).expect("captured IPC special header");
+    let offset = header.handle_offset();
+    let copy_end = offset + header.copy_handle_count() * 4;
+    let move_end = copy_end + header.move_handle_count() * 4;
+    let word = |bytes: &[u8]| u32::from_le_bytes(bytes.try_into().expect("one handle word"));
+    // ProcessMessageSpecialData walks the handle words directly. Receive-list
+    // metadata is consumed by the destination, not by the emitting transport.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_server_session.cpp#L162-L235
+    let handles = crate::ipc_wire::handles::capture(
+        context.process(),
+        context.thread().object(),
+        bytes[offset..copy_end].chunks_exact(4).map(word),
+        bytes[copy_end..move_end].chunks_exact(4).map(word),
+        allow_move_handles,
+    )?;
+    // The kernel supplies the sending process identity, never the PID in the
+    // source buffer. The fixed header/special header precede this eight-byte slot.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_server_session.cpp#L162-L172
+    if header.sends_pid() {
+        bytes[12..20].copy_from_slice(&context.process().process_id().to_le_bytes());
     }
     Ok(SessionMessage::TransportedBuffer {
         bytes,
-        copy_handles,
-        move_handles,
+        copy_handles: handles.copied,
+        move_handles: handles.moved,
     })
-}
-
-pub(super) fn copy_ipc_object(
-    context: &ExceptionDispatchContext<'_>,
-    handle: u32,
-) -> Result<Option<HandleObject>, HorizonKernelResult> {
-    match handle {
-        0 => Ok(None),
-        CURRENT_PROCESS_HANDLE => Ok(Some(HandleObject::new(ProcessObject::new(
-            context.process().process_id(),
-        )))),
-        CURRENT_THREAD_HANDLE => Ok(Some(HandleObject::from_arc(context.thread().object()))),
-        _ => context
-            .process()
-            .handles()
-            .lookup(handle)
-            .map(Some)
-            .ok_or(HorizonKernelResult::INVALID_HANDLE),
-    }
 }
 
 pub(super) struct ReceivedMessage {
     pub(super) bytes: Vec<u8>,
     reservations: Vec<nixe_runtime::HandleReservation>,
+    pub(super) receive: Option<nixe_runtime::SessionReceive>,
+}
+impl ReceivedMessage {
+    fn complete_receive(&mut self) {
+        if let Some(receive) = self.receive.take() {
+            receive.complete();
+        }
+    }
 }
 pub(super) fn materialize_message_handles(
-    context: &mut ExceptionDispatchContext<'_>,
-    message: SessionMessage,
-) -> Result<Option<ReceivedMessage>, HorizonKernelResult> {
-    materialize_message_handles_in_table(context.process().handles(), message)
-}
-pub(super) fn materialize_message_handles_in_table(
     handles: &std::sync::Arc<HandleTable>,
     message: SessionMessage,
-) -> Result<Option<ReceivedMessage>, HorizonKernelResult> {
+    capacity: usize,
+) -> Result<ReceivedMessage, HorizonKernelResult> {
     let (mut bytes, copied, moved) = match message {
         SessionMessage::Buffer(bytes) => {
-            return Ok(Some(ReceivedMessage {
+            if bytes.len() > capacity {
+                return Err(HorizonKernelResult::MESSAGE_TOO_LARGE);
+            }
+            return Ok(ReceivedMessage {
                 bytes,
                 reservations: Vec::new(),
-            }));
+                receive: None,
+            });
         }
-        SessionMessage::Light(_) => return Ok(None),
+        SessionMessage::Light(_) => unreachable!("normal session carries buffer messages"),
         SessionMessage::TransportedBuffer {
             bytes,
             copy_handles,
             move_handles,
         } => (bytes, copy_handles, move_handles),
     };
-    let offset = {
-        let header =
-            decode_transport_header(&bytes)?.ok_or(HorizonKernelResult::INVALID_COMBINATION)?;
-        if header.copy_handles.len() != copied.len() || header.move_handles.len() != moved.len() {
-            return Err(HorizonKernelResult::INVALID_COMBINATION);
-        }
-        header.handle_offset()
-    };
+    // Source acceptance already decoded the descriptors and retained their
+    // handles. Delivery only needs the fixed header's layout, as MessageBuffer.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_server_session.cpp#L584-L615
+    if bytes.len() > capacity {
+        return Err(HorizonKernelResult::MESSAGE_TOO_LARGE);
+    }
+    let header = HipcHeader::decode(&bytes).expect("captured IPC special header");
+    debug_assert!(header.has_special_header());
+    debug_assert_eq!(header.copy_handle_count(), copied.len());
+    debug_assert_eq!(header.move_handle_count(), moved.len());
+    let offset = header.handle_offset();
     let mut reservations = Vec::with_capacity(copied.len() + moved.len());
     for (index, object) in copied.into_iter().chain(moved).enumerate() {
         let handle = if let Some(object) = object {
             let reservation = handles
-                .reserve_object(object)
+                .reserve(Some(object))
                 .map_err(|_| HorizonKernelResult::OUT_OF_HANDLES)?;
             let handle = reservation.handle();
             reservations.push(reservation);
@@ -634,10 +759,11 @@ pub(super) fn materialize_message_handles_in_table(
         };
         bytes[offset + index * 4..offset + index * 4 + 4].copy_from_slice(&handle.to_le_bytes());
     }
-    Ok(Some(ReceivedMessage {
+    Ok(ReceivedMessage {
         bytes,
         reservations,
-    }))
+        receive: None,
+    })
 }
 impl HorizonSvcDispatcher {
     pub(super) fn write_received_message(
@@ -648,13 +774,6 @@ impl HorizonSvcDispatcher {
         mut message: ReceivedMessage,
         output1: Option<u64>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        if message.bytes.is_empty() {
-            result(context, HorizonKernelResult::SUCCESS);
-            if let Some(value) = output1 {
-                write_register(context.thread_mut().state_mut(), 1, value);
-            }
-            return resume();
-        }
         let ranges = match nixe_memory::CapturedMemory::new(ranges) {
             Ok(ranges) => ranges,
             Err(error) => {
@@ -686,6 +805,7 @@ impl HorizonSvcDispatcher {
                 if let Err(error) = handles.publish(&mut message.reservations) {
                     return ipc_fault(immediate, IpcWireError::Handle(error));
                 }
+                message.complete_receive();
                 result(context, HorizonKernelResult::SUCCESS);
                 if let Some(value) = output1 {
                     write_register(context.thread_mut().state_mut(), 1, value);
@@ -709,6 +829,7 @@ impl HorizonSvcDispatcher {
                                 error,
                             ))),
                         })?;
+                    message.complete_receive();
                     Ok(super::memory_wait::SvcCompletion::success(output1))
                 })
             }
@@ -716,30 +837,12 @@ impl HorizonSvcDispatcher {
     }
 }
 
-pub(super) fn decode_transport_header(
-    bytes: &[u8],
-) -> Result<Option<HipcRequest<'_>>, HorizonKernelResult> {
-    let Some(word1) = bytes
-        .get(4..8)
-        .and_then(|word| <[u8; 4]>::try_from(word).ok())
-        .map(u32::from_le_bytes)
-    else {
-        return Ok(None);
-    };
-    if word1 >> 31 == 0 {
-        return Ok(None);
-    }
-    let bounded = &bytes[..bytes.len().min(TLS_COMMAND_BUFFER_SIZE)];
-    HipcRequest::decode(bounded)
-        .map(Some)
-        .map_err(|_| HorizonKernelResult::INVALID_COMBINATION)
-}
-
 pub(super) fn session_error(
     context: &mut ExceptionDispatchContext<'_>,
     error: SessionError,
 ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
     let code = match error {
+        SessionError::TransferFailed(code) => HorizonKernelResult(code),
         SessionError::PeerClosed => HorizonKernelResult::SESSION_CLOSED,
         SessionError::QueueFull => HorizonKernelResult::OUT_OF_RESOURCE,
         SessionError::WrongEndpoint

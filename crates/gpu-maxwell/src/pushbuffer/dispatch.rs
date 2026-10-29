@@ -4,6 +4,7 @@
 //! selection but no engine method tables, mappings, Horizon ABI, or backend
 //! objects. Engine-specific interpretation begins at the next dispatch layer.
 
+#[cfg(test)]
 use crate::pushbuffer::packet::PacketView;
 use std::fmt::{Display, Formatter};
 
@@ -11,7 +12,7 @@ use nixe_gpu::{FrontendSubmissionId, GpuClassId, GpuMethodId};
 
 use crate::{
     MaxwellChannelFrontendState, MaxwellChannelId, MaxwellDecodedMethod,
-    MaxwellGpfifoSourceLocation, MaxwellGpuChannel, MaxwellGpuProfile, MaxwellPushbufferControl,
+    MaxwellGpfifoSourceLocation, MaxwellGpuProfile, MaxwellPushbufferControl,
     MaxwellPushbufferSubchannel,
 };
 
@@ -39,8 +40,7 @@ const MEM_OP_B_L2_FLUSH_DIRTY: u8 = 0x10;
 /// Complete pointer-free source of one expanded Maxwell method write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellMethodSource {
-    // Dispatch validates both identities against the location. Retain them once
-    // rather than copying duplicate IDs through every raw/typed/shadow register.
+    // The command reader supplies the active channel and submission identity.
     location: MaxwellGpfifoSourceLocation,
     subchannel: MaxwellPushbufferSubchannel,
     method: GpuMethodId,
@@ -48,20 +48,6 @@ pub struct MaxwellMethodSource {
 }
 
 impl MaxwellMethodSource {
-    pub(crate) const fn from_parts(
-        location: MaxwellGpfifoSourceLocation,
-        subchannel: MaxwellPushbufferSubchannel,
-        method: GpuMethodId,
-        argument: u32,
-    ) -> Self {
-        Self {
-            location,
-            subchannel,
-            method,
-            argument,
-        }
-    }
-
     pub(crate) const fn decoded(
         method: MaxwellDecodedMethod,
         subchannel: MaxwellPushbufferSubchannel,
@@ -217,11 +203,6 @@ impl Display for MaxwellMethodDispatch {
 /// Failure at the class-binding boundary, before engine method execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellMethodDispatchError {
-    SourceIdentityMismatch {
-        source: MaxwellGpfifoSourceLocation,
-        channel: MaxwellChannelId,
-        submission: FrontendSubmissionId,
-    },
     MissingPacketSubchannel {
         source: MaxwellGpfifoSourceLocation,
     },
@@ -261,14 +242,6 @@ pub enum MaxwellMethodDispatchError {
 impl Display for MaxwellMethodDispatchError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SourceIdentityMismatch {
-                source,
-                channel,
-                submission,
-            } => write!(
-                formatter,
-                "Maxwell method source belongs to another dispatch: expected=[{channel} {submission}] actual=[{source}]"
-            ),
             Self::MissingPacketSubchannel { source } => {
                 write!(
                     formatter,
@@ -332,59 +305,6 @@ impl Display for MaxwellMethodDispatchError {
 }
 
 impl std::error::Error for MaxwellMethodDispatchError {}
-
-type RoutedMethods<'a> = (
-    MaxwellPushbufferSubchannel,
-    crate::MaxwellMethodSpan<'a>,
-    MaxwellDecodedMethod,
-    Option<GpuClassId>,
-);
-
-/// Validate packet routing once; register dispatch itself cannot suspend.
-pub(crate) fn packet_methods<'a>(
-    channel: &MaxwellGpuChannel,
-    submission: FrontendSubmissionId,
-    packet: PacketView<'a>,
-) -> Result<Option<RoutedMethods<'a>>, MaxwellMethodDispatchError> {
-    match packet {
-        PacketView::Methods {
-            header,
-            subchannel,
-            methods,
-            ..
-        } => {
-            validate_source_identity(channel.id(), submission, header)?;
-            if methods.is_empty() {
-                return Ok(None);
-            }
-            let subchannel = subchannel
-                .ok_or(MaxwellMethodDispatchError::MissingPacketSubchannel { source: header })?;
-            let first = methods.first().unwrap();
-            let class = if first.method().0 >= HOST_METHOD_LIMIT {
-                validate_source_identity(channel.id(), submission, first.argument_source())?;
-                Some(channel.frontend().subchannel_binding(subchannel).ok_or(
-                    MaxwellMethodDispatchError::UnboundSubchannel {
-                        source: MaxwellMethodSource::decoded(first, subchannel),
-                    },
-                )?)
-            } else {
-                None
-            };
-            Ok(Some((subchannel, methods, first, class)))
-        }
-        PacketView::Control { operation, source } => {
-            validate_source_identity(channel.id(), submission, source)?;
-            match operation {
-                MaxwellPushbufferControl::Nop | MaxwellPushbufferControl::EndSegment => Ok(None),
-                MaxwellPushbufferControl::SetSubdeviceMask(_)
-                | MaxwellPushbufferControl::StoreSubdeviceMask(_)
-                | MaxwellPushbufferControl::UseSubdeviceMask => {
-                    Err(MaxwellMethodDispatchError::UnsupportedControl { source, operation })
-                }
-            }
-        }
-    }
-}
 
 #[inline(always)]
 pub(crate) fn dispatch_method(
@@ -554,21 +474,6 @@ fn preflight_legacy_mem_op_b(
     })
 }
 
-fn validate_source_identity(
-    channel: MaxwellChannelId,
-    submission: FrontendSubmissionId,
-    source: MaxwellGpfifoSourceLocation,
-) -> Result<(), MaxwellMethodDispatchError> {
-    if source.channel != channel || source.frontend != submission {
-        return Err(MaxwellMethodDispatchError::SourceIdentityMismatch {
-            source,
-            channel,
-            submission,
-        });
-    }
-    Ok(())
-}
-
 fn preflight_set_object(
     profile: &MaxwellGpuProfile,
     source: MaxwellMethodSource,
@@ -636,6 +541,7 @@ mod tests {
     use nixe_gpu::{GpuVirtualAddress, MappingGeneration};
 
     use super::*;
+    use crate::MaxwellGpuChannel;
     use crate::{
         MaxwellChannelOwner, MaxwellDecodedPacket, MaxwellDecodedPushbuffer,
         MaxwellGpfifoSourceLocation, MaxwellMappingId, MaxwellPushbufferWord,
@@ -655,11 +561,23 @@ mod tests {
 
     fn dispatch_maxwell_packet(
         channel: &mut MaxwellGpuChannel,
-        submission: FrontendSubmissionId,
+        _submission: FrontendSubmissionId,
         packet: &MaxwellDecodedPacket,
     ) -> Result<MaxwellPacketDispatch, MaxwellMethodDispatchError> {
         let mut methods = Vec::new();
-        if let Some((subchannel, span, _, _)) = packet_methods(channel, submission, packet.view())?
+        if let PacketView::Control { operation, source } = packet.view()
+            && !matches!(
+                operation,
+                MaxwellPushbufferControl::Nop | MaxwellPushbufferControl::EndSegment
+            )
+        {
+            return Err(MaxwellMethodDispatchError::UnsupportedControl { operation, source });
+        }
+        if let PacketView::Methods {
+            subchannel: Some(subchannel),
+            methods: span,
+            ..
+        } = packet.view()
         {
             let profile = channel.profile();
             for method in span {
@@ -821,26 +739,6 @@ mod tests {
                     && source.method() == GpuMethodId(0x400)
         ));
         assert_eq!(channel.frontend(), before);
-    }
-
-    #[test]
-    fn retained_source_identity_cannot_be_relabelled_for_another_submission() {
-        let class = SWITCH_1_GM20B_PROFILE.classes().three_d();
-        let decoded = decode(&[word(header(1, 0, 0, 1), 0), word(class.0, 1)]);
-        let mut channel = channel();
-        assert!(matches!(
-            dispatch_maxwell_packet(
-                &mut channel,
-                FrontendSubmissionId::new(12),
-                &decoded.packets()[0]
-            ),
-            Err(MaxwellMethodDispatchError::SourceIdentityMismatch {
-                source,
-                submission,
-                ..
-            }) if source == location(0) && submission == FrontendSubmissionId::new(12)
-        ));
-        assert_eq!(channel.frontend(), MaxwellChannelFrontendState::default());
     }
 
     #[test]

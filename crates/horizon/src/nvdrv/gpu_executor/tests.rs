@@ -5,7 +5,7 @@ fn channel_acceptance_stays_ordered_until_its_submission_is_queued() {
     use super::super::{NV_SUCCESS, NvDrvInlineBuffer, NvDrvIoctlCaller, NvDrvSession};
     use std::time::{Duration, Instant};
 
-    let session = NvDrvSession::new(crate::test_memory::machine());
+    let session = NvDrvSession::new(crate::test_memory::machine(), &crate::test_memory::kernel());
     session.initialize(0);
     let nvmap = session.open(b"/dev/nvmap", 1).unwrap();
     let space = session.open(b"/dev/nvhost-as-gpu", 1).unwrap();
@@ -77,7 +77,7 @@ fn channel_acceptance_stays_ordered_until_its_submission_is_queued() {
 
 #[test]
 fn admission_bounds_real_deliveries_and_teardown_wakes_capacity_waiters() {
-    let budget = Arc::new(GpuWorkBudget::default());
+    let budget = Arc::new(GpuWorkBudget::new(&crate::test_memory::kernel()));
     let mut permits = Vec::new();
     for _ in 0..MAX_GPU_SUBMISSIONS_IN_FLIGHT {
         let Some(GpuSubmissionAdmission::Ready(permit)) = budget.reserve(0) else {
@@ -103,7 +103,7 @@ fn admission_bounds_real_deliveries_and_teardown_wakes_capacity_waiters() {
 }
 #[test]
 fn progress_notifications_are_coalesced_without_a_capture_frontier() {
-    let budget = GpuWorkBudget::default();
+    let budget = GpuWorkBudget::new(&crate::test_memory::kernel());
     assert_eq!(budget.request_progress(), Some(true));
     assert_eq!(budget.request_progress(), Some(false));
     assert!(budget.take_progress_request());
@@ -191,7 +191,7 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
         row_pitch: 4,
         inputs: vec![input],
     };
-    let executor = NvDrvGpuExecutor::new(machine);
+    let executor = NvDrvGpuExecutor::new(machine, &crate::test_memory::kernel());
     let GpuSubmissionAdmission::Ready(permit) = executor.reserve_submission(0).unwrap() else {
         panic!()
     };
@@ -210,7 +210,9 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
                 channel.configuration(),
                 address_space.memory().clone(),
                 None,
-                Arc::new(Mutex::new(NvHostControl::default())),
+                Arc::new(Mutex::new(
+                    NvHostControl::new(&crate::test_memory::kernel()),
+                )),
                 permit,
             ),
             &nixe_runtime::VirtualClock::default(),
@@ -230,7 +232,7 @@ fn presentation_cannot_overtake_a_frontend_delivery() {
 
 #[test]
 fn admission_accounts_owned_bytes_and_releases_them_before_device_completion() {
-    let budget = Arc::new(GpuWorkBudget::default());
+    let budget = Arc::new(GpuWorkBudget::new(&crate::test_memory::kernel()));
     let Some(GpuSubmissionAdmission::Ready(first)) = budget.reserve(MAX_GPU_INGRESS_BYTES - 8)
     else {
         panic!("initial capacity")

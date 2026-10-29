@@ -24,14 +24,14 @@ fn thread(s: &SchedulerState, process: ProcessId, priority: i32) -> GuestThreadI
     s.make_ready(id).unwrap();
     id
 }
-fn scheduler() -> SchedulerState {
+fn scheduler() -> std::sync::Arc<SchedulerState> {
     SchedulerState::new(
         MachineSchedulerProfile::new(
             vec![crate::VirtualCpuDescriptor::new(VirtualCpuId::new(0), 0)],
             crate::PriorityRange::new(0, 63).unwrap(),
         )
         .unwrap(),
-        crate::VirtualClock::default(),
+        crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 }),
     )
 }
 fn check_tree(state: &State, tree: &WaitTree, expected: &[GuestThreadId], seen: &mut [bool]) {
@@ -189,9 +189,12 @@ fn mixed_waits_preserve_fifo_balance_and_identity_through_growth_and_reuse() {
                         Wait::Mutex(owner, address) => s
                             .add_waiter(m.process, LockKey::User(address), owner, m.id, Some(m.id))
                             .unwrap(),
-                        Wait::Ordered(kind, address) => {
-                            s.register_ordered_wait(m.id, kind, address).unwrap()
-                        }
+                        Wait::Ordered(kind, address) => s
+                            .edit(|state| {
+                                let index = state.slots.index(m.id)?;
+                                state.insert_ordered_wait(index, kind, address)
+                            })
+                            .unwrap(),
                     }
                     m.wait = Some(wait);
                     m.order = step;
@@ -238,7 +241,7 @@ fn mixed_waits_preserve_fifo_balance_and_identity_through_growth_and_reuse() {
                 let handoff = s
                     .release_lock(process, LockKey::User(address), owner)
                     .unwrap();
-                assert_eq!(handoff.next, Some(expected));
+                assert_eq!(handoff.0.next, Some(expected));
                 for m in &mut model {
                     if m.process == process && m.wait == Some(Wait::Mutex(owner, address)) {
                         m.wait = (m.id != expected).then_some(Wait::Mutex(expected, address));
@@ -246,7 +249,7 @@ fn mixed_waits_preserve_fifo_balance_and_identity_through_growth_and_reuse() {
                 }
                 owner = expected;
                 check(&s, &model);
-                if !handoff.more_waiters {
+                if !handoff.0.more_waiters {
                     break;
                 }
             }
@@ -273,7 +276,11 @@ fn ordered_bounds_and_reprioritization_preserve_process_key_and_fifo_order() {
                 let mut threads = Vec::new();
                 for _ in 0..24 {
                     let id = thread(&s, process, 20);
-                    s.register_ordered_wait(id, kind, address).unwrap();
+                    s.edit(|state| {
+                        let index = state.slots.index(id)?;
+                        state.insert_ordered_wait(index, kind, address)
+                    })
+                    .unwrap();
                     threads.push(id);
                 }
                 rows.push((process, kind, address, threads));

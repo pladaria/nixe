@@ -102,6 +102,19 @@ fn width(address: usize, remaining: usize) -> usize {
         1
     }
 }
+
+/// Copy complete accepted words without creating references to guest storage.
+/// The output belongs to the host and may be uninitialized before this call.
+pub(crate) unsafe fn copy_words_to_host(source: *const u8, target: *mut u32, count: usize) {
+    unsafe {
+        words(source, target.cast(), count / 2);
+        if !count.is_multiple_of(2) {
+            target
+                .add(count - 1)
+                .write(load(source.add((count - 1) * 4), 4) as u32);
+        }
+    }
+}
 #[cfg(target_arch = "x86_64")]
 unsafe fn words(source: *const u8, destination: *mut u8, count: usize) {
     // The System V ABI keeps DF clear. REP MOVSQ performs eight-byte transfers

@@ -229,6 +229,7 @@ fn connect_service(
             PerformanceManagerSession::new(),
         )),
         ServiceKind::Applet => process.return_handle(HorizonIpcObject::Applet(AppletSession::new(
+            process.kernel(),
             initial_operation_mode,
         ))),
         ServiceKind::Hid => process.return_handle(HorizonIpcObject::Hid(HidSession::new(

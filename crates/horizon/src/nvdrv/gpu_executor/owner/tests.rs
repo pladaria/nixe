@@ -198,7 +198,7 @@ fn owned_memory_access_waits_until_the_current_effect_is_consumed() {
 
     let preparation_ready = Arc::new(AtomicBool::new(false));
     let _release = ReleasePreparationOnDrop(Arc::clone(&preparation_ready));
-    let budget = GpuWorkBudget::default();
+    let budget = GpuWorkBudget::new(&crate::test_memory::kernel());
     let budget = Arc::new(budget);
     let Some(GpuSubmissionAdmission::Ready(permit)) = budget.reserve(0) else {
         panic!();
@@ -233,7 +233,9 @@ fn owned_memory_access_waits_until_the_current_effect_is_consumed() {
         request: 0xc018_481b,
         frontend: FrontendSubmissionId::new(1),
         reservation: None,
-        control: Arc::new(Mutex::new(NvHostControl::default())),
+        control: Arc::new(Mutex::new(
+            NvHostControl::new(&crate::test_memory::kernel()),
+        )),
     };
     let command = nixe_gpu::native::NativeWork {
         frontend: work.frontend,
@@ -442,7 +444,9 @@ fn queued_commands(
             channel.configuration(),
             space.memory().clone(),
             None,
-            Arc::new(Mutex::new(NvHostControl::default())),
+            Arc::new(Mutex::new(
+                NvHostControl::new(&crate::test_memory::kernel()),
+            )),
             permit,
         ),
     };
@@ -468,7 +472,7 @@ fn command_entry_after_dma(overwrite: bool, sync_wait: bool) {
     };
     let validation = device.validation_monitor();
     let memory = Machine::new(0x10000).unwrap();
-    let budget = Arc::new(GpuWorkBudget::default());
+    let budget = Arc::new(GpuWorkBudget::new(&crate::test_memory::kernel()));
     let mut output = None;
     let (_space, queued) = queued_commands(&budget, &memory, 1, 1, sync_wait, |base, input| {
         let word = (4u32 << 29) | (0x50 / 4); // Valid SET_REFERENCE replaces an invalid header.
@@ -708,7 +712,7 @@ fn ready_channel_resumes_while_another_remains_blocked_and_preserves_fifo() {
     let memory = Machine::new(0x10000).unwrap();
     let outer_ready = Arc::new(AtomicBool::new(false));
     let inner_ready = Arc::new(AtomicBool::new(false));
-    let budget = Arc::new(GpuWorkBudget::default());
+    let budget = Arc::new(GpuWorkBudget::new(&crate::test_memory::kernel()));
     let (sender, receiver) = mpsc::channel();
     let (inner_started, waiting_inner) = mpsc::channel();
     let (recorded, records) = mpsc::channel();
@@ -759,7 +763,7 @@ fn ready_channel_resumes_while_another_remains_blocked_and_preserves_fifo() {
 #[test]
 fn stopping_with_suspended_channels_releases_admission_without_emitting_effects() {
     let memory = Machine::new(0x10000).unwrap();
-    let budget = Arc::new(GpuWorkBudget::default());
+    let budget = Arc::new(GpuWorkBudget::new(&crate::test_memory::kernel()));
     let (sender, receiver) = mpsc::channel();
     let (started, waiting) = mpsc::channel();
     let (recorded, records) = mpsc::channel();
@@ -809,7 +813,7 @@ fn idle_owner_publishes_explicit_fences_without_new_commands() {
     let memory = Machine::new(0x10000).unwrap();
     let allocation = memory.account(4096).unwrap().allocate(4096).unwrap();
     let target = AllocationRange::new(allocation.pin(), 0, 4096).unwrap();
-    let budget = Arc::new(GpuWorkBudget::default());
+    let budget = Arc::new(GpuWorkBudget::new(&crate::test_memory::kernel()));
     let (sender, receiver) = mpsc::channel();
     let (completed, observed) = mpsc::channel();
     let wake = sender.clone();
@@ -861,7 +865,9 @@ fn idle_owner_publishes_explicit_fences_without_new_commands() {
             request: 0xc018_481b,
             frontend: work.frontend,
             reservation: None,
-            control: Arc::new(Mutex::new(NvHostControl::default())),
+            control: Arc::new(Mutex::new(
+                NvHostControl::new(&crate::test_memory::kernel()),
+            )),
         },
     });
     let stopping = Arc::clone(&budget);

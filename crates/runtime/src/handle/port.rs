@@ -7,13 +7,12 @@ pub enum PortEndpoint {
     Client,
 }
 
-// Port connection queues and endpoint-close state follow:
-// https://github.com/Atmosphere-NX/Atmosphere/blob/e468f59c9d369b8ebbffa040f4c9fc201b9f75a8/libraries/libmesosphere/source/kern_k_port.cpp
+// Queue ownership, readiness and cleanup follow KServerPort:
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_server_port.cpp
 
 #[derive(Debug)]
 pub(super) struct PortState {
     server_open: bool,
-    client_open: bool,
     max_sessions: usize,
     pub(super) active_sessions: usize,
     is_light: bool,
@@ -23,7 +22,6 @@ pub(super) struct PortState {
 #[derive(Debug)]
 struct PortIdentity {
     state: Arc<Mutex<PortState>>,
-    wake_generation: AtomicU64,
     wake_event: EventObject,
 }
 
@@ -35,19 +33,20 @@ struct PortEndpointLease {
 
 impl Drop for PortEndpointLease {
     fn drop(&mut self) {
-        let mut state = self
-            .identity
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match self.endpoint {
-            PortEndpoint::Server => state.server_open = false,
-            PortEndpoint::Client => state.client_open = false,
+        if self.endpoint != PortEndpoint::Server {
+            return;
         }
-        self.identity
-            .wake_generation
-            .fetch_add(1, Ordering::Release);
-        self.identity.wake_event.signal();
+        let pending = {
+            let mut state = self
+                .identity
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.server_open = false;
+            std::mem::take(&mut state.pending)
+        };
+        // Session finalizers and peer wakeups must run outside the port lock.
+        drop(pending);
     }
 }
 
@@ -61,18 +60,20 @@ pub struct PortObject {
 
 impl PortObject {
     #[must_use]
-    pub fn create_pair(max_sessions: usize, is_light: bool) -> (Self, Self) {
+    pub fn create_pair(
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
+        max_sessions: usize,
+        is_light: bool,
+    ) -> (Self, Self) {
         let identity = Arc::new(PortIdentity {
             state: Arc::new(Mutex::new(PortState {
                 server_open: true,
-                client_open: true,
                 max_sessions,
                 active_sessions: 0,
                 is_light,
                 pending: VecDeque::new(),
             })),
-            wake_generation: AtomicU64::new(0),
-            wake_event: EventObject::new(),
+            wake_event: EventObject::new(kernel),
         });
         let server_lease = Arc::new(PortEndpointLease {
             identity: Arc::clone(&identity),
@@ -111,13 +112,8 @@ impl PortObject {
     }
 
     #[must_use]
-    pub fn wake_generation(&self) -> u64 {
-        self.identity.wake_generation.load(Ordering::Acquire)
-    }
-
-    #[must_use]
     pub fn readable_event(&self) -> ReadableEventObject {
-        ReadableEventObject(self.identity.wake_event.clone())
+        self.identity.wake_event.readable()
     }
 
     #[must_use]
@@ -127,7 +123,7 @@ impl PortObject {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.endpoint == PortEndpoint::Server && (!state.pending.is_empty() || !state.client_open)
+        self.endpoint == PortEndpoint::Server && !state.pending.is_empty()
     }
 
     pub fn connect(&self) -> Result<SessionObject, PortError> {
@@ -146,16 +142,18 @@ impl PortObject {
             return Err(PortError::SessionLimit);
         }
         let (server, client) = SessionObject::create_pair_with_kind(
+            self.identity.wake_event.kernel(),
             state.is_light,
             Some(Arc::downgrade(&self.identity.state)),
         );
         state.active_sessions += 1;
+        let notify = state.pending.is_empty();
         state.pending.push_back(server);
+        let notifications = notify.then(|| self.identity.wake_event.publish_readiness(true));
         drop(state);
-        self.identity
-            .wake_generation
-            .fetch_add(1, Ordering::Release);
-        self.identity.wake_event.signal();
+        if let Some(notifications) = notifications {
+            notifications.notify();
+        }
         Ok(client)
     }
 
@@ -168,18 +166,16 @@ impl PortObject {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let session = state.pending.pop_front().ok_or_else(|| {
-            if state.client_open {
-                PortError::NoPendingSession
-            } else {
-                PortError::PeerClosed
-            }
-        })?;
+        let session = state
+            .pending
+            .pop_front()
+            .ok_or(PortError::NoPendingSession)?;
+        let notifications = self
+            .identity
+            .wake_event
+            .publish_readiness(!state.pending.is_empty());
         drop(state);
-        self.identity
-            .wake_generation
-            .fetch_add(1, Ordering::Release);
-        self.identity.wake_event.signal();
+        notifications.notify();
         Ok(session)
     }
 }
@@ -191,4 +187,75 @@ pub enum PortError {
     PeerClosed,
     SessionLimit,
     NoPendingSession,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn server_close_disconnects_unaccepted_sessions_and_preserves_accepted_sessions() {
+        for light in [false, true] {
+            let (server, client) =
+                PortObject::create_pair(&crate::process::tests::test_kernel(), 2, light);
+            let accepted_client = client.connect().unwrap();
+            let accepted_server = server.accept().unwrap();
+            let pending_client = client.connect().unwrap();
+            let owner = SessionRequestOwner {
+                process_id: 1,
+                thread_id: 1,
+            };
+            let message = || {
+                if light {
+                    SessionMessage::Light([7; 7])
+                } else {
+                    SessionMessage::Buffer(vec![7])
+                }
+            };
+            pending_client.request(owner, message()).unwrap();
+
+            let unlocked = Arc::new(AtomicBool::new(false));
+            let observed = unlocked.clone();
+            let state = client.identity.state.clone();
+            let _watch = crate::process::tests::watch_future(
+                pending_client.response(owner),
+                Arc::new(move || {
+                    observed.store(state.try_lock().is_ok(), Ordering::Release);
+                }),
+            );
+
+            drop(server);
+
+            assert_eq!(
+                crate::process::tests::poll_session(&pending_client, owner),
+                Err(SessionError::PeerClosed)
+            );
+            assert!(unlocked.load(Ordering::Acquire));
+            assert!(matches!(client.connect(), Err(PortError::PeerClosed)));
+            assert_eq!(accepted_client.request(owner, message()), Ok(()));
+            let received = if light {
+                accepted_server.receive_light(SessionRequestOwner {
+                    process_id: 1,
+                    thread_id: 2,
+                })
+            } else {
+                accepted_server.receive().map(|mut receive| {
+                    let message = receive.take_message();
+                    receive.complete();
+                    message
+                })
+            };
+            assert_eq!(received, Ok(message()));
+        }
+    }
+
+    #[test]
+    fn client_port_close_does_not_signal_a_server_without_pending_sessions() {
+        let (server, client) =
+            PortObject::create_pair(&crate::process::tests::test_kernel(), 1, false);
+        drop(client);
+        assert!(!server.is_signalled());
+        assert!(matches!(server.accept(), Err(PortError::NoPendingSession)));
+    }
 }

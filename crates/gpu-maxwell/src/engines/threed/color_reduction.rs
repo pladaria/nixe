@@ -13,8 +13,6 @@
 //! <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1547-L1549>
 //! <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1551-L1553>
 
-use crate::MaxwellMethodSource;
-
 use super::MaxwellThreeDRegister;
 
 /// One unsigned normalized eight-bit threshold component.
@@ -331,109 +329,56 @@ impl MaxwellThreeDColorReductionThresholdsEnable {
     }
 }
 
-/// One validated color-reduction register transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellThreeDColorReductionStateWrite {
-    Enable {
-        value: MaxwellThreeDColorReductionThresholdsEnable,
-        source: MaxwellMethodSource,
-    },
-    ThresholdsUnorm8 {
-        value: MaxwellThreeDColorReductionThresholdsUnorm8,
-        source: MaxwellMethodSource,
-    },
-    ThresholdsUnorm10 {
-        value: MaxwellThreeDColorReductionThresholdsUnorm10,
-        source: MaxwellMethodSource,
-    },
-    ThresholdsUnorm16 {
-        value: MaxwellThreeDColorReductionThresholdsUnorm16,
-        source: MaxwellMethodSource,
-    },
-    ThresholdsFp16 {
-        value: MaxwellThreeDColorReductionThresholdsFp16,
-        source: MaxwellMethodSource,
-    },
-    ThresholdsSrgb8 {
-        value: MaxwellThreeDColorReductionThresholdsSrgb8,
-        source: MaxwellMethodSource,
-    },
-}
-
 /// Persistent color-reduction configuration for one `MAXWELL_B` channel.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDColorReductionState {
-    enable: MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsEnable>,
-    thresholds_unorm8: MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsUnorm8>,
-    thresholds_unorm10: MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsUnorm10>,
-    thresholds_unorm16: MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsUnorm16>,
-    thresholds_fp16: MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsFp16>,
-    thresholds_srgb8: MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsSrgb8>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDColorReductionState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDColorReductionState {
+impl MaxwellThreeDColorReductionState<'_> {
     #[must_use]
-    pub const fn enable(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsEnable> {
-        &self.enable
+    pub fn enable(&self) -> MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsEnable> {
+        self.registers.read(0x0d9c, |raw| {
+            MaxwellThreeDColorReductionThresholdsEnable::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn thresholds_unorm8(
+    pub fn thresholds_unorm8(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsUnorm8> {
-        &self.thresholds_unorm8
+    ) -> MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsUnorm8> {
+        self.registers.read(0x10cc, |raw| {
+            MaxwellThreeDColorReductionThresholdsUnorm8::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn thresholds_unorm10(
+    pub fn thresholds_unorm10(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsUnorm10> {
-        &self.thresholds_unorm10
+    ) -> MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsUnorm10> {
+        self.registers.read(0x10e0, |raw| {
+            MaxwellThreeDColorReductionThresholdsUnorm10::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn thresholds_unorm16(
+    pub fn thresholds_unorm16(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsUnorm16> {
-        &self.thresholds_unorm16
+    ) -> MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsUnorm16> {
+        self.registers.read(0x10e4, |raw| {
+            MaxwellThreeDColorReductionThresholdsUnorm16::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn thresholds_fp16(
+    pub fn thresholds_fp16(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsFp16> {
-        &self.thresholds_fp16
+    ) -> MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsFp16> {
+        self.registers.read(0x10ec, |raw| {
+            MaxwellThreeDColorReductionThresholdsFp16::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn thresholds_srgb8(
+    pub fn thresholds_srgb8(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsSrgb8> {
-        &self.thresholds_srgb8
-    }
-
-    pub(super) fn apply(&mut self, write: MaxwellThreeDColorReductionStateWrite) {
-        match write {
-            MaxwellThreeDColorReductionStateWrite::Enable { value, source: _ } => {
-                self.enable = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm8 { value, source: _ } => {
-                self.thresholds_unorm8 = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm10 { value, source: _ } => {
-                self.thresholds_unorm10 = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDColorReductionStateWrite::ThresholdsUnorm16 { value, source: _ } => {
-                self.thresholds_unorm16 = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDColorReductionStateWrite::ThresholdsFp16 { value, source: _ } => {
-                self.thresholds_fp16 = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDColorReductionStateWrite::ThresholdsSrgb8 { value, source: _ } => {
-                self.thresholds_srgb8 = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-        }
+    ) -> MaxwellThreeDRegister<MaxwellThreeDColorReductionThresholdsSrgb8> {
+        self.registers.read(0x10f0, |raw| {
+            MaxwellThreeDColorReductionThresholdsSrgb8::parse(raw)
+        })
     }
 }

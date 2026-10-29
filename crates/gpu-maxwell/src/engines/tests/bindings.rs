@@ -9,7 +9,7 @@ pub(super) fn fixture_bindings(
 ) -> Result<MaxwellThreeDResolvedResources, MaxwellThreeDResourceError> {
     use MaxwellThreeDResourceRole as R;
     let mut roles = Vec::new();
-    roles.extend((0..state.vertex_input().streams().len()).map(|i| R::VertexStream(i as u8)));
+    roles.extend((0..MAXWELL_VERTEX_STREAM_COUNT).map(|i| R::VertexStream(i as u8)));
     let index = state.vertex_input().index();
     if [
         index.address_upper().raw(),
@@ -30,7 +30,7 @@ pub(super) fn fixture_bindings(
             }),
         );
     }
-    roles.extend((0..state.render_targets().color().len()).map(|i| R::ColorTarget(i as u8)));
+    roles.extend((0..MAXWELL_COLOR_TARGET_COUNT).map(|i| R::ColorTarget(i as u8)));
     let depth = state.render_targets().depth_stencil();
     if state.render_targets().depth_target_count().value()
         != Some(&MaxwellThreeDDepthTargetCount::None)

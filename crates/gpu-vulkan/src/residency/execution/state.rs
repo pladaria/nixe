@@ -60,6 +60,7 @@ pub struct PreparedGraphics {
     pub(super) program: Arc<PreparedProgram>,
     pub(super) parameters: Arc<GraphicsParameters>,
 }
+#[derive(Clone)]
 pub(crate) struct PreparedGraphicsState {
     pipeline: Arc<NativePipeline>,
     parameters: Arc<GraphicsParameters>,

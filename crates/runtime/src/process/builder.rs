@@ -3,7 +3,7 @@ use super::*;
 /// Builds an emulated process from a prepared launch plan.
 pub struct ProcessBuilder {
     config: ProcessBuildConfig,
-    virtual_clock: crate::VirtualClock,
+    kernel: Arc<nixe_scheduler::SchedulerState>,
     sd_card_root: Option<PathBuf>,
     machine: nixe_memory::Machine,
     system: nixe_memory::MemoryAccount,
@@ -14,7 +14,7 @@ impl std::fmt::Debug for ProcessBuilder {
         formatter
             .debug_struct("ProcessBuilder")
             .field("config", &self.config)
-            .field("virtual_clock", &self.virtual_clock)
+            .field("kernel", &self.kernel)
             .field("sd_card_root", &self.sd_card_root)
             .field("machine", &self.machine.identity())
             .finish()
@@ -25,10 +25,14 @@ impl ProcessBuilder {
     /// Creates a process builder using Switch 1 defaults.
     ///
     #[must_use]
-    pub fn new(machine: nixe_memory::Machine, system: nixe_memory::MemoryAccount) -> Self {
+    pub fn new(
+        machine: nixe_memory::Machine,
+        system: nixe_memory::MemoryAccount,
+        kernel: Arc<nixe_scheduler::SchedulerState>,
+    ) -> Self {
         Self {
             config: ProcessBuildConfig::default(),
-            virtual_clock: crate::VirtualClock::default(),
+            kernel,
             sd_card_root: None,
             machine,
             system,
@@ -38,13 +42,6 @@ impl ProcessBuilder {
     #[must_use]
     pub const fn with_config(mut self, config: ProcessBuildConfig) -> Self {
         self.config = config;
-        self
-    }
-
-    /// Selects the clock source shared by CPU architectural timers and services.
-    #[must_use]
-    pub fn with_virtual_clock(mut self, virtual_clock: crate::VirtualClock) -> Self {
-        self.virtual_clock = virtual_clock;
         self
     }
 
@@ -101,12 +98,7 @@ impl ProcessBuilder {
             .map_or_else(crate::HandleTable::new, |size| {
                 crate::HandleTable::with_capacity_limit(usize::from(size))
             });
-        let main_thread_object = Arc::new(crate::ThreadObject::new(1));
-        let main_thread_handle = handles
-            .insert_object(crate::HandleObject::from_arc(main_thread_object.clone()))
-            .map_err(|error| {
-                ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
-            })?;
+        let handles = Arc::new(handles);
 
         let user_limit = self
             .config
@@ -130,6 +122,7 @@ impl ProcessBuilder {
             metadata.system_resource_size,
         )
         .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
+        let memory = Arc::new(memory);
         let cpu =
             ProcessCpuContext::for_platform(self.config.target_platform, memory.space().identity());
         for module in &modules {
@@ -181,7 +174,7 @@ impl ProcessBuilder {
         // Both regions share the same kernel-owned page and allocation index.
         // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/kernel/k_process.cpp
         let process_local_region = local_page;
-        let mut thread_local = thread_local::ThreadLocalPages::new(
+        let thread_local = Arc::new(Mutex::new(thread_local::ThreadLocalPages::new(
             local_page,
             memory_layout.stack().base(),
             memory_layout
@@ -189,26 +182,15 @@ impl ProcessBuilder {
                 .base()
                 .checked_add(memory_layout.stack().size())
                 .expect("validated stack region has a finite end"),
-        );
-        let tls_base = thread_local
-            .allocate(&memory)
+        )));
+        let allocation = thread::ThreadLocalRegion::allocate(thread_local.clone(), memory.clone())
             .map_err(|error| ProcessBuildError::new(ProcessBuildStage::Mapping, error))?;
+        let tls_base = allocation.address;
         let (abi_context, loader_return) = if matches!(abi, InitialProcessAbi::Homebrew) {
             let address = local_page
                 .checked_add(PAGE_SIZE + RESOURCE_GUARD_SIZE)
                 .ok_or_else(|| error(ProcessBuildStage::Placement, "ABI context overflows"))?;
             validate_range(address_space, address.get(), nixe_memory::PAGE_SIZE)?;
-            install_homebrew_context(
-                &memory,
-                address,
-                main_thread_handle,
-                plan.homebrew_identity().ok_or_else(|| {
-                    error(
-                        ProcessBuildStage::Metadata,
-                        "homebrew launch has no retained executable identity",
-                    )
-                })?,
-            )?;
             let loader_return = address
                 .checked_add(nixe_memory::PAGE_SIZE + RESOURCE_GUARD_SIZE)
                 .ok_or_else(|| error(ProcessBuildStage::Placement, "loader return overflows"))?;
@@ -220,34 +202,66 @@ impl ProcessBuilder {
         };
 
         let entry = GuestVirtualAddress::new(modules[entry_module].entry_address());
-        let mut state = GuestCpuState::default();
+        let state = GuestCpuState::default();
+        let main_thread_id = nixe_scheduler::GuestThreadId::new(1);
+        let main_thread = Arc::new(crate::ThreadObject::new(
+            &self.kernel,
+            main_thread_id,
+            state,
+            stack_bottom,
+            stack_top,
+            loader_return,
+            allocation,
+        ));
+        let handle = handles
+            .insert_object(crate::HandleObject::from_arc(main_thread.clone()))
+            .map_err(|error| {
+                ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
+            })?;
+        // KProcess/CreateThread publish the self handle in the kernel TLS region.
+        // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/kernel/k_process.cpp
+        memory
+            .space()
+            .write(
+                tls_base
+                    .checked_add(0x110)
+                    .expect("TLS handle lies within its region"),
+                &handle.to_le_bytes(),
+            )
+            .and_then(|access| {
+                access.into_ready().map_err(|_| {
+                    nixe_memory::MemoryError::Execution(
+                        "kernel TLS handle write unexpectedly suspended".into(),
+                    )
+                })
+            })
+            .map_err(|error| {
+                ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
+            })?;
+        if let Some(address) = abi_context {
+            install_homebrew_context(
+                &memory,
+                address,
+                handle,
+                plan.homebrew_identity().ok_or_else(|| {
+                    error(
+                        ProcessBuildStage::Metadata,
+                        "homebrew launch has no executable identity",
+                    )
+                })?,
+            )?;
+        }
         initialize_thread(
-            &mut state,
+            &mut main_thread.registers(),
             entry,
             stack_top,
             tls_base,
-            main_thread_handle,
+            handle,
             abi_context,
             loader_return,
-        )?;
-        let main_thread = crate::GuestThread {
-            // The coordinator replaces this process-local provisional identity
-            // with a runtime-global identity before scheduler publication.
-            id: nixe_scheduler::GuestThreadId::new(1),
-            object: Arc::downgrade(&main_thread_object),
-            running_reference: Some(main_thread_object),
-            exit: None,
-            state: Some(state),
-            handle: main_thread_handle,
-            stack_bottom,
-            stack_top,
-            tls_base,
-            abi_context,
-            loader_return,
-        };
-        let main_thread_id = main_thread.id();
-        let mut threads = crate::ThreadTable::new();
-        threads.insert(main_thread).map_err(|error| {
+        );
+        let threads = crate::ThreadTable::new();
+        threads.insert(&main_thread, true).map_err(|error| {
             ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
         })?;
         let cpu_process_id = execution::allocate_cpu_process_id().ok_or_else(|| {
@@ -256,10 +270,9 @@ impl ProcessBuilder {
                 "CPU process identity exhausted",
             )
         })?;
-        let memory = std::sync::Arc::new(memory);
         let execution = execution::ProcessExecutionControl::new(
             execution::ProcessExecutionConfiguration {
-                virtual_clock: self.virtual_clock.clone(),
+                virtual_clock: self.kernel.clock().clone(),
                 timer_frequency: self.config.architectural_timer_frequency,
                 cpu,
             },
@@ -268,11 +281,16 @@ impl ProcessBuilder {
         )
         .map_err(|error| ProcessBuildError::new(ProcessBuildStage::CpuInitialization, error))?;
         let process = RunnableProcess {
-            scheduler: std::sync::OnceLock::new(),
+            scheduler: self.kernel.clone(),
+            generation: std::sync::atomic::AtomicU64::new(1),
+            events: std::sync::OnceLock::new(),
             process_id: self.config.process_id,
-            lifecycle: nixe_scheduler::ProcessLifecycle::Running,
-            process_exit: None,
-            num_running_threads: 1,
+            state: Mutex::new(ProcessState {
+                lifecycle: nixe_scheduler::ProcessLifecycle::Running,
+                exit: None,
+                num_running_threads: 1,
+                termination: None,
+            }),
             cpu,
             address_space,
             memory_layout,
@@ -291,9 +309,9 @@ impl ProcessBuilder {
                 plan,
                 self.sd_card_root.clone(),
             )),
-            handles: std::sync::Arc::new(handles),
+            handles,
             address_waits: std::sync::Arc::default(),
-            execution,
+            execution: Mutex::new(execution),
         };
         Ok(process)
     }
@@ -560,7 +578,7 @@ pub(super) fn initialize_thread(
     main_thread_handle: u32,
     abi_context: Option<GuestVirtualAddress>,
     loader_return: Option<GuestVirtualAddress>,
-) -> Result<(), ProcessBuildError> {
+) {
     state.set_pc(entry.get());
     state.write_x(A64Register::StackPointer, stack_top.get());
     state.set_tpidr_el0(tls_base.get());
@@ -581,20 +599,22 @@ pub(super) fn initialize_thread(
         A64Register::General(a64_register(30)),
         loader_return.map_or(0, GuestVirtualAddress::get),
     );
-    Ok(())
 }
 
 pub(super) fn initialize_created_thread(
     state: &mut GuestCpuState,
     request: &ThreadCreateRequest,
     tls_base: GuestVirtualAddress,
-) -> Result<(), ProcessBuildError> {
+) {
+    // CreateThread inherits the caller's live FPU status before publication.
+    // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/kernel/svc/svc_thread.cpp
+    state.set_fpcr(request.fpcr);
+    state.set_fpsr(request.fpsr);
     state.set_pc(request.entry.get());
     state.write_x(A64Register::StackPointer, request.stack_top.get());
     state.set_tpidr_el0(tls_base.get());
     state.set_tpidrro_el0_from_runtime(tls_base.get());
     state.write_x(A64Register::General(a64_register(0)), request.argument);
-    Ok(())
 }
 
 pub(super) fn validate_range(

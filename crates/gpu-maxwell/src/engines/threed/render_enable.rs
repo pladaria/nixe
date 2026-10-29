@@ -1,7 +1,5 @@
 //! Typed `MAXWELL_B` render-enable state.
 
-use crate::MaxwellMethodSource;
-
 use super::{MaxwellThreeDRegister, MaxwellThreeDUnresolvedAddress};
 
 /// Whether render-enable evaluation may conditionally load a constant buffer.
@@ -94,102 +92,55 @@ impl MaxwellThreeDRenderEnableOverride {
     }
 }
 
-/// One validated 3D render-enable transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellThreeDRenderEnableStateWrite {
-    AddressUpper {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    AddressLower {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    Override {
-        value: MaxwellThreeDRenderEnableOverride,
-        source: MaxwellMethodSource,
-    },
-    Mode {
-        value: MaxwellThreeDRenderEnableMode,
-        source: MaxwellMethodSource,
-    },
-    ConditionalLoadConstantBuffer {
-        value: MaxwellThreeDConditionalLoadConstantBuffer,
-        source: MaxwellMethodSource,
-    },
-}
-
 /// Persistent render-enable configuration on one `MAXWELL_B` channel.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDRenderEnableState {
-    address_upper: MaxwellThreeDRegister<u8>,
-    address_lower: MaxwellThreeDRegister<u32>,
-    override_mode: MaxwellThreeDRegister<MaxwellThreeDRenderEnableOverride>,
-    mode: MaxwellThreeDRegister<MaxwellThreeDRenderEnableMode>,
-    conditional_load_constant_buffer:
-        MaxwellThreeDRegister<MaxwellThreeDConditionalLoadConstantBuffer>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDRenderEnableState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDRenderEnableState {
-    /// NVIDIA's SET_RENDER_ENABLE_A/B form one 40-bit condition address.
-    /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
+impl MaxwellThreeDRenderEnableState<'_> {
+    #[must_use]
+    pub fn address_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers
+            .read(0x1550, |raw| (raw & !(0xff) == 0).then_some(raw as u8))
+    }
+    #[must_use]
+    pub fn address_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x1554, Some)
+    }
+    #[must_use]
+    pub fn override_mode(&self) -> MaxwellThreeDRegister<MaxwellThreeDRenderEnableOverride> {
+        self.registers
+            .read(0x1944, MaxwellThreeDRenderEnableOverride::parse)
+    }
+    #[must_use]
+    pub fn mode(&self) -> MaxwellThreeDRegister<MaxwellThreeDRenderEnableMode> {
+        self.registers
+            .read(0x1558, MaxwellThreeDRenderEnableMode::parse)
+    }
+    #[must_use]
+    pub fn conditional_load_constant_buffer(
+        &self,
+    ) -> MaxwellThreeDRegister<MaxwellThreeDConditionalLoadConstantBuffer> {
+        self.registers.read(0x030c, |raw| {
+            MaxwellThreeDConditionalLoadConstantBuffer::parse(raw)
+        })
+    }
     #[must_use]
     pub fn address(&self) -> Option<MaxwellThreeDUnresolvedAddress> {
         Some(MaxwellThreeDUnresolvedAddress::new(
-            *self.address_upper.value()?,
-            *self.address_lower.value()?,
+            *self.address_upper().value()?,
+            *self.address_lower().value()?,
         ))
     }
-    #[must_use]
-    pub const fn override_mode(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRenderEnableOverride> {
-        &self.override_mode
-    }
-
-    #[must_use]
-    pub const fn mode(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRenderEnableMode> {
-        &self.mode
-    }
-
-    #[must_use]
-    pub const fn conditional_load_constant_buffer(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDConditionalLoadConstantBuffer> {
-        &self.conditional_load_constant_buffer
-    }
-
     pub(in crate::engines) fn execution_mode(&self) -> Option<MaxwellThreeDRenderEnableMode> {
-        match self.override_mode.value() {
+        match self.override_mode().value() {
             Some(MaxwellThreeDRenderEnableOverride::AlwaysRender) => {
                 Some(MaxwellThreeDRenderEnableMode::Enabled)
             }
             Some(MaxwellThreeDRenderEnableOverride::NeverRender) => {
                 Some(MaxwellThreeDRenderEnableMode::Disabled)
             }
-            _ => self.mode.value().copied(),
-        }
-    }
-
-    pub(super) fn apply(&mut self, write: MaxwellThreeDRenderEnableStateWrite) {
-        match write {
-            MaxwellThreeDRenderEnableStateWrite::AddressUpper { value, source: _ } => {
-                self.address_upper = MaxwellThreeDRegister::decoded(u32::from(value), value);
-            }
-            MaxwellThreeDRenderEnableStateWrite::AddressLower { value, source: _ } => {
-                self.address_lower = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDRenderEnableStateWrite::Override { value, source: _ } => {
-                self.override_mode = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDRenderEnableStateWrite::Mode { value, source: _ } => {
-                self.mode = MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDRenderEnableStateWrite::ConditionalLoadConstantBuffer {
-                value,
-                source: _,
-            } => {
-                self.conditional_load_constant_buffer =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
+            _ => self.mode().value().copied(),
         }
     }
 }

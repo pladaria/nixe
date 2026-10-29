@@ -17,7 +17,6 @@ use std::{
 #[derive(Clone, Debug)]
 struct DrawAttachmentSelection {
     colors: Vec<(u8, MaxwellThreeDResourceRole)>,
-    color_outputs: [nixe_gpu::ColorOutputState; 8],
     depth_stencil: Option<MaxwellThreeDResourceRole>,
 }
 
@@ -122,15 +121,16 @@ impl MaxwellThreeDOperationTrigger {
 /// old streams configured while disabling all their attributes (for example,
 /// when a subsequent shader generates geometry from the vertex ID).
 fn consumed_vertex_streams(state: &MaxwellThreeDState) -> impl Iterator<Item = u8> {
-    let mut mask = state.vertex_input().attributes().iter().enumerate().fold(
-        0_u32,
-        |mask, (index, attribute)| match attribute.value().filter(|attribute| {
-            attribute.enabled() && state.vertex_input().attribute_skip_mask(index as u8) != 15
-        }) {
-            Some(attribute) => mask | (1 << attribute.stream()),
-            None => mask,
-        },
-    );
+    let mut mask = (0..32)
+        .map(|i| (i, state.vertex_input().attributes(i)))
+        .fold(0_u32, |mask, (index, attribute)| {
+            match attribute.value().filter(|attribute| {
+                attribute.enabled() && state.vertex_input().attribute_skip_mask(index as u8) != 15
+            }) {
+                Some(attribute) => mask | (1 << attribute.stream()),
+                None => mask,
+            }
+        });
     std::iter::from_fn(move || {
         if mask == 0 {
             return None;
@@ -339,6 +339,7 @@ fn select_draw_attachments(
         .render_targets()
         .color_target_selection()
         .value()
+        .copied()
         .ok_or(MaxwellLoweringError::IncompleteDraw("SET_CT_SELECT"))?;
     for (slot, target) in selection.active_targets().iter().copied().enumerate() {
         if selection.active_targets()[..slot].contains(&target) {
@@ -347,7 +348,7 @@ fn select_draw_attachments(
     }
     let mut colors = Vec::with_capacity(selection.target_count() as usize);
     for (slot, target) in selection.active_targets().iter().copied().enumerate() {
-        let configured = &state.render_targets().color()[target as usize];
+        let configured = &state.render_targets().color(target as usize);
         match configured.readiness(true) {
             super::threed::MaxwellThreeDAttachmentReadiness::Unprogrammed => {
                 return Err(MaxwellLoweringError::ColorTargetRouteUnprogrammed {
@@ -387,7 +388,6 @@ fn select_draw_attachments(
     }
     Ok(DrawAttachmentSelection {
         colors,
-        color_outputs: [nixe_gpu::ColorOutputState::REPLACE; 8],
         depth_stencil,
     })
 }
@@ -442,7 +442,7 @@ fn draw_depth_stencil_enable_state(state: &MaxwellThreeDState) -> (Option<bool>,
 }
 
 fn draw_depth_state(state: &MaxwellThreeDState) -> Result<DepthState, MaxwellLoweringError> {
-    let register = |register| state.fixed_function().register(register).value();
+    let register = |register| state.fixed_function().register(register).value().copied();
     let Some(MaxwellThreeDFixedFunctionValue::Boolean(test_enabled)) =
         register(MaxwellThreeDFixedFunctionRegister::DepthTestEnable)
     else {
@@ -463,8 +463,8 @@ fn draw_depth_state(state: &MaxwellThreeDState) -> Result<DepthState, MaxwellLow
     };
     Ok(DepthState::new(
         true,
-        *write_enabled,
-        neutral_depth_compare(*compare),
+        write_enabled,
+        neutral_depth_compare(compare),
     ))
 }
 
@@ -476,9 +476,9 @@ fn draw_stencil_test_state(
     if draw_depth_stencil_enable_state(state).1 != Some(true) {
         return Ok(None);
     }
-    let value = |r| state.fixed_function().register(r).value();
+    let value = |r| state.fixed_function().register(r).value().copied();
     let two_sided = match value(R::TwoSidedStencilTestEnable) {
-        Some(V::Boolean(enabled)) => *enabled,
+        Some(V::Boolean(enabled)) => enabled,
         _ => {
             return Err(MaxwellLoweringError::IncompleteDraw(
                 "two-sided stencil enable",
@@ -496,13 +496,13 @@ fn draw_stencil_test_state(
             return Err(MaxwellLoweringError::IncompleteDraw("stencil reference"));
         };
         let operation = |r| match value(r) {
-            Some(V::StencilOp(op)) => Ok(neutral_stencil_operation(*op)),
+            Some(V::StencilOp(op)) => Ok(neutral_stencil_operation(op)),
             _ => Err(MaxwellLoweringError::IncompleteDraw("stencil operation")),
         };
         let [fail, depth_fail, pass] = ops.map(operation);
         let [fail, depth_fail, pass] = [fail?, depth_fail?, pass?];
         let write_mask = match value(write_mask) {
-            Some(V::Mask(mask)) => *mask as u8,
+            Some(V::Mask(mask)) => mask as u8,
             _ if [fail, depth_fail, pass]
                 .iter()
                 .all(|op| *op == nixe_gpu::StencilOperation::Keep) =>
@@ -512,10 +512,10 @@ fn draw_stencil_test_state(
             _ => return Err(MaxwellLoweringError::IncompleteDraw("stencil write mask")),
         };
         Ok(nixe_gpu::StencilFaceState {
-            compare: neutral_depth_compare(*compare),
-            read_mask: *mask as u8,
+            compare: neutral_depth_compare(compare),
+            read_mask: mask as u8,
             write_mask,
-            reference: *reference as u8,
+            reference: reference as u8,
             fail,
             depth_fail,
             pass,
@@ -600,7 +600,7 @@ fn draw_scissor_region(
     height: u32,
 ) -> Result<nixe_gpu::ScissorRect, MaxwellLoweringError> {
     let mut region = draw_surface_region(state, width, height)?;
-    let scissor = &state.fixed_function().scissor()[0];
+    let scissor = &state.fixed_function().scissor(0);
     if scissor.enable().value() == Some(&true) {
         let mut scissor_y =
             scissor
@@ -641,8 +641,16 @@ fn draw_surface_region(
     // shader-visible coordinates even when their intersection is empty.
     // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1386-L1392
     let mut region = MaxwellThreeDRasterRegion::attachment(width, height);
-    let horizontal = state.fixed_function().surface_clip_horizontal().value();
-    let vertical = state.fixed_function().surface_clip_vertical().value();
+    let horizontal = state
+        .fixed_function()
+        .surface_clip_horizontal()
+        .value()
+        .copied();
+    let vertical = state
+        .fixed_function()
+        .surface_clip_vertical()
+        .value()
+        .copied();
     match (horizontal, vertical) {
         (Some(horizontal), Some(vertical)) => {
             region.min_x = u32::from(horizontal.origin()).min(width);
@@ -705,7 +713,7 @@ fn draw_viewport_transform_with_depth_usage(
     };
     // The current draw contract selects viewport zero. Shader-selected or
     // replicated viewports require a distinct draw contract.
-    let viewport = &state.fixed_function().viewport()[0];
+    let viewport = &state.fixed_function().viewport(0);
     if let Some(&precision) = viewport.snap_grid_precision().value()
         && precision != [0, 0]
     {
@@ -738,15 +746,11 @@ fn draw_viewport_transform_with_depth_usage(
         }
         return Ok(None);
     }
-    let scale = viewport
-        .scale()
-        .each_ref()
-        .map(|register| register.value().copied())
+    let scale = [0, 1, 2]
+        .map(|axis| viewport.scale(axis).value().copied())
         .map(|value| value.map(|value| f32::from_bits(value.get())));
-    let offset = viewport
-        .offset()
-        .each_ref()
-        .map(|register| register.value().copied())
+    let offset = [0, 1, 2]
+        .map(|axis| viewport.offset(axis).value().copied())
         .map(|value| value.map(|value| f32::from_bits(value.get())));
     let [Some(scale_x), Some(scale_y), Some(scale_z)] = scale else {
         return Err(MaxwellLoweringError::IncompleteDraw(
@@ -946,7 +950,7 @@ impl MaxwellThreeDClearRegions {
         let scissor = control
             .is_some_and(|control| control.use_scissor_zero())
             .then(|| {
-                let scissor = &state.fixed_function().scissor()[0];
+                let scissor = &state.fixed_function().scissor(0);
                 Ok((
                     scissor.horizontal().value().copied().ok_or(
                         MaxwellLoweringError::IncompleteClear("SET_SCISSOR_HORIZONTAL(0)"),
@@ -960,7 +964,7 @@ impl MaxwellThreeDClearRegions {
         let viewport_clip = control
             .is_some_and(|control| control.use_viewport_clip_zero())
             .then(|| {
-                let viewport = &state.fixed_function().viewport()[0];
+                let viewport = &state.fixed_function().viewport(0);
                 Ok((
                     viewport.clip_horizontal().value().copied().ok_or(
                         MaxwellLoweringError::IncompleteClear("SET_VIEWPORT_CLIP_HORIZONTAL(0)"),
@@ -2142,15 +2146,17 @@ mod tests {
             ScissorRect {
                 x: 0,
                 y: 0,
-                width: 64,
-                height: 32
+                width: 0,
+                height: 0
             }
         );
         program_three_d(&mut channel, 0x0ff4, (40 << 16) | 5);
-        assert!(matches!(
-            super::draw_scissor_region(channel.three_d(), 64, 32),
-            Err(MaxwellLoweringError::IncompleteDraw(_))
-        ));
+        assert_eq!(
+            super::draw_scissor_region(channel.three_d(), 64, 32)
+                .unwrap()
+                .height,
+            0
+        );
         program_three_d(&mut channel, 0x0ff8, (20 << 16) | 7);
         assert_eq!(
             super::draw_scissor_region(channel.three_d(), 64, 32).unwrap(),
@@ -2228,7 +2234,11 @@ mod tests {
         program_three_d(&mut channel, 0x0a1c, 0);
         program_three_d(&mut channel, 0x0bfc, 0x1f1f);
         assert!(super::draw_viewport_transform(channel.three_d()).is_ok());
-        let register = channel.three_d().fixed_function().viewport()[15].snap_grid_precision();
+        let register = channel
+            .three_d()
+            .fixed_function()
+            .viewport(15)
+            .snap_grid_precision();
         assert_eq!(register.value(), Some(&[31, 31]));
 
         program_three_d(&mut channel, 0x0a1c, 0x0302);

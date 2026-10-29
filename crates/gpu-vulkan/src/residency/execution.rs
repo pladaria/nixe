@@ -10,6 +10,7 @@ pub use graphics::{
     AttachmentSource, Draw, IndexBuffer, PreparedDraw, PreparedTargets, RenderAttachment,
     RenderingTargets, VertexBuffer,
 };
+pub(crate) use state::PreparedGraphicsState;
 pub use state::{GraphicsParameters, PreparedGraphics};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -316,29 +317,6 @@ impl VulkanResidency {
                             "shader descriptors require an individual depth or stencil view aspect",
                         ));
                     }
-                    for mip in description.base_mip..description.base_mip + description.mip_count {
-                        for layer in
-                            description.base_layer..description.base_layer + description.layer_count
-                        {
-                            for aspect in [
-                                vk::ImageAspectFlags::COLOR,
-                                vk::ImageAspectFlags::DEPTH,
-                                vk::ImageAspectFlags::STENCIL,
-                            ] {
-                                if description.aspects.contains(aspect)
-                                    && !image.planes.iter().any(|p| {
-                                        p.aspect == aspect
-                                            && p.mip_level == mip
-                                            && p.array_layer == layer
-                                    })
-                                {
-                                    return Err(VulkanError::InvalidResource(
-                                        "sampled/storage view consumes a subresource without an initialized native plane",
-                                    ));
-                                }
-                            }
-                        }
-                    }
                     let usage = if reflected.kind == vk::DescriptorType::STORAGE_IMAGE {
                         vk::ImageUsageFlags::STORAGE
                     } else {
@@ -366,35 +344,33 @@ impl VulkanResidency {
                             layout,
                         },
                     });
-                    // Vulkan subresources are mip/layer/aspect ranges. Z slices
-                    // belong to texel transfer/ownership, not repeated shader uses.
-                    // https://github.com/eden-emulator/mirror/blob/master/src/video_core/renderer_vulkan/vk_texture_cache.cpp
-                    for cell in &image.access {
-                        let aspects = description.aspects & cell.aspect;
-                        if !aspects.is_empty()
-                            && (description.base_mip..description.base_mip + description.mip_count)
-                                .contains(&cell.mip)
-                            && (description.base_layer
-                                ..description.base_layer + description.layer_count)
-                                .contains(&cell.layer)
-                            && !stages.is_empty()
-                        {
-                            for aspect in [
-                                vk::ImageAspectFlags::COLOR,
-                                vk::ImageAspectFlags::DEPTH,
-                                vk::ImageAspectFlags::STENCIL,
-                            ]
-                            .into_iter()
-                            .filter(|aspect| aspects.contains(*aspect))
-                            {
+                    // Views are validated once when created. Keep their native
+                    // ranges instead of expanding and rejoining every mip/layer.
+                    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_texture_cache.cpp#L519-L538
+                    if !stages.is_empty() {
+                        let volume = image.description.image_type == vk::ImageType::TYPE_3D;
+                        for aspect in [
+                            vk::ImageAspectFlags::COLOR,
+                            vk::ImageAspectFlags::DEPTH,
+                            vk::ImageAspectFlags::STENCIL,
+                        ] {
+                            if description.aspects.contains(aspect) {
                                 uses.push(Use::Image {
                                     id: view.image,
                                     range: vk::ImageSubresourceRange::default()
                                         .aspect_mask(aspect)
-                                        .base_mip_level(cell.mip)
-                                        .level_count(1)
-                                        .base_array_layer(cell.layer)
-                                        .layer_count(1),
+                                        .base_mip_level(description.base_mip)
+                                        .level_count(description.mip_count)
+                                        .base_array_layer(if volume {
+                                            0
+                                        } else {
+                                            description.base_layer
+                                        })
+                                        .layer_count(if volume {
+                                            1
+                                        } else {
+                                            description.layer_count
+                                        }),
                                     scope,
                                 });
                             }
@@ -406,68 +382,7 @@ impl VulkanResidency {
                 }
             }
         }
-        // Union simultaneous accesses, rather than generating false intra-command
-        // dependencies for aliased bindings. Buffer windows are merged only when
-        // they overlap; independent ranges retain independent hazards.
-        let mut merged = Vec::<Use>::new();
-        for mut next in uses {
-            let mut i = 0;
-            while i < merged.len() {
-                match (next, merged[i]) {
-                    (
-                        Use::Buffer {
-                            id,
-                            offset,
-                            size,
-                            mut scope,
-                        },
-                        Use::Buffer {
-                            id: old,
-                            offset: start,
-                            size: length,
-                            scope: previous,
-                        },
-                    ) if id == old && offset <= start + length && start <= offset + size => {
-                        scope.stages |= previous.stages;
-                        scope.access |= previous.access;
-                        let end = (offset + size).max(start + length);
-                        next = Use::Buffer {
-                            id,
-                            offset: offset.min(start),
-                            size: end - offset.min(start),
-                            scope,
-                        };
-                        merged.swap_remove(i);
-                        i = 0;
-                    }
-                    (
-                        Use::Image {
-                            id,
-                            range,
-                            mut scope,
-                        },
-                        Use::Image {
-                            id: old,
-                            range: previous_range,
-                            scope: previous,
-                        },
-                    ) if id == old
-                        && range.aspect_mask == previous_range.aspect_mask
-                        && range.base_mip_level == previous_range.base_mip_level
-                        && range.base_array_layer == previous_range.base_array_layer =>
-                    {
-                        scope.stages |= previous.stages;
-                        scope.access |= previous.access;
-                        next = Use::Image { id, range, scope };
-                        merged.swap_remove(i);
-                        i = 0;
-                    }
-                    _ => i += 1,
-                }
-            }
-            merged.push(next);
-        }
-        coalesce_image_uses(&mut merged);
+        let merged = merge_program_uses(uses);
         let binding_uses: Box<[_]> = bindings.iter().map(|binding| match binding {
             Binding::Buffer { buffer, offset, size } | Binding::TexelBuffer { buffer, offset, size, .. } => merged.iter().position(|usage| matches!(usage,
                 Use::Buffer { id, offset: start, size: length, .. } if id == buffer && *start <= *offset && *offset + *size <= *start + *length
@@ -1000,8 +915,172 @@ fn plane_in_range(plane: ImagePlane, range: vk::ImageSubresourceRange) -> bool {
             .contains(&plane.array_layer)
 }
 
-// Prepare compact native ranges once. The input cells already merge scopes
-// across overlapping shader bindings, so coalescing never invents written mips.
+// Only descriptor boundaries partition simultaneous image accesses. Texture
+// dimensions and layer counts do not determine the size of this preparation.
+fn merge_program_uses(mut uses: Vec<Use>) -> Vec<Use> {
+    uses.sort_unstable_by_key(|usage| match *usage {
+        Use::Buffer { id, offset, .. } => [0, id.slot as u64, u64::from(id.generation), 0, offset],
+        Use::Image { id, range, .. } => [
+            1,
+            id.slot as u64,
+            u64::from(id.generation),
+            u64::from(range.aspect_mask.as_raw()),
+            0,
+        ],
+    });
+    let mut merged = Vec::with_capacity(uses.len());
+    let mut group = None;
+    let mut group_start = 0;
+    for usage in uses {
+        match usage {
+            Use::Buffer {
+                id,
+                offset,
+                size,
+                scope,
+            } => {
+                if let Some(Use::Buffer {
+                    id: previous,
+                    offset: start,
+                    size: length,
+                    scope: access,
+                }) = merged.last_mut()
+                    && *previous == id
+                    && offset <= *start + *length
+                {
+                    *length = (*start + *length).max(offset + size) - *start;
+                    access.stages |= scope.stages;
+                    access.access |= scope.access;
+                } else {
+                    merged.push(usage);
+                }
+            }
+            Use::Image { id, range, scope } => {
+                let key = (id, range.aspect_mask);
+                if group != Some(key) {
+                    group = Some(key);
+                    group_start = merged.len();
+                }
+                let mut pending: smallvec::SmallVec<[vk::ImageSubresourceRange; 4]> =
+                    smallvec::smallvec![range];
+                let mut pieces: smallvec::SmallVec<[Use; 4]> = smallvec::SmallVec::new();
+                for old in &mut merged[group_start..] {
+                    let Use::Image {
+                        range: previous,
+                        scope: access,
+                        ..
+                    } = *old
+                    else {
+                        unreachable!()
+                    };
+                    let Some(overlap) = image_range_overlap(previous, range) else {
+                        continue;
+                    };
+                    let combined = AccessScope::new(
+                        access.stages | scope.stages,
+                        access.access | scope.access,
+                    );
+                    if combined != access {
+                        subtract_image_range(previous, overlap, |range| {
+                            pieces.push(Use::Image {
+                                id,
+                                range,
+                                scope: access,
+                            });
+                        });
+                        *old = Use::Image {
+                            id,
+                            range: overlap,
+                            scope: combined,
+                        };
+                    }
+                    let mut index = 0;
+                    while index < pending.len() {
+                        let piece = pending[index];
+                        if let Some(overlap) = image_range_overlap(piece, previous) {
+                            let _ = pending.swap_remove(index);
+                            subtract_image_range(piece, overlap, |range| pending.push(range));
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    if pending.is_empty() {
+                        break;
+                    }
+                }
+                merged.extend(pieces);
+                merged.extend(
+                    pending
+                        .into_iter()
+                        .map(|range| Use::Image { id, range, scope }),
+                );
+            }
+        }
+    }
+    coalesce_image_uses(&mut merged);
+    merged
+}
+
+fn image_range_overlap(
+    a: vk::ImageSubresourceRange,
+    b: vk::ImageSubresourceRange,
+) -> Option<vk::ImageSubresourceRange> {
+    let mip = a.base_mip_level.max(b.base_mip_level);
+    let mip_end = (a.base_mip_level + a.level_count).min(b.base_mip_level + b.level_count);
+    let layer = a.base_array_layer.max(b.base_array_layer);
+    let layer_end = (a.base_array_layer + a.layer_count).min(b.base_array_layer + b.layer_count);
+    (mip < mip_end && layer < layer_end).then(|| vk::ImageSubresourceRange {
+        aspect_mask: a.aspect_mask,
+        base_mip_level: mip,
+        level_count: mip_end - mip,
+        base_array_layer: layer,
+        layer_count: layer_end - layer,
+    })
+}
+
+fn subtract_image_range(
+    range: vk::ImageSubresourceRange,
+    cut: vk::ImageSubresourceRange,
+    mut emit: impl FnMut(vk::ImageSubresourceRange),
+) {
+    for (mip, mip_end, layer, layer_end) in [
+        (
+            range.base_mip_level,
+            cut.base_mip_level,
+            range.base_array_layer,
+            range.base_array_layer + range.layer_count,
+        ),
+        (
+            cut.base_mip_level + cut.level_count,
+            range.base_mip_level + range.level_count,
+            range.base_array_layer,
+            range.base_array_layer + range.layer_count,
+        ),
+        (
+            cut.base_mip_level,
+            cut.base_mip_level + cut.level_count,
+            range.base_array_layer,
+            cut.base_array_layer,
+        ),
+        (
+            cut.base_mip_level,
+            cut.base_mip_level + cut.level_count,
+            cut.base_array_layer + cut.layer_count,
+            range.base_array_layer + range.layer_count,
+        ),
+    ] {
+        if mip < mip_end && layer < layer_end {
+            emit(vk::ImageSubresourceRange {
+                base_mip_level: mip,
+                level_count: mip_end - mip,
+                base_array_layer: layer,
+                layer_count: layer_end - layer,
+                ..range
+            });
+        }
+    }
+}
+
 fn coalesce_image_uses(uses: &mut Vec<Use>) {
     for layers in [true, false] {
         uses.sort_unstable_by_key(|usage| match *usage {

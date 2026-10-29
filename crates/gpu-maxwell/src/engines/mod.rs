@@ -75,27 +75,23 @@ pub use threed::{
     MaxwellThreeDColorTargetFormat, MaxwellThreeDColorTargetSelection,
     MaxwellThreeDColorTargetState, MaxwellThreeDCompareOp, MaxwellThreeDCompressionThreshold,
     MaxwellThreeDConditionalLoadConstantBuffer, MaxwellThreeDConservativeRasterEnable,
-    MaxwellThreeDConstantBufferBinding, MaxwellThreeDConstantBufferLoadState,
-    MaxwellThreeDConstantBufferSelectorState, MaxwellThreeDConstantColorComponent,
-    MaxwellThreeDConstantColorRenderingState, MaxwellThreeDConstantColorValue,
-    MaxwellThreeDCounterState, MaxwellThreeDCoverageState, MaxwellThreeDCoverageToColor,
-    MaxwellThreeDCsaaEnable, MaxwellThreeDCullFace, MaxwellThreeDDecompressSurface,
-    MaxwellThreeDDepthArrayControl, MaxwellThreeDDepthStencilFormat,
-    MaxwellThreeDDepthStencilTargetState, MaxwellThreeDDepthTargetCount,
-    MaxwellThreeDDescriptorPoolState, MaxwellThreeDDirectlyAddressableMemory,
-    MaxwellThreeDEdgeFlag, MaxwellThreeDFalconError, MaxwellThreeDFalconMaskedRegisterWrite,
-    MaxwellThreeDFalconRegister, MaxwellThreeDFalconRegisterAddress, MaxwellThreeDFalconState,
-    MaxwellThreeDFillViaTriangleMode, MaxwellThreeDFixedFunctionRegister,
-    MaxwellThreeDFixedFunctionState, MaxwellThreeDFixedFunctionValue,
-    MaxwellThreeDFlushPendingWrites, MaxwellThreeDFrontFace, MaxwellThreeDGuestImageFormat,
-    MaxwellThreeDHybridAntiAliasCentroid, MaxwellThreeDHybridAntiAliasControl,
-    MaxwellThreeDImageKind, MaxwellThreeDImageLayout, MaxwellThreeDIndexBufferState,
-    MaxwellThreeDIndexElementSize, MaxwellThreeDInlineConstantBufferUpload,
-    MaxwellThreeDInlineToMemoryCompletion, MaxwellThreeDInlineToMemoryLaunch,
-    MaxwellThreeDInlineToMemoryLayout, MaxwellThreeDInlineToMemoryState,
-    MaxwellThreeDInstrumentationState, MaxwellThreeDInstrumentationValue,
-    MaxwellThreeDIteratedBlend, MaxwellThreeDIteratedBlendPassCount,
-    MaxwellThreeDL2CacheEvictionPolicy, MaxwellThreeDL2CacheState, MaxwellThreeDLineState,
+    MaxwellThreeDConstantBufferBinding, MaxwellThreeDConstantBufferSelectorState,
+    MaxwellThreeDCoverageState, MaxwellThreeDCoverageToColor, MaxwellThreeDCsaaEnable,
+    MaxwellThreeDCullFace, MaxwellThreeDDecompressSurface, MaxwellThreeDDepthArrayControl,
+    MaxwellThreeDDepthStencilFormat, MaxwellThreeDDepthStencilTargetState,
+    MaxwellThreeDDepthTargetCount, MaxwellThreeDDescriptorPoolState,
+    MaxwellThreeDDirectlyAddressableMemory, MaxwellThreeDEdgeFlag, MaxwellThreeDFalconError,
+    MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconRegister,
+    MaxwellThreeDFalconRegisterAddress, MaxwellThreeDFalconState, MaxwellThreeDFillViaTriangleMode,
+    MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionState,
+    MaxwellThreeDFixedFunctionValue, MaxwellThreeDFlushPendingWrites, MaxwellThreeDFrontFace,
+    MaxwellThreeDGuestImageFormat, MaxwellThreeDHybridAntiAliasCentroid,
+    MaxwellThreeDHybridAntiAliasControl, MaxwellThreeDImageKind, MaxwellThreeDImageLayout,
+    MaxwellThreeDIndexBufferState, MaxwellThreeDIndexElementSize,
+    MaxwellThreeDInlineConstantBufferUpload, MaxwellThreeDInlineToMemoryCompletion,
+    MaxwellThreeDInlineToMemoryLaunch, MaxwellThreeDInlineToMemoryLayout,
+    MaxwellThreeDInlineToMemoryState, MaxwellThreeDIteratedBlend,
+    MaxwellThreeDIteratedBlendPassCount, MaxwellThreeDLineState,
     MaxwellThreeDLineStippleParameters, MaxwellThreeDLogicOp, MaxwellThreeDMappingReference,
     MaxwellThreeDMmeExecutionError, MaxwellThreeDMmeInstruction, MaxwellThreeDMmeLoadError,
     MaxwellThreeDMmeRam, MaxwellThreeDMmeRamAddress, MaxwellThreeDMmeShadowRamControl,
@@ -121,10 +117,10 @@ pub use threed::{
     MaxwellThreeDReportSemaphoreStructureSize, MaxwellThreeDReportSemaphoreWrite,
     MaxwellThreeDResolvedBuffer, MaxwellThreeDResolvedImage, MaxwellThreeDResolvedResource,
     MaxwellThreeDResolvedResources, MaxwellThreeDResolvedSampler, MaxwellThreeDResourceAccess,
-    MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDRopL2CacheRequest,
-    MaxwellThreeDSampleLocation, MaxwellThreeDSampleLocationGroup, MaxwellThreeDSampleMode,
-    MaxwellThreeDSamplerBindingMode, MaxwellThreeDScissorState, MaxwellThreeDSeparateFragmentData,
-    MaxwellThreeDShadeMode, MaxwellThreeDShaderBindingState, MaxwellThreeDShaderCacheInvalidation,
+    MaxwellThreeDResourceError, MaxwellThreeDResourceRole, MaxwellThreeDSampleLocation,
+    MaxwellThreeDSampleLocationGroup, MaxwellThreeDSampleMode, MaxwellThreeDSamplerBindingMode,
+    MaxwellThreeDScissorState, MaxwellThreeDSeparateFragmentData, MaxwellThreeDShadeMode,
+    MaxwellThreeDShaderBindingState, MaxwellThreeDShaderCacheInvalidation,
     MaxwellThreeDShaderExceptionsEnable, MaxwellThreeDShaderExecutionState,
     MaxwellThreeDShaderLocalMemoryPerWarpSize, MaxwellThreeDShaderLocalMemoryState,
     MaxwellThreeDShaderWatermarkRange, MaxwellThreeDShaderWatermarkTarget,
@@ -132,14 +128,11 @@ pub use threed::{
     MaxwellThreeDStencilOp, MaxwellThreeDSubtilingPerfKnobA, MaxwellThreeDSubtilingPerfKnobB,
     MaxwellThreeDSynchronizationError, MaxwellThreeDSynchronizationPlan,
     MaxwellThreeDSynchronizationTrigger, MaxwellThreeDSyncpointCondition,
-    MaxwellThreeDSyncpointIncrement, MaxwellThreeDSystemMemoryVolatile,
-    MaxwellThreeDTessellationLod, MaxwellThreeDTessellationMode,
+    MaxwellThreeDSyncpointIncrement, MaxwellThreeDTessellationLod, MaxwellThreeDTessellationMode,
     MaxwellThreeDTextureCacheInvalidation, MaxwellThreeDTextureCacheLines,
-    MaxwellThreeDTextureCacheTarget, MaxwellThreeDTiledCacheFlushMode,
-    MaxwellThreeDTiledCacheState, MaxwellThreeDTiledCacheTileSize,
-    MaxwellThreeDTiledCacheUnknownConfig, MaxwellThreeDTirControl, MaxwellThreeDTirMode,
-    MaxwellThreeDTirModulationComponentSelect, MaxwellThreeDTirModulationFunction,
-    MaxwellThreeDUnorm8, MaxwellThreeDUnresolvedAddress, MaxwellThreeDVafL2CacheControl,
+    MaxwellThreeDTextureCacheTarget, MaxwellThreeDTiledCacheFlushMode, MaxwellThreeDTirControl,
+    MaxwellThreeDTirMode, MaxwellThreeDTirModulationComponentSelect,
+    MaxwellThreeDTirModulationFunction, MaxwellThreeDUnorm8, MaxwellThreeDUnresolvedAddress,
     MaxwellThreeDVertexArrayPrimitiveRestartEnable, MaxwellThreeDVertexAssemblyState,
     MaxwellThreeDVertexAttributeFormat, MaxwellThreeDVertexComponentWidths,
     MaxwellThreeDVertexIdUsesArrayStart, MaxwellThreeDVertexInputState,
@@ -150,12 +143,7 @@ pub use threed::{
     MaxwellThreeDViewportState, MaxwellThreeDViewportSwizzleComponent,
     MaxwellThreeDViewportTransformState, MaxwellThreeDViewportZClipRange,
     MaxwellThreeDVisibleCallLimit, MaxwellThreeDWindowClipState, MaxwellThreeDWindowClipType,
-    MaxwellThreeDZCompressionMode, MaxwellThreeDZCullAxis, MaxwellThreeDZCullBounds,
-    MaxwellThreeDZCullCriterion, MaxwellThreeDZCullDepthFormat, MaxwellThreeDZCullDirectionFormat,
-    MaxwellThreeDZCullEnable, MaxwellThreeDZCullRegionFormat, MaxwellThreeDZCullRegionId,
-    MaxwellThreeDZCullRegionLocation, MaxwellThreeDZCullState, MaxwellThreeDZCullStatsEnable,
-    MaxwellThreeDZCullStencilFunction, MaxwellThreeDZCullSubregion,
-    MaxwellThreeDZPassPixelCountEnable, lower_maxwell_three_d_synchronization,
+    MaxwellThreeDZCompressionMode, lower_maxwell_three_d_synchronization,
 };
 pub use twod::{
     MAXWELL_TWO_D_CORRAL_SIZE_MAX, MAXWELL_TWO_D_NOTIFY_ADDRESS_UPPER_MAX, MaxwellTwoDBeta1,
@@ -170,9 +158,11 @@ pub use twod::{
 
 use std::fmt::{Display, Formatter};
 
-use nixe_gpu::{FrontendSubmissionId, GpuClassId, GpuMethodId};
+#[cfg(test)]
+use nixe_gpu::FrontendSubmissionId;
+use nixe_gpu::{GpuClassId, GpuMethodId};
 
-use crate::pushbuffer::dispatch::{dispatch_method, packet_methods};
+use crate::pushbuffer::dispatch::dispatch_method;
 use crate::{
     MaxwellAamVersionRange, MaxwellGpuChannel, MaxwellHostMethod, MaxwellHostSynchronizationKind,
     MaxwellMethodDispatch, MaxwellMethodDispatchError, MaxwellMethodDispatchKind,
@@ -582,6 +572,7 @@ impl std::error::Error for MaxwellEngineDispatchError {}
 pub(crate) enum MaxwellEngineStreamError<E> {
     Dispatch(Box<MaxwellEngineDispatchError>),
     Consumer(E),
+    Decode(crate::MaxwellPushbufferDecodeError),
 }
 
 impl<E> MaxwellEngineStreamError<E> {
@@ -684,16 +675,15 @@ pub(crate) async fn finish_maxwell_engine_stream<E>(
     .await
 }
 
-/// Applies one packet and streams sparse execution effects in exact method order.
+/// Consume the current command entry directly, suspending only at engine effects.
 ///
 /// Unsupported semantics terminate the guest process, so successfully applied
 /// method prefixes are intentionally not rolled back. A 3D effect borrows the
 /// live state only for the callback and therefore cannot survive a following
 /// register mutation.
-pub(crate) async fn stream_maxwell_engine_packet<E>(
+pub(crate) async fn stream_maxwell_engine_entry<E>(
     channel: &mut MaxwellGpuChannel,
-    submission: FrontendSubmissionId,
-    packet: crate::pushbuffer::packet::PacketView<'_>,
+    stream: &mut crate::pushbuffer::packet::CommandStream,
     #[cfg(test)] methods: Option<&mut Vec<MaxwellEngineMethodDispatch>>,
     mme_methods: &mut Option<MaxwellMethodDispatch>,
     mme_parameters: &mut Vec<u32>,
@@ -701,324 +691,370 @@ pub(crate) async fn stream_maxwell_engine_packet<E>(
 ) -> Result<(), MaxwellEngineStreamError<E>> {
     #[cfg(test)]
     let mut methods = methods;
-    if let Some((subchannel, span, first, plain_class)) =
-        packet_methods(channel, submission, packet)
-            .map_err(|error| MaxwellEngineStreamError::dispatch(error.into()))?
-    {
-        if mme_methods.is_none()
-            && let Some(class) = plain_class
-            && span.len() >= 2
-            && let Some(port) = bulk::port(first.method())
-            && bulk::stream_packet(channel, class, subchannel, span, first, port, consume).await?
-        {
-            #[cfg(test)]
-            if let Some(observed) = methods.as_deref_mut() {
-                for method in span.iter() {
-                    observed.push(MaxwellEngineMethodDispatch::new(
-                        MaxwellMethodDispatch::class_method(
-                            MaxwellMethodSource::decoded(method, subchannel),
-                            class,
-                        ),
-                        MaxwellEngineMethodMetadata::new(
-                            class,
-                            if class == threed::CLASS {
-                                "MAXWELL_B"
-                            } else if class == compute::CLASS {
-                                "MAXWELL_COMPUTE_B"
-                            } else {
-                                "MAXWELL_INLINE_TO_MEMORY_A"
-                            },
-                            method.method(),
-                            if class == threed::CLASS {
-                                "STATE_REGISTER"
-                            } else {
-                                "LOAD_INLINE_DATA"
-                            },
-                        ),
+    'packets: while !stream.needs_entry() {
+        if let Some(operation) = stream.next().map_err(MaxwellEngineStreamError::Decode)? {
+            match operation {
+                crate::MaxwellPushbufferControl::Nop
+                | crate::MaxwellPushbufferControl::EndSegment => continue,
+                _ => {
+                    return Err(MaxwellEngineStreamError::dispatch(
+                        MaxwellMethodDispatchError::UnsupportedControl {
+                            operation,
+                            source: stream.header_location(),
+                        }
+                        .into(),
                     ));
                 }
             }
-            return Ok(());
         }
-        // Macro payloads are one ordered word span. Admit the range once, as
-        // the command pusher does, rather than routing every argument through
-        // the ordinary register dispatcher.
-        if plain_class == Some(threed::CLASS)
-            && threed::is_mme_aperture(first.method())
-            && let Some(last) = span.last()
-            && threed::is_mme_aperture(last.method())
+        let last = stream.last();
+        let span = stream.methods();
+        if span.is_empty() {
+            continue;
+        }
+        let subchannel = stream
+            .subchannel()
+            .expect("nonempty hardware method packet");
+        let first = span.method_at(0);
+        let plain_class = if first.0 >= 0x100 {
+            Some(
+                channel
+                    .frontend()
+                    .subchannel_binding(subchannel)
+                    .ok_or_else(|| {
+                        MaxwellEngineStreamError::dispatch(
+                            MaxwellMethodDispatchError::UnboundSubchannel {
+                                source: MaxwellMethodSource::decoded(
+                                    span.first().unwrap(),
+                                    subchannel,
+                                ),
+                            }
+                            .into(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         {
-            let first_method = first.method().0;
-            let expected = mme_methods
-                .as_ref()
-                .map_or(first_method, |pending| pending.source().method().0);
-            let starts_call = mme_methods.is_none() && (first_method - 0x3800) & 7 == 0;
-            let continues_call =
-                mme_methods.is_some() && (first_method == expected || first_method == expected + 4);
-            if (starts_call || continues_call)
-                && (last.method().0 == expected || last.method().0 == expected + 4)
+            if mme_methods.is_none()
+                && let Some(class) = plain_class
+                && span.len() >= 2
+                && let Some(port) = bulk::port(first)
+                && bulk::stream_packet(
+                    channel,
+                    class,
+                    subchannel,
+                    span,
+                    span.first().unwrap(),
+                    port,
+                    consume,
+                )
+                .await?
             {
-                if starts_call {
-                    let first = MaxwellMethodDispatch::class_method(
-                        MaxwellMethodSource::decoded(first, subchannel),
-                        threed::CLASS,
-                    );
-                    mme_parameters.clear();
-                    *mme_methods = Some(first);
-                }
-                mme_parameters.try_reserve(span.len()).map_err(|_| {
-                    MaxwellEngineStreamError::dispatch(
-                        MaxwellEngineDispatchError::ResourceExhausted,
-                    )
-                })?;
-                mme_parameters.extend(span.arguments());
                 #[cfg(test)]
                 if let Some(observed) = methods.as_deref_mut() {
-                    for (index, decoded) in span.iter().enumerate() {
-                        let source = MaxwellMethodSource::decoded(decoded, subchannel);
-                        let method = MaxwellMethodDispatch::class_method(source, threed::CLASS);
+                    for method in span.iter() {
                         observed.push(MaxwellEngineMethodDispatch::new(
-                            method,
+                            MaxwellMethodDispatch::class_method(
+                                MaxwellMethodSource::decoded(method, subchannel),
+                                class,
+                            ),
                             MaxwellEngineMethodMetadata::new(
-                                threed::CLASS,
-                                "MAXWELL_B",
-                                source.method(),
-                                if starts_call && index == 0 {
-                                    "CALL_MME_MACRO"
+                                class,
+                                if class == threed::CLASS {
+                                    "MAXWELL_B"
+                                } else if class == compute::CLASS {
+                                    "MAXWELL_COMPUTE_B"
                                 } else {
-                                    "CALL_MME_DATA"
+                                    "MAXWELL_INLINE_TO_MEMORY_A"
+                                },
+                                method.method(),
+                                if class == threed::CLASS {
+                                    "STATE_REGISTER"
+                                } else {
+                                    "LOAD_INLINE_DATA"
                                 },
                             ),
                         ));
                     }
                 }
-                if !matches!(
-                    packet,
-                    crate::pushbuffer::packet::PacketView::Methods { last: false, .. }
-                ) {
-                    flush_mme_methods(channel, mme_methods, mme_parameters, consume).await?;
-                }
-                return Ok(());
+                continue 'packets;
             }
-        }
-        let profile = channel.profile();
-        let mut cursor = 0;
-        while let Some(decoded) = span.get(cursor) {
-            cursor += 1;
-            if mme_methods.is_none()
-                && plain_class == Some(threed::CLASS)
-                && threed::is_plain_method(decoded.method())
-                && !threed::draw::is_pending(channel.three_d_mut())
-                && channel.three_d_mut().pending_notification.is_none()
+            // Macro payloads are one ordered word span. Admit the range once, as
+            // the command pusher does, rather than routing every argument through
+            // the ordinary register dispatcher.
+            if plain_class == Some(threed::CLASS)
+                && threed::is_mme_aperture(first)
+                && threed::is_mme_aperture(span.method_at(span.len() - 1))
             {
-                let count = threed::write_plain_span(
-                    subchannel,
-                    span.slice(cursor - 1..),
-                    channel.three_d_mut(),
-                    |source, argument| {
-                        #[cfg(not(test))]
-                        let _ = (source, argument);
-                        #[cfg(test)]
-                        if let Some(observed) = methods.as_deref_mut() {
-                            let mut dispatch =
-                                MaxwellMethodDispatch::class_method(source, threed::CLASS);
-                            dispatch.set_effective_argument(argument);
-                            observed.push(MaxwellEngineMethodDispatch::new(
-                                dispatch,
-                                MaxwellEngineMethodMetadata::new(
-                                    threed::CLASS,
-                                    "MAXWELL_B",
-                                    source.method(),
-                                    "STATE_REGISTER",
-                                ),
-                            ));
-                        }
-                    },
-                )
-                .map_err(MaxwellEngineStreamError::dispatch)?;
-                cursor += count - 1;
-                continue;
-            }
-            let method = if let Some(class) = plain_class {
-                MaxwellMethodDispatch::class_method(
-                    MaxwellMethodSource::decoded(decoded, subchannel),
-                    class,
-                )
-            } else {
-                dispatch_method(&profile, subchannel, decoded, channel.frontend_mut())
-                    .map_err(|error| MaxwellEngineStreamError::dispatch(error.into()))?
-            };
-            if mme_methods.is_some() {
-                let first_method = mme_methods.unwrap().source().method().0;
-                let next_method = method.source().method().0;
-                let continues = method.kind() == MaxwellMethodDispatchKind::ClassMethod
-                    && method.class() == threed::CLASS
-                    && (next_method == first_method || next_method == first_method + 4);
-                if continues {
-                    mme_parameters.try_reserve(1).map_err(|_| {
+                let first_method = first.0;
+                let expected = mme_methods
+                    .as_ref()
+                    .map_or(first_method, |pending| pending.source().method().0);
+                let starts_call = mme_methods.is_none() && (first_method - 0x3800) & 7 == 0;
+                let continues_call = mme_methods.is_some()
+                    && (first_method == expected || first_method == expected + 4);
+                if (starts_call || continues_call)
+                    && (span.method_at(span.len() - 1).0 == expected
+                        || span.method_at(span.len() - 1).0 == expected + 4)
+                {
+                    if starts_call {
+                        let first = MaxwellMethodDispatch::class_method(
+                            MaxwellMethodSource::decoded(span.first().unwrap(), subchannel),
+                            threed::CLASS,
+                        );
+                        mme_parameters.clear();
+                        *mme_methods = Some(first);
+                    }
+                    span.append_arguments(mme_parameters).map_err(|_| {
                         MaxwellEngineStreamError::dispatch(
                             MaxwellEngineDispatchError::ResourceExhausted,
                         )
                     })?;
-                    mme_parameters.push(method.source().argument());
                     #[cfg(test)]
-                    observe_mme_method(&mut methods, method, false);
-                    continue;
-                }
-                flush_mme_methods(channel, mme_methods, mme_parameters, consume).await?;
-            }
-            if threed::draw::is_pending(channel.three_d_mut()) {
-                flush_before_method(channel, method.source(), consume).await?;
-            }
-            if let Some((_, source)) = channel.three_d_mut().pending_notification
-                && (method.source().subchannel() != source.subchannel()
-                    || (!matches!(method.kind(), MaxwellMethodDispatchKind::HostMethod(_))
-                        && (method.kind() != MaxwellMethodDispatchKind::ClassMethod
-                            || method.class() != threed::CLASS)))
-            {
-                return Err(MaxwellEngineStreamError::dispatch(
-                    MaxwellEngineDispatchError::InvalidMethodEncoding {
-                        source: method.source(),
-                        method_name: "NOTIFY",
-                        reason: "object or subchannel switched with a pending notification",
-                    },
-                ));
-            }
-            if let MaxwellMethodDispatchKind::HostMethod(host) = method.kind() {
-                let (_name, operation) = match host {
-                    MaxwellHostMethod::SemaphoreState => (
-                        match method.source().method().0 {
-                            0x10 => "SEMAPHOREA",
-                            0x14 => "SEMAPHOREB",
-                            _ => "SEMAPHOREC",
-                        },
-                        None,
-                    ),
-                    MaxwellHostMethod::SemaphoreRelease(operation) => {
-                        ("SEMAPHORED", Some(operation))
-                    }
-                    MaxwellHostMethod::SetReference => (
-                        "SET_REFERENCE",
-                        Some(MaxwellHostSynchronizationKind::WaitForIdle { all: true }),
-                    ),
-                    MaxwellHostMethod::WaitForIdle { all } => (
-                        "WFI",
-                        Some(MaxwellHostSynchronizationKind::WaitForIdle { all }),
-                    ),
-                    MaxwellHostMethod::Nop => ("NOP", None),
-                    MaxwellHostMethod::LegacyMemOpA { .. } => ("MEM_OP_A", None),
-                    MaxwellHostMethod::LegacyMemOpB(operation) => ("MEM_OP_B", Some(operation)),
-                };
-                if let Some(operation) = operation {
-                    emit_pending_operation(
-                        PendingEngineOperation::HostSynchronization(
-                            MaxwellHostSynchronizationOperation {
-                                operation,
-                                source: method.source(),
-                            },
-                        ),
-                        channel.three_d(),
-                        Some(channel.compute()),
-                        consume,
-                    )
-                    .await
-                    .map_err(MaxwellEngineStreamError::Consumer)?;
-                }
-                #[cfg(test)]
-                if let Some(methods) = methods.as_deref_mut() {
-                    let class_name = if matches!(
-                        host,
-                        MaxwellHostMethod::LegacyMemOpA { .. } | MaxwellHostMethod::LegacyMemOpB(_)
-                    ) {
-                        "MAXWELL_CHANNEL_GPFIFO_A(legacy-host-compatibility)"
-                    } else {
-                        "MAXWELL_CHANNEL_GPFIFO_A"
-                    };
-                    methods.push(MaxwellEngineMethodDispatch::new(
-                        method,
-                        MaxwellEngineMethodMetadata::new(
-                            method.class(),
-                            class_name,
-                            method.source().method(),
-                            _name,
-                        ),
-                    ));
-                }
-                continue;
-            }
-            if method.kind() == MaxwellMethodDispatchKind::ClassMethod
-                && method.class() == threed::CLASS
-                && threed::is_mme_aperture(method.source().method())
-            {
-                let first_method = method.source().method().0;
-                if (first_method - 0x3800) & 7 != 0 {
-                    return Err(MaxwellEngineStreamError::dispatch(
-                        MaxwellEngineDispatchError::MmeExecution {
-                            source: method.source(),
-                            error: MaxwellThreeDMmeExecutionError::DataWithoutCall,
-                        },
-                    ));
-                }
-                mme_parameters.try_reserve(1).map_err(|_| {
-                    MaxwellEngineStreamError::dispatch(
-                        MaxwellEngineDispatchError::ResourceExhausted,
-                    )
-                })?;
-                *mme_methods = Some(method);
-                mme_parameters.clear();
-                mme_parameters.push(method.source().argument());
-                #[cfg(test)]
-                observe_mme_method(&mut methods, method, true);
-                continue;
-            }
-            if method.kind() == MaxwellMethodDispatchKind::ClassMethod {
-                if method.class() == threed::CLASS {
-                    let mut method = method;
-                    if threed::write_plain_method(&mut method, channel.three_d_mut())
-                        .map_err(MaxwellEngineStreamError::dispatch)?
-                    {
-                        #[cfg(test)]
-                        if let Some(observed) = methods.as_deref_mut() {
+                    if let Some(observed) = methods.as_deref_mut() {
+                        for (index, decoded) in span.iter().enumerate() {
+                            let source = MaxwellMethodSource::decoded(decoded, subchannel);
+                            let method = MaxwellMethodDispatch::class_method(source, threed::CLASS);
                             observed.push(MaxwellEngineMethodDispatch::new(
                                 method,
                                 MaxwellEngineMethodMetadata::new(
                                     threed::CLASS,
                                     "MAXWELL_B",
-                                    method.source().method(),
-                                    "STATE_REGISTER",
+                                    source.method(),
+                                    if starts_call && index == 0 {
+                                        "CALL_MME_MACRO"
+                                    } else {
+                                        "CALL_MME_DATA"
+                                    },
                                 ),
                             ));
                         }
+                    }
+                    if last {
+                        flush_mme_methods(channel, mme_methods, mme_parameters, consume).await?;
+                    }
+                    continue 'packets;
+                }
+            }
+            let profile = channel.profile();
+            let mut cursor = 0;
+            while cursor < span.len() {
+                if mme_methods.is_none()
+                    && plain_class == Some(threed::CLASS)
+                    && threed::is_plain_method(span.method_at(cursor))
+                    && !threed::draw::is_pending(channel.three_d_mut())
+                    && channel.three_d_mut().pending_notification.is_none()
+                {
+                    let count = threed::write_plain_span(
+                        subchannel,
+                        span.slice(cursor..),
+                        channel.three_d_mut(),
+                        #[cfg(test)]
+                        |source, argument| {
+                            #[cfg(test)]
+                            if let Some(observed) = methods.as_deref_mut() {
+                                let mut dispatch =
+                                    MaxwellMethodDispatch::class_method(source, threed::CLASS);
+                                dispatch.set_effective_argument(argument);
+                                observed.push(MaxwellEngineMethodDispatch::new(
+                                    dispatch,
+                                    MaxwellEngineMethodMetadata::new(
+                                        threed::CLASS,
+                                        "MAXWELL_B",
+                                        source.method(),
+                                        "STATE_REGISTER",
+                                    ),
+                                ));
+                            }
+                        },
+                    )
+                    .map_err(MaxwellEngineStreamError::dispatch)?;
+                    cursor += count;
+                    continue;
+                }
+                let decoded = span.get(cursor).unwrap();
+                cursor += 1;
+                let method = if let Some(class) = plain_class {
+                    MaxwellMethodDispatch::class_method(
+                        MaxwellMethodSource::decoded(decoded, subchannel),
+                        class,
+                    )
+                } else {
+                    dispatch_method(&profile, subchannel, decoded, channel.frontend_mut())
+                        .map_err(|error| MaxwellEngineStreamError::dispatch(error.into()))?
+                };
+                if mme_methods.is_some() {
+                    let first_method = mme_methods.unwrap().source().method().0;
+                    let next_method = method.source().method().0;
+                    let continues = method.kind() == MaxwellMethodDispatchKind::ClassMethod
+                        && method.class() == threed::CLASS
+                        && (next_method == first_method || next_method == first_method + 4);
+                    if continues {
+                        mme_parameters.try_reserve(1).map_err(|_| {
+                            MaxwellEngineStreamError::dispatch(
+                                MaxwellEngineDispatchError::ResourceExhausted,
+                            )
+                        })?;
+                        mme_parameters.push(method.source().argument());
+                        #[cfg(test)]
+                        observe_mme_method(&mut methods, method, false);
                         continue;
                     }
+                    flush_mme_methods(channel, mme_methods, mme_parameters, consume).await?;
                 }
-                let applied = dispatch_class_method(channel, method)
-                    .map_err(MaxwellEngineStreamError::dispatch)?;
-                if let Some(operation) = applied.operation {
-                    route_operation(channel, operation, consume)
+                if threed::draw::is_pending(channel.three_d_mut()) {
+                    flush_before_method(channel, method.source(), consume).await?;
+                }
+                if let Some((_, source)) = channel.three_d_mut().pending_notification
+                    && (method.source().subchannel() != source.subchannel()
+                        || (!matches!(method.kind(), MaxwellMethodDispatchKind::HostMethod(_))
+                            && (method.kind() != MaxwellMethodDispatchKind::ClassMethod
+                                || method.class() != threed::CLASS)))
+                {
+                    return Err(MaxwellEngineStreamError::dispatch(
+                        MaxwellEngineDispatchError::InvalidMethodEncoding {
+                            source: method.source(),
+                            method_name: "NOTIFY",
+                            reason: "object or subchannel switched with a pending notification",
+                        },
+                    ));
+                }
+                if let MaxwellMethodDispatchKind::HostMethod(host) = method.kind() {
+                    let (_name, operation) = match host {
+                        MaxwellHostMethod::SemaphoreState => (
+                            match method.source().method().0 {
+                                0x10 => "SEMAPHOREA",
+                                0x14 => "SEMAPHOREB",
+                                _ => "SEMAPHOREC",
+                            },
+                            None,
+                        ),
+                        MaxwellHostMethod::SemaphoreRelease(operation) => {
+                            ("SEMAPHORED", Some(operation))
+                        }
+                        MaxwellHostMethod::SetReference => (
+                            "SET_REFERENCE",
+                            Some(MaxwellHostSynchronizationKind::WaitForIdle { all: true }),
+                        ),
+                        MaxwellHostMethod::WaitForIdle { all } => (
+                            "WFI",
+                            Some(MaxwellHostSynchronizationKind::WaitForIdle { all }),
+                        ),
+                        MaxwellHostMethod::Nop => ("NOP", None),
+                        MaxwellHostMethod::LegacyMemOpA { .. } => ("MEM_OP_A", None),
+                        MaxwellHostMethod::LegacyMemOpB(operation) => ("MEM_OP_B", Some(operation)),
+                    };
+                    if let Some(operation) = operation {
+                        emit_pending_operation(
+                            PendingEngineOperation::HostSynchronization(
+                                MaxwellHostSynchronizationOperation {
+                                    operation,
+                                    source: method.source(),
+                                },
+                            ),
+                            channel.three_d(),
+                            Some(channel.compute()),
+                            consume,
+                        )
                         .await
                         .map_err(MaxwellEngineStreamError::Consumer)?;
-                    channel.three_d_mut().complete_inline_draw();
+                    }
+                    #[cfg(test)]
+                    if let Some(methods) = methods.as_deref_mut() {
+                        let class_name = if matches!(
+                            host,
+                            MaxwellHostMethod::LegacyMemOpA { .. }
+                                | MaxwellHostMethod::LegacyMemOpB(_)
+                        ) {
+                            "MAXWELL_CHANNEL_GPFIFO_A(legacy-host-compatibility)"
+                        } else {
+                            "MAXWELL_CHANNEL_GPFIFO_A"
+                        };
+                        methods.push(MaxwellEngineMethodDispatch::new(
+                            method,
+                            MaxwellEngineMethodMetadata::new(
+                                method.class(),
+                                class_name,
+                                method.source().method(),
+                                _name,
+                            ),
+                        ));
+                    }
+                    continue;
                 }
-                #[cfg(test)]
-                if let Some(methods) = methods.as_deref_mut() {
-                    methods.push(applied.dispatch);
+                if method.kind() == MaxwellMethodDispatchKind::ClassMethod
+                    && method.class() == threed::CLASS
+                    && threed::is_mme_aperture(method.source().method())
+                {
+                    let first_method = method.source().method().0;
+                    if (first_method - 0x3800) & 7 != 0 {
+                        return Err(MaxwellEngineStreamError::dispatch(
+                            MaxwellEngineDispatchError::MmeExecution {
+                                source: method.source(),
+                                error: MaxwellThreeDMmeExecutionError::DataWithoutCall,
+                            },
+                        ));
+                    }
+                    mme_parameters.try_reserve(1).map_err(|_| {
+                        MaxwellEngineStreamError::dispatch(
+                            MaxwellEngineDispatchError::ResourceExhausted,
+                        )
+                    })?;
+                    *mme_methods = Some(method);
+                    mme_parameters.clear();
+                    mme_parameters.push(method.source().argument());
+                    #[cfg(test)]
+                    observe_mme_method(&mut methods, method, true);
+                    continue;
+                }
+                if method.kind() == MaxwellMethodDispatchKind::ClassMethod {
+                    if method.class() == threed::CLASS {
+                        let mut method = method;
+                        if threed::write_plain_method(&mut method, channel.three_d_mut())
+                            .map_err(MaxwellEngineStreamError::dispatch)?
+                        {
+                            #[cfg(test)]
+                            if let Some(observed) = methods.as_deref_mut() {
+                                observed.push(MaxwellEngineMethodDispatch::new(
+                                    method,
+                                    MaxwellEngineMethodMetadata::new(
+                                        threed::CLASS,
+                                        "MAXWELL_B",
+                                        method.source().method(),
+                                        "STATE_REGISTER",
+                                    ),
+                                ));
+                            }
+                            continue;
+                        }
+                    }
+                    let applied = dispatch_class_method(channel, method)
+                        .map_err(MaxwellEngineStreamError::dispatch)?;
+                    if let Some(operation) = applied.operation {
+                        route_operation(channel, operation, consume)
+                            .await
+                            .map_err(MaxwellEngineStreamError::Consumer)?;
+                        channel.three_d_mut().complete_inline_draw();
+                    }
+                    #[cfg(test)]
+                    if let Some(methods) = methods.as_deref_mut() {
+                        methods.push(applied.dispatch);
+                    }
                 }
             }
         }
+        if mme_methods.is_some() && last {
+            flush_mme_methods(channel, mme_methods, mme_parameters, consume).await?;
+        }
+        // Maxwell register programming is not transactional across pushbuffer
+        // packets. Related address, limit, format, and selector fields may form an
+        // inconsistent intermediate snapshot while the guest moves from one valid
+        // configuration to the next. Keep method-local encoding checks here, but
+        // defer relational validation until a draw or clear consumes its immutable
+        // state snapshot in the neutral lowering preflight.
     }
-    if !matches!(
-        packet,
-        crate::pushbuffer::packet::PacketView::Methods { last: false, .. }
-    ) {
-        flush_mme_methods(channel, mme_methods, mme_parameters, consume).await?;
-    }
-    // Maxwell register programming is not transactional across pushbuffer
-    // packets. Related address, limit, format, and selector fields may form an
-    // inconsistent intermediate snapshot while the guest moves from one valid
-    // configuration to the next. Keep method-local encoding checks here, but
-    // defer relational validation until a draw or clear consumes its immutable
-    // state snapshot in the neutral lowering preflight.
     Ok(())
 }
 

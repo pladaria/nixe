@@ -74,6 +74,7 @@ pub struct HidSystem {
 
 #[derive(Debug)]
 struct HidState {
+    kernel: Arc<nixe_scheduler::SchedulerState>,
     shared_memory: SharedMemoryObject,
     infrared: crate::object::IrsSession,
     style_events: [OnceLock<(WritableEventObject, ReadableEventObject)>; 10],
@@ -241,7 +242,13 @@ impl Lifo {
 }
 
 impl HidSystem {
-    pub fn new(account: &MemoryAccount) -> Result<Self, Arc<MemoryError>> {
+    pub fn kernel(&self) -> &Arc<nixe_scheduler::SchedulerState> {
+        &self.state.kernel
+    }
+    pub fn new(
+        account: &MemoryAccount,
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
+    ) -> Result<Self, Arc<MemoryError>> {
         let allocation = account
             .allocate(HID_SHARED_MEMORY_SIZE as u64)
             .map_err(Arc::new)?;
@@ -251,6 +258,7 @@ impl HidSystem {
         let infrared = crate::object::IrsSession::new(account)?;
         Ok(Self {
             state: Arc::new(HidState {
+                kernel: kernel.clone(),
                 shared_memory,
                 infrared,
                 style_events: std::array::from_fn(|_| OnceLock::new()),
@@ -377,7 +385,7 @@ impl HidSystem {
     pub(crate) fn acquire_style_event(&self, id: u32) -> Option<ReadableEventObject> {
         let index = npad_index(id)?;
         let (writable, readable) = self.state.style_events[index]
-            .get_or_init(|| EventObject::create_pair_with_source(ExternalEventSource::Input));
+            .get_or_init(|| EventObject::create_pair(&self.state.kernel));
         // Acquiring also signals the event so a client can inspect the initial
         // style. Later signals follow publication of a changed style tag.
         // https://github.com/eden-emulator/mirror/blob/master/src/hid_core/resources/npad/npad_resource.cpp
@@ -810,7 +818,11 @@ mod tests {
 
     fn hid() -> HidSystem {
         let machine = nixe_memory::Machine::new(2 * 1024 * 1024).unwrap();
-        HidSystem::new(&machine.account(machine.arena().capacity()).unwrap()).unwrap()
+        HidSystem::new(
+            &machine.account(machine.arena().capacity()).unwrap(),
+            &crate::test_memory::kernel(),
+        )
+        .unwrap()
     }
     fn read(memory: &SharedMemoryObject, offset: usize, destination: &mut [u8]) {
         let nixe_memory::Access::Ready(bytes) = memory.read(offset, destination.len()).unwrap()
@@ -867,7 +879,7 @@ mod tests {
         };
         let machine = Machine::new(2 * 1024 * 1024).unwrap();
         let account = machine.account(machine.arena().capacity()).unwrap();
-        let hid = HidSystem::new(&account).unwrap();
+        let hid = HidSystem::new(&account, &crate::test_memory::kernel()).unwrap();
         let shared = hid.shared_memory();
         let space = AddressSpace::new(machine, AddressWidth::Bits32).unwrap();
         let address = GuestVirtualAddress::new(0x1000);

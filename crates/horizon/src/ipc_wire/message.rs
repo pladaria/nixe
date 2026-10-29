@@ -145,8 +145,85 @@ pub(crate) struct ReceiveStaticDescriptor {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReceiveStatics {
     None,
-    Auto,
+    MessageBuffer,
     Entries(Vec<ReceiveStaticDescriptor>),
+}
+
+/// Fixed HIPC header words. Transport layout needs no descriptor allocations.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/message_buffer.h#L553-L576
+pub(crate) struct HipcHeader {
+    word0: u32,
+    word1: u32,
+    special: u32,
+}
+impl HipcHeader {
+    pub(crate) fn decode(raw: &[u8]) -> Result<Self, MessageError> {
+        let word0 = get_u32(raw, 0)?;
+        let word1 = get_u32(raw, 4)?;
+        let special = if word1 >> 31 != 0 {
+            get_u32(raw, 8)?
+        } else {
+            0
+        };
+        Ok(Self {
+            word0,
+            word1,
+            special,
+        })
+    }
+    pub(crate) fn has_special_header(&self) -> bool {
+        self.word1 >> 31 != 0
+    }
+    pub(crate) fn sends_pid(&self) -> bool {
+        self.special & 1 != 0
+    }
+    pub(crate) fn copy_handle_count(&self) -> usize {
+        field(self.special, 1, 4)
+    }
+    pub(crate) fn move_handle_count(&self) -> usize {
+        field(self.special, 5, 4)
+    }
+    pub(crate) fn handle_offset(&self) -> usize {
+        8 + usize::from(self.has_special_header()) * 4 + usize::from(self.special & 1 != 0) * 8
+    }
+    /// The transferred extent excludes the sender's receive list and capacity.
+    pub(crate) fn message_size(&self, capacity: usize) -> Result<usize, MessageError> {
+        let size = self.handle_offset()
+            + (self.copy_handle_count() + self.move_handle_count()) * 4
+            + field(self.word0, 16, 4) * 8
+            + (field(self.word0, 20, 4) + field(self.word0, 24, 4) + field(self.word0, 28, 4)) * 12
+            + field(self.word1, 0, 10) * 4;
+        if size > capacity {
+            return Err(MessageError("HIPC message exceeds its source buffer"));
+        }
+        Ok(size)
+    }
+    /// Locate receive metadata at its explicit word offset or inline-data end.
+    /// Modes 0/1 have no entries, mode 2 has one, and higher modes encode N+2.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_server_session.cpp#L45-L57
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/message_buffer.h#L578-L584
+    pub(crate) fn receive_list(
+        &self,
+        data_end: usize,
+        capacity: usize,
+    ) -> Result<std::ops::Range<usize>, MessageError> {
+        debug_assert!(data_end <= capacity);
+        let mode = field(self.word1, 10, 4);
+        let count = match mode {
+            0 | 1 => return Ok(data_end..data_end),
+            2 => 1,
+            _ => mode - 2,
+        };
+        let offset = field(self.word1, 20, 11) * 4;
+        let start = if offset == 0 { data_end } else { offset };
+        let end = start + count * 8;
+        if end > capacity {
+            return Err(MessageError(
+                "HIPC receive-static list exceeds its source buffer",
+            ));
+        }
+        Ok(start..end)
+    }
 }
 
 /// Fully decoded HIPC request metadata and descriptor tables.
@@ -162,19 +239,17 @@ pub(crate) struct HipcRequest<'a> {
     pub(crate) exchange_buffers: Vec<BufferDescriptor>,
     pub(crate) receive_statics: ReceiveStatics,
     raw: &'a [u8],
-    handle_offset: usize,
     data_offset: usize,
     data_end: usize,
 }
 
 impl<'a> HipcRequest<'a> {
-    /// Decodes one complete TLS command buffer without reading outside it.
+    /// Decodes accepted message bytes without reading outside them. The caller
+    /// captures these bytes within its admitted TLS or user-buffer capacity.
     pub(crate) fn decode(raw: &'a [u8]) -> Result<Self, MessageError> {
-        if raw.len() > COMMAND_BUFFER_SIZE {
-            return Err(MessageError("HIPC command buffer exceeds 0x100 bytes"));
-        }
-        let word0 = get_u32(raw, 0)?;
-        let word1 = get_u32(raw, 4)?;
+        let header = HipcHeader::decode(raw)?;
+        let word0 = header.word0;
+        let word1 = header.word1;
         let command_type = word0 as u16;
         let send_static_count = field(word0, 16, 4);
         let send_buffer_count = field(word0, 20, 4);
@@ -185,18 +260,18 @@ impl<'a> HipcRequest<'a> {
         if field(word1, 14, 6) != 0 {
             return Err(MessageError("HIPC header padding is nonzero"));
         }
-        let has_special_header = word1 >> 31 != 0;
+        let has_special_header = header.has_special_header();
 
         let mut offset = 8;
         let (pid, copy_handle_count, move_handle_count) = if has_special_header {
-            let special = get_u32(raw, offset)?;
+            let special = header.special;
             offset = checked_add(offset, 4)?;
             if special >> 9 != 0 {
                 return Err(MessageError("HIPC special-header padding is nonzero"));
             }
-            let sends_pid = special & 1 != 0;
-            let copy_count = field(special, 1, 4);
-            let move_count = field(special, 5, 4);
+            let sends_pid = header.sends_pid();
+            let copy_count = header.copy_handle_count();
+            let move_count = header.move_handle_count();
             let pid = if sends_pid {
                 let value = get_u64(raw, offset)?;
                 offset = checked_add(offset, 8)?;
@@ -209,7 +284,6 @@ impl<'a> HipcRequest<'a> {
             (None, 0, 0)
         };
 
-        let handle_offset = offset;
         let (copy_handles, next) = decode_words(raw, offset, copy_handle_count)?;
         offset = next;
         let (move_handles, next) = decode_words(raw, offset, move_handle_count)?;
@@ -228,23 +302,18 @@ impl<'a> HipcRequest<'a> {
         if data_end > raw.len() {
             return Err(MessageError("HIPC data words exceed the command buffer"));
         }
-        offset = data_end;
         let receive_statics = match receive_static_mode {
             0 => ReceiveStatics::None,
-            1 => return Err(MessageError("HIPC receive-static mode 1 is reserved")),
-            2 => ReceiveStatics::Auto,
-            mode => {
-                let count = mode - 2;
-                let (entries, next) = decode_receive_statics(raw, offset, count)?;
-                offset = next;
+            1 => ReceiveStatics::MessageBuffer,
+            _ => {
+                // As Eden's HLE parser, expose the single-buffer mode as its
+                // one actual entry instead of inventing an empty "auto" list.
+                // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/hle_ipc.cpp#L225-L246
+                let list = header.receive_list(data_end, raw.len())?;
+                let (entries, _) = decode_receive_statics(raw, list.start, list.len() / 8)?;
                 ReceiveStatics::Entries(entries)
             }
         };
-        if offset > raw.len() {
-            return Err(MessageError(
-                "HIPC receive-static list exceeds the command buffer",
-            ));
-        }
 
         Ok(Self {
             command_type,
@@ -257,14 +326,9 @@ impl<'a> HipcRequest<'a> {
             exchange_buffers,
             receive_statics,
             raw,
-            handle_offset,
             data_offset: data_end - data_size,
             data_end,
         })
-    }
-
-    pub(crate) const fn handle_offset(&self) -> usize {
-        self.handle_offset
     }
 
     fn aligned_data(&self) -> Result<&'a [u8], MessageError> {
@@ -765,6 +829,76 @@ fn align_up(value: usize, alignment: usize) -> Result<usize, MessageError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn inline_receive_mode_does_not_require_an_external_receive_list() {
+        let mut bytes = [0; 8];
+        put_word(&mut bytes, 0, 4);
+        put_word(&mut bytes, 4, 1 << 10);
+        let request = HipcRequest::decode(&bytes).unwrap();
+        assert_eq!(request.data_word_bytes(), 0);
+        assert_eq!(request.receive_statics, ReceiveStatics::MessageBuffer);
+    }
+
+    #[test]
+    fn receive_metadata_must_fit_its_buffer_and_may_overlap_inline_data() {
+        let mut bytes = [0; 136];
+        put_word(&mut bytes, 0, 4);
+        put_word(&mut bytes, 4, 8 | (3 << 10) | (32 << 20));
+        bytes[128..136].copy_from_slice(&(0x1234_u64 | (0x80_u64 << 48)).to_le_bytes());
+        let expected = ReceiveStatics::Entries(vec![ReceiveStaticDescriptor {
+            address: 0x1234,
+            size: 0x80,
+        }]);
+        assert_eq!(
+            HipcRequest::decode(&bytes).unwrap().receive_statics,
+            expected
+        );
+        assert!(HipcRequest::decode(&bytes[..135]).is_err());
+        put_word(&mut bytes, 4, 8 | (2 << 10));
+        assert!(HipcRequest::decode(&bytes[..40]).is_err());
+        bytes[40..48].copy_from_slice(&(0x1234_u64 | (0x80_u64 << 48)).to_le_bytes());
+        assert_eq!(
+            HipcRequest::decode(&bytes[..48]).unwrap().receive_statics,
+            expected
+        );
+        put_word(&mut bytes, 4, 8 | (3 << 10) | (4 << 20));
+        bytes[16..24].copy_from_slice(&(0x1234_u64 | (0x80_u64 << 48)).to_le_bytes());
+        assert_eq!(
+            HipcRequest::decode(&bytes[..40]).unwrap().receive_statics,
+            expected
+        );
+    }
+
+    #[test]
+    fn transport_size_covers_headers_descriptors_and_data_but_excludes_receive_list_and_capacity() {
+        let mut bytes = [0; 0x100];
+        put_word(
+            &mut bytes,
+            0,
+            4 | (1 << 16) | (1 << 20) | (1 << 24) | (1 << 28),
+        );
+        put_word(&mut bytes, 4, 4 | (3 << 10) | (1 << 31));
+        put_word(&mut bytes, 8, 1 | (2 << 1) | (1 << 5));
+        let decoded = HipcRequest::decode(&bytes).unwrap();
+        let header = HipcHeader::decode(&bytes).unwrap();
+        assert_eq!(header.message_size(bytes.len()), Ok(92));
+        assert_eq!(header.receive_list(92, bytes.len()), Ok(92..100));
+        assert!(header.receive_list(92, 99).is_err());
+        assert!(
+            matches!(decoded.receive_statics, ReceiveStatics::Entries(ref entries) if entries.len() == 1)
+        );
+    }
+
+    #[test]
+    fn user_message_layout_accepts_large_inline_data_and_rejects_truncated_spans() {
+        let mut bytes = vec![0; 0x1000];
+        put_word(&mut bytes, 0, 4);
+        put_word(&mut bytes, 4, 300);
+        let header = HipcHeader::decode(&bytes).unwrap();
+        assert_eq!(header.message_size(bytes.len()), Ok(1208));
+        assert!(header.message_size(1207).is_err());
+    }
+
     fn put_word(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
@@ -936,14 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reserved_modes_bad_counts_and_truncated_tables() {
-        let mut reserved = [0_u8; 8];
-        put_word(&mut reserved, 4, 1 << 10);
-        assert_eq!(
-            HipcRequest::decode(&reserved).unwrap_err(),
-            MessageError("HIPC receive-static mode 1 is reserved")
-        );
-
+    fn rejects_bad_counts_and_truncated_tables() {
         let mut truncated = [0_u8; 12];
         put_word(&mut truncated, 0, 1 << 20);
         assert_eq!(

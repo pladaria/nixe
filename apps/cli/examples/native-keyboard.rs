@@ -20,8 +20,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frontend = nixe_gpu_maxwell::MaxwellNativeFrontend::new(
         renderer.device_profile().shader_compiler.clone(),
     );
+    let kernel = nixe_scheduler::SchedulerState::new(
+        nixe_horizon::switch_1_scheduler_profile(),
+        nixe_runtime::VirtualClock::default(),
+    );
     let video = nixe_horizon::VideoSystem::with_gpu_frontend(
         memory,
+        &kernel,
         Some(window.mailbox()),
         renderer,
         frontend,

@@ -18,7 +18,7 @@ fn user_registration_is_unavailable_and_validates_the_pid_placeholder() {
     for invalid in [false, true] {
         put_u32(&mut request, 48, u32::from(invalid));
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), handle);
+        process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -55,7 +55,7 @@ fn last_opened_user_returns_the_application_launch_uid() {
     put_u32(&mut request, 16, 0x4943_4653);
     put_u32(&mut request, 24, 4);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -86,7 +86,7 @@ fn user_existence_distinguishes_the_local_uid_from_absent_users() {
         put_u32(&mut request, 24, 1);
         request[32..48].copy_from_slice(&uid.to_le_bytes());
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), handle);
+        process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -115,7 +115,7 @@ fn account_switch_lock_uses_application_policy_instead_of_user_count() {
         put_u32(&mut request, 16, 0x4943_4653);
         put_u32(&mut request, 24, 150);
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), handle);
+        process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -128,7 +128,7 @@ fn account_switch_lock_uses_application_policy_instead_of_user_count() {
 
         put_u32(&mut request, 32, 1);
         write_guest_bytes(&process, tls, &request);
-        state(&mut process).write_w(x(0), handle);
+        process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -153,7 +153,7 @@ fn application_info_v2_requires_a_pid_and_zero_placeholder() {
     put_u32(&mut request, 32, 0x4943_4653);
     put_u32(&mut request, 40, 160);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -162,7 +162,7 @@ fn application_info_v2_requires_a_pid_and_zero_placeholder() {
 
     put_u32(&mut request, 48, 1);
     write_guest_bytes(&process, tls, &request);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -193,7 +193,7 @@ fn account_pointer_budget_and_enumeration_agree_with_the_opened_profile() {
     put_u32(&mut query, 16, 0x4943_4653);
     put_u32(&mut query, 24, 3);
     write_guest_bytes(&process, tls, &query);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -208,7 +208,7 @@ fn account_pointer_budget_and_enumeration_agree_with_the_opened_profile() {
         put_u64(&mut list, 40, destination.get() | (128_u64 << 48));
         write_guest_bytes(&process, destination, &[0xff; 128]);
         write_guest_bytes(&process, tls, &list);
-        state(&mut process).write_w(x(0), handle);
+        process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
@@ -225,7 +225,7 @@ fn account_pointer_budget_and_enumeration_agree_with_the_opened_profile() {
     put_u32(&mut open, 24, 5);
     open[32..48].copy_from_slice(&1_u128.to_le_bytes());
     write_guest_bytes(&process, tls, &open);
-    state(&mut process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed
@@ -244,7 +244,7 @@ fn account_pointer_budget_and_enumeration_agree_with_the_opened_profile() {
     put_u32(&mut get, 16, 0x4943_4653);
     put_u32(&mut get, 24, 1);
     write_guest_bytes(&process, tls, &get);
-    state(&mut process).write_w(x(0), profile);
+    process.main_thread().registers().write_w(x(0), profile);
     assert!(matches!(
         dispatch_next(&mut process, &mut dispatcher),
         ExceptionHandlingResult::Resumed

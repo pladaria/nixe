@@ -26,10 +26,14 @@ fn interrupted_sdk_critical_section_runs_to_its_release_before_a_higher_priority
     let entry = instruction_address(&process);
     let tls = process.main_thread().tls_base;
     let work = process.main_thread().stack_bottom;
-    state(&mut process).write_x(x(2), work.get());
+    process.main_thread().registers().write_x(x(2), work.get());
     process
-        .coordinator_mut()
-        .set_thread_priority(Some(main), main.get(), 52)
+        .scheduler()
+        .set_priority(
+            nixe_scheduler::GuestThreadId::new(main.get()),
+            52,
+            Some(main),
+        )
         .unwrap();
     let (higher, _) = super::mutex::add_thread(&mut process, entry + 9 * 4, 51);
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -52,10 +56,7 @@ fn interrupted_sdk_critical_section_runs_to_its_release_before_a_higher_priority
             "native critical section did not start"
         );
     }
-    process
-        .coordinator_mut()
-        .start_thread(higher.get())
-        .unwrap();
+    process.thread(higher).unwrap().start().unwrap();
 
     let interrupted = process
         .coordinator_mut()
@@ -141,12 +142,15 @@ fn synchronize_preemption_state_without_a_pin_preserves_tls_and_all_registers() 
         &0x0001_0002_u32.to_le_bytes(),
     );
     for i in 0..31 {
-        state(&mut process).write_x(x(i), 0x1234_5678_0000_0000 | u64::from(i));
+        process
+            .main_thread()
+            .registers()
+            .write_x(x(i), 0x1234_5678_0000_0000 | u64::from(i));
     }
-    let original = state(&mut process).register_context();
+    let original = process.main_thread().registers().register_context();
     let (_, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
     assert!(matches!(handling, ExceptionHandlingResult::Resumed));
-    let after = state(&mut process).register_context();
+    let after = process.main_thread().registers().register_context();
     assert_eq!(after.x, original.x);
     assert_eq!(after.sp, original.sp);
     assert_eq!(after.nzcv, original.nzcv);
@@ -154,12 +158,6 @@ fn synchronize_preemption_state_without_a_pin_preserves_tls_and_all_registers() 
     assert_eq!(
         read_guest_u32(&process, tls.checked_add(0x100).unwrap()),
         0x0001_0002
-    );
-    assert!(
-        dispatcher
-            .coverage()
-            .iter()
-            .any(|entry| entry.immediate == 0x36 && entry.support == HorizonSvcSupport::Complete)
     );
 }
 
@@ -170,7 +168,7 @@ fn synchronization_does_not_clear_another_threads_pin_or_interrupt_flag() {
     let process_id = process.scheduler_process_id();
     let entry = instruction_address(&process);
     let (peer, _) = super::mutex::add_thread(&mut process, entry + 4, 52);
-    process.coordinator_mut().start_thread(peer.get()).unwrap();
+    process.thread(peer).unwrap().start().unwrap();
     let peer_tls = process.thread(peer).unwrap().tls_base;
     write_guest_bytes(
         &process,
@@ -247,12 +245,12 @@ fn deferred_flag_clear_retains_the_pin_until_completion_and_preserves_void_regis
     for succeeds in [true, false] {
         let (_directory, mut process) = fixture_process(&[svc(0x36)]);
         let ingress = process.coordinator_mut().event_sender();
-        let mut dispatcher = support::dispatcher(&process).with_memory_completions(ingress.clone());
+        let mut dispatcher = support::dispatcher(&process).with_input_completions(ingress.clone());
         let main = process.main_thread_id();
         let process_id = process.scheduler_process_id();
         let flag = process.main_thread().tls_base.checked_add(0x102).unwrap();
         write_guest_bytes(&process, flag, &1u16.to_le_bytes());
-        state(&mut process).write_x(x(0), 0x12345678);
+        process.main_thread().registers().write_x(x(0), 0x12345678);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let execution = loop {
             if let Some(execution) = process
@@ -372,7 +370,7 @@ fn thread_activity_and_affinity_wait_for_the_targets_real_unpin() {
             svc(0x0a),
         ]);
         let mut dispatcher = fixed_time_dispatcher(&process)
-            .with_memory_completions(process.coordinator_mut().event_sender());
+            .with_input_completions(process.coordinator_mut().event_sender());
         let main = process.main_thread_id();
         let entry = instruction_address(&process);
         let gate = process.main_thread().stack_bottom;
@@ -396,22 +394,22 @@ fn thread_activity_and_affinity_wait_for_the_targets_real_unpin() {
             &0x0001_0002u32.to_le_bytes(),
         );
         process
-            .thread_mut(target)
+            .thread(target)
             .unwrap()
-            .state_mut()
+            .registers()
             .write_x(x(2), gate.get());
-        process
-            .coordinator_mut()
-            .start_thread(target.get())
-            .unwrap();
+        process.thread(target).unwrap().start().unwrap();
         process
             .coordinator_mut()
             .scheduler()
             .pin_thread(VirtualCpuId::new(0), target)
             .unwrap();
-        state(&mut process).write_x(x(0), u64::from(handle));
-        state(&mut process).write_x(x(1), 1);
-        state(&mut process).write_x(x(2), 2);
+        process
+            .main_thread()
+            .registers()
+            .write_x(x(0), u64::from(handle));
+        process.main_thread().registers().write_x(x(1), 1);
+        process.main_thread().registers().write_x(x(2), 2);
         let (caller, handling) = next_call(&mut process, &mut dispatcher);
         assert_eq!(caller, main);
         assert!(matches!(handling, ExceptionHandlingResult::Suspended));
@@ -527,14 +525,15 @@ fn competing_thread_properties_serialize_through_unpin_and_publish_results_once(
                 &0x0001_0002u32.to_le_bytes(),
             );
             process
-                .thread_mut(target)
+                .thread(target)
                 .unwrap()
-                .state_mut()
+                .registers()
                 .write_x(x(2), gate.get());
-            state(&mut process).write_w(x(0), handle);
-            state(&mut process).write_x(x(1), 1);
-            state(&mut process).write_x(x(2), 2);
-            let second_state = process.thread_mut(second).unwrap().state_mut();
+            process.main_thread().registers().write_w(x(0), handle);
+            process.main_thread().registers().write_x(x(1), 1);
+            process.main_thread().registers().write_x(x(2), 2);
+            let second_state_thread = process.thread(second).unwrap();
+            let mut second_state = second_state_thread.registers();
             second_state.write_x(
                 x(0),
                 if context_query {
@@ -554,24 +553,19 @@ fn competing_thread_properties_serialize_through_unpin_and_publish_results_once(
                 },
             );
             second_state.write_x(x(2), if operation == "preserve" { 3 } else { 1 });
-            process
-                .coordinator_mut()
-                .start_thread(target.get())
-                .unwrap();
+            drop(second_state);
+            process.thread(target).unwrap().start().unwrap();
             process
                 .coordinator_mut()
                 .scheduler()
                 .pin_thread(VirtualCpuId::new(0), target)
                 .unwrap();
             let mut dispatcher = fixed_time_dispatcher(&process)
-                .with_memory_completions(process.coordinator_mut().event_sender());
+                .with_input_completions(process.coordinator_mut().event_sender());
             let (caller, handling) = next_call(&mut process, &mut dispatcher);
             assert_eq!(caller, main);
             assert!(matches!(handling, ExceptionHandlingResult::Suspended));
-            process
-                .coordinator_mut()
-                .start_thread(second.get())
-                .unwrap();
+            process.thread(second).unwrap().start().unwrap();
             let (caller, handling) = next_call(&mut process, &mut dispatcher);
             assert_eq!(caller, second);
             assert!(matches!(handling, ExceptionHandlingResult::Suspended));
@@ -599,12 +593,10 @@ fn competing_thread_properties_serialize_through_unpin_and_publish_results_once(
             );
             assert_eq!(read_guest_bytes(&process, output, 0x320), [0xaa; 0x320]);
             // Both accepted operations retain their actual target across close.
-            let object = process.thread(target).unwrap().object();
+            let object = process.thread(target).unwrap().clone();
             let target_lifetime = std::sync::Arc::downgrade(&object);
             drop(object);
-            let original = process.thread(target).unwrap().handle;
             drop(process.handles().close(handle).unwrap());
-            drop(process.handles().close(original).unwrap());
             if stop {
                 process
                     .coordinator_mut()
@@ -670,9 +662,9 @@ fn competing_thread_properties_serialize_through_unpin_and_publish_results_once(
                 );
             }
             assert_eq!(read_abi_register(&process, 0), 0);
-            assert_eq!(process.thread(second).unwrap().state().read_x(x(0)), 0);
-            assert_eq!(process.thread(main).unwrap().state().pc(), entry + 4);
-            assert_eq!(process.thread(second).unwrap().state().pc(), entry + 64);
+            assert_eq!(process.thread(second).unwrap().registers().read_x(x(0)), 0);
+            assert_eq!(process.thread(main).unwrap().registers().pc(), entry + 4);
+            assert_eq!(process.thread(second).unwrap().registers().pc(), entry + 64);
             let scheduler = process.coordinator_mut().scheduler();
             assert_eq!(scheduler.thread(main).unwrap().effective_priority, 44);
             let target_info = scheduler.thread(target).unwrap();

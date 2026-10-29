@@ -12,7 +12,7 @@ pub(crate) enum NamedPortResult {
 }
 
 pub(crate) fn connect_to_named_port(
-    process: &mut nixe_runtime::ExceptionProcessContext<'_>,
+    process: &nixe_runtime::RunnableProcess,
     name: &[u8],
 ) -> NamedPortResult {
     if name != b"sm:" {

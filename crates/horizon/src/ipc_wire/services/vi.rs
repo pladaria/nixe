@@ -213,7 +213,7 @@ pub(in crate::ipc_wire) async fn dispatch_vi(
                     let Some(layer_id) = request_u64(request.data, 0x40) else {
                         return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                     };
-                    let descriptor = one_receive_buffer(hipc)?;
+                    let descriptor = one_receive_buffer(process, hipc)?;
                     let Some(layer) = session.open_layer(layer_id) else {
                         return cmif_error(
                             request.token,
@@ -242,7 +242,7 @@ pub(in crate::ipc_wire) async fn dispatch_vi(
                             HorizonIpcResult::SF_PRECONDITION_VIOLATION,
                         );
                     };
-                    let descriptor = one_receive_buffer(hipc)?;
+                    let descriptor = one_receive_buffer(process, hipc)?;
                     let native_window = crate::graphics::encode_native_window(layer.binder_id);
                     write_descriptor_bytes(process, descriptor, &native_window).await?;
                     let mut data = Vec::with_capacity(16);
@@ -413,7 +413,7 @@ pub(in crate::ipc_wire) async fn dispatch_vi(
                         );
                     };
                     if command == ManagerDisplayCommand::CreateStray {
-                        let descriptor = one_receive_buffer(hipc)?;
+                        let descriptor = one_receive_buffer(process, hipc)?;
                         let native_window = crate::graphics::encode_native_window(layer.binder_id);
                         write_descriptor_bytes(process, descriptor, &native_window).await?;
                         let mut data = Vec::with_capacity(16);
@@ -480,17 +480,12 @@ async fn dispatch_binder_relay(
             let Some(code) = request_u32(request.data, 4) else {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             };
-            let input = one_send_buffer(hipc)?;
-            let output = one_receive_buffer(hipc)?;
+            let input = one_send_buffer(process, hipc)?;
+            let output = one_receive_buffer(process, hipc)?;
             let input_size = usize::try_from(input.size)
                 .map_err(|_| IpcWireError::Malformed("Binder input buffer is too large"))?;
             let mut encoded = vec![0_u8; input_size];
-            read_bytes(
-                process,
-                GuestVirtualAddress::new(input.address),
-                &mut encoded,
-            )
-            .await?;
+            process.read(input, 0, &mut encoded).await?;
             let transaction =
                 video
                     .transact_binder(binder_id, code, &encoded)

@@ -1014,7 +1014,8 @@ impl MaxwellThreeDMmeState {
     pub(super) fn track_shadow_register(
         &mut self,
         control: Option<MaxwellThreeDMmeShadowRamControl>,
-        source: MaxwellMethodSource,
+        method: GpuMethodId,
+        argument: u32,
     ) {
         // Public Maxwell implementations agree that TrackWithFilter follows
         // Track for ordinary class-register writes; the undocumented filter
@@ -1023,9 +1024,12 @@ impl MaxwellThreeDMmeState {
         if control.is_some_and(|mode| mode.tracks()) {
             // PFIFO/MME methods index the same fixed 12-bit register file as
             // the live state. Replay consumes only the tracked value.
-            self.shadow_registers
-                .write(source.method(), source.argument());
+            self.write_shadow_register(method, argument);
         }
+    }
+
+    pub(super) fn write_shadow_register(&mut self, method: GpuMethodId, argument: u32) {
+        self.shadow_registers.write(method, argument);
     }
 
     #[must_use]

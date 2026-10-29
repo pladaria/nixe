@@ -2,7 +2,6 @@
 
 use crate::IpcRequest;
 use crate::ipc_wire::IpcWireError;
-use crate::ipc_wire::buffer::one_receive_buffer;
 use crate::ipc_wire::io::{has_ipc_descriptors, request_u64};
 use crate::ipc_wire::message::{CmifRequest, HipcRequest};
 
@@ -30,7 +29,16 @@ pub(super) async fn decode(
             let requested = usize::try_from(requested).map_err(|_| {
                 IpcWireError::Malformed("storage read request size is out of range")
             })?;
-            let descriptor = one_receive_buffer(hipc)?;
+            let [descriptor] = hipc.receive_buffers.as_slice() else {
+                return Err(IpcWireError::Malformed(
+                    "service command requires exactly one output buffer",
+                ));
+            };
+            if descriptor.size == 0 {
+                return Err(IpcWireError::Malformed(
+                    "service command requires a nonempty output buffer",
+                ));
+            }
             let capacity = usize::try_from(descriptor.size)
                 .map_err(|_| IpcWireError::Malformed("storage output buffer is too large"))?;
             if requested > capacity {

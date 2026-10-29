@@ -1,23 +1,17 @@
-//! Consume live contiguous command RAM; gather scattered/device sources once.
+//! Consume one accepted entry with a compact DMA cursor.
 use super::*;
 use crate::MaxwellResolvedRange;
-
-/// Reusable storage owned by the GPU command processor, never a native worker.
 #[derive(Default)]
 pub struct MaxwellCommandSourceScratch {
     bytes: Vec<u8>,
 }
 impl MaxwellCommandSourceScratch {
-    /// Keep the largest completed scratch when another channel ran during a wait.
     pub fn recycle(&mut self, completed: Self) {
         if completed.bytes.capacity() > self.bytes.capacity() {
             *self = completed;
         }
     }
 }
-
-/// One entry's live physical storage or coherent gathered bytes. A borrowed
-/// method span cannot outlive this owner or its physical pin.
 pub(crate) enum EntryWords {
     Ram {
         address: nixe_memory::HostAddress,
@@ -25,37 +19,120 @@ pub(crate) enum EntryWords {
     },
     Gathered(Vec<u8>),
 }
-impl EntryWords {
-    pub(crate) fn read(&self, offset: usize) -> u32 {
-        match self {
-            Self::Ram { address, .. } => {
-                // SAFETY: the parser bounds each borrowed span by the pinned
-                // entry and reads owned scalars without forming RAM references.
-                unsafe { address.read_u32(offset) }
-            }
-            Self::Gathered(bytes) => {
-                u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-            }
-        }
-    }
-}
-
-/// Hardware packet continuation and the current entry; no future entry is read.
 #[derive(Default)]
 pub(crate) struct CommandStream {
     next_entry: usize,
     entry: usize,
+    origin: Option<MaxwellGpfifoSourceLocation>,
     offset: usize,
     end: usize,
-    segment: usize,
     direct: Option<crate::MaxwellResolvedMapping>,
     source: Option<MaxwellResolvedRange>,
     words: Option<EntryWords>,
+    address: Option<nixe_memory::HostAddress>,
     packet: Option<MethodHeader>,
     consumed: u16,
-    immediate: Option<MaxwellDecodedMethodPacket>,
+    current: Option<MethodHeader>,
+    last: bool,
+    header_offset: usize,
+    header_origin: Option<MaxwellGpfifoSourceLocation>,
+    #[cfg(test)]
+    locations: Vec<MaxwellGpfifoSourceLocation>,
 }
 impl CommandStream {
+    fn set_words(&mut self, words: EntryWords) {
+        self.address = Some(match &words {
+            EntryWords::Ram { address, .. } => *address,
+            EntryWords::Gathered(bytes) => {
+                nixe_memory::HostAddress::from_pointer(bytes.as_ptr().cast_mut())
+            }
+        });
+        self.words = Some(words);
+    }
+    fn retain_header_location(&mut self) {
+        if self.packet.is_some() && self.header_origin.is_none() {
+            self.header_origin = Some(self.location_at(self.header_offset));
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture(packet: PacketView<'_>) -> Self {
+        let (origin, words) = match packet {
+            PacketView::Control { operation, source } => {
+                let word = match operation {
+                    MaxwellPushbufferControl::Nop => 0,
+                    MaxwellPushbufferControl::EndSegment => 7 << 29,
+                    MaxwellPushbufferControl::SetSubdeviceMask(mask) => {
+                        (1 << 16) | u32::from(mask) << 4
+                    }
+                    MaxwellPushbufferControl::StoreSubdeviceMask(mask) => {
+                        (2 << 16) | u32::from(mask) << 4
+                    }
+                    MaxwellPushbufferControl::UseSubdeviceMask => 3 << 16,
+                };
+                (source, vec![word])
+            }
+            PacketView::Methods {
+                header,
+                subchannel,
+                methods,
+                last,
+            } => {
+                let first = methods.first();
+                let mode = if methods.is_empty() {
+                    MaxwellMethodPacketMode::Incrementing
+                } else {
+                    methods.mode()
+                };
+                let opcode = match mode {
+                    MaxwellMethodPacketMode::Incrementing => 1,
+                    MaxwellMethodPacketMode::NonIncrementing => 3,
+                    MaxwellMethodPacketMode::Immediate => 4,
+                    MaxwellMethodPacketMode::IncrementOnce => 5,
+                };
+                let immediate = mode == MaxwellMethodPacketMode::Immediate;
+                let count = if immediate {
+                    first.unwrap().argument()
+                } else {
+                    (methods.len() + usize::from(!last)) as u32
+                };
+                let method = first.map_or(0, |m| m.method().0 / 4);
+                let word = (opcode << 29)
+                    | (count << 16)
+                    | (u32::from(subchannel.map_or(0, |s| s.get())) << 13)
+                    | method;
+                let mut words = vec![word];
+                if !immediate {
+                    words.extend(methods.arguments());
+                }
+                let origin = first.map_or(header, |first| {
+                    let mut source = first.argument_source();
+                    if !immediate {
+                        source.word_offset -= 1;
+                    }
+                    source
+                });
+                (origin, words)
+            }
+        };
+        Self::fixture_words(origin, &words)
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_words(origin: MaxwellGpfifoSourceLocation, words: &[u32]) -> Self {
+        let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let mut stream = Self {
+            origin: Some(origin),
+            end: bytes.len(),
+            ..Self::default()
+        };
+        stream.set_words(EntryWords::Gathered(bytes));
+        stream
+    }
+    #[cfg(test)]
+    pub(crate) fn rewind(&mut self) {
+        self.offset = 0;
+        self.packet = None;
+        self.consumed = 0;
+    }
     pub(crate) fn needs_entry(&self) -> bool {
         self.offset == self.end
     }
@@ -77,8 +154,8 @@ impl CommandStream {
         scratch: &mut MaxwellCommandSourceScratch,
         host: &mut H,
     ) -> Result<bool, MaxwellGpfifoSourceError> {
-        if let Some(EntryWords::Gathered(mut bytes)) = self.words.take() {
-            bytes.clear();
+        self.retain_header_location();
+        if let Some(EntryWords::Gathered(bytes)) = self.words.take() {
             scratch.bytes = bytes;
         }
         self.direct = None;
@@ -88,7 +165,6 @@ impl CommandStream {
             self.next_entry += 1;
             self.offset = 0;
             self.end = entry.byte_count() as usize;
-            self.segment = 0;
             if self.end == 0 {
                 continue;
             }
@@ -103,8 +179,17 @@ impl CommandStream {
                     error,
                 })?
             {
+                self.origin = Some(MaxwellGpfifoSourceLocation {
+                    channel: submission.channel(),
+                    frontend: submission.frontend(),
+                    entry_index: self.entry as u32,
+                    pushbuffer: entry.address(),
+                    word_offset: 0,
+                    mapping: segment.mapping().id(),
+                    generation: segment.mapping().generation(),
+                });
                 self.direct = Some(segment);
-                self.words = Some(EntryWords::Ram { address, _pin: pin });
+                self.set_words(EntryWords::Ram { address, _pin: pin });
                 return Ok(true);
             }
             let source = memory
@@ -134,17 +219,16 @@ impl CommandStream {
                 mapping: first.mapping().id(),
                 generation: first.mapping().generation(),
             };
-            self.words = Some(
+            self.set_words(
                 if let Some((address, pin)) = memory
                     .command_ram(&source)
                     .map_err(|error| MaxwellGpfifoSourceError::Access { location, error })?
                 {
                     EntryWords::Ram { address, _pin: pin }
                 } else {
-                    scratch.bytes.clear();
                     scratch
                         .bytes
-                        .try_reserve(self.end)
+                        .try_reserve(self.end.saturating_sub(scratch.bytes.len()))
                         .map_err(|_| MaxwellGpfifoSourceError::ResourceExhausted)?;
                     scratch.bytes.resize(self.end, 0);
                     memory
@@ -156,92 +240,93 @@ impl CommandStream {
                 },
             );
             self.source = Some(source);
+            self.origin = Some(location);
             return Ok(true);
         }
         Ok(false)
     }
-    fn location(
-        &mut self,
-        submission: &MaxwellValidatedGpfifoSubmission,
-    ) -> (MaxwellGpfifoSourceLocation, usize) {
-        let entry = submission.decoded().entries()[self.entry];
-        let address = entry.address().get() + self.offset as u64;
-        let segments = if let Some(segment) = &self.direct {
-            std::slice::from_ref(segment)
-        } else {
-            self.source.as_ref().unwrap().segments()
-        };
-        while address >= segments[self.segment].gpu_offset().get() + segments[self.segment].size() {
-            self.segment += 1;
+
+    pub(super) fn location_at(&self, offset: usize) -> MaxwellGpfifoSourceLocation {
+        #[cfg(test)]
+        if let Some(source) = self.locations.get(offset / 4) {
+            return *source;
         }
-        let segment = &segments[self.segment];
-        let mapping = segment.mapping();
-        (
-            MaxwellGpfifoSourceLocation {
-                channel: submission.channel(),
-                frontend: submission.frontend(),
-                entry_index: self.entry as u32,
-                pushbuffer: entry.address(),
-                word_offset: self.offset as u64 / 4,
-                mapping: mapping.id(),
-                generation: mapping.generation(),
-            },
-            (segment.gpu_offset().get() + segment.size() - address) as usize / 4,
+        let mut origin = self.origin.unwrap();
+        origin.word_offset += offset as u64 / 4;
+        if let Some(range) = &self.source {
+            let address = origin.pushbuffer.get() + offset as u64;
+            let segments = range.segments();
+            let index = segments.partition_point(|s| s.gpu_offset().get() + s.size() <= address);
+            origin.mapping = segments[index].mapping().id();
+            origin.generation = segments[index].mapping().generation();
+        }
+        origin
+    }
+    pub(crate) fn header_location(&self) -> MaxwellGpfifoSourceLocation {
+        self.header_origin
+            .unwrap_or_else(|| self.location_at(self.header_offset))
+    }
+    pub(crate) fn last(&self) -> bool {
+        self.last
+    }
+    pub(crate) fn subchannel(&self) -> Option<MaxwellPushbufferSubchannel> {
+        self.current.unwrap().subchannel
+    }
+    pub(crate) fn methods(&self) -> MaxwellMethodSpan<'_> {
+        let current = self.current.as_ref().unwrap();
+        let address = if current.mode == MaxwellMethodPacketMode::Immediate {
+            nixe_memory::HostAddress::from_pointer(
+                (&current.immediate as *const u32).cast_mut().cast(),
+            )
+        } else {
+            nixe_memory::HostAddress::from_pointer(unsafe {
+                self.address.unwrap().as_ptr().add(current.offset)
+            })
+        };
+        MaxwellMethodSpan::live(
+            self,
+            address,
+            current.offset,
+            current.count as usize,
+            current.first,
+            current.mode,
         )
     }
-    pub(crate) fn next<'a>(
-        &'a mut self,
-        submission: &MaxwellValidatedGpfifoSubmission,
-        budget: usize,
-    ) -> Result<(PacketView<'a>, usize), MaxwellPushbufferDecodeError> {
-        self.next_at(budget, |stream| stream.location(submission))
+    pub(super) fn gathered_bytes(&self, begin: usize, end: usize) -> Option<&[u8]> {
+        if self.current.unwrap().mode == MaxwellMethodPacketMode::Immediate {
+            return None;
+        }
+        match self.words.as_ref().unwrap() {
+            EntryWords::Gathered(bytes) => Some(&bytes[begin..end]),
+            _ => None,
+        }
     }
-    fn next_at<'a>(
-        &'a mut self,
-        budget: usize,
-        mut location: impl FnMut(&mut Self) -> (MaxwellGpfifoSourceLocation, usize),
-    ) -> Result<(PacketView<'a>, usize), MaxwellPushbufferDecodeError> {
-        let mut header_words = 0;
+    /// Advance hardware packet state in place; ordinary packets return no object.
+    pub(crate) fn next(
+        &mut self,
+    ) -> Result<Option<MaxwellPushbufferControl>, MaxwellPushbufferDecodeError> {
         if self.packet.is_none() {
-            let (source, _) = location(self);
-            let word =
-                MaxwellPushbufferWord::new(self.words.as_ref().unwrap().read(self.offset), source);
+            self.header_offset = self.offset;
+            self.header_origin = None;
+            // SAFETY: the entry and its complete word count were accepted before
+            // entering this loop. No reference to mutable guest RAM is formed.
+            let word = unsafe { self.address.unwrap().read_u32(self.offset) };
+            let header = decode_header(word, self.offset, || self.location_at(self.offset))?;
             self.offset += 4;
-            header_words = 1;
-            match decode_header(word)? {
+            match header {
                 Header::Control(operation) => {
                     if operation == MaxwellPushbufferControl::EndSegment {
                         self.offset = self.end;
                     }
-                    return Ok((PacketView::Control { operation, source }, 1));
+                    self.current = None;
+                    return Ok(Some(operation));
                 }
                 Header::Methods(header)
                     if header.mode == MaxwellMethodPacketMode::Immediate || header.count == 0 =>
                 {
-                    self.immediate = Some(MaxwellDecodedMethodPacket {
-                        mode: header.mode,
-                        header: source,
-                        subchannel: header.subchannel,
-                        methods: if header.count == 0 {
-                            PacketMethods::Empty
-                        } else {
-                            PacketMethods::One(MaxwellDecodedMethod {
-                                method: method_id(header.first),
-                                argument: header.immediate,
-                                argument_source: source,
-                            })
-                        },
-                    });
-                    let packet = self.immediate.as_ref().unwrap();
-                    return Ok((
-                        PacketView::Methods {
-                            header: source,
-                            subchannel: packet.subchannel,
-                            methods: packet.methods(),
-                            last: true,
-                        },
-                        1,
-                    ));
+                    self.current = Some(header);
+                    self.last = true;
+                    return Ok(None);
                 }
                 Header::Methods(header) => {
                     self.packet = Some(header);
@@ -250,79 +335,43 @@ impl CommandStream {
             }
         }
         let header = self.packet.unwrap();
-        // A header at an entry's end does not authorize reading the next entry.
-        // Return an empty fragment so the owner can consume pending effects first.
-        if self.offset == self.end || budget == header_words {
-            self.immediate = Some(MaxwellDecodedMethodPacket {
-                mode: header.mode,
-                header: header.source,
-                subchannel: header.subchannel,
-                methods: PacketMethods::Empty,
-            });
-            return Ok((
-                PacketView::Methods {
-                    header: header.source,
-                    subchannel: header.subchannel,
-                    methods: self.immediate.as_ref().unwrap().methods(),
-                    last: false,
-                },
-                header_words,
-            ));
-        }
-        let (source, available) = location(self);
-        let count = usize::from(header.count - self.consumed)
-            .min(available)
-            .min((self.end - self.offset) / 4)
-            .min(budget - header_words);
-        let offset = self.offset;
+        let count = usize::from(header.count - self.consumed).min((self.end - self.offset) / 4);
+        self.current = Some(MethodHeader {
+            offset: self.offset,
+            first: method_dword(header.mode, header.first, self.consumed),
+            count: count as u16,
+            mode: if header.mode == MaxwellMethodPacketMode::IncrementOnce && self.consumed > 0 {
+                MaxwellMethodPacketMode::NonIncrementing
+            } else {
+                header.mode
+            },
+            ..header
+        });
         self.offset += count * 4;
-        let first = method_dword(header.mode, header.first, self.consumed);
-        let mode = if header.mode == MaxwellMethodPacketMode::IncrementOnce && self.consumed > 0 {
-            MaxwellMethodPacketMode::NonIncrementing
-        } else {
-            header.mode
-        };
         self.consumed += count as u16;
-        let last = self.consumed == header.count;
-        if last {
+        self.last = self.consumed == header.count;
+        if self.last {
             self.packet = None;
         }
-        Ok((
-            PacketView::Methods {
-                header: header.source,
-                subchannel: header.subchannel,
-                methods: MaxwellMethodSpan::live(
-                    self.words.as_ref().unwrap(),
-                    offset,
-                    count,
-                    first,
-                    mode,
-                    source,
-                ),
-                last,
-            },
-            count + header_words,
-        ))
+        Ok(None)
     }
     pub(crate) fn finish(
         &mut self,
         scratch: &mut MaxwellCommandSourceScratch,
     ) -> Result<(), MaxwellPushbufferDecodeError> {
-        if let Some(EntryWords::Gathered(mut bytes)) = self.words.take() {
-            bytes.clear();
-            scratch.bytes = bytes;
-        }
         if let Some(header) = self.packet {
             return Err(MaxwellPushbufferDecodeError::TruncatedPacket {
-                source: header.source,
+                source: self.header_location(),
                 expected_arguments: header.count,
                 available_arguments: self.consumed,
             });
         }
+        if let Some(EntryWords::Gathered(bytes)) = self.words.take() {
+            scratch.bytes = bytes;
+        }
         Ok(())
     }
 }
-
 #[cfg(test)]
 pub(super) fn fixture_packets(
     words: Vec<MaxwellPushbufferWord>,
@@ -332,46 +381,37 @@ pub(super) fn fixture_packets(
     let mut arguments = Vec::new();
     let mut mode = MaxwellMethodPacketMode::Immediate;
     for entry in words.chunk_by(|a, b| a.location.entry_index == b.location.entry_index) {
-        stream.words = Some(EntryWords::Gathered(
+        stream.retain_header_location();
+        stream.set_words(EntryWords::Gathered(
             entry
                 .iter()
                 .flat_map(|word| word.value.to_le_bytes())
                 .collect(),
         ));
+        stream.origin = Some(entry[0].location);
+        stream.locations = entry.iter().map(|w| w.location).collect();
         stream.offset = 0;
         stream.end = entry.len() * 4;
         while !stream.needs_entry() {
-            if stream.packet.is_none()
-                && let Header::Methods(header) = decode_header(entry[stream.offset / 4])?
-            {
-                mode = header.mode;
+            let new_header = stream.packet.is_none();
+            if let Some(operation) = stream.next()? {
+                packets.push(MaxwellDecodedPacket::Control {
+                    operation,
+                    source: stream.header_location(),
+                });
+                continue;
             }
-            // Each fixture word keeps its supplied provenance. All continuation,
-            // truncation and END_SEGMENT decisions use the production parser.
-            let (packet, _) =
-                stream.next_at(4096, |stream| (entry[stream.offset / 4].location, 1))?;
-            match packet {
-                PacketView::Control { operation, source } => {
-                    packets.push(MaxwellDecodedPacket::Control { operation, source })
-                }
-                PacketView::Methods {
-                    header,
-                    subchannel,
-                    methods,
-                    last,
-                } => {
-                    arguments.extend(methods.iter());
-                    if last {
-                        packets.push(MaxwellDecodedPacket::Methods(MaxwellDecodedMethodPacket {
-                            mode,
-                            header,
-                            subchannel,
-                            methods: PacketMethods::Fixture(
-                                std::mem::take(&mut arguments).into_boxed_slice(),
-                            ),
-                        }));
-                    }
-                }
+            if new_header {
+                mode = stream.current.unwrap().mode;
+            }
+            arguments.extend(stream.methods().iter());
+            if stream.last {
+                packets.push(MaxwellDecodedPacket::Methods(MaxwellDecodedMethodPacket {
+                    mode,
+                    header: stream.header_location(),
+                    subchannel: stream.subchannel(),
+                    methods: std::mem::take(&mut arguments).into_boxed_slice(),
+                }));
             }
         }
     }
@@ -379,4 +419,80 @@ pub(super) fn fixture_packets(
     Ok(MaxwellDecodedPushbuffer {
         packets: packets.into_boxed_slice(),
     })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_packet_crosses_mappings_without_fragmenting_or_losing_error_locations() {
+        use crate::{
+            MaxwellAddressSpaceId, MaxwellAddressSpaceInitialization, MaxwellAllocationId,
+            MaxwellGpuAddressSpace, MaxwellMapRequest, SWITCH_1_GM20B_PROFILE,
+        };
+        use nixe_memory::MemoryPermissions;
+        let machine = crate::test_memory::machine();
+        let mut space = MaxwellGpuAddressSpace::new(
+            machine.clone(),
+            MaxwellAddressSpaceId::new(1),
+            SWITCH_1_GM20B_PROFILE,
+        );
+        space
+            .initialize(MaxwellAddressSpaceInitialization::default())
+            .unwrap();
+        let mut map = || {
+            let allocation = crate::test_memory::allocate(&machine, 0x1000);
+            space
+                .map(MaxwellMapRequest {
+                    allocation: MaxwellAllocationId::new(1),
+                    backing: crate::test_memory::ranges(&allocation),
+                    backing_offset: 0,
+                    size: 0x1000,
+                    allocation_alignment: 0x1000,
+                    page_size: 0,
+                    kind: 0,
+                    cacheable: false,
+                    permissions: MemoryPermissions::READ_WRITE,
+                    fixed_offset: None,
+                })
+                .unwrap()
+        };
+        let left = map();
+        let right = map();
+        assert_eq!(right.offset().get(), left.offset().get() + 0x1000);
+        let memory = space.memory();
+        let start = memory.checked_add(left.offset(), 0xff8).unwrap();
+        let range = memory
+            .resolve_range(start, 16, MemoryPermissions::READ)
+            .unwrap();
+        let origin = MaxwellGpfifoSourceLocation {
+            channel: crate::MaxwellChannelId::new(1),
+            frontend: nixe_gpu::FrontendSubmissionId::new(1),
+            entry_index: 0,
+            pushbuffer: start,
+            word_offset: 0,
+            mapping: left.id(),
+            generation: left.generation(),
+        };
+        let mut stream = CommandStream::fixture_words(
+            origin,
+            &[(1 << 29) | (3 << 16) | (0x0a00 / 4), 11, 22, 33],
+        );
+        stream.source = Some(range);
+        assert_eq!(stream.next().unwrap(), None);
+        assert!(stream.last());
+        let methods = stream.methods();
+        assert_eq!(methods.len(), 3);
+        assert_eq!(methods.argument_at(2), 33);
+        assert_eq!(methods.get(0).unwrap().argument_source().mapping, left.id());
+        assert_eq!(
+            methods.get(1).unwrap().argument_source().mapping,
+            right.id()
+        );
+        assert_eq!(methods.get(2).unwrap().argument_source().word_offset, 3);
+        assert!(stream.needs_entry());
+        stream
+            .finish(&mut MaxwellCommandSourceScratch::default())
+            .unwrap();
+    }
 }

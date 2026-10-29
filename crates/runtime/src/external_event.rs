@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -7,11 +7,6 @@ use std::sync::mpsc::{
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-use nixe_scheduler::WakeToken;
-
-use crate::ReadableEventObject;
-use crate::handle::EventWatchRegistration;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExternalEventSource {
@@ -48,11 +43,6 @@ pub enum ExternalEvent {
     HostService(ExternalEventSource),
     /// The last reference to a canonical thread queued its actual finalization.
     ThreadRetirement,
-    Wake {
-        source: ExternalEventSource,
-        token: WakeToken,
-    },
-    CancelWait(WakeToken),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,12 +52,19 @@ pub struct SequencedExternalEvent {
 }
 
 #[derive(Debug)]
+pub(crate) struct RetiredThread {
+    pub process: nixe_scheduler::ProcessId,
+    pub thread: nixe_scheduler::GuestThreadId,
+    pub owner: std::sync::Weak<crate::RunnableProcess>,
+}
+
+#[derive(Debug)]
 struct EventPublication {
     sender: SyncSender<CoordinatorEvent>,
     next_sequence: Mutex<u64>,
     pending: AtomicUsize,
     capacity: usize,
-    retired_threads: Mutex<VecDeque<(nixe_scheduler::ProcessId, nixe_scheduler::GuestThreadId)>>,
+    retired_threads: Mutex<VecDeque<RetiredThread>>,
     retirement_pending: AtomicBool,
 }
 
@@ -105,49 +102,7 @@ impl EventPublication {
 #[derive(Clone, Debug)]
 pub struct ExternalEventSender {
     publication: Arc<EventPublication>,
-    wait_groups: Arc<Mutex<HashMap<WakeToken, Arc<ExternalWaitGroup>>>>,
     overflowed: Arc<AtomicBool>,
-}
-
-struct ExternalWaitGroup {
-    won: AtomicBool,
-    registrations: Mutex<Vec<EventWatchRegistration>>,
-}
-
-impl ExternalWaitGroup {
-    fn new() -> Self {
-        Self {
-            won: AtomicBool::new(false),
-            registrations: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn add(&self, registration: EventWatchRegistration) {
-        let mut registrations = self
-            .registrations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !self.won.load(Ordering::Acquire) {
-            registrations.push(registration);
-        }
-    }
-
-    fn cancel(&self) {
-        self.won.store(true, Ordering::Release);
-        self.registrations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-    }
-}
-
-impl std::fmt::Debug for ExternalWaitGroup {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ExternalWaitGroup")
-            .field("won", &self.won)
-            .finish_non_exhaustive()
-    }
 }
 
 impl ExternalEventSender {
@@ -157,11 +112,16 @@ impl ExternalEventSender {
         &self,
         process: nixe_scheduler::ProcessId,
         thread: nixe_scheduler::GuestThreadId,
+        owner: std::sync::Weak<crate::RunnableProcess>,
     ) {
         let first = {
             let mut retired = self.publication.retired_threads.lock().unwrap();
             let first = retired.is_empty();
-            retired.push_back((process, thread));
+            retired.push_back(RetiredThread {
+                process,
+                thread,
+                owner,
+            });
             self.publication
                 .retirement_pending
                 .store(true, Ordering::Release);
@@ -177,9 +137,7 @@ impl ExternalEventSender {
         }
     }
 
-    pub(crate) fn take_retired_thread(
-        &self,
-    ) -> Option<(nixe_scheduler::ProcessId, nixe_scheduler::GuestThreadId)> {
+    pub(crate) fn take_retired_thread(&self) -> Option<RetiredThread> {
         if !self.publication.retirement_pending.load(Ordering::Acquire) {
             return None;
         }
@@ -209,86 +167,14 @@ impl ExternalEventSender {
     pub fn submit(&self, event: ExternalEvent) -> Result<(), ExternalEventSendError> {
         self.publication.publish(event)
     }
+}
 
-    pub fn wake(
-        &self,
-        source: ExternalEventSource,
-        token: WakeToken,
-    ) -> Result<(), ExternalEventSendError> {
-        self.submit(ExternalEvent::Wake { source, token })
+impl std::task::Wake for ExternalEventSender {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
     }
-
-    pub fn gpu_completion(&self, token: WakeToken) -> Result<(), ExternalEventSendError> {
-        self.wake(ExternalEventSource::GpuCompletion, token)
-    }
-
-    pub fn display_event(&self, token: WakeToken) -> Result<(), ExternalEventSendError> {
-        self.wake(ExternalEventSource::Display, token)
-    }
-
-    pub fn input_event(&self, token: WakeToken) -> Result<(), ExternalEventSendError> {
-        self.wake(ExternalEventSource::Input, token)
-    }
-
-    /// Registers a non-blocking observer which publishes readiness directly to
-    /// the bounded inbox. Deadlines belong to the runtime coordinator.
-    pub fn watch_readable_event(
-        &self,
-        event: ReadableEventObject,
-        timeout: Option<Duration>,
-        token: WakeToken,
-        source: ExternalEventSource,
-    ) -> Result<(), ExternalEventSendError> {
-        if timeout.is_some() {
-            return Err(ExternalEventSendError::HostDeadlineUnsupported);
-        }
-        let source = event.source().unwrap_or(source);
-        let group = {
-            let mut groups = self
-                .wait_groups
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            groups
-                .entry(token)
-                .or_insert_with(|| Arc::new(ExternalWaitGroup::new()))
-                .clone()
-        };
-        let publication = Arc::clone(&self.publication);
-        let overflowed = Arc::clone(&self.overflowed);
-        let callback_group = Arc::clone(&group);
-        let registration = event.watch(Arc::new(move || {
-            if callback_group.won.swap(true, Ordering::AcqRel) {
-                return;
-            }
-            if let Err(error) = publication.publish(ExternalEvent::Wake { source, token })
-                && matches!(
-                    error,
-                    ExternalEventSendError::Full | ExternalEventSendError::SequenceExhausted
-                )
-            {
-                overflowed.store(true, Ordering::Release);
-            }
-        }));
-        group.add(registration);
-        Ok(())
-    }
-
-    pub(crate) fn cancel_watchers(&self, token: WakeToken) {
-        if let Some(group) = self
-            .wait_groups
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&token)
-        {
-            group.cancel();
-        }
-    }
-
-    pub(crate) fn watcher_group_count(&self) -> usize {
-        self.wait_groups
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notify_host_service(ExternalEventSource::Timer);
     }
 }
 
@@ -326,7 +212,6 @@ impl ExternalEventInbox {
                     retired_threads: Mutex::default(),
                     retirement_pending: AtomicBool::new(false),
                 }),
-                wait_groups: Arc::new(Mutex::new(HashMap::new())),
                 overflowed: Arc::new(AtomicBool::new(false)),
             },
             receiver,
@@ -360,6 +245,12 @@ impl ExternalEventInbox {
         }
     }
 
+    pub(crate) fn recv(&self) -> Result<CoordinatorEvent, ExternalEventSendError> {
+        self.receiver
+            .recv()
+            .map_err(|_| ExternalEventSendError::Closed)
+    }
+
     pub(crate) fn recv_timeout(
         &self,
         timeout: Duration,
@@ -377,7 +268,6 @@ pub enum ExternalEventSendError {
     ZeroCapacity,
     Full,
     Closed,
-    HostDeadlineUnsupported,
     SequenceExhausted,
 }
 
@@ -408,9 +298,11 @@ mod tests {
                     let sender = sender.clone();
                     scope.spawn(move || {
                         for i in 0..512 {
-                            let object = crate::ThreadObject::new(worker * 512 + i + 1);
-                            object.bind_retirement(ProcessId::new(7), sender.clone());
-                            drop(object);
+                            sender.retire_thread(
+                                ProcessId::new(7),
+                                GuestThreadId::new(worker * 512 + i + 1),
+                                std::sync::Weak::new(),
+                            );
                         }
                     });
                 }
@@ -429,29 +321,29 @@ mod tests {
             inbox.consume_external();
             assert!(inbox.try_recv().unwrap().is_none());
             let mut retired = std::collections::BTreeSet::new();
-            while let Some((process, thread)) = sender.take_retired_thread() {
-                assert_eq!(process, ProcessId::new(7));
-                assert!(retired.insert(thread));
+            while let Some(item) = sender.take_retired_thread() {
+                assert_eq!(item.process, ProcessId::new(7));
+                assert!(retired.insert(item.thread));
             }
             assert_eq!(retired.len(), 2048);
-            let object = crate::ThreadObject::new(2049);
-            object.bind_retirement(ProcessId::new(7), sender.clone());
-            drop(object);
+            sender.retire_thread(
+                ProcessId::new(7),
+                GuestThreadId::new(2049),
+                std::sync::Weak::new(),
+            );
             assert!(
                 matches!(inbox.try_recv().unwrap(), Some(CoordinatorEvent::External(event)) if event.event == ExternalEvent::ThreadRetirement)
             );
             assert_eq!(
-                sender.take_retired_thread(),
+                sender
+                    .take_retired_thread()
+                    .map(|item| (item.process, item.thread)),
                 Some((ProcessId::new(7), GuestThreadId::new(2049)))
             );
         }
     }
 
     use super::*;
-    use crate::EventObject;
-    use nixe_scheduler::{GuestThreadId, WakeGeneration};
-    use std::sync::Barrier;
-    use std::thread;
 
     fn external(
         inbox: &ExternalEventInbox,
@@ -514,51 +406,6 @@ mod tests {
     }
 
     #[test]
-    fn event_observers_publish_without_host_threads_and_cancel_atomically() {
-        let inbox = ExternalEventInbox::bounded(4, 0).unwrap();
-        let token = WakeToken {
-            thread: GuestThreadId::new(7),
-            generation: WakeGeneration::new(3),
-        };
-        let (writable, readable) = crate::EventObject::create_pair();
-        inbox
-            .sender()
-            .watch_readable_event(readable, None, token, ExternalEventSource::Device)
-            .unwrap();
-        writable.signal();
-        assert_eq!(
-            inbox
-                .try_recv()
-                .map(|event| external(&inbox, event))
-                .unwrap()
-                .map(|event| event.event),
-            Some(ExternalEvent::Wake {
-                source: ExternalEventSource::Device,
-                token,
-            })
-        );
-
-        let cancelled = WakeToken {
-            thread: GuestThreadId::new(8),
-            generation: WakeGeneration::new(4),
-        };
-        let (writable, readable) = crate::EventObject::create_pair();
-        let sender = inbox.sender();
-        sender
-            .watch_readable_event(readable, None, cancelled, ExternalEventSource::Ipc)
-            .unwrap();
-        sender.cancel_watchers(cancelled);
-        writable.signal();
-        assert_eq!(
-            inbox
-                .try_recv()
-                .map(|event| external(&inbox, event))
-                .unwrap(),
-            None
-        );
-    }
-
-    #[test]
     fn bounded_receive_distinguishes_a_host_deadline_from_an_external_event() {
         let inbox = ExternalEventInbox::bounded(1, 0).unwrap();
         assert_eq!(
@@ -581,78 +428,25 @@ mod tests {
     }
     #[test]
     fn concurrent_device_producers_are_published_in_one_monotonic_order() {
-        const PRODUCERS: usize = 24;
-        let inbox = ExternalEventInbox::bounded(PRODUCERS, 0).unwrap();
-        let sender = inbox.sender();
-        let start = Arc::new(Barrier::new(PRODUCERS + 1));
-        let workers: Vec<_> = (0..PRODUCERS)
-            .map(|index| {
-                let sender = sender.clone();
-                let start = Arc::clone(&start);
-                thread::spawn(move || {
-                    start.wait();
-                    let source = match index % 3 {
-                        0 => ExternalEventSource::GpuCompletion,
-                        1 => ExternalEventSource::Display,
-                        _ => ExternalEventSource::Input,
-                    };
-                    let token = WakeToken {
-                        thread: GuestThreadId::new(index as u64 + 1),
-                        generation: WakeGeneration::new(1),
-                    };
-                    match source {
-                        ExternalEventSource::GpuCompletion => sender.gpu_completion(token),
-                        ExternalEventSource::Display => sender.display_event(token),
-                        ExternalEventSource::Input => sender.input_event(token),
-                        _ => unreachable!(),
+        let inbox = ExternalEventInbox::bounded(512, 0).unwrap();
+        std::thread::scope(|scope| {
+            for source in [
+                ExternalEventSource::GpuCompletion,
+                ExternalEventSource::Display,
+                ExternalEventSource::Input,
+            ] {
+                let sender = inbox.sender();
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        sender.submit(ExternalEvent::HostService(source)).unwrap();
                     }
-                    .unwrap();
-                })
-            })
-            .collect();
-        start.wait();
-        for worker in workers {
-            worker.join().unwrap();
-        }
-
-        let mut previous = 0;
-        for _ in 0..PRODUCERS {
-            let event = inbox
-                .try_recv()
-                .map(|event| external(&inbox, event))
-                .unwrap()
-                .unwrap();
-            assert!(event.sequence.get() > previous);
-            previous = event.sequence.get();
-        }
-        assert_eq!(previous, PRODUCERS as u64);
-    }
-
-    #[test]
-    fn typed_event_object_overrides_the_generic_wait_fallback_source() {
-        let inbox = ExternalEventInbox::bounded(1, 0).unwrap();
-        let token = WakeToken {
-            thread: GuestThreadId::new(1),
-            generation: WakeGeneration::new(1),
-        };
-        let (writable, readable) =
-            EventObject::create_pair_with_source(ExternalEventSource::Display);
-        inbox
-            .sender()
-            .watch_readable_event(readable, None, token, ExternalEventSource::Device)
-            .unwrap();
-        writable.signal();
-        assert_eq!(
-            inbox
-                .try_recv()
-                .map(|event| external(&inbox, event))
-                .unwrap()
-                .unwrap()
-                .event,
-            ExternalEvent::Wake {
-                source: ExternalEventSource::Display,
-                token,
+                });
             }
-        );
+        });
+        for expected in 1..=300 {
+            let event = external(&inbox, inbox.try_recv().unwrap()).unwrap();
+            assert_eq!(event.sequence.get(), expected);
+        }
+        assert!(inbox.try_recv().unwrap().is_none());
     }
 }

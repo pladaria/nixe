@@ -85,10 +85,13 @@ fn pending_tls(
     Arc<Device>,
     mpsc::Receiver<()>,
 ) {
-    let mut coordinator = RuntimeCoordinator::new(two_core_profile());
+    let mut coordinator = RuntimeCoordinator::new(SchedulerState::new(
+        two_core_profile(),
+        crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 }),
+    ));
     let process = coordinator
         .register_process(
-            synthetic_native_instruction_process(1, &[0x14000000]),
+            synthetic_native_instruction_process(coordinator.scheduler(), 1, &[0x14000000]),
             registration(&coordinator),
         )
         .unwrap();
@@ -139,16 +142,21 @@ fn pending_native_data(
     Arc<Device>,
     mpsc::Receiver<()>,
 ) {
-    let mut coordinator = RuntimeCoordinator::new(profile());
-    let mut process = synthetic_native_instruction_process(1, instructions);
+    let mut coordinator = RuntimeCoordinator::new(SchedulerState::new(
+        profile(),
+        crate::VirtualClock::new(crate::VirtualClockMode::Fixed { unix_seconds: 0 }),
+    ));
+    let process = synthetic_native_instruction_process(coordinator.scheduler(), 1, instructions);
     let address = process.main_thread().stack_bottom;
     use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
-    let state = process.main_thread_mut().state_mut();
+    let state_thread = process.main_thread();
+    let mut state = state_thread.registers();
     state.write_x(A64Register::General(A64GeneralRegister::new(0).unwrap()), 7);
     state.write_x(
         A64Register::General(A64GeneralRegister::new(1).unwrap()),
         address.get(),
     );
+    drop(state);
     let process = coordinator
         .register_process(process, registration(&coordinator))
         .unwrap();
@@ -320,7 +328,7 @@ fn deferred_tls_read_and_flag_leave_other_cores_and_host_stop_live() {
         let (mut coordinator, process, thread, device, arrived) = pending_tls(None);
         let other = coordinator
             .register_process(
-                synthetic_native_instruction_process(2, &[0xd4000201]), // SVC #0x10
+                synthetic_native_instruction_process(coordinator.scheduler(), 2, &[0xd4000201]), // SVC #0x10
                 ProcessRegistration {
                     priority: 44,
                     ideal_vcpu: Some(VirtualCpuId::new(3)),

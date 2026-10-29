@@ -57,66 +57,32 @@ impl MaxwellThreeDDecompressSurface {
 ///
 /// ABI source:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3609-L3619>
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDReportSemaphoreState {
-    address_upper: MaxwellThreeDRegister<u8>,
-    address_lower: MaxwellThreeDRegister<u32>,
-    payload: MaxwellThreeDRegister<u32>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDReportSemaphoreState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDReportSemaphoreState {
+impl MaxwellThreeDReportSemaphoreState<'_> {
     #[must_use]
-    pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.address_upper
+    pub fn address_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers.read(0x1b00, |raw| {
+            (raw & !(0x0000_00ff) == 0).then_some(raw as u8)
+        })
     }
-
     #[must_use]
-    pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.address_lower
+    pub fn address_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x1b04, Some)
     }
-
+    #[must_use]
+    pub fn payload(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x1b08, Some)
+    }
     #[must_use]
     pub fn address(&self) -> Option<MaxwellThreeDUnresolvedAddress> {
         Some(MaxwellThreeDUnresolvedAddress::new(
-            *self.address_upper.value()?,
-            *self.address_lower.value()?,
+            *self.address_upper().value()?,
+            *self.address_lower().value()?,
         ))
     }
-
-    #[must_use]
-    pub const fn payload(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.payload
-    }
-
-    pub(super) fn apply(&mut self, write: MaxwellThreeDReportSemaphoreStateWrite) {
-        match write {
-            MaxwellThreeDReportSemaphoreStateWrite::AddressUpper { value, source: _ } => {
-                self.address_upper = MaxwellThreeDRegister::decoded(u32::from(value), value);
-            }
-            MaxwellThreeDReportSemaphoreStateWrite::AddressLower { value, source: _ } => {
-                self.address_lower = MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDReportSemaphoreStateWrite::Payload { value, source: _ } => {
-                self.payload = MaxwellThreeDRegister::decoded(value, value);
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellThreeDReportSemaphoreStateWrite {
-    AddressUpper {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    AddressLower {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    Payload {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
 }
 
 /// Operation selected by `SET_REPORT_SEMAPHORE_D`.
@@ -752,7 +718,9 @@ pub fn lower_maxwell_three_d_synchronization(
 ) -> Result<MaxwellThreeDSynchronizationPlan, MaxwellThreeDSynchronizationError> {
     match trigger {
         MaxwellThreeDSynchronizationTrigger::DecompressSurface { request, source } => {
-            let compression = state.render_targets().color()[usize::from(request.color_target())]
+            let compression = state
+                .render_targets()
+                .color(usize::from(request.color_target()))
                 .compression()
                 .value()
                 .copied()

@@ -1,13 +1,10 @@
 //! `IFileSystem` wire command decoding.
 
 use crate::ipc_wire::request::Request;
-use nixe_memory::GuestVirtualAddress;
 
 use crate::ipc_wire::IpcWireError;
-use crate::ipc_wire::io::{read_bytes, request_u32, request_u64};
-use crate::ipc_wire::message::{
-    BufferDescriptor, BufferMode, CmifRequest, HipcRequest, SendStaticDescriptor,
-};
+use crate::ipc_wire::io::{request_u32, request_u64};
+use crate::ipc_wire::message::{CmifRequest, HipcRequest};
 use crate::{IpcRequest, MAX_IPC_PATH_BYTES, SemanticIpcObject};
 
 use super::abi::FS_MAX_PATH;
@@ -104,35 +101,17 @@ pub(super) async fn decode(
 }
 
 async fn read_path(process: &Request, hipc: &HipcRequest<'_>) -> Result<String, IpcWireError> {
-    enum InputDescriptor {
-        Static(SendStaticDescriptor),
-        Buffer(BufferDescriptor),
-    }
-
     let descriptor = match (hipc.send_statics.as_slice(), hipc.send_buffers.as_slice()) {
-        ([descriptor], []) => InputDescriptor::Static(*descriptor),
-        ([], [descriptor]) => InputDescriptor::Buffer(*descriptor),
+        ([_], []) => &process.send_statics()[0],
+        ([], [_]) => &process.send_buffers()[0],
         _ => {
             return Err(IpcWireError::Malformed(
                 "filesystem path requires exactly one input descriptor",
             ));
         }
     };
-    let (address, size) = match descriptor {
-        InputDescriptor::Static(descriptor) => (descriptor.address, usize::from(descriptor.size)),
-        InputDescriptor::Buffer(descriptor) => {
-            if descriptor.mode == BufferMode::Invalid {
-                return Err(IpcWireError::Malformed(
-                    "filesystem path buffer has an invalid mapping mode",
-                ));
-            }
-            (
-                descriptor.address,
-                usize::try_from(descriptor.size)
-                    .map_err(|_| IpcWireError::Malformed("filesystem path buffer is too large"))?,
-            )
-        }
-    };
+    let size = usize::try_from(descriptor.size)
+        .map_err(|_| IpcWireError::Malformed("filesystem path buffer is too large"))?;
     if size == 0 || size > FS_MAX_PATH || size > MAX_IPC_PATH_BYTES + 1 {
         return Err(IpcWireError::Malformed(
             "filesystem path descriptor has an invalid size",
@@ -140,7 +119,7 @@ async fn read_path(process: &Request, hipc: &HipcRequest<'_>) -> Result<String, 
     }
 
     let mut bytes = vec![0; size];
-    read_bytes(process, GuestVirtualAddress::new(address), &mut bytes).await?;
+    process.read(descriptor, 0, &mut bytes).await?;
     let nul = bytes
         .iter()
         .position(|byte| *byte == 0)

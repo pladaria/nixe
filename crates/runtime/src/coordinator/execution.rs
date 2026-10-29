@@ -16,7 +16,6 @@ impl RuntimeCoordinator {
         }
         let deadline = std::time::Instant::now() + host_wait;
         loop {
-            self.wake_due_deadlines()?;
             let idle = self.scheduler.idle_vcpus();
             for vcpu in idle {
                 let lease = self.scheduler.claim(vcpu)?;
@@ -35,29 +34,32 @@ impl RuntimeCoordinator {
                 }
                 continue;
             }
-            if !self.scheduler.has_active_leases() && self.fast_forward_to_next_deadline()? {
-                continue;
-            }
             if let Some(event) = self.deferred_events.pop_front() {
-                let retirement = matches!(event.event, ExternalEvent::ThreadRetirement);
+                let internal = matches!(
+                    event.event,
+                    ExternalEvent::ThreadRetirement
+                        | ExternalEvent::HostService(crate::ExternalEventSource::Timer)
+                );
                 self.apply_external_event(event, &mut CoordinatorDrainReport::default())?;
-                if retirement {
+                if internal {
                     continue;
                 }
                 return Ok(None);
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let timeout = self
-                .worker_wait_timeout()
-                .map_or(remaining, |timeout| timeout.min(remaining));
+            let timeout = remaining;
             match self.inbox.recv_timeout(timeout)? {
                 Some(crate::external_event::CoordinatorEvent::Completed(result)) => {
                     self.workers.pending_results.push_back(result);
                 }
                 Some(crate::external_event::CoordinatorEvent::External(event)) => {
-                    let retirement = matches!(event.event, ExternalEvent::ThreadRetirement);
+                    let internal = matches!(
+                        event.event,
+                        ExternalEvent::ThreadRetirement
+                            | ExternalEvent::HostService(crate::ExternalEventSource::Timer)
+                    );
                     self.apply_external_event(event, &mut CoordinatorDrainReport::default())?;
-                    if retirement {
+                    if internal {
                         continue;
                     }
                     return Ok(None);
@@ -72,16 +74,26 @@ impl RuntimeCoordinator {
     /// process termination or teardown. Native contexts remain resident until
     /// an actual switch or full-state consumer. Preemption precedes waiting.
     pub fn quiesce(&mut self) -> Result<(), CoordinatorError> {
-        let leases: Vec<_> = self.scheduler.active_leases().collect();
+        let leases = self.scheduler.active_leases().collect();
+        self.quiesce_leases(leases)
+    }
+
+    pub(super) fn quiesce_process(&mut self, process: ProcessId) -> Result<(), CoordinatorError> {
+        let leases = self
+            .scheduler
+            .active_leases()
+            .filter(|lease| lease.process == process)
+            .collect();
+        self.quiesce_leases(leases)
+    }
+
+    fn quiesce_leases(&mut self, leases: Vec<Lease>) -> Result<(), CoordinatorError> {
         for process in leases
             .iter()
             .map(|lease| lease.process)
             .collect::<BTreeSet<_>>()
         {
-            self.processes
-                .get_mut(&process)
-                .unwrap()
-                .request_safepoint();
+            self.processes.get(&process).unwrap().request_safepoint();
         }
         let mut first_error = None;
         for lease in leases {
@@ -96,8 +108,12 @@ impl RuntimeCoordinator {
                     error: ProcessExecutionError::Cpu { fault },
                     ..
                 }) if fault.kind == nixe_cpu::execution::CpuFaultKind::Stopped
-                    && self.processes[&process].lifecycle()
-                        == nixe_scheduler::ProcessLifecycle::Exited => {}
+                    && matches!(
+                        self.processes[&process].lifecycle(),
+                        nixe_scheduler::ProcessLifecycle::Terminating
+                            | nixe_scheduler::ProcessLifecycle::Exited
+                            | nixe_scheduler::ProcessLifecycle::Faulted
+                    ) => {}
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
@@ -121,24 +137,6 @@ impl RuntimeCoordinator {
         }
     }
 
-    fn worker_wait_timeout(&self) -> Option<std::time::Duration> {
-        if self.virtual_clock.mode() != crate::VirtualClockMode::Realtime {
-            return None;
-        }
-        let deadline = self
-            .next_preemption_ns
-            .into_iter()
-            .chain(
-                self.deadlines
-                    .first_key_value()
-                    .map(|((deadline, _), _)| *deadline),
-            )
-            .min()?;
-        Some(std::time::Duration::from_nanos(
-            deadline.saturating_sub(self.virtual_time_ns()),
-        ))
-    }
-
     fn dispatch_worker(
         &mut self,
         lease: Lease,
@@ -151,7 +149,7 @@ impl RuntimeCoordinator {
             .clone();
         let execution = self
             .processes
-            .get_mut(&lease.process)
+            .get(&lease.process)
             .ok_or(CoordinatorError::UnknownProcess(lease.process))
             .and_then(|process| {
                 process
@@ -186,7 +184,7 @@ impl RuntimeCoordinator {
             report,
         ) {
             self.processes
-                .get_mut(&lease.process)
+                .get(&lease.process)
                 .expect("the dispatched process remains registered")
                 .abort_thread_execution(lease.thread, lease.vcpu, Some(failure.request.execution));
             self.complete_failed_worker_lease(lease)?;
@@ -209,19 +207,23 @@ impl RuntimeCoordinator {
                 {
                     break self.workers.pending_results.remove(index).unwrap();
                 }
-                match self.inbox.recv_timeout(
-                    self.worker_wait_timeout()
-                        .unwrap_or(std::time::Duration::from_secs(5)),
-                )? {
-                    Some(crate::external_event::CoordinatorEvent::Completed(result)) => {
+                match self.inbox.recv()? {
+                    crate::external_event::CoordinatorEvent::Completed(result) => {
                         self.workers.pending_results.push_back(result);
                     }
-                    Some(crate::external_event::CoordinatorEvent::External(event)) => {
-                        self.deferred_events.push_back(event)
-                    }
-                    None => {
-                        self.wake_due_deadlines()?;
-                        self.interrupt_rescheduled_cores();
+                    crate::external_event::CoordinatorEvent::External(event) => {
+                        if matches!(
+                            event.event,
+                            ExternalEvent::HostService(crate::ExternalEventSource::Timer)
+                        ) {
+                            self.apply_external_event(
+                                event,
+                                &mut CoordinatorDrainReport::default(),
+                            )?;
+                            self.interrupt_rescheduled_cores();
+                        } else {
+                            self.deferred_events.push_back(event);
+                        }
                     }
                 }
             };
@@ -244,7 +246,7 @@ impl RuntimeCoordinator {
         );
         if worker_result.lease != expected {
             self.processes
-                .get_mut(&expected.process)
+                .get(&expected.process)
                 .expect("the dispatched process remains registered")
                 .abort_thread_execution(expected.thread, expected.vcpu, None);
             self.complete_failed_worker_lease(expected)?;
@@ -258,7 +260,7 @@ impl RuntimeCoordinator {
             Err(WorkerRunFailure::Execution(error)) => Err(error),
             Err(WorkerRunFailure::Worker(failure)) => {
                 self.processes
-                    .get_mut(&expected.process)
+                    .get(&expected.process)
                     .expect("the dispatched process remains registered")
                     .abort_thread_execution(expected.thread, expected.vcpu, None);
                 self.complete_failed_worker_lease(expected)?;
@@ -267,7 +269,7 @@ impl RuntimeCoordinator {
         };
         let result = self
             .processes
-            .get_mut(&expected.process)
+            .get(&expected.process)
             .expect("the dispatched process remains registered")
             .finish_thread_execution(
                 expected.thread,
@@ -315,25 +317,42 @@ impl RuntimeCoordinator {
             Err(ProcessExecutionError::ConcurrentProcessStop { .. }) => Completion::Ready,
             Err(ProcessExecutionError::Cpu { fault })
                 if fault.kind == nixe_cpu::execution::CpuFaultKind::Stopped
-                    && self.processes[&expected.process].lifecycle()
-                        == nixe_scheduler::ProcessLifecycle::Exited =>
+                    && matches!(
+                        self.processes[&expected.process].lifecycle(),
+                        nixe_scheduler::ProcessLifecycle::Terminating
+                            | nixe_scheduler::ProcessLifecycle::Exited
+                    ) =>
             {
                 Completion::Exited
             }
             Err(_) => Completion::Faulted,
         };
-        if matches!(completion, Completion::Exited | Completion::Faulted) {
-            self.processes
-                .get_mut(&expected.process)
-                .unwrap()
-                .finish_thread(expected.thread);
+        let terminated = if matches!(completion, Completion::Exited | Completion::Faulted) {
+            let process = self.processes.get(&expected.process).unwrap();
+            let thread = process
+                .thread(expected.thread)
+                .expect("running kernel object");
+            process.finish_thread(&thread);
             self.finalize_thread_waits(expected.process, expected.thread);
-        }
+            Some(thread)
+        } else {
+            None
+        };
         if !self.scheduler.complete(expected, completion)? {
             // The SVC raced its interrupt. Continue the kernel boundary on its
             // original core; no guest instruction or SVC effect is replayed.
             self.dispatch_worker(expected, Some(result.expect("kernel-call completion")))?;
             return Ok(None);
+        }
+        if let Some(thread) = terminated {
+            thread.signal();
+        }
+        if matches!(
+            &result,
+            Err(ProcessExecutionError::ConcurrentProcessStop { .. })
+        ) || matches!(completion, Completion::Exited | Completion::Faulted)
+        {
+            self.finish_process_termination(expected.process)?;
         }
         result
             .map(|report| {
@@ -350,15 +369,21 @@ impl RuntimeCoordinator {
     }
 
     fn complete_failed_worker_lease(&mut self, lease: Lease) -> Result<(), CoordinatorError> {
-        self.processes
-            .get_mut(&lease.process)
+        let thread = self
+            .processes
+            .get(&lease.process)
             .unwrap()
-            .finish_thread(lease.thread);
+            .thread(lease.thread)
+            .expect("failed worker retains its kernel object");
+        self.processes
+            .get(&lease.process)
+            .unwrap()
+            .finish_thread(&thread);
         self.finalize_thread_waits(lease.process, lease.thread);
-        self.scheduler
-            .complete(lease, Completion::Faulted)
-            .map(|_| ())
-            .map_err(Into::into)
+        self.scheduler.complete(lease, Completion::Faulted)?;
+        thread.signal();
+        self.finish_process_termination(lease.process)?;
+        Ok(())
     }
 }
 

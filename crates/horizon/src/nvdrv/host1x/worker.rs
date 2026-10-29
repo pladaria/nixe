@@ -442,7 +442,7 @@ mod tests {
     }
     #[test]
     fn pending_dependencies_do_not_publish_completion_and_failures_are_retained() {
-        let mut control = NvHostControl::default();
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
         let producer = descriptor(1);
         let consumer = descriptor(2);
         let a = control.allocate_channel_syncpoint(producer, 0).unwrap();

@@ -17,23 +17,14 @@ use super::output::{
 
 use super::{
     MAXWELL_COLOR_TARGET_COUNT, MAXWELL_PIPELINE_SHADER_COUNT, MaxwellThreeDColorReductionState,
-    MaxwellThreeDColorReductionStateWrite, MaxwellThreeDConstantColorRenderingState,
-    MaxwellThreeDConstantColorRenderingStateWrite, MaxwellThreeDCounterState,
-    MaxwellThreeDCounterStateWrite, MaxwellThreeDCoverageState, MaxwellThreeDCoverageStateWrite,
-    MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconState,
-    MaxwellThreeDFixedFunctionRegister, MaxwellThreeDFixedFunctionState,
-    MaxwellThreeDFixedFunctionWrite, MaxwellThreeDInlineToMemoryState,
-    MaxwellThreeDInlineToMemoryStateWrite, MaxwellThreeDInstrumentationState,
-    MaxwellThreeDInstrumentationStateWrite, MaxwellThreeDL2CacheState,
-    MaxwellThreeDL2CacheStateWrite, MaxwellThreeDLineState, MaxwellThreeDLineStateWrite,
+    MaxwellThreeDCoverageState, MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconState,
+    MaxwellThreeDFixedFunctionState, MaxwellThreeDInlineToMemoryState,
+    MaxwellThreeDInlineToMemoryStateWrite, MaxwellThreeDLineState,
     MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState, MaxwellThreeDMmeStateWrite,
-    MaxwellThreeDRenderEnableState, MaxwellThreeDRenderEnableStateWrite,
-    MaxwellThreeDRenderTargetState, MaxwellThreeDRenderTargetWrite,
-    MaxwellThreeDReportSemaphoreState, MaxwellThreeDReportSemaphoreStateWrite,
-    MaxwellThreeDResourceRole, MaxwellThreeDShaderBindingState, MaxwellThreeDShaderBindingWrite,
-    MaxwellThreeDShaderExecutionState, MaxwellThreeDShaderExecutionStateWrite,
-    MaxwellThreeDTiledCacheState, MaxwellThreeDTiledCacheStateWrite, MaxwellThreeDVertexInputState,
-    MaxwellThreeDVertexInputWrite, MaxwellThreeDZCullState, MaxwellThreeDZCullStateWrite,
+    MaxwellThreeDRenderEnableState, MaxwellThreeDRenderTargetState,
+    MaxwellThreeDReportSemaphoreState, MaxwellThreeDResourceRole, MaxwellThreeDShaderBindingState,
+    MaxwellThreeDShaderBindingWrite, MaxwellThreeDShaderExecutionState,
+    MaxwellThreeDVertexInputState, MaxwellThreeDVertexInputWrite,
     render_targets::{
         MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD, MAXWELL_THREE_D_COLOR_COMPRESSION_RESET,
         MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE, MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD,
@@ -97,7 +88,7 @@ pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u
         // https://gitlab.com/kernel-firmware/linux-firmware/-/blob/main/WHENCE
         // https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/nouveau/nvkm/engine/gr/gk20a.c#L110-L149
         // The same GM20B table disables sparse depth (B197 dword 0x482).
-        0x1208 | 0x15b8 => Some(0),
+        0x1208 | 0x15b8 | 0x190..=0x1ac => Some(0),
         raw @ 0x3400..=0x35fc if raw.is_multiple_of(4) => Some(0),
         raw if raw >= 0x0c00 && raw < 0x0d00 && (raw - 0x0c00) % 0x10 == 8 => {
             Some(VIEWPORT_CLIP_MIN_Z_RESET)
@@ -119,6 +110,9 @@ pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u
         // The same pinned GM20B table writes (0x04d7b197, 0) at byte 0x2780:
         // SET_SINGLE_ROP_CONTROL starts with independent target enables.
         0x135c => Some(0),
+        // The adjacent entry at table offset 0x2788 is (0x03e4b197, 0):
+        // SET_SINGLE_CT_WRITE_CONTROL selects each target's own color mask.
+        0x0f90 => Some(0),
         // GM20B sw_method_init.bin, SHA-256 6372e2f6f547d7bd086beb066ce46ac379795f95c38eeeedd9e13c7b32515b24:
         // byte offsets 0x2490/0x2498 contain (0x064bb197, 1) and (0x064fb197, 0x2c1c).
         // These defaults must also be visible to MME shadow-register reads.
@@ -280,16 +274,20 @@ impl<T> MaxwellThreeDRegister<T> {
 pub(super) struct MaxwellThreeDRawRegisterFile {
     values: Box<[u32]>,
     valid: [u64; 64],
-    written: [u64; 64],
 }
 
 impl Default for MaxwellThreeDRawRegisterFile {
     fn default() -> Self {
-        Self {
+        let mut registers = Self {
             values: vec![0; 0x1000].into_boxed_slice(),
             valid: [0; 64],
-            written: [0; 64],
+        };
+        for index in 0..4096 {
+            if let Some(value) = verified_raw_register_reset(GpuMethodId(index * 4)) {
+                registers.set_reset(GpuMethodId(index * 4), value);
+            }
         }
+        registers
     }
 }
 
@@ -303,6 +301,17 @@ impl MaxwellThreeDRawRegisterFile {
             .then(|| self.values[index])
     }
 
+    #[inline]
+    pub(super) fn read<T>(
+        &self,
+        method: u32,
+        decode: impl FnOnce(u32) -> Option<T>,
+    ) -> MaxwellThreeDRegister<T> {
+        let raw = self.raw(GpuMethodId(method));
+        let value = raw.and_then(decode);
+        MaxwellThreeDRegister { raw, value }
+    }
+
     fn set_reset(&mut self, method: GpuMethodId, value: u32) {
         let index = (method.0 / 4) as usize;
         self.values[index] = value;
@@ -313,7 +322,6 @@ impl MaxwellThreeDRawRegisterFile {
         let index = (method.0 / 4) as usize;
         self.values[index] = value;
         self.valid[index / 64] |= 1 << (index % 64);
-        self.written[index / 64] |= 1 << (index % 64);
     }
 }
 
@@ -650,169 +658,70 @@ impl MaxwellThreeDConservativeRasterEnable {
     }
 }
 
-/// Raw rasterization registers whose derived combinations are validated later.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDRasterState {
-    point_size: MaxwellThreeDRegister<MaxwellThreeDPointSize>,
-    attribute_point_size: MaxwellThreeDRegister<MaxwellThreeDAttributePointSize>,
-    point_sprite_enable: MaxwellThreeDRegister<bool>,
-    anti_aliased_point_enable: MaxwellThreeDRegister<bool>,
-    point_sprite_select: MaxwellThreeDRegister<MaxwellThreeDPointSpriteSelect>,
-    point_center_mode: MaxwellThreeDRegister<MaxwellThreeDPointCenterMode>,
-    edge_flag: MaxwellThreeDRegister<MaxwellThreeDEdgeFlag>,
-    alpha_fraction: MaxwellThreeDRegister<MaxwellThreeDAlphaFraction>,
-    bounding_box: MaxwellThreeDRegister<MaxwellThreeDRasterBoundingBox>,
-    fill_via_triangle: MaxwellThreeDRegister<MaxwellThreeDFillViaTriangleMode>,
-    conservative_raster: MaxwellThreeDRegister<MaxwellThreeDConservativeRasterEnable>,
-    polygon_smooth_enable: MaxwellThreeDRegister<bool>,
-    polygon_stipple_enable: MaxwellThreeDRegister<bool>,
-    polygon_stipple_pattern:
-        [MaxwellThreeDRegister<u32>; MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT],
+/// Direct read-only interpretation of the authoritative raster registers.
+#[derive(Clone, Copy)]
+pub struct MaxwellThreeDRasterState<'a> {
+    registers: &'a MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDRasterState {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            point_size: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            attribute_point_size: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            point_sprite_enable: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            anti_aliased_point_enable: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            point_sprite_select: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            point_center_mode: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            edge_flag: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            alpha_fraction: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            bounding_box: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            fill_via_triangle: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            conservative_raster: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            polygon_smooth_enable: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            polygon_stipple_enable: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            polygon_stipple_pattern: [const {
-                MaxwellThreeDRegister {
-                    raw: None,
-                    value: None,
-                }
-            }; MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT],
-        }
+impl MaxwellThreeDRasterState<'_> {
+    pub fn point_size(&self) -> MaxwellThreeDRegister<MaxwellThreeDPointSize> {
+        self.registers
+            .read(0x1518, |raw| Some(MaxwellThreeDPointSize::from_bits(raw)))
     }
-
-    #[must_use]
-    pub const fn point_size(&self) -> &MaxwellThreeDRegister<MaxwellThreeDPointSize> {
-        &self.point_size
+    pub fn attribute_point_size(&self) -> MaxwellThreeDRegister<MaxwellThreeDAttributePointSize> {
+        self.registers
+            .read(0x1910, MaxwellThreeDAttributePointSize::parse)
     }
-
-    #[must_use]
-    pub const fn attribute_point_size(
+    pub fn point_sprite_enable(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers
+            .read(0x1520, |raw| (raw <= 1).then_some(raw != 0))
+    }
+    pub fn anti_aliased_point_enable(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers
+            .read(0x1658, |raw| (raw <= 1).then_some(raw != 0))
+    }
+    pub fn point_sprite_select(&self) -> MaxwellThreeDRegister<MaxwellThreeDPointSpriteSelect> {
+        self.registers
+            .read(0x1604, MaxwellThreeDPointSpriteSelect::parse)
+    }
+    pub fn point_center_mode(&self) -> MaxwellThreeDRegister<MaxwellThreeDPointCenterMode> {
+        self.registers
+            .read(0x165c, MaxwellThreeDPointCenterMode::parse)
+    }
+    pub fn edge_flag(&self) -> MaxwellThreeDRegister<MaxwellThreeDEdgeFlag> {
+        self.registers.read(0x15e4, MaxwellThreeDEdgeFlag::parse)
+    }
+    pub fn alpha_fraction(&self) -> MaxwellThreeDRegister<MaxwellThreeDAlphaFraction> {
+        self.registers.read(0x074c, |raw| {
+            (raw <= 255).then_some(MaxwellThreeDAlphaFraction::new(raw as u8))
+        })
+    }
+    pub fn bounding_box(&self) -> MaxwellThreeDRegister<MaxwellThreeDRasterBoundingBox> {
+        self.registers.read(0x02ec, |raw| {
+            (raw & !0xff1 == 0).then_some(MaxwellThreeDRasterBoundingBox::parse(raw))
+        })
+    }
+    pub fn fill_via_triangle(&self) -> MaxwellThreeDRegister<MaxwellThreeDFillViaTriangleMode> {
+        self.registers
+            .read(0x113c, MaxwellThreeDFillViaTriangleMode::parse)
+    }
+    pub fn conservative_raster(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDAttributePointSize> {
-        &self.attribute_point_size
+    ) -> MaxwellThreeDRegister<MaxwellThreeDConservativeRasterEnable> {
+        self.registers
+            .read(0x1148, MaxwellThreeDConservativeRasterEnable::parse)
     }
-
-    #[must_use]
-    pub const fn point_sprite_enable(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.point_sprite_enable
+    pub fn polygon_smooth_enable(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers
+            .read(0x0db4, |raw| (raw <= 1).then_some(raw != 0))
     }
-
-    #[must_use]
-    pub const fn anti_aliased_point_enable(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.anti_aliased_point_enable
+    pub fn polygon_stipple_enable(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers
+            .read(0x168c, |raw| (raw <= 1).then_some(raw != 0))
     }
-
-    #[must_use]
-    pub const fn point_sprite_select(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDPointSpriteSelect> {
-        &self.point_sprite_select
-    }
-
-    #[must_use]
-    pub const fn point_center_mode(&self) -> &MaxwellThreeDRegister<MaxwellThreeDPointCenterMode> {
-        &self.point_center_mode
-    }
-
-    #[must_use]
-    pub const fn edge_flag(&self) -> &MaxwellThreeDRegister<MaxwellThreeDEdgeFlag> {
-        &self.edge_flag
-    }
-
-    #[must_use]
-    pub const fn alpha_fraction(&self) -> &MaxwellThreeDRegister<MaxwellThreeDAlphaFraction> {
-        &self.alpha_fraction
-    }
-
-    #[must_use]
-    pub const fn bounding_box(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRasterBoundingBox> {
-        &self.bounding_box
-    }
-
-    #[must_use]
-    pub const fn fill_via_triangle(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDFillViaTriangleMode> {
-        &self.fill_via_triangle
-    }
-
-    #[must_use]
-    pub const fn conservative_raster(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDConservativeRasterEnable> {
-        &self.conservative_raster
-    }
-
-    #[must_use]
-    pub const fn polygon_smooth_enable(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.polygon_smooth_enable
-    }
-
-    #[must_use]
-    pub const fn polygon_stipple_enable(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.polygon_stipple_enable
-    }
-
-    #[must_use]
-    pub const fn polygon_stipple_pattern(
-        &self,
-    ) -> &[MaxwellThreeDRegister<u32>; MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT] {
-        &self.polygon_stipple_pattern
+    pub fn polygon_stipple_word(&self, index: usize) -> MaxwellThreeDRegister<u32> {
+        assert!(index < MAXWELL_POLYGON_STIPPLE_PATTERN_WORD_COUNT);
+        self.registers.read(0x1700 + index as u32 * 4, Some)
     }
 }
 
@@ -868,56 +777,31 @@ impl MaxwellThreeDViewportZClipRange {
 }
 
 /// Raw viewport registers whose complete combinations are validated later.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDViewportState {
-    z_clip_range: MaxwellThreeDRegister<MaxwellThreeDViewportZClipRange>,
-    pixel_center: MaxwellThreeDRegister<MaxwellThreeDViewportPixelCenter>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDViewportState<'a> {
+    pub(super) registers: &'a MaxwellThreeDRawRegisterFile,
 }
-
-impl Default for MaxwellThreeDViewportState {
-    fn default() -> Self {
-        Self {
-            z_clip_range: MaxwellThreeDRegister::verified_reset(
-                0,
-                Some(MaxwellThreeDViewportZClipRange::NegativeWToPositiveW),
-            ),
-            pixel_center: Default::default(),
-        }
-    }
-}
-
-impl MaxwellThreeDViewportState {
+impl MaxwellThreeDViewportState<'_> {
     #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            z_clip_range: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-            pixel_center: MaxwellThreeDRegister {
-                raw: None,
-                value: None,
-            },
-        }
+    pub fn z_clip_range(&self) -> MaxwellThreeDRegister<MaxwellThreeDViewportZClipRange> {
+        self.registers
+            .read(0x0d7c, MaxwellThreeDViewportZClipRange::parse)
     }
-
     #[must_use]
-    pub const fn z_clip_range(&self) -> &MaxwellThreeDRegister<MaxwellThreeDViewportZClipRange> {
-        &self.z_clip_range
-    }
-
-    #[must_use]
-    pub const fn pixel_center(&self) -> &MaxwellThreeDRegister<MaxwellThreeDViewportPixelCenter> {
-        &self.pixel_center
+    pub fn pixel_center(&self) -> MaxwellThreeDRegister<MaxwellThreeDViewportPixelCenter> {
+        self.registers
+            .read(0x1924, MaxwellThreeDViewportPixelCenter::parse)
     }
 }
 
-/// Derived typed cache of one channel's authoritative raw register file.
-/// Dirty fields are decoded at their consuming operation; lowering borrows this
-/// cache and queued work retains immutable lowered values. Shader bindings can
-/// be shared with translation, so copy-on-write occurs at consumption only.
+/// Authoritative class registers, renderer dirty domains and operational state.
+/// Consumers interpret only the fields required by the operation they execute.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellThreeDState {
+    registers: MaxwellThreeDRawRegisterFile,
+    dirty_domains: u16,
+    dirty_vertices: u32,
+    dirty_colors: u8,
     inline_index: Option<Arc<[u8]>>,
     // Revisions are local to one register-file lifetime. Retain a namespace
     // across snapshots so shared caches cannot confuse two channels whose
@@ -937,26 +821,10 @@ pub struct MaxwellThreeDState {
     sampler_revision: u64,
     sample_mode_revision: u64,
     shader_revision: u64,
-    render_targets: Box<MaxwellThreeDRenderTargetState>,
-    fixed_function: Box<MaxwellThreeDFixedFunctionState>,
-    vertex_input: Box<MaxwellThreeDVertexInputState>,
-    shader_bindings: Arc<MaxwellThreeDShaderBindingState>,
-    raster: Box<MaxwellThreeDRasterState>,
-    viewport: Box<MaxwellThreeDViewportState>,
-    render_enable: Box<MaxwellThreeDRenderEnableState>,
-    shader_execution: Box<MaxwellThreeDShaderExecutionState>,
-    color_reduction: Box<MaxwellThreeDColorReductionState>,
-    constant_color_rendering: Box<MaxwellThreeDConstantColorRenderingState>,
-    coverage: Box<MaxwellThreeDCoverageState>,
-    line: Box<MaxwellThreeDLineState>,
-    zcull: Box<MaxwellThreeDZCullState>,
-    l2_cache: Box<MaxwellThreeDL2CacheState>,
-    report_semaphore: Box<MaxwellThreeDReportSemaphoreState>,
-    counters: Box<MaxwellThreeDCounterState>,
+    primitive_sequence: super::vertex::MaxwellThreeDPrimitiveSequence,
+    shader_resources: super::bindings::MaxwellThreeDShaderResources,
     falcon: Box<MaxwellThreeDFalconState>,
-    instrumentation: Box<MaxwellThreeDInstrumentationState>,
-    inline_to_memory: Box<MaxwellThreeDInlineToMemoryState>,
-    tiled_cache: Box<MaxwellThreeDTiledCacheState>,
+    inline_transfer: Option<super::inline_to_memory::PendingTransfer>,
 }
 
 /// Retained identity of the state domains which determine resource bindings.
@@ -1039,106 +907,16 @@ impl MaxwellThreeDResourceStateIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct MaxwellThreeDResourceSemanticWrites {
-    draw_state: bool,
-    draw_parameters: bool,
-    render_targets: bool,
-    constant_buffers: bool,
-    textures: bool,
-    sample_mode: bool,
-}
-
 /// Complete currently modeled live state of one channel's `MAXWELL_B` engine.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub(crate) struct MaxwellThreeDFrontendState {
     pub(super) instance_run: Option<super::draw::InstanceRun>,
     deferred_draw_end: Option<MaxwellThreeDVertexInputWrite>,
-    raw_registers: MaxwellThreeDRawRegisterFile,
-    // One bit per method, plus a summary bit per 64-method group. Only changed
-    // state is decoded at a consumer; the raw register file is authoritative.
-    pending_registers: [u64; 64],
-    pending_groups: u64,
-    pending_original: Box<[u32]>,
-    pending_original_valid: [u64; 64],
-    pending_sources: Box<
-        [Option<(
-            crate::MaxwellGpfifoSourceLocation,
-            crate::MaxwellPushbufferSubchannel,
-        )>],
-    >,
     inline_indices: Vec<u8>,
     inline_end: Option<MaxwellMethodSource>,
     pub(in crate::engines) pending_notification: Option<(u64, MaxwellMethodSource)>,
     operation: MaxwellThreeDState,
     mme: MaxwellThreeDMmeState,
-}
-
-impl Default for MaxwellThreeDFrontendState {
-    fn default() -> Self {
-        // Maxwell methods are 12-bit word addresses in PFIFO. Keep validated
-        // raw values and provenance in that fixed register file, not a tree.
-        let mut raw_registers = MaxwellThreeDRawRegisterFile::default();
-        for method in [
-            0x1208,
-            0x15b8,
-            0x0f8c,
-            0x166c,
-            0x1918,
-            0x191c,
-            0x1920,
-            0x133c,
-            0x135c,
-            MAXWELL_THREE_D_FRONT_POLYGON_MODE_METHOD,
-            MAXWELL_THREE_D_BACK_POLYGON_MODE_METHOD,
-            MAXWELL_THREE_D_WINDOW_ORIGIN_METHOD,
-            MAXWELL_THREE_D_DEPTH_TARGET_LAYER_METHOD,
-        ] {
-            let reset = verified_raw_register_reset(GpuMethodId(method))
-                .expect("listed Maxwell register reset must be verified");
-            raw_registers.set_reset(GpuMethodId(method), reset);
-        }
-        for pipeline in 0..MAXWELL_PIPELINE_SHADER_COUNT {
-            let method = MAXWELL_THREE_D_PIPELINE_SHADER_BASE_METHOD
-                + pipeline as u32 * MAXWELL_THREE_D_PIPELINE_SHADER_STRIDE;
-            for register in [method, method + 0x10] {
-                let reset = verified_raw_register_reset(GpuMethodId(register))
-                    .expect("listed Maxwell pipeline reset must be verified");
-                raw_registers.set_reset(GpuMethodId(register), reset);
-            }
-        }
-        for target in 0..MAXWELL_COLOR_TARGET_COUNT {
-            let blend_method = BLEND_SEPARATE_ALPHA_BASE + target as u32 * BLEND_TARGET_STRIDE;
-            raw_registers.set_reset(GpuMethodId(blend_method), BLEND_SEPARATE_ALPHA_RESET);
-            let method = MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD
-                + target as u32 * MAXWELL_THREE_D_COLOR_TARGET_STRIDE
-                + MAXWELL_THREE_D_COLOR_TARGET_LAYER_OFFSET;
-            let reset = verified_raw_register_reset(GpuMethodId(method))
-                .expect("listed Maxwell color-target layer reset must be verified");
-            raw_registers.set_reset(GpuMethodId(method), reset);
-
-            let compression_method = MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD
-                + target as u32 * MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE;
-            let compression_reset = verified_raw_register_reset(GpuMethodId(compression_method))
-                .expect("listed Maxwell color-compression reset must be verified");
-            raw_registers.set_reset(GpuMethodId(compression_method), compression_reset);
-        }
-        Self {
-            raw_registers,
-            instance_run: None,
-            deferred_draw_end: None,
-            pending_registers: [0; 64],
-            pending_groups: 0,
-            pending_original: vec![0; 4096].into_boxed_slice(),
-            pending_original_valid: [0; 64],
-            pending_sources: vec![None; 4096].into_boxed_slice(),
-            inline_indices: Vec::new(),
-            inline_end: None,
-            pending_notification: None,
-            operation: MaxwellThreeDState::default(),
-            mme: Default::default(),
-        }
-    }
 }
 
 impl MaxwellThreeDFrontendState {
@@ -1160,7 +938,7 @@ impl MaxwellThreeDFrontendState {
     ) -> Result<(), super::MaxwellEngineDispatchError> {
         if self
             .operation
-            .vertex_input
+            .vertex_input()
             .primitive()
             .active_begin()
             .is_none()
@@ -1209,7 +987,7 @@ impl MaxwellThreeDFrontendState {
     ) -> Result<u32, super::MaxwellEngineDispatchError> {
         if self
             .operation
-            .vertex_input
+            .vertex_input()
             .primitive()
             .restart_enabled()
             .value()
@@ -1217,7 +995,7 @@ impl MaxwellThreeDFrontendState {
         {
             let restart = self
                 .operation
-                .vertex_input
+                .vertex_input()
                 .primitive()
                 .restart_index()
                 .raw()
@@ -1244,13 +1022,12 @@ impl MaxwellThreeDFrontendState {
         if let Some(source) = self.inline_end.take() {
             self.operation.inline_index = None;
             self.inline_indices.clear();
-            self.apply(
-                MaxwellThreeDStateWrite::VertexInput(MaxwellThreeDVertexInputWrite::End {
+            self.apply(MaxwellThreeDStateWrite::VertexInput(
+                MaxwellThreeDVertexInputWrite::End {
                     value: source.argument() != 0,
                     source,
-                }),
-                false,
-            );
+                },
+            ));
         }
     }
     #[must_use]
@@ -1261,10 +1038,6 @@ impl MaxwellThreeDFrontendState {
     #[must_use]
     pub fn operation_state(&self) -> &MaxwellThreeDState {
         &self.operation
-    }
-
-    fn operation_state_mut(&mut self) -> &mut MaxwellThreeDState {
-        &mut self.operation
     }
 
     #[must_use]
@@ -1279,65 +1052,88 @@ impl MaxwellThreeDFrontendState {
     /// Returns the last validated raw value for one byte-addressed class method.
     #[must_use]
     pub(in crate::engines) fn raw_register_value(&self, method: GpuMethodId) -> Option<u32> {
-        self.raw_registers.raw(method)
+        self.operation.registers.raw(method)
     }
 
-    pub(super) fn defer_register(&mut self, source: MaxwellMethodSource) {
-        let index = (source.method().0 / 4) as usize;
-        let previous = self.raw_register_value(source.method());
-        if previous != Some(source.argument())
-            || self.raw_registers.written[index / 64] & (1 << (index % 64)) == 0
-            || self.pending_registers[index / 64] & (1 << (index % 64)) != 0
-        {
-            if self.pending_registers[index / 64] & (1 << (index % 64)) == 0 {
-                self.pending_original[index] = previous.unwrap_or(0);
-                if self.raw_registers.written[index / 64] & (1 << (index % 64)) != 0 {
-                    self.pending_original_valid[index / 64] |= 1 << (index % 64);
-                }
-            }
-            self.pending_registers[index / 64] |= 1 << (index % 64);
-            self.pending_groups |= 1 << (index / 64);
-            self.pending_sources[index] = Some((source.location(), source.subchannel()));
+    pub(super) fn write_register(&mut self, method: GpuMethodId, argument: u32) {
+        if self.operation.registers.raw(method) == Some(argument) {
+            return;
         }
-        self.record_raw_register(source);
-    }
-
-    pub(super) fn pending_register(&self, groups: u64) -> Option<MaxwellMethodSource> {
-        let pending = self.pending_groups & groups;
-        if pending == 0 {
-            return None;
+        self.operation.registers.write(method, argument);
+        let domains = super::registers::domains(method);
+        self.operation.dirty_domains |= domains;
+        if domains & super::registers::VERTEX != 0 {
+            let index = if method.0 >= 0x1f00 {
+                (method.0 - 0x1f00) / 8
+            } else {
+                (method.0 - 0x1c00) / 16
+            };
+            self.operation.dirty_vertices |= 1 << index;
         }
-        let group = pending.trailing_zeros() as usize;
-        let bit = self.pending_registers[group].trailing_zeros() as usize;
-        let index = group * 64 + bit;
-        self.pending_sources[index].map(|(location, subchannel)| {
-            MaxwellMethodSource::from_parts(
-                location,
-                subchannel,
-                GpuMethodId(index as u32 * 4),
-                self.raw_registers.values[index],
-            )
-        })
-    }
-
-    pub(super) fn decoded_register(&mut self, method: GpuMethodId) {
-        let index = (method.0 / 4) as usize;
-        self.pending_registers[index / 64] &= !(1 << (index % 64));
-        self.pending_original_valid[index / 64] &= !(1 << (index % 64));
-        self.pending_sources[index] = None;
-        if self.pending_registers[index / 64] == 0 {
-            self.pending_groups &= !(1 << (index / 64));
+        if domains & super::registers::COLOR != 0 {
+            self.operation.dirty_colors |= if method.0 == 0x15b8 {
+                0xff
+            } else if method.0 >= 0x19e0 {
+                1 << ((method.0 - 0x19e0) / 4)
+            } else {
+                1 << ((method.0 - 0x0800) / 0x40)
+            };
         }
     }
-
-    pub(super) fn pending_returns_to_original(&self, source: MaxwellMethodSource) -> bool {
-        let index = (source.method().0 / 4) as usize;
-        self.pending_original_valid[index / 64] & (1 << (index % 64)) != 0
-            && self.pending_original[index] == source.argument()
-    }
-
     pub(super) fn record_raw_register(&mut self, source: MaxwellMethodSource) {
-        self.raw_registers.write(source.method(), source.argument());
+        self.write_register(source.method(), source.argument());
+    }
+
+    pub(super) fn flush_dirty(&mut self) {
+        use super::registers as D;
+        let state = &mut self.operation;
+        let domains = std::mem::take(&mut state.dirty_domains);
+        if domains & D::DRAW != 0 {
+            advance_revision(&mut state.draw_state_revision);
+        }
+        if domains & D::PARAMETERS != 0 {
+            advance_revision(&mut state.draw_parameters_revision);
+        }
+        if domains & D::SHADERS != 0 {
+            advance_revision(&mut state.shader_revision);
+        }
+        if domains & (D::VERTEX | D::INDEX) != 0 {
+            advance_revision(&mut state.resource_group_revisions[0]);
+        }
+        let mut vertices = std::mem::take(&mut state.dirty_vertices);
+        while vertices != 0 {
+            let index = vertices.trailing_zeros() as usize;
+            vertices &= vertices - 1;
+            advance_revision(&mut state.vertex_slots[index]);
+        }
+        if domains & D::INDEX != 0 {
+            advance_revision(&mut state.index_revision);
+        }
+        if domains & (D::COLOR | D::DEPTH | D::SAMPLE_MODE) != 0 {
+            advance_revision(&mut state.resource_group_revisions[3]);
+        }
+        let mut colors = std::mem::take(&mut state.dirty_colors);
+        while colors != 0 {
+            let index = colors.trailing_zeros() as usize;
+            colors &= colors - 1;
+            advance_revision(&mut state.color_target_revisions[index]);
+        }
+        if domains & D::DEPTH != 0 {
+            advance_revision(&mut state.depth_target_revision);
+        }
+        if domains & D::SAMPLE_MODE != 0 {
+            advance_revision(&mut state.sample_mode_revision);
+        }
+        if domains & (D::HEADERS | D::SAMPLERS) != 0 {
+            advance_revision(&mut state.texture_revision);
+            advance_revision(&mut state.resource_group_revisions[2]);
+        }
+        if domains & D::HEADERS != 0 {
+            advance_revision(&mut state.texture_header_revision);
+        }
+        if domains & D::SAMPLERS != 0 {
+            advance_revision(&mut state.sampler_revision);
+        }
     }
 }
 
@@ -1417,82 +1213,88 @@ impl MaxwellThreeDState {
     }
 
     #[must_use]
-    pub fn render_targets(&self) -> &MaxwellThreeDRenderTargetState {
-        &self.render_targets
+    pub fn render_targets(&self) -> MaxwellThreeDRenderTargetState<'_> {
+        MaxwellThreeDRenderTargetState {
+            registers: &self.registers,
+        }
     }
 
     #[must_use]
-    pub fn fixed_function(&self) -> &MaxwellThreeDFixedFunctionState {
-        &self.fixed_function
+    pub fn fixed_function(&self) -> MaxwellThreeDFixedFunctionState<'_> {
+        MaxwellThreeDFixedFunctionState {
+            registers: &self.registers,
+        }
     }
 
     #[must_use]
-    pub fn vertex_input(&self) -> &MaxwellThreeDVertexInputState {
-        &self.vertex_input
+    pub fn vertex_input(&self) -> MaxwellThreeDVertexInputState<'_> {
+        MaxwellThreeDVertexInputState {
+            registers: &self.registers,
+            sequence: &self.primitive_sequence,
+        }
     }
 
-    pub fn shader_bindings(&self) -> &MaxwellThreeDShaderBindingState {
-        &self.shader_bindings
-    }
-
-    #[must_use]
-    pub fn raster(&self) -> &MaxwellThreeDRasterState {
-        self.raster.as_ref()
-    }
-
-    #[must_use]
-    pub fn viewport(&self) -> &MaxwellThreeDViewportState {
-        self.viewport.as_ref()
+    pub fn shader_bindings(&self) -> MaxwellThreeDShaderBindingState<'_> {
+        MaxwellThreeDShaderBindingState {
+            registers: &self.registers,
+            resources: &self.shader_resources,
+        }
     }
 
     #[must_use]
-    pub fn render_enable(&self) -> &MaxwellThreeDRenderEnableState {
-        self.render_enable.as_ref()
+    pub fn raster(&self) -> MaxwellThreeDRasterState<'_> {
+        MaxwellThreeDRasterState {
+            registers: &self.registers,
+        }
     }
 
     #[must_use]
-    pub fn shader_execution(&self) -> &MaxwellThreeDShaderExecutionState {
-        self.shader_execution.as_ref()
+    pub fn viewport(&self) -> MaxwellThreeDViewportState<'_> {
+        MaxwellThreeDViewportState {
+            registers: &self.registers,
+        }
     }
 
     #[must_use]
-    pub fn color_reduction(&self) -> &MaxwellThreeDColorReductionState {
-        self.color_reduction.as_ref()
+    pub fn render_enable(&self) -> MaxwellThreeDRenderEnableState<'_> {
+        MaxwellThreeDRenderEnableState {
+            registers: &self.registers,
+        }
     }
 
     #[must_use]
-    pub fn constant_color_rendering(&self) -> &MaxwellThreeDConstantColorRenderingState {
-        self.constant_color_rendering.as_ref()
+    pub fn shader_execution(&self) -> MaxwellThreeDShaderExecutionState<'_> {
+        MaxwellThreeDShaderExecutionState {
+            registers: &self.registers,
+        }
     }
 
     #[must_use]
-    pub fn coverage(&self) -> &MaxwellThreeDCoverageState {
-        self.coverage.as_ref()
+    pub fn color_reduction(&self) -> MaxwellThreeDColorReductionState<'_> {
+        MaxwellThreeDColorReductionState {
+            registers: &self.registers,
+        }
     }
 
     #[must_use]
-    pub fn line(&self) -> &MaxwellThreeDLineState {
-        self.line.as_ref()
+    pub fn coverage(&self) -> MaxwellThreeDCoverageState<'_> {
+        MaxwellThreeDCoverageState {
+            registers: &self.registers,
+        }
     }
 
     #[must_use]
-    pub fn zcull(&self) -> &MaxwellThreeDZCullState {
-        self.zcull.as_ref()
+    pub fn line(&self) -> MaxwellThreeDLineState<'_> {
+        MaxwellThreeDLineState {
+            registers: &self.registers,
+        }
     }
 
     #[must_use]
-    pub fn l2_cache(&self) -> &MaxwellThreeDL2CacheState {
-        self.l2_cache.as_ref()
-    }
-
-    #[must_use]
-    pub fn report_semaphore(&self) -> &MaxwellThreeDReportSemaphoreState {
-        self.report_semaphore.as_ref()
-    }
-
-    #[must_use]
-    pub fn counters(&self) -> &MaxwellThreeDCounterState {
-        self.counters.as_ref()
+    pub fn report_semaphore(&self) -> MaxwellThreeDReportSemaphoreState<'_> {
+        MaxwellThreeDReportSemaphoreState {
+            registers: &self.registers,
+        }
     }
 
     #[must_use]
@@ -1501,29 +1303,22 @@ impl MaxwellThreeDState {
     }
 
     #[must_use]
-    pub fn instrumentation(&self) -> &MaxwellThreeDInstrumentationState {
-        self.instrumentation.as_ref()
-    }
-
-    #[must_use]
-    pub fn inline_to_memory(&self) -> &MaxwellThreeDInlineToMemoryState {
-        self.inline_to_memory.as_ref()
-    }
-
-    #[must_use]
-    pub fn tiled_cache(&self) -> &MaxwellThreeDTiledCacheState {
-        self.tiled_cache.as_ref()
+    pub fn inline_to_memory(&self) -> MaxwellThreeDInlineToMemoryState<'_> {
+        MaxwellThreeDInlineToMemoryState {
+            registers: &self.registers,
+            pending: &self.inline_transfer,
+        }
     }
 
     /// Patches consume the tessellator's output primitive, not their input topology.
     pub(in crate::engines) fn generated_primitive(&self) -> Option<GeneratedPrimitive> {
         use GeneratedPrimitive as Output;
-        match self.vertex_input.primitive().active_begin()?.topology() {
+        match self.vertex_input().primitive().active_begin()?.topology() {
             0 => Some(Output::Points),
             1 | 3 => Some(Output::Lines),
             4..=7 => Some(Output::Triangles),
             14 => self
-                .shader_bindings
+                .shader_bindings()
                 .tessellation_mode()
                 .value()?
                 .lower()
@@ -1539,14 +1334,26 @@ impl MaxwellThreeDState {
 }
 
 impl MaxwellThreeDFrontendState {
-    pub(super) fn complete_draw_end(&mut self) {
-        if let Some(write) = self.deferred_draw_end.take() {
-            self.operation_state_mut().vertex_input.apply(write);
+    fn apply_primitive(&mut self, write: MaxwellThreeDVertexInputWrite) {
+        match write {
+            MaxwellThreeDVertexInputWrite::Begin { value, source } => self
+                .operation
+                .primitive_sequence
+                .begin(source.argument(), value),
+            MaxwellThreeDVertexInputWrite::End { value, source } => self
+                .operation
+                .primitive_sequence
+                .end(source.argument(), value),
         }
     }
-    pub(super) fn apply(&mut self, write: MaxwellThreeDStateWrite, changed: bool) {
+    pub(super) fn complete_draw_end(&mut self) {
+        if let Some(write) = self.deferred_draw_end.take() {
+            self.apply_primitive(write);
+        }
+    }
+    pub(super) fn apply(&mut self, write: MaxwellThreeDStateWrite) {
         // END terminates the pending draw, whose capture still consumes its
-        // validated BEGIN. Materialize that termination after the draw consumer
+        // validated BEGIN. Apply that termination after the draw consumer
         // or before the next BEGIN; raw/shadow register writes remain immediate.
         if self.instance_run.is_some()
             && let MaxwellThreeDStateWrite::VertexInput(
@@ -1556,277 +1363,68 @@ impl MaxwellThreeDFrontendState {
             self.deferred_draw_end = Some(end);
             return;
         }
-        let mut resource_semantic_writes = if changed {
-            write.resource_semantic_writes()
-        } else {
-            MaxwellThreeDResourceSemanticWrites::default()
-        };
-        if let MaxwellThreeDStateWrite::ShaderBinding(
-            MaxwellThreeDShaderBindingWrite::BindConstantBuffer {
-                group,
-                slot,
-                enabled,
-                address,
-                size,
-                ..
-            },
-        ) = write
-        {
-            let previous = self.operation_state().shader_bindings().groups()[group as usize]
-                .constant_buffers()[slot as usize];
-            resource_semantic_writes.constant_buffers = previous.is_none_or(|previous| {
-                previous.enabled() != enabled
-                    || previous.address() != address
-                    || previous.size() != size
-            });
-        }
-        resource_semantic_writes.draw_state = changed && write.affects_prepared_draw();
-        resource_semantic_writes.draw_parameters = changed && write.affects_draw_parameters();
-        let shader_semantic_write = changed && write.affects_shader_translation();
-        if changed {
-            use MaxwellThreeDVertexInputWrite as V;
-            match write {
-                MaxwellThreeDStateWrite::VertexInput(
-                    V::StreamFormat { stream, .. }
-                    | V::StreamAddressUpper { stream, .. }
-                    | V::StreamAddressLower { stream, .. }
-                    | V::StreamLimitUpper { stream, .. }
-                    | V::StreamLimitLower { stream, .. },
-                ) => {
-                    let state = self.operation_state_mut();
-                    advance_revision(&mut state.vertex_slots[stream as usize]);
-                    advance_revision(&mut state.resource_group_revisions[0]);
-                }
-                MaxwellThreeDStateWrite::VertexInput(
-                    V::IndexAddressUpper { .. }
-                    | V::IndexAddressLower { .. }
-                    | V::IndexLimitUpper { .. }
-                    | V::IndexLimitLower { .. }
-                    | V::IndexElementSize { .. }
-                    | V::IndexFirst { .. }
-                    | V::IndexCount { .. },
-                ) => {
-                    let state = self.operation_state_mut();
-                    advance_revision(&mut state.index_revision);
-                    advance_revision(&mut state.resource_group_revisions[0]);
-                }
-                _ => (),
-            }
-        }
-        if resource_semantic_writes.constant_buffers
-            && let MaxwellThreeDStateWrite::ShaderBinding(
-                MaxwellThreeDShaderBindingWrite::BindConstantBuffer { group, slot, .. },
-            ) = write
-        {
-            advance_revision(
-                &mut self.operation_state_mut().constant_slots[group as usize][slot as usize],
-            );
-        }
         match write {
-            MaxwellThreeDStateWrite::PointSize { value, source: _ } => {
-                self.operation_state_mut().raster.point_size =
-                    MaxwellThreeDRegister::decoded(value.bits(), value);
-            }
-            MaxwellThreeDStateWrite::InlineToMemory(write) => {
-                self.operation_state_mut().inline_to_memory.apply(write);
-            }
-            MaxwellThreeDStateWrite::AttributePointSize { value, source: _ } => {
-                self.operation_state_mut().raster.attribute_point_size =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDStateWrite::PointSpriteEnable { value, source: _ } => {
-                self.operation_state_mut().raster.point_sprite_enable =
-                    MaxwellThreeDRegister::decoded(u32::from(value), value);
-            }
-            MaxwellThreeDStateWrite::AntiAliasedPointEnable { value, source: _ } => {
-                self.operation_state_mut().raster.anti_aliased_point_enable =
-                    MaxwellThreeDRegister::decoded(u32::from(value), value);
-            }
-            MaxwellThreeDStateWrite::PointSpriteSelect { value, source: _ } => {
-                self.operation_state_mut().raster.point_sprite_select =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDStateWrite::PointCenterMode { value, source: _ } => {
-                self.operation_state_mut().raster.point_center_mode =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDStateWrite::EdgeFlag { value, source: _ } => {
-                self.operation_state_mut().raster.edge_flag =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDStateWrite::AlphaFraction { value, source: _ } => {
-                self.operation_state_mut().raster.alpha_fraction =
-                    MaxwellThreeDRegister::decoded(u32::from(value.raw()), value);
-            }
-            MaxwellThreeDStateWrite::RasterBoundingBox { value, source: _ } => {
-                self.operation_state_mut().raster.bounding_box =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDStateWrite::FillViaTriangle { value, source: _ } => {
-                self.operation_state_mut().raster.fill_via_triangle =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDStateWrite::ConservativeRaster { value, source: _ } => {
-                self.operation_state_mut().raster.conservative_raster =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDStateWrite::PolygonSmoothEnable { value, source: _ } => {
-                self.operation_state_mut().raster.polygon_smooth_enable =
-                    MaxwellThreeDRegister::decoded(u32::from(value), value);
-            }
-            MaxwellThreeDStateWrite::PolygonStippleEnable { value, source: _ } => {
-                self.operation_state_mut().raster.polygon_stipple_enable =
-                    MaxwellThreeDRegister::decoded(u32::from(value), value);
-            }
-            MaxwellThreeDStateWrite::PolygonStipplePattern {
-                word,
-                value,
-                source: _,
-            } => {
-                self.operation_state_mut().raster.polygon_stipple_pattern[word as usize] =
-                    MaxwellThreeDRegister::decoded(value, value);
-            }
-            MaxwellThreeDStateWrite::ViewportZClip { value, source: _ } => {
-                self.operation_state_mut().viewport.z_clip_range =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDStateWrite::ViewportPixelCenter { value, source: _ } => {
-                self.operation_state_mut().viewport.pixel_center =
-                    MaxwellThreeDRegister::decoded(value.raw(), value);
-            }
-            MaxwellThreeDStateWrite::RenderTarget(write) => {
-                self.operation_state_mut().render_targets.apply(write);
-            }
-            MaxwellThreeDStateWrite::FixedFunction(write) => {
-                self.operation_state_mut().fixed_function.apply(write);
-            }
-            MaxwellThreeDStateWrite::VertexInput(write) => {
-                self.operation_state_mut().vertex_input.apply(write);
-            }
+            MaxwellThreeDStateWrite::InlineToMemory(write) => match write {
+                MaxwellThreeDInlineToMemoryStateWrite::Launch {
+                    address,
+                    byte_length,
+                    ..
+                } => {
+                    self.operation.inline_transfer =
+                        (byte_length != 0).then_some(super::inline_to_memory::PendingTransfer {
+                            address,
+                            byte_length,
+                            next_offset: 0,
+                        });
+                }
+                MaxwellThreeDInlineToMemoryStateWrite::Data { next_offset, .. } => {
+                    let pending = self
+                        .operation
+                        .inline_transfer
+                        .as_mut()
+                        .expect("validated inline transfer");
+                    pending.next_offset = next_offset;
+                    if next_offset >= pending.byte_length {
+                        self.operation.inline_transfer = None;
+                    }
+                }
+            },
+            MaxwellThreeDStateWrite::VertexInput(write) => self.apply_primitive(write),
             MaxwellThreeDStateWrite::ShaderBinding(write) => {
-                Arc::make_mut(&mut self.operation_state_mut().shader_bindings).apply(write);
-            }
-            MaxwellThreeDStateWrite::RenderEnable(write) => {
-                self.operation_state_mut().render_enable.apply(write)
-            }
-            MaxwellThreeDStateWrite::ShaderExecution(write) => {
-                self.operation_state_mut().shader_execution.apply(write)
-            }
-            MaxwellThreeDStateWrite::ColorReduction(write) => {
-                self.operation_state_mut().color_reduction.apply(write)
-            }
-            MaxwellThreeDStateWrite::ConstantColorRendering(write) => {
-                self.operation_state_mut()
-                    .constant_color_rendering
-                    .apply(write);
-            }
-            MaxwellThreeDStateWrite::Coverage(write) => {
-                self.operation_state_mut().coverage.apply(write)
-            }
-            MaxwellThreeDStateWrite::Line(write) => self.operation_state_mut().line.apply(write),
-            MaxwellThreeDStateWrite::ZCull(write) => self.operation_state_mut().zcull.apply(write),
-            MaxwellThreeDStateWrite::L2Cache(write) => {
-                self.operation_state_mut().l2_cache.apply(write)
-            }
-            MaxwellThreeDStateWrite::ReportSemaphore(write) => {
-                self.operation_state_mut().report_semaphore.apply(write)
-            }
-            MaxwellThreeDStateWrite::Counter(write) => {
-                self.operation_state_mut().counters.apply(write)
-            }
-            MaxwellThreeDStateWrite::Instrumentation(write) => {
-                self.operation_state_mut().instrumentation.apply(write)
-            }
-            MaxwellThreeDStateWrite::TiledCache(write) => {
-                self.operation_state_mut().tiled_cache.apply(write)
+                if let MaxwellThreeDShaderBindingWrite::BindConstantBuffer {
+                    group,
+                    slot,
+                    enabled,
+                    address,
+                    size,
+                    ..
+                } = write
+                {
+                    let previous = self.operation.shader_bindings().groups()[group as usize]
+                        .constant_buffers()[slot as usize];
+                    if previous.is_none_or(|p| {
+                        p.enabled() != enabled || p.address() != address || p.size() != size
+                    }) {
+                        advance_revision(
+                            &mut self.operation.constant_slots[group as usize][slot as usize],
+                        );
+                        advance_revision(&mut self.operation.constant_buffer_revision);
+                        advance_revision(&mut self.operation.resource_group_revisions[1]);
+                        advance_revision(&mut self.operation.resource_group_revisions[2]);
+                    }
+                }
+                self.operation.shader_resources.apply(write);
             }
             MaxwellThreeDStateWrite::FalconMaskedRegister(write) => {
-                self.operation_state_mut().falcon.apply(write);
-                let completion = MaxwellThreeDMmeStateWrite::ShadowScratch {
+                self.operation.falcon.apply(write);
+                self.mme.apply(MaxwellThreeDMmeStateWrite::ShadowScratch {
                     index: MaxwellThreeDMmeShadowScratchIndex::new(0),
                     value: 1,
                     source: write.source(),
-                };
-                self.mme.apply(completion);
-                self.raw_registers.write(GpuMethodId(0x3400), 1);
+                });
+                self.operation.registers.write(GpuMethodId(0x3400), 1);
             }
             MaxwellThreeDStateWrite::Mme(write) => self.mme.apply(write),
-        }
-        let state = self.operation_state_mut();
-        if resource_semantic_writes.draw_state {
-            advance_revision(&mut state.draw_state_revision);
-        }
-        if resource_semantic_writes.draw_parameters {
-            advance_revision(&mut state.draw_parameters_revision);
-        }
-        if resource_semantic_writes.render_targets {
-            advance_revision(&mut state.resource_group_revisions[3]);
-            use MaxwellThreeDRenderTargetWrite as R;
-            match write {
-                MaxwellThreeDStateWrite::RenderTarget(
-                    R::ColorAddressUpper { target, .. }
-                    | R::ColorAddressLower { target, .. }
-                    | R::ColorWidth { target, .. }
-                    | R::ColorHeight { target, .. }
-                    | R::ColorFormat { target, .. }
-                    | R::ColorLayout { target, .. }
-                    | R::ColorThirdDimension { target, .. }
-                    | R::ColorArrayPitch { target, .. }
-                    | R::ColorLayer { target, .. }
-                    | R::ColorCompression { target, .. },
-                ) => advance_revision(&mut state.color_target_revisions[target as usize]),
-                MaxwellThreeDStateWrite::RenderTarget(R::SrgbWrite { .. }) => {
-                    for revision in &mut state.color_target_revisions {
-                        advance_revision(revision);
-                    }
-                }
-                _ => advance_revision(&mut state.depth_target_revision),
-            }
-        }
-        if resource_semantic_writes.constant_buffers {
-            advance_revision(&mut state.constant_buffer_revision);
-            advance_revision(&mut state.resource_group_revisions[1]);
-            advance_revision(&mut state.resource_group_revisions[2]);
-        }
-        if resource_semantic_writes.textures {
-            advance_revision(&mut state.texture_revision);
-            advance_revision(&mut state.resource_group_revisions[2]);
-            use MaxwellThreeDShaderBindingWrite as B;
-            let linked = state.shader_bindings().sampler_binding().value()
-                == Some(&super::MaxwellThreeDSamplerBindingMode::ViaTextureHeader);
-            match write {
-                MaxwellThreeDStateWrite::ShaderBinding(
-                    B::TextureHeaderAddressUpper { .. }
-                    | B::TextureHeaderAddressLower { .. }
-                    | B::MaxwellTextureHeaders { .. },
-                ) => advance_revision(&mut state.texture_header_revision),
-                MaxwellThreeDStateWrite::ShaderBinding(B::TextureHeaderMaximumIndex { .. }) => {
-                    advance_revision(&mut state.texture_header_revision);
-                    if linked {
-                        advance_revision(&mut state.sampler_revision);
-                    }
-                }
-                MaxwellThreeDStateWrite::ShaderBinding(
-                    B::SamplerAddressUpper { .. } | B::SamplerAddressLower { .. },
-                ) => advance_revision(&mut state.sampler_revision),
-                MaxwellThreeDStateWrite::ShaderBinding(B::SamplerMaximumIndex { .. }) => {
-                    if !linked {
-                        advance_revision(&mut state.sampler_revision);
-                    }
-                }
-                MaxwellThreeDStateWrite::ShaderBinding(B::SamplerBinding { .. }) => {
-                    advance_revision(&mut state.texture_header_revision);
-                    advance_revision(&mut state.sampler_revision);
-                }
-                _ => unreachable!("texture revision belongs to descriptor table methods"),
-            }
-        }
-        if resource_semantic_writes.sample_mode {
-            advance_revision(&mut state.sample_mode_revision);
-            advance_revision(&mut state.resource_group_revisions[3]);
-        }
-        if shader_semantic_write {
-            advance_revision(&mut state.shader_revision);
         }
     }
 }
@@ -1841,254 +1439,10 @@ fn advance_revision(revision: &mut u64) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDStateWrite {
     InlineToMemory(MaxwellThreeDInlineToMemoryStateWrite),
-    PointSize {
-        value: MaxwellThreeDPointSize,
-        source: MaxwellMethodSource,
-    },
-    AttributePointSize {
-        value: MaxwellThreeDAttributePointSize,
-        source: MaxwellMethodSource,
-    },
-    PointSpriteEnable {
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    AntiAliasedPointEnable {
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    PointSpriteSelect {
-        value: MaxwellThreeDPointSpriteSelect,
-        source: MaxwellMethodSource,
-    },
-    PointCenterMode {
-        value: MaxwellThreeDPointCenterMode,
-        source: MaxwellMethodSource,
-    },
-    EdgeFlag {
-        value: MaxwellThreeDEdgeFlag,
-        source: MaxwellMethodSource,
-    },
-    AlphaFraction {
-        value: MaxwellThreeDAlphaFraction,
-        source: MaxwellMethodSource,
-    },
-    RasterBoundingBox {
-        value: MaxwellThreeDRasterBoundingBox,
-        source: MaxwellMethodSource,
-    },
-    FillViaTriangle {
-        value: MaxwellThreeDFillViaTriangleMode,
-        source: MaxwellMethodSource,
-    },
-    ConservativeRaster {
-        value: MaxwellThreeDConservativeRasterEnable,
-        source: MaxwellMethodSource,
-    },
-    PolygonSmoothEnable {
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    PolygonStippleEnable {
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    PolygonStipplePattern {
-        word: u8,
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    ViewportZClip {
-        value: MaxwellThreeDViewportZClipRange,
-        source: MaxwellMethodSource,
-    },
-    ViewportPixelCenter {
-        value: MaxwellThreeDViewportPixelCenter,
-        source: MaxwellMethodSource,
-    },
-    RenderTarget(MaxwellThreeDRenderTargetWrite),
-    FixedFunction(MaxwellThreeDFixedFunctionWrite),
     VertexInput(MaxwellThreeDVertexInputWrite),
     ShaderBinding(MaxwellThreeDShaderBindingWrite),
-    RenderEnable(MaxwellThreeDRenderEnableStateWrite),
-    ShaderExecution(MaxwellThreeDShaderExecutionStateWrite),
-    ColorReduction(MaxwellThreeDColorReductionStateWrite),
-    ConstantColorRendering(MaxwellThreeDConstantColorRenderingStateWrite),
-    Coverage(MaxwellThreeDCoverageStateWrite),
-    Line(MaxwellThreeDLineStateWrite),
-    ZCull(MaxwellThreeDZCullStateWrite),
-    L2Cache(MaxwellThreeDL2CacheStateWrite),
-    ReportSemaphore(MaxwellThreeDReportSemaphoreStateWrite),
-    Counter(MaxwellThreeDCounterStateWrite),
-    Instrumentation(MaxwellThreeDInstrumentationStateWrite),
-    TiledCache(MaxwellThreeDTiledCacheStateWrite),
     FalconMaskedRegister(MaxwellThreeDFalconMaskedRegisterWrite),
     Mme(MaxwellThreeDMmeStateWrite),
-}
-
-impl MaxwellThreeDStateWrite {
-    const fn affects_draw_parameters(self) -> bool {
-        // Physical stream windows and draw arguments do not change vertex
-        // formats, rasterization, or shader specialization. They are resolved
-        // and bounds-checked independently at each consuming draw.
-        self.affects_prepared_draw()
-            && !matches!(
-                self,
-                Self::VertexInput(
-                    MaxwellThreeDVertexInputWrite::StreamAddressUpper { .. }
-                        | MaxwellThreeDVertexInputWrite::StreamAddressLower { .. }
-                        | MaxwellThreeDVertexInputWrite::StreamLimitUpper { .. }
-                        | MaxwellThreeDVertexInputWrite::StreamLimitLower { .. }
-                        | MaxwellThreeDVertexInputWrite::IndexAddressUpper { .. }
-                        | MaxwellThreeDVertexInputWrite::IndexAddressLower { .. }
-                        | MaxwellThreeDVertexInputWrite::IndexLimitUpper { .. }
-                        | MaxwellThreeDVertexInputWrite::IndexLimitLower { .. }
-                        | MaxwellThreeDVertexInputWrite::IndexFirst { .. }
-                        | MaxwellThreeDVertexInputWrite::IndexCount { .. }
-                )
-            )
-    }
-    const fn affects_prepared_draw(self) -> bool {
-        match self {
-            Self::PointSize { .. }
-            | Self::AttributePointSize { .. }
-            | Self::PointSpriteEnable { .. }
-            | Self::AntiAliasedPointEnable { .. }
-            | Self::PointSpriteSelect { .. }
-            | Self::PointCenterMode { .. }
-            | Self::EdgeFlag { .. }
-            | Self::AlphaFraction { .. }
-            | Self::RasterBoundingBox { .. }
-            | Self::FillViaTriangle { .. }
-            | Self::ConservativeRaster { .. }
-            | Self::PolygonSmoothEnable { .. }
-            | Self::PolygonStippleEnable { .. }
-            | Self::PolygonStipplePattern { .. }
-            | Self::ViewportZClip { .. }
-            | Self::ViewportPixelCenter { .. }
-            | Self::FixedFunction(_)
-            | Self::ColorReduction(_)
-            | Self::Coverage(_)
-            | Self::Line(_) => true,
-            // The reference renderer retains this register family without
-            // replacing fragment shader outputs or specializing the pipeline.
-            // https://github.com/eden-emulator/mirror/blob/master/src/video_core/engines/maxwell_3d.h
-            Self::ConstantColorRendering(_) => false,
-            Self::RenderEnable(write) => matches!(write, MaxwellThreeDRenderEnableStateWrite::ConditionalLoadConstantBuffer{..}),
-            Self::ShaderExecution(write) => !matches!(write, MaxwellThreeDShaderExecutionStateWrite::OpportunisticEarlyZHysteresis { .. }),
-            Self::RenderTarget(write) => !matches!(
-                write,
-                MaxwellThreeDRenderTargetWrite::ClearColor { .. }
-                    | MaxwellThreeDRenderTargetWrite::ClearDepth { .. }
-                    | MaxwellThreeDRenderTargetWrite::ClearStencil { .. }
-                    | MaxwellThreeDRenderTargetWrite::ClearHorizontal { .. }
-                    | MaxwellThreeDRenderTargetWrite::ClearVertical { .. }
-                    | MaxwellThreeDRenderTargetWrite::ClearSurfaceControl { .. }
-                    | MaxwellThreeDRenderTargetWrite::ClearSurface { .. }
-                    | MaxwellThreeDRenderTargetWrite::ColorZeroBandwidthClear { .. }
-                    | MaxwellThreeDRenderTargetWrite::DepthZeroBandwidthClear { .. }
-            ),
-            Self::VertexInput(write) => !matches!(
-                write,
-                MaxwellThreeDVertexInputWrite::VertexArrayStart { .. }
-            ),
-            Self::ShaderBinding(MaxwellThreeDShaderBindingWrite::TessellationMode { .. }
-                | MaxwellThreeDShaderBindingWrite::TessellationLod { .. }) => true,
-            Self::InlineToMemory(_)
-            // Z-cull only describes the guest's hierarchical cache. The
-            // neutral draw always uses its ordinary depth/stencil tests.
-            | Self::ZCull(_)
-            | Self::ShaderBinding(_)
-            | Self::L2Cache(_)
-            | Self::ReportSemaphore(_)
-            | Self::Counter(_)
-            | Self::Instrumentation(_)
-            | Self::TiledCache(_)
-            | Self::FalconMaskedRegister(_)
-            | Self::Mme(_) => false,
-        }
-    }
-
-    fn resource_semantic_writes(self) -> MaxwellThreeDResourceSemanticWrites {
-        match self {
-            Self::RenderTarget(
-                MaxwellThreeDRenderTargetWrite::ColorAddressUpper { .. }
-                | MaxwellThreeDRenderTargetWrite::ColorAddressLower { .. }
-                | MaxwellThreeDRenderTargetWrite::ColorWidth { .. }
-                | MaxwellThreeDRenderTargetWrite::ColorHeight { .. }
-                | MaxwellThreeDRenderTargetWrite::ColorFormat { .. }
-                | MaxwellThreeDRenderTargetWrite::SrgbWrite { .. }
-                | MaxwellThreeDRenderTargetWrite::ColorLayout { .. }
-                | MaxwellThreeDRenderTargetWrite::ColorThirdDimension { .. }
-                | MaxwellThreeDRenderTargetWrite::ColorArrayPitch { .. }
-                | MaxwellThreeDRenderTargetWrite::ColorLayer { .. }
-                | MaxwellThreeDRenderTargetWrite::ColorCompression { .. }
-                | MaxwellThreeDRenderTargetWrite::DepthAddressUpper { .. }
-                | MaxwellThreeDRenderTargetWrite::DepthAddressLower { .. }
-                | MaxwellThreeDRenderTargetWrite::DepthFormat { .. }
-                | MaxwellThreeDRenderTargetWrite::DepthSparse { .. }
-                | MaxwellThreeDRenderTargetWrite::DepthLayout { .. }
-                | MaxwellThreeDRenderTargetWrite::DepthWidth { .. }
-                | MaxwellThreeDRenderTargetWrite::DepthHeight { .. }
-                | MaxwellThreeDRenderTargetWrite::DepthThirdDimension { .. }
-                | MaxwellThreeDRenderTargetWrite::DepthArrayPitch { .. }
-                | MaxwellThreeDRenderTargetWrite::DepthLayer { .. }
-                | MaxwellThreeDRenderTargetWrite::DepthCompression { .. },
-            ) => MaxwellThreeDResourceSemanticWrites {
-                render_targets: true,
-                ..MaxwellThreeDResourceSemanticWrites::default()
-            },
-            Self::FixedFunction(MaxwellThreeDFixedFunctionWrite::Register {
-                register: MaxwellThreeDFixedFunctionRegister::SampleMode,
-                ..
-            }) => MaxwellThreeDResourceSemanticWrites {
-                sample_mode: true,
-                ..MaxwellThreeDResourceSemanticWrites::default()
-            },
-            Self::ShaderBinding(MaxwellThreeDShaderBindingWrite::BindConstantBuffer { .. }) => {
-                MaxwellThreeDResourceSemanticWrites {
-                    constant_buffers: true,
-                    ..MaxwellThreeDResourceSemanticWrites::default()
-                }
-            }
-            Self::ShaderBinding(
-                MaxwellThreeDShaderBindingWrite::TextureHeaderAddressUpper { .. }
-                | MaxwellThreeDShaderBindingWrite::TextureHeaderAddressLower { .. }
-                | MaxwellThreeDShaderBindingWrite::TextureHeaderMaximumIndex { .. }
-                | MaxwellThreeDShaderBindingWrite::SamplerAddressUpper { .. }
-                | MaxwellThreeDShaderBindingWrite::SamplerAddressLower { .. }
-                | MaxwellThreeDShaderBindingWrite::SamplerMaximumIndex { .. }
-                | MaxwellThreeDShaderBindingWrite::SamplerBinding { .. }
-                | MaxwellThreeDShaderBindingWrite::MaxwellTextureHeaders { .. },
-            ) => MaxwellThreeDResourceSemanticWrites {
-                textures: true,
-                ..MaxwellThreeDResourceSemanticWrites::default()
-            },
-            _ => MaxwellThreeDResourceSemanticWrites::default(),
-        }
-    }
-
-    const fn affects_shader_translation(self) -> bool {
-        matches!(
-            self,
-            Self::VertexInput(MaxwellThreeDVertexInputWrite::Attribute { .. })
-                | Self::FixedFunction(MaxwellThreeDFixedFunctionWrite::Register {
-                    register: MaxwellThreeDFixedFunctionRegister::WindowOrigin
-                        | MaxwellThreeDFixedFunctionRegister::ViewportScaleOffsetEnable,
-                    ..
-                })
-                | Self::ShaderBinding(
-                    MaxwellThreeDShaderBindingWrite::ProgramRegionAddressUpper { .. }
-                        | MaxwellThreeDShaderBindingWrite::ProgramRegionAddressLower { .. }
-                        | MaxwellThreeDShaderBindingWrite::PipelineShader { .. }
-                        | MaxwellThreeDShaderBindingWrite::PipelineProgram { .. }
-                        | MaxwellThreeDShaderBindingWrite::PipelineRegisterCount { .. }
-                        | MaxwellThreeDShaderBindingWrite::PipelineGroup { .. }
-                        | MaxwellThreeDShaderBindingWrite::BindlessTextureSlot { .. }
-                        | MaxwellThreeDShaderBindingWrite::GeometryPassthroughMask { .. }
-                )
-        )
-    }
 }
 
 #[cfg(test)]
@@ -2098,13 +1452,8 @@ mod tests {
     #[test]
     fn viewport_depth_reset_is_shared_by_typed_live_state_and_mme_shadow_reads() {
         let frontend = MaxwellThreeDFrontendState::default();
-        for (index, viewport) in frontend
-            .operation_state()
-            .fixed_function()
-            .viewport()
-            .iter()
-            .enumerate()
-        {
+        for index in 0..16 {
+            let viewport = frontend.operation_state().fixed_function().viewport(index);
             for (offset, register, expected) in [
                 (8, viewport.clip_min_z(), 0),
                 (12, viewport.clip_max_z(), 1.0_f32.to_bits()),
@@ -2119,12 +1468,7 @@ mod tests {
                     Some(expected)
                 );
             }
-            assert!(
-                viewport
-                    .scale()
-                    .iter()
-                    .all(|register| register.value().is_none())
-            );
+            assert!((0..3).all(|axis| viewport.scale(axis).value().is_none()));
         }
     }
 }

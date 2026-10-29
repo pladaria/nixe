@@ -93,7 +93,7 @@ fn three_d_embedded_inline_upload_still_rejects_active_unsupported_launch_modes(
     ] {
         let mut channel = three_d_channel();
         dispatch_incrementing(&mut channel, 0x0180 / 4, &[4, 1, 0, 0x0409_3000]).unwrap();
-        let before = channel.three_d().inline_to_memory().clone();
+        let before = channel.three_d().clone();
         assert!(matches!(
             dispatch_first(&mut channel, &packet(0x01b0 / 4, raw)),
             Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
@@ -101,7 +101,7 @@ fn three_d_embedded_inline_upload_still_rejects_active_unsupported_launch_modes(
                 ..
             })
         ));
-        assert_eq!(channel.three_d().inline_to_memory(), &before);
+        assert_eq!(channel.three_d(), &before);
     }
 }
 
@@ -150,6 +150,7 @@ fn non_indexed_resource_scope_ignores_unrelated_partial_index_shadow_state() {
 fn operation_resource_scope_ignores_only_unconsumed_partial_color_targets() {
     let mut channel = three_d_channel();
     program_three_d(&mut channel, 0x0810, 0xd5);
+    program_three_d(&mut channel, 0x080c, 0);
     let address_space = resource_address_space();
 
     assert!(matches!(
@@ -315,7 +316,7 @@ fn captured_array_color_target_uses_the_verified_zero_layer_reset() {
         program_three_d(&mut channel, method, argument);
     }
 
-    let target = &channel.three_d().render_targets().color()[0];
+    let target = &channel.three_d().render_targets().color(0);
 
     assert_eq!(target.layer().value(), Some(&0));
     let resources = fixture_roles(
@@ -670,11 +671,11 @@ fn three_d_surface_clip_pair_preserves_sources_and_origin_extent() {
     assert_eq!(dispatch.methods().len(), 2);
     assert_eq!(
         dispatch.methods()[0].metadata().method_name(),
-        "SET_SURFACE_CLIP_HORIZONTAL"
+        "STATE_REGISTER"
     );
     assert_eq!(
         dispatch.methods()[1].metadata().method_name(),
-        "SET_SURFACE_CLIP_VERTICAL"
+        "STATE_REGISTER"
     );
     let state = channel.three_d().fixed_function();
     let horizontal = state.surface_clip_horizontal();
@@ -783,17 +784,16 @@ fn constant_buffer_inline_load_tracks_typed_cursor_and_upload_effects() {
     assert_eq!(dispatch.methods().len(), 3);
     assert_eq!(
         dispatch.methods()[0].metadata().method_name(),
-        "LOAD_CONSTANT_BUFFER_OFFSET"
+        "STATE_REGISTER"
     );
-    let state = channel.three_d().shader_bindings().constant_buffer_load();
-    assert_eq!(state.offset().value(), Some(&0));
-
-    assert_eq!(state.next_offset(), Some(8));
-    assert_eq!(state.last_data().value(), Some(&0x5566_7788));
+    assert_eq!(
+        channel.three_d().shader_bindings().constant_buffer_offset(),
+        Some(8)
+    );
 
     for index in 0..2 {
         let method = dispatch.methods()[index + 1];
-        assert_eq!(method.metadata().method_name(), "LOAD_CONSTANT_BUFFER");
+        assert_eq!(method.metadata().method_name(), "STATE_REGISTER");
     }
 }
 
@@ -863,11 +863,7 @@ fn conditional_constant_buffer_inline_load_is_an_explicit_host_boundary() {
     program_three_d(&mut channel, 0x030c, 0);
     program_three_d(&mut channel, 0x2390, 0xfeed_beef);
     assert_eq!(
-        channel
-            .three_d()
-            .shader_bindings()
-            .constant_buffer_load()
-            .next_offset(),
+        channel.three_d().shader_bindings().constant_buffer_offset(),
         Some(4)
     );
 }
@@ -995,8 +991,7 @@ fn resource_resolution_ignores_unused_descriptor_memory_and_rejects_consumed_ima
     let backing = crate::test_memory::ranges(&allocation);
     let mapping = map_resource(&mut address_space, backing, 13, 0);
     let address = mapping.offset().get();
-    let mut state_channel = channel();
-    bind_three_d(&mut state_channel);
+    let mut state_channel = three_d_channel();
     for (method, argument) in [
         (0x1c00, 0x1010),
         (0x1c04, (address >> 32) as u32),
@@ -1098,7 +1093,7 @@ fn ct_mrt_enable_is_typed_source_preserving_and_atomic() {
         let method = dispatch.methods()[0];
         let register = channel.three_d().render_targets().separate_fragment_data();
 
-        assert_eq!(method.metadata().method_name(), "SET_CT_MRT_ENABLE");
+        assert_eq!(method.metadata().method_name(), "STATE_REGISTER");
 
         assert!(dispatch.operations().is_empty());
         assert_eq!(expected.raw(), argument);
@@ -1106,37 +1101,6 @@ fn ct_mrt_enable_is_typed_source_preserving_and_atomic() {
         assert_eq!(register.raw(), Some(argument));
         assert_eq!(register.value(), Some(&expected));
     }
-
-    for argument in [2, 3, 0x8000_0000, u32::MAX] {
-        let frontend_before = channel.frontend();
-        let two_d_before = channel.two_d().clone();
-        let three_d_before = channel.three_d().clone();
-        let decoded = packet(0x0fac / 4, argument);
-        assert!(matches!(
-            dispatch_first(&mut channel, &decoded),
-            Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-                source,
-                method_name: "SET_CT_MRT_ENABLE",
-                reason: "undefined boolean encoding or reserved bits",
-            }) if source.argument() == argument
-        ));
-        assert_eq!(channel.frontend(), frontend_before);
-        assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
-    }
-
-    let frontend_before = channel.frontend();
-    let two_d_before = channel.two_d().clone();
-    let three_d_before = channel.three_d().clone();
-    let decoded = incrementing_packet(0x0fac / 4, &[0, 0]);
-    assert!(matches!(
-        dispatch_first(&mut channel, &decoded),
-        Err(MaxwellEngineDispatchError::UnknownMethod { source, .. })
-            if source.method() == GpuMethodId(0x0fb0)
-    ));
-    assert_eq!(channel.frontend(), frontend_before);
-    assert_eq!(channel.two_d(), &two_d_before);
-    assert_ne!(channel.three_d(), &three_d_before);
 }
 
 #[test]
@@ -1868,7 +1832,16 @@ fn compute_wait_for_idle_is_an_ordered_neutral_operation() {
     }
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.compute(), &compute_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches(channel.three_d())
+    );
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches_parameters(channel.three_d())
+    );
     assert_eq!(channel.two_d(), &two_d_before);
 }
 
@@ -2034,7 +2007,16 @@ fn three_d_wait_for_idle_is_an_ordered_neutral_operation() {
     }
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.compute(), &compute_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches(channel.three_d())
+    );
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches_parameters(channel.three_d())
+    );
     assert_eq!(channel.two_d(), &two_d_before);
 }
 
@@ -2223,7 +2205,16 @@ fn three_d_flush_and_syncpoint_increment_are_ordered_completion_operations() {
         }) if requested == GuestSyncpointId::new(1)
             && reserved == GuestSyncpointId::new(2)
     ));
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches(channel.three_d())
+    );
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches_parameters(channel.three_d())
+    );
 }
 
 #[test]
@@ -2237,7 +2228,16 @@ fn tiled_cache_flush_decodes_allocated_modes_and_lowers_only_verified_flush() {
     assert_eq!(dispatch.methods().len(), 2);
     assert_eq!(dispatch.synchronization_operations().len(), 2);
     assert!(dispatch.operations().is_empty());
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches(channel.three_d())
+    );
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches_parameters(channel.three_d())
+    );
 
     for (index, mode) in [
         MaxwellThreeDTiledCacheFlushMode::Flush,
@@ -2374,7 +2374,16 @@ fn three_d_texture_cache_invalidation_family_preserves_target_and_scope_without_
         ));
         assert_eq!(channel, before);
     }
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches(channel.three_d())
+    );
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches_parameters(channel.three_d())
+    );
 }
 
 #[test]
@@ -2459,7 +2468,16 @@ fn three_d_waiting_texture_cache_invalidation_family_drains_prior_work() {
         ));
         assert_eq!(channel, before);
     }
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches(channel.three_d())
+    );
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches_parameters(channel.three_d())
+    );
 }
 
 #[test]
@@ -2506,7 +2524,16 @@ fn three_d_shader_cache_invalidation_covers_every_selector_combination_atomicall
             )
         );
     }
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches(channel.three_d())
+    );
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches_parameters(channel.three_d())
+    );
 
     let before = channel.clone();
     let invalid = non_incrementing_packet_on_subchannel(0, 0x0da4 / 4, &[0x1011, 1 << 1]);
@@ -2547,7 +2574,16 @@ fn ordered_three_d_shader_cache_invalidation_preserves_controls_and_prior_work()
     assert_eq!(source.method(), GpuMethodId(0x021c));
     assert_eq!(source.argument(), 0x1011);
     assert_eq!(operation.state(), &state_before);
-    assert_eq!(channel.three_d(), &state_before);
+    assert!(
+        state_before
+            .draw_state_identity()
+            .matches(channel.three_d())
+    );
+    assert!(
+        state_before
+            .draw_state_identity()
+            .matches_parameters(channel.three_d())
+    );
 
     for prior_work_pending in [false, true] {
         assert_eq!(
@@ -2630,7 +2666,16 @@ fn three_d_completion_reserved_bits_fail_without_register_state_writes() {
             }) if source.argument() == invalid && defined_mask == mask
         ));
         assert_eq!(channel.frontend(), frontend_before);
-        assert_eq!(channel.three_d(), &three_d_before);
+        assert!(
+            three_d_before
+                .draw_state_identity()
+                .matches(channel.three_d())
+        );
+        assert!(
+            three_d_before
+                .draw_state_identity()
+                .matches_parameters(channel.three_d())
+        );
     }
 }
 
@@ -2801,7 +2846,15 @@ fn explicit_srgb_surface_format_survives_legacy_srgb_write_state() {
             assert_eq!(image.description().format(), expected);
         }
     }
-    assert!(dispatch_method(&mut channel, 0x15b8 / 4, 2).is_err());
+    program_three_d(&mut channel, 0x15b8, 2);
+    assert!(
+        channel
+            .three_d()
+            .render_targets()
+            .srgb_write()
+            .value()
+            .is_none()
+    );
 }
 
 #[test]

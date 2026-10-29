@@ -28,18 +28,17 @@ fn update_error(error: UpdateError, token: u32) -> Result<(Vec<u8>, Option<u32>)
     }
 }
 
-fn update_outputs(hipc: &HipcRequest<'_>, auto: bool) -> Result<[(u64, usize); 2], IpcWireError> {
+fn update_outputs<'a>(
+    process: &'a Request,
+    hipc: &HipcRequest<'_>,
+    auto: bool,
+) -> Result<[&'a Buffer; 2], IpcWireError> {
     let [status, performance] = hipc.receive_buffers.as_slice() else {
         return Err(IpcWireError::Malformed(
             "renderer update requires two output buffers",
         ));
     };
-    if status.mode == BufferMode::Invalid || performance.mode == BufferMode::Invalid {
-        return Err(IpcWireError::Malformed(
-            "renderer output buffer has an invalid mapping mode",
-        ));
-    }
-    let mut result = [(0, 0); 2];
+    let mut result = [&process.receive_buffers()[0], &process.receive_buffers()[1]];
     let pointers = match &hipc.receive_statics {
         ReceiveStatics::Entries(pointers) if auto && pointers.len() == 2 => Some(pointers),
         ReceiveStatics::None if !auto => None,
@@ -59,9 +58,9 @@ fn update_outputs(hipc: &HipcRequest<'_>, auto: bool) -> Result<[(u64, usize); 2
                 pointer.address != 0 || pointer.size != 0,
                 address != 0 || size != 0,
             ) {
-                (true, false) if pointer.address != 0 => (pointer.address, pointer.size as usize),
-                (false, true) if address != 0 => (address, size),
-                (false, false) => (0, 0),
+                (true, false) if pointer.address != 0 => &process.receive_statics()[index],
+                (false, true) if address != 0 => &process.receive_buffers()[index],
+                (false, false) => &process.receive_buffers()[index],
                 _ => {
                     return Err(IpcWireError::Malformed(
                         "renderer output has invalid auto-select descriptor sides",
@@ -69,7 +68,7 @@ fn update_outputs(hipc: &HipcRequest<'_>, auto: bool) -> Result<[(u64, usize); 2
                 }
             }
         } else {
-            (address, size)
+            &process.receive_buffers()[index]
         };
     }
     Ok(result)
@@ -90,27 +89,19 @@ async fn dispatch_update(
     {
         return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
     }
-    let (input_address, input_size) = if auto {
-        one_auto_select_input(hipc)?
+    let input_buffer = if auto {
+        one_auto_select_input(process, hipc)?
     } else {
-        let descriptor = one_send_buffer(hipc)?;
-        (
-            descriptor.address,
-            usize::try_from(descriptor.size)
-                .map_err(|_| IpcWireError::Malformed("renderer input size overflows"))?,
-        )
+        one_send_buffer(process, hipc)?
     };
-    let [(output_address, output_size), _performance] = update_outputs(hipc, auto)?;
+    let input_size = input_buffer.size as usize;
+    let [output_buffer, _performance] = update_outputs(process, hipc, auto)?;
+    let output_size = output_buffer.size as usize;
     if input_size < HEADER_SIZE {
         return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_UPDATE_INFO);
     }
     let mut header = [0; HEADER_SIZE];
-    read_bytes(
-        process,
-        GuestVirtualAddress::new(input_address),
-        &mut header,
-    )
-    .await?;
+    process.read(input_buffer, 0, &mut header).await?;
     let layout = match UpdateLayout::parse(&session.0.parameters, &header, input_size) {
         Ok(layout) => layout,
         Err(error) => return update_error(error, request.token),
@@ -118,17 +109,12 @@ async fn dispatch_update(
     if output_size != layout.output_size {
         return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_UPDATE_INFO);
     }
-    crate::ipc_wire::io::validate_writable_ram_range(
-        process,
-        GuestVirtualAddress::new(output_address),
-        output_size,
-    )?;
     let mut input = Vec::new();
     input
         .try_reserve_exact(input_size)
         .map_err(|_| IpcWireError::HostResourceExhausted("reading an audio renderer update"))?;
     input.resize(input_size, 0);
-    read_bytes(process, GuestVirtualAddress::new(input_address), &mut input).await?;
+    process.read(input_buffer, 0, &mut input).await?;
     let output = {
         let mut state = session.0.update.take().await;
         if let Some(error) = session.0.failure.get() {
@@ -147,7 +133,7 @@ async fn dispatch_update(
         session.0.event.clear();
         output
     };
-    write_bytes(process, GuestVirtualAddress::new(output_address), &output).await?;
+    process.write(output_buffer, 0, &output).await?;
     semantic_success(request.token, false, &[], &[], &[], None)
 }
 
@@ -221,18 +207,15 @@ pub(in crate::ipc_wire) async fn dispatch_audio_renderer_manager(
         let Some(work_memory) = process.copy_handle::<TransferMemoryObject>(0) else {
             return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_HANDLE);
         };
-        let owner = hipc.copy_handles[1];
-        if owner != crate::CURRENT_PROCESS_HANDLE {
-            let Some(owner) = process.copy_handle::<nixe_runtime::ProcessObject>(1) else {
-                return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_HANDLE);
-            };
-            if owner.process_id() != process.process_id() {
-                return unsupported_variant(
-                    "audren:u",
-                    command,
-                    "renderer for another process is not implemented",
-                );
-            }
+        let Some(owner) = process.copy_handle::<nixe_runtime::RunnableProcess>(1) else {
+            return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_HANDLE);
+        };
+        if owner.process_id() != process.process_id() {
+            return unsupported_variant(
+                "audren:u",
+                command,
+                "renderer for another process is not implemented",
+            );
         }
         let work_size = request_u64(request.data, 56).unwrap();
         if work_size > work_memory.size() || work_size < size {

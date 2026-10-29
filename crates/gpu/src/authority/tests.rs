@@ -3,6 +3,44 @@ use crate::physical::WriteDomain;
 use nixe_memory::{Machine, PAGE_SIZE};
 
 #[test]
+fn physical_overlap_relations_follow_registration_retirement_and_replacement() {
+    let machine = Machine::new(4 * PAGE_SIZE).unwrap();
+    let allocation = machine
+        .account(4 * PAGE_SIZE)
+        .unwrap()
+        .allocate(4 * PAGE_SIZE)
+        .unwrap();
+    let physical =
+        PhysicalMapping::new(&[AllocationRange::new(allocation.pin(), 0, 4 * PAGE_SIZE).unwrap()])
+            .unwrap();
+    let buffer = |start, bytes| {
+        Footprint::new(physical.clone(), WriteDomain::Buffer { start, bytes }).unwrap()
+    };
+    let mut authority = Authority::new(machine.identity());
+    authority
+        .register(1u32, vec![buffer(0, PAGE_SIZE)])
+        .unwrap();
+    authority
+        .register(2, vec![buffer(PAGE_SIZE / 2, PAGE_SIZE)])
+        .unwrap();
+    authority
+        .register(3, vec![buffer(2 * PAGE_SIZE, PAGE_SIZE)])
+        .unwrap();
+    assert!(authority.resources_may_overlap(1, 1));
+    assert!(authority.resources_may_overlap(1, 2));
+    assert!(authority.resources_may_overlap(2, 1));
+    assert!(!authority.resources_may_overlap(1, 3));
+    assert!(!authority.resources_may_overlap(3, 2));
+    authority.unregister(2).unwrap();
+    assert!(!authority.resources_may_overlap(1, 2));
+    authority
+        .register(2, vec![buffer(3 * PAGE_SIZE, PAGE_SIZE)])
+        .unwrap();
+    assert!(!authority.resources_may_overlap(1, 2));
+    assert!(!authority.resources_may_overlap(2, 1));
+}
+
+#[test]
 fn accepted_equivalent_mappings_use_registered_spans_and_reuse_writers() {
     let machine = Machine::new(4 * PAGE_SIZE).unwrap();
     let allocation = machine

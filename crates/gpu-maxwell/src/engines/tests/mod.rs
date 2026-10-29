@@ -38,6 +38,7 @@ pub(crate) fn three_d_channel() -> MaxwellGpuChannel {
     // Synthetic tests which omit viewport coefficients explicitly select
     // window coordinates. Tests of firmware resets use an untouched channel.
     program_three_d(&mut channel, 0x192c, 0);
+    program_three_d(&mut channel, 0x0810, 0);
     channel
 }
 
@@ -58,25 +59,7 @@ fn dispatch_first(
     channel: &mut MaxwellGpuChannel,
     decoded: &MaxwellDecodedPushbuffer,
 ) -> Result<MaxwellEnginePacketDispatch, MaxwellEngineDispatchError> {
-    let streamed = dispatch_maxwell_engine_packet(
-        channel,
-        FrontendSubmissionId::new(3),
-        &decoded.packets()[0],
-    );
-    // Register-state tests deliberately consume all pending typed groups.
-    // The stream collector above observes only the effects emitted at runtime.
-    let (profile, state) = channel.three_d_with_profile_mut();
-    let materialized = threed::materialize_state(profile, state);
-    let mut streamed = streamed?;
-    materialized?;
-    let mut inspector = state.clone();
-    for observed in &mut streamed.methods {
-        if observed.metadata.method_name() == "STATE_REGISTER" {
-            observed.metadata =
-                threed::inspect_state_metadata(profile, observed.method.source(), &mut inspector);
-        }
-    }
-    Ok(streamed)
+    dispatch_maxwell_engine_packet(channel, FrontendSubmissionId::new(3), &decoded.packets()[0])
 }
 
 fn dispatch_method(
@@ -413,7 +396,6 @@ mod coverage_dither;
 mod graphics_pipeline;
 mod indexed;
 mod multisample;
-mod raster_pipeline;
 mod resources_compute;
 mod solid_rect;
 mod state_validation;

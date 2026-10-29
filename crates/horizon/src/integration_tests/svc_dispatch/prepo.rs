@@ -66,7 +66,7 @@ fn play_report_protocols_persist_exact_payloads_for_plain_and_domain_sessions() 
             inline[pid..].copy_from_slice(&1_u64.to_le_bytes());
             let request = report_request(command, &inline, mapped.get(), pointer.get(), domain);
             write_guest_bytes(&process, tls, &request);
-            state(&mut process).write_w(x(0), handle);
+            process.main_thread().registers().write_w(x(0), handle);
             assert!(matches!(
                 dispatch_next(&mut process, &mut dispatcher),
                 ExceptionHandlingResult::Resumed

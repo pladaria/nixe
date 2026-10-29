@@ -24,14 +24,14 @@ pub use layout::{
 };
 pub use memory_accounting::ProcessMemoryAccounting;
 pub use thread::{
-    GuestThread, ThreadCreateError, ThreadCreateRequest, ThreadCreation, ThreadTable,
-    ThreadTableError,
+    ThreadCreateError, ThreadCreateRequest, ThreadCreation, ThreadObject, ThreadRegisters,
+    ThreadStartError, ThreadTable, ThreadTableError, ThreadWait,
 };
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::GuestCpuState;
 use crate::memory::ProcessMemory;
@@ -45,12 +45,10 @@ use nixe_loader_executable::{
 use nixe_memory::GuestVirtualAddress;
 use nixe_memory::{MemoryPermissions, PAGE_SIZE};
 
-use crate::exception_dispatch::{ExceptionProcessMetadata, ExceptionProcessResources};
 use crate::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatcher,
-    ExceptionHandlingResult, ExceptionProcessContext, ExceptionResume, ExceptionRouteError,
-    ExceptionTerminationReason, ExceptionTerminationScope, ExceptionThreadContext, LaunchKind,
-    LaunchModuleImage, LaunchPlan,
+    ExceptionHandlingResult, ExceptionResume, ExceptionRouteError, ExceptionTerminationReason,
+    ExceptionTerminationScope, ExceptionThreadContext, LaunchKind, LaunchModuleImage, LaunchPlan,
 };
 
 const DEFAULT_IMAGE_BASE: u64 = 0x7100_0000;
@@ -69,9 +67,8 @@ const HORIZON_REGION_ALIGNMENT: u64 = 0x20_0000;
 /// A process whose executable bytes are visible only through process memory.
 pub struct RunnableProcess {
     process_id: u64,
-    lifecycle: nixe_scheduler::ProcessLifecycle,
-    process_exit: Option<ProcessExit>,
-    num_running_threads: usize,
+    state: Mutex<ProcessState>,
+    generation: std::sync::atomic::AtomicU64,
     cpu: ProcessCpuContext,
     address_space: ProcessAddressSpace,
     memory_layout: ProcessMemoryLayout,
@@ -83,14 +80,30 @@ pub struct RunnableProcess {
     initial_thread_priority: i32,
     initial_ideal_vcpu: nixe_scheduler::VirtualCpuId,
     thread_policy: Option<ThreadPolicy>,
-    thread_local: thread_local::ThreadLocalPages,
+    thread_local: Arc<Mutex<thread_local::ThreadLocalPages>>,
     process_local_region: GuestVirtualAddress,
     threads: crate::ThreadTable,
     mounts: std::sync::Arc<crate::ProcessMountNamespace>,
     handles: std::sync::Arc<crate::HandleTable>,
     address_waits: std::sync::Arc<crate::AddressWaitRegistry>,
-    pub(crate) scheduler: std::sync::OnceLock<std::sync::Arc<nixe_scheduler::SchedulerState>>,
-    execution: execution::ProcessExecutionControl,
+    pub(crate) scheduler: std::sync::Arc<nixe_scheduler::SchedulerState>,
+    execution: Mutex<execution::ProcessExecutionControl>,
+    pub(crate) events: std::sync::OnceLock<crate::ExternalEventSender>,
+}
+
+impl std::fmt::Debug for RunnableProcess {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Process")
+            .field("id", &self.process_id)
+            .finish_non_exhaustive()
+    }
+}
+
+struct ProcessState {
+    lifecycle: nixe_scheduler::ProcessLifecycle,
+    exit: Option<ProcessExit>,
+    num_running_threads: usize,
+    termination: Option<nixe_scheduler::ProcessLifecycle>,
 }
 
 impl RunnableProcess {
@@ -104,18 +117,8 @@ impl RunnableProcess {
     }
 
     #[must_use]
-    pub const fn lifecycle(&self) -> nixe_scheduler::ProcessLifecycle {
-        self.lifecycle
-    }
-
-    #[must_use]
-    pub const fn cpu_context(&self) -> ProcessCpuContext {
-        self.cpu
-    }
-
-    #[must_use]
-    pub const fn address_space(&self) -> ProcessAddressSpace {
-        self.address_space
+    pub fn lifecycle(&self) -> nixe_scheduler::ProcessLifecycle {
+        self.state.lock().unwrap().lifecycle
     }
 
     #[must_use]
@@ -157,17 +160,10 @@ impl RunnableProcess {
     }
 
     #[must_use]
-    pub fn main_thread(&self) -> &crate::GuestThread {
+    pub fn main_thread(&self) -> Arc<crate::ThreadObject> {
         self.threads
             .get(self.main_thread_id)
-            .expect("the main thread has not been finalized")
-    }
-
-    /// Returns mutable main-thread state for runtime scheduling and ABI setup.
-    pub fn main_thread_mut(&mut self) -> &mut crate::GuestThread {
-        self.threads
-            .get_mut(self.main_thread_id)
-            .expect("the main thread has not been finalized")
+            .expect("main thread remains retained")
     }
 
     #[must_use]
@@ -185,115 +181,145 @@ impl RunnableProcess {
         self.initial_ideal_vcpu
     }
 
-    pub(crate) fn validate_thread_request(
-        &self,
-        request: &ThreadCreateRequest,
-    ) -> Result<(), ThreadCreateError> {
-        if request.entry.get() >= self.address_space.exclusive_limit()
-            || !request.entry.get().is_multiple_of(4)
-        {
-            return Err(ThreadCreateError::InvalidEntry);
-        }
-        if self
-            .memory
-            .space()
-            .translate(request.entry, MemoryPermissions::EXECUTE)
-            .is_err()
-        {
-            return Err(ThreadCreateError::InvalidEntry);
-        }
-        let Some(stack_byte) = request.stack_top.get().checked_sub(1) else {
-            return Err(ThreadCreateError::InvalidStack);
-        };
-        if request.stack_top.get() > self.address_space.exclusive_limit()
-            || !request.stack_top.get().is_multiple_of(16)
-        {
-            return Err(ThreadCreateError::InvalidStack);
-        }
-        if self
-            .memory
-            .space()
-            .translate(
-                GuestVirtualAddress::new(stack_byte),
-                MemoryPermissions::WRITE,
-            )
-            .is_err()
-        {
-            return Err(ThreadCreateError::InvalidStack);
-        }
-        if let Some(policy) = self.thread_policy
-            && (request.priority < policy.highest_priority
-                || request.priority > policy.lowest_priority
-                || request
-                    .affinity
-                    .iter()
-                    .any(|vcpu| vcpu.get() < policy.min_core || vcpu.get() > policy.max_core))
-        {
-            return Err(ThreadCreateError::PolicyDenied);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn commit_created_thread(
-        &mut self,
-        id: nixe_scheduler::GuestThreadId,
-        request: &ThreadCreateRequest,
-        retirement: crate::ExternalEventSender,
+    pub async fn create_thread(
+        self: &Arc<Self>,
+        request: ThreadCreateRequest,
     ) -> Result<ThreadCreation, ThreadCreateError> {
-        let tls_base = self.thread_local.allocate(&self.memory).map_err(|error| {
-            log::debug!("thread TLS allocation failed: error={error:?}");
-            ThreadCreateError::ResourceLimit
-        })?;
-        let object = Arc::new(crate::ThreadObject::new(id.get()));
-        object.bind_retirement(nixe_scheduler::ProcessId::new(self.process_id), retirement);
-        let handle = match self
-            .handles
-            .insert_object(crate::HandleObject::from_arc(object.clone()))
+        if self.lifecycle() != nixe_scheduler::ProcessLifecycle::Running {
+            return Err(ThreadCreateError::Terminating);
+        }
+        let scheduler = self.scheduler();
+        if let Some(vcpu) = request.affinity.iter().find(|core| {
+            !scheduler.profile().contains(*core)
+                || self.thread_policy.is_some_and(|policy| {
+                    core.get() < policy.min_core || core.get() > policy.max_core
+                })
+        }) {
+            return Err(ThreadCreateError::InvalidVirtualCpu(vcpu));
+        }
+        if let Some(ideal) = request.ideal_vcpu
+            && !request.affinity.contains(ideal)
         {
-            Ok(handle) => handle,
-            Err(error) => {
-                log::debug!("thread handle allocation failed: {error}");
-                self.thread_local.release(&self.memory, tls_base);
-                return Err(ThreadCreateError::ResourceLimit);
+            return Err(ThreadCreateError::InvalidVirtualCpu(ideal));
+        }
+        if !scheduler.profile().priorities().contains(request.priority)
+            || self.thread_policy.is_some_and(|policy| {
+                request.priority < policy.highest_priority
+                    || request.priority > policy.lowest_priority
+            })
+        {
+            return Err(ThreadCreateError::InvalidPriority(request.priority));
+        }
+        let allocation =
+            thread::ThreadLocalRegion::allocate(self.thread_local.clone(), self.memory.clone())
+                .map_err(|error| {
+                    if self.lifecycle() != nixe_scheduler::ProcessLifecycle::Running {
+                        ThreadCreateError::Terminating
+                    } else {
+                        match error {
+                            crate::memory::MappingError::Memory(fault) => match fault.as_ref() {
+                                nixe_memory::MemoryError::ProcessLimit { .. }
+                                | nixe_memory::MemoryError::PhysicalExhaustion { .. }
+                                | nixe_memory::MemoryError::RetainedAllocations { .. } => {
+                                    ThreadCreateError::OutOfMemory
+                                }
+                                _ => ThreadCreateError::Memory(fault),
+                            },
+                            crate::memory::MappingError::InvalidRange => {
+                                ThreadCreateError::OutOfMemory
+                            }
+                            _ => ThreadCreateError::Internal,
+                        }
+                    }
+                })?;
+        let tls_base = allocation.address;
+        let mut state = GuestCpuState::default();
+        initialize_created_thread(&mut state, &request, tls_base);
+        // This object is private until initialization and scheduler registration
+        // finish; reserved handles cannot resolve the provisional identity.
+        let object = Arc::new(crate::ThreadObject::new(
+            &self.scheduler,
+            nixe_scheduler::GuestThreadId::new(0),
+            state,
+            request.stack_top,
+            request.stack_top,
+            None,
+            allocation,
+        ));
+        object.bind_owner(self);
+        let reservation = self
+            .handles
+            .reserve(Some(crate::HandleObject::from_arc(object.clone())))
+            .map_err(|error| match error {
+                crate::HandleError::Closed => ThreadCreateError::Terminating,
+                crate::HandleError::Exhausted => ThreadCreateError::OutOfHandles,
+                _ => ThreadCreateError::Internal,
+            })?;
+        let handle = reservation.handle();
+        // Zero the reserved region and install its self handle in one coherent
+        // write, without holding the TLS allocation lock across device access.
+        let access = {
+            let mut bytes = [0; thread_local::REGION_SIZE as usize];
+            bytes[0x110..0x114].copy_from_slice(&handle.to_le_bytes());
+            self.memory
+                .space()
+                .write(tls_base, &bytes)
+                .map_err(|fault| ThreadCreateError::Memory(Arc::new(fault)))?
+        };
+        if let nixe_memory::Access::Pending(pending) = access {
+            match pending.await.map_err(ThreadCreateError::Memory)? {
+                nixe_memory::AccessResult::Written => {}
+                _ => return Err(ThreadCreateError::Internal),
+            }
+        }
+        let id = scheduler
+            .create_thread(nixe_scheduler::ScheduledThreadConfig {
+                process: nixe_scheduler::ProcessId::new(self.process_id),
+                base_priority: request.priority,
+                ideal_vcpu: request.ideal_vcpu,
+                affinity: request.affinity,
+            })
+            .map_err(|fault| match fault {
+                nixe_scheduler::SchedulerError::ThreadIdExhausted => {
+                    ThreadCreateError::IdentityExhausted
+                }
+                _ => ThreadCreateError::Internal,
+            })?;
+        object.assign_thread_id(id.get());
+        let result = {
+            let process = self.state.lock().unwrap();
+            if process.lifecycle != nixe_scheduler::ProcessLifecycle::Running {
+                Err(ThreadCreateError::Terminating)
+            } else if self.threads.insert(&object, false).is_err() {
+                Err(ThreadCreateError::Internal)
+            } else if self.handles.publish(&mut [reservation]).is_err() {
+                self.threads
+                    .remove(id)
+                    .expect("unpublished thread membership");
+                Err(ThreadCreateError::Terminating)
+            } else {
+                object.bind_retirement(
+                    nixe_scheduler::ProcessId::new(self.process_id),
+                    self.events.get().expect("registered process").clone(),
+                );
+                Ok(ThreadCreation { id, handle })
             }
         };
-        let mut state = GuestCpuState::default();
-        if initialize_created_thread(&mut state, request, tls_base).is_err() {
-            let _ = self.handles.close(handle);
-            self.thread_local.release(&self.memory, tls_base);
-            return Err(ThreadCreateError::Internal);
+        if result.is_err() {
+            scheduler
+                .unregister(id)
+                .expect("unpublished thread has no register owner");
         }
-        let thread = GuestThread {
-            id,
-            object: Arc::downgrade(&object),
-            running_reference: None,
-            exit: None,
-            state: Some(state),
-            handle,
-            stack_bottom: request.stack_top,
-            stack_top: request.stack_top,
-            tls_base,
-            abi_context: None,
-            loader_return: None,
-        };
-        if self.threads.insert(thread).is_err() {
-            let _ = self.handles.close(handle);
-            self.thread_local.release(&self.memory, tls_base);
-            return Err(ThreadCreateError::Internal);
-        }
-        Ok(ThreadCreation { id, handle })
+        result
     }
 
     pub(crate) fn retire_thread(
-        &mut self,
+        &self,
         id: nixe_scheduler::GuestThreadId,
     ) -> Result<(), ThreadCreateError> {
-        let thread = self
-            .threads
+        self.threads
             .remove(id)
-            .map_err(|_| ThreadCreateError::Internal)?;
-        self.thread_local.release(&self.memory, thread.tls_base);
-        Ok(())
+            .map_err(|_| ThreadCreateError::Internal)
     }
 
     /// Replaces the provisional main-thread identity before publication. The
@@ -305,12 +331,12 @@ impl RunnableProcess {
     ) -> Result<(), crate::ThreadTableError> {
         let old = self.main_thread_id;
         if old == id {
-            self.main_thread().object().assign_thread_id(id.get());
+            self.main_thread().assign_thread_id(id.get());
             return Ok(());
         }
         self.threads.rekey(old, id)?;
         self.main_thread_id = id;
-        self.main_thread().object().assign_thread_id(id.get());
+        self.main_thread().assign_thread_id(id.get());
         Ok(())
     }
 
@@ -320,68 +346,88 @@ impl RunnableProcess {
     }
 
     #[must_use]
-    pub fn thread(&self, id: nixe_scheduler::GuestThreadId) -> Option<&crate::GuestThread> {
+    pub fn thread(&self, id: nixe_scheduler::GuestThreadId) -> Option<Arc<crate::ThreadObject>> {
         self.threads.get(id)
     }
 
-    pub fn thread_mut(
-        &mut self,
-        id: nixe_scheduler::GuestThreadId,
-    ) -> Option<&mut crate::GuestThread> {
-        self.threads.get_mut(id)
-    }
-
-    pub(crate) fn start_thread(
-        &mut self,
-        id: nixe_scheduler::GuestThreadId,
-    ) -> Result<(), crate::ThreadOperationError> {
-        let thread = self
-            .threads
-            .get_mut(id)
-            .ok_or(crate::ThreadOperationError::InvalidHandle)?;
-        debug_assert!(thread.running_reference.is_none());
-        thread.running_reference = Some(
-            thread
-                .object
-                .upgrade()
-                .ok_or(crate::ThreadOperationError::InvalidHandle)?,
-        );
-        self.num_running_threads += 1;
-        Ok(())
-    }
-
-    // Count actual execution references, not retained handles or created records.
-    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_thread.cpp#L1152-L1195
-    pub(crate) fn finish_thread(&mut self, id: nixe_scheduler::GuestThreadId) -> bool {
-        if self
-            .threads
-            .get_mut(id)
-            .expect("the terminating thread remains registered")
-            .finish()
+    pub(crate) fn finish_thread(&self, thread: &Arc<crate::ThreadObject>) -> bool {
+        let id = thread.id();
         {
-            self.num_running_threads -= 1;
-            self.num_running_threads == 0
-        } else {
-            false
+            let mut process = self.state.lock().unwrap();
+            if self.threads.finish(id) {
+                process.num_running_threads -= 1;
+                let last = process.num_running_threads == 0;
+                if last && process.lifecycle == nixe_scheduler::ProcessLifecycle::Running {
+                    process.lifecycle = nixe_scheduler::ProcessLifecycle::Terminating;
+                    process.termination = Some(nixe_scheduler::ProcessLifecycle::Exited);
+                    self.generation
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+                last
+            } else {
+                false
+            }
         }
     }
 
     pub(crate) fn terminate_thread_from_coordinator(
-        &mut self,
+        &self,
         id: nixe_scheduler::GuestThreadId,
         exit_code: u64,
         requested_scope: ExceptionTerminationScope,
-    ) {
-        let thread = self
-            .threads
-            .get_mut(id)
-            .expect("the coordinator owns every scheduled thread");
-        thread.exit = Some(ThreadExit {
+    ) -> Option<Arc<crate::ThreadObject>> {
+        let thread = self.thread(id)?;
+        thread.set_exit(ThreadExit {
             requested_scope,
             exit_code,
             source: None,
         });
-        self.finish_thread(id);
+        self.finish_thread(&thread);
+        Some(thread)
+    }
+
+    pub fn scheduler(&self) -> &Arc<nixe_scheduler::SchedulerState> {
+        &self.scheduler
+    }
+    pub fn allowed_core_mask(&self) -> Option<u64> {
+        self.thread_policy?.allowed_core_mask()
+    }
+    pub fn allowed_priority_mask(&self) -> Option<u64> {
+        self.thread_policy?.allowed_priority_mask()
+    }
+    pub fn address_space_limit(&self) -> u64 {
+        self.address_space.exclusive_limit()
+    }
+    pub fn cpu(&self) -> ProcessCpuContext {
+        self.cpu
+    }
+    pub fn random_entropy(&self, index: usize) -> Option<u64> {
+        self.random_entropy.get(index).copied()
+    }
+    pub fn total_user_physical_memory_size(&self) -> u64 {
+        self.memory.accounting().total_user_physical_memory_size()
+    }
+    pub fn used_user_physical_memory_size(&self) -> u64 {
+        self.memory.accounting().used_user_physical_memory_size()
+    }
+    pub fn total_non_system_user_physical_memory_size(&self) -> u64 {
+        self.memory
+            .accounting()
+            .total_non_system_user_physical_memory_size()
+    }
+    pub fn used_non_system_user_physical_memory_size(&self) -> u64 {
+        self.memory
+            .accounting()
+            .used_non_system_user_physical_memory_size()
+    }
+    pub fn total_system_resource_size(&self) -> u64 {
+        self.memory.accounting().total_system_resource_size()
+    }
+    pub fn used_system_resource_size(&self) -> u64 {
+        self.memory.accounting().used_system_resource_size()
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Returns the immutable process-local filesystem namespace.
@@ -396,21 +442,26 @@ impl RunnableProcess {
         &self.handles
     }
 
+    /// The accepted continuation owns its mailbox; ingress only wakes the execution owner.
+    pub fn notify_kernel_completion(&self) {
+        self.events
+            .get()
+            .expect("executing process is registered")
+            .notify_host_service(crate::ExternalEventSource::Device);
+    }
+
     #[must_use]
     pub const fn address_waits(&self) -> &std::sync::Arc<crate::AddressWaitRegistry> {
         &self.address_waits
     }
 
-    pub fn mounts_and_handles(&self) -> (&crate::ProcessMountNamespace, &crate::HandleTable) {
-        (&self.mounts, &self.handles)
-    }
-
-    /// Consumes the process and deterministically releases all process-owned resources.
-    pub fn try_teardown(mut self) -> Result<ProcessTeardownReport, ProcessTeardownFailure> {
-        let previous_lifecycle = self.lifecycle;
+    /// Closes process resources after native contexts have quiesced. Retained
+    /// kernel objects continue to own their identity and pinned physical inputs.
+    pub(crate) fn try_teardown(&self) -> Result<ProcessTeardownReport, ProcessTeardownFailure> {
+        let previous_lifecycle = self.lifecycle();
         let report = ProcessTeardownReport {
             previous_lifecycle,
-            exit: self.process_exit.take(),
+            exit: self.state.lock().unwrap().exit.clone(),
             threads_released: self.threads.len(),
             modules_released: self.modules.len(),
             mappings_released: self
@@ -423,9 +474,13 @@ impl RunnableProcess {
             handles_released: self.handles.len(),
             address_waiters_released: self.address_waits.lock().waiter_count(),
         };
-        let execution = self.execution.shutdown();
+        self.cancel_waits();
+        let execution = self.execution.lock().unwrap().shutdown();
+        self.thread_local.lock().unwrap().closed = true;
         let memory = self.memory.close();
         self.handles.close_all();
+        self.threads.release_running();
+        self.state.lock().unwrap().num_running_threads = 0;
         if let Err(fault) = execution {
             return Err(ProcessTeardownFailure {
                 report: Box::new(report),
@@ -445,56 +500,31 @@ impl RunnableProcess {
     }
 
     pub(crate) fn request_vcpu_safepoint(&self, vcpu: nixe_scheduler::VirtualCpuId) {
-        self.execution.request_vcpu_safepoint(vcpu);
+        self.execution.lock().unwrap().request_vcpu_safepoint(vcpu);
     }
 
     pub(crate) fn request_execution_safepoint(&self) {
-        self.execution.request_safepoint();
+        self.execution.lock().unwrap().request_safepoint();
     }
 }
 
 impl Drop for RunnableProcess {
     fn drop(&mut self) {
-        let _ = self.execution.request_stop();
+        let _ = self.execution.get_mut().unwrap().request_stop();
+        self.thread_local.lock().unwrap().closed = true;
         let _ = self.memory.close();
         self.handles.close_all();
     }
 }
 
-fn supervisor_call_continuation(
-    source: LocationDescriptor,
-    continuation: ExceptionResume,
-) -> Result<LocationDescriptor, ExceptionRouteError> {
+fn supervisor_call_pc(source: LocationDescriptor, continuation: ExceptionResume) -> u64 {
+    // Native entry supplies the immutable profile and an executed A64 SVC
+    // boundary; no arbitrary target/profile is accepted by this continuation.
+    // https://github.com/eden-emulator/mirror/blob/master/src/core/hle/kernel/physical_core.cpp
     match continuation {
-        ExceptionResume::Retry => Ok(source),
-        ExceptionResume::At(target) => Ok(target),
-        ExceptionResume::Next => {
-            let pc = source
-                .pc
-                .checked_add(4)
-                .ok_or(ExceptionRouteError::ContinuationAddressOverflow { source })?;
-            Ok(LocationDescriptor::new(pc, source.profile_id))
-        }
+        ExceptionResume::Retry => source.pc.get(),
+        ExceptionResume::Next => source.pc.get().wrapping_add(4),
     }
-}
-
-fn install_continuation(
-    cpu: ProcessCpuContext,
-    state: &mut GuestCpuState,
-    target: LocationDescriptor,
-) -> Result<(), ExceptionRouteError> {
-    let expected_profile = cpu.profile_id();
-    if target.profile_id != expected_profile {
-        return Err(ExceptionRouteError::ContinuationProfileMismatch {
-            source: execution::current_location(cpu, state),
-            target,
-        });
-    }
-    if !target.is_aligned() {
-        return Err(ExceptionRouteError::InvalidContinuationTarget { target });
-    }
-    state.set_pc(target.pc.get());
-    Ok(())
 }
 
 /// Stage at which process construction failed.

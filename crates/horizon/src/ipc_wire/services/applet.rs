@@ -85,7 +85,10 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
     match object {
         AppletObject::Root => {
             if hipc.pid.is_none()
-                || hipc.copy_handles.as_slice() != [crate::CURRENT_PROCESS_HANDLE]
+                || hipc.copy_handles.len() != 1
+                || process
+                    .copy_handle::<nixe_runtime::RunnableProcess>(0)
+                    .is_none_or(|owner| owner.process_id() != process.process_id())
                 || request_u64(request.data, 0) != Some(0)
                 || request.data[8..].iter().any(|byte| *byte != 0)
                 || !hipc.move_handles.is_empty()
@@ -1177,9 +1180,10 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                         );
                     }
-                    let (address, size) = one_auto_select_input(hipc)?;
+                    let buffer = one_auto_select_input(process, hipc)?;
+                    let size = buffer.size as usize;
                     let mut bytes = vec![0; size];
-                    read_bytes(process, GuestVirtualAddress::new(address), &mut bytes).await?;
+                    process.read(buffer, 0, &mut bytes).await?;
                     let offset = request_u64(request.data, 0)
                         .expect("validated IStorageAccessor::Write payload length");
                     match session.write_storage(storage_id, offset, &bytes).await {
@@ -1221,12 +1225,13 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                         );
                     }
-                    let (address, size) = one_auto_select_output(hipc)?;
+                    let buffer = one_auto_select_output(process, hipc)?;
+                    let size = buffer.size as usize;
                     let offset = request_u64(request.data, 0)
                         .expect("validated IStorageAccessor::Read payload length");
                     match session.read_storage(storage_id, offset, size).await {
                         Ok(bytes) => {
-                            write_bytes(process, GuestVirtualAddress::new(address), &bytes).await?;
+                            process.write(buffer, 0, &bytes).await?;
                             applet_data(request.token, &[])
                         }
                         Err(AppletStorageAccessError::NotFound) => {

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nixe_gpu::{
     GuestSyncpointId, GuestSyncpointValue, GuestTimeline, GuestTimelinePoint,
@@ -71,7 +71,7 @@ pub(crate) struct PendingNvHostCtrlWait {
     kind: NvHostCtrlWaitKind,
     event_slot: Option<GpuSyncpointEventSlot>,
     wake_event: ReadableEventObject,
-    deadline: Option<Instant>,
+    deadline: Option<u64>,
 }
 
 impl PendingNvHostCtrlWait {
@@ -80,8 +80,11 @@ impl PendingNvHostCtrlWait {
     }
 
     pub(crate) fn remaining(&self) -> Option<Duration> {
-        self.deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        self.deadline.map(|deadline| {
+            Duration::from_nanos(
+                deadline.saturating_sub(self.wake_event.kernel().clock().scheduler_time_ns()),
+            )
+        })
     }
 }
 
@@ -136,9 +139,12 @@ struct GpuSyncpointEvent {
 }
 
 impl GpuSyncpointEvent {
-    fn new(slot: GpuSyncpointEventSlot, registered: bool) -> Self {
-        let (writable, readable) =
-            EventObject::create_pair_with_source(nixe_runtime::ExternalEventSource::GpuCompletion);
+    fn new(
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
+        slot: GpuSyncpointEventSlot,
+        registered: bool,
+    ) -> Self {
+        let (writable, readable) = EventObject::create_pair(kernel);
         Self {
             source: GraphicsEventSource::GpuSyncpoint {
                 event_slot: slot.get(),
@@ -169,7 +175,7 @@ struct NvHostCtrlDevice {
 struct DirectWait {
     descriptor: NvDrvDeviceDescriptor,
     target: GuestTimelinePoint,
-    deadline: Option<Instant>,
+    deadline: Option<u64>,
     writable: WritableEventObject,
     readable: ReadableEventObject,
 }
@@ -180,6 +186,7 @@ struct DirectWait {
 /// event slots remain descriptor-owned Horizon/runtime resources.
 #[derive(Clone, Debug)]
 pub(super) struct NvHostControl {
+    kernel: Arc<nixe_scheduler::SchedulerState>,
     timelines: BTreeMap<GuestSyncpointId, GuestTimeline>,
     channel_syncpoints: BTreeMap<GuestSyncpointId, u64>,
     devices: BTreeMap<NvDrvFileDescriptor, NvHostCtrlDevice>,
@@ -188,9 +195,10 @@ pub(super) struct NvHostControl {
     progress: Option<Arc<(Mutex<u64>, Condvar)>>,
 }
 
-impl Default for NvHostControl {
-    fn default() -> Self {
+impl NvHostControl {
+    pub(super) fn new(kernel: &Arc<nixe_scheduler::SchedulerState>) -> Self {
         Self {
+            kernel: kernel.clone(),
             timelines: BTreeMap::new(),
             channel_syncpoints: BTreeMap::new(),
             devices: BTreeMap::new(),
@@ -517,7 +525,7 @@ impl NvHostControl {
                 }
                 device
                     .events
-                    .insert(slot, GpuSyncpointEvent::new(slot, true));
+                    .insert(slot, GpuSyncpointEvent::new(&self.kernel, slot, true));
                 Ok(NvHostCtrlIoctlOutcome::Complete(sized_output(input, 4)))
             }
             IOCTL_SYNCPT_FREE_EVENT => {
@@ -601,7 +609,7 @@ impl NvHostControl {
             }
             if wait
                 .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
+                .is_some_and(|deadline| self.kernel.clock().scheduler_time_ns() >= deadline)
             {
                 self.direct_waits.remove(&waiter_id);
                 return Ok(NvHostCtrlIoctlOutcome::DriverResult {
@@ -620,11 +628,13 @@ impl NvHostControl {
             }));
         }
 
-        let deadline = u64::try_from(timeout_microseconds)
-            .ok()
-            .and_then(|timeout| Instant::now().checked_add(Duration::from_micros(timeout)));
-        let (writable, readable) =
-            EventObject::create_pair_with_source(nixe_runtime::ExternalEventSource::GpuCompletion);
+        let deadline = u64::try_from(timeout_microseconds).ok().map(|timeout| {
+            self.kernel
+                .clock()
+                .scheduler_time_ns()
+                .saturating_add(timeout.saturating_mul(1_000))
+        });
+        let (writable, readable) = EventObject::create_pair(&self.kernel);
         self.direct_waits.insert(
             waiter_id,
             DirectWait {
@@ -685,7 +695,7 @@ impl NvHostControl {
                     .ok_or(NvDrvCallError::GuestResult(NV_INVALID_STATE))?;
                 device
                     .events
-                    .insert(slot, GpuSyncpointEvent::new(slot, false));
+                    .insert(slot, GpuSyncpointEvent::new(&self.kernel, slot, false));
                 slot
             }
         };
@@ -914,7 +924,7 @@ mod tests {
 
     #[test]
     fn read_increment_and_already_satisfied_wait_use_neutral_timeline() {
-        let mut control = NvHostControl::default();
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
         control.open(FD);
 
         assert!(matches!(
@@ -936,7 +946,7 @@ mod tests {
 
     #[test]
     fn released_channel_syncpoint_preserves_completed_fences_across_reuse() {
-        let mut control = NvHostControl::default();
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
         control.open(FD);
         let allocated = control
             .allocate_channel_syncpoint(descriptor(), IOCTL_SYNCPT_INCREMENT)
@@ -981,7 +991,7 @@ mod tests {
 
     #[test]
     fn zero_increment_submission_returns_latest_reserved_fence() {
-        let mut control = NvHostControl::default();
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
         control.open(FD);
         let id = control
             .allocate_channel_syncpoint(descriptor(), IOCTL_SYNCPT_INCREMENT)
@@ -1002,7 +1012,7 @@ mod tests {
 
     #[test]
     fn unresolved_wait_is_explicit_and_does_not_advance_progress() {
-        let mut control = NvHostControl::default();
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
         control.open(FD);
         let NvHostCtrlIoctlOutcome::Pending(wait) = control
             .ioctl(descriptor(), IOCTL_SYNCPT_WAIT, &words(&[2, 9, u32::MAX]))
@@ -1026,7 +1036,7 @@ mod tests {
 
     #[test]
     fn zero_timeout_is_a_nonblocking_guest_timeout() {
-        let mut control = NvHostControl::default();
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
         control.open(FD);
         assert_eq!(
             control
@@ -1041,7 +1051,7 @@ mod tests {
 
     #[test]
     fn registered_gpu_events_are_descriptor_owned_and_queryable() {
-        let mut control = NvHostControl::default();
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
         control.open(FD);
         assert!(matches!(
             control.ioctl(descriptor(), IOCTL_SYNCPT_ALLOC_EVENT, &words(&[6])),
@@ -1105,7 +1115,7 @@ mod tests {
 
     #[test]
     fn direct_wait_wakes_on_progress_times_out_and_is_cancelled_on_close() {
-        let mut control = NvHostControl::default();
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
         control.open(FD);
         let waiter = NvHostCtrlWaiterId::new(7, 9);
         let NvHostCtrlIoctlOutcome::Pending(pending) = control
@@ -1140,10 +1150,9 @@ mod tests {
         else {
             panic!("finite direct wait completed before its deadline")
         };
-        assert_eq!(
-            finite.wake_event().wait(finite.remaining()),
-            nixe_runtime::EventWaitOutcome::TimedOut
-        );
+        control
+            .kernel
+            .advance_time(u64::try_from(finite.remaining().unwrap().as_nanos()).unwrap());
         assert!(matches!(
             control.ioctl_for_waiter(descriptor(), IOCTL_SYNCPT_WAIT, &words(&[3, 2, 1]), waiter,),
             Ok(NvHostCtrlIoctlOutcome::DriverResult {
@@ -1169,7 +1178,7 @@ mod tests {
 
     #[test]
     fn one_syncpoint_advance_wakes_every_reached_waiter() {
-        let mut control = NvHostControl::default();
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
         control.open(FD);
         let first_id = NvHostCtrlWaiterId::new(7, 9);
         let second_id = NvHostCtrlWaiterId::new(7, 10);
@@ -1201,7 +1210,9 @@ mod tests {
 
     #[test]
     fn backend_owner_publishes_completion_without_the_nvdrv_client_lock() {
-        let control = std::sync::Arc::new(std::sync::Mutex::new(NvHostControl::default()));
+        let control = std::sync::Arc::new(std::sync::Mutex::new(NvHostControl::new(
+            &crate::test_memory::kernel(),
+        )));
         let (reservation, wait) = {
             let mut control = control.lock().unwrap();
             control.open(FD);
@@ -1253,7 +1264,7 @@ mod tests {
 
     #[test]
     fn process_teardown_removes_waiters_events_and_timeline_state() {
-        let mut control = NvHostControl::default();
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
         control.open(FD);
         control
             .ioctl(descriptor(), IOCTL_SYNCPT_INCREMENT, &words(&[8]))
@@ -1291,7 +1302,7 @@ mod tests {
 
     #[test]
     fn invalid_syncpoints_slots_and_sizes_return_guest_argument_errors() {
-        let mut control = NvHostControl::default();
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
         control.open(FD);
         assert!(matches!(
             control.ioctl(
@@ -1317,7 +1328,7 @@ mod tests {
 
     #[test]
     fn unknown_host_control_ioctl_remains_typed_and_fatal() {
-        let mut control = NvHostControl::default();
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
         control.open(FD);
         assert!(matches!(
             control.ioctl(descriptor(), 0xc004_0022, &[0; 4]),

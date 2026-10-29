@@ -1,8 +1,8 @@
 //! Shared kernel clock for scheduling, guest time and host services.
 
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Initial wall-clock policy selected by the application runtime.
@@ -23,6 +23,8 @@ struct VirtualClockState {
     // Running: accumulated paused nanoseconds. Paused: flag + frozen elapsed.
     // One atomic word keeps reads lock-free and transitions indivisible.
     pause: AtomicU64,
+    timer_epoch: Mutex<u64>,
+    timer_changed: Condvar,
 }
 
 const PAUSED: u64 = 1 << 63;
@@ -59,6 +61,8 @@ impl VirtualClock {
                 monotonic_anchor: Instant::now(),
                 scheduler_time_ns: AtomicU64::new(0),
                 pause: AtomicU64::new(0),
+                timer_epoch: Mutex::new(0),
+                timer_changed: Condvar::new(),
             }),
         }
     }
@@ -68,10 +72,7 @@ impl VirtualClock {
     pub fn unix_seconds(&self) -> i64 {
         self.state
             .wall_anchor
-            .saturating_add(match self.state.mode {
-                VirtualClockMode::Realtime => duration_seconds(self.elapsed()),
-                VirtualClockMode::Fixed { .. } => 0,
-            })
+            .saturating_add(duration_seconds(self.elapsed()))
     }
 
     /// Returns monotonic elapsed time since this clock was created.
@@ -79,7 +80,9 @@ impl VirtualClock {
     pub fn elapsed(&self) -> Duration {
         match self.state.mode {
             VirtualClockMode::Realtime => self.host_elapsed(),
-            VirtualClockMode::Fixed { .. } => Duration::ZERO,
+            VirtualClockMode::Fixed { .. } => {
+                Duration::from_nanos(self.state.scheduler_time_ns.load(Ordering::Acquire))
+            }
         }
     }
 
@@ -108,6 +111,7 @@ impl VirtualClock {
 
     /// Freezes/resumes the shared process clock, excluding host pause duration.
     pub fn set_paused(&self, paused: bool) {
+        let mut epoch = self.timer_epoch();
         let mut state = self.state.pause.load(Ordering::Acquire);
         loop {
             if (state & PAUSED != 0) == paused {
@@ -120,7 +124,11 @@ impl VirtualClock {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => {
+                    *epoch = epoch.wrapping_add(1);
+                    self.state.timer_changed.notify_all();
+                    return;
+                }
                 Err(observed) => state = observed,
             }
         }
@@ -139,7 +147,7 @@ impl VirtualClock {
 
     /// Scheduler time follows the same monotonic host clock in realtime mode,
     /// so host device events can arrive before guest wait deadlines expire.
-    /// Fixed-clock runs advance only through explicit coordinator decisions.
+    /// Fixed-clock runs advance only through their explicit diagnostic driver.
     #[must_use]
     pub fn scheduler_time_ns(&self) -> u64 {
         let scheduled = self.state.scheduler_time_ns.load(Ordering::Acquire);
@@ -151,12 +159,54 @@ impl VirtualClock {
         }
     }
 
-    /// Advances the explicit scheduler timeline monotonically. Runtime
-    /// coordinators are the production authority.
+    /// Advances diagnostic guest time monotonically, preserving pause semantics.
     pub fn advance_scheduler_to(&self, nanoseconds: u64) {
-        self.state
+        let mut epoch = self.timer_epoch();
+        if self.is_paused() {
+            return;
+        }
+        let previous = self
+            .state
             .scheduler_time_ns
             .fetch_max(nanoseconds, Ordering::AcqRel);
+        if previous < nanoseconds {
+            *epoch = epoch.wrapping_add(1);
+            self.state.timer_changed.notify_all();
+        }
+    }
+
+    pub(crate) fn timer_epoch(&self) -> MutexGuard<'_, u64> {
+        self.state
+            .timer_epoch
+            .lock()
+            .expect("timer clock lock poisoned")
+    }
+
+    pub(crate) fn wake_timers(&self) {
+        let mut epoch = self.timer_epoch();
+        *epoch = epoch.wrapping_add(1);
+        self.state.timer_changed.notify_all();
+    }
+
+    pub(crate) fn wait_for_timer_change<'a>(
+        &self,
+        epoch: MutexGuard<'a, u64>,
+        timeout: Option<Duration>,
+    ) -> MutexGuard<'a, u64> {
+        match timeout {
+            Some(timeout) => {
+                self.state
+                    .timer_changed
+                    .wait_timeout(epoch, timeout)
+                    .expect("timer clock lock poisoned")
+                    .0
+            }
+            None => self
+                .state
+                .timer_changed
+                .wait(epoch)
+                .expect("timer clock lock poisoned"),
+        }
     }
 }
 

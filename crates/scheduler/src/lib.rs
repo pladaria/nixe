@@ -12,9 +12,11 @@ pub use lifecycle::{
     LifecycleTransitionError, ProcessLifecycle, ThreadLifecycle, transition_process,
 };
 pub use scheduler::{
-    Completion, IdealCore, Lease, LeaseGeneration, LockHandoff, LockKey, OrderedWaitKind,
+    Completion, Deadline, EventFuture, EventNotifications, EventObject, IdealCore, KernelWait,
+    Lease, LeaseGeneration, LockHandoff, LockKey, OrderedWaitKind, ReadableEventObject,
     ScheduledThreadConfig, ScheduledThreadView, SchedulerError, SchedulerState, Selection,
-    ThreadPropertyGuard, ThreadPropertyLock, WakeToken, YieldMigration,
+    ThreadPropertyGuard, ThreadPropertyLock, TimerStopped, WaitEffect, WaitOutcome, WaitPhase,
+    WaitStart, WakeToken, WritableEventObject, YieldMigration,
 };
 pub use topology::{
     CoreSet, CoreSetError, MachineSchedulerProfile, MachineSchedulerProfileError, PriorityRange,
@@ -23,3 +25,6 @@ pub use topology::{
 
 #[cfg(feature = "performance-counters")]
 pub use scheduler::SchedulerStatistics;
+
+#[cfg(feature = "performance-counters")]
+pub use scheduler::TimerStatistics;

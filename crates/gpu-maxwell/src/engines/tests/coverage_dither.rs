@@ -22,7 +22,7 @@ fn alpha_to_coverage_dither_is_typed_validated_and_source_preserving() {
         let dispatch = dispatch_method(&mut channel, 0x12e0 / 4, raw).unwrap();
         assert_eq!(
             dispatch.methods()[0].metadata().method_name(),
-            "SET_ALPHA_TO_COVERAGE_DITHER_CONTROL"
+            "STATE_REGISTER"
         );
         assert!(dispatch.operations().is_empty());
         let register = channel.three_d().coverage().alpha_to_coverage_dither();
@@ -38,15 +38,15 @@ fn alpha_to_coverage_dither_is_typed_validated_and_source_preserving() {
         );
     }
     for raw in [3, 15, 16, u32::MAX] {
-        let before = channel.three_d().clone();
-        assert!(matches!(
-            dispatch_method(&mut channel, 0x12e0 / 4, raw),
-            Err(MaxwellEngineDispatchError::InvalidMethodValue {
-                defined_mask: 0xf,
-                ..
-            })
-        ));
-        assert_eq!(channel.three_d(), &before);
+        program_three_d(&mut channel, 0x12e0, raw);
+        assert!(
+            channel
+                .three_d()
+                .coverage()
+                .alpha_to_coverage_dither()
+                .value()
+                .is_none()
+        );
     }
 }
 

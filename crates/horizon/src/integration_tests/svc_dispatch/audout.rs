@@ -99,7 +99,7 @@ pub(super) fn call(
 ) -> u32 {
     let tls = process.main_thread().tls_base;
     write_guest_bytes(process, tls, b);
-    state(process).write_w(x(0), handle);
+    process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
         dispatch_next(process, dispatcher),
         ExceptionHandlingResult::Resumed
@@ -123,11 +123,119 @@ pub(super) fn handle(process: &ScheduledProcess) -> u32 {
 }
 
 #[test]
+fn queued_audio_open_retains_the_copied_process_after_its_client_handle_closes() {
+    use nixe_memory::{AccessOperation, DeviceAccessEndpoint};
+    use std::sync::mpsc;
+
+    let (_directory, mut process) = fixture_process_with_svcs(&[0x21, 0x21]);
+    let entry = instruction_address(&process);
+    let (child, _) = super::mutex::add_thread(&mut process, entry + 4, 30);
+    let caller = process.thread(child).unwrap();
+    let backend = Arc::new(Backend::default());
+    let manager = process
+        .handles()
+        .insert(HorizonIpcObject::AudioOutManager(
+            crate::AudioOutManagerSession {
+                backend: Some(backend.clone()),
+                devices: Default::default(),
+            },
+        ))
+        .unwrap();
+    let owner = process
+        .handles()
+        .insert_object(nixe_runtime::HandleObject::from_arc(Arc::clone(&process)))
+        .unwrap();
+    let listing = process
+        .main_thread()
+        .stack_bottom
+        .checked_add(0x1000)
+        .unwrap();
+    let name = listing.checked_add(0x1000).unwrap();
+    let output = name.checked_add(256).unwrap();
+    write_guest_bytes(&process, name, &[0; 256]);
+    write_guest_bytes(
+        &process,
+        process.main_thread().tls_base,
+        &command(0, &[], None, Some((listing.get(), 256)), false, false),
+    );
+    write_abi_register(&process, 0, u64::from(manager));
+    let mut open = command(
+        1,
+        &[0; 16],
+        Some((name.get(), 256)),
+        Some((output.get(), 256)),
+        false,
+        true,
+    );
+    put_u32(&mut open, 20, owner);
+    write_guest_bytes(&process, caller.tls_base, &open);
+    caller.registers().write_w(x(0), manager);
+    let events = process.coordinator_mut().event_sender();
+    let mut dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let machine = process.memory().account().machine().clone();
+    let ranges = process
+        .memory()
+        .space()
+        .capture(listing, 256, MemoryPermissions::WRITE)
+        .unwrap();
+    let (send, receive) = mpsc::channel();
+    let device: Arc<dyn DeviceAccessEndpoint> = Arc::new(super::ipc_lifetime::Device(send));
+    machine.set_device_endpoint(&device);
+    machine.publish_device_write(&ranges, || Ok(())).unwrap();
+    assert!(matches!(
+        dispatch_scheduled_next(&mut process, &mut dispatcher),
+        (id, ExceptionHandlingResult::Suspended) if id == process.main_thread_id()
+    ));
+    let write = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(matches!(write.operation(), AccessOperation::Write(_)));
+    caller.start().unwrap();
+    assert!(matches!(
+        dispatch_scheduled_next(&mut process, &mut dispatcher),
+        (id, ExceptionHandlingResult::Suspended) if id == child
+    ));
+    drop(process.handles().close(owner).unwrap());
+    let replacement = process
+        .handles()
+        .insert(EventObject::new(process.scheduler()))
+        .unwrap();
+    assert_eq!(replacement & 0x7fff, owner & 0x7fff);
+    let value = machine
+        .apply_resolved_access(write.ranges(), write.operation())
+        .unwrap();
+    write.finish(Ok(value));
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
+    dispatcher
+        .poll_memory_completions(process.coordinator_mut())
+        .unwrap();
+    assert!(
+        process
+            .scheduler()
+            .thread(child)
+            .unwrap()
+            .active_wait
+            .is_none()
+    );
+    assert_eq!(caller.registers().read_w(x(0)), 0);
+    assert_eq!(
+        read_guest_u32(&process, caller.tls_base.checked_add(24).unwrap()),
+        0
+    );
+    assert_eq!(backend.live.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        read_guest_u32(&process, output),
+        u32::from_le_bytes(*b"Devi")
+    );
+}
+
+#[test]
 fn output_volume_ipc_controls_already_queued_pcm_and_preserves_invalid_input_errors() {
     let (_directory, mut process) = fixture_process_with_svcs(&[0x21; 4]);
     let backend = Arc::new(Backend::default());
     let mut dispatcher = support::dispatcher(&process).with_audio_backend(backend.clone());
     let session = crate::AudioOutSession::open(
+        process.scheduler(),
         backend.as_ref(),
         nixe_audio::PcmFormat::STEREO_48KHZ,
         Default::default(),
@@ -191,6 +299,142 @@ fn output_volume_ipc_controls_already_queued_pcm_and_preserves_invalid_input_err
 }
 
 #[test]
+fn nested_pcm_uses_its_own_capture_after_the_descriptor_mapping_changes() {
+    use nixe_memory::{AccessOperation, DeviceAccessEndpoint};
+    use std::sync::mpsc;
+
+    for pointer in [false, true] {
+        let (_directory, mut process) = fixture_process_with_svcs(&[0x21]);
+        let events = process.coordinator_mut().event_sender();
+        let backend = Arc::new(Backend::default());
+        let mut dispatcher = support::dispatcher(&process)
+            .with_audio_backend(backend.clone())
+            .with_input_completions(events);
+        let session = crate::AudioOutSession::open(
+            process.scheduler(),
+            backend.as_ref(),
+            nixe_audio::PcmFormat::STEREO_48KHZ,
+            Default::default(),
+        )
+        .unwrap();
+        session.output.lock().unwrap().start().unwrap();
+        let feed = backend.feed.lock().unwrap().take().unwrap();
+        let handle = process
+            .handles()
+            .insert(HorizonIpcObject::AudioOut(session))
+            .unwrap();
+        let descriptor = process
+            .main_thread()
+            .stack_bottom
+            .checked_add(0x1000)
+            .unwrap();
+        let samples = descriptor.checked_add(8).unwrap();
+        let mut data = [0; 40];
+        put_u64(&mut data, 8, samples.get());
+        put_u64(&mut data, 16, 4);
+        put_u64(&mut data, 24, 4);
+        write_guest_bytes(&process, descriptor, &data);
+        let mut bytes = command(
+            if pointer { 7 } else { 3 },
+            &123_u64.to_le_bytes(),
+            Some((descriptor.get(), 40)),
+            None,
+            pointer,
+            false,
+        );
+        if pointer {
+            put_send_static(&mut bytes, 8, descriptor.get(), 40);
+            bytes[16..28].fill(0);
+        }
+        write_guest_bytes(&process, process.main_thread().tls_base, &bytes);
+        write_abi_register(&process, 0, u64::from(handle));
+        let mapping = process.memory().query(descriptor).unwrap().mapping.unwrap();
+        let machine = process.memory().account().machine().clone();
+        let ranges = process
+            .memory()
+            .space()
+            .capture(descriptor, 40, MemoryPermissions::READ)
+            .unwrap();
+        let (send, receive) = mpsc::channel();
+        let device: Arc<dyn DeviceAccessEndpoint> = Arc::new(super::ipc_lifetime::Device(send));
+        machine.set_device_endpoint(&device);
+        let stop = process.run_slice().unwrap().stop;
+        machine.publish_device_write(&ranges, || Ok(())).unwrap();
+        assert!(matches!(
+            process
+                .route_supervisor_call(&stop, &mut dispatcher)
+                .unwrap(),
+            ExceptionHandlingResult::Suspended
+        ));
+        let read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(read.operation(), AccessOperation::Read));
+        assert_eq!(read.ranges()[0].bytes(), 40);
+        process.memory().unmap(descriptor, 0x1000, mapping).unwrap();
+        process
+            .memory()
+            .map_zeroed(descriptor, 0x1000, mapping)
+            .unwrap();
+        write_guest_bytes(&process, samples, &[0xe8, 0x03, 0x18, 0xfc]);
+        let value = machine
+            .apply_resolved_access(read.ranges(), read.operation())
+            .unwrap();
+        read.finish(Ok(value));
+        dispatcher
+            .poll_memory_completions(process.coordinator_mut())
+            .unwrap();
+        assert_eq!(read_abi_register(&process, 0), 0);
+        let mut pcm = [0; 2];
+        feed.render(&mut pcm);
+        assert_eq!(pcm, [1000, -1000]);
+    }
+}
+
+#[test]
+fn native_auto_select_rejects_invalid_modes_and_two_active_input_sides() {
+    for invalid_mode in [true, false] {
+        let (_directory, mut process) = fixture_process_with_svcs(&[0x21]);
+        let backend = Backend::default();
+        let session = crate::AudioOutSession::open(
+            process.scheduler(),
+            &backend,
+            nixe_audio::PcmFormat::STEREO_48KHZ,
+            Default::default(),
+        )
+        .unwrap();
+        let handle = process
+            .handles()
+            .insert(HorizonIpcObject::AudioOut(session))
+            .unwrap();
+        let descriptor = process.main_thread().stack_bottom;
+        let mut bytes = command(
+            7,
+            &123_u64.to_le_bytes(),
+            Some((descriptor.get(), 40)),
+            None,
+            true,
+            false,
+        );
+        let expected = if invalid_mode {
+            // The A descriptor's mode is checked during common admission.
+            bytes[24] |= 2;
+            "invalid IPC buffer mode"
+        } else {
+            put_send_static(&mut bytes, 8, descriptor.get(), 40);
+            "auto-select input has both descriptor sides active"
+        };
+        write_guest_bytes(&process, process.main_thread().tls_base, &bytes);
+        write_abi_register(&process, 0, u64::from(handle));
+        let mut dispatcher = support::dispatcher(&process);
+        assert!(matches!(
+            dispatch_next(&mut process, &mut dispatcher),
+            ExceptionHandlingResult::Fault(HorizonSvcFault::Ipc { immediate: 0x21, fault })
+                if fault.to_string() == HorizonIpcFault::malformed(expected).to_string()
+        ));
+        assert_eq!(backend.live.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
 fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
     'variants: for (auto, invalid_release, channel_count, device_gain) in [
         (false, false, 2, false),
@@ -208,12 +452,15 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         let mut dispatcher = support::dispatcher(&process).with_audio_backend(backend.clone());
         let service_name = process.main_thread().stack_bottom;
         write_guest_bytes(&process, service_name, b"sm:\0");
-        state(&mut process).write_x(x(1), service_name.get());
+        process
+            .main_thread()
+            .registers()
+            .write_x(x(1), service_name.get());
         assert!(matches!(
             dispatch_next(&mut process, &mut dispatcher),
             ExceptionHandlingResult::Resumed
         ));
-        let sm = state(&mut process).read_w(x(1));
+        let sm = process.main_thread().registers().read_w(x(1));
         // RegisterClient sends a PID descriptor.
         let mut register = [0; 256];
         put_u32(&mut register, 0, 4);
@@ -508,7 +755,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
                     false,
                 );
                 write_guest_bytes(&process, process.main_thread().tls_base, &release);
-                state(&mut process).write_w(x(0), audio);
+                process.main_thread().registers().write_w(x(0), audio);
                 let ExceptionHandlingResult::Rejected(fault) =
                     dispatch_next(&mut process, &mut dispatcher)
                 else {
@@ -519,7 +766,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
                     if fault.guest_result() == Some(HorizonKernelResult::INVALID_POINTER))
                 );
                 assert_eq!(
-                    state(&mut process).read_w(x(0)),
+                    process.main_thread().registers().read_w(x(0)),
                     HorizonKernelResult::INVALID_POINTER.raw()
                 );
                 assert!(
@@ -636,13 +883,13 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         assert!(event.is_signalled());
         let tls = process.main_thread().tls_base;
         write_guest_bytes(&process, tls, &release);
-        state(&mut process).write_w(x(0), audio);
+        process.main_thread().registers().write_w(x(0), audio);
         let ExceptionHandlingResult::Fault(fault) = dispatch_next(&mut process, &mut dispatcher)
         else {
             panic!("host audio failure must reject the IPC");
         };
         assert!(fault.to_string().contains("test device disconnected"));
-        process.handles().close(audio).unwrap();
+        assert!(process.handles().lookup(audio).is_none());
         assert_eq!(backend.live.load(Ordering::SeqCst), 0);
     }
 }

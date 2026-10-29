@@ -83,6 +83,7 @@ pub struct RenderingTargets {
 struct Attachment {
     description: RenderAttachment,
     plane: ImagePlane,
+    physical: Option<Arc<Footprint>>,
     view: Arc<crate::AllocatedImageView>,
     layout: vk::ImageLayout,
     format: vk::Format,
@@ -263,7 +264,7 @@ impl VulkanResidency {
         area: vk::Rect2D,
         aspect: vk::ImageAspectFlags,
     ) -> Result<Attachment, VulkanError> {
-        let (description, p, view) = match a.source {
+        let (description, p, view, physical) = match a.source {
             AttachmentSource::Canonical { image, plane } => {
                 let p = self.checked_image_rect(image, plane, area)?;
                 let description = self.image(image)?.description;
@@ -296,7 +297,12 @@ impl VulkanResidency {
                         swizzle: [vk::ComponentSwizzle::IDENTITY; 4],
                     },
                 )?;
-                (description, p, self.image_view_lease(view)?)
+                (
+                    description,
+                    p,
+                    self.image_view_lease(view)?,
+                    self.image(image)?.contents.geometry.get(plane).cloned(),
+                )
             }
             AttachmentSource::ResidentOnly(id) => {
                 let entry = self.attachment(id)?;
@@ -333,7 +339,7 @@ impl VulkanResidency {
                     block_extent,
                     bytes_per_block,
                 };
-                (d, p, Arc::clone(&entry.view))
+                (d, p, Arc::clone(&entry.view), None)
             }
         };
         if p.aspect != aspect || p.extent.depth != 1 {
@@ -373,6 +379,7 @@ impl VulkanResidency {
         Ok(Attachment {
             description: a,
             plane: p,
+            physical,
             view,
             layout: shader_attachment_layout(description.usage),
             format: description.format,
@@ -513,27 +520,33 @@ impl VulkanResidency {
             if !i.offset.is_multiple_of(size) || !self.buffer(i.buffer)?.usage.contains(vk::BufferUsageFlags::INDEX_BUFFER) { return Err(VulkanError::InvalidResource("index stream requires aligned INDEX_BUFFER storage")); }
             Ok(i)
         }).transpose()?;
-        let attachment_images: Vec<_> = targets
-            .attachments()
-            .filter_map(|a| {
-                if let AttachmentSource::Canonical { image, .. } = a.description.source {
-                    Some(Resource::Image(image))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let overlaps = |footprint: &Footprint| {
-            attachment_images.iter().any(|&resource| {
-                self.contents(resource)
-                    .expect("prepared attachment")
-                    .geometry
-                    .iter()
-                    .any(|target| target.intersects(footprint))
+        // Retain the selected planes once. Physical overlap relationships are
+        // built with resource registration, as in the texture cache's retained
+        // overlapping/aliased image lists, rather than rediscovered per draw.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/image_base.h#L118-L119
+        let attachment_planes = || {
+            targets.attachments().filter_map(|attachment| {
+                let AttachmentSource::Canonical { image, .. } = attachment.description.source
+                else {
+                    return None;
+                };
+                Some((Resource::Image(image), attachment.physical.as_deref()?))
             })
         };
         let buffer_overlaps = |id: BufferId, offset, bytes| -> Result<bool, VulkanError> {
             let entry = self.buffer(id)?;
+            if entry.contents.geometry.is_empty() {
+                return Ok(false);
+            }
+            let mut candidates = attachment_planes()
+                .filter(|(target, _)| {
+                    self.authority
+                        .resources_may_overlap(Resource::Buffer(id), *target)
+                })
+                .peekable();
+            if candidates.peek().is_none() {
+                return Ok(false);
+            }
             let [full] = entry.contents.geometry.as_slice() else {
                 return Err(VulkanError::InvalidResource(
                     "vertex/storage binding requires a linear physical buffer",
@@ -546,30 +559,49 @@ impl VulkanResidency {
                     bytes,
                 },
             )?;
-            Ok(overlaps(&footprint))
+            Ok(candidates.any(|(_, target)| target.intersects(&footprint)))
         };
         let mut batchable = targets.attachments().all(|a| {
             a.description.load == vk::AttachmentLoadOp::LOAD
                 && a.description.store == vk::AttachmentStoreOp::STORE
         });
-        for vertex in &vertices {
-            batchable &= !buffer_overlaps(vertex.buffer, vertex.offset, vertex.size)?;
+        if batchable {
+            for vertex in &vertices {
+                if buffer_overlaps(vertex.buffer, vertex.offset, vertex.size)? {
+                    batchable = false;
+                    break;
+                }
+            }
         }
-        if let Some(index) = &index {
-            batchable &= !buffer_overlaps(index.buffer, index.offset, index.size)?;
+        if batchable && let Some(index) = &index {
+            batchable = !buffer_overlaps(index.buffer, index.offset, index.size)?;
         }
-        for usage in &graphics.program.uses {
-            batchable &= !match *usage {
-                Use::Buffer {
-                    id, offset, size, ..
-                } => buffer_overlaps(id, offset, size)?,
-                Use::Image { id, .. } => self
-                    .image(id)?
-                    .contents
-                    .geometry
-                    .iter()
-                    .any(|f| overlaps(f)),
-            };
+        if batchable {
+            for usage in &graphics.program.uses {
+                let overlaps = match *usage {
+                    Use::Buffer {
+                        id, offset, size, ..
+                    } => buffer_overlaps(id, offset, size)?,
+                    Use::Image { id, range, .. } => {
+                        let entry = self.image(id)?;
+                        !entry.contents.geometry.is_empty()
+                            && attachment_planes().any(|(target, footprint)| {
+                                self.authority
+                                    .resources_may_overlap(Resource::Image(id), target)
+                                    && entry.planes.iter().zip(&entry.contents.geometry).any(
+                                        |(&plane, source)| {
+                                            super::plane_in_range(plane, range)
+                                                && footprint.intersects(source)
+                                        },
+                                    )
+                            })
+                    }
+                };
+                if overlaps {
+                    batchable = false;
+                    break;
+                }
+            }
         }
         let native_vertices = vertices
             .iter()

@@ -4,8 +4,6 @@
 //! commit `9fdf5c4062007929d9f4e6cbad9c9771fe61b880`:
 //! https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
 
-use std::sync::Arc;
-
 use crate::MaxwellMethodSource;
 
 use super::state::MaxwellThreeDRegister;
@@ -137,54 +135,35 @@ impl MaxwellThreeDVertexIdUsesArrayStart {
 }
 
 /// Data-assembly controls that affect values presented to the vertex shader.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDVertexAssemblyState {
-    attribute_defaults: MaxwellThreeDRegister<MaxwellThreeDAttributeDefaults>,
-    vertex_id_uses_array_start: MaxwellThreeDRegister<MaxwellThreeDVertexIdUsesArrayStart>,
-    vertex_id_base: MaxwellThreeDRegister<u32>,
-    global_base_vertex_index: MaxwellThreeDRegister<u32>,
-    global_base_instance_index: MaxwellThreeDRegister<u32>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDVertexAssemblyState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDVertexAssemblyState {
+impl MaxwellThreeDVertexAssemblyState<'_> {
     #[must_use]
-    pub const fn attribute_defaults(
+    pub fn attribute_defaults(&self) -> MaxwellThreeDRegister<MaxwellThreeDAttributeDefaults> {
+        self.registers
+            .read(0x1610, MaxwellThreeDAttributeDefaults::parse)
+    }
+    #[must_use]
+    pub fn vertex_id_uses_array_start(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDAttributeDefaults> {
-        &self.attribute_defaults
+    ) -> MaxwellThreeDRegister<MaxwellThreeDVertexIdUsesArrayStart> {
+        self.registers.read(0x164c, |raw| {
+            MaxwellThreeDVertexIdUsesArrayStart::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn vertex_id_uses_array_start(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDVertexIdUsesArrayStart> {
-        &self.vertex_id_uses_array_start
+    pub fn vertex_id_base(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x1118, Some)
     }
-
-    /// The independently programmed vertex-ID base, not a vertex-buffer offset.
-    ///
-    /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1378-L1379
     #[must_use]
-    pub const fn vertex_id_base(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.vertex_id_base
+    pub fn global_base_vertex_index(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x1434, Some)
     }
-
-    /// Base added to the vertex index presented to shader execution.
-    ///
-    /// ABI source:
-    /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2633-L2634>
     #[must_use]
-    pub const fn global_base_vertex_index(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.global_base_vertex_index
-    }
-
-    /// Base added to the instance index presented to shader execution.
-    ///
-    /// ABI source:
-    /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2636-L2637>
-    #[must_use]
-    pub const fn global_base_instance_index(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.global_base_instance_index
+    pub fn global_base_instance_index(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x1438, Some)
     }
 }
 
@@ -202,28 +181,24 @@ pub struct MaxwellThreeDUnresolvedAddress {
 ///
 /// ABI source:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1255-L1259>
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDVertexStreamSubstituteState {
-    address_upper: MaxwellThreeDRegister<u8>,
-    address_lower: MaxwellThreeDRegister<u32>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDVertexStreamSubstituteState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDVertexStreamSubstituteState {
+impl MaxwellThreeDVertexStreamSubstituteState<'_> {
     #[must_use]
-    pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.address_upper
+    pub fn address_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers.read(0x0f84, |raw| u8::try_from(raw).ok())
     }
-
     #[must_use]
-    pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.address_lower
+    pub fn address_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x0f88, Some)
     }
-
     #[must_use]
     pub fn address(&self) -> Option<MaxwellThreeDUnresolvedAddress> {
         Some(MaxwellThreeDUnresolvedAddress::new(
-            *self.address_upper.value()?,
-            *self.address_lower.value()?,
+            *self.address_upper().value()?,
+            *self.address_lower().value()?,
         ))
     }
 }
@@ -386,60 +361,59 @@ impl MaxwellThreeDVertexAttributeFormat {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDVertexStreamState {
-    format: MaxwellThreeDRegister<MaxwellThreeDVertexStreamFormat>,
-    address_upper: MaxwellThreeDRegister<u8>,
-    address_lower: MaxwellThreeDRegister<u32>,
-    limit_upper: MaxwellThreeDRegister<u8>,
-    limit_lower: MaxwellThreeDRegister<u32>,
-    frequency: MaxwellThreeDRegister<u32>,
-    instanced: MaxwellThreeDRegister<bool>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDVertexStreamState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
+    index: usize,
 }
-
-impl MaxwellThreeDVertexStreamState {
+impl MaxwellThreeDVertexStreamState<'_> {
     #[must_use]
-    pub const fn format(&self) -> &MaxwellThreeDRegister<MaxwellThreeDVertexStreamFormat> {
-        &self.format
+    pub fn format(&self) -> MaxwellThreeDRegister<MaxwellThreeDVertexStreamFormat> {
+        self.registers.read(0x1c00 + self.index as u32 * 16, |raw| {
+            MaxwellThreeDVertexStreamFormat::parse(raw)
+        })
     }
     #[must_use]
-    pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.address_upper
+    pub fn address_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers.read(0x1c04 + self.index as u32 * 16, |raw| {
+            u8::try_from(raw).ok()
+        })
     }
     #[must_use]
-    pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.address_lower
+    pub fn address_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x1c08 + self.index as u32 * 16, Some)
     }
     #[must_use]
-    pub const fn limit_upper(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.limit_upper
+    pub fn frequency(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x1c0c + self.index as u32 * 16, Some)
     }
     #[must_use]
-    pub const fn limit_lower(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.limit_lower
+    pub fn limit_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers
+            .read(0x1f00 + self.index as u32 * 8, |raw| u8::try_from(raw).ok())
     }
     #[must_use]
-    pub const fn frequency(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.frequency
+    pub fn limit_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x1f04 + self.index as u32 * 8, Some)
     }
     #[must_use]
-    pub const fn instanced(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.instanced
+    pub fn instanced(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers.read(0x1880 + self.index as u32 * 4, |raw| {
+            (raw <= 1).then_some(raw != 0)
+        })
     }
-
     #[must_use]
     pub fn address(&self) -> Option<MaxwellThreeDUnresolvedAddress> {
         Some(MaxwellThreeDUnresolvedAddress::new(
-            *self.address_upper.value()?,
-            *self.address_lower.value()?,
+            *self.address_upper().value()?,
+            *self.address_lower().value()?,
         ))
     }
-
     #[must_use]
     pub fn limit(&self) -> Option<MaxwellThreeDUnresolvedAddress> {
         Some(MaxwellThreeDUnresolvedAddress::new(
-            *self.limit_upper.value()?,
-            *self.limit_lower.value()?,
+            *self.limit_upper().value()?,
+            *self.limit_lower().value()?,
         ))
     }
 }
@@ -470,45 +444,39 @@ impl MaxwellThreeDIndexElementSize {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDIndexBufferState {
-    address_upper: MaxwellThreeDRegister<u8>,
-    address_lower: MaxwellThreeDRegister<u32>,
-    limit_upper: MaxwellThreeDRegister<u8>,
-    limit_lower: MaxwellThreeDRegister<u32>,
-    element_size: MaxwellThreeDRegister<MaxwellThreeDIndexElementSize>,
-    count: MaxwellThreeDRegister<u32>,
-    first: MaxwellThreeDRegister<u32>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDIndexBufferState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDIndexBufferState {
+impl MaxwellThreeDIndexBufferState<'_> {
     #[must_use]
-    pub const fn count(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.count
+    pub fn address_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers.read(0x17c8, |raw| u8::try_from(raw).ok())
     }
     #[must_use]
-    pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.address_upper
+    pub fn address_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x17cc, Some)
     }
     #[must_use]
-    pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.address_lower
+    pub fn limit_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers.read(0x17d0, |raw| u8::try_from(raw).ok())
     }
     #[must_use]
-    pub const fn limit_upper(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.limit_upper
+    pub fn limit_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x17d4, Some)
     }
     #[must_use]
-    pub const fn limit_lower(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.limit_lower
+    pub fn element_size(&self) -> MaxwellThreeDRegister<MaxwellThreeDIndexElementSize> {
+        self.registers
+            .read(0x17d8, MaxwellThreeDIndexElementSize::parse)
     }
     #[must_use]
-    pub const fn element_size(&self) -> &MaxwellThreeDRegister<MaxwellThreeDIndexElementSize> {
-        &self.element_size
+    pub fn first(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x17dc, Some)
     }
     #[must_use]
-    pub const fn first(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.first
+    pub fn count(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x17e0, Some)
     }
 }
 
@@ -663,95 +631,109 @@ impl MaxwellThreeDBalancedPrimitiveWorkload {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDPrimitiveState {
-    balanced_workload: MaxwellThreeDRegister<MaxwellThreeDBalancedPrimitiveWorkload>,
-    circular_buffer_throttle: MaxwellThreeDRegister<MaxwellThreeDPrimitiveCircularBufferThrottle>,
-    patch_size: MaxwellThreeDRegister<MaxwellThreeDPatchSize>,
-    topology_override: MaxwellThreeDRegister<bool>,
-    topology: MaxwellThreeDRegister<MaxwellThreeDPrimitiveTopology>,
-    vertex_array_restart_enabled:
-        MaxwellThreeDRegister<MaxwellThreeDVertexArrayPrimitiveRestartEnable>,
-    restart_enabled: MaxwellThreeDRegister<bool>,
-    restart_index: MaxwellThreeDRegister<u32>,
-    vertex_array_start: MaxwellThreeDRegister<u32>,
+pub(super) struct MaxwellThreeDPrimitiveSequence {
     begin: MaxwellThreeDRegister<MaxwellThreeDBegin>,
     end: MaxwellThreeDRegister<bool>,
     instance_index: u32,
     open: bool,
 }
-
-impl MaxwellThreeDPrimitiveState {
+impl MaxwellThreeDPrimitiveSequence {
+    pub(super) fn begin(&mut self, raw: u32, value: MaxwellThreeDBegin) {
+        self.instance_index = match value.instance() {
+            MaxwellThreeDBeginInstance::First => 0,
+            MaxwellThreeDBeginInstance::Subsequent => self.instance_index.wrapping_add(1),
+            MaxwellThreeDBeginInstance::Unchanged => self.instance_index,
+        };
+        self.begin = MaxwellThreeDRegister::decoded(raw, value);
+        self.open = true;
+    }
+    pub(super) fn end(&mut self, raw: u32, value: bool) {
+        self.end = MaxwellThreeDRegister::decoded(raw, value);
+        self.open = false;
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDPrimitiveState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
+    pub(super) sequence: &'a MaxwellThreeDPrimitiveSequence,
+}
+impl<'a> MaxwellThreeDPrimitiveState<'a> {
     #[must_use]
-    pub const fn balanced_workload(
+    pub fn balanced_workload(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDBalancedPrimitiveWorkload> {
-        &self.balanced_workload
+    ) -> MaxwellThreeDRegister<MaxwellThreeDBalancedPrimitiveWorkload> {
+        self.registers.read(0x0374, |raw| {
+            MaxwellThreeDBalancedPrimitiveWorkload::parse(raw)
+        })
     }
-
     #[must_use]
-    pub const fn circular_buffer_throttle(
+    pub fn circular_buffer_throttle(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDPrimitiveCircularBufferThrottle> {
-        &self.circular_buffer_throttle
-    }
-
-    #[must_use]
-    pub const fn patch_size(&self) -> &MaxwellThreeDRegister<MaxwellThreeDPatchSize> {
-        &self.patch_size
-    }
-
-    #[must_use]
-    pub const fn topology_override(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.topology_override
+    ) -> MaxwellThreeDRegister<MaxwellThreeDPrimitiveCircularBufferThrottle> {
+        self.registers.read(0x02d0, |raw| {
+            MaxwellThreeDPrimitiveCircularBufferThrottle::new(raw)
+        })
     }
     #[must_use]
-    pub const fn topology(&self) -> &MaxwellThreeDRegister<MaxwellThreeDPrimitiveTopology> {
-        &self.topology
+    pub fn patch_size(&self) -> MaxwellThreeDRegister<MaxwellThreeDPatchSize> {
+        self.registers.read(0x0dcc, |raw| {
+            (raw <= 0xff).then_some(MaxwellThreeDPatchSize::new(raw as u8))
+        })
     }
     #[must_use]
-    pub const fn vertex_array_restart_enabled(
+    pub fn topology_override(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers
+            .read(0x1948, |raw| (raw <= 1).then_some(raw != 0))
+    }
+    #[must_use]
+    pub fn topology(&self) -> MaxwellThreeDRegister<MaxwellThreeDPrimitiveTopology> {
+        self.registers
+            .read(0x1970, MaxwellThreeDPrimitiveTopology::parse)
+    }
+    #[must_use]
+    pub fn vertex_array_restart_enabled(
         &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDVertexArrayPrimitiveRestartEnable> {
-        &self.vertex_array_restart_enabled
+    ) -> MaxwellThreeDRegister<MaxwellThreeDVertexArrayPrimitiveRestartEnable> {
+        self.registers.read(0x0de8, |raw| {
+            MaxwellThreeDVertexArrayPrimitiveRestartEnable::parse(raw)
+        })
     }
     #[must_use]
-    pub const fn restart_enabled(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.restart_enabled
+    pub fn restart_enabled(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers
+            .read(0x1644, |raw| (raw <= 1).then_some(raw != 0))
     }
     #[must_use]
-    pub const fn restart_index(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.restart_index
+    pub fn restart_index(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x1648, Some)
     }
     #[must_use]
-    pub const fn vertex_array_start(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.vertex_array_start
+    pub fn vertex_array_start(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x0d74, Some)
     }
     #[must_use]
-    pub const fn begin(&self) -> &MaxwellThreeDRegister<MaxwellThreeDBegin> {
-        &self.begin
+    pub const fn begin(&self) -> &'a MaxwellThreeDRegister<MaxwellThreeDBegin> {
+        &self.sequence.begin
     }
-
-    /// Last validated `END` write, retained independently from the preceding
-    /// `BEGIN` so diagnostics can reconstruct the primitive sequence.
     #[must_use]
-    pub const fn end(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.end
+    pub const fn end(&self) -> &'a MaxwellThreeDRegister<bool> {
+        &self.sequence.end
     }
-
+    #[must_use]
+    pub const fn active_begin(&self) -> Option<&'a MaxwellThreeDBegin> {
+        if self.sequence.open {
+            self.sequence.begin.value()
+        } else {
+            None
+        }
+    }
     #[must_use]
     pub const fn is_open(&self) -> bool {
-        self.open
+        self.sequence.open
     }
-
-    #[must_use]
-    pub const fn active_begin(&self) -> Option<&MaxwellThreeDBegin> {
-        if self.open { self.begin.value() } else { None }
-    }
-
-    /// Zero-based instance selected by the current `BEGIN` sequence.
     #[must_use]
     pub const fn instance_index(&self) -> u32 {
-        self.instance_index
+        self.sequence.instance_index
     }
 }
 
@@ -814,328 +796,67 @@ impl MaxwellThreeDBegin {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDVertexInputState {
-    attribute_skip_masks: [MaxwellThreeDRegister<u32>; 4],
-    streams: Arc<[MaxwellThreeDVertexStreamState; MAXWELL_VERTEX_STREAM_COUNT]>,
-    attributes: Arc<
-        [MaxwellThreeDRegister<MaxwellThreeDVertexAttributeFormat>; MAXWELL_VERTEX_ATTRIBUTE_COUNT],
-    >,
-    index: MaxwellThreeDIndexBufferState,
-    primitive: MaxwellThreeDPrimitiveState,
-    assembly: MaxwellThreeDVertexAssemblyState,
-    stream_substitute: MaxwellThreeDVertexStreamSubstituteState,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDVertexInputState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
+    pub(super) sequence: &'a MaxwellThreeDPrimitiveSequence,
 }
-
-impl Default for MaxwellThreeDVertexInputState {
-    fn default() -> Self {
-        Self {
-            attribute_skip_masks: std::array::from_fn(|_| MaxwellThreeDRegister::default()),
-            streams: Arc::new(std::array::from_fn(|_| {
-                MaxwellThreeDVertexStreamState::default()
-            })),
-            attributes: Arc::new(std::array::from_fn(|_| MaxwellThreeDRegister::default())),
-            index: MaxwellThreeDIndexBufferState::default(),
-            primitive: MaxwellThreeDPrimitiveState::default(),
-            assembly: MaxwellThreeDVertexAssemblyState::default(),
-            stream_substitute: MaxwellThreeDVertexStreamSubstituteState::default(),
-        }
-    }
-}
-
-impl MaxwellThreeDVertexInputState {
-    /// DA output is the vertex fetcher's output, not the vertex shader's output.
-    /// A/B select scalar attributes 0..63/64..127, one bit per component.
-    /// https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1605-L1800
-    /// https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/src/common/unix/nvidia-3d/src/nvidia-3d-vertex-arrays.c#L274-L297
+impl<'a> MaxwellThreeDVertexInputState<'a> {
     #[must_use]
-    pub fn attribute_skip_masks(&self) -> &[MaxwellThreeDRegister<u32>; 4] {
-        &self.attribute_skip_masks
+    pub fn attribute_skip_masks(&self, index: usize) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x1120 + index as u32 * 4, Some)
     }
-
     #[must_use]
     pub fn attribute_skip_mask(&self, attribute: u8) -> u8 {
-        assert!(attribute < MAXWELL_VERTEX_ATTRIBUTE_COUNT as u8);
-        let word = &self.attribute_skip_masks[attribute as usize / 8];
-        word.value()
+        self.attribute_skip_masks(attribute as usize / 8)
+            .value()
             .map_or(0, |value| ((value >> ((attribute % 8) * 4)) & 15) as u8)
-    }
-
-    #[must_use]
-    pub fn streams(&self) -> &[MaxwellThreeDVertexStreamState; MAXWELL_VERTEX_STREAM_COUNT] {
-        &self.streams
     }
     #[must_use]
     pub fn attributes(
         &self,
-    ) -> &[MaxwellThreeDRegister<MaxwellThreeDVertexAttributeFormat>; MAXWELL_VERTEX_ATTRIBUTE_COUNT]
-    {
-        &self.attributes
+        index: usize,
+    ) -> MaxwellThreeDRegister<MaxwellThreeDVertexAttributeFormat> {
+        self.registers.read(0x1160 + index as u32 * 4, |raw| {
+            MaxwellThreeDVertexAttributeFormat::parse(raw)
+        })
     }
     #[must_use]
-    pub const fn index(&self) -> &MaxwellThreeDIndexBufferState {
-        &self.index
+    pub fn streams(&self, index: usize) -> MaxwellThreeDVertexStreamState<'a> {
+        MaxwellThreeDVertexStreamState {
+            registers: self.registers,
+            index,
+        }
     }
     #[must_use]
-    pub const fn primitive(&self) -> &MaxwellThreeDPrimitiveState {
-        &self.primitive
+    pub fn index(&self) -> MaxwellThreeDIndexBufferState<'a> {
+        MaxwellThreeDIndexBufferState {
+            registers: self.registers,
+        }
     }
     #[must_use]
-    pub const fn assembly(&self) -> &MaxwellThreeDVertexAssemblyState {
-        &self.assembly
+    pub fn assembly(&self) -> MaxwellThreeDVertexAssemblyState<'a> {
+        MaxwellThreeDVertexAssemblyState {
+            registers: self.registers,
+        }
     }
-
     #[must_use]
-    pub const fn stream_substitute(&self) -> &MaxwellThreeDVertexStreamSubstituteState {
-        &self.stream_substitute
+    pub fn stream_substitute(&self) -> MaxwellThreeDVertexStreamSubstituteState<'a> {
+        MaxwellThreeDVertexStreamSubstituteState {
+            registers: self.registers,
+        }
     }
-
-    pub(super) fn apply(&mut self, write: MaxwellThreeDVertexInputWrite) {
-        let raw = write.raw();
-        match write {
-            MaxwellThreeDVertexInputWrite::AttributeSkipMask { index, value, .. } => {
-                self.attribute_skip_masks[index as usize] =
-                    MaxwellThreeDRegister::decoded(raw, value);
-            }
-            MaxwellThreeDVertexInputWrite::BalancedPrimitiveWorkload { value, .. } => {
-                self.primitive.balanced_workload = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::PrimitiveCircularBufferThrottle { value, .. } => {
-                self.primitive.circular_buffer_throttle = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::PatchSize { value, .. } => {
-                self.primitive.patch_size = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::StreamFormat { stream, value, .. } => {
-                Arc::make_mut(&mut self.streams)[stream as usize].format =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::StreamAddressUpper { stream, value, .. } => {
-                Arc::make_mut(&mut self.streams)[stream as usize].address_upper =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::StreamAddressLower { stream, value, .. } => {
-                Arc::make_mut(&mut self.streams)[stream as usize].address_lower =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::StreamLimitUpper { stream, value, .. } => {
-                Arc::make_mut(&mut self.streams)[stream as usize].limit_upper =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::StreamLimitLower { stream, value, .. } => {
-                Arc::make_mut(&mut self.streams)[stream as usize].limit_lower =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::StreamFrequency { stream, value, .. } => {
-                Arc::make_mut(&mut self.streams)[stream as usize].frequency =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::StreamInstanced { stream, value, .. } => {
-                Arc::make_mut(&mut self.streams)[stream as usize].instanced =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::Attribute {
-                attribute, value, ..
-            } => {
-                Arc::make_mut(&mut self.attributes)[attribute as usize] =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::IndexAddressUpper { value, .. } => {
-                self.index.address_upper = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::IndexAddressLower { value, .. } => {
-                self.index.address_lower = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::IndexLimitUpper { value, .. } => {
-                self.index.limit_upper = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::IndexLimitLower { value, .. } => {
-                self.index.limit_lower = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::IndexElementSize { value, .. } => {
-                self.index.element_size = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::IndexFirst { value, .. } => {
-                self.index.first = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::IndexCount { value, .. } => {
-                self.index.count = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::TopologyOverride { value, .. } => {
-                self.primitive.topology_override = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::Topology { value, .. } => {
-                self.primitive.topology = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::VertexArrayPrimitiveRestartEnable { value, .. } => {
-                self.primitive.vertex_array_restart_enabled =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::PrimitiveRestartEnable { value, .. } => {
-                self.primitive.restart_enabled = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::PrimitiveRestartIndex { value, .. } => {
-                self.primitive.restart_index = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::VertexArrayStart { value, .. } => {
-                self.primitive.vertex_array_start = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::Begin { value, .. } => {
-                // deko3d emits FIRST followed by SUBSEQUENT BEGIN writes for
-                // the one-instance draws that compose a public instanced draw.
-                // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/draw.mme
-                self.primitive.instance_index = match value.instance() {
-                    MaxwellThreeDBeginInstance::First => 0,
-                    MaxwellThreeDBeginInstance::Subsequent => {
-                        self.primitive.instance_index.wrapping_add(1)
-                    }
-                    MaxwellThreeDBeginInstance::Unchanged => self.primitive.instance_index,
-                };
-                self.primitive.begin = MaxwellThreeDRegister::decoded(raw, value);
-                self.primitive.open = true;
-            }
-            MaxwellThreeDVertexInputWrite::End { value, .. } => {
-                self.primitive.end = MaxwellThreeDRegister::decoded(raw, value);
-                self.primitive.open = false;
-            }
-            MaxwellThreeDVertexInputWrite::AttributeDefaults { value, .. } => {
-                self.assembly.attribute_defaults = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::VertexIdUsesArrayStart { value, .. } => {
-                self.assembly.vertex_id_uses_array_start =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::GlobalBaseVertexIndex { value, .. } => {
-                self.assembly.global_base_vertex_index = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::VertexIdBase { value, .. } => {
-                self.assembly.vertex_id_base = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::GlobalBaseInstanceIndex { value, .. } => {
-                self.assembly.global_base_instance_index =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::StreamSubstituteAddressUpper { value, .. } => {
-                self.stream_substitute.address_upper = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDVertexInputWrite::StreamSubstituteAddressLower { value, .. } => {
-                self.stream_substitute.address_lower = MaxwellThreeDRegister::decoded(raw, value)
-            }
+    #[must_use]
+    pub fn primitive(&self) -> MaxwellThreeDPrimitiveState<'a> {
+        MaxwellThreeDPrimitiveState {
+            registers: self.registers,
+            sequence: self.sequence,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDVertexInputWrite {
-    AttributeSkipMask {
-        index: u8,
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    IndexCount {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    BalancedPrimitiveWorkload {
-        value: MaxwellThreeDBalancedPrimitiveWorkload,
-        source: MaxwellMethodSource,
-    },
-    PrimitiveCircularBufferThrottle {
-        value: MaxwellThreeDPrimitiveCircularBufferThrottle,
-        source: MaxwellMethodSource,
-    },
-    PatchSize {
-        value: MaxwellThreeDPatchSize,
-        source: MaxwellMethodSource,
-    },
-    StreamFormat {
-        stream: u8,
-        value: MaxwellThreeDVertexStreamFormat,
-        source: MaxwellMethodSource,
-    },
-    StreamAddressUpper {
-        stream: u8,
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    StreamAddressLower {
-        stream: u8,
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    StreamLimitUpper {
-        stream: u8,
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    StreamLimitLower {
-        stream: u8,
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    StreamFrequency {
-        stream: u8,
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    StreamInstanced {
-        stream: u8,
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    Attribute {
-        attribute: u8,
-        value: MaxwellThreeDVertexAttributeFormat,
-        source: MaxwellMethodSource,
-    },
-    IndexAddressUpper {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    IndexAddressLower {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    IndexLimitUpper {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    IndexLimitLower {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    IndexElementSize {
-        value: MaxwellThreeDIndexElementSize,
-        source: MaxwellMethodSource,
-    },
-    IndexFirst {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    TopologyOverride {
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    Topology {
-        value: MaxwellThreeDPrimitiveTopology,
-        source: MaxwellMethodSource,
-    },
-    VertexArrayPrimitiveRestartEnable {
-        value: MaxwellThreeDVertexArrayPrimitiveRestartEnable,
-        source: MaxwellMethodSource,
-    },
-    PrimitiveRestartEnable {
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    PrimitiveRestartIndex {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    VertexArrayStart {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
     Begin {
         value: MaxwellThreeDBegin,
         source: MaxwellMethodSource,
@@ -1144,76 +865,4 @@ pub enum MaxwellThreeDVertexInputWrite {
         value: bool,
         source: MaxwellMethodSource,
     },
-    AttributeDefaults {
-        value: MaxwellThreeDAttributeDefaults,
-        source: MaxwellMethodSource,
-    },
-    VertexIdUsesArrayStart {
-        value: MaxwellThreeDVertexIdUsesArrayStart,
-        source: MaxwellMethodSource,
-    },
-    GlobalBaseVertexIndex {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    VertexIdBase {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    GlobalBaseInstanceIndex {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    StreamSubstituteAddressUpper {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    StreamSubstituteAddressLower {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-}
-
-impl MaxwellThreeDVertexInputWrite {
-    pub(super) const fn source(self) -> MaxwellMethodSource {
-        match self {
-            Self::AttributeSkipMask { source, .. }
-            | Self::BalancedPrimitiveWorkload { source, .. }
-            | Self::PrimitiveCircularBufferThrottle { source, .. }
-            | Self::PatchSize { source, .. }
-            | Self::StreamFormat { source, .. }
-            | Self::StreamAddressUpper { source, .. }
-            | Self::StreamAddressLower { source, .. }
-            | Self::StreamLimitUpper { source, .. }
-            | Self::StreamLimitLower { source, .. }
-            | Self::StreamFrequency { source, .. }
-            | Self::StreamInstanced { source, .. }
-            | Self::Attribute { source, .. }
-            | Self::IndexAddressUpper { source, .. }
-            | Self::IndexAddressLower { source, .. }
-            | Self::IndexLimitUpper { source, .. }
-            | Self::IndexLimitLower { source, .. }
-            | Self::IndexElementSize { source, .. }
-            | Self::IndexFirst { source, .. }
-            | Self::IndexCount { source, .. }
-            | Self::TopologyOverride { source, .. }
-            | Self::Topology { source, .. }
-            | Self::VertexArrayPrimitiveRestartEnable { source, .. }
-            | Self::PrimitiveRestartEnable { source, .. }
-            | Self::PrimitiveRestartIndex { source, .. }
-            | Self::VertexArrayStart { source, .. }
-            | Self::Begin { source, .. }
-            | Self::End { source, .. }
-            | Self::AttributeDefaults { source, .. }
-            | Self::VertexIdUsesArrayStart { source, .. }
-            | Self::GlobalBaseVertexIndex { source, .. }
-            | Self::VertexIdBase { source, .. }
-            | Self::GlobalBaseInstanceIndex { source, .. }
-            | Self::StreamSubstituteAddressUpper { source, .. }
-            | Self::StreamSubstituteAddressLower { source, .. } => source,
-        }
-    }
-    pub(super) const fn raw(self) -> u32 {
-        self.source().argument()
-    }
 }

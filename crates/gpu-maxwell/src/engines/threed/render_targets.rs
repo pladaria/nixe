@@ -1,7 +1,5 @@
 //! Typed render-target, depth/stencil-target, and clear frontend state.
 
-use crate::MaxwellMethodSource;
-
 use super::state::MaxwellThreeDRegister;
 
 pub const MAXWELL_COLOR_TARGET_COUNT: usize = 8;
@@ -493,109 +491,92 @@ impl MaxwellThreeDColorCompressionMode {
 
 /// One unresolved color attachment. Every member remains explicitly unset
 /// until the guest programs it.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDColorTargetState {
-    address_upper: MaxwellThreeDRegister<u8>,
-    address_lower: MaxwellThreeDRegister<u32>,
-    width: MaxwellThreeDRegister<u32>,
-    height: MaxwellThreeDRegister<u32>,
-    format: MaxwellThreeDRegister<MaxwellThreeDColorTargetFormat>,
-    layout: MaxwellThreeDRegister<MaxwellThreeDImageLayout>,
-    kind: MaxwellThreeDRegister<MaxwellThreeDImageKind>,
-    third_dimension: MaxwellThreeDRegister<u32>,
-    array_pitch: MaxwellThreeDRegister<u32>,
-    layer: MaxwellThreeDRegister<u16>,
-    compression: MaxwellThreeDRegister<MaxwellThreeDColorCompressionMode>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDColorTargetState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
+    index: usize,
 }
-
-impl Default for MaxwellThreeDColorTargetState {
-    fn default() -> Self {
-        // The Maxwell class register file is zero-initialized. In particular,
-        // omitted SET_COLOR_TARGET_LAYER and SET_COLOR_COMPRESSION methods
-        // select layer zero and disabled compression; deko3d relies on both
-        // resets before fully programming the attachment.
-        // Keep the reset explicit so Unset continues to mean unknown state.
-        //
-        // NVIDIA layer and compression zero encodings:
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L773-L774
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3575-L3578
-        // Zero-initialized live and shadow register files:
-        // https://github.com/yuzu-emu-mirror/yuzu-mainline/blob/310c1f50beb77fc5c6f9075029973161d4e51a4a/src/video_core/engines/maxwell_3d.cpp#L34-L104
-        Self {
-            address_upper: MaxwellThreeDRegister::default(),
-            address_lower: MaxwellThreeDRegister::default(),
-            width: MaxwellThreeDRegister::default(),
-            height: MaxwellThreeDRegister::default(),
-            format: MaxwellThreeDRegister::default(),
-            layout: MaxwellThreeDRegister::default(),
-            kind: MaxwellThreeDRegister::default(),
-            third_dimension: MaxwellThreeDRegister::default(),
-            array_pitch: MaxwellThreeDRegister::default(),
-            layer: MaxwellThreeDRegister::verified_reset(
-                MAXWELL_THREE_D_COLOR_TARGET_LAYER_RESET,
-                Some(MAXWELL_THREE_D_COLOR_TARGET_LAYER_RESET as u16),
-            ),
-            compression: MaxwellThreeDRegister::verified_reset(
-                MAXWELL_THREE_D_COLOR_COMPRESSION_RESET,
-                Some(MaxwellThreeDColorCompressionMode::Disabled),
-            ),
-        }
-    }
-}
-
-impl MaxwellThreeDColorTargetState {
+impl MaxwellThreeDColorTargetState<'_> {
     #[must_use]
-    pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.address_upper
+    pub fn address_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers
+            .read(0x0800 + self.index as u32 * 0x40, |raw| {
+                u8::try_from(raw).ok()
+            })
     }
     #[must_use]
-    pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.address_lower
+    pub fn address_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers
+            .read(0x0800 + self.index as u32 * 0x40 + 4, Some)
     }
     #[must_use]
-    pub const fn width(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.width
+    pub fn width(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers
+            .read(0x0800 + self.index as u32 * 0x40 + 8, |raw| {
+                (raw <= 0x0fffffff).then_some(raw)
+            })
     }
     #[must_use]
-    pub const fn height(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.height
+    pub fn height(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers
+            .read(0x0800 + self.index as u32 * 0x40 + 12, |raw| {
+                (raw <= 0x1ffff).then_some(raw)
+            })
     }
     #[must_use]
-    pub const fn format(&self) -> &MaxwellThreeDRegister<MaxwellThreeDColorTargetFormat> {
-        &self.format
+    pub fn format(&self) -> MaxwellThreeDRegister<MaxwellThreeDColorTargetFormat> {
+        self.registers
+            .read(0x0800 + self.index as u32 * 0x40 + 16, |raw| {
+                MaxwellThreeDColorTargetFormat::parse(raw)
+            })
     }
     #[must_use]
-    pub const fn layout(&self) -> &MaxwellThreeDRegister<MaxwellThreeDImageLayout> {
-        &self.layout
+    pub fn layout(&self) -> MaxwellThreeDRegister<MaxwellThreeDImageLayout> {
+        self.registers
+            .read(0x0800 + self.index as u32 * 0x40 + 20, |raw| {
+                color_layout(raw)
+            })
     }
     #[must_use]
-    pub const fn kind(&self) -> &MaxwellThreeDRegister<MaxwellThreeDImageKind> {
-        &self.kind
+    pub fn kind(&self) -> MaxwellThreeDRegister<MaxwellThreeDImageKind> {
+        self.registers
+            .read(0x0800 + self.index as u32 * 0x40 + 20, |raw| {
+                color_layout(raw).map(|_| {
+                    if raw & 0x10000 != 0 {
+                        MaxwellThreeDImageKind::ThreeDimensional
+                    } else {
+                        MaxwellThreeDImageKind::Array
+                    }
+                })
+            })
     }
     #[must_use]
-    pub const fn third_dimension(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.third_dimension
+    pub fn third_dimension(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers
+            .read(0x0800 + self.index as u32 * 0x40 + 24, |raw| {
+                (raw <= 0x0fffffff).then_some(raw)
+            })
     }
     #[must_use]
-    pub const fn array_pitch(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.array_pitch
+    pub fn array_pitch(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers
+            .read(0x0800 + self.index as u32 * 0x40 + 28, Some)
     }
     #[must_use]
-    pub const fn layer(&self) -> &MaxwellThreeDRegister<u16> {
-        &self.layer
+    pub fn layer(&self) -> MaxwellThreeDRegister<u16> {
+        self.registers
+            .read(0x0800 + self.index as u32 * 0x40 + 32, |raw| {
+                u16::try_from(raw).ok()
+            })
     }
     #[must_use]
-    pub const fn compression(&self) -> &MaxwellThreeDRegister<MaxwellThreeDColorCompressionMode> {
-        &self.compression
+    pub fn compression(&self) -> MaxwellThreeDRegister<MaxwellThreeDColorCompressionMode> {
+        self.registers.read(0x19e0 + self.index as u32 * 4, |raw| {
+            MaxwellThreeDColorCompressionMode::parse(raw)
+        })
     }
-
-    /// Classifies only attachment-description completeness and relationships.
-    /// The compression selector is intentionally excluded: it configures work
-    /// on an attachment but neither describes nor binds one. This function
-    /// resolves no address and creates no image view.
-    #[must_use]
     pub fn readiness(&self, profile_supports_format: bool) -> MaxwellThreeDAttachmentReadiness {
-        let Some(format) = self.format.value().copied() else {
+        let Some(format) = self.format().value().copied() else {
             return MaxwellThreeDAttachmentReadiness::Unprogrammed;
         };
         if format == MaxwellThreeDColorTargetFormat::Disabled {
@@ -605,131 +586,119 @@ impl MaxwellThreeDColorTargetState {
             return MaxwellThreeDAttachmentReadiness::ProfileUnavailable;
         }
         let required = [
-            self.address_upper.raw(),
-            self.address_lower.raw(),
-            self.width.raw(),
-            self.height.raw(),
-            self.layout.raw(),
-            self.kind.raw(),
-            self.third_dimension.raw(),
+            self.address_upper().raw(),
+            self.address_lower().raw(),
+            self.width().raw(),
+            self.height().raw(),
+            self.layout().raw(),
+            self.kind().raw(),
+            self.third_dimension().raw(),
         ];
         if required.iter().any(Option::is_none) {
             return MaxwellThreeDAttachmentReadiness::Incomplete;
         }
-        if self.width.value() == Some(&0)
-            || self.height.value() == Some(&0)
-            || self.third_dimension.value() == Some(&0)
+        if self.width().value() == Some(&0)
+            || self.height().value() == Some(&0)
+            || self.third_dimension().value() == Some(&0)
         {
             return MaxwellThreeDAttachmentReadiness::Contradictory;
         }
-        if self.kind.value() == Some(&MaxwellThreeDImageKind::ThreeDimensional)
-            && self.layer.value().is_some_and(|layer| *layer != 0)
+        if self.kind().value() == Some(&MaxwellThreeDImageKind::ThreeDimensional)
+            && self.layer().value().is_some_and(|layer| *layer != 0)
         {
             return MaxwellThreeDAttachmentReadiness::Contradictory;
         }
         MaxwellThreeDAttachmentReadiness::Ready
     }
 }
+fn color_layout(raw: u32) -> Option<MaxwellThreeDImageLayout> {
+    let height = ((raw >> 4) & 15) as u8;
+    let depth = ((raw >> 8) & 15) as u8;
+    if raw & !0x11ff0 != 0 || height > 5 || depth > 5 {
+        return None;
+    }
+    if raw & 0x1000 != 0 {
+        (height == 0 && depth == 0).then_some(MaxwellThreeDImageLayout::PitchLinear)
+    } else {
+        Some(MaxwellThreeDImageLayout::BlockLinear {
+            block_height_log2: height,
+            block_depth_log2: depth,
+        })
+    }
+}
 
 /// One unresolved depth/stencil attachment.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDDepthStencilTargetState {
-    address_upper: MaxwellThreeDRegister<u8>,
-    address_lower: MaxwellThreeDRegister<u32>,
-    format: MaxwellThreeDRegister<MaxwellThreeDDepthStencilFormat>,
-    layout: MaxwellThreeDRegister<MaxwellThreeDImageLayout>,
-    width: MaxwellThreeDRegister<u32>,
-    height: MaxwellThreeDRegister<u32>,
-    third_dimension: MaxwellThreeDRegister<u16>,
-    array_control: MaxwellThreeDRegister<MaxwellThreeDDepthArrayControl>,
-    array_pitch: MaxwellThreeDRegister<u32>,
-    layer: MaxwellThreeDRegister<u16>,
-    compression: MaxwellThreeDRegister<MaxwellThreeDZCompressionMode>,
-    sparse: MaxwellThreeDRegister<u8>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDDepthStencilTargetState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl Default for MaxwellThreeDDepthStencilTargetState {
-    fn default() -> Self {
-        // SET_ZT_LAYER starts at zero, like SET_COLOR_TARGET_LAYER. Deko3d's
-        // depth-target binding leaves it unwritten. Model only this verified
-        // reset, not a fallback that would hide other incomplete target fields.
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L3180-L3181
-        // https://github.com/yuzu-emu-mirror/yuzu-mainline/blob/310c1f50beb77fc5c6f9075029973161d4e51a4a/src/video_core/engines/maxwell_3d.cpp#L45-L127
-        // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_3d_base.cpp#L267-L297
-        Self {
-            address_upper: MaxwellThreeDRegister::default(),
-            address_lower: MaxwellThreeDRegister::default(),
-            format: MaxwellThreeDRegister::default(),
-            layout: MaxwellThreeDRegister::default(),
-            width: MaxwellThreeDRegister::default(),
-            height: MaxwellThreeDRegister::default(),
-            third_dimension: MaxwellThreeDRegister::default(),
-            array_control: MaxwellThreeDRegister::default(),
-            array_pitch: MaxwellThreeDRegister::default(),
-            layer: MaxwellThreeDRegister::verified_reset(
-                MAXWELL_THREE_D_DEPTH_TARGET_LAYER_RESET,
-                Some(MAXWELL_THREE_D_DEPTH_TARGET_LAYER_RESET as u16),
-            ),
-            compression: MaxwellThreeDRegister::default(),
-            // NVIDIA's public GM20B context writes zero to B197 dword 0x482.
-            // Table SHA256: 6372e2f6f547d7bd086beb066ce46ac379795f95c38eeeedd9e13c7b32515b24.
-            // https://gitlab.com/kernel-firmware/linux-firmware/-/blob/main/WHENCE
-            // https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/nouveau/nvkm/engine/gr/gk20a.c#L110-L149
-            sparse: MaxwellThreeDRegister::verified_reset(0, Some(0)),
-        }
-    }
-}
-
-impl MaxwellThreeDDepthStencilTargetState {
-    /// Bit 0 enables sparse depth; bit 1 selects the unmapped comparison policy.
+impl MaxwellThreeDDepthStencilTargetState<'_> {
     #[must_use]
-    pub const fn sparse(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.sparse
-    }
-
-    #[must_use]
-    pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.address_upper
+    pub fn address_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers.read(0x0fe0, |raw| u8::try_from(raw).ok())
     }
     #[must_use]
-    pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.address_lower
+    pub fn address_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x0fe4, Some)
     }
     #[must_use]
-    pub const fn format(&self) -> &MaxwellThreeDRegister<MaxwellThreeDDepthStencilFormat> {
-        &self.format
+    pub fn format(&self) -> MaxwellThreeDRegister<MaxwellThreeDDepthStencilFormat> {
+        self.registers
+            .read(0x0fe8, MaxwellThreeDDepthStencilFormat::parse)
     }
     #[must_use]
-    pub const fn layout(&self) -> &MaxwellThreeDRegister<MaxwellThreeDImageLayout> {
-        &self.layout
+    pub fn layout(&self) -> MaxwellThreeDRegister<MaxwellThreeDImageLayout> {
+        self.registers.read(0x0fec, |raw| {
+            (raw & !0xff0 == 0 && ((raw >> 4) & 15) <= 5 && ((raw >> 8) & 15) == 0).then_some(
+                MaxwellThreeDImageLayout::BlockLinear {
+                    block_height_log2: ((raw >> 4) & 15) as u8,
+                    block_depth_log2: 0,
+                },
+            )
+        })
     }
     #[must_use]
-    pub const fn width(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.width
+    pub fn width(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers
+            .read(0x1228, |raw| (raw <= 0x0fffffff).then_some(raw))
     }
     #[must_use]
-    pub const fn height(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.height
+    pub fn height(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers
+            .read(0x122c, |raw| (raw <= 0x1ffff).then_some(raw))
     }
     #[must_use]
-    pub const fn third_dimension(&self) -> &MaxwellThreeDRegister<u16> {
-        &self.third_dimension
+    pub fn third_dimension(&self) -> MaxwellThreeDRegister<u16> {
+        self.registers
+            .read(0x1230, |raw| (raw & !0x1ffff == 0).then_some(raw as u16))
     }
     #[must_use]
-    pub const fn array_control(&self) -> &MaxwellThreeDRegister<MaxwellThreeDDepthArrayControl> {
-        &self.array_control
+    pub fn array_control(&self) -> MaxwellThreeDRegister<MaxwellThreeDDepthArrayControl> {
+        self.registers.read(0x1230, |raw| {
+            (raw & !0x1ffff == 0).then_some(if raw & 0x10000 != 0 {
+                MaxwellThreeDDepthArrayControl::ArraySizeIsOne
+            } else {
+                MaxwellThreeDDepthArrayControl::ThirdDimensionDefinesArraySize
+            })
+        })
     }
     #[must_use]
-    pub const fn array_pitch(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.array_pitch
+    pub fn array_pitch(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x0ff0, Some)
     }
     #[must_use]
-    pub const fn layer(&self) -> &MaxwellThreeDRegister<u16> {
-        &self.layer
+    pub fn layer(&self) -> MaxwellThreeDRegister<u16> {
+        self.registers.read(0x179c, |raw| u16::try_from(raw).ok())
     }
     #[must_use]
-    pub const fn compression(&self) -> &MaxwellThreeDRegister<MaxwellThreeDZCompressionMode> {
-        &self.compression
+    pub fn compression(&self) -> MaxwellThreeDRegister<MaxwellThreeDZCompressionMode> {
+        self.registers
+            .read(0x19cc, MaxwellThreeDZCompressionMode::parse)
+    }
+    #[must_use]
+    pub fn sparse(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers
+            .read(0x1208, |raw| (raw <= 3).then_some(raw as u8))
     }
 }
 
@@ -842,503 +811,123 @@ impl MaxwellThreeDClearSurface {
 
 /// Values consumed by a later clear operation. `last_surface` records the
 /// trigger but does not execute or lower it.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDClearState {
-    color: [MaxwellThreeDRegister<MaxwellThreeDRawValue>; 4],
-    depth: MaxwellThreeDRegister<MaxwellThreeDRawValue>,
-    stencil: MaxwellThreeDRegister<u8>,
-    horizontal: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
-    vertical: MaxwellThreeDRegister<MaxwellThreeDRectangle>,
-    surface_control: MaxwellThreeDRegister<MaxwellThreeDClearSurfaceControl>,
-    last_surface: MaxwellThreeDRegister<MaxwellThreeDClearSurface>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDClearState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDClearState {
+impl MaxwellThreeDClearState<'_> {
     #[must_use]
-    pub const fn color(&self) -> &[MaxwellThreeDRegister<MaxwellThreeDRawValue>; 4] {
-        &self.color
-    }
-    #[must_use]
-    pub const fn depth(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRawValue> {
-        &self.depth
+    pub fn color(&self, component: usize) -> MaxwellThreeDRegister<MaxwellThreeDRawValue> {
+        self.registers.read(0x0d80 + component as u32 * 4, |raw| {
+            Some(MaxwellThreeDRawValue::new(raw))
+        })
     }
     #[must_use]
-    pub const fn stencil(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.stencil
+    pub fn depth(&self) -> MaxwellThreeDRegister<MaxwellThreeDRawValue> {
+        self.registers
+            .read(0x0d90, |raw| Some(MaxwellThreeDRawValue::new(raw)))
     }
     #[must_use]
-    pub const fn horizontal(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRectangle> {
-        &self.horizontal
+    pub fn stencil(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers.read(0x0da0, |raw| u8::try_from(raw).ok())
     }
     #[must_use]
-    pub const fn vertical(&self) -> &MaxwellThreeDRegister<MaxwellThreeDRectangle> {
-        &self.vertical
+    pub fn horizontal(&self) -> MaxwellThreeDRegister<MaxwellThreeDRectangle> {
+        self.registers.read(0x0d6c, super::rectangle)
     }
     #[must_use]
-    pub const fn surface_control(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDClearSurfaceControl> {
-        &self.surface_control
+    pub fn vertical(&self) -> MaxwellThreeDRegister<MaxwellThreeDRectangle> {
+        self.registers.read(0x0d70, super::rectangle)
     }
     #[must_use]
-    pub const fn last_surface(&self) -> &MaxwellThreeDRegister<MaxwellThreeDClearSurface> {
-        &self.last_surface
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDRenderTargetState {
-    color: [MaxwellThreeDColorTargetState; MAXWELL_COLOR_TARGET_COUNT],
-    color_target_selection: MaxwellThreeDRegister<MaxwellThreeDColorTargetSelection>,
-    srgb_write: MaxwellThreeDRegister<bool>,
-    compression_threshold: MaxwellThreeDRegister<MaxwellThreeDCompressionThreshold>,
-    color_zero_bandwidth_clear: MaxwellThreeDRegister<u16>,
-    depth_zero_bandwidth_clear: MaxwellThreeDRegister<u16>,
-    separate_fragment_data: MaxwellThreeDRegister<MaxwellThreeDSeparateFragmentData>,
-    render_target_layer: MaxwellThreeDRegister<MaxwellThreeDRenderTargetLayer>,
-    render_target_index_offset: MaxwellThreeDRegister<MaxwellThreeDRenderTargetIndexOffset>,
-    depth_target_count: MaxwellThreeDRegister<MaxwellThreeDDepthTargetCount>,
-    depth_stencil: MaxwellThreeDDepthStencilTargetState,
-    clear: MaxwellThreeDClearState,
-}
-
-impl Default for MaxwellThreeDRenderTargetState {
-    fn default() -> Self {
-        Self {
-            color: Default::default(),
-            // Shared with MME replay; GM20B firmware provenance is in state.rs.
-            color_target_selection: MaxwellThreeDRegister::verified_reset(
-                0x0fac_6881,
-                MaxwellThreeDColorTargetSelection::parse(0x0fac_6881),
-            ),
-            // GM20B's public context method table clears B197 dword 0x56e.
-            // Provenance and hash are documented in verified_raw_register_reset.
-            srgb_write: MaxwellThreeDRegister::verified_reset(0, Some(false)),
-            compression_threshold: Default::default(),
-            color_zero_bandwidth_clear: Default::default(),
-            depth_zero_bandwidth_clear: Default::default(),
-            separate_fragment_data: Default::default(),
-            render_target_layer: Default::default(),
-            render_target_index_offset: Default::default(),
-            depth_target_count: MaxwellThreeDRegister::verified_reset(
-                1,
-                MaxwellThreeDDepthTargetCount::parse(1),
-            ),
-            depth_stencil: Default::default(),
-            clear: Default::default(),
-        }
-    }
-}
-
-impl MaxwellThreeDRenderTargetState {
-    #[must_use]
-    pub const fn srgb_write(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.srgb_write
+    pub fn surface_control(&self) -> MaxwellThreeDRegister<MaxwellThreeDClearSurfaceControl> {
+        self.registers
+            .read(0x10f8, MaxwellThreeDClearSurfaceControl::parse)
     }
     #[must_use]
-    pub const fn color(&self) -> &[MaxwellThreeDColorTargetState; MAXWELL_COLOR_TARGET_COUNT] {
-        &self.color
-    }
-    #[must_use]
-    pub const fn color_target_selection(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDColorTargetSelection> {
-        &self.color_target_selection
-    }
-    #[must_use]
-    pub const fn compression_threshold(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDCompressionThreshold> {
-        &self.compression_threshold
-    }
-    /// Fifteen-bit disable mask for the color ZBC table slots.
-    ///
-    /// ZBC encodes constant tiles using table indices instead of pixel bytes:
-    /// <https://patents.google.com/patent/US8862823B1/en>.
-    /// These masks restrict that storage optimization, not the clear value or
-    /// affected attachments. Our clear path materializes resident images and
-    /// does not emit guest ZBC tags, so neither mask changes neutral GPU work.
-    /// Compressed imports still require their existing explicit support.
-    /// Field definitions:
-    /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h>.
-    #[must_use]
-    pub const fn color_zero_bandwidth_clear(&self) -> &MaxwellThreeDRegister<u16> {
-        &self.color_zero_bandwidth_clear
-    }
-    /// Fifteen-bit disable mask for the depth ZBC table slots, independent of color.
-    #[must_use]
-    pub const fn depth_zero_bandwidth_clear(&self) -> &MaxwellThreeDRegister<u16> {
-        &self.depth_zero_bandwidth_clear
-    }
-    #[must_use]
-    pub const fn separate_fragment_data(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDSeparateFragmentData> {
-        &self.separate_fragment_data
-    }
-    #[must_use]
-    pub const fn render_target_layer(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDRenderTargetLayer> {
-        &self.render_target_layer
-    }
-    #[must_use]
-    pub const fn render_target_index_offset(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDRenderTargetIndexOffset> {
-        &self.render_target_index_offset
-    }
-    #[must_use]
-    pub const fn depth_target_count(
-        &self,
-    ) -> &MaxwellThreeDRegister<MaxwellThreeDDepthTargetCount> {
-        &self.depth_target_count
-    }
-    #[must_use]
-    pub const fn depth_stencil(&self) -> &MaxwellThreeDDepthStencilTargetState {
-        &self.depth_stencil
-    }
-    #[must_use]
-    pub const fn clear(&self) -> &MaxwellThreeDClearState {
-        &self.clear
-    }
-
-    pub(super) fn apply(&mut self, write: MaxwellThreeDRenderTargetWrite) {
-        let raw = write.raw();
-        match write {
-            MaxwellThreeDRenderTargetWrite::ColorAddressUpper { target, value, .. } => {
-                self.color[target as usize].address_upper =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ColorAddressLower { target, value, .. } => {
-                self.color[target as usize].address_lower =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ColorWidth { target, value, .. } => {
-                self.color[target as usize].width = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ColorHeight { target, value, .. } => {
-                self.color[target as usize].height = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ColorFormat { target, value, .. } => {
-                self.color[target as usize].format = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ColorLayout {
-                target,
-                layout,
-                kind,
-                ..
-            } => {
-                self.color[target as usize].layout = MaxwellThreeDRegister::decoded(raw, layout);
-                self.color[target as usize].kind = MaxwellThreeDRegister::decoded(raw, kind);
-            }
-            MaxwellThreeDRenderTargetWrite::ColorThirdDimension { target, value, .. } => {
-                self.color[target as usize].third_dimension =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ColorArrayPitch { target, value, .. } => {
-                self.color[target as usize].array_pitch = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ColorLayer { target, value, .. } => {
-                self.color[target as usize].layer = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ColorCompression { target, value, .. } => {
-                self.color[target as usize].compression = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ColorTargetSelection { value, .. } => {
-                self.color_target_selection = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::CompressionThreshold { value, .. } => {
-                self.compression_threshold = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ColorZeroBandwidthClear { value, .. } => {
-                self.color_zero_bandwidth_clear = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::DepthZeroBandwidthClear { value, .. } => {
-                self.depth_zero_bandwidth_clear = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::SrgbWrite { value, .. } => {
-                self.srgb_write = MaxwellThreeDRegister::decoded(raw, value);
-            }
-            MaxwellThreeDRenderTargetWrite::SeparateFragmentData { value, .. } => {
-                self.separate_fragment_data = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::RenderTargetLayer { value, .. } => {
-                self.render_target_layer = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::RenderTargetIndexOffset { value, .. } => {
-                self.render_target_index_offset = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::DepthTargetCount { value, .. } => {
-                self.depth_target_count = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::DepthAddressUpper { value, .. } => {
-                self.depth_stencil.address_upper = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::DepthAddressLower { value, .. } => {
-                self.depth_stencil.address_lower = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::DepthSparse { value, .. } => {
-                self.depth_stencil.sparse = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::DepthFormat { value, .. } => {
-                self.depth_stencil.format = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::DepthLayout { value, .. } => {
-                self.depth_stencil.layout = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::DepthWidth { value, .. } => {
-                self.depth_stencil.width = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::DepthHeight { value, .. } => {
-                self.depth_stencil.height = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::DepthThirdDimension { value, control, .. } => {
-                self.depth_stencil.third_dimension = MaxwellThreeDRegister::decoded(raw, value);
-                self.depth_stencil.array_control = MaxwellThreeDRegister::decoded(raw, control);
-            }
-            MaxwellThreeDRenderTargetWrite::DepthArrayPitch { value, .. } => {
-                self.depth_stencil.array_pitch = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::DepthLayer { value, .. } => {
-                self.depth_stencil.layer = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::DepthCompression { value, .. } => {
-                self.depth_stencil.compression = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ClearColor {
-                component, value, ..
-            } => self.clear.color[component as usize] = MaxwellThreeDRegister::decoded(raw, value),
-            MaxwellThreeDRenderTargetWrite::ClearDepth { value, .. } => {
-                self.clear.depth = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ClearStencil { value, .. } => {
-                self.clear.stencil = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ClearHorizontal { value, .. } => {
-                self.clear.horizontal = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ClearVertical { value, .. } => {
-                self.clear.vertical = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ClearSurfaceControl { value, .. } => {
-                self.clear.surface_control = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDRenderTargetWrite::ClearSurface { value, .. } => {
-                self.clear.last_surface = MaxwellThreeDRegister::decoded(raw, value)
-            }
-        }
+    pub fn last_surface(&self) -> MaxwellThreeDRegister<MaxwellThreeDClearSurface> {
+        self.registers
+            .read(0x19d0, MaxwellThreeDClearSurface::parse)
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellThreeDRenderTargetWrite {
-    ColorAddressUpper {
-        target: u8,
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    ColorAddressLower {
-        target: u8,
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    ColorWidth {
-        target: u8,
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    ColorHeight {
-        target: u8,
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    ColorFormat {
-        target: u8,
-        value: MaxwellThreeDColorTargetFormat,
-        source: MaxwellMethodSource,
-    },
-    ColorLayout {
-        target: u8,
-        layout: MaxwellThreeDImageLayout,
-        kind: MaxwellThreeDImageKind,
-        source: MaxwellMethodSource,
-    },
-    ColorThirdDimension {
-        target: u8,
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    ColorArrayPitch {
-        target: u8,
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    ColorLayer {
-        target: u8,
-        value: u16,
-        source: MaxwellMethodSource,
-    },
-    ColorCompression {
-        target: u8,
-        value: MaxwellThreeDColorCompressionMode,
-        source: MaxwellMethodSource,
-    },
-    ColorTargetSelection {
-        value: MaxwellThreeDColorTargetSelection,
-        source: MaxwellMethodSource,
-    },
-    CompressionThreshold {
-        value: MaxwellThreeDCompressionThreshold,
-        source: MaxwellMethodSource,
-    },
-    ColorZeroBandwidthClear {
-        value: u16,
-        source: MaxwellMethodSource,
-    },
-    DepthZeroBandwidthClear {
-        value: u16,
-        source: MaxwellMethodSource,
-    },
-    SrgbWrite {
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    SeparateFragmentData {
-        value: MaxwellThreeDSeparateFragmentData,
-        source: MaxwellMethodSource,
-    },
-    RenderTargetLayer {
-        value: MaxwellThreeDRenderTargetLayer,
-        source: MaxwellMethodSource,
-    },
-    RenderTargetIndexOffset {
-        value: MaxwellThreeDRenderTargetIndexOffset,
-        source: MaxwellMethodSource,
-    },
-    DepthTargetCount {
-        value: MaxwellThreeDDepthTargetCount,
-        source: MaxwellMethodSource,
-    },
-    DepthAddressUpper {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    DepthAddressLower {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    DepthSparse {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    DepthFormat {
-        value: MaxwellThreeDDepthStencilFormat,
-        source: MaxwellMethodSource,
-    },
-    DepthLayout {
-        value: MaxwellThreeDImageLayout,
-        source: MaxwellMethodSource,
-    },
-    DepthWidth {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    DepthHeight {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    DepthThirdDimension {
-        value: u16,
-        control: MaxwellThreeDDepthArrayControl,
-        source: MaxwellMethodSource,
-    },
-    DepthArrayPitch {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    DepthLayer {
-        value: u16,
-        source: MaxwellMethodSource,
-    },
-    DepthCompression {
-        value: MaxwellThreeDZCompressionMode,
-        source: MaxwellMethodSource,
-    },
-    ClearColor {
-        component: u8,
-        value: MaxwellThreeDRawValue,
-        source: MaxwellMethodSource,
-    },
-    ClearDepth {
-        value: MaxwellThreeDRawValue,
-        source: MaxwellMethodSource,
-    },
-    ClearStencil {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    ClearHorizontal {
-        value: MaxwellThreeDRectangle,
-        source: MaxwellMethodSource,
-    },
-    ClearVertical {
-        value: MaxwellThreeDRectangle,
-        source: MaxwellMethodSource,
-    },
-    ClearSurfaceControl {
-        value: MaxwellThreeDClearSurfaceControl,
-        source: MaxwellMethodSource,
-    },
-    ClearSurface {
-        value: MaxwellThreeDClearSurface,
-        source: MaxwellMethodSource,
-    },
+pub struct MaxwellThreeDRenderTargetState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDRenderTargetWrite {
-    pub(super) const fn source(self) -> MaxwellMethodSource {
-        match self {
-            Self::ColorAddressUpper { source, .. }
-            | Self::ColorAddressLower { source, .. }
-            | Self::ColorWidth { source, .. }
-            | Self::ColorHeight { source, .. }
-            | Self::ColorFormat { source, .. }
-            | Self::ColorLayout { source, .. }
-            | Self::ColorThirdDimension { source, .. }
-            | Self::ColorArrayPitch { source, .. }
-            | Self::ColorLayer { source, .. }
-            | Self::ColorCompression { source, .. }
-            | Self::ColorTargetSelection { source, .. }
-            | Self::CompressionThreshold { source, .. }
-            | Self::ColorZeroBandwidthClear { source, .. }
-            | Self::DepthZeroBandwidthClear { source, .. }
-            | Self::SrgbWrite { source, .. }
-            | Self::SeparateFragmentData { source, .. }
-            | Self::RenderTargetLayer { source, .. }
-            | Self::RenderTargetIndexOffset { source, .. }
-            | Self::DepthTargetCount { source, .. }
-            | Self::DepthAddressUpper { source, .. }
-            | Self::DepthAddressLower { source, .. }
-            | Self::DepthFormat { source, .. }
-            | Self::DepthSparse { source, .. }
-            | Self::DepthLayout { source, .. }
-            | Self::DepthWidth { source, .. }
-            | Self::DepthHeight { source, .. }
-            | Self::DepthThirdDimension { source, .. }
-            | Self::DepthArrayPitch { source, .. }
-            | Self::DepthLayer { source, .. }
-            | Self::DepthCompression { source, .. }
-            | Self::ClearColor { source, .. }
-            | Self::ClearDepth { source, .. }
-            | Self::ClearStencil { source, .. }
-            | Self::ClearHorizontal { source, .. }
-            | Self::ClearVertical { source, .. }
-            | Self::ClearSurfaceControl { source, .. }
-            | Self::ClearSurface { source, .. } => source,
+impl<'a> MaxwellThreeDRenderTargetState<'a> {
+    #[must_use]
+    pub fn color_target_selection(
+        &self,
+    ) -> MaxwellThreeDRegister<MaxwellThreeDColorTargetSelection> {
+        self.registers
+            .read(0x121c, MaxwellThreeDColorTargetSelection::parse)
+    }
+    #[must_use]
+    pub fn srgb_write(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers
+            .read(0x15b8, |raw| (raw <= 1).then_some(raw != 0))
+    }
+    #[must_use]
+    pub fn compression_threshold(
+        &self,
+    ) -> MaxwellThreeDRegister<MaxwellThreeDCompressionThreshold> {
+        self.registers
+            .read(0x1220, MaxwellThreeDCompressionThreshold::parse)
+    }
+    #[must_use]
+    pub fn color_zero_bandwidth_clear(&self) -> MaxwellThreeDRegister<u16> {
+        self.registers
+            .read(0x07a4, |raw| (raw <= 0x7fff).then_some(raw as u16))
+    }
+    #[must_use]
+    pub fn depth_zero_bandwidth_clear(&self) -> MaxwellThreeDRegister<u16> {
+        self.registers
+            .read(0x07a8, |raw| (raw <= 0x7fff).then_some(raw as u16))
+    }
+    #[must_use]
+    pub fn separate_fragment_data(
+        &self,
+    ) -> MaxwellThreeDRegister<MaxwellThreeDSeparateFragmentData> {
+        self.registers
+            .read(0x0fac, MaxwellThreeDSeparateFragmentData::parse)
+    }
+    #[must_use]
+    pub fn render_target_layer(&self) -> MaxwellThreeDRegister<MaxwellThreeDRenderTargetLayer> {
+        self.registers.read(0x15cc, |raw| {
+            (raw <= 0x1ffff).then_some(MaxwellThreeDRenderTargetLayer::parse(raw))
+        })
+    }
+    #[must_use]
+    pub fn render_target_index_offset(
+        &self,
+    ) -> MaxwellThreeDRegister<MaxwellThreeDRenderTargetIndexOffset> {
+        self.registers.read(0x11f0, |raw| {
+            MaxwellThreeDRenderTargetIndexOffset::parse(raw)
+        })
+    }
+    #[must_use]
+    pub fn depth_target_count(&self) -> MaxwellThreeDRegister<MaxwellThreeDDepthTargetCount> {
+        self.registers
+            .read(0x1538, MaxwellThreeDDepthTargetCount::parse)
+    }
+    #[must_use]
+    pub fn color(&self, index: usize) -> MaxwellThreeDColorTargetState<'a> {
+        MaxwellThreeDColorTargetState {
+            registers: self.registers,
+            index,
         }
     }
-    pub(super) const fn raw(self) -> u32 {
-        self.source().argument()
+    #[must_use]
+    pub fn depth_stencil(&self) -> MaxwellThreeDDepthStencilTargetState<'a> {
+        MaxwellThreeDDepthStencilTargetState {
+            registers: self.registers,
+        }
+    }
+    #[must_use]
+    pub fn clear(&self) -> MaxwellThreeDClearState<'a> {
+        MaxwellThreeDClearState {
+            registers: self.registers,
+        }
     }
 }

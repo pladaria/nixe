@@ -66,7 +66,7 @@ impl MaxwellEnginePacketDispatch {
 /// Test collector for method semantics and owned trigger observations.
 pub fn dispatch_maxwell_engine_packet(
     channel: &mut MaxwellGpuChannel,
-    submission: FrontendSubmissionId,
+    _submission: FrontendSubmissionId,
     packet: &crate::MaxwellDecodedPacket,
 ) -> Result<MaxwellEnginePacketDispatch, MaxwellEngineDispatchError> {
     let mut methods = Vec::new();
@@ -130,10 +130,9 @@ pub fn dispatch_maxwell_engine_packet(
         ordered_operations.push(operation);
         Ok::<(), std::convert::Infallible>(())
     };
-    let streamed = crate::test_memory::ready(stream_maxwell_engine_packet(
+    let streamed = crate::test_memory::ready(stream_maxwell_engine_entry(
         channel,
-        submission,
-        packet.view(),
+        &mut crate::pushbuffer::packet::CommandStream::fixture(packet.view()),
         Some(&mut methods),
         &mut mme_methods,
         &mut mme_parameters,
@@ -142,6 +141,7 @@ pub fn dispatch_maxwell_engine_packet(
     .map_err(|error| match error {
         MaxwellEngineStreamError::Dispatch(error) => *error,
         MaxwellEngineStreamError::Consumer(never) => match never {},
+        MaxwellEngineStreamError::Decode(error) => panic!("invalid command fixture: {error}"),
     });
     if streamed.is_ok() {
         match crate::test_memory::ready(finish_maxwell_engine_stream(channel, &mut observe)) {

@@ -125,18 +125,12 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
             let mut encoded_handles = vec![0; handles_size];
             let mut encoded_values = vec![0; values_size];
             if handles_size != 0 {
-                read_bytes(
-                    process,
-                    GuestVirtualAddress::new(handles.address),
-                    &mut encoded_handles,
-                )
-                .await?;
-                read_bytes(
-                    process,
-                    GuestVirtualAddress::new(values.address),
-                    &mut encoded_values,
-                )
-                .await?;
+                process
+                    .read(&process.send_statics()[0], 0, &mut encoded_handles)
+                    .await?;
+                process
+                    .read(&process.send_statics()[1], 0, &mut encoded_values)
+                    .await?;
             }
             let mut updates = Vec::with_capacity(handles_size / 4);
             for (handle, value) in encoded_handles
@@ -284,12 +278,14 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
             if descriptor.index != 0 || !hipc.send_buffers.is_empty() {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
-            let (address, size) = (descriptor.address, usize::from(descriptor.size));
+            let size = usize::from(descriptor.size);
             if size == 0 || !size.is_multiple_of(4) || size > 10 * 4 {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let mut encoded_ids = vec![0; size];
-            read_bytes(process, GuestVirtualAddress::new(address), &mut encoded_ids).await?;
+            process
+                .read(&process.send_statics()[0], 0, &mut encoded_ids)
+                .await?;
             let ids = encoded_ids
                 .chunks_exact(4)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));

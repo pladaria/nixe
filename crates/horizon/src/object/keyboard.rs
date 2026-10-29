@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn asynchronous_validation_rejection_confirmation_and_completion() {
         for utf8 in [false, true] {
-            let session = AppletSession::new(OperationMode::Console);
+            let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
             session.convert_to_domain();
             let applet = session
                 .create_library_applet(
@@ -360,7 +360,7 @@ mod tests {
         initial[0xffc..0x1004].copy_from_slice(b"initial!");
         let transfer = crate::test_memory::transfer(&initial);
         let ranges = transfer.ranges().clone();
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         session.convert_to_domain();
         let id = session
             .create_transfer_storage(Arc::clone(&transfer), 0x2000, true)
@@ -407,7 +407,7 @@ mod tests {
     }
     #[test]
     fn cancellation_and_accessor_close_finish_host_keyboard() {
-        let session = AppletSession::new(OperationMode::Console);
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         session.convert_to_domain();
         let applet = session
             .create_library_applet(

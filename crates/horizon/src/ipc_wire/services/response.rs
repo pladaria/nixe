@@ -1,14 +1,10 @@
 //! Encoding for responses produced by the typed filesystem and add-on backends.
 
-use crate::ipc_wire::request::Request;
-use nixe_memory::GuestVirtualAddress;
+use crate::ipc_wire::request::{Buffer, Request};
 
 use super::super::IpcWireError;
 use super::super::buffer::one_receive_buffer;
-use super::super::io::{
-    cmif_error, encode_domain_response, validate_writable_ram_range, write_bytes,
-    write_descriptor_bytes,
-};
+use super::super::io::{cmif_error, encode_domain_response, write_descriptor_bytes};
 use super::super::message::{CmifRequest, CmifResponse, HipcRequest};
 use super::fsp::abi::{FS_DIRECTORY_ENTRY_FILE, FS_DIRECTORY_ENTRY_SIZE, FS_MAX_PATH};
 use crate::{
@@ -119,7 +115,7 @@ pub(super) async fn encode_semantic_response(
             }
         }
         IpcResponse::Data(data) => {
-            let descriptor = one_receive_buffer(hipc)?;
+            let descriptor = one_receive_buffer(process, hipc)?;
             write_descriptor_bytes(process, descriptor, &data).await?;
             let count = u64::try_from(data.len())
                 .map_err(|_| IpcWireError::Malformed("file read count overflows"))?;
@@ -133,22 +129,13 @@ pub(super) async fn encode_semantic_response(
             )
         }
         IpcResponse::StorageRead { offset, size } => {
-            let descriptor = one_receive_buffer(hipc)?;
+            let descriptor = one_receive_buffer(process, hipc)?;
             let Some(SemanticIpcObject::ReadOnlyStorage(storage)) = target_object else {
                 return Err(IpcWireError::Internal(
                     "storage read response did not originate from IStorage",
                 ));
             };
-            match write_storage_read(
-                process,
-                storage,
-                descriptor.address,
-                descriptor.size,
-                offset,
-                size,
-            )
-            .await
-            {
+            match write_storage_read(process, storage, descriptor, offset, size).await {
                 Ok(()) => semantic_success(request.token, is_domain, &[], &[], &[], None),
                 Err(StorageReadError::Source) => semantic_error(
                     request.token,
@@ -162,7 +149,7 @@ pub(super) async fn encode_semantic_response(
             }
         }
         IpcResponse::DirectoryEntries(entries) => {
-            let descriptor = one_receive_buffer(hipc)?;
+            let descriptor = one_receive_buffer(process, hipc)?;
             let mut encoded = Vec::new();
             encoded
                 .try_reserve_exact(entries.len().saturating_mul(FS_DIRECTORY_ENTRY_SIZE))
@@ -194,7 +181,7 @@ pub(super) async fn encode_semantic_response(
             )
         }
         IpcResponse::AddOnContentEntries(entries) => {
-            let descriptor = one_receive_buffer(hipc)?;
+            let descriptor = one_receive_buffer(process, hipc)?;
             let mut encoded = Vec::new();
             encoded
                 .try_reserve_exact(entries.len().saturating_mul(4))
@@ -240,22 +227,19 @@ impl From<IpcWireError> for StorageReadError {
 async fn write_storage_read(
     process: &Request,
     storage: &ReadOnlyStorage,
-    guest_address: u64,
-    descriptor_size: u64,
+    descriptor: &Buffer,
     storage_offset: u64,
     size: usize,
 ) -> Result<(), StorageReadError> {
     if u64::try_from(size)
         .ok()
-        .is_none_or(|size| size > descriptor_size)
+        .is_none_or(|size| size > descriptor.size)
     {
         return Err(
             IpcWireError::Malformed("storage response exceeds its output descriptor").into(),
         );
     }
 
-    let guest_address = GuestVirtualAddress::new(guest_address);
-    validate_writable_ram_range(process, guest_address, size)?;
     if size == 0 {
         return Ok(());
     }
@@ -282,13 +266,9 @@ async fn write_storage_read(
             .storage()
             .read_at(source_offset, &mut buffer[..chunk_size])
             .map_err(|_| StorageReadError::Source)?;
-        let destination = guest_address
-            .checked_add(
-                u64::try_from(transferred)
-                    .map_err(|_| IpcWireError::Internal("storage read address overflows"))?,
-            )
-            .ok_or(IpcWireError::Internal("storage read address overflows"))?;
-        write_bytes(process, destination, &buffer[..chunk_size]).await?;
+        process
+            .write(descriptor, transferred as u64, &buffer[..chunk_size])
+            .await?;
         transferred += chunk_size;
     }
     Ok(())

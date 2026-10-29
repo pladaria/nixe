@@ -46,7 +46,7 @@ impl ProcessMemory {
 }
 impl HeapResize {
     fn claim(&mut self, context: &Context<'_>) -> Result<bool, MappingError> {
-        let incoming = Arc::new(context.waker().clone());
+        let incoming = context.waker().clone();
         let mut requests = self.memory.heap_requests.lock().unwrap();
         let ticket = match self.ticket {
             Some(ticket) => ticket,
@@ -59,16 +59,23 @@ impl HeapResize {
                 requests.next
             }
         };
-        let previous = requests.waiters.insert(ticket, incoming);
         if requests.active.is_none()
             && requests
                 .waiters
                 .first_key_value()
-                .is_some_and(|(&first, _)| first == ticket)
+                .is_none_or(|(&first, _)| first == ticket)
         {
             requests.active = Some(ticket);
         }
         let acquired = requests.active == Some(ticket);
+        // As KLightLock's uncontended path, an owner which can run needs no
+        // waiter node. A physical allocation wait registers its observer below.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_light_lock.cpp#L41-L53
+        let previous = if acquired {
+            None
+        } else {
+            requests.waiters.insert(ticket, Arc::new(incoming))
+        };
         drop(requests);
         drop(previous);
         Ok(acquired)
@@ -104,6 +111,15 @@ impl HeapResize {
         self.release();
         Poll::Ready(result)
     }
+    fn pending(&mut self) -> Poll<Result<GuestVirtualAddress, MappingError>> {
+        // close() may have notified the previous executor before this poll
+        // registered its current waker. Recheck after every actual registration.
+        if self.memory.closed.load(Ordering::Acquire) {
+            self.finish(Err(MemoryError::Invalid("process memory is closed").into()))
+        } else {
+            Poll::Pending
+        }
+    }
 }
 impl Future for HeapResize {
     type Output = Result<GuestVirtualAddress, MappingError>;
@@ -120,7 +136,7 @@ impl Future for HeapResize {
             return this.finish(Err(MappingError::InvalidRange));
         }
         match this.claim(context) {
-            Ok(false) => return Poll::Pending,
+            Ok(false) => return this.pending(),
             Err(error) => return this.finish(Err(error)),
             Ok(true) => {}
         }
@@ -157,7 +173,18 @@ impl Future for HeapResize {
             unreachable!()
         };
         match Pin::new(allocation).poll(context) {
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                let incoming = Arc::new(context.waker().clone());
+                let previous = this
+                    .memory
+                    .heap_requests
+                    .lock()
+                    .unwrap()
+                    .waiters
+                    .insert(this.ticket.expect("active heap owner"), incoming);
+                drop(previous);
+                this.pending()
+            }
             Poll::Ready(Err(error)) => this.finish(Err(MappingError::Memory(error))),
             Poll::Ready(Ok(allocation)) => {
                 let result = this.memory.map(
@@ -309,6 +336,96 @@ mod tests {
         memory.close().unwrap();
         drop(retained);
         drop(outside);
+        assert_eq!(memory.account.machine().statistics().allocated_bytes, 0);
+    }
+
+    #[test]
+    fn closing_memory_wakes_the_active_allocation_wait_and_queued_heap_mutations() {
+        let memory = fixture();
+        let owner_wake = Arc::new(WakeCount::default());
+        let (mut owner, retained, outside) = pending_growth(&memory, &owner_wake);
+        let queued_wake = Arc::new(WakeCount::default());
+        let mut queued = memory.resize_heap(0);
+        assert!(poll(&mut queued, &queued_wake).is_pending());
+        memory.close().unwrap();
+        assert!(owner_wake.0.load(Ordering::Relaxed) != 0);
+        assert!(queued_wake.0.load(Ordering::Relaxed) != 0);
+        assert!(matches!(poll(&mut owner, &owner_wake), Poll::Ready(Err(_))));
+        assert!(matches!(
+            poll(&mut queued, &queued_wake),
+            Poll::Ready(Err(_))
+        ));
+        drop(retained);
+        drop(outside);
+        assert_eq!(memory.account.machine().pending_allocation_count(), 0);
+        assert_eq!(memory.account.machine().statistics().allocated_bytes, 0);
+    }
+
+    #[test]
+    fn memory_close_during_waker_replacement_cannot_leave_the_new_executor_asleep() {
+        use std::mem::ManuallyDrop;
+        use std::sync::{Weak, atomic::AtomicBool};
+        use std::task::{RawWaker, RawWakerVTable};
+
+        struct CloseOnClone {
+            memory: Weak<ProcessMemory>,
+            closed: AtomicBool,
+            wakes: Arc<WakeCount>,
+        }
+        unsafe fn clone(data: *const ()) -> RawWaker {
+            // Every raw waker owns one Arc. Borrowing a callback keeps its
+            // original reference alive; clone returns one additional reference.
+            let state = ManuallyDrop::new(unsafe { Arc::from_raw(data.cast::<CloseOnClone>()) });
+            if !state.closed.swap(true, Ordering::AcqRel) {
+                state.memory.upgrade().unwrap().close().unwrap();
+            }
+            RawWaker::new(Arc::into_raw(Arc::clone(&state)).cast(), &VTABLE)
+        }
+        unsafe fn wake(data: *const ()) {
+            let state = unsafe { Arc::from_raw(data.cast::<CloseOnClone>()) };
+            state.wakes.0.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe fn wake_by_ref(data: *const ()) {
+            let state = ManuallyDrop::new(unsafe { Arc::from_raw(data.cast::<CloseOnClone>()) });
+            state.wakes.0.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe fn release(data: *const ()) {
+            drop(unsafe { Arc::from_raw(data.cast::<CloseOnClone>()) });
+        }
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, release);
+
+        let memory = fixture();
+        let old_wake = Arc::new(WakeCount::default());
+        let (mut owner, retained, outside) = pending_growth(&memory, &old_wake);
+        // Keep all RAM resident after address-space closure, so physical
+        // retirement cannot accidentally repair a missing close notification.
+        let live = memory
+            .space()
+            .capture(
+                memory.heap_region.base(),
+                PAGE_SIZE,
+                MemoryPermissions::READ,
+            )
+            .unwrap();
+        let current_wake = Arc::new(WakeCount::default());
+        let state = Arc::new(CloseOnClone {
+            memory: Arc::downgrade(&memory),
+            closed: AtomicBool::new(false),
+            wakes: current_wake.clone(),
+        });
+        // SAFETY: VTABLE preserves Arc ownership and all callback state is Sync.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(state).cast(), &VTABLE)) };
+        let result = Pin::new(&mut owner).poll(&mut Context::from_waker(&waker));
+        assert!(
+            matches!(result, Poll::Ready(Err(_))) || current_wake.0.load(Ordering::Relaxed) != 0,
+            "a close must finish or notify the current executor"
+        );
+        drop(owner);
+        drop(waker);
+        drop(live);
+        drop(retained);
+        drop(outside);
+        assert_eq!(memory.account.machine().pending_allocation_count(), 0);
         assert_eq!(memory.account.machine().statistics().allocated_bytes, 0);
     }
 }

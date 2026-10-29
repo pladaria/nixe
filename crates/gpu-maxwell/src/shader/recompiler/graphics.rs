@@ -9,10 +9,10 @@ pub fn graphics_request(
     pipeline_index: usize,
 ) -> Result<CaptureRequest> {
     let bindings = state.shader_bindings();
-    let pipeline = bindings
-        .pipeline()
-        .get(pipeline_index)
-        .ok_or_else(|| invalid("Graphics pipeline slot is out of range"))?;
+    if pipeline_index >= crate::MAXWELL_PIPELINE_SHADER_COUNT {
+        return Err(invalid("Graphics pipeline slot is out of range"));
+    }
+    let pipeline = bindings.pipeline(pipeline_index);
     if pipeline.enabled().value() != Some(&true) {
         return Err(invalid("Graphics pipeline slot is disabled"));
     }

@@ -5,10 +5,7 @@
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/audio_render_manager.cpp
 
 use crate::audio_device::{AudioDeviceSession, AudioDeviceState};
-use nixe_runtime::{
-    EventObject, ExternalEventSource, ReadableEventObject, TransferMemoryObject,
-    WritableEventObject,
-};
+use nixe_runtime::{EventObject, ReadableEventObject, TransferMemoryObject, WritableEventObject};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 mod biquad;
 mod buffer;
@@ -146,8 +143,9 @@ impl RendererParameters {
 
 /// Renderer slots belong to the service, not to a particular manager connection.
 /// Weak reservations release a slot only after the last session clone closes.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct AudioRendererManagerSession {
+    kernel: Arc<nixe_scheduler::SchedulerState>,
     slots: Arc<Mutex<[Weak<AudioRendererState>; 2]>>,
     pub(crate) devices: Arc<AudioDeviceState>,
 }
@@ -172,6 +170,13 @@ pub(crate) struct AudioRendererState {
 }
 
 impl AudioRendererManagerSession {
+    pub fn new(kernel: &Arc<nixe_scheduler::SchedulerState>) -> Self {
+        Self {
+            kernel: kernel.clone(),
+            slots: Arc::default(),
+            devices: Arc::default(),
+        }
+    }
     pub(crate) fn set_host_paused(&self, paused: bool) {
         let states: Vec<_> = self
             .slots
@@ -191,6 +196,7 @@ impl AudioRendererManagerSession {
         backend: Arc<dyn nixe_audio::AudioBackend>,
     ) -> Result<AudioDeviceSession, nixe_audio::AudioError> {
         AudioDeviceSession::new(
+            &self.kernel,
             self.devices.clone(),
             revision,
             applet_resource_user_id,
@@ -206,13 +212,13 @@ impl AudioRendererManagerSession {
         applet_resource_user_id: u64,
         process_id: u64,
     ) -> Result<Option<AudioRendererSession>, Arc<nixe_memory::MemoryError>> {
-        let (signal, event) = EventObject::create_pair_with_source(ExternalEventSource::Device);
+        let (signal, event) = EventObject::create_pair(&self.kernel);
         let state = Arc::new(AudioRendererState {
             parameters,
             event,
             signal,
             rendering_time_limit: Mutex::new(100),
-            update: Arc::default(),
+            update: Arc::new(state::UpdateSlot::new(&self.kernel)),
             failure: Arc::default(),
             worker: Mutex::new(None),
             devices: self.devices.clone(),
@@ -330,7 +336,7 @@ mod tests {
                 panic!("metadata does not start playback")
             }
         }
-        let manager = AudioRendererManagerSession::default();
+        let manager = AudioRendererManagerSession::new(&crate::test_memory::kernel());
         let connection = manager.clone();
         let device = connection.device(7, 1, Arc::new(Backend)).unwrap();
         let transfer = transfer(&vec![0; 0x50000]);
@@ -371,7 +377,7 @@ mod tests {
     fn renderer_initializes_retained_memory_and_releases_slots_after_the_last_clone() {
         let transfer = transfer(&vec![0xcc; 0x51000]);
         let ranges = transfer.ranges().clone();
-        let manager = AudioRendererManagerSession::default();
+        let manager = AudioRendererManagerSession::new(&crate::test_memory::kernel());
         let another_manager_connection = manager.clone();
         let open = |manager: &AudioRendererManagerSession| {
             run(manager.open(parameters(7), transfer.clone(), 0x50000, 1, 1)).unwrap()

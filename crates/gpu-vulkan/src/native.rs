@@ -46,6 +46,11 @@ enum Graphics {
     },
     Ready {
         pipeline: Arc<NativePipeline>,
+        parameters: Option<(
+            PreparedStateId,
+            crate::residency::execution::PreparedGraphicsState,
+            Arc<[u8]>,
+        )>,
     },
 }
 enum Computing {
@@ -364,7 +369,13 @@ impl NativeGpuExecution {
                     Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
                 };
                 self.statistics.prepared_graphics += 1;
-                self.graphics.insert(id, Graphics::Ready { pipeline });
+                self.graphics.insert(
+                    id,
+                    Graphics::Ready {
+                        pipeline,
+                        parameters: None,
+                    },
+                );
                 Ok(true)
             }
             _ => unreachable!("only shader preparation can be pending"),
@@ -397,16 +408,31 @@ impl NativeGpuExecution {
         if !self.graphics(source)? {
             return Ok(false);
         }
-        let Graphics::Ready { pipeline, .. } = &self.graphics[&graphics_key] else {
+        let Graphics::Ready {
+            pipeline,
+            parameters: retained_parameters,
+        } = self.graphics.get_mut(&graphics_key).unwrap()
+        else {
             unreachable!()
         };
         let pipeline = Arc::clone(pipeline);
-        let push: Arc<[u8]> = state::guest_push(&pipeline, Some(&source.parameters))?.into();
-        let parameters =
-            state::parameters(&source.parameters, pipeline.graphics.as_ref().unwrap())?;
-        let state = self
-            .residency
-            .prepare_graphics_state(Arc::clone(&pipeline), parameters)?;
+        // Buffer/descriptor changes do not change viewport, scissor or pipeline
+        // state. Like dirty-state updates, convert only changed draw parameters.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+        if retained_parameters
+            .as_ref()
+            .is_none_or(|(id, _, _)| *id != source.parameters.identity)
+        {
+            let push = state::guest_push(&pipeline, Some(&source.parameters))?.into();
+            let parameters =
+                state::parameters(&source.parameters, pipeline.graphics.as_ref().unwrap())?;
+            let state = self
+                .residency
+                .prepare_graphics_state(Arc::clone(&pipeline), parameters)?;
+            *retained_parameters = Some((source.parameters.identity, state, push));
+        }
+        let (_, state, push) = retained_parameters.as_ref().unwrap();
+        let (state, push) = (state.clone(), Arc::clone(push));
         let program_key = (source.program.identity, Arc::as_ptr(&pipeline) as usize);
         let retained = self.residency.constructing.len();
         // Select the complete binding set before materializing descriptor uses.

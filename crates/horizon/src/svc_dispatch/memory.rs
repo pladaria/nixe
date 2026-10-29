@@ -29,11 +29,27 @@ pub(super) fn get_info(
         result(context, HorizonKernelResult::INVALID_COMBINATION);
         return resume();
     }
-    if handle != CURRENT_PROCESS_HANDLE {
-        result(context, HorizonKernelResult::INVALID_HANDLE);
-        return resume();
-    }
-    let layout = context.process().memory_layout();
+    // Retain the selected KProcess, then query it outside the handle-table lock.
+    // The current-process pseudohandle already has the dispatch context's owner.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/svc/svc_info.cpp
+    let retained;
+    let process = if handle == CURRENT_PROCESS_HANDLE {
+        context.process().as_ref()
+    } else {
+        retained = match context
+            .process()
+            .handles()
+            .lookup_as::<nixe_runtime::RunnableProcess>(handle)
+        {
+            Some(process) => process,
+            None => {
+                result(context, HorizonKernelResult::INVALID_HANDLE);
+                return resume();
+            }
+        };
+        retained.as_ref()
+    };
+    let layout = process.memory_layout();
     // Horizon derives these six physical-memory views from the same KProcess
     // counters. Runtime keeps their shared accounting incremental so queries
     // remain mutually consistent without scanning mappings here.
@@ -43,9 +59,9 @@ pub(super) fn get_info(
         // https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/svc/kern_svc_info.cpp
         0 | 1 => {
             let mask = if info_type == 0 {
-                context.process().allowed_core_mask()
+                process.allowed_core_mask()
             } else {
-                context.process().allowed_priority_mask()
+                process.allowed_priority_mask()
             };
             let Some(mask) = mask else {
                 return ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedSemantics {
@@ -63,20 +79,16 @@ pub(super) fn get_info(
         13 => layout.aslr().size(),
         14 => layout.stack().base().get(),
         15 => layout.stack().size(),
-        6 => context.process().total_user_physical_memory_size(),
-        7 => context.process().used_user_physical_memory_size(),
-        16 => context.process().total_system_resource_size(),
-        17 => context.process().used_system_resource_size(),
+        6 => process.total_user_physical_memory_size(),
+        7 => process.used_user_physical_memory_size(),
+        16 => process.total_system_resource_size(),
+        17 => process.used_system_resource_size(),
         // UserExceptionContextAddress is the process-local region, allocated
         // from kernel TLS pages rather than borrowed from a live thread.
         // https://switchbrew.org/wiki/SVC#InfoType
-        20 => context.process().user_exception_context_address().get(),
-        21 => context
-            .process()
-            .total_non_system_user_physical_memory_size(),
-        22 => context
-            .process()
-            .used_non_system_user_physical_memory_size(),
+        20 => process.user_exception_context_address().get(),
+        21 => process.total_non_system_user_physical_memory_size(),
+        22 => process.used_non_system_user_physical_memory_size(),
         28 => 0,
         _ => {
             return ExceptionDispatchOutcome::Fault(HorizonSvcFault::UnsupportedSemantics {
@@ -346,7 +358,6 @@ pub(super) fn map_shared_memory(
         .process()
         .handles()
         .lookup_as::<SharedMemoryObject>(handle)
-        .map(std::sync::Arc::unwrap_or_clone)
     else {
         result(context, HorizonKernelResult::INVALID_HANDLE);
         return resume();
@@ -387,7 +398,6 @@ pub(super) fn unmap_shared_memory(
         .process()
         .handles()
         .lookup_as::<SharedMemoryObject>(handle)
-        .map(std::sync::Arc::unwrap_or_clone)
     else {
         result(context, HorizonKernelResult::INVALID_HANDLE);
         return resume();
@@ -453,7 +463,7 @@ pub(super) fn create_transfer_memory(
             );
         }
     };
-    match context.process_mut().handles().insert(transfer) {
+    match context.process().handles().insert(transfer) {
         Ok(handle) => {
             result(context, HorizonKernelResult::SUCCESS);
             write_register(context.thread_mut().state_mut(), 1, u64::from(handle));

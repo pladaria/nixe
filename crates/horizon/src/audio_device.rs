@@ -5,7 +5,7 @@
 //! https://github.com/eden-emulator/mirror/blob/master/src/audio_core/renderer/audio_device.cpp
 
 use nixe_audio::{AudioBackend, AudioError};
-use nixe_runtime::{EventObject, ExternalEventSource, ReadableEventObject};
+use nixe_runtime::{EventObject, ReadableEventObject};
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
@@ -57,6 +57,7 @@ pub struct AudioDeviceSession {
 
 impl AudioDeviceSession {
     pub(crate) fn new(
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
         state: Arc<AudioDeviceState>,
         revision: u32,
         applet_resource_user_id: u64,
@@ -64,14 +65,13 @@ impl AudioDeviceSession {
     ) -> Result<Self, AudioError> {
         // Do not advertise an initialized output when its backend is unavailable.
         backend.output_layout()?;
-        let (signal, output_event) =
-            EventObject::create_pair_with_source(ExternalEventSource::Device);
+        let (signal, output_event) = EventObject::create_pair(kernel);
         // Initial output-state publication. Queries return the same notification
         // and do not re-signal it or conflate it with DSP block completion.
         signal.signal();
         // The virtual console has no connected input route. Its notification is
         // separate and unsignalled; this does not advertise microphone support.
-        let (_, input_event) = EventObject::create_pair_with_source(ExternalEventSource::Device);
+        let (_, input_event) = EventObject::create_pair(kernel);
         Ok(Self {
             state,
             revision,

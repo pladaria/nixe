@@ -14,8 +14,10 @@ pub(super) fn draw_color_outputs(
     state: &MaxwellThreeDState,
     resources: &MaxwellThreeDResolvedResources,
     attachments: &DrawAttachmentSelection,
-) -> Result<[ColorOutputState; 8], MaxwellLoweringError> {
-    let mut outputs = [ColorOutputState::REPLACE; 8];
+) -> Result<Box<[ColorOutputState]>, MaxwellLoweringError> {
+    // Convert physical target registers into fragment-output order once.
+    // The returned entries already match the native attachment order.
+    let mut outputs = vec![ColorOutputState::REPLACE; attachments.colors.len()].into_boxed_slice();
     if attachments.colors.is_empty() {
         return Ok(outputs);
     }
@@ -24,6 +26,14 @@ pub(super) fn draw_color_outputs(
         fixed.register(R::BlendPerTargetEnable).value().copied(),
         None,
         "SET_BLEND_STATE_PER_TARGET",
+    )?)?;
+    let common_mask = boolean(required(
+        fixed
+            .register(R::SingleColorTargetWriteControl)
+            .value()
+            .copied(),
+        None,
+        "SET_SINGLE_CT_WRITE_CONTROL",
     )?)?;
     // Equation selection (0x12e4) and enable selection (0x135c) are independent.
     // SINGLE_ROP_CONTROL broadcasts SET_BLEND(0); otherwise SET_BLEND(target)
@@ -46,7 +56,8 @@ pub(super) fn draw_color_outputs(
                 MaxwellThreeDSingleRopControl::Disabled => target,
             }
         };
-        let enabled = fixed.blend_enable()[usize::from(enable_target)]
+        let enabled = fixed
+            .blend_enable(usize::from(enable_target))
             .value()
             .copied()
             .ok_or(MaxwellLoweringError::IncompleteBlendState {
@@ -114,7 +125,8 @@ pub(super) fn draw_color_outputs(
                 ][index];
                 required(
                     if per_target {
-                        fixed.per_target_blend()[usize::from(target)][index]
+                        fixed
+                            .per_target_blend(usize::from(target), index)
                             .value()
                             .copied()
                     } else {
@@ -155,17 +167,16 @@ pub(super) fn draw_color_outputs(
             let alpha = if separate { component(4)? } else { color };
             outputs[slot].blend = Some(ColorBlendState { color, alpha });
         }
-        if let Some(V::Boolean(single)) = fixed.register(R::SingleColorTargetWriteControl).value() {
-            let mask_register = if *single { 0 } else { target };
-            let mask = fixed.color_mask()[usize::from(mask_register)]
-                .value()
-                .ok_or(MaxwellLoweringError::IncompleteColorWriteState {
-                    target,
-                    mask_register,
-                })?;
-            outputs[slot].write_mask =
-                ColorWriteMask::new(mask.red, mask.green, mask.blue, mask.alpha);
-        }
+        let mask_register = if common_mask { 0 } else { target };
+        let mask = fixed
+            .color_mask(usize::from(mask_register))
+            .value()
+            .copied()
+            .ok_or(MaxwellLoweringError::IncompleteColorWriteState {
+                target,
+                mask_register,
+            })?;
+        outputs[slot].write_mask = ColorWriteMask::new(mask.red, mask.green, mask.blue, mask.alpha);
     }
     Ok(outputs)
 }

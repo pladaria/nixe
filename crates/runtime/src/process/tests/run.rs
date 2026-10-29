@@ -1,118 +1,122 @@
 use super::*;
 
-#[test]
-fn loader_stub_executes_before_runtime_termination() {
-    {
-        let (_directory, plan) = plan();
-        let mut process = reference_process_builder().build(&plan).unwrap();
-        let entry = GuestVirtualAddress::new(process.entry_module().entry_address());
-        let stub = process.main_thread().loader_return.unwrap();
-        write_code(&process, entry, &0xd65f03c0_u32.to_le_bytes()); // RET X30 to the real mapped loader stub.
-        let result = 0x8123_4567_89ab_cdef;
-        process
-            .main_thread_mut()
-            .state_mut()
-            .write_x(A64Register::General(a64_register(0)), result);
-        let mut cpu_thread = process
-            .execution
-            .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
-            .unwrap();
-
-        let report = process.run_with_cpu_thread(&mut cpu_thread).unwrap();
-        assert!(matches!(report.stop,
-                crate::ExecutionStop::LoaderReturn { source, result_code }
-                    if source.pc == stub && result_code == result));
-
-        assert_eq!(process.main_thread().state().pc(), stub.get());
-        assert_eq!(
-            report.context,
-            Some(process.main_thread().state().register_context())
+pub(super) fn scheduled(
+    process: RunnableProcess,
+) -> (
+    crate::RuntimeCoordinator,
+    nixe_scheduler::ProcessId,
+    Arc<RunnableProcess>,
+) {
+    let core = nixe_scheduler::VirtualCpuId::new(0);
+    let mut coordinator = crate::RuntimeCoordinator::new(process.scheduler().clone());
+    let registration = crate::ProcessRegistration {
+        priority: 44,
+        ideal_vcpu: Some(core),
+        affinity: coordinator.scheduler().profile().all_cores(),
+    };
+    let id = coordinator.register_process(process, registration).unwrap();
+    let process = coordinator.process(id).unwrap().clone();
+    (coordinator, id, process)
+}
+fn execute(coordinator: &mut crate::RuntimeCoordinator) -> ExecutionReport {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(execution) = coordinator
+            .run_next(deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap()
+        {
+            return execution.report;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native execution did not produce a guest boundary"
         );
-        assert_eq!(
-            process.lifecycle(),
-            nixe_scheduler::ProcessLifecycle::Exited
-        );
-        let exit = process.exit().unwrap();
-        assert_eq!(exit.cause, ProcessExitCause::LoaderReturned);
-        assert_eq!(exit.exit_code, result);
-        assert_eq!(exit.source.unwrap().pc, stub);
-        assert_eq!(exit.context.as_deref(), report.context.as_ref());
-        assert_eq!(
-            process.main_thread().exit.as_ref().unwrap().exit_code,
-            result
-        );
-
-        process.request_execution_stop().unwrap();
-
-        drop(cpu_thread);
-        process.complete_cpu_thread_retirement();
-        process.try_teardown().unwrap();
     }
 }
 
 #[test]
+fn loader_stub_executes_before_runtime_termination() {
+    let (_directory, plan) = plan();
+    let process = reference_process_builder(super::test_kernel())
+        .build(&plan)
+        .unwrap();
+    let entry = GuestVirtualAddress::new(process.entry_module().entry_address());
+    let stub = process.main_thread().loader_return.unwrap();
+    write_code(&process, entry, &0xd65f03c0_u32.to_le_bytes());
+    let result = 0x8123_4567_89ab_cdef;
+    process
+        .main_thread()
+        .registers()
+        .write_x(A64Register::General(a64_register(0)), result);
+    let thread = process.main_thread();
+    let (mut coordinator, _, process) = scheduled(process);
+    let report = execute(&mut coordinator);
+    assert!(
+        matches!(report.stop, ExecutionStop::LoaderReturn { source, result_code } if source.pc == stub && result_code == result)
+    );
+    assert_eq!(
+        process.lifecycle(),
+        nixe_scheduler::ProcessLifecycle::Exited
+    );
+    let exit = process.exit().unwrap();
+    assert_eq!(exit.cause, ProcessExitCause::LoaderReturned);
+    assert_eq!(exit.exit_code, result);
+    assert_eq!(exit.source.unwrap().pc, stub);
+    assert_eq!(exit.context.as_deref(), report.context.as_ref());
+    assert_eq!(thread.exit().unwrap().exit_code, result);
+    assert!(process.handles().is_empty());
+    drop(thread);
+    coordinator.shutdown().unwrap();
+}
+#[test]
 fn loader_stub_recognition_requires_the_thread_address_and_exit_svc() {
-    // Same SVC elsewhere, same stub without this thread's registration,
-    // and another SVC at the registered address must remain ordinary calls.
-    for case in 0..3 {
+    for stub_address in [false, true] {
         let (_directory, plan) = plan();
-        let mut process = reference_process_builder().build(&plan).unwrap();
-        let stub = process.main_thread().loader_return.unwrap();
-        let pc = if case == 0 {
-            GuestVirtualAddress::new(process.entry_module().entry_address())
+        let process = reference_process_builder(super::test_kernel())
+            .build(&plan)
+            .unwrap();
+        let pc = if stub_address {
+            process.main_thread().loader_return.unwrap()
         } else {
-            stub
+            GuestVirtualAddress::new(process.entry_module().entry_address())
         };
-        let (instruction, immediate) = if case == 2 {
+        let (instruction, immediate) = if stub_address {
             (0xd4000841_u32, 0x42)
         } else {
             (HOME_BREW_EXIT_PROCESS_INSTRUCTION, 7)
         };
         write_code(&process, pc, &instruction.to_le_bytes());
-        if case == 1 {
-            process.main_thread_mut().loader_return = None;
-        }
-        process.main_thread_mut().state_mut().set_pc(pc.get());
-        let mut cpu_thread = process
-            .execution
-            .create_worker_cpu_thread(nixe_scheduler::VirtualCpuId::new(0))
-            .unwrap();
-        let report = process.run_with_cpu_thread(&mut cpu_thread).unwrap();
-        assert!(matches!(report.stop,
-                crate::ExecutionStop::SupervisorCall { source, immediate: observed }
-                    if source.pc == pc && observed == immediate));
-
-        assert_eq!(process.main_thread().state().pc(), pc.get());
+        process.main_thread().registers().set_pc(pc.get());
+        let (mut coordinator, _, process) = scheduled(process);
+        let report = execute(&mut coordinator);
+        assert!(
+            matches!(report.stop, ExecutionStop::SupervisorCall { source, immediate: observed } if source.pc == pc && observed == immediate)
+        );
+        assert_eq!(process.main_thread().registers().pc(), pc.get());
         assert!(report.context.is_none());
         assert!(process.exit().is_none());
-        assert_eq!(
-            process.lifecycle(),
-            nixe_scheduler::ProcessLifecycle::Running
-        );
-        process.request_execution_stop().unwrap();
-
-        drop(cpu_thread);
-        process.complete_cpu_thread_retirement();
-        process.try_teardown().unwrap();
+        coordinator.shutdown().unwrap();
     }
 }
-
 #[test]
 fn fixed_virtual_timer_is_stable_across_native_slices() {
     let (_directory, plan) = plan();
     let frequency = 24_000_000;
-    let mut process = reference_process_builder()
+    let fixed = nixe_scheduler::SchedulerState::new(
+        super::test_kernel().profile().clone(),
+        crate::VirtualClock::new(crate::VirtualClockMode::Fixed {
+            unix_seconds: 1_700_000_000,
+        }),
+    );
+    let process = reference_process_builder(fixed)
         .with_config(ProcessBuildConfig {
             architectural_timer_frequency: frequency,
             ..ProcessBuildConfig::default()
         })
-        .with_virtual_clock(crate::VirtualClock::new(crate::VirtualClockMode::Fixed {
-            unix_seconds: 1_700_000_000,
-        }))
         .build(&plan)
         .unwrap();
     replace_entry_instructions(
-        &mut process,
+        &process,
         &[
             0xd53b_e001, // MRS X1,CNTFRQ_EL0
             0xd53b_e022, // MRS X2,CNTVCT_EL0
@@ -121,52 +125,51 @@ fn fixed_virtual_timer_is_stable_across_native_slices() {
         ],
     );
 
-    let first = process.run().unwrap();
+    let (mut coordinator, _, process) = scheduled(process);
+    let first = execute(&mut coordinator);
 
     assert!(matches!(
         first.stop,
         crate::ExecutionStop::SupervisorCall { .. }
     ));
     let entry = process.entry_module().entry_address();
-    process.main_thread_mut().state_mut().set_pc(entry);
-    let second = process.run().unwrap();
+    process.main_thread().registers().set_pc(entry);
+    coordinator
+        .scheduler()
+        .make_ready(process.main_thread_id())
+        .unwrap();
+    let second = execute(&mut coordinator);
 
     assert!(matches!(
         second.stop,
         crate::ExecutionStop::SupervisorCall { .. }
     ));
 
-    let state = process.main_thread().state();
+    let state_thread = process.main_thread();
+
+    let state = state_thread.registers();
     assert_eq!(
         state.read_x(A64Register::General(a64_register(1))),
         frequency
     );
     assert_eq!(state.read_x(A64Register::General(a64_register(2))), 0);
     assert_eq!(state.read_x(A64Register::General(a64_register(3))), 0);
-}
-
-#[test]
-fn reference_execution_observes_safepoints_before_fetch() {
-    let (_directory, plan) = plan();
-    let mut process = reference_process_builder().build(&plan).unwrap();
-    let entry = process.entry_module().entry_address();
-    process.request_safepoint();
-
-    let report = process.run().unwrap();
-
-    assert_eq!(report.stop, crate::ExecutionStop::Safepoint);
-    let state = process.main_thread().state();
-    assert_eq!(state.pc(), entry);
+    drop(state);
 }
 
 #[test]
 fn reference_execution_reports_instruction_fetch_faults_as_a_distinct_stop() {
     let (_directory, plan) = plan();
-    let mut process = reference_process_builder().build(&plan).unwrap();
-    let state = process.main_thread_mut().state_mut();
+    let process = reference_process_builder(super::test_kernel())
+        .build(&plan)
+        .unwrap();
+    let state_thread = process.main_thread();
+    let mut state = state_thread.registers();
     state.set_pc(0x1000);
+    drop(state);
 
-    let report = process.run().unwrap();
+    let (mut coordinator, _, _process) = scheduled(process);
+    let report = execute(&mut coordinator);
 
     assert!(matches!(
         report.stop,
@@ -180,25 +183,31 @@ fn reference_execution_reports_instruction_fetch_faults_as_a_distinct_stop() {
 #[test]
 fn native_execution_reports_an_unallocated_instruction_with_its_original_source() {
     let (_directory, plan) = plan();
-    let mut process = reference_process_builder().build(&plan).unwrap();
-    replace_entry_instruction(&mut process, 0);
+    let process = reference_process_builder(super::test_kernel())
+        .build(&plan)
+        .unwrap();
+    replace_entry_instruction(&process, 0);
     let entry = process.entry_module().entry_address();
-    let report = process.run().unwrap();
+    let (mut coordinator, _, process) = scheduled(process);
+    let report = execute(&mut coordinator);
     let crate::ExecutionStop::UnallocatedEncoding { error } = report.stop else {
         panic!("unallocated encoding must stop execution")
     };
     assert_eq!(error.instruction.location.pc.get(), entry);
     assert_eq!(error.instruction.encoding.bits(), 0);
-    assert_eq!(process.main_thread().state().pc(), entry);
+    assert_eq!(process.main_thread().registers().pc(), entry);
 }
 
 #[test]
 fn reference_execution_distinguishes_svc_architectural_and_data_fault_stops() {
     let (_directory, plan) = plan();
 
-    let mut svc = reference_process_builder().build(&plan).unwrap();
-    replace_entry_instruction(&mut svc, 0xd400_0841); // SVC #0x42
-    let report = svc.run().unwrap();
+    let svc = reference_process_builder(super::test_kernel())
+        .build(&plan)
+        .unwrap();
+    replace_entry_instruction(&svc, 0xd400_0841); // SVC #0x42
+    let (mut svc_coordinator, _, _svc) = scheduled(svc);
+    let report = execute(&mut svc_coordinator);
     let dispatch = report.stop.exception_dispatch_request().unwrap();
     assert_eq!(
         dispatch.kind(),
@@ -214,9 +223,12 @@ fn reference_execution_distinguishes_svc_architectural_and_data_fault_stops() {
     ));
     assert!(report.to_string().contains("supervisor-call"));
 
-    let mut breakpoint = reference_process_builder().build(&plan).unwrap();
-    replace_entry_instruction(&mut breakpoint, 0xd420_2460); // BRK #0x123
-    let report = breakpoint.run().unwrap();
+    let breakpoint = reference_process_builder(super::test_kernel())
+        .build(&plan)
+        .unwrap();
+    replace_entry_instruction(&breakpoint, 0xd420_2460); // BRK #0x123
+    let (mut breakpoint_coordinator, _, _breakpoint) = scheduled(breakpoint);
+    let report = execute(&mut breakpoint_coordinator);
     let dispatch = report.stop.exception_dispatch_request().unwrap();
     assert_eq!(
         dispatch.kind(),

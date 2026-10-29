@@ -18,30 +18,28 @@ pub use transactional_directory::{DirectoryWriteLease, TransactionalDirectory};
 
 pub use address_wait::{
     AddressOperationGuard, AddressSignalTargets, AddressWaitCompletion, AddressWaitRegistry,
-    AddressWaitResult, ConditionAcquire, ConditionClaim, ConditionSignal, ConditionWait,
-    MutexHandoff,
+    ConditionAcquire, ConditionClaim, ConditionSignal, ConditionWait, MutexHandoff,
 };
 pub use coordinator::{
     CoordinatorDrainReport, CoordinatorError, CoordinatorExecution, CoordinatorResourceCounts,
-    CoordinatorRouteError, ProcessRegistration, RuntimeCoordinator, ThreadOperationError,
-    WorkerFailure,
+    CoordinatorRouteError, ProcessRegistration, RuntimeCoordinator, WorkerFailure,
 };
 pub use exception_dispatch::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatchRequest,
-    ExceptionDispatcher, ExceptionHandlingResult, ExceptionProcessContext, ExceptionResume,
-    ExceptionRouteError, ExceptionTerminationReason, ExceptionTerminationScope,
-    ExceptionThreadContext, GuestBreakPayload, MAX_GUEST_BREAK_PAYLOAD_BYTES,
+    ExceptionDispatcher, ExceptionHandlingResult, ExceptionResume, ExceptionRouteError,
+    ExceptionTerminationReason, ExceptionTerminationScope, ExceptionThreadContext,
+    GuestBreakPayload, MAX_GUEST_BREAK_PAYLOAD_BYTES,
 };
 pub use external_event::{
     ExternalEvent, ExternalEventSendError, ExternalEventSender, ExternalEventSequence,
     ExternalEventSource, SequencedExternalEvent,
 };
 pub use handle::{
-    EventFuture, EventObject, EventWaitOutcome, HandleError, HandleObject, HandleReservation,
-    HandleTable, HandleValue, MAX_SESSION_REQUESTS, PortEndpoint, PortError, PortObject,
-    ProcessObject, ReadableEventObject, SessionEndpoint, SessionError, SessionMessage,
-    SessionObject, SessionRequestOwner, SessionRequestResult, SharedMemoryObject, ThreadObject,
-    TransferMemoryObject, WritableEventObject,
+    EventFuture, EventObject, HandleError, HandleObject, HandleReservation, HandleTable,
+    HandleValue, MAX_SESSION_REQUESTS, PortEndpoint, PortError, PortObject, ReadableEventObject,
+    SessionEndpoint, SessionError, SessionMessage, SessionObject, SessionReceive, SessionRequest,
+    SessionRequestOwner, SessionResponse, SharedMemoryObject, TransferMemoryObject,
+    WritableEventObject,
 };
 pub use launch_plan::{
     AddOnContent, HOME_BREW_EXECUTABLE_ARGV0, HOME_BREW_EXECUTABLE_GUEST_PATH, HomebrewIdentity,
@@ -53,12 +51,12 @@ pub use module_memory::{InstallStage, ModuleInstallError, install_prepared_modul
 pub use nixe_scheduler::{ProcessLifecycle, ThreadLifecycle};
 pub use nixe_scheduler::{VirtualClock, VirtualClockMode};
 pub use process::{
-    ExecutionReport, ExecutionStop, GuestStackFrame, GuestThread, ProcessAddressSpace,
-    ProcessBuildConfig, ProcessBuildError, ProcessBuildStage, ProcessBuilder,
-    ProcessExecutionError, ProcessExit, ProcessExitCause, ProcessMemoryAccounting,
-    ProcessMemoryLayout, ProcessMemoryLayoutProfile, ProcessTeardownFailure, ProcessTeardownReport,
-    ProcessVirtualRegion, RunnableProcess, ThreadCreateError, ThreadCreateRequest, ThreadCreation,
-    ThreadExit, ThreadTable, ThreadTableError,
+    ExecutionReport, ExecutionStop, GuestStackFrame, ProcessAddressSpace, ProcessBuildConfig,
+    ProcessBuildError, ProcessBuildStage, ProcessBuilder, ProcessExecutionError, ProcessExit,
+    ProcessExitCause, ProcessMemoryAccounting, ProcessMemoryLayout, ProcessMemoryLayoutProfile,
+    ProcessTeardownFailure, ProcessTeardownReport, ProcessVirtualRegion, RunnableProcess,
+    ThreadCreateError, ThreadCreateRequest, ThreadCreation, ThreadExit, ThreadObject,
+    ThreadRegisters, ThreadStartError, ThreadTable, ThreadTableError, ThreadWait,
 };
 pub use process_mount::ProcessMountNamespace;
 

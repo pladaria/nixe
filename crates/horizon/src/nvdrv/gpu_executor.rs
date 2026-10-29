@@ -151,11 +151,9 @@ struct GpuWorkBudgetState {
     bytes: usize,
     progress_requested: bool,
 }
-impl Default for GpuWorkBudget {
-    fn default() -> Self {
-        let (writable, readable) = nixe_runtime::EventObject::create_pair_with_source(
-            nixe_runtime::ExternalEventSource::Device,
-        );
+impl GpuWorkBudget {
+    fn new(kernel: &Arc<nixe_scheduler::SchedulerState>) -> Self {
+        let (writable, readable) = nixe_runtime::EventObject::create_pair(kernel);
         Self {
             state: Mutex::default(),
             stopped: Default::default(),
@@ -328,14 +326,20 @@ impl std::fmt::Debug for NvDrvGpuExecutor {
     }
 }
 impl NvDrvGpuExecutor {
-    pub(super) fn new(machine: Machine) -> Self {
+    pub(super) fn new(machine: Machine, kernel: &Arc<nixe_scheduler::SchedulerState>) -> Self {
         Self::with_frontend(
             machine,
+            kernel,
             None::<std::convert::Infallible>,
             nixe_gpu_maxwell::MaxwellNativeFrontend::new(Default::default()),
         )
     }
-    pub(super) fn with_frontend<E, L>(machine: Machine, mut backend: Option<E>, cache: L) -> Self
+    pub(super) fn with_frontend<E, L>(
+        machine: Machine,
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
+        mut backend: Option<E>,
+        cache: L,
+    ) -> Self
     where
         L: MaxwellFrontend,
         E: GpuExecution<
@@ -346,7 +350,7 @@ impl NvDrvGpuExecutor {
         let device_uuid = backend.as_ref().and_then(GpuExecution::device_uuid);
         let (sender, receiver) = mpsc::channel();
         let failure = Arc::new(Mutex::new(None));
-        let budget = Arc::new(GpuWorkBudget::default());
+        let budget = Arc::new(GpuWorkBudget::new(kernel));
         let endpoint = Arc::new(GpuMemoryEndpoint {
             sender: sender.clone(),
             stopped: Mutex::new(None),

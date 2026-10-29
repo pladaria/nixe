@@ -7,7 +7,6 @@
 
 use crate::{MaxwellMethodSource, MaxwellSpaVersion};
 
-use super::state::{MAXWELL_THREE_D_PIPELINE_BINDING_RESET, MAXWELL_THREE_D_PIPELINE_SHADER_RESET};
 use super::{MaxwellThreeDRegister, MaxwellThreeDTessellationMode, MaxwellThreeDUnresolvedAddress};
 
 pub const MAXWELL_PIPELINE_SHADER_COUNT: usize = 6;
@@ -52,40 +51,33 @@ impl MaxwellThreeDTessellationLod {
 ///
 /// NVIDIA defines an eight-bit upper field followed by a 32-bit lower field:
 /// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2996-L3000>
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDProgramRegionState {
-    address_upper: MaxwellThreeDRegister<u8>,
-    address_lower: MaxwellThreeDRegister<u32>,
-    spa_version: MaxwellThreeDRegister<MaxwellSpaVersion>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDProgramRegionState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-impl MaxwellThreeDProgramRegionState {
+impl MaxwellThreeDProgramRegionState<'_> {
     #[must_use]
-    pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.address_upper
+    pub fn address_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers.read(0x1608, |raw| u8::try_from(raw).ok())
     }
-
     #[must_use]
-    pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.address_lower
+    pub fn address_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x160c, Some)
     }
-
     #[must_use]
-    pub const fn spa_version(&self) -> &MaxwellThreeDRegister<MaxwellSpaVersion> {
-        &self.spa_version
+    pub fn spa_version(&self) -> MaxwellThreeDRegister<MaxwellSpaVersion> {
+        self.registers.read(0x0310, MaxwellSpaVersion::parse)
     }
-
     #[must_use]
     pub fn address(&self) -> Option<MaxwellThreeDUnresolvedAddress> {
         Some(MaxwellThreeDUnresolvedAddress::new(
-            *self.address_upper.value()?,
-            *self.address_lower.value()?,
+            *self.address_upper().value()?,
+            *self.address_lower().value()?,
         ))
     }
-
     pub(in crate::engines) fn is_partially_programmed(&self) -> bool {
         self.address().is_none()
-            && (self.address_upper.raw().is_some() || self.address_lower.raw().is_some())
+            && (self.address_upper().raw().is_some() || self.address_lower().raw().is_some())
     }
 }
 
@@ -105,96 +97,78 @@ impl MaxwellShaderStage {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDPipelineBindingState {
-    enabled: MaxwellThreeDRegister<bool>,
-    stage: MaxwellThreeDRegister<MaxwellShaderStage>,
-    program_offset: MaxwellThreeDRegister<u32>,
-    register_count: MaxwellThreeDRegister<u8>,
-    group: MaxwellThreeDRegister<u8>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDPipelineBindingState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
+    index: usize,
 }
-
-impl MaxwellThreeDPipelineBindingState {
-    fn initialized(pipeline: usize) -> Self {
-        let header = MAXWELL_THREE_D_PIPELINE_SHADER_RESET[pipeline];
-        let group = MAXWELL_THREE_D_PIPELINE_BINDING_RESET[pipeline];
-        Self {
-            enabled: MaxwellThreeDRegister::verified_reset(header, Some(header & 1 != 0)),
-            stage: MaxwellThreeDRegister::verified_reset(
-                header,
-                MaxwellShaderStage::parse(header >> 4),
-            ),
-            program_offset: MaxwellThreeDRegister::default(),
-            register_count: MaxwellThreeDRegister::default(),
-            group: MaxwellThreeDRegister::verified_reset(group, Some(group as u8)),
-        }
-    }
-}
-
-impl MaxwellThreeDPipelineBindingState {
+impl MaxwellThreeDPipelineBindingState<'_> {
     #[must_use]
-    pub const fn enabled(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.enabled
+    pub fn enabled(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers
+            .read(0x2000 + self.index as u32 * 0x40, |raw| {
+                (raw & !0x71 == 0 && MaxwellShaderStage::parse((raw >> 4) & 7).is_some())
+                    .then_some(raw & 1 != 0)
+            })
     }
     #[must_use]
-    pub const fn stage(&self) -> &MaxwellThreeDRegister<MaxwellShaderStage> {
-        &self.stage
+    pub fn stage(&self) -> MaxwellThreeDRegister<MaxwellShaderStage> {
+        self.registers
+            .read(0x2000 + self.index as u32 * 0x40, |raw| {
+                (raw & !0x71 == 0)
+                    .then(|| MaxwellShaderStage::parse((raw >> 4) & 7))
+                    .flatten()
+            })
     }
     #[must_use]
-    pub const fn program_offset(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.program_offset
+    pub fn program_offset(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers
+            .read(0x2000 + self.index as u32 * 0x40 + 4, Some)
     }
     #[must_use]
-    pub const fn register_count(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.register_count
+    pub fn register_count(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers
+            .read(0x2000 + self.index as u32 * 0x40 + 12, |raw| {
+                u8::try_from(raw).ok()
+            })
     }
     #[must_use]
-    pub const fn group(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.group
+    pub fn group(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers
+            .read(0x2000 + self.index as u32 * 0x40 + 16, |raw| {
+                (raw <= 7).then_some(raw as u8)
+            })
     }
-
-    /// Returns the hardware binding group, including the initialized context.
     #[must_use]
     pub fn effective_group(&self) -> Option<u8> {
-        self.group.value().copied()
+        self.group().value().copied()
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDConstantBufferSelectorState {
-    size: MaxwellThreeDRegister<u32>,
-    address_upper: MaxwellThreeDRegister<u8>,
-    address_lower: MaxwellThreeDRegister<u32>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDConstantBufferSelectorState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
 }
-
-/// Inline constant-buffer upload cursor and the last accepted data word.
-///
-/// The selector supplies the destination range. `LOAD_CONSTANT_BUFFER_OFFSET`
-/// selects a byte offset within that range, and each
-/// `LOAD_CONSTANT_BUFFER(0)` word advances the internal cursor by four bytes.
-///
-/// <https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L4067-L4080>
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDConstantBufferLoadState {
-    offset: MaxwellThreeDRegister<u16>,
-    next_offset: Option<u32>,
-    last_data: MaxwellThreeDRegister<u32>,
-}
-
-impl MaxwellThreeDConstantBufferLoadState {
+impl MaxwellThreeDConstantBufferSelectorState<'_> {
     #[must_use]
-    pub const fn offset(&self) -> &MaxwellThreeDRegister<u16> {
-        &self.offset
+    pub fn size(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers
+            .read(0x2380, |raw| (raw <= 0x1ffff).then_some(raw))
     }
-
     #[must_use]
-    pub const fn next_offset(&self) -> Option<u32> {
-        self.next_offset
+    pub fn address_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers.read(0x2384, |raw| u8::try_from(raw).ok())
     }
-
     #[must_use]
-    pub const fn last_data(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.last_data
+    pub fn address_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x2388, Some)
+    }
+    #[must_use]
+    pub fn address(&self) -> Option<MaxwellThreeDUnresolvedAddress> {
+        Some(MaxwellThreeDUnresolvedAddress::new(
+            *self.address_upper().value()?,
+            *self.address_lower().value()?,
+        ))
     }
 }
 
@@ -241,28 +215,6 @@ impl MaxwellThreeDInlineConstantBufferUpload {
     #[must_use]
     pub const fn source(self) -> MaxwellMethodSource {
         self.source
-    }
-}
-
-impl MaxwellThreeDConstantBufferSelectorState {
-    #[must_use]
-    pub const fn size(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.size
-    }
-    #[must_use]
-    pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.address_upper
-    }
-    #[must_use]
-    pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.address_lower
-    }
-    #[must_use]
-    pub fn address(&self) -> Option<MaxwellThreeDUnresolvedAddress> {
-        Some(MaxwellThreeDUnresolvedAddress::new(
-            *self.address_upper.value()?,
-            *self.address_lower.value()?,
-        ))
     }
 }
 
@@ -322,222 +274,56 @@ pub enum MaxwellThreeDSamplerBindingMode {
     ViaTextureHeader,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MaxwellThreeDDescriptorPoolState {
-    address_upper: MaxwellThreeDRegister<u8>,
-    address_lower: MaxwellThreeDRegister<u32>,
-    maximum_index: MaxwellThreeDRegister<u32>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDDescriptorPoolState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
+    base: u32,
+    maximum: u32,
 }
-
-impl MaxwellThreeDDescriptorPoolState {
+impl MaxwellThreeDDescriptorPoolState<'_> {
     #[must_use]
-    pub const fn address_upper(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.address_upper
+    pub fn address_upper(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers.read(self.base, |raw| u8::try_from(raw).ok())
     }
     #[must_use]
-    pub const fn address_lower(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.address_lower
+    pub fn address_lower(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(self.base + 4, Some)
     }
     #[must_use]
-    pub const fn maximum_index(&self) -> &MaxwellThreeDRegister<u32> {
-        &self.maximum_index
+    pub fn maximum_index(&self) -> MaxwellThreeDRegister<u32> {
+        self.registers
+            .read(self.base + 8, |raw| (raw <= self.maximum).then_some(raw))
     }
     #[must_use]
     pub fn address(&self) -> Option<MaxwellThreeDUnresolvedAddress> {
         Some(MaxwellThreeDUnresolvedAddress::new(
-            *self.address_upper.value()?,
-            *self.address_lower.value()?,
+            *self.address_upper().value()?,
+            *self.address_lower().value()?,
         ))
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaxwellThreeDShaderBindingState {
-    geometry_passthrough_mask: [MaxwellThreeDRegister<u32>; 8],
-    program_region: MaxwellThreeDProgramRegionState,
-    pipeline: [MaxwellThreeDPipelineBindingState; MAXWELL_PIPELINE_SHADER_COUNT],
-    selector: MaxwellThreeDConstantBufferSelectorState,
-    constant_buffer_load: MaxwellThreeDConstantBufferLoadState,
+pub(super) struct MaxwellThreeDShaderResources {
     groups: Box<[MaxwellThreeDBindGroupState; MAXWELL_BIND_GROUP_COUNT]>,
-    texture_headers: MaxwellThreeDDescriptorPoolState,
-    samplers: MaxwellThreeDDescriptorPoolState,
-    sampler_binding: MaxwellThreeDRegister<MaxwellThreeDSamplerBindingMode>,
-    maxwell_texture_headers: MaxwellThreeDRegister<bool>,
-    bindless_texture_constant_buffer_slot: MaxwellThreeDRegister<u8>,
-    tessellation_lod: [MaxwellThreeDRegister<u32>; MAXWELL_TESSELLATION_LOD_COUNT],
-    tessellation_mode: MaxwellThreeDRegister<MaxwellThreeDTessellationMode>,
+    constant_buffer_offset: Option<u32>,
 }
-
-impl Default for MaxwellThreeDShaderBindingState {
+impl Default for MaxwellThreeDShaderResources {
     fn default() -> Self {
         Self {
-            geometry_passthrough_mask: std::array::from_fn(|_| MaxwellThreeDRegister::default()),
-            program_region: MaxwellThreeDProgramRegionState::default(),
-            pipeline: std::array::from_fn(MaxwellThreeDPipelineBindingState::initialized),
-            selector: MaxwellThreeDConstantBufferSelectorState::default(),
-            constant_buffer_load: MaxwellThreeDConstantBufferLoadState::default(),
-            groups: Box::new(std::array::from_fn(|_| {
-                MaxwellThreeDBindGroupState::default()
-            })),
-            texture_headers: MaxwellThreeDDescriptorPoolState::default(),
-            samplers: MaxwellThreeDDescriptorPoolState::default(),
-            sampler_binding: MaxwellThreeDRegister::default(),
-            maxwell_texture_headers: MaxwellThreeDRegister::default(),
-            bindless_texture_constant_buffer_slot: MaxwellThreeDRegister::default(),
-            tessellation_lod: std::array::from_fn(|_| MaxwellThreeDRegister::default()),
-            tessellation_mode: MaxwellThreeDRegister::default(),
+            groups: Box::new(std::array::from_fn(|_| Default::default())),
+            constant_buffer_offset: None,
         }
     }
 }
-
-impl MaxwellThreeDShaderBindingState {
-    pub fn geometry_passthrough_mask(&self) -> Option<[u32; 8]> {
-        let mut mask = [0; 8];
-        for (value, register) in mask.iter_mut().zip(&self.geometry_passthrough_mask) {
-            *value = *register.value()?;
-        }
-        Some(mask)
-    }
-    pub const fn tessellation_mode(&self) -> &MaxwellThreeDRegister<MaxwellThreeDTessellationMode> {
-        &self.tessellation_mode
-    }
-    #[must_use]
-    pub const fn program_region(&self) -> &MaxwellThreeDProgramRegionState {
-        &self.program_region
-    }
-
-    pub(in crate::engines) fn has_enabled_pipeline(&self) -> bool {
-        self.pipeline
-            .iter()
-            .any(|pipeline| pipeline.enabled.value() == Some(&true))
-    }
-
-    #[must_use]
-    pub const fn pipeline(
-        &self,
-    ) -> &[MaxwellThreeDPipelineBindingState; MAXWELL_PIPELINE_SHADER_COUNT] {
-        &self.pipeline
-    }
-    #[must_use]
-    pub const fn selector(&self) -> &MaxwellThreeDConstantBufferSelectorState {
-        &self.selector
-    }
-    #[must_use]
-    pub const fn constant_buffer_load(&self) -> &MaxwellThreeDConstantBufferLoadState {
-        &self.constant_buffer_load
-    }
-    #[must_use]
-    pub fn groups(&self) -> &[MaxwellThreeDBindGroupState; MAXWELL_BIND_GROUP_COUNT] {
-        &self.groups
-    }
-    #[must_use]
-    pub const fn texture_headers(&self) -> &MaxwellThreeDDescriptorPoolState {
-        &self.texture_headers
-    }
-    #[must_use]
-    pub const fn samplers(&self) -> &MaxwellThreeDDescriptorPoolState {
-        &self.samplers
-    }
-    #[must_use]
-    pub const fn sampler_binding(&self) -> &MaxwellThreeDRegister<MaxwellThreeDSamplerBindingMode> {
-        &self.sampler_binding
-    }
-    #[must_use]
-    pub const fn maxwell_texture_headers(&self) -> &MaxwellThreeDRegister<bool> {
-        &self.maxwell_texture_headers
-    }
-    #[must_use]
-    pub const fn bindless_texture_constant_buffer_slot(&self) -> &MaxwellThreeDRegister<u8> {
-        &self.bindless_texture_constant_buffer_slot
-    }
-    #[must_use]
-    pub const fn tessellation_lod(
-        &self,
-        level: MaxwellThreeDTessellationLod,
-    ) -> &MaxwellThreeDRegister<u32> {
-        &self.tessellation_lod[level.index()]
-    }
-
-    /// Stages whose enabled pipeline slot selects this binding group.
-    #[must_use]
-    pub fn stage_visibility(&self, group: u8) -> [bool; MAXWELL_PIPELINE_SHADER_COUNT] {
-        let mut visible = [false; MAXWELL_PIPELINE_SHADER_COUNT];
-        if group as usize >= MAXWELL_BIND_GROUP_COUNT {
-            return visible;
-        }
-        for pipeline in &self.pipeline {
-            if pipeline.enabled.value() == Some(&true)
-                && pipeline.effective_group() == Some(group)
-                && let Some(stage) = pipeline.stage.value()
-            {
-                visible[*stage as usize] = true;
-            }
-        }
-        visible
-    }
-
+impl MaxwellThreeDShaderResources {
     pub(super) fn apply(&mut self, write: MaxwellThreeDShaderBindingWrite) {
-        let raw = write.raw();
-        let source = write.source();
         match write {
-            MaxwellThreeDShaderBindingWrite::GeometryPassthroughMask { index, value, .. } => {
-                self.geometry_passthrough_mask[index as usize] =
-                    MaxwellThreeDRegister::decoded(raw, value);
-            }
-            MaxwellThreeDShaderBindingWrite::ProgramRegionAddressUpper { value, .. } => {
-                self.program_region.address_upper = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::ProgramRegionAddressLower { value, .. } => {
-                self.program_region.address_lower = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::SpaVersion { value, .. } => {
-                self.program_region.spa_version = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::PipelineShader {
-                pipeline,
-                enabled,
-                stage,
-                ..
-            } => {
-                self.pipeline[pipeline as usize].enabled =
-                    MaxwellThreeDRegister::decoded(raw, enabled);
-                self.pipeline[pipeline as usize].stage = MaxwellThreeDRegister::decoded(raw, stage);
-            }
-            MaxwellThreeDShaderBindingWrite::PipelineProgram {
-                pipeline, offset, ..
-            } => {
-                self.pipeline[pipeline as usize].program_offset =
-                    MaxwellThreeDRegister::decoded(raw, offset)
-            }
-            MaxwellThreeDShaderBindingWrite::PipelineRegisterCount {
-                pipeline, count, ..
-            } => {
-                self.pipeline[pipeline as usize].register_count =
-                    MaxwellThreeDRegister::decoded(raw, count)
-            }
-            MaxwellThreeDShaderBindingWrite::PipelineGroup {
-                pipeline, group, ..
-            } => {
-                self.pipeline[pipeline as usize].group = MaxwellThreeDRegister::decoded(raw, group)
-            }
-            MaxwellThreeDShaderBindingWrite::SelectorSize { size, .. } => {
-                self.selector.size = MaxwellThreeDRegister::decoded(raw, size)
-            }
-            MaxwellThreeDShaderBindingWrite::SelectorAddressUpper { value, .. } => {
-                self.selector.address_upper = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::SelectorAddressLower { value, .. } => {
-                self.selector.address_lower = MaxwellThreeDRegister::decoded(raw, value)
-            }
             MaxwellThreeDShaderBindingWrite::ConstantBufferLoadOffset { value, .. } => {
-                self.constant_buffer_load.offset = MaxwellThreeDRegister::decoded(raw, value);
-                self.constant_buffer_load.next_offset = Some(u32::from(value));
+                self.constant_buffer_offset = Some(u32::from(value));
             }
-            MaxwellThreeDShaderBindingWrite::ConstantBufferLoadData {
-                value, next_offset, ..
-            } => {
-                self.constant_buffer_load.last_data = MaxwellThreeDRegister::decoded(raw, value);
-                self.constant_buffer_load.next_offset = Some(next_offset);
+            MaxwellThreeDShaderBindingWrite::ConstantBufferLoadData { next_offset, .. } => {
+                self.constant_buffer_offset = Some(next_offset);
             }
             MaxwellThreeDShaderBindingWrite::BindConstantBuffer {
                 group,
@@ -545,7 +331,7 @@ impl MaxwellThreeDShaderBindingState {
                 enabled,
                 address,
                 size,
-                ..
+                source,
             } => {
                 self.groups[group as usize].constant_buffers[slot as usize] =
                     Some(MaxwellThreeDConstantBufferBinding {
@@ -553,108 +339,128 @@ impl MaxwellThreeDShaderBindingState {
                         address,
                         size,
                         source,
-                    })
-            }
-            MaxwellThreeDShaderBindingWrite::TextureHeaderAddressUpper { value, .. } => {
-                self.texture_headers.address_upper = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::TextureHeaderAddressLower { value, .. } => {
-                self.texture_headers.address_lower = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::TextureHeaderMaximumIndex { value, .. } => {
-                self.texture_headers.maximum_index = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::SamplerAddressUpper { value, .. } => {
-                self.samplers.address_upper = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::SamplerAddressLower { value, .. } => {
-                self.samplers.address_lower = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::SamplerMaximumIndex { value, .. } => {
-                self.samplers.maximum_index = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::SamplerBinding { value, .. } => {
-                self.sampler_binding = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::MaxwellTextureHeaders { value, .. } => {
-                self.maxwell_texture_headers = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::BindlessTextureSlot { value, .. } => {
-                self.bindless_texture_constant_buffer_slot =
-                    MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::TessellationLod { level, value, .. } => {
-                self.tessellation_lod[level.index()] = MaxwellThreeDRegister::decoded(raw, value)
-            }
-            MaxwellThreeDShaderBindingWrite::TessellationMode { value, .. } => {
-                self.tessellation_mode = MaxwellThreeDRegister::decoded(raw, value)
+                    });
             }
         }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxwellThreeDShaderBindingState<'a> {
+    pub(super) registers: &'a super::state::MaxwellThreeDRawRegisterFile,
+    pub(super) resources: &'a MaxwellThreeDShaderResources,
+}
+impl<'a> MaxwellThreeDShaderBindingState<'a> {
+    #[must_use]
+    pub fn program_region(&self) -> MaxwellThreeDProgramRegionState<'a> {
+        MaxwellThreeDProgramRegionState {
+            registers: self.registers,
+        }
+    }
+    #[must_use]
+    pub fn pipeline(&self, index: usize) -> MaxwellThreeDPipelineBindingState<'a> {
+        MaxwellThreeDPipelineBindingState {
+            registers: self.registers,
+            index,
+        }
+    }
+    #[must_use]
+    pub fn selector(&self) -> MaxwellThreeDConstantBufferSelectorState<'a> {
+        MaxwellThreeDConstantBufferSelectorState {
+            registers: self.registers,
+        }
+    }
+    #[must_use]
+    pub fn texture_headers(&self) -> MaxwellThreeDDescriptorPoolState<'a> {
+        MaxwellThreeDDescriptorPoolState {
+            registers: self.registers,
+            base: 0x1574,
+            maximum: 0x3fffff,
+        }
+    }
+    #[must_use]
+    pub fn samplers(&self) -> MaxwellThreeDDescriptorPoolState<'a> {
+        MaxwellThreeDDescriptorPoolState {
+            registers: self.registers,
+            base: 0x155c,
+            maximum: 0xfffff,
+        }
+    }
+    #[must_use]
+    pub fn tessellation_mode(&self) -> MaxwellThreeDRegister<MaxwellThreeDTessellationMode> {
+        self.registers
+            .read(0x0320, |raw| Some(MaxwellThreeDTessellationMode::new(raw)))
+    }
+    #[must_use]
+    pub fn tessellation_lod(
+        &self,
+        level: MaxwellThreeDTessellationLod,
+    ) -> MaxwellThreeDRegister<u32> {
+        self.registers.read(0x0324 + level.index() as u32 * 4, Some)
+    }
+    #[must_use]
+    pub fn sampler_binding(&self) -> MaxwellThreeDRegister<MaxwellThreeDSamplerBindingMode> {
+        self.registers.read(0x1234, |raw| match raw {
+            0 => Some(MaxwellThreeDSamplerBindingMode::Independent),
+            1 => Some(MaxwellThreeDSamplerBindingMode::ViaTextureHeader),
+            _ => None,
+        })
+    }
+    #[must_use]
+    pub fn maxwell_texture_headers(&self) -> MaxwellThreeDRegister<bool> {
+        self.registers
+            .read(0x0f10, |raw| (raw <= 1).then_some(raw != 0))
+    }
+    #[must_use]
+    pub fn bindless_texture_constant_buffer_slot(&self) -> MaxwellThreeDRegister<u8> {
+        self.registers
+            .read(0x2608, |raw| (raw <= 31).then_some(raw as u8))
+    }
+    #[must_use]
+    pub fn geometry_passthrough_mask(&self) -> Option<[u32; 8]> {
+        let mut mask = [0; 8];
+        for (index, value) in mask.iter_mut().enumerate() {
+            *value = self
+                .registers
+                .raw(nixe_gpu::GpuMethodId(0x1240 + index as u32 * 4))?;
+        }
+        Some(mask)
+    }
+    pub(in crate::engines) fn has_enabled_pipeline(&self) -> bool {
+        (0..MAXWELL_PIPELINE_SHADER_COUNT)
+            .any(|i| self.pipeline(i).enabled().value() == Some(&true))
+    }
+    #[must_use]
+    pub fn constant_buffer_offset(&self) -> Option<u32> {
+        self.resources.constant_buffer_offset
+    }
+
+    #[must_use]
+    pub fn groups(&self) -> &'a [MaxwellThreeDBindGroupState; MAXWELL_BIND_GROUP_COUNT] {
+        &self.resources.groups
+    }
+    #[must_use]
+    pub fn stage_visibility(&self, group: u8) -> [bool; MAXWELL_PIPELINE_SHADER_COUNT] {
+        let mut visible = [false; MAXWELL_PIPELINE_SHADER_COUNT];
+        for index in 0..MAXWELL_PIPELINE_SHADER_COUNT {
+            let pipeline = self.pipeline(index);
+            if pipeline.enabled().value() == Some(&true)
+                && pipeline.effective_group() == Some(group)
+                && let Some(stage) = pipeline.stage().value()
+            {
+                visible[*stage as usize] = true;
+            }
+        }
+        visible
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDShaderBindingWrite {
-    GeometryPassthroughMask {
-        index: u8,
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    TessellationMode {
-        value: MaxwellThreeDTessellationMode,
-        source: MaxwellMethodSource,
-    },
-    ProgramRegionAddressUpper {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    ProgramRegionAddressLower {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    SpaVersion {
-        value: MaxwellSpaVersion,
-        source: MaxwellMethodSource,
-    },
-    PipelineShader {
-        pipeline: u8,
-        enabled: bool,
-        stage: MaxwellShaderStage,
-        source: MaxwellMethodSource,
-    },
-    PipelineProgram {
-        pipeline: u8,
-        offset: u32,
-        source: MaxwellMethodSource,
-    },
-    PipelineRegisterCount {
-        pipeline: u8,
-        count: u8,
-        source: MaxwellMethodSource,
-    },
-    PipelineGroup {
-        pipeline: u8,
-        group: u8,
-        source: MaxwellMethodSource,
-    },
-    SelectorSize {
-        size: u32,
-        source: MaxwellMethodSource,
-    },
-    SelectorAddressUpper {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    SelectorAddressLower {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
     ConstantBufferLoadOffset {
         value: u16,
         source: MaxwellMethodSource,
     },
     ConstantBufferLoadData {
-        value: u32,
         next_offset: u32,
         source: MaxwellMethodSource,
     },
@@ -666,80 +472,4 @@ pub enum MaxwellThreeDShaderBindingWrite {
         size: Option<u32>,
         source: MaxwellMethodSource,
     },
-    TextureHeaderAddressUpper {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    TextureHeaderAddressLower {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    TextureHeaderMaximumIndex {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    SamplerAddressUpper {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    SamplerAddressLower {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    SamplerMaximumIndex {
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-    SamplerBinding {
-        value: MaxwellThreeDSamplerBindingMode,
-        source: MaxwellMethodSource,
-    },
-    MaxwellTextureHeaders {
-        value: bool,
-        source: MaxwellMethodSource,
-    },
-    BindlessTextureSlot {
-        value: u8,
-        source: MaxwellMethodSource,
-    },
-    TessellationLod {
-        level: MaxwellThreeDTessellationLod,
-        value: u32,
-        source: MaxwellMethodSource,
-    },
-}
-
-impl MaxwellThreeDShaderBindingWrite {
-    pub(super) const fn source(self) -> MaxwellMethodSource {
-        match self {
-            Self::GeometryPassthroughMask { source, .. } => source,
-            Self::TessellationMode { source, .. }
-            | Self::ProgramRegionAddressUpper { source, .. }
-            | Self::ProgramRegionAddressLower { source, .. }
-            | Self::SpaVersion { source, .. }
-            | Self::PipelineShader { source, .. }
-            | Self::PipelineProgram { source, .. }
-            | Self::PipelineRegisterCount { source, .. }
-            | Self::PipelineGroup { source, .. }
-            | Self::SelectorSize { source, .. }
-            | Self::SelectorAddressUpper { source, .. }
-            | Self::SelectorAddressLower { source, .. }
-            | Self::ConstantBufferLoadOffset { source, .. }
-            | Self::ConstantBufferLoadData { source, .. }
-            | Self::BindConstantBuffer { source, .. }
-            | Self::TextureHeaderAddressUpper { source, .. }
-            | Self::TextureHeaderAddressLower { source, .. }
-            | Self::TextureHeaderMaximumIndex { source, .. }
-            | Self::SamplerAddressUpper { source, .. }
-            | Self::SamplerAddressLower { source, .. }
-            | Self::SamplerMaximumIndex { source, .. }
-            | Self::SamplerBinding { source, .. }
-            | Self::MaxwellTextureHeaders { source, .. }
-            | Self::BindlessTextureSlot { source, .. }
-            | Self::TessellationLod { source, .. } => source,
-        }
-    }
-    pub(super) const fn raw(self) -> u32 {
-        self.source().argument()
-    }
 }

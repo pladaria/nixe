@@ -49,7 +49,7 @@ fn kernel_call(s: &SchedulerState, caller: GuestThreadId, core: u32) {
 
 #[test]
 fn an_unpolled_or_recursive_acquisition_cannot_release_an_existing_guard() {
-    let s = Arc::new(scheduler(1));
+    let s = scheduler(1);
     let caller = add(&s, 1, 30, Some(0), &[0]);
     kernel_call(&s, caller, 0);
     let guard = s.try_thread_property(caller, caller).unwrap().unwrap();
@@ -68,7 +68,7 @@ fn an_unpolled_or_recursive_acquisition_cannot_release_an_existing_guard() {
 
 #[test]
 fn property_handoff_preserves_wait_generations_until_results_are_installed() {
-    let s = Arc::new(scheduler(2));
+    let s = scheduler(2);
     let target = add(&s, 1, 50, Some(0), &[0]);
     let first = add(&s, 1, 30, Some(1), &[1]);
     s.pin_thread(VirtualCpuId::new(0), target).unwrap();
@@ -78,14 +78,14 @@ fn property_handoff_preserves_wait_generations_until_results_are_installed() {
     let (first_wake, waker) = notification(&s);
     let mut quiescence = Box::pin(guard.wait_quiescent(None));
     assert!(poll(&mut quiescence, &waker).is_pending());
-    let first_token = s.register_wait(first).unwrap();
+    let first_token = s.register_wait(first).unwrap().token();
     s.set_activity(first, true).unwrap();
     let second = add(&s, 2, 10, Some(1), &[1]);
     kernel_call(&s, second, 1);
     let (second_wake, waker2) = notification(&s);
     let mut acquire = s.lock_thread_property(second, target);
     assert!(poll(&mut acquire, &waker2).is_pending());
-    let second_token = s.register_wait(second).unwrap();
+    let second_token = s.register_wait(second).unwrap().token();
     assert_eq!(s.thread(first).unwrap().effective_priority, 10);
     s.unpin_thread(target).unwrap();
     assert_eq!(first_wake.calls.load(Ordering::Relaxed), 1);
@@ -117,23 +117,23 @@ fn property_handoff_preserves_wait_generations_until_results_are_installed() {
 #[test]
 fn cancelling_a_contender_before_or_after_handoff_releases_the_real_node() {
     for handoff in [false, true] {
-        let s = Arc::new(scheduler(2));
+        let s = scheduler(2);
         let target = add(&s, 1, 50, Some(0), &[0]);
         let first = add(&s, 1, 30, Some(1), &[1]);
         kernel_call(&s, first, 1);
         let guard = s.try_thread_property(first, target).unwrap().unwrap();
-        s.register_wait(first).unwrap();
+        s.register_wait(first).unwrap().token();
         let second = add(&s, 1, 10, Some(1), &[1]);
         kernel_call(&s, second, 1);
         let (_, waker) = notification(&s);
         let mut second_lock = s.lock_thread_property(second, target);
         assert!(poll(&mut second_lock, &waker).is_pending());
-        s.register_wait(second).unwrap();
+        s.register_wait(second).unwrap().token();
         let third = add(&s, 1, 20, Some(1), &[1]);
         kernel_call(&s, third, 1);
         let mut third_lock = s.lock_thread_property(third, target);
         assert!(poll(&mut third_lock, &waker).is_pending());
-        s.register_wait(third).unwrap();
+        s.register_wait(third).unwrap().token();
         if handoff {
             drop(guard);
             drop(second_lock);
@@ -152,18 +152,18 @@ fn cancelling_a_contender_before_or_after_handoff_releases_the_real_node() {
 
 #[test]
 fn terminating_an_owner_hands_off_and_stale_guards_cannot_release_its_replacement() {
-    let s = Arc::new(scheduler(2));
+    let s = scheduler(2);
     let target = add(&s, 1, 50, Some(0), &[0]);
     let first = add(&s, 1, 30, Some(1), &[1]);
     kernel_call(&s, first, 1);
     let guard = s.try_thread_property(first, target).unwrap().unwrap();
-    s.register_wait(first).unwrap();
+    s.register_wait(first).unwrap().token();
     let second = add(&s, 1, 10, Some(1), &[1]);
     kernel_call(&s, second, 1);
     let (_, waker) = notification(&s);
     let mut acquire = s.lock_thread_property(second, target);
     assert!(poll(&mut acquire, &waker).is_pending());
-    s.register_wait(second).unwrap();
+    s.register_wait(second).unwrap().token();
     s.terminate(first, false).unwrap();
     s.unregister(first).unwrap();
     let replacement = add(&s, 1, 40, Some(1), &[1]);
@@ -188,7 +188,7 @@ fn terminating_an_owner_hands_off_and_stale_guards_cannot_release_its_replacemen
 #[test]
 fn retiring_a_pin_owner_waiting_on_its_own_property_cannot_resurrect_the_slot() {
     for remove in [false, true] {
-        let s = Arc::new(scheduler(1));
+        let s = scheduler(1);
         let target = add(&s, 1, 30, Some(0), &[0]);
         s.pin_thread(VirtualCpuId::new(0), target).unwrap();
         kernel_call(&s, target, 0);
@@ -196,7 +196,7 @@ fn retiring_a_pin_owner_waiting_on_its_own_property_cannot_resurrect_the_slot() 
         let (_, waker) = notification(&s);
         let mut wait = Box::pin(guard.wait_quiescent(None));
         assert!(poll(&mut wait, &waker).is_pending());
-        s.register_wait(target).unwrap();
+        s.register_wait(target).unwrap().token();
         if !remove {
             s.terminate(target, false).unwrap();
         }
@@ -234,7 +234,7 @@ fn affinity_preserves_unassigned_suggestions_until_a_real_migration_search() {
 #[test]
 fn a_registered_pin_wait_survives_native_boundaries_and_blocking_until_unpin() {
     for block in [false, true] {
-        let s = Arc::new(scheduler(2));
+        let s = scheduler(2);
         let target = add(&s, 1, 50, Some(0), &[0]);
         let caller = add(&s, 1, 30, Some(1), &[1]);
         s.pin_thread(VirtualCpuId::new(0), target).unwrap();
@@ -247,7 +247,7 @@ fn a_registered_pin_wait_survives_native_boundaries_and_blocking_until_unpin() {
         let (notified, waker) = notification(&s);
         let mut wait = Box::pin(guard.wait_quiescent(Some(allowed)));
         assert!(poll(&mut wait, &waker).is_pending());
-        let token = s.register_wait(caller).unwrap();
+        let token = s.register_wait(caller).unwrap().token();
         s.complete(
             target_lease,
             Completion::KernelCall {
@@ -258,7 +258,7 @@ fn a_registered_pin_wait_survives_native_boundaries_and_blocking_until_unpin() {
         assert!(!guard.is_quiescent(Some(allowed)).unwrap());
         assert!(poll(&mut wait, &waker).is_pending());
         if block {
-            s.register_wait(target).unwrap();
+            s.register_wait(target).unwrap().token();
             assert!(poll(&mut wait, &waker).is_pending());
         }
         assert_eq!(notified.calls.load(Ordering::Relaxed), 0);
@@ -275,12 +275,12 @@ fn a_registered_pin_wait_survives_native_boundaries_and_blocking_until_unpin() {
 
 #[test]
 fn a_mask_change_to_an_already_blocked_pinned_thread_needs_no_unpin_wait() {
-    let s = Arc::new(scheduler(2));
+    let s = scheduler(2);
     let target = add(&s, 1, 50, Some(0), &[0]);
     let caller = add(&s, 1, 30, Some(1), &[1]);
     s.pin_thread(VirtualCpuId::new(0), target).unwrap();
     s.complete(lease(&s, 0), Completion::Waiting).unwrap();
-    s.register_wait(target).unwrap();
+    s.register_wait(target).unwrap().token();
     kernel_call(&s, caller, 1);
     let guard = s.try_thread_property(caller, target).unwrap().unwrap();
     let allowed = s.profile().core_set([VirtualCpuId::new(1)]).unwrap();
@@ -300,18 +300,18 @@ fn a_mask_change_to_an_already_blocked_pinned_thread_needs_no_unpin_wait() {
 #[test]
 fn a_suspended_final_property_recipient_waits_for_resume_or_a_real_kernel_waiter() {
     for kernel_waiter in [false, true] {
-        let s = Arc::new(scheduler(2));
+        let s = scheduler(2);
         let target = add(&s, 1, 50, Some(0), &[0]);
         let first = add(&s, 1, 30, Some(1), &[1]);
         kernel_call(&s, first, 1);
         let guard = s.try_thread_property(first, target).unwrap().unwrap();
-        let first_token = s.register_wait(first).unwrap();
+        let first_token = s.register_wait(first).unwrap().token();
         let second = add(&s, 1, 20, Some(1), &[1]);
         kernel_call(&s, second, 1);
         let (notified, waker) = notification(&s);
         let mut acquire = s.lock_thread_property(second, target);
         assert!(poll(&mut acquire, &waker).is_pending());
-        let token = s.register_wait(second).unwrap();
+        let token = s.register_wait(second).unwrap().token();
         s.set_activity(second, true).unwrap();
         drop(guard);
         s.finish_wait(first_token).unwrap();
@@ -325,7 +325,7 @@ fn a_suspended_final_property_recipient_waits_for_resume_or_a_real_kernel_waiter
             let (_, waker3) = notification(&s);
             let mut lock = s.lock_thread_property(third, target);
             assert!(poll(&mut lock, &waker3).is_pending());
-            s.register_wait(third).unwrap();
+            s.register_wait(third).unwrap().token();
             contender = Some(lock);
         } else {
             s.set_activity(second, false).unwrap();
@@ -345,7 +345,7 @@ fn a_suspended_final_property_recipient_waits_for_resume_or_a_real_kernel_waiter
 #[test]
 fn quiescence_completion_respects_caller_suspension_and_real_context_release() {
     for pinned in [false, true] {
-        let s = Arc::new(scheduler(2));
+        let s = scheduler(2);
         let target = add(&s, 1, 50, Some(0), &[0]);
         let caller = add(&s, 1, 30, Some(1), &[1]);
         if pinned {
@@ -358,7 +358,7 @@ fn quiescence_completion_respects_caller_suspension_and_real_context_release() {
         let (notified, waker) = notification(&s);
         let mut wait = Box::pin(guard.wait_quiescent(None));
         assert!(poll(&mut wait, &waker).is_pending());
-        let token = s.register_wait(caller).unwrap();
+        let token = s.register_wait(caller).unwrap().token();
         s.set_activity(caller, true).unwrap();
         if pinned {
             s.unpin_thread(target).unwrap();
