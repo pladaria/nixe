@@ -210,6 +210,9 @@ impl NvHostControl {
 }
 
 impl NvHostControl {
+    pub(super) fn kernel(&self) -> &Arc<nixe_scheduler::SchedulerState> {
+        &self.kernel
+    }
     pub(super) fn host_progress(&mut self) -> Arc<(Mutex<u64>, Condvar)> {
         Arc::clone(
             self.progress
@@ -383,6 +386,31 @@ impl NvHostControl {
             return Err(NvDrvCallError::GuestResult(NV_INVALID_STATE));
         }
         Ok(self.timeline(descriptor, id)?.latest_reserved_point())
+    }
+
+    /// Host1x publishes each consumed THI increment after preceding engine
+    /// execution and canonical writes, preserving waits inside a command list.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/cdma_pusher.cpp#L106-L113
+    pub(super) fn increment_channel_submission(
+        &mut self,
+        descriptor: NvDrvDeviceDescriptor,
+        request: u32,
+        completion: &ReservedTimelinePoint,
+    ) -> Result<GuestTimelinePoint, NvDrvCallError> {
+        let point = self
+            .timeline_mut(descriptor, completion.point().syncpoint())?
+            .increment_reserved(timeline_owner(descriptor), completion)
+            .map_err(|_| {
+                NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::Ioctl {
+                    context: context(
+                        descriptor,
+                        request,
+                        NvDrvValidationReason::TimelineOrderingUnavailable,
+                    ),
+                })
+            })?;
+        self.signal_reached(point.syncpoint(), point.value());
+        Ok(point)
     }
 
     /// Publishes backend-complete work after host execution and canonical

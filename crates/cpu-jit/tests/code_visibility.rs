@@ -1,6 +1,6 @@
 //! Code invalidation and mapping lifetime on the production physical arena.
 use nixe_cpu::{
-    execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState},
+    execution::{ArchitecturalTimer, CpuExit, TimerSnapshot},
     platform::TargetPlatform,
     profile::ProcessCpuContext,
     state::a64::{A64GeneralRegister, A64Register},
@@ -63,7 +63,6 @@ fn run(jit: &mut JitThread, state: &mut ThreadState) -> nixe_cpu::execution::Exe
         JitRunRequest {
             state,
             timer: &Timer,
-            events: &VcpuEventState::default(),
         },
     )
     .unwrap()
@@ -170,7 +169,8 @@ fn remapped_code_and_surviving_physical_aliases_reach_both_idle_cores() {
         assert_eq!(value_at(core, CODE), 45);
         assert_eq!(value_at(core, old_alias), 44);
     }
-    assert!(process.try_shutdown().unwrap());
+    process.request_stop();
+    space.close().unwrap();
 }
 
 #[test]
@@ -180,11 +180,12 @@ fn host_alias_writes_reach_concurrent_native_cores() {
     let mut commands = Vec::new();
     let mut workers = Vec::new();
     for _ in 0..2 {
-        let mut jit = process.create_thread().unwrap();
+        let worker_process = process.clone();
         let (send, receive) = std::sync::mpsc::channel();
         commands.push(send);
         let results = results.clone();
         workers.push(std::thread::spawn(move || {
+            let mut jit = worker_process.create_thread().unwrap();
             for expected in receive {
                 assert_eq!(value_at(&mut jit, CODE), expected);
                 results.send(()).unwrap();
@@ -211,7 +212,8 @@ fn host_alias_writes_reach_concurrent_native_cores() {
     for worker in workers {
         worker.join().unwrap();
     }
-    assert!(process.try_shutdown().unwrap());
+    process.request_stop();
+    space.close().unwrap();
 }
 
 #[test]

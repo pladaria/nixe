@@ -106,10 +106,10 @@ impl GpuExecution for QueueFixture {
     fn access_memory(
         &mut self,
         ranges: Vec<AllocationRange>,
-        operation: AccessOperation,
+        mut operation: AccessOperation,
     ) -> Result<nixe_gpu::OwnerAccess, BackendRuntimeError> {
         self.memory
-            .apply_resolved_access(&ranges, &operation)
+            .apply_resolved_access(&ranges, &mut operation)
             .map(nixe_gpu::OwnerAccess::Ready)
             .map_err(|e| BackendRuntimeError::Memory(Arc::new(e)))
     }
@@ -122,12 +122,13 @@ impl GpuExecution for QueueFixture {
     }
     fn queue_device_access(
         &mut self,
-        request: nixe_memory::DeviceAccessRequest,
+        mut request: nixe_memory::DeviceAccessRequest,
     ) -> Result<(), BackendRuntimeError> {
-        let result = self
-            .memory
-            .apply_resolved_access(request.ranges(), request.operation())
-            .map_err(Arc::new);
+        let result = {
+            let (ranges, operation) = request.parts_mut();
+            self.memory.apply_resolved_access(ranges, operation)
+        }
+        .map_err(Arc::new);
         request.finish(result);
         Ok(())
     }
@@ -249,7 +250,7 @@ fn owned_memory_access_waits_until_the_current_effect_is_consumed() {
     let producer = thread::spawn(move || {
         waited.recv_timeout(Duration::from_secs(3)).unwrap();
         let (request, mut pending) = producer_memory
-            .prepare_device_access(vec![producer_input], AccessOperation::Read)
+            .prepare_device_access(vec![producer_input], AccessOperation::Read(Vec::new()))
             .unwrap();
         let (wake, completed) = mpsc::sync_channel(1);
         pending.set_waker(Arc::new(move || {
@@ -281,7 +282,7 @@ fn owned_memory_access_waits_until_the_current_effect_is_consumed() {
         "compiler readiness and admitted RAM access must not submit unrelated work"
     );
     let (request, mut warm_reply) = memory
-        .prepare_device_access(vec![input], AccessOperation::Read)
+        .prepare_device_access(vec![input], AccessOperation::Read(Vec::new()))
         .unwrap();
     warm_sender.send(GpuMessage::MemoryAccess(request)).unwrap();
     finish(
@@ -638,10 +639,10 @@ impl GpuExecution for ControlledPreparation {
     fn access_memory(
         &mut self,
         ranges: Vec<AllocationRange>,
-        operation: AccessOperation,
+        mut operation: AccessOperation,
     ) -> Result<nixe_gpu::OwnerAccess, BackendRuntimeError> {
         self.memory
-            .apply_resolved_access(&ranges, &operation)
+            .apply_resolved_access(&ranges, &mut operation)
             .map(nixe_gpu::OwnerAccess::Ready)
             .map_err(|e| BackendRuntimeError::Memory(Arc::new(e)))
     }
@@ -654,12 +655,13 @@ impl GpuExecution for ControlledPreparation {
     }
     fn queue_device_access(
         &mut self,
-        request: nixe_memory::DeviceAccessRequest,
+        mut request: nixe_memory::DeviceAccessRequest,
     ) -> Result<(), BackendRuntimeError> {
-        let result = self
-            .memory
-            .apply_resolved_access(request.ranges(), request.operation())
-            .map_err(Arc::new);
+        let result = {
+            let (ranges, operation) = request.parts_mut();
+            self.memory.apply_resolved_access(ranges, operation)
+        }
+        .map_err(Arc::new);
         request.finish(result);
         Ok(())
     }

@@ -1,166 +1,137 @@
 //! Ordered asynchronous Host1x work. Completion follows canonical surface writes.
 use super::{
-    NvDrvCallError, NvDrvDeviceDescriptor, NvDrvDeviceKind, NvDrvFileDescriptor, NvHostControl,
+    NvDrvCallError, NvDrvDeviceDescriptor, NvDrvDeviceKind, NvHostControl,
     UnsupportedNvDrvOperation, execution_error, video,
 };
 use nixe_gpu::{GuestSyncpointId, GuestSyncpointValue, GuestTimelinePoint, ReservedTimelinePoint};
-use std::collections::BTreeMap;
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU8, Ordering},
     mpsc,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
-pub(super) enum Operation {
-    Wait(GuestTimelinePoint),
-    Execute(Vec<u32>),
-}
-#[derive(Debug)]
 pub(super) struct Job {
     pub descriptor: NvDrvDeviceDescriptor,
     pub request: u32,
-    pub commands: Vec<Box<[u8]>>,
-    pub advertised: BTreeMap<u32, u32>,
-    pub completions: Vec<ReservedTimelinePoint>,
+    pub commands: Vec<Vec<u8>>,
+    pub completion: Option<ReservedTimelinePoint>,
     pub mappings: video::Mappings,
     pub timeout: u32,
 }
-#[derive(Debug)]
-enum Message {
-    Job(Job),
-    Close(NvDrvFileDescriptor, mpsc::Sender<()>),
-    Stop,
-}
-type Failure = Arc<Mutex<Option<(NvDrvDeviceDescriptor, u32, String)>>>;
+const RUNNING: u8 = 0;
+const CLOSING: u8 = 1;
+const STOPPING: u8 = 2;
+pub(super) type Failure = Arc<Mutex<Option<(NvDrvDeviceDescriptor, u32, String)>>>;
 
+/// Each device owns its command FIFO and engine state, as CDmaPusher does.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/cdma_pusher.cpp#L22-L95
 #[derive(Debug)]
-pub(super) struct Worker {
-    sender: mpsc::Sender<Message>,
+pub(in crate::nvdrv) struct Worker {
+    sender: mpsc::Sender<Option<Job>>,
     thread: Mutex<Option<JoinHandle<()>>>,
-    stopped: Arc<AtomicBool>,
+    stopped: Arc<AtomicU8>,
     progress: Arc<(Mutex<u64>, Condvar)>,
     failure: Failure,
+    done: nixe_runtime::ReadableEventObject,
+    descriptor: NvDrvDeviceDescriptor,
+}
+pub(super) fn require_healthy(failure: &Failure) -> Result<(), UnsupportedNvDrvOperation> {
+    if let Some((descriptor, request, error)) = &*failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        let NvDrvCallError::Unsupported(operation) =
+            execution_error(*descriptor, *request, error.clone())
+        else {
+            unreachable!()
+        };
+        return Err(operation);
+    }
+    Ok(())
 }
 impl Worker {
     pub(super) fn new(
         control: Arc<Mutex<NvHostControl>>,
         gpu: Option<Arc<super::super::gpu_executor::NvDrvGpuExecutor>>,
+        descriptor: NvDrvDeviceDescriptor,
+        frames: Arc<video::FrameQueue>,
+        failure: Failure,
     ) -> Result<Self, NvDrvCallError> {
-        let (sender, receiver) = mpsc::channel();
-        let stopped = Arc::new(AtomicBool::new(false));
-        let thread_stopped = Arc::clone(&stopped);
-        let failure: Failure = Arc::default();
-        let thread_failure = Arc::clone(&failure);
-        let progress = control
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .host_progress();
-        let thread_progress = Arc::clone(&progress);
+        let (sender, receiver) = mpsc::channel::<Option<Job>>();
+        let stopped = Arc::new(AtomicU8::new(RUNNING));
+        let thread_stopped = stopped.clone();
+        let thread_failure = failure.clone();
+        let (progress, (finished, done)) = {
+            let mut control = control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                control.host_progress(),
+                nixe_runtime::EventObject::create_pair(control.kernel()),
+            )
+        };
+        let thread_progress = progress.clone();
         let thread = thread::Builder::new()
-            .name("nixe-host1x".into())
+            .name(format!("nixe-host1x-{}", descriptor.fd().raw()))
             .spawn(move || {
-                let mut decoders = BTreeMap::new();
-                let mut channels = BTreeMap::<NvDrvFileDescriptor, DecodeState>::new();
-                while let Ok(message) = receiver.recv() {
-                    match message {
-                        Message::Stop => break,
-                        Message::Close(fd, ack) => {
-                            if decoders.remove(&fd).is_some() {
-                                for state in channels.values_mut() {
-                                    if state.vic.decoder == Some(fd) { state.vic = Default::default(); }
-                                }
-                            }
-                            channels.remove(&fd);
-                            let _ = ack.send(());
-                        }
-                        Message::Job(job) => {
-                            if thread_stopped.load(Ordering::Acquire) {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let run = || -> Result<(), (u32, String)> {
+                        let mut channel = Channel::default();
+                        while let Ok(Some(job)) = receiver.recv() {
+                            if thread_stopped.load(Ordering::Acquire) != RUNNING {
                                 break;
                             }
-                            if thread_failure
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .is_some()
+                            require_healthy(&thread_failure)
+                                .map_err(|e| (job.request, e.to_string()))?;
+                            if !channel
+                                .execute(
+                                    &job,
+                                    &control,
+                                    gpu.as_deref(),
+                                    &frames,
+                                    &thread_progress,
+                                    &thread_stopped,
+                                    &thread_failure,
+                                )
+                                .map_err(|error| (job.request, error))?
                             {
-                                continue;
-                            }
-                            let execute = || -> Result<(), String> {
-                                let state = channels.entry(job.descriptor.fd()).or_default();
-                                let operations = decode(state, &job)?;
-                                for operation in &operations {
-                                    match operation {
-                                        Operation::Wait(point) => wait(
-                                            &control,
-                                            &thread_progress,
-                                            &thread_stopped,
-                                            &thread_failure,
-                                            *point,
-                                            job.timeout,
-                                        )?,
-                                        Operation::Execute(registers) => {
-                                            match job.descriptor.kind() {
-                                                NvDrvDeviceKind::HostNvDec => {
-                                                    if let std::collections::btree_map::Entry::Vacant(entry) = decoders.entry(job.descriptor.fd()) {
-                                                        entry.insert(video::NvDec::new(gpu.as_deref().and_then(|gpu| gpu.device_uuid())));
-                                                    }
-                                                    decoders.get_mut(&job.descriptor.fd()).unwrap().execute(registers, &job.mappings)?;
-                                                }
-                                                NvDrvDeviceKind::HostVic => {
-                                                    state.vic.execute(registers, &job.mappings, gpu.as_deref(), &mut decoders)?
-                                                }
-                                                _ => return Err("invalid Host1x engine".into()),
-                                            }
-                                        }
-                                    }
-                                }
-                                let mut control = control
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                for completion in &job.completions {
-                                    control
-                                        .complete_channel_submission(
-                                            job.descriptor,
-                                            job.request,
-                                            completion,
-                                        )
-                                        .map_err(|e| format!("{e:?}"))?;
-                                }
-                                Ok(())
-                            };
-                            let result =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(execute))
-                                    .unwrap_or_else(|_| Err("Host1x worker panicked".into()));
-                            if let Err(error) = result
-                                && !thread_stopped.load(Ordering::Acquire)
-                            {
-                                log::error!("Host1x execution failed: {error}");
-                                let mut failure = thread_failure
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if failure.is_none() {
-                                    *failure = Some((job.descriptor, job.request, error));
-                                }
-                                drop(failure);
-                                // Release channels waiting on the failed producer. They
-                                // retain the original error and never publish completion.
-                                let mut generation = thread_progress
-                                    .0
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                *generation = generation.wrapping_add(1);
-                                thread_progress.1.notify_all();
-                                drop(generation);
-                                control
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .wake_on_execution_failure();
+                                break;
                             }
                         }
+                        Ok(())
+                    };
+                    let result = run();
+                    if descriptor.kind() == NvDrvDeviceKind::HostNvDec {
+                        frames.close(descriptor.fd());
                     }
+                    result
+                }))
+                .unwrap_or_else(|_| Err((0, "Host1x worker execution or cleanup panicked".into())));
+                if let Err((request, error)) = result {
+                    log::error!("Host1x execution failed: {error}");
+                    let mut failed = thread_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if failed.is_none() {
+                        *failed = Some((descriptor, request, error));
+                    }
+                    drop(failed);
+                    let mut generation = thread_progress
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *generation = generation.wrapping_add(1);
+                    thread_progress.1.notify_all();
+                    drop(generation);
+                    control
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .wake_on_execution_failure();
                 }
+                finished.signal();
             })
             .map_err(|_| NvDrvCallError::GuestResult(super::super::NV_INSUFFICIENT_MEMORY))?;
         Ok(Self {
@@ -169,57 +140,66 @@ impl Worker {
             stopped,
             progress,
             failure,
+            done,
+            descriptor,
         })
     }
     pub(super) fn require_healthy(&self) -> Result<(), UnsupportedNvDrvOperation> {
-        if let Some((descriptor, request, error)) = &*self
-            .failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            let NvDrvCallError::Unsupported(operation) =
-                execution_error(*descriptor, *request, error.clone())
-            else {
-                unreachable!()
-            };
-            return Err(operation);
-        }
-        Ok(())
+        require_healthy(&self.failure)
     }
     pub(super) fn submit(&self, job: Job) -> Result<(), NvDrvCallError> {
-        if self.stopped.load(Ordering::Acquire) {
+        if self.stopped.load(Ordering::Acquire) != RUNNING {
             return Err(NvDrvCallError::GuestResult(super::super::NV_INVALID_STATE));
         }
         self.require_healthy()
             .map_err(NvDrvCallError::Unsupported)?;
         self.sender
-            .send(Message::Job(job))
+            .send(Some(job))
             .map_err(|_| NvDrvCallError::GuestResult(super::super::NV_INVALID_STATE))
     }
-    pub(super) fn close(&self, fd: NvDrvFileDescriptor) {
-        let (sender, receiver) = mpsc::channel();
-        if self.sender.send(Message::Close(fd, sender)).is_ok() {
-            let _ = receiver.recv();
+    pub(super) fn stop(&self) {
+        if self.stopped.swap(STOPPING, Ordering::AcqRel) == STOPPING {
+            return;
         }
+        let _guard = self
+            .progress
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.progress.1.notify_all();
+        let _ = self.sender.send(None);
     }
-    pub(super) fn shutdown(&self) {
-        self.stopped.store(true, Ordering::Release);
-        {
-            let _guard = self
-                .progress
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.progress.1.notify_all();
+    pub(super) fn begin_close(&self) -> nixe_runtime::EventFuture {
+        // A normal device close stops admission and drains the current command
+        // list, as CDmaPusher's stop token does. Machine stop/cancel can abort
+        // a passive syncpoint wait without inventing its completion.
+        if self.stopped.fetch_max(CLOSING, Ordering::AcqRel) == RUNNING {
+            let _ = self.sender.send(None);
         }
-        let _ = self.sender.send(Message::Stop);
-        if let Some(thread) = self
+        self.done.wait_async()
+    }
+    pub(super) fn join(&self) -> Result<(), UnsupportedNvDrvOperation> {
+        let thread = self
             .thread
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+            .take();
+        if let Some(thread) = thread
+            && thread.join().is_err()
         {
-            let _ = thread.join();
+            let NvDrvCallError::Unsupported(error) =
+                execution_error(self.descriptor, 0, "Host1x worker cleanup panicked")
+            else {
+                unreachable!()
+            };
+            return Err(error);
+        }
+        Ok(())
+    }
+    pub(super) fn shutdown(&self) {
+        self.stop();
+        if let Err(error) = self.join() {
+            log::error!("{error}");
         }
     }
 }
@@ -228,27 +208,24 @@ impl Drop for Worker {
         self.shutdown();
     }
 }
+
 fn wait(
     control: &Arc<Mutex<NvHostControl>>,
     progress: &Arc<(Mutex<u64>, Condvar)>,
-    stopped: &AtomicBool,
+    stopped: &AtomicU8,
     failure: &Failure,
     point: GuestTimelinePoint,
     timeout: u32,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let deadline = if timeout == 0 {
         None
     } else {
         Some(Instant::now() + Duration::from_millis(u64::from(timeout)))
     };
     loop {
-        if stopped.load(Ordering::Acquire)
-            || failure
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some()
-        {
-            return Err("Host1x stopped/failed while waiting for dependency".into());
+        require_healthy(failure).map_err(|error| error.to_string())?;
+        if stopped.load(Ordering::Acquire) == STOPPING {
+            return Ok(false);
         }
         let generation = *progress
             .0
@@ -259,7 +236,7 @@ fn wait(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .point_reached(point)
         {
-            Some(true) => return Ok(()),
+            Some(true) => return Ok(true),
             Some(false) => {}
             None => return Err(format!("unknown Host1x dependency {point:?}")),
         }
@@ -268,7 +245,7 @@ fn wait(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if *guard != generation
-            || stopped.load(Ordering::Acquire)
+            || stopped.load(Ordering::Acquire) == STOPPING
             || failure
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -298,33 +275,47 @@ fn wait(
     }
 }
 
-struct DecodeState {
+/// The device thread consumes methods directly; waits and increments remain in
+/// stream order and each execute borrows the device's current registers.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/cdma_pusher.cpp#L43-L119
+struct Channel {
     packet: super::PacketState,
-    registers: Vec<u32>,
+    registers: [u32; 0x446],
+    decoder: Option<video::NvDec>,
     vic: super::vic::Vic,
 }
-impl Default for DecodeState {
+impl Default for Channel {
     fn default() -> Self {
         Self {
             packet: Default::default(),
-            registers: vec![0; 0x446],
+            registers: [0; 0x446],
+            decoder: None,
             vic: Default::default(),
         }
     }
 }
-fn decode(channel: &mut DecodeState, job: &Job) -> Result<Vec<Operation>, String> {
-    let decode = || -> Result<Vec<Operation>, NvDrvCallError> {
+impl Channel {
+    #[allow(clippy::too_many_arguments)]
+    fn execute(
+        &mut self,
+        job: &Job,
+        control: &Arc<Mutex<NvHostControl>>,
+        gpu: Option<&super::super::gpu_executor::NvDrvGpuExecutor>,
+        frames: &Arc<video::FrameQueue>,
+        progress: &Arc<(Mutex<u64>, Condvar)>,
+        stopped: &AtomicU8,
+        failure: &Failure,
+    ) -> Result<bool, String> {
         let descriptor = job.descriptor;
-        let request = job.request;
-        let mut operations = Vec::new();
-        let mut increments = BTreeMap::<u32, u32>::new();
+        let mut remaining = job
+            .completion
+            .as_ref()
+            .map_or(0, ReservedTimelinePoint::increments);
         for bytes in &job.commands {
             for word in bytes.chunks_exact(4) {
-                let word = u32::from_le_bytes(word.try_into().unwrap());
-                let Some((class, method, argument)) = channel
+                let Some((class, method, argument)) = self
                     .packet
-                    .word(word)
-                    .map_err(|error| super::execution_error(descriptor, request, error))?
+                    .word(u32::from_le_bytes(word.try_into().unwrap()))?
                 else {
                     continue;
                 };
@@ -334,21 +325,17 @@ fn decode(channel: &mut DecodeState, job: &Job) -> Result<Vec<Operation>, String
                 );
                 if class == 1 {
                     match method {
-                        0x4e => channel.packet.wait_value = argument,
+                        0x4e => self.packet.wait_value = argument,
                         0x8 | 0x50 => {
                             let point = GuestTimelinePoint::new(
                                 GuestSyncpointId::new(argument),
-                                GuestSyncpointValue::new(channel.packet.wait_value),
+                                GuestSyncpointValue::new(self.packet.wait_value),
                             );
-                            operations.push(Operation::Wait(point));
+                            if !wait(control, progress, stopped, failure, point, job.timeout)? {
+                                return Ok(false);
+                            }
                         }
-                        _ => {
-                            return Err(super::execution_error(
-                                descriptor,
-                                request,
-                                format!("unsupported Host1x control method {method:#x}"),
-                            ));
-                        }
+                        _ => return Err(format!("unsupported Host1x control method {method:#x}")),
                     }
                     continue;
                 }
@@ -358,71 +345,70 @@ fn decode(channel: &mut DecodeState, job: &Job) -> Result<Vec<Operation>, String
                     0x5d
                 };
                 if class != expected {
-                    return Err(super::execution_error(
-                        descriptor,
-                        request,
-                        format!("unsupported channel class {class:#x}"),
-                    ));
+                    return Err(format!("unsupported channel class {class:#x}"));
                 }
                 match method {
                     0 => {
                         if argument & !0xffff != 0 || argument >> 8 > 2 {
-                            return Err(super::execution_error(
-                                descriptor,
-                                request,
-                                "unsupported syncpoint increment condition",
-                            ));
+                            return Err("unsupported syncpoint increment condition".into());
                         }
-                        let id = argument & 0xff;
-                        let count = increments.entry(id).or_default();
-                        *count = count.checked_add(1).ok_or(super::super::NV_OVERFLOW)?;
+                        let completion = job
+                            .completion
+                            .as_ref()
+                            .filter(|point| {
+                                point.point().syncpoint().get() == argument & 0xff && remaining != 0
+                            })
+                            .ok_or("submission contains an unreserved syncpoint increment")?;
+                        control
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .increment_channel_submission(descriptor, job.request, completion)
+                            .map_err(|error| format!("{error:?}"))?;
+                        remaining -= 1;
                     }
-                    0x10 => channel.packet.engine_method = argument,
+                    0x10 => self.packet.engine_method = argument,
                     0x11 => {
-                        let method = channel.packet.engine_method;
-                        let register =
-                            channel.registers.get_mut(method as usize).ok_or_else(|| {
-                                super::execution_error(
-                                    descriptor,
-                                    request,
-                                    format!("engine register out of range: {method:#x}"),
-                                )
-                            })?;
-                        *register = argument;
+                        let method = self.packet.engine_method;
+                        *self.registers.get_mut(method as usize).ok_or_else(|| {
+                            format!("engine register out of range: {method:#x}")
+                        })? = argument;
                         log::trace!(
                             "Host1x engine: fd={} method={method:#x} argument={argument:#010x}",
                             descriptor.fd()
                         );
                         if method == 0xc0 {
-                            operations.push(Operation::Execute(channel.registers.clone()));
+                            match descriptor.kind() {
+                                NvDrvDeviceKind::HostNvDec => self
+                                    .decoder
+                                    .get_or_insert_with(|| {
+                                        video::NvDec::new(
+                                            gpu.and_then(|gpu| gpu.device_uuid()),
+                                            frames.clone(),
+                                            descriptor.fd(),
+                                        )
+                                    })
+                                    .execute(&self.registers, &job.mappings)?,
+                                NvDrvDeviceKind::HostVic => {
+                                    self.vic
+                                        .execute(&self.registers, &job.mappings, gpu, frames)?
+                                }
+                                _ => return Err("invalid Host1x engine".into()),
+                            }
                         }
                     }
                     _ => {
-                        return Err(super::execution_error(
-                            descriptor,
-                            request,
-                            format!("unsupported THI method {method:#x} argument={argument:#x}"),
+                        return Err(format!(
+                            "unsupported THI method {method:#x} argument={argument:#x}"
                         ));
                     }
                 }
             }
         }
-        if job
-            .advertised
-            .iter()
-            .any(|(id, count)| increments.remove(id).unwrap_or(0) != *count)
-            || !increments.is_empty()
-        {
-            return Err(super::execution_error(
-                descriptor,
-                request,
-                "submission syncpoint increments do not match executed commands",
-            ));
+        if remaining != 0 {
+            return Err("submission syncpoint increments do not match executed commands".into());
         }
-        Ok(operations)
-    };
-    let mut decode = decode;
-    decode().map_err(|error| error.to_string())
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -455,7 +441,14 @@ mod tests {
             .unwrap();
         let point = completion.point();
         let control = Arc::new(Mutex::new(control));
-        let worker = Worker::new(Arc::clone(&control), None).unwrap();
+        let worker = Worker::new(
+            Arc::clone(&control),
+            None,
+            consumer,
+            Arc::default(),
+            Arc::default(),
+        )
+        .unwrap();
         worker
             .submit(Job {
                 descriptor: consumer,
@@ -473,19 +466,38 @@ mod tests {
                     .flat_map(u32::to_le_bytes)
                     .collect(),
                 ],
-                advertised: BTreeMap::from([(b.syncpoint().get(), 1)]),
-                completions: vec![completion],
+                completion: Some(completion),
                 mappings: Arc::new(BTreeMap::new()),
                 timeout: 0,
             })
             .unwrap();
+        assert_eq!(control.lock().unwrap().point_reached(point), Some(false));
+        // Closing another device must not join this channel's unresolved wait.
+        let other = Worker::new(
+            control.clone(),
+            None,
+            descriptor(3),
+            Arc::default(),
+            Arc::default(),
+        )
+        .unwrap();
+        crate::test_memory::run(other.begin_close());
+        other.join().unwrap();
         assert_eq!(control.lock().unwrap().point_reached(point), Some(false));
         control
             .lock()
             .unwrap()
             .complete_channel_submission(producer, 0, &dependency)
             .unwrap();
-        worker.close(consumer.fd());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while control.lock().unwrap().point_reached(point) == Some(false) {
+            worker.require_healthy().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "Host1x dependency did not complete"
+            );
+            std::thread::yield_now();
+        }
         worker.require_healthy().unwrap();
         assert_eq!(control.lock().unwrap().point_reached(point), Some(true));
         let reservation = control
@@ -509,13 +521,16 @@ mod tests {
                     .flat_map(u32::to_le_bytes)
                     .collect(),
                 ],
-                advertised: BTreeMap::from([(b.syncpoint().get(), 1)]),
-                completions: vec![reservation],
+                completion: Some(reservation),
                 mappings: Arc::new(BTreeMap::new()),
                 timeout: 0,
             })
             .unwrap();
-        worker.close(consumer.fd());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.require_healthy().is_ok() {
+            assert!(Instant::now() < deadline, "Host1x failure was not reported");
+            std::thread::yield_now();
+        }
         assert!(
             worker
                 .require_healthy()
@@ -524,5 +539,197 @@ mod tests {
                 .contains("unmapped Host1x")
         );
         assert_eq!(control.lock().unwrap().point_reached(failed), Some(false));
+    }
+    use crate::nvdrv::nvmap::{NvMapAllocationMetadata, NvMapCpuMapping, NvMapObjects, NvMapOwner};
+    use nixe_memory::{
+        AddressSpaceId, AllocationRange, DeviceAccessEndpoint, DeviceAccessRequest,
+        GuestVirtualAddress,
+    };
+    struct Endpoint(mpsc::Sender<DeviceAccessRequest>);
+    impl DeviceAccessEndpoint for Endpoint {
+        fn submit(&self, r: DeviceAccessRequest) {
+            self.0.send(r).unwrap();
+        }
+        fn cancel(&self, _: nixe_memory::AccessRequestId) {}
+        fn allocation_released(&self, _: nixe_memory::MachineId, _: nixe_memory::AllocationId) {}
+        fn physical_retired(
+            &self,
+            _: nixe_memory::MachineId,
+            _: nixe_memory::AllocationId,
+            _: Box<[nixe_memory::Extent]>,
+        ) {
+        }
+        fn allocation_pressure(&self, _: nixe_memory::MachineId, _: u64) {}
+    }
+    fn job(mappings: video::Mappings) -> Job {
+        let words = [
+            0x5du32 << 6,
+            (4 << 28) | (0x10 << 16) | 0x1c2,
+            (4 << 28) | (0x11 << 16) | 0x10,
+            (4 << 28) | (0x10 << 16) | 0xc0,
+            (4 << 28) | (0x11 << 16) | 1,
+        ];
+        Job {
+            descriptor: descriptor(2),
+            request: 0x123,
+            commands: vec![words.into_iter().flat_map(u32::to_le_bytes).collect()],
+            completion: None,
+            mappings,
+            timeout: 0,
+        }
+    }
+    #[test]
+    fn stopping_preserves_a_real_device_read_failure() {
+        let machine = crate::test_memory::machine();
+        let allocation = machine.account(4096).unwrap().allocate(4096).unwrap();
+        let range = AllocationRange::new(allocation.pin(), 0, 4096).unwrap();
+        let mut nvmap = NvMapObjects::default();
+        let owner = NvMapOwner::new(1);
+        let handle = nvmap.create(owner, 4096).unwrap();
+        nvmap
+            .allocate(
+                owner,
+                handle,
+                NvMapAllocationMetadata::new(0, 0, 4096, 0),
+                NvMapCpuMapping::new(AddressSpaceId::new(1), GuestVirtualAddress::new(0x1000)),
+                Arc::from([range.clone()]),
+            )
+            .unwrap();
+        let object = nvmap
+            .object_snapshot_by_owned_handle(owner, handle)
+            .unwrap();
+        let mapping = super::super::Mapping {
+            physical: nixe_gpu::physical::PhysicalMapping::new(object.ranges().unwrap()).unwrap(),
+            object,
+            references: 1,
+        };
+        let mappings = Arc::new(BTreeMap::from([(0x1000, mapping)]));
+        machine.publish_device_write(&[range], || Ok(())).unwrap();
+        let (send, receive) = mpsc::channel();
+        let endpoint: Arc<dyn DeviceAccessEndpoint> = Arc::new(Endpoint(send));
+        machine.set_device_endpoint(&endpoint);
+        let control = Arc::new(Mutex::new(
+            NvHostControl::new(&crate::test_memory::kernel()),
+        ));
+        let worker =
+            Worker::new(control, None, descriptor(2), Arc::default(), Arc::default()).unwrap();
+        worker.submit(job(mappings)).unwrap();
+        let access = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.stop();
+        access.finish(Err(Arc::new(nixe_memory::MemoryError::Execution(
+            "native producer failed".into(),
+        ))));
+        crate::test_memory::run(worker.begin_close());
+        worker.join().unwrap();
+        assert!(
+            worker
+                .require_healthy()
+                .unwrap_err()
+                .to_string()
+                .contains("native producer failed")
+        );
+    }
+    #[test]
+    fn in_stream_increments_satisfy_intermediate_waits_before_the_job_finishes() {
+        let d = descriptor(2);
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
+        let initial = control.allocate_channel_syncpoint(d, 0).unwrap();
+        let completion = control
+            .reserve_channel_submission(d, 0, initial.syncpoint(), 2)
+            .unwrap();
+        let point = completion.point();
+        let control = Arc::new(Mutex::new(control));
+        let worker = Worker::new(control.clone(), None, d, Arc::default(), Arc::default()).unwrap();
+        let words = [
+            0x5du32 << 6,
+            (4 << 28) | point.syncpoint().get(),
+            1 << 6,
+            (4 << 28) | (0x4e << 16) | point.value().get().wrapping_sub(1),
+            (1 << 28) | (0x50 << 16) | 1,
+            point.syncpoint().get(),
+            0x5d << 6,
+            (4 << 28) | point.syncpoint().get(),
+        ];
+        worker
+            .submit(Job {
+                descriptor: d,
+                request: 0x456,
+                commands: vec![words.into_iter().flat_map(u32::to_le_bytes).collect()],
+                completion: Some(completion),
+                mappings: Arc::default(),
+                timeout: 10,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while control.lock().unwrap().point_reached(point) == Some(false) {
+            worker.require_healthy().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "in-stream dependency did not complete"
+            );
+            std::thread::yield_now();
+        }
+        worker.require_healthy().unwrap();
+        worker.stop();
+        worker.join().unwrap();
+        assert_eq!(control.lock().unwrap().point_reached(point), Some(true));
+    }
+    #[test]
+    fn stopping_a_passive_wait_preserves_prior_increments_without_a_failure() {
+        let producer = descriptor(1);
+        let consumer = descriptor(2);
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
+        let a = control.allocate_channel_syncpoint(producer, 0).unwrap();
+        let b = control.allocate_channel_syncpoint(consumer, 0).unwrap();
+        let dependency = control
+            .reserve_channel_submission(producer, 0, a.syncpoint(), 1)
+            .unwrap();
+        let completion = control
+            .reserve_channel_submission(consumer, 0, b.syncpoint(), 1)
+            .unwrap();
+        let point = completion.point();
+        let control = Arc::new(Mutex::new(control));
+        let worker = Worker::new(
+            control.clone(),
+            None,
+            consumer,
+            Arc::default(),
+            Arc::default(),
+        )
+        .unwrap();
+        let words = [
+            0x5du32 << 6,
+            (4 << 28) | point.syncpoint().get(),
+            1 << 6,
+            (4 << 28) | (0x4e << 16) | dependency.point().value().get(),
+            (1 << 28) | (0x50 << 16) | 1,
+            dependency.point().syncpoint().get(),
+        ];
+        worker
+            .submit(Job {
+                descriptor: consumer,
+                request: 0,
+                commands: vec![words.into_iter().flat_map(u32::to_le_bytes).collect()],
+                completion: Some(completion),
+                mappings: Arc::default(),
+                timeout: 0,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while control.lock().unwrap().point_reached(point) == Some(false) {
+            worker.require_healthy().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "worker did not execute its first increment"
+            );
+            std::thread::yield_now();
+        }
+        worker.stop();
+        worker.join().unwrap();
+        worker.require_healthy().unwrap();
+        assert_eq!(
+            control.lock().unwrap().point_reached(dependency.point()),
+            Some(false)
+        );
     }
 }

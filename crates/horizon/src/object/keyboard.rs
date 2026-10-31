@@ -30,26 +30,15 @@ impl AppletSession {
         let next = object
             .checked_add(1)
             .ok_or(CreateAppletStorageError::DomainCapacityExhausted)?;
-        let storage = domain.next_storage_id;
-        let next_storage = storage
-            .checked_add(1)
-            .ok_or(CreateAppletStorageError::AllocationFailed)?;
-        domain.storages.insert(
-            storage,
-            AppletStorage::Transfer {
+        domain.objects.insert(
+            object,
+            AppletObject::Storage(Arc::new(AppletStorage::Transfer {
                 memory,
                 size,
                 writable,
-            },
-        );
-        domain.objects.insert(
-            object,
-            AppletObject::Storage {
-                storage_id: storage,
-            },
+            })),
         );
         domain.next_object_id = next;
-        domain.next_storage_id = next_storage;
         Ok(object)
     }
     pub(crate) fn start_keyboard(
@@ -148,26 +137,16 @@ impl AppletSession {
         let next = id
             .checked_add(1)
             .ok_or(PopAppletLaunchParameterError::ObjectIdExhausted)?;
-        let storage = domain.next_storage_id;
-        let next_storage = storage
-            .checked_add(1)
-            .ok_or(PopAppletLaunchParameterError::StorageIdExhausted)?;
         let active = domain.active_library_applet.as_mut().unwrap();
         let output = active.interactive_output.pop_front().unwrap();
         if active.interactive_output.is_empty() {
             active.interactive_event.clear();
         }
-        domain
-            .storages
-            .insert(storage, AppletStorage::Owned(output));
         domain.objects.insert(
             id,
-            AppletObject::Storage {
-                storage_id: storage,
-            },
+            AppletObject::Storage(Arc::new(AppletStorage::Owned(Mutex::new(output)))),
         );
         domain.next_object_id = next;
-        domain.next_storage_id = next_storage;
         Ok(id)
     }
     pub(crate) async fn keyboard_validation(
@@ -177,20 +156,13 @@ impl AppletSession {
     ) -> Result<(), KeyboardValidationError> {
         let read = {
             let domain = self.domain.lock().unwrap();
-            let Some(AppletObject::Storage { storage_id }) = domain.objects.get(&storage_object)
-            else {
+            let Some(AppletObject::Storage(source)) = domain.objects.get(&storage_object) else {
                 return Err("keyboard validation input is not an IStorage".into());
             };
-            let source = domain
-                .storages
-                .get(storage_id)
-                .ok_or("keyboard validation storage is missing")?;
 
-            source
-                .read(0, source.len())
-                .map_err(|_| "cannot read keyboard validation storage")?
+            source.clone()
         };
-        let bytes = read.resolve().await.map_err(|error| match error {
+        let bytes = read.get_data().await.map_err(|error| match error {
             AppletStorageAccessError::Memory(error) => KeyboardValidationError::Memory(error),
             _ => KeyboardValidationError::Invalid("cannot read keyboard validation storage"),
         })?;
@@ -248,6 +220,7 @@ impl AppletSession {
 
 #[cfg(test)]
 mod tests {
+    use super::super::storage_test_support::*;
     use super::*;
     use crate::test_memory::run;
     fn config(check: bool, utf8: bool) -> KeyboardConfig {
@@ -262,16 +235,16 @@ mod tests {
     }
     fn response(session: &AppletSession, result: u32, message: &str, utf8: bool) -> u32 {
         let storage = session.create_storage(0x7d8).unwrap();
-        let AppletObject::Storage { storage_id } = session.object(storage).unwrap() else {
+        let AppletObject::Storage(backing) = session.object(storage).unwrap() else {
             unreachable!()
         };
-        run(session.write_storage(storage_id, 0, &result.to_le_bytes())).unwrap();
+        run(storage_write(&backing, 0, &result.to_le_bytes())).unwrap();
         let bytes: Vec<_> = if utf8 {
             message.as_bytes().to_vec()
         } else {
             message.encode_utf16().flat_map(u16::to_le_bytes).collect()
         };
-        run(session.write_storage(storage_id, 4, &bytes)).unwrap();
+        run(storage_write(&backing, 4, &bytes)).unwrap();
         storage
     }
     #[test]
@@ -301,10 +274,10 @@ mod tests {
             assert!(session.library_applet_result(applet).is_none());
             let output = session.pop_interactive_output(applet).unwrap();
             assert!(!event.is_signalled());
-            let AppletObject::Storage { storage_id } = session.object(output).unwrap() else {
+            let AppletObject::Storage(backing) = session.object(output).unwrap() else {
                 unreachable!()
             };
-            let bytes = run(session.read_storage(storage_id, 0, 0x7dc)).unwrap();
+            let bytes = run(storage_read(&backing, 0, 0x7dc)).unwrap();
             assert_eq!(
                 u64::from_le_bytes(bytes[..8].try_into().unwrap()),
                 if utf8 { 5 } else { 10 }
@@ -346,10 +319,10 @@ mod tests {
                     .unwrap()
                     .is_signalled()
             );
-            let AppletObject::Storage { storage_id } = session.object(output).unwrap() else {
+            let AppletObject::Storage(backing) = session.object(output).unwrap() else {
                 unreachable!()
             };
-            let bytes = run(session.read_storage(storage_id, 0, 0x7d8)).unwrap();
+            let bytes = run(storage_read(&backing, 0, 0x7d8)).unwrap();
             assert_eq!(bytes, keyboard.config.encode_result("Nixe", false));
             assert!(session.close_object(applet));
         }
@@ -365,43 +338,36 @@ mod tests {
         let id = session
             .create_transfer_storage(Arc::clone(&transfer), 0x2000, true)
             .unwrap();
-        let AppletObject::Storage { storage_id } = session.object(id).unwrap() else {
+        let AppletObject::Storage(backing) = session.object(id).unwrap() else {
             unreachable!()
         };
         drop(transfer);
-        assert_eq!(
-            run(session.read_storage(storage_id, 0xffc, 8)).unwrap(),
-            b"initial!"
-        );
-        run(session.write_storage(storage_id, 0xffe, b"change")).unwrap();
+        assert_eq!(run(storage_read(&backing, 0xffc, 8)).unwrap(), b"initial!");
+        run(storage_write(&backing, 0xffe, b"change")).unwrap();
         let mut actual = [0; 8];
         let alias = ranges.capture(0xffc, 8).unwrap();
         crate::test_memory::read(&alias, &mut actual);
         assert_eq!(&actual, b"inchange");
-        let reader = session.open_storage_accessor(storage_id).unwrap();
+        let reader = session.open_storage_accessor(backing.clone()).unwrap();
         session.close_object(id);
-        assert_eq!(
-            run(session.read_storage(storage_id, 0xffc, 8)).unwrap(),
-            b"inchange"
-        );
+        assert_eq!(run(storage_read(&backing, 0xffc, 8)).unwrap(), b"inchange");
+        let weak = Arc::downgrade(&backing);
+        drop(backing);
         session.close_object(reader);
-        assert!(matches!(
-            run(session.read_storage(storage_id, 0, 1)),
-            Err(AppletStorageAccessError::NotFound)
-        ));
+        assert!(weak.upgrade().is_none());
         let transfer = crate::test_memory::transfer(&[0; 0x2000]);
         let id = session
             .create_transfer_storage(transfer, 0x1000, false)
             .unwrap();
-        let AppletObject::Storage { storage_id } = session.object(id).unwrap() else {
+        let AppletObject::Storage(backing) = session.object(id).unwrap() else {
             unreachable!()
         };
         assert!(matches!(
-            run(session.write_storage(storage_id, 0, b"x")),
+            run(storage_write(&backing, 0, b"x")),
             Err(AppletStorageAccessError::ReadOnly)
         ));
         assert!(matches!(
-            run(session.read_storage(storage_id, 0x1000, 1)),
+            run(storage_read(&backing, 0x1000, 1)),
             Err(AppletStorageAccessError::OutOfRange)
         ));
     }
@@ -422,11 +388,11 @@ mod tests {
         let keyboard = host.take_request().unwrap();
         keyboard.submit(Submission::Cancel);
         let output = session.pop_library_applet_output(applet).unwrap();
-        let AppletObject::Storage { storage_id } = session.object(output).unwrap() else {
+        let AppletObject::Storage(backing) = session.object(output).unwrap() else {
             unreachable!()
         };
         assert_eq!(
-            run(session.read_storage(storage_id, 0, 4)).unwrap(),
+            run(storage_read(&backing, 0, 4)).unwrap(),
             1u32.to_le_bytes()
         );
         session.close_object(applet);

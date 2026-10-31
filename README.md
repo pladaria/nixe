@@ -15,7 +15,7 @@ both platforms whenever technically appropriate.
 
 ## Project Status
 
-Nixe is in an early stage of development, but it can already run a range of homebrew applications and
+Nixe is in an early stage of development, but it can already run a range of Switch homebrew applications and
 commercial games; some run at native speed, depending on the title and host hardware. It supports homebrew
 NRO files and commercial NSP and XCI packages, including the compressed NSZ and XCZ formats. Gamepad input is
 available through the emulated HID services.
@@ -34,6 +34,10 @@ available through the emulated HID services.
   <tr>
     <td><img src="docs/screenshots/the-legend-of-zelda-link-s-awakening-20261026T211235.406668086Z.png" alt=""></td>
     <td><img src="docs/screenshots/the-legend-of-zelda-link-s-awakening-20261026T211322.695753781Z.png" alt=""></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/mario-vs-donkey-kong-20261030T164922.412480780Z.png" alt=""></td>
+    <td><img src="docs/screenshots/mario-vs-donkey-kong-20261030T164956.989531837Z.png" alt=""></td>
   </tr>
 </table>
 
@@ -88,7 +92,8 @@ cargo cli run <id | name>
 Hotkeys:
 
 - <kbd>S</kbd>: save a screenshot as a PNG file (see `nixe.toml` for the screenshots directory)
-- <kbd>1</kbd>: resize the window to the frame's native resolution.
+- <kbd>P</kbd>: pause or resume the emulation
+- <kbd>1</kbd>: resize the window to the frame's native resolution
 
 ## Testing
 

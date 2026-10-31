@@ -733,7 +733,7 @@ mod visibility {
             .unwrap();
         let output = AllocationRange::new(allocation.pin(), PAGE_SIZE, 9 * 80).unwrap();
         let nixe_memory::AccessResult::Read(bytes) = residency
-            .access_memory(vec![output], nixe_memory::AccessOperation::Read)
+            .access_memory(vec![output], nixe_memory::AccessOperation::Read(Vec::new()))
             .unwrap()
         else {
             panic!("physical read");
@@ -839,7 +839,7 @@ mod visibility {
             "native aspect writes must not recapture their old RAM inputs"
         );
         let nixe_memory::AccessResult::Read(result) = residency
-            .access_memory(vec![input], nixe_memory::AccessOperation::Read)
+            .access_memory(vec![input], nixe_memory::AccessOperation::Read(Vec::new()))
             .unwrap()
         else {
             panic!("physical read");

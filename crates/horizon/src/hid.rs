@@ -142,7 +142,7 @@ impl Publication {
             match pending.poll() {
                 None => return Ok(false),
                 Some(Err(error)) => return Err(HidInputError::Memory(error)),
-                Some(Ok(AccessResult::Written)) => self.pending = None,
+                Some(Ok(AccessResult::Written(_))) => self.pending = None,
                 Some(Ok(_)) => {
                     return Err(HidInputError::Memory(Arc::new(MemoryError::Execution(
                         "invalid HID write completion".into(),

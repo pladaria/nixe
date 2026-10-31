@@ -147,7 +147,7 @@ impl CodeRead {
             let AccessResult::Read(bytes) = result else {
                 return Err(Arc::new(MemoryError::Invalid("invalid code read result")));
             };
-            let bytes: [u8; 4] = bytes.as_ref().try_into().map_err(|_| {
+            let bytes: [u8; 4] = bytes.as_slice().try_into().map_err(|_| {
                 Arc::new(MemoryError::Invalid(
                     "code read did not return one A64 word",
                 ))

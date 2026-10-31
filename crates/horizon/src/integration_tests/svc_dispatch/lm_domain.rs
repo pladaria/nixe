@@ -20,10 +20,12 @@ fn domain_request(id: u32, pid: bool) -> [u8; 0x100] {
 #[test]
 fn logger_domain_shares_child_objects_with_clones_and_closes_them_independently() {
     let (_directory, mut process) = fixture_process(&[svc(0x21); 7]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let handle = process
         .handles()
-        .insert(HorizonIpcObject::LogManager(Default::default()))
+        .insert(nixe_horizon::ServiceSession::new(
+            HorizonIpcObject::LogManager(Default::default()),
+        ))
         .unwrap();
     let tls = process.main_thread().tls_base;
     let mut control = [0; 0x100];
@@ -34,7 +36,7 @@ fn logger_domain_shares_child_objects_with_clones_and_closes_them_independently(
     write_guest_bytes(&process, tls, &control);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
@@ -42,7 +44,7 @@ fn logger_domain_shares_child_objects_with_clones_and_closes_them_independently(
     write_guest_bytes(&process, tls, &domain_request(1, false));
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
@@ -53,7 +55,7 @@ fn logger_domain_shares_child_objects_with_clones_and_closes_them_independently(
     write_guest_bytes(&process, tls, &domain_request(1, true));
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, tls.checked_add(16).unwrap()), 1);
@@ -69,7 +71,7 @@ fn logger_domain_shares_child_objects_with_clones_and_closes_them_independently(
     write_guest_bytes(&process, tls, &control);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     let clone = read_guest_u32(&process, tls.checked_add(12).unwrap());
@@ -94,7 +96,7 @@ fn logger_domain_shares_child_objects_with_clones_and_closes_them_independently(
     write_guest_bytes(&process, tls, &log);
     process.main_thread().registers().write_w(x(0), clone);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
@@ -108,14 +110,14 @@ fn logger_domain_shares_child_objects_with_clones_and_closes_them_independently(
     write_guest_bytes(&process, tls, &close);
     process.main_thread().registers().write_w(x(0), clone);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
     write_guest_bytes(&process, tls, &log);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(

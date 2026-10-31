@@ -331,9 +331,7 @@ impl Timers {
                     }
                 }
                 Action::Preempt(interval) => {
-                    if kernel.rotate() {
-                        self.shared.notify();
-                    }
+                    kernel.rotate();
                     let next = now.saturating_add(interval - (now - entry.deadline) % interval);
                     self.insert(next, Action::Preempt(interval));
                 }
@@ -448,6 +446,9 @@ impl Future for Deadline {
                 _ => {}
             }
         } else {
+            if kernel.timers.shared.stopped.load(Ordering::Acquire) {
+                return Poll::Ready(Err(TimerStopped));
+            }
             if !kernel.clock.is_paused() && kernel.clock.scheduler_time_ns() >= this.deadline {
                 return Poll::Ready(Ok(()));
             }
@@ -631,6 +632,19 @@ mod tests {
         fn wake(self: Arc<Self>) {
             let _ = self.0.send(());
         }
+    }
+
+    #[test]
+    fn stopped_driver_rejects_an_elapsed_deadline_that_has_not_been_polled() {
+        let kernel = kernel(VirtualClockMode::Fixed { unix_seconds: 0 });
+        let mut deadline = std::pin::pin!(kernel.deadline(0));
+        kernel.stop_timers().unwrap();
+        assert_eq!(
+            deadline
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(TimerStopped))
+        );
     }
 
     #[test]

@@ -139,7 +139,7 @@ fn dispatch_network_interface_manager(
                 )
             } else {
                 let handle = process
-                    .return_handle(HorizonIpcObject::NetworkGeneralService(service))
+                    .return_service(HorizonIpcObject::NetworkGeneralService(service))
                     .map_err(IpcWireError::Handle)?;
                 log::debug!("nifm:u opened IGeneralService handle {handle:#x}");
                 Ok((
@@ -196,7 +196,7 @@ pub(in crate::ipc_wire) fn dispatch_network_general_service(
         semantic_success(request.token, true, &[], &[], &[id], None)
     } else {
         let handle = process
-            .return_handle(HorizonIpcObject::NetworkRequest(session))
+            .return_service(HorizonIpcObject::NetworkRequest(session))
             .map_err(IpcWireError::Handle)?;
         semantic_success(request.token, false, &[], &[], &[], Some(handle))
     }

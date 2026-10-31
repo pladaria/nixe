@@ -214,7 +214,7 @@ impl VulkanResidency {
                 );
             }
             let nixe_memory::AccessResult::Read(data) =
-                self.access_memory(inputs, nixe_memory::AccessOperation::Read)?
+                self.access_memory(inputs, nixe_memory::AccessOperation::Read(Vec::new()))?
             else {
                 return Err(VulkanError::InvalidResource(
                     "encoded image read returned no bytes",

@@ -124,7 +124,7 @@ impl AddressWord {
         {
             Access::Ready(()) => Ok(()),
             Access::Pending(pending) => match pending.await? {
-                AccessResult::Written => Ok(()),
+                AccessResult::Written(_) => Ok(()),
                 _ => Err(Arc::new(MemoryError::Execution(
                     "kernel word write completion kind".into(),
                 ))),

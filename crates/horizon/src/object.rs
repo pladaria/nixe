@@ -23,12 +23,8 @@ use crate::nvdrv::NvDrvSession;
 use crate::user::{DEFAULT_USER, UserIdentity};
 use crate::{BsdSession, bsd::BsdServiceRegistry};
 
-/// Every Horizon-owned object that may receive an IPC request through a
-/// process handle.
-///
-/// Keeping one exhaustive value in the generic runtime handle table makes
-/// object classification constant-time and compiler-checked. Kernel objects
-/// such as events and shared memory remain independent runtime handle values.
+/// Typed handlers owned by service sessions. Kernel objects such as events
+/// and shared memory remain independent runtime handle values.
 #[derive(Clone, Debug)]
 pub enum HorizonIpcObject {
     ServiceManager(ServiceManagerSession),
@@ -994,6 +990,7 @@ impl HidSession {
 #[derive(Clone, Debug)]
 pub struct IrsSession {
     shared_memory: SharedMemoryObject,
+    publication: Arc<crate::ipc_wire::operation::Publication>,
 }
 
 impl IrsSession {
@@ -1007,6 +1004,7 @@ impl IrsSession {
         }
         Ok(Self {
             shared_memory: crate::system_memory::create(account, initial.len(), &initial)?,
+            publication: Arc::default(),
         })
     }
 
@@ -1018,19 +1016,8 @@ impl IrsSession {
         &self,
         aruid: u64,
         active: bool,
-        scheduling: &Arc<crate::ipc_wire::operation::ServiceScheduling>,
     ) -> Result<bool, Arc<nixe_memory::MemoryError>> {
-        let allocation = self.shared_memory.allocation();
-        let turn = scheduling
-            .enter(crate::ipc_wire::operation::ServiceKey::Shared(
-                allocation.machine().identity(),
-                allocation.identity(),
-            ))
-            .map_err(|_| {
-                Arc::new(nixe_memory::MemoryError::Execution(
-                    "IRS update identity exhausted".into(),
-                ))
-            })?;
+        let turn = self.publication.enter();
         (&turn).await;
         let mut empty = None;
         for index in 0..5 {
@@ -1076,9 +1063,6 @@ mod infrared_tests {
             shared.remote_permissions(),
             nixe_cpu::memory::MemoryPermissions::READ
         );
-        let scheduling = Arc::new(crate::ipc_wire::operation::ServiceScheduling::new(
-            &crate::test_memory::kernel(),
-        ));
         for camera in 0..9 {
             let entry =
                 crate::test_memory::run(crate::system_memory::read(&shared, camera * 0xe30, 16))
@@ -1087,12 +1071,12 @@ mod infrared_tests {
             assert!(entry[1..].iter().all(|byte| *byte == 0));
         }
         for aruid in 1..=5 {
-            assert!(crate::test_memory::run(session.set_active(aruid, true, &scheduling)).unwrap());
+            assert!(crate::test_memory::run(session.set_active(aruid, true)).unwrap());
         }
-        assert!(crate::test_memory::run(clone.set_active(3, true, &scheduling)).unwrap());
-        assert!(!crate::test_memory::run(session.set_active(6, true, &scheduling)).unwrap());
-        assert!(crate::test_memory::run(clone.set_active(3, false, &scheduling)).unwrap());
-        assert!(crate::test_memory::run(session.set_active(6, true, &scheduling)).unwrap());
+        assert!(crate::test_memory::run(clone.set_active(3, true)).unwrap());
+        assert!(!crate::test_memory::run(session.set_active(6, true)).unwrap());
+        assert!(crate::test_memory::run(clone.set_active(3, false)).unwrap());
+        assert!(crate::test_memory::run(session.set_active(6, true)).unwrap());
         let entries = crate::test_memory::run(crate::system_memory::read(
             &clone.shared_memory(),
             9 * 0xe30,
@@ -1232,6 +1216,7 @@ impl TimeEnvironment {
                 shared_memory,
                 clock_contexts: Mutex::new([context; 3]),
                 counters: Mutex::new([0; 2]),
+                publications: std::array::from_fn(|_| Arc::default()),
             }),
         })
     }
@@ -1253,6 +1238,7 @@ struct TimeState {
     timezone: Tz,
     shared_memory: SharedMemoryObject,
     clock_contexts: Mutex<[SystemClockContext; 3]>,
+    publications: [Arc<crate::ipc_wire::operation::Publication>; 3],
     counters: Mutex<[u32; 2]>,
 }
 
@@ -1327,20 +1313,8 @@ impl TimeState {
         &self,
         kind: SystemClockKind,
         unix_seconds: i64,
-        scheduling: &Arc<crate::ipc_wire::operation::ServiceScheduling>,
     ) -> Result<(), Arc<nixe_memory::MemoryError>> {
-        let allocation = self.shared_memory.allocation();
-        let turn = scheduling
-            .enter(crate::ipc_wire::operation::ServiceKey::Clock(
-                allocation.machine().identity(),
-                allocation.identity(),
-                kind.index() as u8,
-            ))
-            .map_err(|_| {
-                Arc::new(nixe_memory::MemoryError::Execution(
-                    "clock update identity exhausted".into(),
-                ))
-            })?;
+        let turn = self.publications[kind.index()].enter();
         (&turn).await;
         let steady_time_point = self.steady_seconds();
         let context = SystemClockContext {
@@ -1482,11 +1456,8 @@ impl SystemClockSession {
     pub(crate) async fn set_current_time(
         &self,
         unix_seconds: i64,
-        scheduling: &Arc<crate::ipc_wire::operation::ServiceScheduling>,
     ) -> Result<(), Arc<nixe_memory::MemoryError>> {
-        self.state
-            .set_current_time(self.kind, unix_seconds, scheduling)
-            .await
+        self.state.set_current_time(self.kind, unix_seconds).await
     }
 
     pub(crate) fn context(&self) -> [u8; 0x20] {
@@ -1679,7 +1650,7 @@ impl LibraryAppletMode {
 }
 
 /// Object kinds hosted by the application applet-service domain.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum AppletObject {
     Root,
     Proxy(AppletProxyKind),
@@ -1699,12 +1670,8 @@ pub(crate) enum AppletObject {
         applet_id: LibraryAppletId,
         mode: LibraryAppletMode,
     },
-    Storage {
-        storage_id: u64,
-    },
-    StorageAccessor {
-        storage_id: u64,
-    },
+    Storage(Arc<AppletStorage>),
+    StorageAccessor(Arc<AppletStorage>),
 }
 
 /// Interface family returned by `IApplicationProxyService` for the caller's
@@ -1726,7 +1693,7 @@ struct ActiveLibraryApplet {
     output_event: WritableEventObject,
     output_reader: ReadableEventObject,
     state_changed_event_reader: ReadableEventObject,
-    input_storage_ids: VecDeque<u64>,
+    input_storages: VecDeque<Arc<AppletStorage>>,
     keyboard: Option<Arc<nixe_applets::keyboard::KeyboardSession>>,
     check_text: Option<String>,
     confirmation_text: Option<String>,
@@ -1820,19 +1787,16 @@ pub(crate) enum PopAppletLaunchParameterError {
     NotAvailable,
     DomainCapacityExhausted,
     ObjectIdExhausted,
-    StorageIdExhausted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OpenAppletStorageAccessorError {
-    StorageNotFound,
     DomainCapacityExhausted,
     ObjectIdExhausted,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum AppletStorageAccessError {
-    NotFound,
     OutOfRange,
     ReadOnly,
     Memory(Arc<nixe_memory::MemoryError>),
@@ -1860,9 +1824,11 @@ pub(crate) enum PrepareLibraryAppletLaunchError {
     AllocationFailed,
 }
 
+/// A storage/accessor retains this backing independently of its domain slot.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/am/library_applet_storage.cpp
 #[derive(Debug)]
-enum AppletStorage {
-    Owned(Vec<u8>),
+pub(crate) enum AppletStorage {
+    Owned(Mutex<Vec<u8>>),
     Transfer {
         memory: Arc<nixe_runtime::TransferMemoryObject>,
         size: usize,
@@ -1870,48 +1836,101 @@ enum AppletStorage {
     },
 }
 impl AppletStorage {
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
-            Self::Owned(bytes) => bytes.len(),
+            Self::Owned(bytes) => bytes.lock().unwrap().len(),
             Self::Transfer { size, .. } => *size,
         }
     }
-    fn read(&self, offset: u64, size: usize) -> Result<StorageRead, AppletStorageAccessError> {
-        let start = usize::try_from(offset).map_err(|_| AppletStorageAccessError::OutOfRange)?;
-        let end = start
-            .checked_add(size)
-            .filter(|end| *end <= self.len())
-            .ok_or(AppletStorageAccessError::OutOfRange)?;
-        Ok(match self {
-            Self::Owned(bytes) => StorageRead::Owned(bytes[start..end].to_vec()),
-            Self::Transfer { memory, .. } => StorageRead::Transfer {
-                memory: memory.clone(),
-                offset,
-                bytes: size,
-            },
-        })
-    }
-}
-
-enum StorageRead {
-    Owned(Vec<u8>),
-    Transfer {
-        memory: Arc<nixe_runtime::TransferMemoryObject>,
+    pub(crate) fn validate(
+        &self,
         offset: u64,
-        bytes: usize,
-    },
-}
-impl StorageRead {
-    async fn resolve(self) -> Result<Vec<u8>, AppletStorageAccessError> {
+        size: usize,
+        write: bool,
+    ) -> Result<(), AppletStorageAccessError> {
+        if write
+            && matches!(
+                self,
+                Self::Transfer {
+                    writable: false,
+                    ..
+                }
+            )
+        {
+            return Err(AppletStorageAccessError::ReadOnly);
+        }
+        if usize::try_from(offset)
+            .ok()
+            .and_then(|start| start.checked_add(size))
+            .is_none_or(|end| end > self.len())
+        {
+            return Err(AppletStorageAccessError::OutOfRange);
+        }
+        Ok(())
+    }
+    pub(crate) async fn read_into(
+        &self,
+        offset: u64,
+        output: &mut Vec<u8>,
+    ) -> Result<(), AppletStorageAccessError> {
         match self {
-            Self::Owned(bytes) => Ok(bytes),
-            Self::Transfer {
-                memory,
-                offset,
-                bytes,
-            } => crate::system_memory::read_transfer(&memory, offset, bytes)
-                .await
-                .map_err(AppletStorageAccessError::Memory),
+            Self::Owned(bytes) => {
+                let bytes = bytes.lock().unwrap();
+                let start =
+                    usize::try_from(offset).map_err(|_| AppletStorageAccessError::OutOfRange)?;
+                let end = start
+                    .checked_add(output.len())
+                    .ok_or(AppletStorageAccessError::OutOfRange)?;
+                output.copy_from_slice(
+                    bytes
+                        .get(start..end)
+                        .ok_or(AppletStorageAccessError::OutOfRange)?,
+                );
+                Ok(())
+            }
+            Self::Transfer { memory, .. } => {
+                self.validate(offset, output.len(), false)?;
+                crate::system_memory::read_transfer_into(memory, offset, output)
+                    .await
+                    .map_err(AppletStorageAccessError::Memory)
+            }
+        }
+    }
+    pub(crate) async fn write(
+        &self,
+        offset: u64,
+        input: &mut Vec<u8>,
+    ) -> Result<(), AppletStorageAccessError> {
+        match self {
+            Self::Owned(bytes) => {
+                let mut bytes = bytes.lock().unwrap();
+                let start =
+                    usize::try_from(offset).map_err(|_| AppletStorageAccessError::OutOfRange)?;
+                let end = start
+                    .checked_add(input.len())
+                    .ok_or(AppletStorageAccessError::OutOfRange)?;
+                bytes
+                    .get_mut(start..end)
+                    .ok_or(AppletStorageAccessError::OutOfRange)?
+                    .copy_from_slice(input);
+                Ok(())
+            }
+            Self::Transfer { memory, .. } => {
+                self.validate(offset, input.len(), true)?;
+                crate::system_memory::write_transfer(memory, offset, input)
+                    .await
+                    .map_err(AppletStorageAccessError::Memory)
+            }
+        }
+    }
+    async fn get_data(&self) -> Result<Vec<u8>, AppletStorageAccessError> {
+        match self {
+            Self::Owned(bytes) => Ok(bytes.lock().unwrap().clone()),
+            Self::Transfer { size, .. } => {
+                let mut output = vec![0; *size];
+                self.read_into(0, &mut output).await?;
+                Ok(output)
+            }
         }
     }
 }
@@ -1941,8 +1960,6 @@ struct AppletDomain {
     accumulated_suspended_ticks: u64,
     gpu_error_detected_event: ReadableEventObject,
     active_library_applet: Option<ActiveLibraryApplet>,
-    next_storage_id: u64,
-    storages: BTreeMap<u64, AppletStorage>,
 }
 
 /// Client session connected to Horizon's `appletOE` service.
@@ -2008,8 +2025,6 @@ impl AppletSession {
                 accumulated_suspended_ticks: 0,
                 gpu_error_detected_event: gpu_error_event_reader,
                 active_library_applet: None,
-                next_storage_id: 1,
-                storages: BTreeMap::new(),
             })),
         };
         // No library applet occupies the process-local launch slot initially.
@@ -2085,7 +2100,7 @@ impl AppletSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .objects
             .get(&object_id)
-            .copied()
+            .cloned()
     }
 
     pub(crate) fn insert_object(&self, object: AppletObject) -> Option<u32> {
@@ -2103,67 +2118,35 @@ impl AppletSession {
     }
 
     pub(crate) fn close_object(&self, object_id: u32) -> bool {
-        let mut domain = self
-            .domain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if object_id == APPLET_ROOT_OBJECT_ID {
             return false;
         }
-        let removed_object = domain.objects.remove(&object_id);
-        let removed = removed_object.is_some();
-        let released_input_storage_ids = if removed
-            && domain
-                .active_library_applet
-                .as_ref()
-                .is_some_and(|active| active.object_id == object_id)
-        {
-            let mut active = domain.active_library_applet.take().unwrap();
-            if let Some(keyboard) = &active.keyboard {
-                keyboard.finish();
-            }
-            domain.library_applet_launchable_event.signal();
-            std::mem::take(&mut active.input_storage_ids)
-        } else {
-            VecDeque::new()
+        let (removed, active) = {
+            let mut domain = self
+                .domain
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let removed = domain.objects.remove(&object_id);
+            let active = if removed.is_some()
+                && domain
+                    .active_library_applet
+                    .as_ref()
+                    .is_some_and(|active| active.object_id == object_id)
+            {
+                Some((
+                    domain.active_library_applet.take().unwrap(),
+                    domain.library_applet_launchable_event.clone(),
+                ))
+            } else {
+                None
+            };
+            (removed, active)
         };
-        if let Some(
-            AppletObject::Storage { storage_id } | AppletObject::StorageAccessor { storage_id },
-        ) = removed_object
-        {
-            let still_referenced = domain.objects.values().any(|object| {
-                matches!(
-                    object,
-                    AppletObject::Storage {
-                        storage_id: candidate
-                    } | AppletObject::StorageAccessor {
-                        storage_id: candidate
-                    } if *candidate == storage_id
-                )
-            }) || domain
-                .active_library_applet
-                .as_ref()
-                .is_some_and(|active| active.input_storage_ids.contains(&storage_id));
-            if !still_referenced {
-                domain.storages.remove(&storage_id);
-            }
+        if let Some((active, launchable)) = active {
+            drop(active);
+            launchable.signal();
         }
-        for storage_id in released_input_storage_ids {
-            let still_referenced = domain.objects.values().any(|object| {
-                matches!(
-                    object,
-                    AppletObject::Storage {
-                        storage_id: candidate
-                    } | AppletObject::StorageAccessor {
-                        storage_id: candidate
-                    } if *candidate == storage_id
-                )
-            });
-            if !still_referenced {
-                domain.storages.remove(&storage_id);
-            }
-        }
-        removed
+        removed.is_some()
     }
 
     pub(crate) fn create_storage(&self, size: u64) -> Result<u32, CreateAppletStorageError> {
@@ -2188,18 +2171,11 @@ impl AppletSession {
         let next_object_id = object_id
             .checked_add(1)
             .ok_or(CreateAppletStorageError::DomainCapacityExhausted)?;
-        let storage_id = domain.next_storage_id;
-        let next_storage_id = storage_id
-            .checked_add(1)
-            .ok_or(CreateAppletStorageError::AllocationFailed)?;
-        domain
-            .storages
-            .insert(storage_id, AppletStorage::Owned(bytes));
-        domain
-            .objects
-            .insert(object_id, AppletObject::Storage { storage_id });
+        domain.objects.insert(
+            object_id,
+            AppletObject::Storage(Arc::new(AppletStorage::Owned(Mutex::new(bytes)))),
+        );
         domain.next_object_id = next_object_id;
-        domain.next_storage_id = next_storage_id;
         Ok(object_id)
     }
 
@@ -2233,38 +2209,28 @@ impl AppletSession {
         let next_object_id = object_id
             .checked_add(1)
             .ok_or(PopAppletLaunchParameterError::ObjectIdExhausted)?;
-        let storage_id = domain.next_storage_id;
-        let next_storage_id = storage_id
-            .checked_add(1)
-            .ok_or(PopAppletLaunchParameterError::StorageIdExhausted)?;
         let bytes = domain
             .launch_parameters
             .get_mut(&kind)
             .and_then(VecDeque::pop_front)
             .expect("launch parameter availability was checked while holding the lock");
 
-        domain
-            .storages
-            .insert(storage_id, AppletStorage::Owned(bytes));
-        domain
-            .objects
-            .insert(object_id, AppletObject::Storage { storage_id });
+        domain.objects.insert(
+            object_id,
+            AppletObject::Storage(Arc::new(AppletStorage::Owned(Mutex::new(bytes)))),
+        );
         domain.next_object_id = next_object_id;
-        domain.next_storage_id = next_storage_id;
         Ok(object_id)
     }
 
     pub(crate) fn open_storage_accessor(
         &self,
-        storage_id: u64,
+        storage: Arc<AppletStorage>,
     ) -> Result<u32, OpenAppletStorageAccessorError> {
         let mut domain = self
             .domain
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !domain.storages.contains_key(&storage_id) {
-            return Err(OpenAppletStorageAccessorError::StorageNotFound);
-        }
         if domain.objects.len() >= MAX_APPLET_DOMAIN_OBJECTS {
             return Err(OpenAppletStorageAccessorError::DomainCapacityExhausted);
         }
@@ -2275,77 +2241,8 @@ impl AppletSession {
             .ok_or(OpenAppletStorageAccessorError::ObjectIdExhausted)?;
         domain
             .objects
-            .insert(object_id, AppletObject::StorageAccessor { storage_id });
+            .insert(object_id, AppletObject::StorageAccessor(storage));
         Ok(object_id)
-    }
-
-    pub(crate) fn storage_size(&self, storage_id: u64) -> Option<u64> {
-        let domain = self
-            .domain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        u64::try_from(domain.storages.get(&storage_id)?.len()).ok()
-    }
-
-    pub(crate) async fn write_storage(
-        &self,
-        storage_id: u64,
-        offset: u64,
-        bytes: &[u8],
-    ) -> Result<(), AppletStorageAccessError> {
-        let transfer = {
-            let mut domain = self
-                .domain
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let storage = domain
-                .storages
-                .get_mut(&storage_id)
-                .ok_or(AppletStorageAccessError::NotFound)?;
-            let start =
-                usize::try_from(offset).map_err(|_| AppletStorageAccessError::OutOfRange)?;
-            let end = start
-                .checked_add(bytes.len())
-                .filter(|end| *end <= storage.len())
-                .ok_or(AppletStorageAccessError::OutOfRange)?;
-            match storage {
-                AppletStorage::Owned(storage) => {
-                    storage[start..end].copy_from_slice(bytes);
-                    return Ok(());
-                }
-                AppletStorage::Transfer {
-                    memory, writable, ..
-                } => {
-                    if !*writable {
-                        return Err(AppletStorageAccessError::ReadOnly);
-                    }
-                    memory.clone()
-                }
-            }
-        };
-        crate::system_memory::write_transfer(&transfer, offset, bytes)
-            .await
-            .map_err(AppletStorageAccessError::Memory)
-    }
-
-    pub(crate) async fn read_storage(
-        &self,
-        storage_id: u64,
-        offset: u64,
-        size: usize,
-    ) -> Result<Vec<u8>, AppletStorageAccessError> {
-        let read = {
-            let domain = self
-                .domain
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            domain
-                .storages
-                .get(&storage_id)
-                .ok_or(AppletStorageAccessError::NotFound)?
-                .read(offset, size)?
-        };
-        read.resolve().await
     }
 
     pub(crate) fn create_library_applet(
@@ -2388,7 +2285,7 @@ impl AppletSession {
             output_event,
             output_reader,
             state_changed_event_reader,
-            input_storage_ids: VecDeque::new(),
+            input_storages: VecDeque::new(),
             keyboard: None,
             check_text: None,
             confirmation_text: None,
@@ -2474,10 +2371,6 @@ impl AppletSession {
         let next_object = storage_object
             .checked_add(1)
             .ok_or(PopAppletLaunchParameterError::ObjectIdExhausted)?;
-        let storage_id = domain.next_storage_id;
-        let next_storage = storage_id
-            .checked_add(1)
-            .ok_or(PopAppletLaunchParameterError::StorageIdExhausted)?;
         let output = domain
             .active_library_applet
             .as_mut()
@@ -2491,13 +2384,10 @@ impl AppletSession {
             .unwrap()
             .output_event
             .clear();
-        domain
-            .storages
-            .insert(storage_id, AppletStorage::Owned(output));
-        domain
-            .objects
-            .insert(storage_object, AppletObject::Storage { storage_id });
-        domain.next_storage_id = next_storage;
+        domain.objects.insert(
+            storage_object,
+            AppletObject::Storage(Arc::new(AppletStorage::Owned(Mutex::new(output)))),
+        );
         domain.next_object_id = next_object;
         Ok(storage_object)
     }
@@ -2511,8 +2401,7 @@ impl AppletSession {
             .domain
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(AppletObject::Storage { storage_id }) =
-            domain.objects.get(&storage_object_id).copied()
+        let Some(AppletObject::Storage(storage)) = domain.objects.get(&storage_object_id).cloned()
         else {
             return Err(PushLibraryAppletStorageError::StorageNotFound);
         };
@@ -2523,10 +2412,10 @@ impl AppletSession {
             return Err(PushLibraryAppletStorageError::AppletNotFound);
         }
         active
-            .input_storage_ids
+            .input_storages
             .try_reserve(1)
             .map_err(|_| PushLibraryAppletStorageError::AllocationFailed)?;
-        active.input_storage_ids.push_back(storage_id);
+        active.input_storages.push_back(storage);
         Ok(())
     }
 
@@ -2546,28 +2435,20 @@ impl AppletSession {
                 return Err(PrepareLibraryAppletLaunchError::AppletNotFound);
             }
             let Some(AppletObject::LibraryAppletAccessor { applet_id, mode }) =
-                domain.objects.get(&applet_object_id).copied()
+                domain.objects.get(&applet_object_id).cloned()
             else {
                 return Err(PrepareLibraryAppletLaunchError::AppletNotFound);
             };
             let mut input_storages = Vec::new();
             input_storages
-                .try_reserve_exact(active.input_storage_ids.len())
+                .try_reserve_exact(active.input_storages.len())
                 .map_err(|_| PrepareLibraryAppletLaunchError::AllocationFailed)?;
-            for storage_id in &active.input_storage_ids {
-                let Some(source) = domain.storages.get(storage_id) else {
-                    return Err(PrepareLibraryAppletLaunchError::StorageBackingMissing);
-                };
-                let storage = source
-                    .read(0, source.len())
-                    .map_err(|_| PrepareLibraryAppletLaunchError::StorageBackingMissing)?;
-                input_storages.push(storage);
-            }
+            input_storages.extend(active.input_storages.iter().cloned());
             (applet_id, mode, input_storages)
         };
         let mut input_storages = Vec::with_capacity(reads.len());
         for read in reads {
-            input_storages.push(read.resolve().await.map_err(|error| match error {
+            input_storages.push(read.get_data().await.map_err(|error| match error {
                 AppletStorageAccessError::Memory(error) => {
                     PrepareLibraryAppletLaunchError::Memory(error)
                 }
@@ -2768,7 +2649,29 @@ fn encode_preselected_user_launch_parameter(user: UserIdentity) -> Vec<u8> {
 }
 
 #[cfg(test)]
+mod storage_test_support {
+    use super::*;
+    pub(super) async fn storage_read(
+        storage: &AppletStorage,
+        offset: u64,
+        size: usize,
+    ) -> Result<Vec<u8>, AppletStorageAccessError> {
+        let mut output = vec![0; size];
+        storage.read_into(offset, &mut output).await?;
+        Ok(output)
+    }
+    pub(super) async fn storage_write(
+        storage: &AppletStorage,
+        offset: u64,
+        input: &[u8],
+    ) -> Result<(), AppletStorageAccessError> {
+        storage.write(offset, &mut input.to_vec()).await
+    }
+}
+
+#[cfg(test)]
 mod applet_tests {
+    use super::storage_test_support::*;
     use super::*;
 
     #[test]
@@ -2797,16 +2700,18 @@ mod applet_tests {
             session.pop_library_applet_output(applet),
             Err(PopAppletLaunchParameterError::NotAvailable)
         ));
-        let Some(AppletObject::Storage { storage_id }) = session.object(storage) else {
+        let Some(AppletObject::Storage(backing)) = session.object(storage) else {
             panic!("output storage missing")
         };
         assert!(session.close_object(applet));
         assert_eq!(
-            crate::test_memory::run(session.read_storage(storage_id, 0, 4)).unwrap(),
+            crate::test_memory::run(storage_read(&backing, 0, 4)).unwrap(),
             [1, 2, 3, 4]
         );
+        let weak = Arc::downgrade(&backing);
+        drop(backing);
         assert!(session.close_object(storage));
-        assert!((session.storage_size(storage_id)).is_none());
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
@@ -2890,18 +2795,18 @@ mod applet_tests {
         assert!(!session.is_domain());
         assert_eq!(session.operation_mode(), OperationMode::Console);
         assert_eq!(session.convert_to_domain(), APPLET_ROOT_OBJECT_ID);
-        assert_eq!(
+        assert!(matches!(
             session.object(APPLET_ROOT_OBJECT_ID),
             Some(AppletObject::Root)
-        );
+        ));
 
         let child = session
             .insert_object(AppletObject::Proxy(AppletProxyKind::Application))
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             session.object(child),
             Some(AppletObject::Proxy(AppletProxyKind::Application))
-        );
+        ));
         assert!(session.close_object(child));
         assert!((session.object(child)).is_none());
         assert!(!session.close_object(APPLET_ROOT_OBJECT_ID));
@@ -3021,13 +2926,13 @@ mod applet_tests {
                 LibraryAppletMode::AllForeground,
             )
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             session.object(accessor),
             Some(AppletObject::LibraryAppletAccessor {
                 applet_id: LibraryAppletId::Controller,
                 mode: LibraryAppletMode::AllForeground,
             })
-        );
+        ));
         assert!(launchable.is_signalled());
         assert!(
             session
@@ -3050,25 +2955,45 @@ mod applet_tests {
     }
 
     #[test]
+    fn accepted_storage_backing_survives_domain_close() {
+        let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
+        session.convert_to_domain();
+        let object = session.create_storage(0x1000).unwrap();
+        let AppletObject::Storage(backing) = session.object(object).unwrap() else {
+            panic!("storage object");
+        };
+        assert!(session.close_object(object));
+        assert!(session.object(object).is_none());
+        crate::test_memory::run(backing.write(0xff8, &mut b"retained".to_vec())).unwrap();
+        let mut bytes = vec![0; 8];
+        crate::test_memory::run(backing.read_into(0xff8, &mut bytes)).unwrap();
+        assert_eq!(&bytes, b"retained");
+    }
+
+    #[test]
     fn applet_storage_backing_lives_until_its_last_domain_object_closes() {
         let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         session.convert_to_domain();
-        let storage = session.create_storage(0x20).unwrap();
-        let storage_id = match session.object(storage).unwrap() {
-            AppletObject::Storage { storage_id } => storage_id,
-            object => panic!("unexpected storage object: {object:?}"),
+        let object = session.create_storage(0x20).unwrap();
+        let AppletObject::Storage(backing) = session.object(object).unwrap() else {
+            panic!("storage");
         };
-        assert_eq!(session.storage_size(storage_id), Some(0x20));
-
-        let accessor = session.open_storage_accessor(storage_id).unwrap();
+        let weak = Arc::downgrade(&backing);
+        let accessor = session.open_storage_accessor(backing).unwrap();
+        assert!(session.close_object(object));
+        let Some(AppletObject::StorageAccessor(backing)) = session.object(accessor) else {
+            panic!("accessor");
+        };
+        assert_eq!(backing.len(), 0x20);
+        crate::test_memory::run(backing.write(0, &mut b"live".to_vec())).unwrap();
         assert_eq!(
-            session.object(accessor),
-            Some(AppletObject::StorageAccessor { storage_id })
+            crate::test_memory::run(storage_read(&backing, 0, 4)).unwrap(),
+            b"live"
         );
-        assert!(session.close_object(storage));
-        assert_eq!(session.storage_size(storage_id), Some(0x20));
+        drop(backing);
+        assert!(weak.upgrade().is_some());
         assert!(session.close_object(accessor));
-        assert!((session.storage_size(storage_id)).is_none());
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
@@ -3084,11 +3009,11 @@ mod applet_tests {
         let storage_object = session
             .pop_launch_parameter(AppletLaunchParameterKind::PreselectedUser)
             .unwrap();
-        let AppletObject::Storage { storage_id } = session.object(storage_object).unwrap() else {
+        let AppletObject::Storage(backing) = session.object(storage_object).unwrap() else {
             panic!("PopLaunchParameter returned the wrong object kind");
         };
-        let bytes = crate::test_memory::run(session.read_storage(
-            storage_id,
+        let bytes = crate::test_memory::run(storage_read(
+            &backing,
             0,
             PRESELECTED_USER_LAUNCH_PARAMETER_SIZE,
         ))
@@ -3121,16 +3046,18 @@ mod applet_tests {
             .create_library_applet(LibraryAppletId::Error, LibraryAppletMode::AllForeground)
             .unwrap();
         let storage = session.create_storage(8).unwrap();
-        let AppletObject::Storage { storage_id } = session.object(storage).unwrap() else {
+        let AppletObject::Storage(backing) = session.object(storage).unwrap() else {
             panic!("CreateStorage returned the wrong object kind");
         };
-        crate::test_memory::run(session.write_storage(storage_id, 0, b"evidence")).unwrap();
+        crate::test_memory::run(storage_write(&backing, 0, b"evidence")).unwrap();
 
         session
             .push_library_applet_input_storage(applet, storage)
             .unwrap();
         assert!(session.close_object(storage));
-        assert_eq!(session.storage_size(storage_id), Some(8));
+        let weak = Arc::downgrade(&backing);
+        drop(backing);
+        assert!(weak.upgrade().is_some());
         assert_eq!(
             crate::test_memory::run(session.prepare_library_applet_launch(applet)).unwrap(),
             LibraryAppletLaunchRequest {
@@ -3141,7 +3068,7 @@ mod applet_tests {
         );
 
         assert!(session.close_object(applet));
-        assert!((session.storage_size(storage_id)).is_none());
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
@@ -3168,25 +3095,25 @@ mod applet_tests {
         let session = AppletSession::new(&crate::test_memory::kernel(), OperationMode::Console);
         session.convert_to_domain();
         let storage = session.create_storage(8).unwrap();
-        let AppletObject::Storage { storage_id } = session.object(storage).unwrap() else {
+        let AppletObject::Storage(backing) = session.object(storage).unwrap() else {
             panic!("CreateStorage returned the wrong object kind");
         };
 
-        crate::test_memory::run(session.write_storage(storage_id, 2, &[1, 2, 3])).unwrap();
+        crate::test_memory::run(storage_write(&backing, 2, &[1, 2, 3])).unwrap();
         assert_eq!(
-            crate::test_memory::run(session.read_storage(storage_id, 0, 8)).unwrap(),
+            crate::test_memory::run(storage_read(&backing, 0, 8)).unwrap(),
             [0, 0, 1, 2, 3, 0, 0, 0]
         );
         assert!(matches!(
-            crate::test_memory::run(session.write_storage(storage_id, 7, &[9, 9])),
+            crate::test_memory::run(storage_write(&backing, 7, &[9, 9])),
             Err(AppletStorageAccessError::OutOfRange)
         ));
         assert_eq!(
-            crate::test_memory::run(session.read_storage(storage_id, 0, 8)).unwrap(),
+            crate::test_memory::run(storage_read(&backing, 0, 8)).unwrap(),
             [0, 0, 1, 2, 3, 0, 0, 0]
         );
         assert!(matches!(
-            crate::test_memory::run(session.read_storage(storage_id, u64::MAX, 1)),
+            crate::test_memory::run(storage_read(&backing, u64::MAX, 1)),
             Err(AppletStorageAccessError::OutOfRange)
         ));
     }
@@ -3301,10 +3228,7 @@ mod time_tests {
         );
         assert_eq!(&user_context[16..], &TIME_SOURCE_ID);
 
-        let scheduling = Arc::new(crate::ipc_wire::operation::ServiceScheduling::new(
-            &crate::test_memory::kernel(),
-        ));
-        crate::test_memory::run(user_clock.set_current_time(1_704_067_260, &scheduling)).unwrap();
+        crate::test_memory::run(user_clock.set_current_time(1_704_067_260)).unwrap();
         assert_eq!(user_clock.current_time(), 1_704_067_260);
         let context = user_clock.context();
         assert_eq!(

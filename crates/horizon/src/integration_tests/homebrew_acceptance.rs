@@ -73,7 +73,7 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
     )
     .unwrap();
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
-    let mut process = ScheduledProcess::new(support::process_builder().build(&plan).unwrap());
+    let process = support::process_builder().build(&plan).unwrap();
     let state_thread = process.main_thread();
     let state = state_thread.registers();
     assert_ne!(
@@ -90,37 +90,35 @@ fn minimal_nro_enters_real_abi_resumes_from_svc_and_returns_to_loader() {
     );
     drop(state);
 
-    let mut dispatcher = support::dispatcher(&process);
-    let first = process.run_slice().unwrap();
-    assert!(matches!(
-        first.stop,
-        ExecutionStop::SupervisorCall {
-            immediate: 0x10,
-            ..
-        }
-    ));
-    assert!(matches!(
-        process
-            .route_supervisor_call(&first.stop, &mut dispatcher)
-            .unwrap(),
-        ExceptionHandlingResult::Resumed
-    ));
-
-    let second = process.run_slice().unwrap();
+    let dispatcher = support::dispatcher(&process);
     let stub = process.main_thread().loader_return.unwrap();
-    assert_eq!(second.context.as_ref().unwrap().pc, stub);
-    assert!(matches!(
-        second.stop,
-        ExecutionStop::LoaderReturn { source, result_code: 0 } if source.pc == stub
-    ));
-    assert_eq!(process.lifecycle(), ProcessLifecycle::Exited);
-    assert_eq!(
-        process.exit().unwrap().cause,
-        ProcessExitCause::LoaderReturned
-    );
+    let mut runtime = nixe_runtime::Runtime::try_new(process.scheduler().clone()).unwrap();
+    let registration = nixe_runtime::ProcessRegistration {
+        priority: 44,
+        ideal_vcpu: Some(nixe_scheduler::VirtualCpuId::new(0)),
+        affinity: runtime.scheduler().profile().all_cores(),
+    };
+    let id = runtime.register_process(process, registration).unwrap();
+    let process = runtime.process(id).unwrap();
+    runtime.start(dispatcher.clone()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while process.lifecycle() != ProcessLifecycle::Exited {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "homebrew did not return to its loader"
+        );
+        runtime
+            .wait_events(deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap();
+    }
+    let exit = process.exit().unwrap();
+    assert_eq!(exit.cause, ProcessExitCause::LoaderReturned);
+    assert_eq!(exit.exit_code, 0);
+    assert_eq!(exit.context.as_ref().unwrap().pc, stub);
 
     assert_eq!(dispatcher.svc_calls(), 1);
-    let teardown = process.teardown();
+    let teardown = runtime.remove_process(id).unwrap();
+    runtime.shutdown().unwrap();
     assert_eq!(teardown.previous_lifecycle, ProcessLifecycle::Exited);
     assert!(teardown.threads_released > 0);
     assert!(teardown.physical_pages_released > 0);
@@ -436,16 +434,22 @@ fn contemporary_libnx_nro_initializes_filesystem_and_reaches_video_initializatio
     let path = asset("templates/application/application.nro");
     let plan = Launcher::build(LauncherInput::new(&path)).unwrap();
     let mut process = ScheduledProcess::new(support::process_builder().build(&plan).unwrap());
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
 
     let mut completed = std::collections::BTreeSet::new();
     loop {
         let report = process.run_slice().unwrap();
         match &report.stop {
             ExecutionStop::SupervisorCall { immediate, .. } => {
-                let outcome = process
-                    .route_supervisor_call(&report.stop, &mut dispatcher)
-                    .unwrap();
+                let caller = process.main_thread_id();
+                let outcome = process.call_local(&report.stop, &dispatcher).unwrap();
+                let outcome = if matches!(outcome, ExceptionHandlingResult::Suspended)
+                    && matches!(*immediate, 0x21 | 0x22)
+                {
+                    process.driver_mut().await_service(caller)
+                } else {
+                    outcome
+                };
                 match outcome {
                     ExceptionHandlingResult::Resumed => {
                         completed.insert(*immediate);

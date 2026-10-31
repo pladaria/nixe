@@ -451,26 +451,18 @@ impl Vic {
         &mut self,
         mappings: &Mappings,
         address: u64,
-        decoders: &mut std::collections::BTreeMap<
-            super::super::NvDrvFileDescriptor,
-            super::video::NvDec,
-        >,
+        frames: &super::video::FrameQueue,
     ) -> Result<Option<&super::video::Frame>, String> {
-        if self.decoder.is_none() {
-            let identity = super::video::surface_identity(mappings, address)?;
-            self.decoder = decoders
-                .iter()
-                .find_map(|(&fd, decoder)| decoder.has_frame(identity).then_some(fd));
+        let previous = self.decoder;
+        let frame = frames.pop(&mut self.decoder, || {
+            super::video::surface_identity(mappings, address)
+        })?;
+        if previous.is_some() && previous != self.decoder {
+            self.current = None;
         }
-        if let Some(fd) = self.decoder
-            && let Some(frame) = decoders
-                .get_mut(&fd)
-                .and_then(super::video::NvDec::pop_frame)
-        {
+        if let Some(frame) = frame {
             self.current = Some(frame);
         }
-        // An execute without a new decoded picture repeats the retained image,
-        // as VIC's persistent slot/output surface does in the reference design.
         Ok(self.current.as_ref())
     }
 
@@ -479,10 +471,7 @@ impl Vic {
         registers: &[u32],
         mappings: &Mappings,
         gpu: Option<&super::super::gpu_executor::NvDrvGpuExecutor>,
-        decoders: &mut std::collections::BTreeMap<
-            super::super::NvDrvFileDescriptor,
-            super::video::NvDec,
-        >,
+        frames: &super::video::FrameQueue,
     ) -> Result<(), String> {
         let config = read(mappings, u64::from(registers[0x1c2]) << 8, 0x610)?;
         let nv12_output = word(&config, 0x20) & 127 == 68;
@@ -561,7 +550,7 @@ impl Vic {
                 u64::from(registers[0x100 + slot * 24]) << 8,
                 u64::from(registers[0x101 + slot * 24]) << 8,
             ];
-            let frame = self.frame(mappings, source_address[0], decoders)?;
+            let frame = self.frame(mappings, source_address[0], frames)?;
 
             let left = (word(state, 0x20) & 0x3fffffff) as usize;
             let right = (word(state, 0x24) & 0x3fffffff) as usize;

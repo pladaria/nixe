@@ -49,7 +49,7 @@ impl AddressWaitState {
                     .kernel()
                     .1
                     .resolve_wait_deferred(effect.registration().token(), WaitOutcome::Ready);
-                self.notifications.push(notifications);
+                self.notifications.append(notifications);
             }
         }
     }

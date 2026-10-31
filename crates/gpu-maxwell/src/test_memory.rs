@@ -30,15 +30,15 @@ pub fn access(
 ) -> Result<nixe_memory::AccessResult, std::sync::Arc<MemoryError>>
 + use<> {
     let machine = machine.clone();
-    move |ranges, operation| {
+    move |ranges, mut operation| {
         machine
-            .apply_resolved_access(&ranges, &operation)
+            .apply_resolved_access(&ranges, &mut operation)
             .map_err(std::sync::Arc::new)
     }
 }
 pub fn apply(
     ranges: Vec<AllocationRange>,
-    operation: nixe_memory::AccessOperation,
+    mut operation: nixe_memory::AccessOperation,
 ) -> Result<nixe_memory::AccessResult, std::sync::Arc<MemoryError>> {
     let memory = ranges
         .first()
@@ -47,7 +47,7 @@ pub fn apply(
         .machine()
         .clone();
     memory
-        .apply_resolved_access(&ranges, &operation)
+        .apply_resolved_access(&ranges, &mut operation)
         .map_err(std::sync::Arc::new)
 }
 

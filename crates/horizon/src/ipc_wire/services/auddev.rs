@@ -73,7 +73,7 @@ pub(in crate::ipc_wire) async fn dispatch_audio_device(
         if size < NAME_SIZE {
             return cmif_error(request.token, HorizonIpcResult::AUDIO_INSUFFICIENT_BUFFER);
         }
-        let mut name = [0; NAME_SIZE];
+        let mut name = vec![0; NAME_SIZE];
         process.read(buffer, 0, &mut name).await?;
         let Some(end) = name.iter().position(|&byte| byte == 0) else {
             return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_ARGUMENT);
@@ -123,13 +123,14 @@ pub(in crate::ipc_wire) async fn dispatch_audio_device(
         if !listing && count == 0 {
             return cmif_error(request.token, HorizonIpcResult::AUDIO_INSUFFICIENT_BUFFER);
         }
-        let mut data = [0; NAME_SIZE * 4];
+        let mut data = vec![0; NAME_SIZE * 4];
         for (index, name) in names.iter().take(count).enumerate() {
             let start = index * NAME_SIZE;
             data[start..start + name.len()].copy_from_slice(name.as_bytes());
         }
         if count != 0 {
-            process.write(buffer, 0, &data[..count * NAME_SIZE]).await?;
+            data.truncate(count * NAME_SIZE);
+            process.write(buffer, 0, &mut data).await?;
         }
         let count_bytes = (count as u32).to_le_bytes();
         return semantic_success(

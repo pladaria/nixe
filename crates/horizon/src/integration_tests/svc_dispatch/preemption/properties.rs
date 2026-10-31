@@ -22,13 +22,13 @@ fn a_registered_affinity_pin_wait_survives_sleep_until_actual_unpin() {
     let (target, handle) = super::super::mutex::add_thread(&mut process, entry + 12, 52);
     let core1 = VirtualCpuId::new(1);
     let affinity = process
-        .coordinator_mut()
+        .driver_mut()
         .scheduler()
         .profile()
         .core_set([core1])
         .unwrap();
     process
-        .coordinator_mut()
+        .driver_mut()
         .scheduler()
         .migrate(caller, IdealCore::Core(core1), affinity)
         .unwrap();
@@ -48,26 +48,26 @@ fn a_registered_affinity_pin_wait_survives_sleep_until_actual_unpin() {
     process.main_thread().registers().write_x(x(2), 2);
     process.thread(target).unwrap().start().unwrap();
     process
-        .coordinator_mut()
+        .driver_mut()
         .scheduler()
         .pin_thread(VirtualCpuId::new(0), target)
         .unwrap();
-    let mut dispatcher = fixed_time_dispatcher(&process)
-        .with_input_completions(process.coordinator_mut().event_sender());
-    let (thread, handling) = next_call(&mut process, &mut dispatcher);
+    let dispatcher =
+        fixed_time_dispatcher(&process).with_input_completions(process.driver_mut().event_sender());
+    let (thread, handling) = next_call(&mut process, &dispatcher);
     assert_eq!(thread, caller);
     assert!(matches!(handling, ExceptionHandlingResult::Suspended));
     let token = process
-        .coordinator_mut()
+        .driver_mut()
         .scheduler()
         .thread(caller)
         .unwrap()
         .active_wait
         .unwrap();
     write_guest_bytes(&process, gate, &1u32.to_le_bytes());
-    let (thread, _) = next_call(&mut process, &mut dispatcher);
+    let (thread, _) = next_call(&mut process, &dispatcher);
     assert_eq!(thread, target);
-    let scheduler = process.coordinator_mut().scheduler();
+    let scheduler = process.driver_mut().scheduler();
     assert_eq!(scheduler.thread(caller).unwrap().active_wait, Some(token));
     assert!(scheduler.thread(target).unwrap().active_wait.is_some());
     assert_eq!(
@@ -81,15 +81,15 @@ fn a_registered_affinity_pin_wait_survives_sleep_until_actual_unpin() {
         0x0001_0002
     );
     process
-        .coordinator_mut()
+        .driver_mut()
         .advance_virtual_time(1_000_000_000)
         .unwrap();
-    let (thread, handling) = next_call(&mut process, &mut dispatcher);
+    let (thread, handling) = next_call(&mut process, &dispatcher);
     assert_eq!(thread, target);
     assert!(matches!(handling, ExceptionHandlingResult::Resumed));
     assert!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .thread(caller)
             .unwrap()
@@ -99,7 +99,7 @@ fn a_registered_affinity_pin_wait_survives_sleep_until_actual_unpin() {
     assert_eq!(read_abi_register(&process, 0), 0);
     assert_eq!(process.main_thread().registers().pc(), entry + 4);
     assert_eq!(read_guest_u32(&process, tls.checked_add(0x100).unwrap()), 0);
-    process.coordinator_mut().shutdown().unwrap();
+    process.driver_mut().shutdown().unwrap();
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn a_suspended_final_property_owner_keeps_its_operation_pending_until_resumed() 
         let (controller, _) = super::super::mutex::add_thread(&mut process, entry + 44, 10);
         let core1 = VirtualCpuId::new(1);
         let affinity = process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .profile()
             .core_set([core1])
@@ -159,7 +159,7 @@ fn a_suspended_final_property_owner_keeps_its_operation_pending_until_resumed() 
             (controller, second_handle, 1),
         ] {
             process
-                .coordinator_mut()
+                .driver_mut()
                 .scheduler()
                 .migrate(thread, IdealCore::Core(core1), affinity)
                 .unwrap();
@@ -178,15 +178,15 @@ fn a_suspended_final_property_owner_keeps_its_operation_pending_until_resumed() 
             &0x0001_0002u32.to_le_bytes(),
         );
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .pin_thread(VirtualCpuId::new(0), target)
             .unwrap();
-        let mut dispatcher = fixed_time_dispatcher(&process)
-            .with_input_completions(process.coordinator_mut().event_sender());
+        let dispatcher = fixed_time_dispatcher(&process)
+            .with_input_completions(process.driver_mut().event_sender());
         for (thread, blocks) in [(first, true), (second, true), (controller, false)] {
             process.thread(thread).unwrap().start().unwrap();
-            let (caller, handling) = next_call(&mut process, &mut dispatcher);
+            let (caller, handling) = next_call(&mut process, &dispatcher);
             assert_eq!(caller, thread);
             assert_eq!(
                 matches!(handling, ExceptionHandlingResult::Suspended),
@@ -194,23 +194,21 @@ fn a_suspended_final_property_owner_keeps_its_operation_pending_until_resumed() 
             );
         }
         let second_token = process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .thread(second)
             .unwrap()
             .active_wait
             .unwrap();
-        let (caller, handling) = next_call(&mut process, &mut dispatcher);
+        let (caller, handling) = next_call(&mut process, &dispatcher);
         assert_eq!(caller, controller);
         assert!(matches!(handling, ExceptionHandlingResult::Suspended));
         write_guest_bytes(&process, gate, &1u32.to_le_bytes());
-        let (caller, handling) = next_call(&mut process, &mut dispatcher);
+        let (caller, handling) = next_call(&mut process, &dispatcher);
         assert_eq!(caller, target);
         assert!(matches!(handling, ExceptionHandlingResult::Resumed));
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
-        let scheduler = process.coordinator_mut().scheduler();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
+        let scheduler = process.driver_mut().scheduler();
         assert!(scheduler.thread(first).unwrap().active_wait.is_none());
         let second_info = scheduler.thread(second).unwrap();
         assert!(second_info.paused);
@@ -221,33 +219,24 @@ fn a_suspended_final_property_owner_keeps_its_operation_pending_until_resumed() 
         );
         assert_eq!(scheduler.priority_donation_count(), 0);
         if stop {
-            process
-                .coordinator_mut()
-                .terminate_process(process_id)
-                .unwrap();
-            dispatcher
-                .poll_memory_completions(process.coordinator_mut())
-                .unwrap();
+            process.driver_mut().terminate_process(process_id).unwrap();
+            dispatcher.drive_pending(process.driver_mut()).unwrap();
         } else {
             writable.signal();
-            dispatcher
-                .poll_memory_completions(process.coordinator_mut())
-                .unwrap();
+            dispatcher.drive_pending(process.driver_mut()).unwrap();
             assert_eq!(
                 process.thread(controller).unwrap().registers().pc(),
                 entry + 64
             );
-            let (caller, handling) = next_call(&mut process, &mut dispatcher);
+            let (caller, handling) = next_call(&mut process, &dispatcher);
             assert_eq!(caller, controller);
             assert!(matches!(handling, ExceptionHandlingResult::Resumed));
             assert_eq!(
                 process.thread(controller).unwrap().registers().read_x(x(0)),
                 0
             );
-            dispatcher
-                .poll_memory_completions(process.coordinator_mut())
-                .unwrap();
-            let scheduler = process.coordinator_mut().scheduler();
+            dispatcher.drive_pending(process.driver_mut()).unwrap();
+            let scheduler = process.driver_mut().scheduler();
             let second_info = scheduler.thread(second).unwrap();
             assert!(!second_info.paused);
             assert!(second_info.active_wait.is_none());
@@ -255,6 +244,6 @@ fn a_suspended_final_property_owner_keeps_its_operation_pending_until_resumed() 
             assert_eq!(process.thread(second).unwrap().registers().read_x(x(0)), 0);
             assert_eq!(process.thread(second).unwrap().registers().pc(), entry + 40);
         }
-        process.coordinator_mut().shutdown().unwrap();
+        process.driver_mut().shutdown().unwrap();
     }
 }

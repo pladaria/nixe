@@ -147,7 +147,7 @@ async fn dispatch_account_root(
                 semantic_success(request.token, true, &[], &[], &[object], None)
             } else {
                 let handle = process
-                    .return_handle(HorizonIpcObject::AccountProfile(profile))
+                    .return_service(HorizonIpcObject::AccountProfile(profile))
                     .map_err(IpcWireError::Handle)?;
                 semantic_success(request.token, false, &[], &[], &[], Some(handle))
             }
@@ -188,10 +188,10 @@ async fn dispatch_account_root(
                     HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                 );
             }
-            let mut users = [0; 128];
+            let mut users = vec![0; 128];
             users[..16].copy_from_slice(&session.user().id().encode());
             process
-                .write(&process.receive_statics()[0], 0, &users)
+                .write(&process.receive_statics()[0], 0, &mut users)
                 .await?;
             account_response(session, request.token, HorizonIpcResult::SUCCESS)
         }
@@ -372,7 +372,7 @@ async fn dispatch_account_root(
                 ))
             } else {
                 let handle = process
-                    .return_handle(HorizonIpcObject::AccountManagerForApplication(manager))
+                    .return_service(HorizonIpcObject::AccountManagerForApplication(manager))
                     .map_err(IpcWireError::Handle)?;
                 log::debug!(
                     "acc:u0 opened IManagerForApplication handle {handle:#x} for user {} ({})",

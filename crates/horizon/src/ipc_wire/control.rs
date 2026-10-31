@@ -280,7 +280,7 @@ pub(super) async fn dispatch_control(
                 &pointer_buffer_size.to_le_bytes(),
                 None,
             )?;
-            process.write_response(&response).await?;
+            process.write_response(response).await?;
         }
         _ => return unsupported_service_command("CMIF control", request.command_id),
     }
@@ -298,7 +298,7 @@ async fn write_domain_conversion(
         &object_id.to_le_bytes(),
         None,
     )?;
-    process.write_response(&response).await
+    process.write_response(response).await
 }
 
 async fn install_clone(
@@ -307,9 +307,9 @@ async fn install_clone(
     object: HorizonIpcObject,
 ) -> Result<u32, IpcWireError> {
     let handle = process
-        .return_handle(object)
+        .return_service(object)
         .map_err(IpcWireError::Handle)?;
     let response = encode_response(token, HorizonIpcResult::SUCCESS, &[], Some(handle))?;
-    process.write_response(&response).await?;
+    process.write_response(response).await?;
     Ok(handle)
 }

@@ -306,7 +306,7 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
         .memory()
         .prepare_device_access(
             backing.pin(0, backing.bytes()).unwrap(),
-            nixe_memory::AccessOperation::Read,
+            nixe_memory::AccessOperation::Read(Vec::new()),
         )
         .unwrap();
     let (release, release_when_recorded) = std::sync::mpsc::channel();
@@ -630,7 +630,7 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         .memory()
         .prepare_device_access(
             whole.pin(0, whole.bytes()).unwrap(),
-            nixe_memory::AccessOperation::Read,
+            nixe_memory::AccessOperation::Read(Vec::new()),
         )
         .unwrap();
     execution.queue_device_access(request).unwrap();

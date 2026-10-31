@@ -235,12 +235,12 @@ impl AudioRendererManagerSession {
         }
         // The pending open owns its slot and transfer object, so the service
         // lock is not held while the device resolves an exact work-memory write.
-        let zeroes = [0; 4096];
+        let mut zeroes = vec![0; 4096];
         let mut offset = 0;
         while offset < work_size {
             let count = (work_size - offset).min(zeroes.len() as u64) as usize;
-            crate::system_memory::write_transfer(&state._work_memory, offset, &zeroes[..count])
-                .await?;
+            zeroes.resize(count, 0);
+            crate::system_memory::write_transfer(&state._work_memory, offset, &mut zeroes).await?;
             offset += count as u64;
         }
         Ok(Some(AudioRendererSession(state)))

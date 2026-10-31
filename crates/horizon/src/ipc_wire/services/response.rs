@@ -98,7 +98,8 @@ pub(super) async fn encode_semantic_response(
                 };
                 semantic_success(request.token, true, &[], &[], &[object_id], None)
             } else {
-                let handle = match process.return_handle(HorizonIpcObject::SemanticObject(object)) {
+                let handle = match process.return_service(HorizonIpcObject::SemanticObject(object))
+                {
                     Ok(handle) => handle,
                     Err(_) => {
                         return semantic_error(
@@ -114,9 +115,9 @@ pub(super) async fn encode_semantic_response(
                 semantic_success(request.token, false, &[], &[], &[], Some(handle))
             }
         }
-        IpcResponse::Data(data) => {
+        IpcResponse::Data(mut data) => {
             let descriptor = one_receive_buffer(process, hipc)?;
-            write_descriptor_bytes(process, descriptor, &data).await?;
+            write_descriptor_bytes(process, descriptor, &mut data).await?;
             let count = u64::try_from(data.len())
                 .map_err(|_| IpcWireError::Malformed("file read count overflows"))?;
             semantic_success(
@@ -168,7 +169,7 @@ pub(super) async fn encode_semantic_response(
                 };
                 encoded[start + 0x308..start + 0x310].copy_from_slice(&entry.size().to_le_bytes());
             }
-            write_descriptor_bytes(process, descriptor, &encoded).await?;
+            write_descriptor_bytes(process, descriptor, &mut encoded).await?;
             let count = u64::try_from(entries.len())
                 .map_err(|_| IpcWireError::Malformed("directory entry count overflows"))?;
             semantic_success(
@@ -180,21 +181,9 @@ pub(super) async fn encode_semantic_response(
                 None,
             )
         }
-        IpcResponse::AddOnContentEntries(entries) => {
+        IpcResponse::AddOnContentIndices(mut encoded) => {
             let descriptor = one_receive_buffer(process, hipc)?;
-            let mut encoded = Vec::new();
-            encoded
-                .try_reserve_exact(entries.len().saturating_mul(4))
-                .map_err(|_| {
-                    IpcWireError::HostResourceExhausted("encoding add-on-content entries")
-                })?;
-            for entry in entries {
-                let Some(index) = entry.horizon_index else {
-                    continue;
-                };
-                encoded.extend_from_slice(&index.to_le_bytes());
-            }
-            write_descriptor_bytes(process, descriptor, &encoded).await?;
+            write_descriptor_bytes(process, descriptor, &mut encoded).await?;
             let count = u32::try_from(encoded.len() / 4)
                 .map_err(|_| IpcWireError::Malformed("add-on count overflows"))?;
             semantic_success(
@@ -247,6 +236,7 @@ async fn write_storage_read(
     // IStorage transfers can be hundreds of MiB. Keep host memory bounded and
     // copy each source chunk directly into the already validated guest range.
     let buffer_size = size.min(STORAGE_READ_BUFFER_BYTES);
+    process.reserve_payload(buffer_size).await?;
     let mut buffer = Vec::new();
     buffer
         .try_reserve_exact(buffer_size)
@@ -262,12 +252,13 @@ async fn write_storage_read(
                     .map_err(|_| IpcWireError::Internal("storage read offset overflows"))?,
             )
             .ok_or(IpcWireError::Internal("storage read offset overflows"))?;
+        buffer.resize(chunk_size, 0);
         storage
             .storage()
-            .read_at(source_offset, &mut buffer[..chunk_size])
+            .read_at(source_offset, &mut buffer)
             .map_err(|_| StorageReadError::Source)?;
         process
-            .write(descriptor, transferred as u64, &buffer[..chunk_size])
+            .write(descriptor, transferred as u64, &mut buffer)
             .await?;
         transferred += chunk_size;
     }

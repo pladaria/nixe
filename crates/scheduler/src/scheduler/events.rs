@@ -26,9 +26,12 @@ impl EventNotifications {
             self.rest.push(notification);
         }
     }
-    pub(super) fn extend(&mut self, notifications: impl IntoIterator<Item = (Waker, bool)>) {
-        for notification in notifications {
-            self.push(notification);
+    pub fn append(&mut self, mut other: Self) {
+        if self.first.is_none() {
+            *self = other;
+        } else {
+            self.rest.extend(other.first.take());
+            self.rest.append(&mut other.rest);
         }
     }
     pub fn notify(self) {
@@ -56,14 +59,10 @@ struct EventSlot {
 struct EventData {
     first: Option<EventWaiter>,
     last: Option<EventWaiter>,
-    observers: BTreeMap<u64, Observer>,
+    // Waiting continuations contain a Waker; a completed observer contains None.
+    observers: BTreeMap<u64, Option<Waker>>,
     next_observer: u64,
-}
-
-#[derive(Debug)]
-struct Observer {
-    wake: Option<Waker>,
-    signalled: bool,
+    last_claimed: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,62 +220,7 @@ impl EventObject {
     /// Publish readiness while the object's state is locked, then notify after unlocking it.
     pub fn publish_readiness(&self, ready: bool) -> EventNotifications {
         let (result, notifications) = self.reference.kernel.edit_deferred(|state| {
-            if self.reference.signalled.load(Ordering::Relaxed) == ready {
-                return Ok(());
-            }
-            self.reference.signalled.store(ready, Ordering::Release);
-            if !ready {
-                return Ok(());
-            }
-            let event = state.events.get_mut(self.reference.id);
-            if self.reference.auto_reset {
-                let mut candidate = event.first;
-                let mut cursor = event.first;
-                while let Some(node) = cursor {
-                    if candidate.is_none_or(|best| {
-                        state.slots[node.thread].priority < state.slots[best.thread].priority
-                    }) {
-                        candidate = Some(node);
-                    }
-                    cursor = state.slots[node.thread].wait_nodes[node.argument as usize].next;
-                }
-                if let Some(waiter) = candidate {
-                    state.notify_event_waiter(
-                        self.reference.id,
-                        waiter,
-                        &self.reference.kernel.profile,
-                    );
-                    self.reference.signalled.store(false, Ordering::Release);
-                } else {
-                    let event = state.events.get_mut(self.reference.id);
-                    if let Some(observer) = event
-                        .observers
-                        .values_mut()
-                        .find(|observer| !observer.signalled)
-                    {
-                        observer.signalled = true;
-                        self.reference.signalled.store(false, Ordering::Release);
-                        if let Some(waker) = observer.wake.take() {
-                            state.deferred_wakers.push((waker, true));
-                        }
-                    }
-                }
-            } else {
-                let observers = std::mem::take(&mut event.observers);
-                state.deferred_wakers.extend(
-                    observers
-                        .into_values()
-                        .filter_map(|observer| observer.wake)
-                        .map(|waker| (waker, true)),
-                );
-                while let Some(waiter) = state.events.get(self.reference.id).first {
-                    state.notify_event_waiter(
-                        self.reference.id,
-                        waiter,
-                        &self.reference.kernel.profile,
-                    );
-                }
-            }
+            state.publish_event(&self.reference, ready, &self.reference.kernel.profile);
             Ok(())
         });
         result.expect("retained kernel event");
@@ -314,6 +258,7 @@ impl SchedulerState {
         let result = self.edit(|state| {
             let index = state.slots.index(thread)?;
             if state.closed
+                || state.slots[index].stopping
                 || matches!(
                     state.slots[index].lifecycle,
                     ThreadLifecycle::Exited | ThreadLifecycle::Faulted
@@ -367,6 +312,69 @@ impl SchedulerState {
 }
 
 impl State {
+    fn publish_event(
+        &mut self,
+        reference: &EventReference,
+        ready: bool,
+        profile: &MachineSchedulerProfile,
+    ) {
+        if reference.signalled.load(Ordering::Relaxed) == ready {
+            return;
+        }
+        reference.signalled.store(ready, Ordering::Release);
+        if !ready {
+            return;
+        }
+        let event = self.events.get_mut(reference.id);
+        if reference.auto_reset {
+            let mut candidate = event.first;
+            let mut cursor = event.first;
+            while let Some(node) = cursor {
+                if candidate.is_none_or(|best| {
+                    self.slots[node.thread].priority < self.slots[best.thread].priority
+                }) {
+                    candidate = Some(node);
+                }
+                cursor = self.slots[node.thread].wait_nodes[node.argument as usize].next;
+            }
+            if let Some(waiter) = candidate {
+                self.notify_event_waiter(reference.id, waiter, profile);
+                reference.signalled.store(false, Ordering::Release);
+            } else {
+                let event = self.events.get_mut(reference.id);
+                if let Some((id, observer)) = event
+                    .observers
+                    .range_mut((
+                        std::ops::Bound::Excluded(event.last_claimed),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next()
+                {
+                    event.last_claimed = *id;
+                    reference.signalled.store(false, Ordering::Release);
+                    if let Some(waker) = observer.take() {
+                        self.deferred_wakers.push((waker, true));
+                    }
+                }
+            }
+        } else {
+            // Clear cannot revoke a completed wait. Retain each receipt until
+            // its continuation observes it or is dropped, just as for auto-reset.
+            for (id, observer) in event.observers.range_mut((
+                std::ops::Bound::Excluded(event.last_claimed),
+                std::ops::Bound::Unbounded,
+            )) {
+                event.last_claimed = *id;
+                if let Some(waker) = observer.take() {
+                    self.deferred_wakers.push((waker, true));
+                }
+            }
+            while let Some(waiter) = self.events.get(reference.id).first {
+                self.notify_event_waiter(reference.id, waiter, profile);
+            }
+        }
+    }
+
     fn notify_event_waiter(
         &mut self,
         event: Index,
@@ -475,19 +483,15 @@ impl Future for EventFuture {
             .kernel
             .edit(|state| {
                 let event = state.events.get_mut(reference.id);
-                let claimed = this.observer.is_some_and(|id| {
-                    event
-                        .observers
-                        .get(&id)
-                        .is_some_and(|observer| observer.signalled)
-                });
+                let claimed = this
+                    .observer
+                    .is_some_and(|id| event.observers.get(&id).is_some_and(Option::is_none));
                 if claimed || reference.signalled.load(Ordering::Acquire) {
                     if reference.auto_reset && !claimed {
                         reference.signalled.store(false, Ordering::Release);
                     }
                     if let Some(id) = this.observer.take()
-                        && let Some(observer) = event.observers.remove(&id)
-                        && let Some(waker) = observer.wake
+                        && let Some(Some(waker)) = event.observers.remove(&id)
                     {
                         state.deferred_wakers.push((waker, false));
                     }
@@ -503,16 +507,10 @@ impl Future for EventFuture {
                 if event
                     .observers
                     .get(&id)
-                    .and_then(|observer| observer.wake.as_ref())
+                    .and_then(Option::as_ref)
                     .is_none_or(|old| !old.will_wake(context.waker()))
-                    && let Some(old) = event.observers.insert(
-                        id,
-                        Observer {
-                            wake: Some(context.waker().clone()),
-                            signalled: false,
-                        },
-                    )
-                    && let Some(old) = old.wake
+                    && let Some(Some(old)) =
+                        event.observers.insert(id, Some(context.waker().clone()))
                 {
                     state.deferred_wakers.push((old, false));
                 }
@@ -528,7 +526,15 @@ impl Drop for EventFuture {
             let reference = &self.event.0.reference;
             let removed = reference
                 .kernel
-                .edit(|state| Ok(state.events.get_mut(reference.id).observers.remove(&id)))
+                .edit(|state| {
+                    let removed = state.events.get_mut(reference.id).observers.remove(&id);
+                    // An unobserved auto-reset grant belongs to the next live
+                    // consumer if its selected continuation is cancelled.
+                    if reference.auto_reset && removed.as_ref().is_some_and(Option::is_none) {
+                        state.publish_event(reference, true, &reference.kernel.profile);
+                    }
+                    Ok(removed)
+                })
                 .expect("retained kernel event");
             drop(removed);
         }

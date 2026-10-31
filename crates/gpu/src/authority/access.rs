@@ -365,7 +365,7 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                 "exact access has unresolved dependencies or names another machine",
             )));
         }
-        let pending = self.accesses.remove(&id).unwrap();
+        let mut pending = self.accesses.remove(&id).unwrap();
         let cancelled = pending.request.is_cancelled();
         let mut result = if cancelled {
             Err(MemoryError::Invalid("exact CPU access was cancelled"))
@@ -386,16 +386,14 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                     }
                     Ok(result)
                 } else {
-                    machine.apply_resolved_access(
-                        pending.request.ranges(),
-                        pending.request.operation(),
-                    )
+                    let (ranges, operation) = pending.request.parts_mut();
+                    machine.apply_resolved_access(ranges, operation)
                 }
             })()
             .and_then(|result| {
                 if matches!(
                     result,
-                    AccessResult::Written | AccessResult::Atomic { written: true, .. }
+                    AccessResult::Written(_) | AccessResult::Atomic { written: true, .. }
                 ) {
                     self.cpu_write(pending.request.ranges())?;
                 }

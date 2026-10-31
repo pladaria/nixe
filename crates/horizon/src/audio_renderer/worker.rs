@@ -363,7 +363,7 @@ mod tests {
                 };
                 assert!(Arc::ptr_eq(&actual, &failure));
             } else {
-                request.finish(Ok(AccessResult::Read(Box::new([4, 5, 6]))));
+                request.finish(Ok(AccessResult::Read(Vec::from([4, 5, 6]))));
                 assert_eq!(worker.join().unwrap().unwrap(), [4, 5, 6]);
             }
         }
@@ -382,7 +382,7 @@ mod tests {
         });
         machine.set_device_endpoint(&endpoint);
         let pending = machine
-            .request_device_access(ranges, AccessOperation::Read)
+            .request_device_access(ranges, AccessOperation::Read(Vec::new()))
             .unwrap();
         let request = receive.recv().unwrap();
         let identity = request.identity();

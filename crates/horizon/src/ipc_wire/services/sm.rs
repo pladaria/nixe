@@ -129,9 +129,7 @@ pub(in crate::ipc_wire) fn dispatch_service_manager(
     manager: &ServiceManagerSession,
     request: ServiceManagerRequest<'_>,
     sent_pid: bool,
-    initial_operation_mode: OperationMode,
-    time_environment: &TimeEnvironment,
-    host_systems: &HostSystems,
+    resources: &ServiceResources,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let Some(command) = ServiceManagerCommand::decode(request.command_id()) else {
         return unsupported_service_command("sm:", request.command_id());
@@ -189,15 +187,7 @@ pub(in crate::ipc_wire) fn dispatch_service_manager(
                     UnsupportedServiceOperation::Connect { name: name.into() },
                 ));
             };
-            connect_service(
-                process,
-                manager,
-                &request,
-                service,
-                initial_operation_mode,
-                time_environment,
-                host_systems,
-            )
+            connect_service(process, manager, &request, service, resources)
         }
     }
 }
@@ -207,86 +197,85 @@ fn connect_service(
     manager: &ServiceManagerSession,
     request: &ServiceManagerRequest<'_>,
     service: ServiceKind,
-    initial_operation_mode: OperationMode,
-    time_environment: &TimeEnvironment,
-    host_systems: &HostSystems,
+    resources: &ServiceResources,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    let initial_operation_mode = resources.system.operation_mode;
+    let time_environment = &resources.system.time;
     let host_resource_failure = matches!(
         service,
         ServiceKind::Account | ServiceKind::Vi(_) | ServiceKind::NvDrv
     );
     let handle = match service {
-        ServiceKind::UserSettings => process.return_handle(HorizonIpcObject::UserSettings(
-            UserSettingsSession::new(host_systems.settings.clone()),
+        ServiceKind::UserSettings => process.return_service(HorizonIpcObject::UserSettings(
+            UserSettingsSession::new(resources.system.settings.clone()),
         )),
-        ServiceKind::SystemSettings => process.return_handle(HorizonIpcObject::SystemSettings(
+        ServiceKind::SystemSettings => process.return_service(HorizonIpcObject::SystemSettings(
             SystemSettingsSession::new(),
         )),
         ServiceKind::Multimedia => {
-            process.return_handle(HorizonIpcObject::Multimedia(manager.multimedia_session()))
+            process.return_service(HorizonIpcObject::Multimedia(manager.multimedia_session()))
         }
-        ServiceKind::Performance => process.return_handle(HorizonIpcObject::PerformanceManager(
+        ServiceKind::Performance => process.return_service(HorizonIpcObject::PerformanceManager(
             PerformanceManagerSession::new(),
         )),
-        ServiceKind::Applet => process.return_handle(HorizonIpcObject::Applet(AppletSession::new(
-            process.kernel(),
-            initial_operation_mode,
-        ))),
-        ServiceKind::Hid => process.return_handle(HorizonIpcObject::Hid(HidSession::new(
-            host_systems.hid.shared_memory(),
-        ))),
-        ServiceKind::SharedFont => process.return_handle(HorizonIpcObject::SharedFont(
-            host_systems.shared_fonts.clone(),
+        ServiceKind::Applet => process.return_service(HorizonIpcObject::Applet(
+            AppletSession::new(process.kernel(), initial_operation_mode),
         )),
-        ServiceKind::Irs => {
-            process.return_handle(HorizonIpcObject::Irs(host_systems.hid.infrared_session()))
-        }
+        ServiceKind::Hid => process.return_service(HorizonIpcObject::Hid(HidSession::new(
+            resources.system.hid.shared_memory(),
+        ))),
+        ServiceKind::SharedFont => process.return_service(HorizonIpcObject::SharedFont(
+            resources.files.shared_fonts.clone(),
+        )),
+        ServiceKind::Irs => process.return_service(HorizonIpcObject::Irs(
+            resources.system.hid.infrared_session(),
+        )),
         ServiceKind::Time => {
-            process.return_handle(HorizonIpcObject::Time(time_environment.create_service()))
+            process.return_service(HorizonIpcObject::Time(time_environment.create_service()))
         }
         // libnx opens acc:u0 for application account sessions. Retain the
         // real session identity while unsupported commands remain fail-fast.
         ServiceKind::Account => {
-            process.return_handle(HorizonIpcObject::Account(AccountSession::new()))
+            process.return_service(HorizonIpcObject::Account(AccountSession::new()))
         }
-        ServiceKind::Bsd => process.return_handle(HorizonIpcObject::Bsd(manager.bsd_session())),
-        ServiceKind::Ssl => process.return_handle(HorizonIpcObject::Ssl(SslSession::new())),
-        ServiceKind::AudioOut => process.return_handle(HorizonIpcObject::AudioOutManager(
+        ServiceKind::Bsd => process.return_service(HorizonIpcObject::Bsd(manager.bsd_session())),
+        ServiceKind::Ssl => process.return_service(HorizonIpcObject::Ssl(SslSession::new())),
+        ServiceKind::AudioOut => process.return_service(HorizonIpcObject::AudioOutManager(
             crate::AudioOutManagerSession {
-                backend: host_systems.audio_backend.clone(),
-                devices: host_systems.audio_renderers.devices.clone(),
+                backend: resources.audio.backend.clone(),
+                devices: resources.audio.renderers.devices.clone(),
             },
         )),
-        ServiceKind::AudioRenderer => process.return_handle(
-            HorizonIpcObject::AudioRendererManager(host_systems.audio_renderers.clone()),
+        ServiceKind::AudioRenderer => process.return_service(
+            HorizonIpcObject::AudioRendererManager(resources.audio.renderers.clone()),
         ),
-        ServiceKind::Opus => process.return_handle(HorizonIpcObject::OpusManager(
-            host_systems.opus.open_session(),
+        ServiceKind::Opus => process.return_service(HorizonIpcObject::OpusManager(
+            resources.audio.opus.open_session(),
         )),
-        ServiceKind::PlayReport => process.return_handle(HorizonIpcObject::PlayReport(
+        ServiceKind::PlayReport => process.return_service(HorizonIpcObject::PlayReport(
             crate::PlayReportSession::new("dump/play-reports"),
         )),
-        ServiceKind::Vi(kind) => process.return_handle(HorizonIpcObject::Vi(ViSession::new(
+        ServiceKind::Vi(kind) => process.return_service(HorizonIpcObject::Vi(ViSession::new(
             ViObjectKind::Root(kind),
-            host_systems.video.clone(),
+            resources.graphics.video.clone(),
         ))),
         ServiceKind::NvDrv => {
-            process.return_handle(HorizonIpcObject::NvDrv(host_systems.video.nvdrv()))
+            process.return_service(HorizonIpcObject::NvDrv(resources.graphics.video.nvdrv()))
         }
         ServiceKind::LogManager => {
-            process.return_handle(HorizonIpcObject::LogManager(LogManagerSession::new()))
+            process.return_service(HorizonIpcObject::LogManager(LogManagerSession::new()))
         }
         ServiceKind::ErrorContextWriter => {
-            process.return_handle(HorizonIpcObject::ErrorContextWriter(Default::default()))
+            process.return_service(HorizonIpcObject::ErrorContextWriter(Default::default()))
         }
-        ServiceKind::ParentalControl => process.return_handle(HorizonIpcObject::ParentalControl(
+        ServiceKind::ParentalControl => process.return_service(HorizonIpcObject::ParentalControl(
             ParentalControlFactorySession::new(),
         )),
-        ServiceKind::NetworkInterface => process.return_handle(HorizonIpcObject::NetworkInterface(
-            NetworkInterfaceManagerSession::new(),
-        )),
+        ServiceKind::NetworkInterface => process.return_service(
+            HorizonIpcObject::NetworkInterface(NetworkInterfaceManagerSession::new()),
+        ),
         ServiceKind::Semantic(service) => {
-            process.return_handle(HorizonIpcObject::SemanticService(IpcSession::new(service)))
+            process.return_service(HorizonIpcObject::SemanticService(IpcSession::new(service)))
         }
     };
     match handle {

@@ -45,15 +45,15 @@ fn write(machine: &Machine, ranges: &[AllocationRange], bytes: &[u8]) {
         machine
             .access_captured(ranges, AccessOperation::Write(bytes.into()))
             .unwrap(),
-        Access::Ready(AccessResult::Written)
+        Access::Ready(AccessResult::Written(_))
     ));
 }
 fn read(machine: &Machine, ranges: &[AllocationRange]) -> Vec<u8> {
     match machine
-        .access_captured(ranges, AccessOperation::Read)
+        .access_captured(ranges, AccessOperation::Read(Vec::new()))
         .unwrap()
     {
-        Access::Ready(AccessResult::Read(bytes)) => bytes.into_vec(),
+        Access::Ready(AccessResult::Read(bytes)) => bytes,
         other => panic!("unexpected read: {other:?}"),
     }
 }
@@ -80,7 +80,7 @@ fn immediate_reads_cross_mappings_and_keep_original_inputs_during_device_remap()
     assert_eq!(output, [11, 11, 11, 11, 22, 22, 22, 22]);
     machine.publish_device_write(&second, || Ok(())).unwrap();
     memory
-        .read_into(address, &mut output, &mut |ranges, operation| {
+        .read_into(address, &mut output, &mut |ranges, mut operation| {
             // The callback can suspend and change virtual mappings. Its inputs
             // must still name the physical bytes accepted before this boundary.
             space.unmap(left.offset()).unwrap();
@@ -88,7 +88,7 @@ fn immediate_reads_cross_mappings_and_keep_original_inputs_during_device_remap()
             let replacement = space.map(request(second.clone(), 0x1000)).unwrap();
             assert_eq!(replacement.offset(), left.offset());
             machine
-                .apply_resolved_access(&ranges, &operation)
+                .apply_resolved_access(&ranges, &mut operation)
                 .map_err(Arc::new)
         })
         .unwrap();
@@ -360,9 +360,9 @@ fn remap_changes_new_translation_but_not_an_accepted_physical_operation() {
     assert!(matches!(
         space
             .memory()
-            .read_resolved(&current, &mut bytes, &mut |ranges, operation| space
+            .read_resolved(&current, &mut bytes, &mut |ranges, mut operation| space
                 .machine()
-                .apply_resolved_access(&ranges, &operation)
+                .apply_resolved_access(&ranges, &mut operation)
                 .map_err(Arc::new))
             .unwrap(),
         ()
@@ -554,9 +554,9 @@ fn scatter_gather_reads_preserve_permissions_holes_and_original_physical_order()
     assert!(matches!(
         space
             .memory()
-            .read_resolved(&source, &mut bytes, &mut |ranges, operation| space
+            .read_resolved(&source, &mut bytes, &mut |ranges, mut operation| space
                 .machine()
-                .apply_resolved_access(&ranges, &operation)
+                .apply_resolved_access(&ranges, &mut operation)
                 .map_err(Arc::new))
             .unwrap(),
         ()

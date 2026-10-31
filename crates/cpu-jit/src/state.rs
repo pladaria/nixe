@@ -115,7 +115,9 @@ impl ThreadState {
         match &self.storage {
             Storage::Native(owner) if Arc::ptr_eq(&owner.core, core) => return Ok(()),
             Storage::Unavailable => {
-                return Err(JitError("architectural state is unavailable".into()));
+                return Err(JitError::Failure(
+                    "architectural state is unavailable".into(),
+                ));
             }
             _ => {}
         }
@@ -125,7 +127,7 @@ impl ThreadState {
         // release, after their final register access; there are no competing
         // claimants requiring an atomic read/modify/write on every switch.
         if core.context_owned.load(Ordering::Acquire) {
-            return Err(JitError(
+            return Err(JitError::Failure(
                 "Dynarmic core still owns another guest context".into(),
             ));
         }

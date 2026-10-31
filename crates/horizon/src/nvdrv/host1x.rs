@@ -26,13 +26,84 @@ struct Channel {
     nvmap_fd: Option<NvDrvFileDescriptor>,
     timeout: u32,
     pins: BTreeMap<u64, u32>,
+    worker: Option<Arc<worker::Worker>>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct Host1x {
     channels: BTreeMap<NvDrvFileDescriptor, Channel>,
     mappings: video::Mappings,
+    frames: Option<Arc<video::FrameQueue>>,
+    failure: Option<worker::Failure>,
+}
+
+/// The accepted device close owns its engine and syncpoint until retirement.
+/// No client lock or service-worker stack is retained while it waits.
+pub(crate) struct Close {
+    result: u32,
     worker: Option<Arc<worker::Worker>>,
+    wait: Option<nixe_runtime::EventFuture>,
+    syncpoint: Option<(Arc<Mutex<NvHostControl>>, GuestSyncpointId)>,
+}
+impl Close {
+    pub(super) fn new(
+        result: u32,
+        pending: Option<(GuestSyncpointId, Option<Arc<worker::Worker>>)>,
+        control: Arc<Mutex<NvHostControl>>,
+    ) -> Self {
+        let (syncpoint, worker) = match pending {
+            Some((point, worker)) => (Some((control, point)), worker),
+            None => (None, None),
+        };
+        let wait = worker.as_ref().map(|worker| worker.begin_close());
+        Self {
+            result,
+            worker,
+            wait,
+            syncpoint,
+        }
+    }
+    pub(crate) fn cancel(&self) {
+        if let Some(worker) = &self.worker {
+            worker.stop();
+        }
+    }
+    fn release(&mut self) {
+        if let Some((control, point)) = self.syncpoint.take() {
+            control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .release_channel_syncpoint(point);
+        }
+    }
+}
+impl std::future::Future for Close {
+    type Output = Result<u32, UnsupportedNvDrvOperation>;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        if let Some(wait) = &mut this.wait {
+            std::task::ready!(std::pin::Pin::new(wait).poll(cx));
+        }
+        this.wait.take();
+        let result = if let Some(worker) = this.worker.take() {
+            worker.join().and_then(|()| worker.require_healthy())
+        } else {
+            Ok(())
+        };
+        this.release();
+        std::task::Poll::Ready(result.map(|()| this.result))
+    }
+}
+impl Drop for Close {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.shutdown();
+        }
+        self.release();
+    }
 }
 
 impl Host1x {
@@ -44,14 +115,15 @@ impl Host1x {
                 nvmap_fd: None,
                 timeout: 0,
                 pins: BTreeMap::new(),
+                worker: None,
             },
         );
     }
-    pub(super) fn close(&mut self, fd: NvDrvFileDescriptor) -> Option<GuestSyncpointId> {
+    pub(super) fn close(
+        &mut self,
+        fd: NvDrvFileDescriptor,
+    ) -> Option<(GuestSyncpointId, Option<Arc<worker::Worker>>)> {
         let channel = self.channels.remove(&fd)?;
-        if let Some(worker) = &self.worker {
-            worker.close(fd);
-        }
         for (object, count) in &channel.pins {
             Arc::make_mut(&mut self.mappings).retain(|_, mapping| {
                 if mapping.object.id().raw() == *object {
@@ -60,20 +132,25 @@ impl Host1x {
                 mapping.references != 0
             });
         }
-        Some(channel.syncpoint)
+        Some((channel.syncpoint, channel.worker))
     }
     pub(super) fn clear(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            worker.shutdown();
+        for channel in self.channels.values() {
+            if let Some(worker) = &channel.worker {
+                worker.stop();
+            }
         }
-        self.channels.clear();
+        for (_, channel) in std::mem::take(&mut self.channels) {
+            if let Some(worker) = channel.worker {
+                worker.shutdown();
+            }
+        }
         Arc::make_mut(&mut self.mappings).clear();
     }
     pub(super) fn require_healthy(&self) -> Result<(), UnsupportedNvDrvOperation> {
-        if let Some(worker) = &self.worker {
-            worker.require_healthy()?;
-        }
-        Ok(())
+        self.failure
+            .as_ref()
+            .map_or(Ok(()), worker::require_healthy)
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn ioctl(
@@ -328,21 +405,22 @@ impl Host1x {
                 .map_err(|error| execution_error(descriptor, request, error.to_string()))?,
             );
         }
-        let mut advertised = BTreeMap::new();
-        let mut counts = Vec::new();
+        let mut increments = None;
         for index in 0..syncpoints {
             let offset = shift_end + index * 20;
             let id = input_u32(input, offset)?;
             let count = input_u32(input, offset + 4)?;
-            if id != channel.syncpoint.get() || advertised.insert(id, count).is_some() {
+            if id != channel.syncpoint.get() || increments.replace(count).is_some() {
                 return Err(NV_BAD_PARAMETER.into());
             }
-            counts.push(count);
         }
-        if self.worker.is_none() {
-            self.worker = Some(Arc::new(worker::Worker::new(
+        if channel.worker.is_none() {
+            channel.worker = Some(Arc::new(worker::Worker::new(
                 Arc::clone(control),
                 gpu.cloned(),
+                descriptor,
+                self.frames.get_or_insert_with(Arc::default).clone(),
+                self.failure.get_or_insert_with(Arc::default).clone(),
             )?));
         }
         Ok(CaptureSubmission {
@@ -350,13 +428,12 @@ impl Host1x {
             request,
             writes,
             commands,
-            advertised,
-            counts,
+            increments,
             output: input.to_vec(),
             fence_offset: sync_end,
             syncpoint: channel.syncpoint,
             control: Arc::clone(control),
-            worker: Arc::clone(self.worker.as_ref().unwrap()),
+            worker: Arc::clone(channel.worker.as_ref().unwrap()),
             mappings: Arc::clone(&self.mappings),
             timeout: channel.timeout,
         })
@@ -369,8 +446,7 @@ pub(crate) struct CaptureSubmission {
     request: u32,
     writes: Vec<(Vec<nixe_memory::AllocationRange>, [u8; 4])>,
     commands: Vec<Vec<nixe_memory::AllocationRange>>,
-    advertised: BTreeMap<u32, u32>,
-    counts: Vec<u32>,
+    increments: Option<u32>,
     output: Vec<u8>,
     fence_offset: usize,
     syncpoint: GuestSyncpointId,
@@ -392,11 +468,11 @@ impl CaptureSubmission {
             match machine
                 .access_captured(
                     &ranges,
-                    nixe_memory::AccessOperation::Write(Box::new(bytes)),
+                    nixe_memory::AccessOperation::Write(Vec::from(bytes)),
                 )
                 .map_err(|error| fail(error.to_string()))?
             {
-                nixe_memory::Access::Ready(nixe_memory::AccessResult::Written) => {}
+                nixe_memory::Access::Ready(nixe_memory::AccessResult::Written(_)) => {}
                 nixe_memory::Access::Pending(pending) => {
                     assert!(matches!(
                         pending.await.map_err(|fault| {
@@ -411,7 +487,7 @@ impl CaptureSubmission {
                                 fault,
                             }
                         })?,
-                        nixe_memory::AccessResult::Written
+                        nixe_memory::AccessResult::Written(_)
                     ));
                 }
                 _ => unreachable!("write returns written"),
@@ -422,7 +498,7 @@ impl CaptureSubmission {
             let machine = ranges[0].allocation().machine();
             let result =
                 match machine
-                    .access_captured(&ranges, nixe_memory::AccessOperation::Read)
+                    .access_captured(&ranges, nixe_memory::AccessOperation::Read(Vec::new()))
                     .map_err(|error| fail(error.to_string()))?
                 {
                     nixe_memory::Access::Ready(result) => result,
@@ -450,26 +526,26 @@ impl CaptureSubmission {
             .control
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut completions = Vec::with_capacity(self.counts.len());
-        for (index, count) in self.counts.into_iter().enumerate() {
+        let completion = if let Some(count) = self.increments {
             let reservation = control
                 .reserve_channel_submission(self.descriptor, self.request, self.syncpoint, count)
                 .map_err(|error| fail(error.to_string()))?;
             write_u32(
                 &mut self.output,
-                self.fence_offset + index * 4,
+                self.fence_offset,
                 reservation.point().value().get(),
             )
             .map_err(|error| fail(error.to_string()))?;
-            completions.push(reservation);
-        }
+            Some(reservation)
+        } else {
+            None
+        };
         self.worker
             .submit(worker::Job {
                 descriptor: self.descriptor,
                 request: self.request,
                 commands: captured,
-                advertised: self.advertised,
-                completions,
+                completion,
                 mappings: self.mappings,
                 timeout: self.timeout,
             })

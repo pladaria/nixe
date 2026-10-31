@@ -100,22 +100,24 @@ async fn dispatch_update(
     if input_size < HEADER_SIZE {
         return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_UPDATE_INFO);
     }
-    let mut header = [0; HEADER_SIZE];
-    process.read(input_buffer, 0, &mut header).await?;
-    let layout = match UpdateLayout::parse(&session.0.parameters, &header, input_size) {
-        Ok(layout) => layout,
-        Err(error) => return update_error(error, request.token),
-    };
-    if output_size != layout.output_size {
-        return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_UPDATE_INFO);
-    }
+    process.reserve_payload(input_size + output_size).await?;
     let mut input = Vec::new();
     input
         .try_reserve_exact(input_size)
         .map_err(|_| IpcWireError::HostResourceExhausted("reading an audio renderer update"))?;
     input.resize(input_size, 0);
     process.read(input_buffer, 0, &mut input).await?;
-    let output = {
+    let header = input[..HEADER_SIZE]
+        .try_into()
+        .expect("captured fixed audio header");
+    let layout = match UpdateLayout::parse(&session.0.parameters, header, input_size) {
+        Ok(layout) => layout,
+        Err(error) => return update_error(error, request.token),
+    };
+    if output_size != layout.output_size {
+        return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_UPDATE_INFO);
+    }
+    let mut output = {
         let mut state = session.0.update.take().await;
         if let Some(error) = session.0.failure.get() {
             return Err(error.clone().into());
@@ -133,7 +135,7 @@ async fn dispatch_update(
         session.0.event.clear();
         output
     };
-    process.write(output_buffer, 0, &output).await?;
+    process.write(output_buffer, 0, &mut output).await?;
     semantic_success(request.token, false, &[], &[], &[], None)
 }
 
@@ -171,7 +173,7 @@ pub(in crate::ipc_wire) async fn dispatch_audio_renderer_manager(
             .device(revision, aruid, backend.clone())
             .map_err(|error| IpcWireError::AudioBackend(error.0.into_boxed_str()))?;
         let handle = process
-            .return_handle(HorizonIpcObject::AudioDevice(device))
+            .return_service(HorizonIpcObject::AudioDevice(device))
             .map_err(IpcWireError::Handle)?;
         log::debug!("opening audio device interface: revision={revision} aruid={aruid:#x}");
         return semantic_success(request.token, false, &[], &[], &[], Some(handle));
@@ -248,7 +250,7 @@ pub(in crate::ipc_wire) async fn dispatch_audio_renderer_manager(
             return cmif_error(request.token, HorizonIpcResult::AUDIO_OUT_OF_SESSIONS);
         };
         let handle = process
-            .return_handle(HorizonIpcObject::AudioRenderer(renderer))
+            .return_service(HorizonIpcObject::AudioRenderer(renderer))
             .map_err(IpcWireError::Handle)?;
         return semantic_success(request.token, false, &[], &[], &[], Some(handle));
     }

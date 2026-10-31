@@ -132,7 +132,7 @@ pub(in crate::ipc_wire) async fn dispatch_log_manager(
                 return semantic_success(request.token, true, &[], &[], &[object_id], None);
             }
             let handle = process
-                .return_handle(HorizonIpcObject::Logger(logger))
+                .return_service(HorizonIpcObject::Logger(logger))
                 .map_err(IpcWireError::Handle)?;
             log::debug!("lm opened ILogger handle {handle:#x} for process {process_id}");
             Ok((
@@ -180,6 +180,7 @@ pub(in crate::ipc_wire) async fn dispatch_logger(
                     "ILogger packet exceeds the bounded diagnostic payload",
                 ));
             }
+            process.reserve_payload(size * 2).await?;
             let mut bytes = vec![0; size];
             if size != 0 {
                 process.read(buffer, 0, &mut bytes).await?;

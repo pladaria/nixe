@@ -41,6 +41,41 @@ fn add(
     thread
 }
 
+fn reschedule_notifications(
+    s: &std::sync::Arc<SchedulerState>,
+) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    struct Notify {
+        kernel: std::sync::Weak<SchedulerState>,
+        mask: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        core: u32,
+    }
+    impl std::task::Wake for Notify {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.kernel.upgrade().unwrap().thread_count();
+            self.mask
+                .fetch_or(1 << self.core, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let mask = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    s.bind_core_wakers(
+        s.profile()
+            .vcpus()
+            .iter()
+            .map(|core| {
+                std::task::Waker::from(std::sync::Arc::new(Notify {
+                    kernel: std::sync::Arc::downgrade(s),
+                    mask: mask.clone(),
+                    core: core.id().get(),
+                }))
+            })
+            .collect(),
+    );
+    mask
+}
+
 fn selected(s: &SchedulerState, core: u32) -> Option<GuestThreadId> {
     s.selection(VirtualCpuId::new(core)).unwrap().thread
 }
@@ -188,33 +223,6 @@ fn priority_donation_requeues_only_the_actual_current_owner_at_the_front() {
 }
 
 #[test]
-fn native_boundaries_keep_queue_turn_and_generation() {
-    let s = scheduler(1);
-    let a = add(&s, 1, 20, Some(0), &[0]);
-    let b = add(&s, 1, 20, Some(0), &[0]);
-    let generation = s.selection(VirtualCpuId::new(0)).unwrap().generation;
-    for outcome in [
-        Completion::Ready,
-        Completion::KernelCall {
-            interrupt_handled: false,
-        },
-    ] {
-        let owner = lease(&s, 0);
-        assert_eq!(owner.thread, a);
-        s.complete(owner, outcome).unwrap();
-        if matches!(outcome, Completion::KernelCall { .. }) {
-            s.make_ready(a).unwrap();
-        }
-        assert_eq!(
-            s.selection(VirtualCpuId::new(0)).unwrap().generation,
-            generation
-        );
-    }
-    s.yield_thread(a, YieldMigration::None).unwrap();
-    assert_eq!(selected(&s, 0), Some(b));
-}
-
-#[test]
 fn donor_balancing_invalidates_yield_cache_even_when_the_original_selection_returns() {
     let s = scheduler(2);
     let a = add(&s, 1, 10, Some(0), &[0]);
@@ -232,33 +240,15 @@ fn donor_balancing_invalidates_yield_cache_even_when_the_original_selection_retu
 }
 
 #[test]
-fn svc_exit_retains_ownership_until_its_racing_interrupt_is_handled() {
+fn a_racing_interrupt_pins_the_current_owner_before_context_release() {
     let s = scheduler(1);
     let a = add(&s, 1, 20, Some(0), &[0]);
     let owner = lease(&s, 0);
     add(&s, 1, 10, Some(0), &[0]);
-    assert!(
-        !s.complete(
-            owner,
-            Completion::KernelCall {
-                interrupt_handled: false
-            }
-        )
-        .unwrap()
-    );
-    assert_eq!(s.lease_for_vcpu(VirtualCpuId::new(0)), Some(owner));
-    s.pin_thread(VirtualCpuId::new(0), a).unwrap();
-    assert!(
-        s.complete(
-            owner,
-            Completion::KernelCall {
-                interrupt_handled: true
-            }
-        )
-        .unwrap()
-    );
-    assert_eq!(s.lease_for_vcpu(VirtualCpuId::new(0)), None);
+    assert_eq!(s.lease_for_vcpu(owner.vcpu), Some(owner));
+    s.pin_thread(owner.vcpu, a).unwrap();
     assert_eq!(selected(&s, 0), Some(a));
+    s.complete(owner, Completion::Ready).unwrap();
 }
 
 #[test]
@@ -411,10 +401,11 @@ fn rotation_does_not_force_preemption_of_other_priorities() {
     let a = add(&s, 1, 20, Some(0), &[0]);
     add(&s, 1, 20, Some(0), &[0]);
     let running = lease(&s, 0);
-    s.take_reschedule_requests();
+    let notifications = reschedule_notifications(&s);
+    notifications.store(0, std::sync::atomic::Ordering::Relaxed);
     s.rotate();
     assert_eq!(selected(&s, 0), Some(a));
-    assert!(s.take_reschedule_requests().is_empty());
+    assert!(notifications.swap(0, std::sync::atomic::Ordering::Relaxed) == 0);
     s.complete(running, Completion::Ready).unwrap();
     s.set_priority(a, 59, None).unwrap();
     let b = selected(&s, 0).unwrap();
@@ -499,7 +490,8 @@ fn empty_retirement_does_not_reselect_but_ready_retirement_does() {
         if state == ThreadLifecycle::Exited {
             s.terminate(retiring, false).unwrap();
         }
-        s.take_reschedule_requests();
+        let notifications = reschedule_notifications(&s);
+        notifications.store(0, std::sync::atomic::Ordering::Relaxed);
         let before = s.statistics().selection_passes;
         s.unregister(retiring).unwrap();
         assert_eq!(
@@ -508,7 +500,7 @@ fn empty_retirement_does_not_reselect_but_ready_retirement_does() {
         );
         assert_eq!(selected(&s, 0), Some(ready));
         assert_eq!(
-            s.take_reschedule_requests().is_empty(),
+            notifications.swap(0, std::sync::atomic::Ordering::Relaxed) == 0,
             state != ThreadLifecycle::Ready
         );
     }
@@ -550,13 +542,7 @@ fn donation_cycle_is_detected_without_corrupting_existing_links() {
 fn wake_generation_and_reused_slot_reject_stale_completions() {
     let s = scheduler(1);
     let a = add(&s, 1, 20, Some(0), &[0]);
-    s.complete(
-        lease(&s, 0),
-        Completion::KernelCall {
-            interrupt_handled: false,
-        },
-    )
-    .unwrap();
+    s.complete(lease(&s, 0), Completion::Waiting).unwrap();
     let token = s.register_wait(a).unwrap().token();
     s.finish_wait(token).unwrap();
     assert_eq!(s.finish_wait(token), Err(SchedulerError::StaleWake(token)));
@@ -573,13 +559,7 @@ fn wake_generation_and_reused_slot_reject_stale_completions() {
 fn paused_waiter_wakes_without_becoming_runnable_until_resumed() {
     let s = scheduler(1);
     let a = add(&s, 1, 20, Some(0), &[0]);
-    s.complete(
-        lease(&s, 0),
-        Completion::KernelCall {
-            interrupt_handled: false,
-        },
-    )
-    .unwrap();
+    s.complete(lease(&s, 0), Completion::Waiting).unwrap();
     let token = s.register_wait(a).unwrap().token();
     s.set_activity(a, true).unwrap();
     s.finish_wait(token).unwrap();
@@ -593,13 +573,18 @@ fn paused_waiter_wakes_without_becoming_runnable_until_resumed() {
 fn selected_changes_produce_targeted_wake_masks() {
     let s = scheduler(2);
     add(&s, 1, 20, Some(0), &[0]);
-    s.take_reschedule_requests();
+    let notifications = reschedule_notifications(&s);
+    notifications.store(0, std::sync::atomic::Ordering::Relaxed);
     add(&s, 1, 10, Some(1), &[1]);
     assert_eq!(
-        s.take_reschedule_requests().iter().collect::<Vec<_>>(),
+        CoreSet {
+            bits: notifications.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }
+        .iter()
+        .collect::<Vec<_>>(),
         [VirtualCpuId::new(1)]
     );
-    assert!(s.take_reschedule_requests().is_empty());
+    assert!(notifications.swap(0, std::sync::atomic::Ordering::Relaxed) == 0);
 }
 
 #[test]
@@ -719,13 +704,7 @@ fn priority_changes_only_keep_the_calling_thread_at_the_front() {
 fn competing_wait_completions_claim_one_generation() {
     let s = scheduler(1);
     let a = add(&s, 1, 20, Some(0), &[0]);
-    s.complete(
-        lease(&s, 0),
-        Completion::KernelCall {
-            interrupt_handled: false,
-        },
-    )
-    .unwrap();
+    s.complete(lease(&s, 0), Completion::Waiting).unwrap();
     let token = s.register_wait(a).unwrap().token();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let workers: Vec<_> = (0..2)
@@ -908,8 +887,13 @@ fn priority_inheritance_reorders_the_actual_condition_or_arbiter_node() {
         s.terminate(b, false).unwrap();
         s.unregister(b).unwrap();
         assert_eq!(
-            s.ordered_waiters(ProcessId::new(1), kind, 0x200, usize::MAX),
-            [a]
+            s.first_ordered_waiter(ProcessId::new(1), kind, 0x200),
+            Some(a)
+        );
+        assert!(s.remove_waiter(a));
+        assert!(
+            s.first_ordered_waiter(ProcessId::new(1), kind, 0x200)
+                .is_none()
         );
     }
 }
@@ -931,14 +915,7 @@ fn cancellation_after_a_resolved_wait_applies_only_to_the_next_wait() {
             .unwrap();
         scheduler.make_ready(thread).unwrap();
         let lease = scheduler.claim(VirtualCpuId::new(0)).unwrap().unwrap();
-        scheduler
-            .complete(
-                lease,
-                Completion::KernelCall {
-                    interrupt_handled: false,
-                },
-            )
-            .unwrap();
+        scheduler.complete(lease, Completion::Waiting).unwrap();
         let wait = match scheduler.wait_on_objects(thread, &[], None, true).unwrap() {
             WaitStart::Pending(wait) => wait,
             _ => panic!("unsignalled wait"),
@@ -952,14 +929,7 @@ fn cancellation_after_a_resolved_wait_applies_only_to_the_next_wait() {
             assert!(!scheduler.cancel_synchronization(thread).unwrap());
         }
         let lease = scheduler.claim(VirtualCpuId::new(0)).unwrap().unwrap();
-        scheduler
-            .complete(
-                lease,
-                Completion::KernelCall {
-                    interrupt_handled: false,
-                },
-            )
-            .unwrap();
+        scheduler.complete(lease, Completion::Waiting).unwrap();
         match scheduler.wait_on_objects(thread, &[], None, true).unwrap() {
             WaitStart::Pending(_) => assert!(cancel_first),
             WaitStart::Ready(WaitOutcome::Cancelled) => assert!(!cancel_first),

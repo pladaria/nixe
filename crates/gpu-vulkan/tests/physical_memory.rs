@@ -169,9 +169,9 @@ fn native_ram_read_resolves_neighbouring_image_and_reopens_both_aliases() {
         access(
             &mut execution,
             vec![input.slice(512, 4).unwrap()],
-            AccessOperation::Write(Box::new(9u32.to_le_bytes()))
+            AccessOperation::Write(Vec::from(9u32.to_le_bytes()))
         ),
-        AccessResult::Written
+        AccessResult::Written(_)
     ));
     assert!(!area.observation().is_invalid());
     {
@@ -191,7 +191,7 @@ fn native_ram_read_resolves_neighbouring_image_and_reopens_both_aliases() {
     let AccessResult::Read(pixel) = access(
         &mut execution,
         vec![input.slice(0, 4).unwrap()],
-        AccessOperation::Read,
+        AccessOperation::Read(Vec::new()),
     ) else {
         panic!("expected actual image bytes");
     };
@@ -388,9 +388,9 @@ fn ordered_literal_fences_publish_ram_and_reopen_aliases_without_readback() {
                 access(
                     &mut execution,
                     ranges,
-                    nixe_memory::AccessOperation::Write(Box::new([99]))
+                    nixe_memory::AccessOperation::Write(Vec::from([99]))
                 ),
-                nixe_memory::AccessResult::Written
+                nixe_memory::AccessResult::Written(_)
             ));
         }
         execution.progress().unwrap();
@@ -577,7 +577,7 @@ fn native_owner_consumes_cpu_alias_overwrites_before_real_image_readback_and_rep
         let AccessResult::Read(actual) = access(
             &mut execution,
             vec![input.slice(0, 128).unwrap()],
-            AccessOperation::Read,
+            AccessOperation::Read(Vec::new()),
         ) else {
             panic!("expected physical readback")
         };

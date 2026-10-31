@@ -91,7 +91,6 @@ pub(in crate::ipc_wire) async fn dispatch_time(
     session: &TimeServiceSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
-    scheduling: &std::sync::Arc<crate::ipc_wire::operation::ServiceScheduling>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let target = match &request.domain {
         Some(DomainRequest::Close { object_id }) => {
@@ -143,7 +142,7 @@ pub(in crate::ipc_wire) async fn dispatch_time(
     match target {
         TimeTarget::Root => dispatch_time_root(process, session, request, hipc),
         TimeTarget::Object(TimeObject::SystemClock(clock)) => {
-            dispatch_system_clock_target(Some(session), &clock, request, hipc, scheduling).await
+            dispatch_system_clock_target(Some(session), &clock, request, hipc).await
         }
         TimeTarget::Object(TimeObject::SteadyClock(clock)) => {
             dispatch_steady_clock_target(Some(session), &clock, request)
@@ -280,7 +279,9 @@ fn dispatch_time_root(
         TimeObject::SteadyClock(clock) => HorizonIpcObject::SteadyClock(clock),
         TimeObject::TimeZone(timezone) => HorizonIpcObject::TimeZone(timezone),
     };
-    let handle = process.return_handle(child).map_err(IpcWireError::Handle)?;
+    let handle = process
+        .return_service(child)
+        .map_err(IpcWireError::Handle)?;
     log::debug!("time:u {command:?} returned child session handle {handle:#x}");
     semantic_success(request.token, false, &[], &[], &[], Some(handle))
 }
@@ -289,9 +290,8 @@ pub(in crate::ipc_wire) async fn dispatch_system_clock(
     session: &SystemClockSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
-    scheduling: &std::sync::Arc<crate::ipc_wire::operation::ServiceScheduling>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    dispatch_system_clock_target(None, session, request, hipc, scheduling).await
+    dispatch_system_clock_target(None, session, request, hipc).await
 }
 
 async fn dispatch_system_clock_target(
@@ -299,7 +299,6 @@ async fn dispatch_system_clock_target(
     session: &SystemClockSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
-    scheduling: &std::sync::Arc<crate::ipc_wire::operation::ServiceScheduling>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let Some(command) = SystemClockCommand::decode(request.command_id) else {
         return unsupported_service_command("ISystemClock", request.command_id);
@@ -348,10 +347,7 @@ async fn dispatch_system_clock_target(
                 );
             }
             session
-                .set_current_time(
-                    i64::from_le_bytes(timestamp.try_into().unwrap()),
-                    scheduling,
-                )
+                .set_current_time(i64::from_le_bytes(timestamp.try_into().unwrap()))
                 .await
                 .map_err(IpcWireError::SystemMemory)?;
             time_object_response(

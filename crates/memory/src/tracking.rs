@@ -910,30 +910,29 @@ impl Machine {
     pub fn apply_resolved_access(
         &self,
         ranges: &[AllocationRange],
-        operation: &crate::AccessOperation,
+        operation: &mut crate::AccessOperation,
     ) -> Result<crate::AccessResult, MemoryError> {
+        let code = matches!(operation, crate::AccessOperation::ReadCode(_));
         match operation {
             crate::AccessOperation::ReadNative => self.read_native_resolved(ranges, None),
             crate::AccessOperation::ReadCode(observation)
             | crate::AccessOperation::ReadObserved(observation) => {
                 let bytes = self
-                    .read_observed_impl(
-                        ranges,
-                        observation,
-                        false,
-                        matches!(operation, crate::AccessOperation::ReadCode(_)),
-                    )?
+                    .read_observed_impl(ranges, observation, false, code)?
                     .expect("owner-resolved code capture cannot defer");
-                Ok(crate::AccessResult::Read(bytes))
+                Ok(crate::AccessResult::Read(bytes.into_vec()))
             }
-            crate::AccessOperation::Read => {
-                let mut bytes = vec![0; self.validate_ranges(ranges)?];
-                self.capture_stream(ranges, &mut bytes)?;
-                Ok(crate::AccessResult::Read(bytes.into_boxed_slice()))
+            crate::AccessOperation::Read(bytes) => {
+                let size = self.validate_ranges(ranges)?;
+                if bytes.len() != size {
+                    bytes.resize(size, 0);
+                }
+                self.capture_stream(ranges, bytes)?;
+                Ok(crate::AccessResult::Read(std::mem::take(bytes)))
             }
             crate::AccessOperation::Write(bytes) => {
                 self.write_resolved(ranges, bytes)?;
-                Ok(crate::AccessResult::Written)
+                Ok(crate::AccessResult::Written(std::mem::take(bytes)))
             }
             crate::AccessOperation::Atomic(operation) => {
                 let [range] = ranges else {
@@ -951,9 +950,9 @@ impl Machine {
     pub fn access_captured(
         &self,
         ranges: &[AllocationRange],
-        operation: crate::AccessOperation,
+        mut operation: crate::AccessOperation,
     ) -> Result<crate::Access<crate::AccessResult>, MemoryError> {
-        if let Some(result) = self.try_access_captured(ranges, &operation)? {
+        if let Some(result) = self.try_access_captured(ranges, &mut operation)? {
             return Ok(crate::Access::Ready(result));
         }
         self.request_device_access(ranges.to_vec(), operation)
@@ -965,7 +964,7 @@ impl Machine {
     pub fn try_access_captured(
         &self,
         ranges: &[AllocationRange],
-        operation: &crate::AccessOperation,
+        operation: &mut crate::AccessOperation,
     ) -> Result<Option<crate::AccessResult>, MemoryError> {
         let size = self.validate_ranges(ranges)?;
         if ranges.is_empty() {
@@ -973,6 +972,7 @@ impl Machine {
                 "captured access requires physical spans",
             ));
         }
+        let code = matches!(operation, crate::AccessOperation::ReadCode(_));
         match operation {
             crate::AccessOperation::ReadNative => {
                 let mut destination = vec![0; size];
@@ -985,18 +985,13 @@ impl Machine {
             }
             crate::AccessOperation::ReadCode(observation)
             | crate::AccessOperation::ReadObserved(observation) => {
-                if let Some(bytes) = self.read_observed_impl(
-                    ranges,
-                    observation,
-                    true,
-                    matches!(operation, crate::AccessOperation::ReadCode(_)),
-                )? {
-                    return Ok(Some(crate::AccessResult::Read(bytes)));
+                if let Some(bytes) = self.read_observed_impl(ranges, observation, true, code)? {
+                    return Ok(Some(crate::AccessResult::Read(bytes.into_vec())));
                 }
             }
             crate::AccessOperation::Write(bytes) => {
                 if self.write_physical_impl(ranges, bytes, true)? {
-                    return Ok(Some(crate::AccessResult::Written));
+                    return Ok(Some(crate::AccessResult::Written(std::mem::take(bytes))));
                 }
             }
             crate::AccessOperation::Atomic(atomic) => {
@@ -1009,12 +1004,12 @@ impl Machine {
                     return Ok(Some(result));
                 }
             }
-            crate::AccessOperation::Read => {
-                let mut destination = vec![0; size];
-                if self.read_physical_into(ranges, &mut destination)? {
-                    return Ok(Some(crate::AccessResult::Read(
-                        destination.into_boxed_slice(),
-                    )));
+            crate::AccessOperation::Read(destination) => {
+                if destination.len() != size {
+                    destination.resize(size, 0);
+                }
+                if self.read_physical_into(ranges, destination)? {
+                    return Ok(Some(crate::AccessResult::Read(std::mem::take(destination))));
                 }
             }
         }
@@ -1033,10 +1028,32 @@ impl Machine {
         let extents = ranges.physical_extents(offset, bytes)?;
         if !self.read_ram_extents(extents, destination)? {
             return self
-                .request_device_access(ranges.capture(offset, bytes)?, crate::AccessOperation::Read)
+                .request_device_access(
+                    ranges.capture(offset, bytes)?,
+                    crate::AccessOperation::Read(Vec::new()),
+                )
                 .map(crate::Access::Pending);
         }
         Ok(crate::Access::Ready(()))
+    }
+    /// Move caller-owned storage across a device dependency and return that
+    /// same allocation after the exact physical read completes.
+    pub fn read_captured_owned(
+        &self,
+        ranges: &crate::CapturedMemory,
+        offset: u64,
+        mut destination: Vec<u8>,
+    ) -> Result<crate::Access<Vec<u8>>, MemoryError> {
+        self.validate_capture(ranges)?;
+        let bytes = destination.len() as u64;
+        if self.read_ram_extents(ranges.physical_extents(offset, bytes)?, &mut destination)? {
+            return Ok(crate::Access::Ready(destination));
+        }
+        self.request_device_access(
+            ranges.capture(offset, bytes)?,
+            crate::AccessOperation::Read(destination),
+        )
+        .map(crate::Access::Pending)
     }
     fn validate_capture(&self, ranges: &crate::CapturedMemory) -> Result<(), MemoryError> {
         if ranges.machine.is_some_and(|id| id != self.identity()) {
@@ -1647,30 +1664,56 @@ impl Machine {
         offset: u64,
         source: &[u8],
     ) -> Result<crate::Access<()>, MemoryError> {
-        self.validate_capture(ranges)?;
-        let extents: smallvec::SmallVec<[_; 4]> = ranges
-            .physical_extents(offset, source.len() as u64)?
-            .collect();
-        if source.is_empty() {
+        if self.write_captured_ram(ranges, offset, source)? {
             return Ok(crate::Access::Ready(()));
-        }
-        let written = self.try_write_extents(&extents, source, true);
-        if written == Some(true) {
-            return Ok(crate::Access::Ready(()));
-        }
-        // Tracking transitions need exact coordinates, but the parent already
-        // owns their lifetime. Only an escaping request acquires independent pins.
-        if written.is_none() {
-            let selected = ranges.views(offset, source.len() as u64)?;
-            if self.write_physical_impl(&selected, source, true)? {
-                return Ok(crate::Access::Ready(()));
-            }
         }
         self.request_device_access(
             ranges.capture(offset, source.len() as u64)?,
             crate::AccessOperation::Write(source.into()),
         )
         .map(crate::Access::Pending)
+    }
+    /// The pending request owns the service's buffer rather than a snapshot of
+    /// a still-retained source. Completion returns it for the next bulk chunk.
+    pub fn write_captured_owned(
+        &self,
+        ranges: &crate::CapturedMemory,
+        offset: u64,
+        source: Vec<u8>,
+    ) -> Result<crate::Access<Vec<u8>>, MemoryError> {
+        if self.write_captured_ram(ranges, offset, &source)? {
+            return Ok(crate::Access::Ready(source));
+        }
+        self.request_device_access(
+            ranges.capture(offset, source.len() as u64)?,
+            crate::AccessOperation::Write(source),
+        )
+        .map(crate::Access::Pending)
+    }
+    fn write_captured_ram(
+        &self,
+        ranges: &crate::CapturedMemory,
+        offset: u64,
+        source: &[u8],
+    ) -> Result<bool, MemoryError> {
+        self.validate_capture(ranges)?;
+        let extents: smallvec::SmallVec<[_; 4]> = ranges
+            .physical_extents(offset, source.len() as u64)?
+            .collect();
+        if source.is_empty() {
+            return Ok(true);
+        }
+        let written = self.try_write_extents(&extents, source, true);
+        if written == Some(true) {
+            return Ok(true);
+        }
+        if written.is_none() {
+            let selected = ranges.views(offset, source.len() as u64)?;
+            if self.write_physical_impl(&selected, source, true)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     fn write_physical_impl(
         &self,
@@ -1775,7 +1818,7 @@ impl crate::Allocation {
                 AllocationRange::new(self.pin_range(offset, bytes as u64)?, offset, bytes as u64)?;
             return self
                 .machine()
-                .request_device_access(vec![range], crate::AccessOperation::Read)
+                .request_device_access(vec![range], crate::AccessOperation::Read(Vec::new()))
                 .map(crate::Access::Pending);
         }
         Ok(crate::Access::Ready(output.into_boxed_slice()))
@@ -2337,7 +2380,7 @@ mod tests {
             machine
                 .try_access_captured(
                     &split,
-                    &crate::AccessOperation::Write(vec![9; 3 * PAGE_SIZE as usize].into())
+                    &mut crate::AccessOperation::Write(vec![9; 3 * PAGE_SIZE as usize])
                 )
                 .unwrap()
                 .is_none()
@@ -2730,7 +2773,7 @@ mod tests {
         // can remain device-produced, so the device page stays inaccessible.
         let code = crate::Observation::default();
         machine
-            .apply_resolved_access(&ranges, &crate::AccessOperation::ReadCode(code.clone()))
+            .apply_resolved_access(&ranges, &mut crate::AccessOperation::ReadCode(code.clone()))
             .unwrap();
         assert_eq!(machine.tracking_statistics().protection_calls, before);
         assert!(invalidations(&context).is_empty());
@@ -3194,9 +3237,12 @@ mod tests {
                 AccessResult::Atomic { written: true, .. }
             ));
             let read = machine
-                .apply_resolved_access(std::slice::from_ref(&range), &AccessOperation::Read)
+                .apply_resolved_access(
+                    std::slice::from_ref(&range),
+                    &mut AccessOperation::Read(Vec::new()),
+                )
                 .unwrap();
-            assert_eq!(read, AccessResult::Read(Box::new([expected])));
+            assert_eq!(read, AccessResult::Read(Vec::from([expected])));
         }
         assert!(observed.is_invalid());
         for width in [2, 4, 8, 16] {

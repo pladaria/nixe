@@ -167,9 +167,11 @@ impl KernelWait {
                     }) {
                         return Ok(Poll::Ready(outcome));
                     }
-                    let index = state.slots.index(self.token.thread)?;
+                    let Ok(index) = state.slots.index(self.token.thread) else {
+                        return Ok(Poll::Ready(WaitOutcome::Terminated));
+                    };
                     if state.slots[index].wait_token() != Some(self.token) {
-                        return Err(SchedulerError::StaleWake(self.token));
+                        return Ok(Poll::Ready(WaitOutcome::Terminated));
                     }
                     let slot = &mut state.slots[index].wait_waker;
                     if slot
@@ -234,6 +236,13 @@ impl State {
             return false;
         }
         if !wait.resolve(outcome) {
+            // The terminal result stays immutable, but retiring its caller
+            // must release a continuation still awaiting an accepted effect.
+            if outcome == WaitOutcome::Terminated
+                && let Some(waker) = self.slots[index].wait_waker.take()
+            {
+                self.deferred_wakers.push((waker, true));
+            }
             return false;
         }
         self.timer_invalidated |= wait.has_timer();

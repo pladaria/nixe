@@ -11,8 +11,6 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
-use nixe_loader_title::TitleId;
-
 use nixe_runtime::{EventObject, ProcessMountNamespace, ReadableEventObject};
 
 use crate::{
@@ -96,15 +94,6 @@ impl Display for IpcResultCode {
     }
 }
 
-/// One authorized add-on reported to the guest.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct AddOnContentEntry {
-    pub title_id: TitleId,
-    pub version: u32,
-    pub horizon_index: Option<u32>,
-    pub mount_count: u32,
-}
-
 /// Bounded semantic requests accepted by the filesystem services.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -162,12 +151,7 @@ pub enum IpcRequest {
     ReadDirectory {
         max_entries: usize,
     },
-    GetAddOnContentCount,
     GetIndexedAddOnContentCount,
-    ListAddOnContent {
-        offset: usize,
-        max_entries: usize,
-    },
     ListIndexedAddOnContent {
         offset: usize,
         max_entries: usize,
@@ -177,10 +161,6 @@ pub enum IpcRequest {
     },
     GetAddOnContentListChangedEvent,
     CheckAddOnContentMountStatus,
-    OpenAddOnContent {
-        title_id: TitleId,
-        mount_index: usize,
-    },
 }
 
 /// Typed response returned on a successful semantic dispatch.
@@ -207,7 +187,8 @@ pub enum IpcResponse {
         size: usize,
     },
     DirectoryEntries(Vec<DirectoryEntry>),
-    AddOnContentEntries(Vec<AddOnContentEntry>),
+    /// Already captured little-endian u32 indices, in the final outgoing allocation.
+    AddOnContentIndices(Vec<u8>),
 }
 
 pub(crate) fn dispatch_semantic_object(
@@ -291,9 +272,6 @@ pub(crate) fn dispatch_session(
                 SemanticIpcObject::HostDirectoryFileSystem(HostDirectoryFileSystem::new(root)),
             ))
         }
-        (IpcService::AddOnContent, IpcRequest::GetAddOnContentCount) => Ok(IpcResponse::Size(
-            u64::try_from(mounts.add_ons().len()).map_err(|_| IpcResultCode::OUT_OF_RANGE)?,
-        )),
         (IpcService::AddOnContent, IpcRequest::GetIndexedAddOnContentCount) => {
             let count = mounts
                 .add_ons()
@@ -306,46 +284,26 @@ pub(crate) fn dispatch_session(
         }
         (
             IpcService::AddOnContent,
-            IpcRequest::ListAddOnContent {
-                offset,
-                max_entries,
-            },
-        ) => {
-            validate_list_limit(max_entries)?;
-            let entries = mounts
-                .add_ons()
-                .iter()
-                .skip(offset)
-                .take(max_entries)
-                .map(|add_on| {
-                    Ok(AddOnContentEntry {
-                        title_id: add_on.title_id(),
-                        version: add_on.version().raw(),
-                        horizon_index: add_on.horizon_index(),
-                        mount_count: u32::try_from(add_on.mounts().len())
-                            .map_err(|_| IpcResultCode::OUT_OF_RANGE)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, IpcResultCode>>()?;
-            Ok(IpcResponse::AddOnContentEntries(entries))
-        }
-        (
-            IpcService::AddOnContent,
             IpcRequest::ListIndexedAddOnContent {
                 offset,
                 max_entries,
             },
         ) => {
             validate_list_limit(max_entries)?;
-            let entries = mounts
+            // AOC exposes indices, not title/version/mount metadata. Capture
+            // them directly into the admitted outgoing storage.
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/aoc/addon_content_manager.cpp#L114-L143
+            let mut indices = Vec::with_capacity(max_entries.min(mounts.add_ons().len()) * 4);
+            for index in mounts
                 .add_ons()
                 .iter()
-                .filter(|add_on| add_on.horizon_index().is_some())
+                .filter_map(|add_on| add_on.horizon_index())
                 .skip(offset)
                 .take(max_entries)
-                .map(add_on_entry)
-                .collect::<Result<Vec<_>, IpcResultCode>>()?;
-            Ok(IpcResponse::AddOnContentEntries(entries))
+            {
+                indices.extend_from_slice(&index.to_le_bytes());
+            }
+            Ok(IpcResponse::AddOnContentIndices(indices))
         }
         (IpcService::AddOnContent, IpcRequest::PrepareAddOnContent { horizon_index }) => {
             if mounts
@@ -371,37 +329,8 @@ pub(crate) fn dispatch_session(
             let (_writable, readable) = EventObject::create_pair(kernel);
             Ok(IpcResponse::Event(readable))
         }
-        (
-            IpcService::AddOnContent,
-            IpcRequest::OpenAddOnContent {
-                title_id,
-                mount_index,
-            },
-        ) => {
-            let add_on = mounts
-                .add_on(title_id)
-                .ok_or(IpcResultCode::PATH_NOT_FOUND)?;
-            let mount = add_on
-                .mounts()
-                .get(mount_index)
-                .cloned()
-                .ok_or(IpcResultCode::OUT_OF_RANGE)?;
-            Ok(IpcResponse::Object(SemanticIpcObject::ReadOnlyFileSystem(
-                ReadOnlyFileSystem::new(mount),
-            )))
-        }
         _ => Err(IpcResultCode::INVALID_COMMAND),
     }
-}
-
-fn add_on_entry(add_on: &nixe_runtime::AddOnContent) -> Result<AddOnContentEntry, IpcResultCode> {
-    Ok(AddOnContentEntry {
-        title_id: add_on.title_id(),
-        version: add_on.version().raw(),
-        horizon_index: add_on.horizon_index(),
-        mount_count: u32::try_from(add_on.mounts().len())
-            .map_err(|_| IpcResultCode::OUT_OF_RANGE)?,
-    })
 }
 
 fn dispatch_filesystem(

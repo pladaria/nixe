@@ -31,15 +31,15 @@ fn a_hle_map_alias_output_keeps_its_capture_separate_from_the_command() {
 
 fn remapped_command_output(map_alias: bool) {
     let (_directory, mut process) = fixture_process(&[svc(0x22)]);
-    let events = process.coordinator_mut().event_sender();
-    let mut dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let events = process.driver_mut().event_sender();
+    let dispatcher = support::dispatcher(&process).with_input_completions(events);
     let session = process
         .handles()
-        .insert(if map_alias {
+        .insert(crate::ServiceSession::new(if map_alias {
             HorizonIpcObject::UserSettings(crate::UserSettingsSession::new(Default::default()))
         } else {
             HorizonIpcObject::SystemSettings(crate::SystemSettingsSession::new())
-        })
+        }))
         .unwrap();
     let buffer = process
         .main_thread()
@@ -78,36 +78,47 @@ fn remapped_command_output(map_alias: bool) {
     let stop = process.run_slice().unwrap().stop;
     machine.publish_device_write(&original, || Ok(())).unwrap();
     assert!(matches!(
-        process
-            .route_supervisor_call(&stop, &mut dispatcher)
-            .unwrap(),
+        process.call_local(&stop, &dispatcher).unwrap(),
         ExceptionHandlingResult::Suspended
     ));
-    let read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert!(matches!(read.operation(), AccessOperation::Read));
+    let mut read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(matches!(read.operation(), AccessOperation::Read(_)));
     process.memory().unmap(buffer, 0x1000, mapping).unwrap();
     process
         .memory()
         .map_zeroed(buffer, 0x1000, mapping)
         .unwrap();
     write_guest_bytes(&process, output, &[0x5a; 0x100]);
-    let value = machine
-        .apply_resolved_access(read.ranges(), read.operation())
-        .unwrap();
+    let value = {
+        let (ranges, operation) = read.parts_mut();
+        machine.apply_resolved_access(ranges, operation)
+    }
+    .unwrap();
     read.finish(Ok(value));
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     while read_abi_register(&process, 0) != 0 {
-        let write = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        let write = loop {
+            dispatcher.drive_pending(process.driver_mut()).unwrap();
+            match receive.try_recv() {
+                Ok(write) => break Some(write),
+                Err(mpsc::TryRecvError::Empty) if read_abi_register(&process, 0) == 0 => {
+                    break None;
+                }
+                Err(mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+                Err(error) => panic!("device request: {error}"),
+            }
+        };
+        let Some(mut write) = write else {
+            break;
+        };
         assert!(matches!(write.operation(), AccessOperation::Write(_)));
-        let value = machine
-            .apply_resolved_access(write.ranges(), write.operation())
-            .unwrap();
+        let value = {
+            let (ranges, operation) = write.parts_mut();
+            machine.apply_resolved_access(ranges, operation)
+        }
+        .unwrap();
         write.finish(Ok(value));
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
     }
     assert_eq!(
         read_guest_u32(&process, output),
@@ -118,7 +129,7 @@ fn remapped_command_output(map_alias: bool) {
         }
     );
     let AccessResult::Read(original) = machine
-        .apply_resolved_access(&original, &AccessOperation::Read)
+        .apply_resolved_access(&original, &mut AccessOperation::Read(Vec::new()))
         .unwrap()
     else {
         panic!("expected the accepted command allocation")
@@ -130,12 +141,12 @@ fn remapped_command_output(map_alias: bool) {
 #[test]
 fn native_hle_user_buffers_read_a_bounded_prefix_and_only_separate_receive_metadata() {
     let (_directory, mut process) = fixture_process(&[svc(0x22)]);
-    let events = process.coordinator_mut().event_sender();
-    let mut dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let events = process.driver_mut().event_sender();
+    let dispatcher = support::dispatcher(&process).with_input_completions(events);
     let session = process
         .handles()
-        .insert(HorizonIpcObject::SystemSettings(
-            crate::SystemSettingsSession::new(),
+        .insert(nixe_horizon::ServiceSession::new(
+            HorizonIpcObject::SystemSettings(crate::SystemSettingsSession::new()),
         ))
         .unwrap();
     let output = process.main_thread().stack_bottom;
@@ -168,48 +179,59 @@ fn native_hle_user_buffers_read_a_bounded_prefix_and_only_separate_receive_metad
     let stop = process.run_slice().unwrap().stop;
     machine.publish_device_write(&ranges, || Ok(())).unwrap();
     assert!(matches!(
-        process
-            .route_supervisor_call(&stop, &mut dispatcher)
-            .unwrap(),
+        process.call_local(&stop, &dispatcher).unwrap(),
         ExceptionHandlingResult::Suspended
     ));
     for (offset, size) in [(0, 256), (1024, 8)] {
-        let read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(read.operation(), AccessOperation::Read));
+        let mut read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(read.operation(), AccessOperation::Read(_)));
         assert_eq!(read.ranges()[0].offset(), ranges[0].offset() + offset);
         assert_eq!(
             read.ranges().iter().map(|range| range.bytes()).sum::<u64>(),
             size
         );
-        let value = machine
-            .apply_resolved_access(read.ranges(), read.operation())
-            .unwrap();
+        let value = {
+            let (ranges, operation) = read.parts_mut();
+            machine.apply_resolved_access(ranges, operation)
+        }
+        .unwrap();
         read.finish(Ok(value));
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
     }
     while read_abi_register(&process, 0) != 0 {
-        let write = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        let write = loop {
+            dispatcher.drive_pending(process.driver_mut()).unwrap();
+            match receive.try_recv() {
+                Ok(write) => break Some(write),
+                Err(mpsc::TryRecvError::Empty) if read_abi_register(&process, 0) == 0 => {
+                    break None;
+                }
+                Err(mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+                Err(error) => panic!("device request: {error}"),
+            }
+        };
+        let Some(mut write) = write else {
+            break;
+        };
         assert!(matches!(write.operation(), AccessOperation::Write(_)));
-        let value = machine
-            .apply_resolved_access(write.ranges(), write.operation())
-            .unwrap();
+        let value = {
+            let (ranges, operation) = write.parts_mut();
+            machine.apply_resolved_access(ranges, operation)
+        }
+        .unwrap();
         write.finish(Ok(value));
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
     }
     assert_eq!(read_abi_register(&process, 0), 0);
     let AccessResult::Read(output) = machine
-        .apply_resolved_access(&output_ranges, &AccessOperation::Read)
+        .apply_resolved_access(&output_ranges, &mut AccessOperation::Read(Vec::new()))
         .unwrap()
     else {
         panic!("expected firmware output")
     };
     assert_eq!(&output[..4], &1_u32.to_le_bytes());
     let AccessResult::Read(reply) = machine
-        .apply_resolved_access(&ranges, &AccessOperation::Read)
+        .apply_resolved_access(&ranges, &mut AccessOperation::Read(Vec::new()))
         .unwrap()
     else {
         panic!("expected IPC response")
@@ -229,8 +251,8 @@ fn kernel_transport_does_not_read_the_emitters_single_receive_descriptor() {
 
 fn capture_emitted_message(mode: u32, list_offset: usize) {
     let (_directory, mut process) = fixture_process(&[svc(0x22)]);
-    let events = process.coordinator_mut().event_sender();
-    let mut dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let events = process.driver_mut().event_sender();
+    let dispatcher = support::dispatcher(&process).with_input_completions(events);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let handle = process.handles().insert(client).unwrap();
     let buffer = process.main_thread().stack_bottom;
@@ -262,26 +284,24 @@ fn capture_emitted_message(mode: u32, list_offset: usize) {
     let stop = process.run_slice().unwrap().stop;
     machine.publish_device_write(&ranges, || Ok(())).unwrap();
     assert!(matches!(
-        process
-            .route_supervisor_call(&stop, &mut dispatcher)
-            .unwrap(),
+        process.call_local(&stop, &dispatcher).unwrap(),
         ExceptionHandlingResult::Suspended
     ));
     for (offset, size) in [(0, 8), (8, 4), (12, 28)] {
-        let read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(read.operation(), AccessOperation::Read));
+        let mut read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(read.operation(), AccessOperation::Read(_)));
         assert_eq!(
             read.ranges().iter().map(|range| range.bytes()).sum::<u64>(),
             size
         );
         assert_eq!(read.ranges()[0].offset(), ranges[0].offset() + offset);
-        let value = machine
-            .apply_resolved_access(read.ranges(), read.operation())
-            .unwrap();
+        let value = {
+            let (ranges, operation) = read.parts_mut();
+            machine.apply_resolved_access(ranges, operation)
+        }
+        .unwrap();
         read.finish(Ok(value));
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
     }
     let mut request = server.receive().unwrap();
     let SessionMessage::TransportedBuffer {
@@ -305,7 +325,7 @@ fn capture_emitted_message(mode: u32, list_offset: usize) {
     ));
     request.complete();
     let id = process.scheduler_process_id();
-    process.coordinator_mut().terminate_process(id).unwrap();
+    process.driver_mut().terminate_process(id).unwrap();
 }
 
 #[test]
@@ -316,8 +336,8 @@ fn a_pending_guest_receive_keeps_its_request_until_output_publication() {
 #[test]
 fn a_device_owned_user_message_captures_only_its_header_and_declared_data() {
     let (_directory, mut process) = fixture_process(&[svc(0x22)]);
-    let events = process.coordinator_mut().event_sender();
-    let mut dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let events = process.driver_mut().event_sender();
+    let dispatcher = support::dispatcher(&process).with_input_completions(events);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let handle = process.handles().insert(client).unwrap();
     let buffer = process.main_thread().stack_bottom;
@@ -340,25 +360,23 @@ fn a_device_owned_user_message_captures_only_its_header_and_declared_data() {
     let stop = process.run_slice().unwrap().stop;
     machine.publish_device_write(&ranges, || Ok(())).unwrap();
     assert!(matches!(
-        process
-            .route_supervisor_call(&stop, &mut dispatcher)
-            .unwrap(),
+        process.call_local(&stop, &dispatcher).unwrap(),
         ExceptionHandlingResult::Suspended
     ));
     for expected in [8, 32] {
-        let read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(read.operation(), AccessOperation::Read));
+        let mut read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(read.operation(), AccessOperation::Read(_)));
         assert_eq!(
             read.ranges().iter().map(|range| range.bytes()).sum::<u64>(),
             expected
         );
-        let value = machine
-            .apply_resolved_access(read.ranges(), read.operation())
-            .unwrap();
+        let value = {
+            let (ranges, operation) = read.parts_mut();
+            machine.apply_resolved_access(ranges, operation)
+        }
+        .unwrap();
         read.finish(Ok(value));
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
     }
     let mut message = server.receive().unwrap();
     let SessionMessage::Buffer(captured) = message.take_message() else {
@@ -368,7 +386,7 @@ fn a_device_owned_user_message_captures_only_its_header_and_declared_data() {
     assert_eq!(captured, bytes[..40]);
     message.complete();
     let id = process.scheduler_process_id();
-    process.coordinator_mut().terminate_process(id).unwrap();
+    process.driver_mut().terminate_process(id).unwrap();
 }
 
 #[test]
@@ -390,8 +408,8 @@ enum ReceiveEnd {
 #[test]
 fn a_pending_reply_retains_its_endpoint_and_completed_result_after_the_last_handle_closes() {
     let (_directory, mut process) = fixture_process(&[svc(0x43)]);
-    let events = process.coordinator_mut().event_sender();
-    let mut dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let events = process.driver_mut().event_sender();
+    let dispatcher = support::dispatcher(&process).with_input_completions(events);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     client
         .request(request_owner(991), SessionMessage::Buffer(vec![0; 8]))
@@ -430,9 +448,7 @@ fn a_pending_reply_retains_its_endpoint_and_completed_result_after_the_last_hand
     let stop = process.run_slice().unwrap().stop;
     machine.publish_device_write(&ranges, || Ok(())).unwrap();
     assert!(matches!(
-        process
-            .route_supervisor_call(&stop, &mut dispatcher)
-            .unwrap(),
+        process.call_local(&stop, &dispatcher).unwrap(),
         ExceptionHandlingResult::Suspended
     ));
     drop(process.handles().close(handle).unwrap());
@@ -442,19 +458,19 @@ fn a_pending_reply_retains_its_endpoint_and_completed_result_after_the_last_hand
             crate::integration_test_support::poll_session(&client, request_owner(991)),
             Ok(None)
         );
-        let read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(read.operation(), AccessOperation::Read));
+        let mut read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(read.operation(), AccessOperation::Read(_)));
         assert_eq!(
             read.ranges().iter().map(|range| range.bytes()).sum::<u64>(),
             expected
         );
-        let result = machine
-            .apply_resolved_access(read.ranges(), read.operation())
-            .unwrap();
+        let result = {
+            let (ranges, operation) = read.parts_mut();
+            machine.apply_resolved_access(ranges, operation)
+        }
+        .unwrap();
         read.finish(Ok(result));
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
     }
     assert_eq!(
         read_abi_register(&process, 0),
@@ -479,8 +495,8 @@ fn a_pending_reply_retains_its_endpoint_and_completed_result_after_the_last_hand
 
 fn guest_receive(ending: ReceiveEnd) {
     let (_directory, mut process) = fixture_process(&[svc(0x43)]);
-    let events = process.coordinator_mut().event_sender();
-    let mut dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let events = process.driver_mut().event_sender();
+    let dispatcher = support::dispatcher(&process).with_input_completions(events);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let handle = process.handles().insert(server.clone()).unwrap();
     let count = process.handles().len();
@@ -519,12 +535,10 @@ fn guest_receive(ending: ReceiveEnd) {
     let stop = process.run_slice().unwrap().stop;
     machine.publish_device_write(&ranges, || Ok(())).unwrap();
     assert!(matches!(
-        process
-            .route_supervisor_call(&stop, &mut dispatcher)
-            .unwrap(),
+        process.call_local(&stop, &dispatcher).unwrap(),
         ExceptionHandlingResult::Suspended
     ));
-    let write = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    let mut write = receive.recv_timeout(Duration::from_secs(2)).unwrap();
     let AccessOperation::Write(bytes) = write.operation() else {
         panic!("expected incoming-message write")
     };
@@ -541,13 +555,13 @@ fn guest_receive(ending: ReceiveEnd) {
     );
     match ending {
         ReceiveEnd::Success => {
-            let value = machine
-                .apply_resolved_access(write.ranges(), write.operation())
-                .unwrap();
+            let value = {
+                let (ranges, operation) = write.parts_mut();
+                machine.apply_resolved_access(ranges, operation)
+            }
+            .unwrap();
             write.finish(Ok(value));
-            dispatcher
-                .poll_memory_completions(process.coordinator_mut())
-                .unwrap();
+            dispatcher.drive_pending(process.driver_mut()).unwrap();
             assert_eq!(read_abi_register(&process, 0), 0);
             assert!(process.handles().lookup(returned).is_some());
             assert_eq!(process.handles().len(), count + 1);
@@ -563,7 +577,7 @@ fn guest_receive(ending: ReceiveEnd) {
         }
         ReceiveEnd::HostStop => {
             let id = process.scheduler_process_id();
-            process.coordinator_mut().terminate_process(id).unwrap();
+            process.driver_mut().terminate_process(id).unwrap();
             assert_eq!(
                 crate::integration_test_support::poll_session(&client, request_owner(991)),
                 Err(nixe_runtime::SessionError::PeerClosed)
@@ -572,10 +586,13 @@ fn guest_receive(ending: ReceiveEnd) {
                 .request(request_owner(992), SessionMessage::Buffer(vec![0; 8]))
                 .unwrap();
             server.receive().unwrap().complete();
-            write.finish(Ok(AccessResult::Written));
-            dispatcher
-                .poll_memory_completions(process.coordinator_mut())
-                .unwrap();
+            let result = {
+                let (ranges, operation) = write.parts_mut();
+                machine.apply_resolved_access(ranges, operation)
+            }
+            .unwrap();
+            write.finish(Ok(result));
+            dispatcher.drive_pending(process.driver_mut()).unwrap();
             assert!(process.handles().lookup(returned).is_none());
             server
                 .reply()
@@ -592,15 +609,16 @@ fn guest_receive(ending: ReceiveEnd) {
                 "incoming write failed".into(),
             ))));
             assert!(matches!(
-                dispatcher.poll_memory_completions(process.coordinator_mut()),
-                Err(HorizonSvcFault::MemoryAccess { immediate: 0x43, fault })
+                dispatcher.drive_pending(process.driver_mut()).err().and_then(|fault| fault.downcast::<HorizonSvcFault>().ok()).as_deref(),
+                Some(HorizonSvcFault::MemoryAccess { immediate: 0x43, fault })
                     if matches!(fault.as_ref(), nixe_memory::MemoryError::Execution(message) if message.as_ref() == "incoming write failed")
             ));
             assert_eq!(
                 crate::integration_test_support::poll_session(&client, request_owner(991)),
                 Err(nixe_runtime::SessionError::PeerClosed)
             );
-            assert_eq!(process.handles().len(), count);
+            assert!(process.handles().is_empty());
+            assert_eq!(process.lifecycle(), ProcessLifecycle::Faulted);
             assert!(process.handles().lookup(returned).is_none());
             client
                 .request(request_owner(992), SessionMessage::Buffer(vec![0; 8]))
@@ -629,8 +647,14 @@ fn a_pending_ipc_reply_publishes_its_handle_only_after_output_completes() {
     pending_reply(Stop::None);
 }
 
+#[test]
+fn a_failed_server_reply_is_reported_even_when_the_client_process_exits() {
+    pending_reply(Stop::DeviceFailure);
+}
+
 enum Stop {
     None,
+    DeviceFailure,
     Guest,
     Host,
     CpuFault,
@@ -652,13 +676,15 @@ fn pending_reply(ending: Stop) {
         process.thread(child).unwrap().registers().set_pc(0);
     }
     process.thread(child).unwrap().start().unwrap();
-    let events = process.coordinator_mut().event_sender();
-    let mut dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let events = process.driver_mut().event_sender();
+    let dispatcher = support::dispatcher(&process).with_input_completions(events);
     let manager = crate::ServiceManagerSession::new();
     manager.register_client();
     let session = process
         .handles()
-        .insert(HorizonIpcObject::ServiceManager(manager))
+        .insert(nixe_horizon::ServiceSession::new(
+            HorizonIpcObject::ServiceManager(manager),
+        ))
         .unwrap();
     let count = process.handles().len();
     let buffer = process.main_thread().tls_base;
@@ -682,37 +708,59 @@ fn pending_reply(ending: Stop) {
     let stop = process.run_slice().unwrap().stop;
     machine.publish_device_write(&ranges, || Ok(())).unwrap();
     assert!(matches!(
-        process
-            .route_supervisor_call(&stop, &mut dispatcher)
-            .unwrap(),
+        process.call_local(&stop, &dispatcher).unwrap(),
         ExceptionHandlingResult::Suspended
     ));
-    let read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert!(matches!(read.operation(), AccessOperation::Read));
-    let result = machine
-        .apply_resolved_access(read.ranges(), read.operation())
-        .unwrap();
+    let mut read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(matches!(read.operation(), AccessOperation::Read(_)));
+    let result = {
+        let (ranges, operation) = read.parts_mut();
+        machine.apply_resolved_access(ranges, operation)
+    }
+    .unwrap();
     read.finish(Ok(result));
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
-    let write = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
+    let mut write = receive.recv_timeout(Duration::from_secs(2)).unwrap();
     let AccessOperation::Write(response) = write.operation() else {
         panic!("expected pending response write")
     };
     let returned = u32::from_le_bytes(response[12..16].try_into().unwrap());
     assert!(process.handles().lookup(returned).is_none());
     assert_eq!(process.handles().len(), count + 1);
+    if matches!(ending, Stop::DeviceFailure) {
+        write.finish(Err(Arc::new(nixe_memory::MemoryError::Execution(
+            "reply device failure".into(),
+        ))));
+        let id = process.scheduler_process_id();
+        assert!(process.driver_mut().terminate_process(id).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Err(error) = dispatcher.drive_pending(process.driver_mut()) {
+                assert!(
+                    error.to_string().contains("reply device failure"),
+                    "{error}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server failure was discarded on cancellation"
+            );
+            std::thread::yield_now();
+        }
+        assert!(process.handles().lookup(returned).is_none());
+        return;
+    }
     if !matches!(ending, Stop::None) {
         if matches!(ending, Stop::Host) {
             let id = process.scheduler_process_id();
-            assert!(process.coordinator_mut().terminate_process(id).unwrap());
+            assert!(process.driver_mut().terminate_process(id).unwrap());
         } else if matches!(ending, Stop::CpuFault) {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while process.lifecycle() == nixe_runtime::ProcessLifecycle::Running {
                 if let Some(execution) = process
-                    .coordinator_mut()
-                    .run_next(Duration::from_millis(20))
+                    .driver_mut()
+                    .run_native(Duration::from_millis(20))
                     .unwrap()
                 {
                     assert!(matches!(
@@ -729,15 +777,22 @@ fn pending_reply(ending: Stop) {
             assert_eq!(process.lifecycle(), nixe_runtime::ProcessLifecycle::Faulted);
         } else {
             assert!(
-                matches!(dispatch_scheduled_next(&mut process, &mut dispatcher), (id, ExceptionHandlingResult::Terminated { .. }) if id == child)
+                matches!(dispatch_scheduled_next(&mut process, &dispatcher), (id, ExceptionHandlingResult::Terminated { .. }) if id == child)
             );
         }
-        // Cancellation must reach the device before any completion is polled.
-        assert!(write.is_cancelled());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !write.is_cancelled() {
+            dispatcher.drive_pending(process.driver_mut()).unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reply write was not cancelled"
+            );
+            std::thread::yield_now();
+        }
         assert!(process.handles().is_empty());
         assert!(process.handles().lookup(returned).is_none());
         let AccessResult::Read(bytes) = machine
-            .apply_resolved_access(write.ranges(), &AccessOperation::Read)
+            .apply_resolved_access(write.ranges(), &mut AccessOperation::Read(Vec::new()))
             .unwrap()
         else {
             panic!("expected reply buffer read")
@@ -745,17 +800,22 @@ fn pending_reply(ending: Stop) {
         assert_eq!(&bytes[..], &command[..bytes.len()]);
     } else {
         assert!(!write.is_cancelled());
-        let result = machine
-            .apply_resolved_access(write.ranges(), write.operation())
-            .unwrap();
+        let result = {
+            let (ranges, operation) = write.parts_mut();
+            machine.apply_resolved_access(ranges, operation)
+        }
+        .unwrap();
         write.finish(Ok(result));
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        let caller = process.main_thread_id();
+        assert!(matches!(
+            process.driver_mut().await_service(caller),
+            ExceptionHandlingResult::Resumed
+        ));
         assert!(
             process
                 .handles()
-                .lookup_as::<HorizonIpcObject>(returned)
+                .lookup_as::<crate::ServiceSession>(returned)
+                .map(|session| std::sync::Arc::new(session.object().clone()))
                 .is_some()
         );
         assert_eq!(process.handles().len(), count + 1);
@@ -803,8 +863,8 @@ fn pending_thread_creation(exit: bool, fail: bool) {
             state.write_x(x(index), value);
         }
     }
-    let events = process.coordinator_mut().event_sender();
-    let mut dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let events = process.driver_mut().event_sender();
+    let dispatcher = support::dispatcher(&process).with_input_completions(events);
     let stop = process.run_slice().unwrap().stop;
     let page = GuestVirtualAddress::new(main.tls_base.get() & !(nixe_memory::PAGE_SIZE - 1));
     let ranges = process
@@ -819,9 +879,7 @@ fn pending_thread_creation(exit: bool, fail: bool) {
     machine.publish_device_write(&ranges, || Ok(())).unwrap();
     let handles_before = process.handles().len();
     let threads_before = process.threads().len();
-    let handling = process
-        .route_supervisor_call(&stop, &mut dispatcher)
-        .unwrap();
+    let handling = process.call_local(&stop, &dispatcher).unwrap();
     assert!(
         matches!(handling, ExceptionHandlingResult::Suspended),
         "TLS initialization returned {handling:?} code={:#x}",
@@ -833,41 +891,38 @@ fn pending_thread_creation(exit: bool, fail: bool) {
         let request = receive.recv_timeout(Duration::from_secs(2)).unwrap();
         if exit {
             let id = process.scheduler_process_id();
-            process.coordinator_mut().terminate_process(id).unwrap();
+            process.driver_mut().terminate_process(id).unwrap();
             assert!(request.is_cancelled());
             assert!(process.handles().is_empty());
-            dispatcher
-                .poll_memory_completions(process.coordinator_mut())
-                .unwrap();
+            dispatcher.drive_pending(process.driver_mut()).unwrap();
         } else {
             request.finish(Err(Arc::new(nixe_memory::MemoryError::Execution(
                 "TLS device initialization failed".into(),
             ))));
-            let error = dispatcher
-                .poll_memory_completions(process.coordinator_mut())
-                .unwrap_err();
+            let error = dispatcher.drive_pending(process.driver_mut()).unwrap_err();
             assert!(
                 error
                     .to_string()
                     .contains("TLS device initialization failed")
             );
-            assert_eq!(process.handles().len(), handles_before);
-            assert_eq!(process.threads().len(), threads_before);
+            assert!(process.handles().is_empty());
+            assert!(process.threads().len() <= threads_before);
+            assert_eq!(process.lifecycle(), ProcessLifecycle::Faulted);
         }
         return;
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while process.main_thread_lifecycle() == nixe_scheduler::ThreadLifecycle::Waiting {
-        if let Ok(request) = receive.try_recv() {
+        if let Ok(mut request) = receive.try_recv() {
             assert!(!request.is_cancelled());
-            let result = machine
-                .apply_resolved_access(request.ranges(), request.operation())
-                .unwrap();
+            let result = {
+                let (ranges, operation) = request.parts_mut();
+                machine.apply_resolved_access(ranges, operation)
+            }
+            .unwrap();
             request.finish(Ok(result));
         }
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
         assert!(
             std::time::Instant::now() < deadline,
             "TLS initialization did not finish"
@@ -889,7 +944,7 @@ fn pending_thread_creation(exit: bool, fail: bool) {
         )
         .unwrap();
     let AccessResult::Read(bytes) = machine
-        .apply_resolved_access(&ranges, &AccessOperation::Read)
+        .apply_resolved_access(&ranges, &mut AccessOperation::Read(Vec::new()))
         .unwrap()
     else {
         panic!("expected TLS device bytes")

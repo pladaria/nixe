@@ -81,7 +81,10 @@ fn indexed_alias_spans_preserve_dependencies_consumers_and_partial_retirement() 
     let unaffected = authority.observe(1, domain(other, 7, 4)).unwrap();
     let range = AllocationRange::new(allocation.pin(), 2 * PAGE_SIZE + 7, 4).unwrap();
     let Access::Pending(pending) = machine
-        .access_captured(std::slice::from_ref(&range), AccessOperation::Read)
+        .access_captured(
+            std::slice::from_ref(&range),
+            AccessOperation::Read(Vec::new()),
+        )
         .unwrap()
     else {
         panic!("device read must defer");
@@ -325,14 +328,14 @@ fn exact_accesses_order_overlaps_allow_disjoint_work_and_apply_operations_once()
         &receiver,
         &mut authority,
         range(4, 4),
-        AccessOperation::Read,
+        AccessOperation::Read(Vec::new()),
     );
     let (write, write_result) = enqueue(
         &machine,
         &receiver,
         &mut authority,
         range(6, 2),
-        AccessOperation::Write(Box::new([9, 10])),
+        AccessOperation::Write(Vec::from([9, 10])),
     );
     assert!(!authority.access_can_prepare(write));
     assert!(authority.record_write(writer, NativeTick(11)).is_err());
@@ -351,11 +354,14 @@ fn exact_accesses_order_overlaps_allow_disjoint_work_and_apply_operations_once()
         &receiver,
         &mut authority,
         range(128, 1),
-        AccessOperation::Write(Box::new([77])),
+        AccessOperation::Write(Vec::from([77])),
     );
     assert!(authority.prepare_access(other).unwrap().is_empty());
     authority.complete_access(&machine, other).unwrap();
-    assert_eq!(other_result.wait().unwrap(), AccessResult::Written);
+    assert!(matches!(
+        other_result.wait().unwrap(),
+        AccessResult::Written(_)
+    ));
     authority.record_write(disjoint, NativeTick(12)).unwrap();
     let [plan]: [AccessReadback<u32>; 1] =
         authority.prepare_access(read).unwrap().try_into().unwrap();
@@ -374,11 +380,14 @@ fn exact_accesses_order_overlaps_allow_disjoint_work_and_apply_operations_once()
     authority.complete_access(&machine, read).unwrap();
     assert_eq!(
         read_result.wait().unwrap(),
-        AccessResult::Read(Box::new([1, 2, 3, 4]))
+        AccessResult::Read(Vec::from([1, 2, 3, 4]))
     );
     assert!(authority.prepare_access(write).unwrap().is_empty());
     authority.complete_access(&machine, write).unwrap();
-    assert_eq!(write_result.wait().unwrap(), AccessResult::Written);
+    assert!(matches!(
+        write_result.wait().unwrap(),
+        AccessResult::Written(_)
+    ));
     assert!(authority.writer_dependencies(writer).unwrap().is_empty());
     assert!(authority.writer_dependencies(late).unwrap().is_empty());
     let (again, again_result) = enqueue(
@@ -386,13 +395,13 @@ fn exact_accesses_order_overlaps_allow_disjoint_work_and_apply_operations_once()
         &receiver,
         &mut authority,
         range(4, 4),
-        AccessOperation::Read,
+        AccessOperation::Read(Vec::new()),
     );
     assert!(authority.prepare_access(again).unwrap().is_empty());
     authority.complete_access(&machine, again).unwrap();
     assert_eq!(
         again_result.wait().unwrap(),
-        AccessResult::Read(Box::new([1, 2, 9, 10]))
+        AccessResult::Read(Vec::from([1, 2, 9, 10]))
     );
     authority.record_write(writer, NativeTick(9)).unwrap();
     let (cancel, cancel_result) = enqueue(
@@ -400,7 +409,7 @@ fn exact_accesses_order_overlaps_allow_disjoint_work_and_apply_operations_once()
         &receiver,
         &mut authority,
         range(4, 4),
-        AccessOperation::Read,
+        AccessOperation::Read(Vec::new()),
     );
     let [old_plan]: [AccessReadback<u32>; 1] = authority
         .prepare_access(cancel)
@@ -455,14 +464,14 @@ fn failure_preserves_the_original_error_and_releases_all_request_pins() {
         &receiver,
         &mut authority,
         AllocationRange::new(allocation.pin(), 0, 4).unwrap(),
-        AccessOperation::Read,
+        AccessOperation::Read(Vec::new()),
     );
     let (b, second) = enqueue(
         &machine,
         &receiver,
         &mut authority,
         AllocationRange::new(allocation.pin(), 2, 2).unwrap(),
-        AccessOperation::Write(Box::new([7, 8])),
+        AccessOperation::Write(Vec::from([7, 8])),
     );
     assert!(authority.access_can_prepare(a));
     assert!(!authority.access_can_prepare(b));
@@ -537,7 +546,7 @@ fn an_owned_atomic_reads_its_current_producer_and_is_never_replayed() {
     machine
         .apply_resolved_access(
             &[range()],
-            &nixe_memory::AccessOperation::ReadCode(code.clone()),
+            &mut nixe_memory::AccessOperation::ReadCode(code.clone()),
         )
         .unwrap();
     let compare = AtomicAccess {
@@ -612,7 +621,7 @@ fn device_code_capture_is_invalidated_before_replay_without_touching_unwritten_p
     authority.complete_access(&machine, id).unwrap();
     assert_eq!(
         result.wait().unwrap(),
-        AccessResult::Read(Box::new(0x11223344u32.to_le_bytes()))
+        AccessResult::Read(Vec::from(0x11223344u32.to_le_bytes()))
     );
     // The owner resolved the only producer above; the device page remains protected.
     let root = [range(0, 2 * PAGE_SIZE)];
@@ -620,7 +629,7 @@ fn device_code_capture_is_invalidated_before_replay_without_touching_unwritten_p
     machine
         .apply_resolved_access(
             &root,
-            &nixe_memory::AccessOperation::ReadObserved(observed.clone()),
+            &mut nixe_memory::AccessOperation::ReadObserved(observed.clone()),
         )
         .unwrap();
     authority.watch_memory(&root, observed.clone()).unwrap();
@@ -712,13 +721,13 @@ fn owner_local_operations_apply_directly_without_endpoint_or_reentry() {
     let (request, result) = machine
         .prepare_device_access(
             vec![range()],
-            AccessOperation::Write(Box::new(41u32.to_le_bytes())),
+            AccessOperation::Write(Vec::from(41u32.to_le_bytes())),
         )
         .unwrap();
     let write = authority.queue_access(request).unwrap();
     assert!(authority.prepare_access(write).unwrap().is_empty());
     authority.complete_access(&machine, write).unwrap();
-    assert_eq!(result.wait().unwrap(), AccessResult::Written);
+    assert!(matches!(result.wait().unwrap(), AccessResult::Written(_)));
 
     // A registered endpoint must not intercept owner-local operations either.
     let (_endpoint, receiver, cancellations) = endpoint(&machine);
@@ -730,7 +739,7 @@ fn owner_local_operations_apply_directly_without_endpoint_or_reentry() {
     let writer = authority.create_writer(1, footprint).unwrap();
     authority.record_write(writer, NativeTick(7)).unwrap();
     let (request, result) = machine
-        .prepare_device_access(vec![range()], AccessOperation::Read)
+        .prepare_device_access(vec![range()], AccessOperation::Read(Vec::new()))
         .unwrap();
     let read = authority.queue_access(request).unwrap();
     let [plan]: [AccessReadback<u32>; 1] =
@@ -742,7 +751,7 @@ fn owner_local_operations_apply_directly_without_endpoint_or_reentry() {
     authority.complete_access(&machine, read).unwrap();
     assert_eq!(
         result.wait().unwrap(),
-        AccessResult::Read(Box::new(70u32.to_le_bytes()))
+        AccessResult::Read(Vec::from(70u32.to_le_bytes()))
     );
 
     let (request, result) = machine
@@ -773,7 +782,7 @@ fn owner_local_operations_apply_directly_without_endpoint_or_reentry() {
     assert_eq!(u32::from_le_bytes(bytes), 72);
 
     let (request, result) = machine
-        .prepare_device_access(vec![range()], AccessOperation::Write(Box::new([99; 4])))
+        .prepare_device_access(vec![range()], AccessOperation::Write(Vec::from([99; 4])))
         .unwrap();
     let cancelled = authority.queue_access(request).unwrap();
     assert!(authority.prepare_access(cancelled).unwrap().is_empty());

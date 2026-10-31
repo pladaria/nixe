@@ -1,7 +1,7 @@
 use nixe_cpu::execution::CpuControl;
 use nixe_runtime::memory::ProcessMemory;
 use nixe_runtime::{
-    EventObject, ExternalEventSender, HandleObject, ReadableEventObject, RuntimeCoordinator,
+    EventObject, ExternalEventSender, HandleObject, ReadableEventObject, Runtime,
     SharedMemoryObject, ThreadObject, WritableEventObject,
 };
 
@@ -21,6 +21,6 @@ fn shared_kernel_resources_are_safe_to_retain_across_workers() {
     assert_send_sync::<HandleObject>();
     assert_send_sync::<ExternalEventSender>();
 
-    // The coordinator is transferred to its owner but deliberately not shared.
-    assert_send::<RuntimeCoordinator>();
+    // The supervisor is transferred to its owner but deliberately not shared.
+    assert_send::<Runtime>();
 }

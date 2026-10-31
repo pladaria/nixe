@@ -93,7 +93,7 @@ pub(super) fn command(
 
 pub(super) fn call(
     process: &mut ScheduledProcess,
-    dispatcher: &mut HorizonSvcDispatcher,
+    dispatcher: &std::sync::Arc<HorizonSvcDispatcher>,
     handle: u32,
     b: &[u8; 256],
 ) -> u32 {
@@ -134,11 +134,11 @@ fn queued_audio_open_retains_the_copied_process_after_its_client_handle_closes()
     let backend = Arc::new(Backend::default());
     let manager = process
         .handles()
-        .insert(HorizonIpcObject::AudioOutManager(
-            crate::AudioOutManagerSession {
+        .insert(nixe_horizon::ServiceSession::new(
+            HorizonIpcObject::AudioOutManager(crate::AudioOutManagerSession {
                 backend: Some(backend.clone()),
                 devices: Default::default(),
-            },
+            }),
         ))
         .unwrap();
     let owner = process
@@ -170,8 +170,8 @@ fn queued_audio_open_retains_the_copied_process_after_its_client_handle_closes()
     put_u32(&mut open, 20, owner);
     write_guest_bytes(&process, caller.tls_base, &open);
     caller.registers().write_w(x(0), manager);
-    let events = process.coordinator_mut().event_sender();
-    let mut dispatcher = support::dispatcher(&process).with_input_completions(events);
+    let events = process.driver_mut().event_sender();
+    let dispatcher = support::dispatcher(&process).with_input_completions(events);
     let machine = process.memory().account().machine().clone();
     let ranges = process
         .memory()
@@ -183,14 +183,14 @@ fn queued_audio_open_retains_the_copied_process_after_its_client_handle_closes()
     machine.set_device_endpoint(&device);
     machine.publish_device_write(&ranges, || Ok(())).unwrap();
     assert!(matches!(
-        dispatch_scheduled_next(&mut process, &mut dispatcher),
+        dispatch_scheduled_next(&mut process, &dispatcher),
         (id, ExceptionHandlingResult::Suspended) if id == process.main_thread_id()
     ));
-    let write = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    let mut write = receive.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(matches!(write.operation(), AccessOperation::Write(_)));
     caller.start().unwrap();
     assert!(matches!(
-        dispatch_scheduled_next(&mut process, &mut dispatcher),
+        dispatch_scheduled_next(&mut process, &dispatcher),
         (id, ExceptionHandlingResult::Suspended) if id == child
     ));
     drop(process.handles().close(owner).unwrap());
@@ -199,16 +199,16 @@ fn queued_audio_open_retains_the_copied_process_after_its_client_handle_closes()
         .insert(EventObject::new(process.scheduler()))
         .unwrap();
     assert_eq!(replacement & 0x7fff, owner & 0x7fff);
-    let value = machine
-        .apply_resolved_access(write.ranges(), write.operation())
-        .unwrap();
+    let value = {
+        let (ranges, operation) = write.parts_mut();
+        machine.apply_resolved_access(ranges, operation)
+    }
+    .unwrap();
     write.finish(Ok(value));
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    assert!(matches!(
+        process.driver_mut().await_service(child),
+        ExceptionHandlingResult::Resumed
+    ));
     assert!(
         process
             .scheduler()
@@ -233,7 +233,7 @@ fn queued_audio_open_retains_the_copied_process_after_its_client_handle_closes()
 fn output_volume_ipc_controls_already_queued_pcm_and_preserves_invalid_input_errors() {
     let (_directory, mut process) = fixture_process_with_svcs(&[0x21; 4]);
     let backend = Arc::new(Backend::default());
-    let mut dispatcher = support::dispatcher(&process).with_audio_backend(backend.clone());
+    let dispatcher = support::dispatcher(&process).with_audio_backend(backend.clone());
     let session = crate::AudioOutSession::open(
         process.scheduler(),
         backend.as_ref(),
@@ -244,19 +244,19 @@ fn output_volume_ipc_controls_already_queued_pcm_and_preserves_invalid_input_err
     let feed = backend.feed.lock().unwrap().take().unwrap();
     let handle = process
         .handles()
-        .insert(HorizonIpcObject::AudioOut(session.clone()))
+        .insert(nixe_horizon::ServiceSession::new(
+            HorizonIpcObject::AudioOut(session.clone()),
+        ))
         .unwrap();
     session
         .output
-        .lock()
-        .unwrap()
         .append(11, vec![1000, -1000, 1000, -1000])
         .unwrap();
-    session.output.lock().unwrap().start().unwrap();
+    session.output.start().unwrap();
     assert_eq!(
         call(
             &mut process,
-            &mut dispatcher,
+            &dispatcher,
             handle,
             &command(13, &[], None, None, false, false)
         ),
@@ -266,7 +266,7 @@ fn output_volume_ipc_controls_already_queued_pcm_and_preserves_invalid_input_err
     assert_eq!(
         call(
             &mut process,
-            &mut dispatcher,
+            &dispatcher,
             handle,
             &command(12, &0.7_f32.to_le_bytes(), None, None, false, false)
         ),
@@ -278,7 +278,7 @@ fn output_volume_ipc_controls_already_queued_pcm_and_preserves_invalid_input_err
     assert_eq!(
         call(
             &mut process,
-            &mut dispatcher,
+            &dispatcher,
             handle,
             &command(13, &[], None, None, false, false)
         ),
@@ -288,7 +288,7 @@ fn output_volume_ipc_controls_already_queued_pcm_and_preserves_invalid_input_err
     assert_eq!(
         call(
             &mut process,
-            &mut dispatcher,
+            &dispatcher,
             handle,
             &command(12, &f32::NAN.to_le_bytes(), None, None, false, false)
         ),
@@ -305,9 +305,9 @@ fn nested_pcm_uses_its_own_capture_after_the_descriptor_mapping_changes() {
 
     for pointer in [false, true] {
         let (_directory, mut process) = fixture_process_with_svcs(&[0x21]);
-        let events = process.coordinator_mut().event_sender();
+        let events = process.driver_mut().event_sender();
         let backend = Arc::new(Backend::default());
-        let mut dispatcher = support::dispatcher(&process)
+        let dispatcher = support::dispatcher(&process)
             .with_audio_backend(backend.clone())
             .with_input_completions(events);
         let session = crate::AudioOutSession::open(
@@ -317,11 +317,13 @@ fn nested_pcm_uses_its_own_capture_after_the_descriptor_mapping_changes() {
             Default::default(),
         )
         .unwrap();
-        session.output.lock().unwrap().start().unwrap();
+        session.output.start().unwrap();
         let feed = backend.feed.lock().unwrap().take().unwrap();
         let handle = process
             .handles()
-            .insert(HorizonIpcObject::AudioOut(session))
+            .insert(nixe_horizon::ServiceSession::new(
+                HorizonIpcObject::AudioOut(session),
+            ))
             .unwrap();
         let descriptor = process
             .main_thread()
@@ -361,13 +363,11 @@ fn nested_pcm_uses_its_own_capture_after_the_descriptor_mapping_changes() {
         let stop = process.run_slice().unwrap().stop;
         machine.publish_device_write(&ranges, || Ok(())).unwrap();
         assert!(matches!(
-            process
-                .route_supervisor_call(&stop, &mut dispatcher)
-                .unwrap(),
+            process.call_local(&stop, &dispatcher).unwrap(),
             ExceptionHandlingResult::Suspended
         ));
-        let read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(read.operation(), AccessOperation::Read));
+        let mut read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(read.operation(), AccessOperation::Read(_)));
         assert_eq!(read.ranges()[0].bytes(), 40);
         process.memory().unmap(descriptor, 0x1000, mapping).unwrap();
         process
@@ -375,13 +375,17 @@ fn nested_pcm_uses_its_own_capture_after_the_descriptor_mapping_changes() {
             .map_zeroed(descriptor, 0x1000, mapping)
             .unwrap();
         write_guest_bytes(&process, samples, &[0xe8, 0x03, 0x18, 0xfc]);
-        let value = machine
-            .apply_resolved_access(read.ranges(), read.operation())
-            .unwrap();
+        let value = {
+            let (ranges, operation) = read.parts_mut();
+            machine.apply_resolved_access(ranges, operation)
+        }
+        .unwrap();
         read.finish(Ok(value));
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        let caller = process.main_thread_id();
+        assert!(matches!(
+            process.driver_mut().await_service(caller),
+            ExceptionHandlingResult::Resumed
+        ));
         assert_eq!(read_abi_register(&process, 0), 0);
         let mut pcm = [0; 2];
         feed.render(&mut pcm);
@@ -403,7 +407,9 @@ fn native_auto_select_rejects_invalid_modes_and_two_active_input_sides() {
         .unwrap();
         let handle = process
             .handles()
-            .insert(HorizonIpcObject::AudioOut(session))
+            .insert(nixe_horizon::ServiceSession::new(
+                HorizonIpcObject::AudioOut(session),
+            ))
             .unwrap();
         let descriptor = process.main_thread().stack_bottom;
         let mut bytes = command(
@@ -424,9 +430,9 @@ fn native_auto_select_rejects_invalid_modes_and_two_active_input_sides() {
         };
         write_guest_bytes(&process, process.main_thread().tls_base, &bytes);
         write_abi_register(&process, 0, u64::from(handle));
-        let mut dispatcher = support::dispatcher(&process);
+        let dispatcher = support::dispatcher(&process);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Fault(HorizonSvcFault::Ipc { immediate: 0x21, fault })
                 if fault.to_string() == HorizonIpcFault::malformed(expected).to_string()
         ));
@@ -449,7 +455,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         let (_dir, mut process) =
             fixture_process_with_svcs(&[&[0x1f][..], &[0x21; 128][..]].concat());
         let backend = Arc::new(Backend::default());
-        let mut dispatcher = support::dispatcher(&process).with_audio_backend(backend.clone());
+        let dispatcher = support::dispatcher(&process).with_audio_backend(backend.clone());
         let service_name = process.main_thread().stack_bottom;
         write_guest_bytes(&process, service_name, b"sm:\0");
         process
@@ -457,7 +463,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             .registers()
             .write_x(x(1), service_name.get());
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         let sm = process.main_thread().registers().read_w(x(1));
@@ -468,11 +474,11 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         put_u32(&mut register, 8, 1);
         put_u32(&mut register, 16, 0);
         put_u32(&mut register, 32, 0x4943_4653);
-        assert_eq!(call(&mut process, &mut dispatcher, sm, &register), 0);
+        assert_eq!(call(&mut process, &dispatcher, sm, &register), 0);
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 sm,
                 &command(1, b"audout:u", None, None, false, false)
             ),
@@ -484,7 +490,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             assert_eq!(
                 call(
                     &mut process,
-                    &mut dispatcher,
+                    &dispatcher,
                     sm,
                     &command(1, b"audren:u", None, None, false, false)
                 ),
@@ -497,7 +503,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             assert_eq!(
                 call(
                     &mut process,
-                    &mut dispatcher,
+                    &dispatcher,
                     renderer_manager,
                     &command(4, &params, None, None, false, false)
                 ),
@@ -512,7 +518,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             assert_eq!(
                 call(
                     &mut process,
-                    &mut dispatcher,
+                    &dispatcher,
                     device,
                     &command(
                         if auto { 7 } else { 1 },
@@ -558,7 +564,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             false,
         );
         assert_eq!(
-            call(&mut process, &mut dispatcher, manager, &missing_owner),
+            call(&mut process, &dispatcher, manager, &missing_owner),
             0x1a60a
         );
         assert_eq!(backend.live.load(Ordering::SeqCst), 0);
@@ -575,18 +581,18 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
                 true,
             );
             assert_eq!(
-                call(&mut process, &mut dispatcher, manager, &request),
+                call(&mut process, &dispatcher, manager, &request),
                 153 | (error << 9)
             );
             assert_eq!(backend.live.load(Ordering::SeqCst), 0);
         }
         write_guest_bytes(&process, base, b"MissingDevice\0");
         assert_eq!(
-            call(&mut process, &mut dispatcher, manager, &open),
+            call(&mut process, &dispatcher, manager, &open),
             153 | (1 << 9)
         );
         write_guest_bytes(&process, base, &[0; 256]);
-        assert_eq!(call(&mut process, &mut dispatcher, manager, &open), 0);
+        assert_eq!(call(&mut process, &dispatcher, manager, &open), 0);
         let audio = handle(&process);
         assert_eq!(data32(&process), 48_000);
         assert_eq!(
@@ -604,7 +610,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 audio,
                 &command(4, &[], None, None, false, false)
             ),
@@ -650,11 +656,11 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             auto,
             false,
         );
-        assert_eq!(call(&mut process, &mut dispatcher, audio, &append), 0);
+        assert_eq!(call(&mut process, &dispatcher, audio, &append), 0);
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 audio,
                 &command(0, &[], None, None, false, false)
             ),
@@ -662,7 +668,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         );
         assert_eq!(data32(&process), 1); // stopped
         write_guest_bytes(&process, releases, &[0xa5; 24]);
-        assert_eq!(call(&mut process, &mut dispatcher, audio, &release), 0);
+        assert_eq!(call(&mut process, &dispatcher, audio, &release), 0);
         assert_eq!(data32(&process), 0);
         assert_eq!(read_guest_bytes(&process, releases, 16), [0; 16]);
         assert_eq!(
@@ -681,7 +687,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
                     assert_eq!(
                         call(
                             &mut process,
-                            &mut dispatcher,
+                            &dispatcher,
                             device,
                             &command(
                                 if auto { 7 } else { 1 },
@@ -695,12 +701,12 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
                         0
                     );
                 }
-                assert_eq!(call(&mut process, &mut dispatcher, audio, &append), 0);
+                assert_eq!(call(&mut process, &dispatcher, audio, &append), 0);
             }
             assert_eq!(
                 call(
                     &mut process,
-                    &mut dispatcher,
+                    &dispatcher,
                     audio,
                     &command(1, &[], None, None, false, false)
                 ),
@@ -709,7 +715,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             assert_eq!(
                 call(
                     &mut process,
-                    &mut dispatcher,
+                    &dispatcher,
                     audio,
                     &command(1, &[], None, None, false, false)
                 ),
@@ -757,7 +763,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
                 write_guest_bytes(&process, process.main_thread().tls_base, &release);
                 process.main_thread().registers().write_w(x(0), audio);
                 let ExceptionHandlingResult::Rejected(fault) =
-                    dispatch_next(&mut process, &mut dispatcher)
+                    dispatch_next(&mut process, &dispatcher)
                 else {
                     panic!("read-only release destination must reject the IPC request");
                 };
@@ -782,7 +788,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
                         MemoryPermissions::READ_WRITE,
                     )
                     .unwrap();
-                assert_eq!(call(&mut process, &mut dispatcher, audio, &release), 0);
+                assert_eq!(call(&mut process, &dispatcher, audio, &release), 0);
                 assert_eq!(data32(&process), 1);
                 assert_eq!(
                     read_guest_bytes(&process, crossing, 8),
@@ -794,7 +800,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             assert_eq!(
                 call(
                     &mut process,
-                    &mut dispatcher,
+                    &dispatcher,
                     audio,
                     &command(9, &[], None, None, false, false)
                 ),
@@ -804,7 +810,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             assert_eq!(
                 call(
                     &mut process,
-                    &mut dispatcher,
+                    &dispatcher,
                     audio,
                     &command(6, &123_u64.to_le_bytes(), None, None, false, false)
                 ),
@@ -812,7 +818,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             );
             assert_eq!(data32(&process), 1);
             write_guest_bytes(&process, releases, &[0xa5; 24]);
-            assert_eq!(call(&mut process, &mut dispatcher, audio, &release), 0);
+            assert_eq!(call(&mut process, &dispatcher, audio, &release), 0);
             assert_eq!(data32(&process), 1);
             let mut expected = [0; 16];
             expected[..8].copy_from_slice(&123_u64.to_le_bytes());
@@ -823,13 +829,13 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             );
             assert!(!event.is_signalled());
             // Polling again must not return the previous tag from reused RAM.
-            assert_eq!(call(&mut process, &mut dispatcher, audio, &release), 0);
+            assert_eq!(call(&mut process, &dispatcher, audio, &release), 0);
             assert_eq!(data32(&process), 0);
             assert_eq!(read_guest_bytes(&process, releases, 16), [0; 16]);
             assert_eq!(
                 call(
                     &mut process,
-                    &mut dispatcher,
+                    &dispatcher,
                     audio,
                     &command(2, &[], None, None, false, false)
                 ),
@@ -838,16 +844,16 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         }
         // Released but uncollected buffers occupy slots; pending count is separate.
         for _ in 0..32 {
-            assert_eq!(call(&mut process, &mut dispatcher, audio, &append), 0);
+            assert_eq!(call(&mut process, &dispatcher, audio, &append), 0);
         }
         assert_eq!(
-            call(&mut process, &mut dispatcher, audio, &append),
+            call(&mut process, &dispatcher, audio, &append),
             153 | (8 << 9)
         );
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 audio,
                 &command(1, &[], None, None, false, false)
             ),
@@ -856,7 +862,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 audio,
                 &command(2, &[], None, None, false, false)
             ),
@@ -864,7 +870,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         );
         assert!(event.is_signalled());
         assert_eq!(
-            call(&mut process, &mut dispatcher, audio, &append),
+            call(&mut process, &dispatcher, audio, &append),
             153 | (8 << 9)
         );
         let drain = command(
@@ -875,7 +881,7 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
             auto,
             false,
         );
-        assert_eq!(call(&mut process, &mut dispatcher, audio, &drain), 0);
+        assert_eq!(call(&mut process, &dispatcher, audio, &drain), 0);
         assert_eq!(data32(&process), 32);
         assert!(!event.is_signalled());
         // A failed host stream wakes the event and preserves an actionable error.
@@ -884,12 +890,68 @@ fn audout_ipc_plays_pcm_releases_tags_and_restarts_through_both_buffer_abis() {
         let tls = process.main_thread().tls_base;
         write_guest_bytes(&process, tls, &release);
         process.main_thread().registers().write_w(x(0), audio);
-        let ExceptionHandlingResult::Fault(fault) = dispatch_next(&mut process, &mut dispatcher)
-        else {
+        let ExceptionHandlingResult::Fault(fault) = dispatch_next(&mut process, &dispatcher) else {
             panic!("host audio failure must reject the IPC");
         };
         assert!(fault.to_string().contains("test device disconnected"));
         assert!(process.handles().lookup(audio).is_none());
         assert_eq!(backend.live.load(Ordering::SeqCst), 0);
     }
+}
+
+#[test]
+fn a_large_pcm_buffer_uses_chunk_capture_and_keeps_its_tag_until_playback_finishes() {
+    let (_directory, mut process) = fixture_process(&[svc(0x21)]);
+    let dispatcher = support::dispatcher(&process);
+    let size = 66 * 1024 * 1024;
+    let samples = support::ready(process.memory().resize_heap(size)).unwrap();
+    write_guest_bytes(&process, samples, &[0xe8, 0x03, 0x18, 0xfc]);
+    let backend = Backend::default();
+    let session = crate::AudioOutSession::open(
+        process.scheduler(),
+        &backend,
+        nixe_audio::PcmFormat::STEREO_48KHZ,
+        Default::default(),
+    )
+    .unwrap();
+    let output = session.output.clone();
+    output.start().unwrap();
+    let feed = backend.feed.lock().unwrap().take().unwrap();
+    let handle = process
+        .handles()
+        .insert(crate::ServiceSession::new(HorizonIpcObject::AudioOut(
+            session,
+        )))
+        .unwrap();
+    let descriptor = process.main_thread().stack_bottom;
+    let mut bytes = [0; 40];
+    put_u64(&mut bytes, 8, samples.get());
+    put_u64(&mut bytes, 16, size);
+    put_u64(&mut bytes, 24, size);
+    write_guest_bytes(&process, descriptor, &bytes);
+    assert_eq!(
+        call(
+            &mut process,
+            &dispatcher,
+            handle,
+            &command(
+                3,
+                &123_u64.to_le_bytes(),
+                Some((descriptor.get(), 40)),
+                None,
+                false,
+                false
+            )
+        ),
+        0
+    );
+    let mut chunk = [0; 4096];
+    feed.render(&mut chunk);
+    assert_eq!(&chunk[..2], &[1000, -1000]);
+    assert!(output.released(16).unwrap().is_empty());
+    for _ in 1..size as usize / (chunk.len() * 2) {
+        feed.render(&mut chunk);
+    }
+    assert_eq!(output.played_frames().unwrap(), size / 4);
+    assert_eq!(output.released(16).unwrap(), vec![123]);
 }

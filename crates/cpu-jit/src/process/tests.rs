@@ -1,7 +1,7 @@
 use super::*;
 use crate::ThreadState;
 use nixe_cpu::{
-    execution::{ArchitecturalTimer, TimerSnapshot, VcpuEventState},
+    execution::{ArchitecturalTimer, TimerSnapshot},
     platform::TargetPlatform,
     state::a64::{A64GeneralRegister, A64Register},
 };
@@ -78,7 +78,6 @@ fn run(
         JitRunRequest {
             state,
             timer: &Timer,
-            events: &VcpuEventState::default(),
         },
     )
 }
@@ -100,12 +99,15 @@ fn exclusive_wait_loop_progresses_after_a_store_without_an_explicit_sev() {
         .unwrap()
         .into_ready()
         .unwrap();
-    let mut consumer = process.create_thread().unwrap();
+    let worker_process = process.clone();
     let (done, completed) = mpsc::channel();
     let executing = std::thread::spawn(move || {
+        let mut consumer = worker_process.create_thread().unwrap();
         let mut worker = NativeWorker::default();
         let mut guest = state();
         let result = run(&mut consumer, &mut worker, &mut guest);
+        guest.leave_core();
+        drop(consumer);
         done.send((result, guest)).unwrap();
         worker.finish().unwrap();
     });
@@ -179,7 +181,8 @@ fn canonical_process_prepares_code_and_retains_registers_across_svc_and_migratio
     ));
     assert_eq!(guest.read_x(register(0)), 11);
     assert_eq!(other.read_x(register(0)), 21);
-    assert!(process.try_shutdown().unwrap());
+    process.request_stop();
+    process.space.close().unwrap();
     assert_eq!(process.space.machine().statistics().allocated_bytes, 0);
     worker.finish().unwrap();
 }
@@ -231,9 +234,10 @@ fn stopping_a_native_dependency_cancels_the_unexecuted_suffix_and_releases_ram()
         .unwrap();
     machine.publish_device_write(&data, || Ok(())).unwrap();
     drop(data);
-    let mut cpu = process.create_thread().unwrap();
+    let worker_process = process.clone();
     let (done, completed) = mpsc::channel();
     let worker = std::thread::spawn(move || {
+        let mut cpu = worker_process.create_thread().unwrap();
         let mut worker = NativeWorker::default();
         let mut guest = state();
         guest.write_x(register(1), DATA + PAGE_SIZE - 8);
@@ -257,7 +261,8 @@ fn stopping_a_native_dependency_cancels_the_unexecuted_suffix_and_releases_ram()
         "the cancelled instruction must not start its suffix"
     );
     worker.join().unwrap();
-    assert!(process.try_shutdown().unwrap());
+    process.request_stop();
+    process.space.close().unwrap();
     assert_eq!(machine.statistics().guest_owned_bytes, 0);
     assert_eq!(machine.statistics().retained_bytes, PAGE_SIZE);
     drop(request);
@@ -277,9 +282,10 @@ fn a_concurrent_stop_preserves_the_original_completed_device_failure() {
         .unwrap();
     machine.publish_device_write(&data, || Ok(())).unwrap();
     drop(data);
-    let mut cpu = process.create_thread().unwrap();
+    let worker_process = process.clone();
     let (done, completed) = mpsc::channel();
     let worker = std::thread::spawn(move || {
+        let mut cpu = worker_process.create_thread().unwrap();
         let mut worker = NativeWorker::default();
         let result = run(&mut cpu, &mut worker, &mut state());
         done.send(result).unwrap();
@@ -296,7 +302,8 @@ fn a_concurrent_stop_preserves_the_original_completed_device_failure() {
     assert!(fault.message.contains("injected original device failure"));
     assert!(Arc::ptr_eq(process.failure.get().unwrap(), &original));
     worker.join().unwrap();
-    assert!(process.try_shutdown().unwrap());
+    process.request_stop();
+    process.space.close().unwrap();
     assert_eq!(machine.statistics().allocated_bytes, 0);
 }
 
@@ -330,7 +337,8 @@ fn canonical_process_reports_fetch_faults_and_relaxes_invalid_guest_data() {
                 .unwrap(),
             Access::Ready(0)
         ));
-        assert!(process.try_shutdown().unwrap());
+        process.request_stop();
+        process.space.close().unwrap();
         worker.finish().unwrap();
     }
 }

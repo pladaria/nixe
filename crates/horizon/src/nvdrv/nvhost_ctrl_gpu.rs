@@ -190,7 +190,10 @@ mod tests {
         assert!(event.is_none());
         assert_eq!(result, NV_BAD_PARAMETER);
 
-        assert_eq!(clone.close(fd), NV_SUCCESS);
+        assert_eq!(
+            crate::test_memory::run(clone.close(fd)).unwrap(),
+            NV_SUCCESS
+        );
         assert!(
             !session
                 .state

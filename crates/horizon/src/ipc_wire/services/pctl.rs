@@ -157,7 +157,7 @@ fn dispatch_parental_control_factory(
                 )
             } else {
                 let handle = process
-                    .return_handle(HorizonIpcObject::ParentalControlService(service))
+                    .return_service(HorizonIpcObject::ParentalControlService(service))
                     .map_err(IpcWireError::Handle)?;
                 Ok((
                     encode_response(request.token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,

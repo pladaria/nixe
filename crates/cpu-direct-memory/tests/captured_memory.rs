@@ -137,25 +137,27 @@ fn native_store_capture_keeps_old_physical_input_after_return_and_remap() {
     let Access::Pending(pending) = machine
         .access_captured(
             &captured,
-            AccessOperation::Write(Box::new([0x11, 0x22, 0x33, 0x44])),
+            AccessOperation::Write(Vec::from([0x11, 0x22, 0x33, 0x44])),
         )
         .unwrap()
     else {
         panic!("old device input must enter its owner");
     };
-    let request = receiver.recv().unwrap();
+    let mut request = receiver.recv().unwrap();
     assert_eq!(request.ranges()[0].allocation().identity(), old_id);
-    let result = machine
-        .apply_resolved_access(request.ranges(), request.operation())
-        .unwrap();
+    let result = {
+        let (ranges, operation) = request.parts_mut();
+        machine.apply_resolved_access(ranges, operation)
+    }
+    .unwrap();
     assert_eq!(
         machine
-            .apply_resolved_access(request.ranges(), &AccessOperation::Read)
+            .apply_resolved_access(request.ranges(), &mut AccessOperation::Read(Vec::new()))
             .unwrap(),
-        AccessResult::Read(Box::new([0x11, 0x22, 0x33, 0x44]))
+        AccessResult::Read(Vec::from([0x11, 0x22, 0x33, 0x44]))
     );
     request.finish(Ok(result));
-    assert_eq!(pending.wait().unwrap(), AccessResult::Written);
+    assert!(matches!(pending.wait().unwrap(), AccessResult::Written(_)));
     assert!(matches!(
         space.read_value(address, 4).unwrap(),
         Access::Ready(0)

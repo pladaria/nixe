@@ -32,12 +32,10 @@ mod debug_string;
 mod ipc;
 mod memory;
 mod memory_wait;
-mod scheduled;
 mod synchronization;
 mod thread;
 use ipc::*;
 use memory::*;
-pub use scheduled::HorizonScheduledDispatchError;
 use synchronization::{get_process_id, get_thread_id, insert_pair};
 
 pub const CURRENT_THREAD_HANDLE: u32 = 0xffff_8000;
@@ -201,6 +199,10 @@ impl HorizonSvcFault {
                 .is_access_fault()
                 .then_some(HorizonKernelResult::INVALID_POINTER),
             Self::Ipc { fault, .. } => fault.guest_result(),
+            Self::Scheduling {
+                fault: nixe_scheduler::SchedulerError::ProcessTerminating(_),
+                ..
+            } => Some(HorizonKernelResult::THREAD_TERMINATING),
             Self::InternalRuntime { .. } | Self::Scheduling { .. } => None,
             Self::NotSupervisorCall | Self::MissingImmediate => None,
         }
@@ -253,32 +255,18 @@ impl std::error::Error for HorizonSvcFault {}
 /// Table-driven Horizon exception dispatcher for the current minimal subset.
 #[derive(Debug)]
 pub struct HorizonSvcDispatcher {
-    svc_calls: u64,
-    initial_operation_mode: crate::OperationMode,
-    time_environment: crate::TimeEnvironment,
-    settings_environment: crate::SettingsEnvironment,
-    application_language: Option<crate::SystemLanguage>,
-    application_display_version: Option<[u8; 16]>,
-    user_account_switch_locked: Option<bool>,
-    save_data: Option<crate::SaveDataSystem>,
-    shared_fonts: crate::SharedFontSession,
-    system_archives: std::sync::Arc<crate::SystemArchives>,
-    keyboard_host: Option<nixe_applets::keyboard::KeyboardHost>,
-    diagnostics: crate::HorizonDiagnostics,
-    video_system: crate::VideoSystem,
-    hid_system: crate::HidSystem,
-    audio_backend: Option<std::sync::Arc<dyn nixe_audio::AudioBackend>>,
-    audio_renderers: crate::AudioRendererManagerSession,
-    opus: crate::OpusManagerSession,
+    svc_calls: std::sync::atomic::AtomicU64,
+    servers: std::sync::OnceLock<Result<crate::ipc_wire::server::Servers, std::io::Error>>,
+    resources: std::sync::Arc<crate::ipc_wire::resources::ServiceResources>,
     named_ports: std::sync::Arc<std::sync::Mutex<BTreeMap<Vec<u8>, PortObject>>>,
     virtual_clock: nixe_runtime::VirtualClock,
-    svc_waits: BTreeMap<GuestThreadId, std::sync::Arc<memory_wait::SvcWait>>,
-    service_scheduling: std::sync::Arc<crate::ipc_wire::operation::ServiceScheduling>,
-    memory_completions: std::sync::Arc<memory_wait::SvcCompletions>,
-    next_memory_generation: u64,
 }
 
 impl HorizonSvcDispatcher {
+    fn resources_mut(&mut self) -> &mut crate::ipc_wire::resources::ServiceResources {
+        std::sync::Arc::get_mut(&mut self.resources)
+            .expect("configure before opening service sessions")
+    }
     /// Creates a dispatcher whose applet service reports the selected initial mode.
     #[must_use]
     pub fn new(
@@ -287,7 +275,7 @@ impl HorizonSvcDispatcher {
         time_environment: crate::TimeEnvironment,
         hid_system: crate::HidSystem,
         shared_fonts: crate::SharedFontSession,
-    ) -> Self {
+    ) -> std::sync::Arc<Self> {
         let video = crate::VideoSystem::new(machine, hid_system.kernel());
         Self::new_with_video(
             initial_operation_mode,
@@ -306,7 +294,7 @@ impl HorizonSvcDispatcher {
         hid_system: crate::HidSystem,
         shared_fonts: crate::SharedFontSession,
         video_system: crate::VideoSystem,
-    ) -> Self {
+    ) -> std::sync::Arc<Self> {
         Self::new_with_video_and_settings(
             initial_operation_mode,
             time_environment,
@@ -326,154 +314,218 @@ impl HorizonSvcDispatcher {
         shared_fonts: crate::SharedFontSession,
         settings_environment: crate::SettingsEnvironment,
         video_system: crate::VideoSystem,
-    ) -> Self {
+    ) -> std::sync::Arc<Self> {
         let virtual_clock = time_environment.clock().clone();
         let audio_renderers = crate::AudioRendererManagerSession::new(hid_system.kernel());
-        let service_scheduling = std::sync::Arc::new(
-            crate::ipc_wire::operation::ServiceScheduling::new(hid_system.kernel()),
-        );
-        Self {
-            svc_calls: 0,
-            initial_operation_mode,
-            time_environment,
-            settings_environment,
-            application_language: None,
-            application_display_version: None,
-            user_account_switch_locked: None,
-            save_data: None,
-            shared_fonts,
-            system_archives: std::sync::Arc::new(crate::SystemArchives::default()),
-            keyboard_host: None,
-            diagnostics: crate::HorizonDiagnostics::default(),
-            video_system,
-            hid_system,
-            audio_backend: None,
-            audio_renderers,
-            opus: crate::OpusManagerSession::default(),
+        std::sync::Arc::new(Self {
+            svc_calls: std::sync::atomic::AtomicU64::new(0),
+            servers: std::sync::OnceLock::new(),
+            resources: std::sync::Arc::new(crate::ipc_wire::resources::ServiceResources {
+                payloads: Default::default(),
+                graphics: crate::ipc_wire::resources::GraphicsServices {
+                    video: video_system,
+                },
+                audio: crate::ipc_wire::resources::AudioServices {
+                    backend: None,
+                    renderers: audio_renderers,
+                    opus: crate::OpusManagerSession::default(),
+                },
+                files: crate::ipc_wire::resources::FileServices {
+                    save_data: None,
+                    shared_fonts,
+                    archives: std::sync::Arc::new(crate::SystemArchives::default()),
+                },
+                system: crate::ipc_wire::resources::SystemServices {
+                    operation_mode: initial_operation_mode,
+                    time: time_environment,
+                    hid: hid_system,
+                    keyboard: None,
+                    settings: settings_environment,
+                    application_language: None,
+                    application_display_version: None,
+                    user_account_switch_locked: None,
+                    diagnostics: crate::HorizonDiagnostics::default(),
+                },
+            }),
             named_ports: std::sync::Arc::default(),
             virtual_clock,
-            svc_waits: BTreeMap::new(),
-            service_scheduling,
-            memory_completions: std::sync::Arc::new(memory_wait::SvcCompletions::default()),
-            next_memory_generation: 0,
-        }
+        })
     }
 
     #[must_use]
-    pub fn with_keyboard_host(mut self, host: nixe_applets::keyboard::KeyboardHost) -> Self {
-        self.keyboard_host = Some(host);
+    pub fn with_keyboard_host(
+        mut self: std::sync::Arc<Self>,
+        host: nixe_applets::keyboard::KeyboardHost,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::get_mut(&mut self)
+            .expect("configure before starting cores")
+            .resources_mut()
+            .system
+            .keyboard = Some(host);
         self
     }
 
     /// Sets the language selected from this application's control metadata.
     /// Without it, GetDesiredLanguage reports unsupported application metadata.
     #[must_use]
-    pub fn with_application_language(mut self, language: crate::SystemLanguage) -> Self {
-        self.application_language = Some(language);
+    pub fn with_application_language(
+        mut self: std::sync::Arc<Self>,
+        language: crate::SystemLanguage,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::get_mut(&mut self)
+            .expect("configure before starting cores")
+            .resources_mut()
+            .system
+            .application_language = Some(language);
         self
     }
 
     /// Installs the NACP display version, including its required terminating NUL.
     #[must_use]
-    pub fn with_application_display_version(mut self, version: &str) -> Self {
+    pub fn with_application_display_version(
+        mut self: std::sync::Arc<Self>,
+        version: &str,
+    ) -> std::sync::Arc<Self> {
         let mut display_version = [0; 16];
         let len = version.len().min(display_version.len() - 1);
         display_version[..len].copy_from_slice(&version.as_bytes()[..len]);
-        self.application_display_version = Some(display_version);
+        std::sync::Arc::get_mut(&mut self)
+            .expect("configure before starting cores")
+            .resources_mut()
+            .system
+            .application_display_version = Some(display_version);
         self
     }
 
     /// Installs the account-switch policy from the launched application's NACP.
     #[must_use]
-    pub fn with_user_account_switch_lock(mut self, locked: bool) -> Self {
-        self.user_account_switch_locked = Some(locked);
+    pub fn with_user_account_switch_lock(
+        mut self: std::sync::Arc<Self>,
+        locked: bool,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::get_mut(&mut self)
+            .expect("configure before starting cores")
+            .resources_mut()
+            .system
+            .user_account_switch_locked = Some(locked);
         self
     }
 
     /// Supplies host-generated resources for filesystem system-data requests.
     #[must_use]
-    pub fn with_system_archives(mut self, archives: crate::SystemArchives) -> Self {
-        self.system_archives = std::sync::Arc::new(archives);
+    pub fn with_system_archives(
+        mut self: std::sync::Arc<Self>,
+        archives: crate::SystemArchives,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::get_mut(&mut self)
+            .expect("configure before starting cores")
+            .resources_mut()
+            .files
+            .archives = std::sync::Arc::new(archives);
         self
     }
 
     /// Installs the launched application's persistent save-data namespace.
     #[must_use]
-    pub fn with_save_data(mut self, save_data: crate::SaveDataSystem) -> Self {
-        self.save_data = Some(save_data);
+    pub fn with_save_data(
+        mut self: std::sync::Arc<Self>,
+        save_data: crate::SaveDataSystem,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::get_mut(&mut self)
+            .expect("configure before starting cores")
+            .resources_mut()
+            .files
+            .save_data = Some(save_data);
         self
     }
 
     /// Applies guest-log and filesystem diagnostic policy to service dispatch.
     #[must_use]
-    pub fn with_diagnostics(mut self, diagnostics: crate::HorizonDiagnostics) -> Self {
-        self.diagnostics = diagnostics;
+    pub fn with_diagnostics(
+        mut self: std::sync::Arc<Self>,
+        diagnostics: crate::HorizonDiagnostics,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::get_mut(&mut self)
+            .expect("configure before starting cores")
+            .resources_mut()
+            .system
+            .diagnostics = diagnostics;
         self
     }
 
     /// Supplies a host PCM backend. Audio remains explicitly unavailable until configured.
     pub fn with_audio_backend(
-        mut self,
+        mut self: std::sync::Arc<Self>,
         backend: std::sync::Arc<dyn nixe_audio::AudioBackend>,
-    ) -> Self {
-        self.audio_backend = Some(backend);
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::get_mut(&mut self)
+            .expect("configure before starting cores")
+            .resources_mut()
+            .audio
+            .backend = Some(backend);
         self
     }
 
     /// Supplies real controller actuator output owned by the host input worker.
-    pub fn with_vibration_output(self, output: nixe_input::VibrationOutput) -> Self {
-        self.hid_system.set_vibration_output(output);
+    pub fn with_vibration_output(
+        self: std::sync::Arc<Self>,
+        output: nixe_input::VibrationOutput,
+    ) -> std::sync::Arc<Self> {
+        self.resources.system.hid.set_vibration_output(output);
         self
     }
 
     #[must_use]
-    pub fn video_system(&self) -> crate::VideoSystem {
-        self.video_system.clone()
+    pub fn video_system(self: &std::sync::Arc<Self>) -> crate::VideoSystem {
+        self.resources.graphics.video.clone()
     }
 
     /// Advances the guest display clock and signals VI VSync when due.
-    pub fn advance_video(&self, elapsed: Duration) -> Result<u64, crate::FramebufferError> {
-        self.video_system.advance(elapsed)
+    pub fn advance_video(
+        self: &std::sync::Arc<Self>,
+        elapsed: Duration,
+    ) -> Result<u64, crate::FramebufferError> {
+        self.resources.graphics.video.advance(elapsed)
     }
 
     /// Parks audio command execution while preserving guest session state.
-    pub fn set_host_paused(&self, paused: bool) {
-        self.audio_renderers.set_host_paused(paused);
+    pub fn set_host_paused(self: &std::sync::Arc<Self>, paused: bool) {
+        self.resources.audio.renderers.set_host_paused(paused);
     }
 
-    pub fn next_video_deadline(&self) -> Duration {
-        self.video_system.next_display_deadline()
+    pub fn next_video_deadline(self: &std::sync::Arc<Self>) -> Duration {
+        self.resources.graphics.video.next_display_deadline()
     }
 
     /// Publishes the latest player-one controller state to Horizon HID.
     pub fn advance_input(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         state: Option<&nixe_input::EmulatedControllerState>,
         delta: Duration,
     ) -> Result<(), crate::HidInputError> {
-        self.hid_system.publish(state, delta)
+        self.resources.system.hid.publish(state, delta)
     }
 
     /// Publishes the latest host touch-screen state to Horizon HID.
     pub fn advance_touch_screen(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         state: &nixe_input::EmulatedTouchScreenState,
         delta: Duration,
     ) -> Result<(), crate::HidInputError> {
-        self.hid_system.publish_touch_screen(state, delta)
+        self.resources.system.hid.publish_touch_screen(state, delta)
     }
 
-    pub fn poll_input_publication(&self) -> Result<(), crate::HidInputError> {
-        self.hid_system.poll_publication()
+    pub fn poll_input_publication(self: &std::sync::Arc<Self>) -> Result<(), crate::HidInputError> {
+        self.resources.system.hid.poll_publication()
     }
 
     /// Number of decoded guest SVC invocations used by execution summaries.
     #[must_use]
-    pub const fn svc_calls(&self) -> u64 {
-        self.svc_calls
+    pub fn svc_calls(self: &std::sync::Arc<Self>) -> u64 {
+        self.svc_calls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn virtual_time_ns(&self) -> u64 {
+    fn virtual_time_ns(self: &std::sync::Arc<Self>) -> u64 {
         self.virtual_clock.scheduler_time_ns()
     }
 }
@@ -482,7 +534,7 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
     type Fault = HorizonSvcFault;
 
     fn dispatch(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         request: ExceptionDispatchRequest,
     ) -> ExceptionDispatchOutcome<Self::Fault> {
@@ -567,7 +619,8 @@ impl ExceptionDispatcher for HorizonSvcDispatcher {
                 })
             }
         };
-        self.svc_calls = self.svc_calls.saturating_add(1);
+        self.svc_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         trace_completed_svc_result(immediate, context.thread().state(), &outcome);
         outcome
     }
@@ -585,7 +638,15 @@ fn reject(
         return ExceptionDispatchOutcome::Fault(diagnostic);
     };
     result(context, guest_result);
-    ExceptionDispatchOutcome::Reject { diagnostic }
+    let level = if guest_result == HorizonKernelResult::THREAD_TERMINATING
+        && context.process().lifecycle() == nixe_scheduler::ProcessLifecycle::Running
+        && context.thread().object().exit().is_none()
+    {
+        log::Level::Warn
+    } else {
+        log::Level::Debug
+    };
+    ExceptionDispatchOutcome::Reject { diagnostic, level }
 }
 
 fn result(context: &mut ExceptionDispatchContext<'_>, value: HorizonKernelResult) {

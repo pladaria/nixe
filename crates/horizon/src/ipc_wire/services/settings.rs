@@ -86,7 +86,7 @@ pub(in crate::ipc_wire) async fn dispatch_system_settings(
                 .write(
                     &process.receive_statics()[0],
                     0,
-                    &emulated_firmware_version(),
+                    &mut emulated_firmware_version().to_vec(),
                 )
                 .await?;
             log::debug!("set:sys returned emulated firmware version 1.0.0");
@@ -174,7 +174,7 @@ pub(in crate::ipc_wire) async fn dispatch_user_settings(
             for language in &SystemLanguage::AVAILABLE[..count] {
                 codes.extend_from_slice(&language.code().to_le_bytes());
             }
-            write_descriptor_bytes(process, descriptor, &codes).await?;
+            write_descriptor_bytes(process, descriptor, &mut codes).await?;
             let count = u32::try_from(count).expect("language table fits in a u32");
             log::debug!("set returned {count} available language codes");
             Ok((

@@ -30,9 +30,10 @@ impl UpdateSlot {
     pub fn try_take(self: &Arc<Self>) -> Option<UpdateLease> {
         let value = {
             let mut state = self.value.lock().unwrap();
+            let value = state.take()?;
             self.ready.clear();
-            state.take()
-        }?;
+            value
+        };
         Some(UpdateLease {
             owner: self.clone(),
             value: Some(value),
@@ -105,6 +106,23 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+    #[test]
+    fn cancelling_the_notified_caller_does_not_strand_available_state() {
+        let slot = Arc::new(UpdateSlot::new(&crate::test_memory::kernel()));
+        let lease = slot.try_take().unwrap();
+        let mut first = Box::pin(slot.take());
+        let mut second = Box::pin(slot.take());
+        let notifications = Arc::new(Notifications(AtomicUsize::new(0)));
+        let waker = Waker::from(notifications.clone());
+        let mut context = Context::from_waker(&waker);
+        assert!(first.as_mut().poll(&mut context).is_pending());
+        assert!(second.as_mut().poll(&mut context).is_pending());
+        drop(lease);
+        let before = notifications.0.load(Ordering::SeqCst);
+        drop(first);
+        assert!(notifications.0.load(Ordering::SeqCst) > before);
+        assert!(second.as_mut().poll(&mut context).is_ready());
     }
     #[test]
     fn returned_state_wakes_async_callers_and_cancelled_callers_do_not_own_it() {

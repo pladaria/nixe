@@ -948,7 +948,7 @@ impl AddressSpace {
             drop(access);
             return self
                 .machine()
-                .request_device_access(ranges, AccessOperation::Read)
+                .request_device_access(ranges, AccessOperation::Read(Vec::new()))
                 .map(Access::Pending);
         }
         let mut address = start.get();
@@ -1135,7 +1135,7 @@ impl AddressSpace {
             drop(access);
             return self
                 .machine()
-                .request_device_access(ranges, AccessOperation::Read)
+                .request_device_access(ranges, AccessOperation::Read(Vec::new()))
                 .map(Access::Pending);
         }
         let source = self
@@ -1676,7 +1676,7 @@ mod tests {
         let (observed, result) = observing.join().unwrap();
         assert_eq!(
             result,
-            crate::AccessResult::Read(Box::new(if wrote { [1, 2, 3, 4] } else { [0; 4] }))
+            crate::AccessResult::Read(Vec::from(if wrote { [1, 2, 3, 4] } else { [0; 4] }))
         );
         assert!(!observed.is_invalid());
         native.resume().unwrap();
@@ -1898,7 +1898,7 @@ mod tests {
         let (access, observation) = machine.access_code_captured(captured).unwrap();
         assert_eq!(
             access.into_ready().unwrap(),
-            crate::AccessResult::Read(Box::new(0x11223344u32.to_le_bytes()))
+            crate::AccessResult::Read(Vec::from(0x11223344u32.to_le_bytes()))
         );
         assert!(!observation.is_invalid());
         native.resume().unwrap();

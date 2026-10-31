@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn filesystem_access_log_returns_version_then_program_index_in_both_transports() {
     let (_directory, mut process) = fixture_process(&[svc(0x21); 3]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let handle = service_handle(&process, IpcService::FileSystem);
     let tls = process.main_thread().tls_base;
     let mut request = [0; 0x100];
@@ -14,7 +14,7 @@ fn filesystem_access_log_returns_version_then_program_index_in_both_transports()
     write_guest_bytes(&process, tls, &request);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
@@ -26,7 +26,7 @@ fn filesystem_access_log_returns_version_then_program_index_in_both_transports()
     write_guest_bytes(&process, tls, &request);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
@@ -42,7 +42,7 @@ fn filesystem_access_log_returns_version_then_program_index_in_both_transports()
     write_guest_bytes(&process, tls, &request);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, tls.checked_add(40).unwrap()), 0);
@@ -53,7 +53,7 @@ fn filesystem_access_log_returns_version_then_program_index_in_both_transports()
 #[test]
 fn filesystem_session_advertises_space_for_two_aligned_pointer_paths() {
     let (_directory, mut process) = fixture_process(&[svc(0x21)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let handle = service_handle(&process, IpcService::FileSystem);
     let tls = process.main_thread().tls_base;
     let mut request = [0; 0x100];
@@ -64,7 +64,7 @@ fn filesystem_session_advertises_space_for_two_aligned_pointer_paths() {
     write_guest_bytes(&process, tls, &request);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);

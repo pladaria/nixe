@@ -1,5 +1,4 @@
 //! Process-owned address wait payloads; generations and timeout arbitration belong to the kernel.
-use crate::{EventObject, ReadableEventObject, WritableEventObject};
 use nixe_scheduler::{
     EventNotifications, GuestThreadId, KernelWait, LockKey, OrderedWaitKind, ProcessId,
     SchedulerError, SchedulerState, WaitEffect, WaitOutcome,
@@ -8,6 +7,7 @@ use std::{
     collections::BTreeMap,
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex, MutexGuard, OnceLock},
+    task::{Poll, Waker},
 };
 mod arbiter;
 pub use arbiter::AddressSignalTargets;
@@ -79,33 +79,51 @@ pub struct MutexHandoff {
     pub more_waiters: bool,
     _effect: Option<WaitEffect>,
 }
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct AddressOperation {
-    thread: GuestThreadId,
-    event: Option<(WritableEventObject, ReadableEventObject)>,
+    owner: u64,
+    next: u64,
+    pending: BTreeMap<u64, Waker>,
 }
 /// An ordered operation for one process-local arbiter word. No host lock is
 /// held while its physical access is pending; other addresses keep progressing.
 pub struct AddressOperationGuard {
     registry: Arc<AddressWaitRegistry>,
     address: u64,
-    thread: GuestThreadId,
+    ticket: u64,
 }
 impl Drop for AddressOperationGuard {
     fn drop(&mut self) {
-        let retired = {
+        let (waker, notify) = {
             let mut state = self.registry.lock();
-            if state
+            let operation = state
                 .operations
-                .get(&self.address)
-                .is_none_or(|operation| operation.thread != self.thread)
-            {
-                return;
+                .get_mut(&self.address)
+                .expect("retained word operation");
+            if operation.owner != self.ticket {
+                (
+                    Some(
+                        operation
+                            .pending
+                            .remove(&self.ticket)
+                            .expect("registered word operation"),
+                    ),
+                    false,
+                )
+            } else if let Some((next, waker)) = operation.pending.pop_first() {
+                // Pass ownership before notifying the one selected successor.
+                // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_light_lock.cpp#L83-L117
+                operation.owner = next;
+                (Some(waker), true)
+            } else {
+                state.operations.remove(&self.address);
+                (None, false)
             }
-            state.operations.remove(&self.address).unwrap()
         };
-        if let Some((signal, _)) = retired.event {
-            signal.signal();
+        if let Some(waker) = waker
+            && notify
+        {
+            waker.wake();
         }
     }
 }
@@ -127,41 +145,62 @@ impl AddressWaitRegistry {
             .expect("address waits already bound");
     }
 
-    pub async fn address_operation(
-        self: &Arc<Self>,
-        address: u64,
-        thread: GuestThreadId,
-    ) -> AddressOperationGuard {
-        loop {
-            let pending = {
+    pub async fn address_operation(self: &Arc<Self>, address: u64) -> AddressOperationGuard {
+        // The guard owns queued registration too: cancellation removes it or
+        // passes on an unobserved ownership grant, without another observer.
+        let mut guard: Option<AddressOperationGuard> = None;
+        std::future::poll_fn(|context| {
+            let old = {
                 let mut state = self.lock();
-                let kernel = state.kernel().1.clone();
-                if let Some(operation) = state.operations.get_mut(&address) {
-                    let (_, event) = operation
-                        .event
-                        .get_or_insert_with(|| EventObject::create_pair(&kernel));
-                    Some(event.clone())
-                } else {
-                    state.operations.insert(
+                let Some(registration) = guard.as_ref() else {
+                    let (ticket, ready) = match state.operations.entry(address) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(AddressOperation::default());
+                            (0, true)
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            let operation = entry.get_mut();
+                            operation.next = operation
+                                .next
+                                .checked_add(1)
+                                .expect("word operation identity exhausted");
+                            let ticket = operation.next;
+                            operation.pending.insert(ticket, context.waker().clone());
+                            (ticket, false)
+                        }
+                    };
+                    guard = Some(AddressOperationGuard {
+                        registry: self.clone(),
                         address,
-                        AddressOperation {
-                            thread,
-                            event: None,
-                        },
-                    );
-                    None
-                }
-            };
-            if let Some(event) = pending {
-                event.wait_async().await;
-            } else {
-                return AddressOperationGuard {
-                    registry: self.clone(),
-                    address,
-                    thread,
+                        ticket,
+                    });
+                    return if ready {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    };
                 };
-            }
-        }
+                let operation = state
+                    .operations
+                    .get_mut(&address)
+                    .expect("retained word operation");
+                if operation.owner == registration.ticket {
+                    return Poll::Ready(());
+                }
+                let slot = operation
+                    .pending
+                    .get_mut(&registration.ticket)
+                    .expect("registered word operation");
+                if slot.will_wake(context.waker()) {
+                    return Poll::Pending;
+                }
+                std::mem::replace(slot, context.waker().clone())
+            };
+            drop(old);
+            Poll::Pending
+        })
+        .await;
+        guard.expect("completed word registration")
     }
     pub fn lock(&self) -> AddressWaitGuard<'_> {
         AddressWaitGuard {
@@ -187,9 +226,7 @@ impl Drop for AddressWaitGuard<'_> {
         let retired = std::mem::take(&mut state.retired);
         let effects = std::mem::take(&mut state.effects);
         drop(state);
-        for notification in notifications {
-            notification.notify();
-        }
+        notifications.notify();
         drop(retired);
         drop(effects);
     }
@@ -202,7 +239,7 @@ pub struct AddressWaitState {
     waiters: BTreeMap<GuestThreadId, AddressWaiter>,
     arbiter_waiters: BTreeMap<GuestThreadId, Arc<KernelWait>>,
     operations: BTreeMap<u64, AddressOperation>,
-    notifications: Vec<EventNotifications>,
+    notifications: EventNotifications,
     retired: Vec<AddressWaiter>,
     effects: Vec<WaitEffect>,
 }
@@ -332,7 +369,7 @@ impl AddressWaitState {
             WaitOutcome::Ready
         };
         let (_, notifications) = self.kernel().1.resolve_wait_deferred(token, outcome);
-        self.notifications.push(notifications);
+        self.notifications.append(notifications);
     }
     fn condition_claim(
         &self,
@@ -405,6 +442,12 @@ impl AddressWaitState {
         let Some(waiter) = self.waiters.get(&claim.thread) else {
             return Ok(());
         };
+        if matches!(
+            claim.wait.outcome(),
+            Some(nixe_scheduler::WaitOutcome::Terminated | nixe_scheduler::WaitOutcome::Cancelled)
+        ) {
+            return Ok(());
+        }
         if waiter.address != claim.key
             || !Arc::ptr_eq(&waiter.wait, &claim.wait)
             || waiter.phase != WaitPhase::Handoff
@@ -474,13 +517,13 @@ impl AddressWaitState {
             self.signal_result(claim.address, *thread, result);
         }
     }
-    pub(crate) fn release_thread(&mut self, thread: GuestThreadId) {
+    pub fn release_thread(&mut self, thread: GuestThreadId) {
         self.remove_address_wait(thread);
         if let Some(waiter) = self.waiters.get(&thread) {
             self.remove(waiter.address, thread);
         }
     }
-    pub(crate) fn cancel_held_waiter(&mut self, thread: GuestThreadId) {
+    pub fn cancel_held_waiter(&mut self, thread: GuestThreadId) {
         if self.waiters.get(&thread).is_some_and(|waiter| {
             waiter.lock_address.is_none() && waiter.phase == WaitPhase::Waiting
         }) {
@@ -531,7 +574,8 @@ mod tests {
     use super::*;
     use std::{
         future::Future,
-        task::{Context, Poll, Waker},
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll, Wake, Waker},
     };
     fn thread(id: u64) -> GuestThreadId {
         GuestThreadId::new(id)
@@ -667,22 +711,140 @@ mod tests {
     fn same_word_operations_suspend_without_holding_a_host_lock() {
         let registry = test_registry();
         let mut context = Context::from_waker(Waker::noop());
-        let first = match std::pin::pin!(registry.address_operation(0x1000, thread(1)))
-            .poll(&mut context)
-        {
+        let first = match std::pin::pin!(registry.address_operation(0x1000)).poll(&mut context) {
             Poll::Ready(guard) => guard,
             _ => panic!("free word"),
         };
-        let mut second = std::pin::pin!(registry.address_operation(0x1000, thread(2)));
+        let mut second = std::pin::pin!(registry.address_operation(0x1000));
         assert!(second.as_mut().poll(&mut context).is_pending());
-        let other = match std::pin::pin!(registry.address_operation(0x2000, thread(3)))
-            .poll(&mut context)
-        {
+        let other = match std::pin::pin!(registry.address_operation(0x2000)).poll(&mut context) {
             Poll::Ready(guard) => guard,
             _ => panic!("disjoint word"),
         };
         drop(first);
         assert!(second.as_mut().poll(&mut context).is_ready());
         drop(other);
+    }
+
+    struct WordWake(Arc<AddressWaitRegistry>, AtomicUsize);
+    impl Wake for WordWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            assert!(self.0.state.try_lock().is_ok());
+            self.1.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn contended_word_handoffs_notify_each_successor_once() {
+        let registry = test_registry();
+        let notified = Arc::new(WordWake(registry.clone(), AtomicUsize::new(0)));
+        let waker = Waker::from(notified.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut owner = match std::pin::pin!(registry.address_operation(0x1000)).poll(&mut context)
+        {
+            Poll::Ready(guard) => Some(guard),
+            _ => panic!("free word"),
+        };
+        let mut pending: Vec<_> = (0..3)
+            .map(|_| Box::pin(registry.address_operation(0x1000)))
+            .collect();
+        for next in &mut pending {
+            assert!(next.as_mut().poll(&mut context).is_pending());
+        }
+        for selected in 0..pending.len() {
+            drop(owner.take());
+            // A real executor repolls each notified task. Only the selected
+            // successor should run; remaining operations keep their registration.
+            for (index, next) in pending.iter_mut().enumerate().skip(selected) {
+                if index == selected {
+                    owner = match next.as_mut().poll(&mut context) {
+                        Poll::Ready(guard) => Some(guard),
+                        _ => panic!("selected successor"),
+                    };
+                } else {
+                    assert!(next.as_mut().poll(&mut context).is_pending());
+                }
+            }
+        }
+        drop(owner);
+        assert_eq!(notified.1.load(Ordering::SeqCst), pending.len());
+        assert!(registry.lock().operations.is_empty());
+    }
+
+    #[test]
+    fn cancelled_word_operations_pass_unobserved_ownership_to_the_next_live_request() {
+        let registry = test_registry();
+        let notified = Arc::new(WordWake(registry.clone(), AtomicUsize::new(0)));
+        let waker = Waker::from(notified.clone());
+        let mut context = Context::from_waker(&waker);
+        let owner = match std::pin::pin!(registry.address_operation(0x1000)).poll(&mut context) {
+            Poll::Ready(guard) => guard,
+            _ => panic!("free word"),
+        };
+        let mut selected = Box::pin(registry.address_operation(0x1000));
+        let mut cancelled = Box::pin(registry.address_operation(0x1000));
+        let mut next = Box::pin(registry.address_operation(0x1000));
+        for pending in [&mut selected, &mut cancelled, &mut next] {
+            assert!(pending.as_mut().poll(&mut context).is_pending());
+        }
+        drop(cancelled);
+        assert_eq!(notified.1.load(Ordering::SeqCst), 0);
+        drop(owner);
+        assert_eq!(notified.1.load(Ordering::SeqCst), 1);
+        let mut arrival = Box::pin(registry.address_operation(0x1000));
+        assert!(arrival.as_mut().poll(&mut context).is_pending());
+        drop(selected);
+        assert_eq!(notified.1.load(Ordering::SeqCst), 2);
+        let owner = match next.as_mut().poll(&mut context) {
+            Poll::Ready(guard) => guard,
+            _ => panic!("next live request owns the word"),
+        };
+        assert!(arrival.as_mut().poll(&mut context).is_pending());
+        drop(owner);
+        assert_eq!(notified.1.load(Ordering::SeqCst), 3);
+        assert!(arrival.as_mut().poll(&mut context).is_ready());
+        assert!(registry.lock().operations.is_empty());
+    }
+
+    #[test]
+    fn word_release_racing_first_poll_never_loses_the_successor_notification() {
+        struct Notify(std::sync::mpsc::Sender<()>);
+        impl Wake for Notify {
+            fn wake(self: Arc<Self>) {
+                self.0.send(()).unwrap();
+            }
+        }
+        let registry = test_registry();
+        for _ in 0..128 {
+            let owner = match std::pin::pin!(registry.address_operation(0x1000))
+                .poll(&mut Context::from_waker(Waker::noop()))
+            {
+                Poll::Ready(guard) => guard,
+                _ => panic!("free word"),
+            };
+            let mut next = Box::pin(registry.address_operation(0x1000));
+            let (send, receive) = std::sync::mpsc::channel();
+            let waker = Waker::from(Arc::new(Notify(send)));
+            let mut context = Context::from_waker(&waker);
+            let result = std::thread::scope(|scope| {
+                scope.spawn(move || drop(owner));
+                next.as_mut().poll(&mut context)
+            });
+            let owner = match result {
+                Poll::Ready(guard) => guard,
+                Poll::Pending => {
+                    receive.try_recv().expect("pending successor was notified");
+                    match next.as_mut().poll(&mut context) {
+                        Poll::Ready(guard) => guard,
+                        _ => panic!("released word"),
+                    }
+                }
+            };
+            drop(owner);
+            assert!(registry.lock().operations.is_empty());
+        }
     }
 }

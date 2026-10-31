@@ -4,7 +4,7 @@ use nixe_scheduler::VirtualCpuId;
 #[test]
 fn start_thread_resolves_the_current_thread_pseudohandle_like_a_retained_thread() {
     let (_directory, mut process) = fixture_process(&[svc(0x09); 6]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let handle = process.main_thread_handle();
     let duplicate = process.handles().duplicate(handle).unwrap();
     let event = process
@@ -21,7 +21,7 @@ fn start_thread_resolves_the_current_thread_pseudohandle_like_a_retained_thread(
     ] {
         write_abi_register(&process, 0, u64::from(handle));
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
@@ -35,7 +35,7 @@ fn start_thread_resolves_the_current_thread_pseudohandle_like_a_retained_thread(
 #[test]
 fn get_info_accepts_process_handles_and_rejects_other_objects_and_closed_handles() {
     let (_directory, mut process) = fixture_process(&[svc(0x29); 8]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let owner = std::sync::Arc::clone(&process);
     let handle = process
         .handles()
@@ -62,7 +62,7 @@ fn get_info_accepts_process_handles_and_rejects_other_objects_and_closed_handles
             write_abi_register(&process, index, value);
         }
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
@@ -88,7 +88,7 @@ fn get_info_accepts_process_handles_and_rejects_other_objects_and_closed_handles
 #[test]
 fn get_info_queries_the_referenced_process_instead_of_the_caller() {
     let (directory, mut process) = fixture_process(&[svc(0x29); 17]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let plan = Launcher::build(LauncherInput::new(directory.path().join("svc.nro"))).unwrap();
     let target = support::process_builder_with_kernel(process.scheduler().clone())
         .with_config(ProcessBuildConfig {
@@ -98,9 +98,9 @@ fn get_info_queries_the_referenced_process_instead_of_the_caller() {
         })
         .build(&plan)
         .unwrap();
-    let affinity = process.coordinator_mut().scheduler().profile().all_cores();
+    let affinity = process.driver_mut().scheduler().profile().all_cores();
     let id = process
-        .coordinator_mut()
+        .driver_mut()
         .register_process(
             target,
             nixe_runtime::ProcessRegistration {
@@ -110,7 +110,7 @@ fn get_info_queries_the_referenced_process_instead_of_the_caller() {
             },
         )
         .unwrap();
-    let target = process.coordinator_mut().process(id).unwrap().clone();
+    let target = process.driver_mut().process(id).unwrap().clone();
     target
         .scheduler()
         .set_activity(target.main_thread_id(), true)
@@ -153,7 +153,7 @@ fn get_info_queries_the_referenced_process_instead_of_the_caller() {
             write_abi_register(&process, index, value);
         }
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(read_abi_register(&process, 0), 0, "GetInfo kind {kind}");
@@ -163,12 +163,12 @@ fn get_info_queries_the_referenced_process_instead_of_the_caller() {
             "GetInfo kind {kind}"
         );
     }
-    process.coordinator_mut().remove_process(id).unwrap();
+    process.driver_mut().remove_process(id).unwrap();
     for (index, value) in [(1, 4), (2, u64::from(handle)), (3, 0)] {
         write_abi_register(&process, index, value);
     }
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_abi_register(&process, 0), 0);
@@ -178,9 +178,9 @@ fn get_info_queries_the_referenced_process_instead_of_the_caller() {
 #[test]
 fn process_id_accepts_process_thread_and_pseudo_handles() {
     let (_directory, mut process) = fixture_process(&[svc(0x24); 6]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let id = process.scheduler_process_id();
-    let owner = process.coordinator_mut().process(id).unwrap().clone();
+    let owner = process.driver_mut().process(id).unwrap().clone();
     let process_handle = owner
         .handles()
         .insert_object(nixe_runtime::HandleObject::from_arc(owner.clone()))
@@ -203,7 +203,7 @@ fn process_id_accepts_process_thread_and_pseudo_handles() {
     ] {
         process.main_thread().registers().write_w(x(1), handle);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
@@ -227,14 +227,14 @@ fn process_id_accepts_process_thread_and_pseudo_handles() {
 fn process_id_of_an_exported_thread_survives_removal_of_its_process() {
     use std::sync::Arc;
     let (directory, mut process) = fixture_process(&[svc(0x24)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let plan = Launcher::build(LauncherInput::new(directory.path().join("svc.nro"))).unwrap();
     let source = support::process_builder_with_kernel(process.scheduler().clone())
         .build(&plan)
         .unwrap();
-    let affinity = process.coordinator_mut().scheduler().profile().all_cores();
+    let affinity = process.driver_mut().scheduler().profile().all_cores();
     let id = process
-        .coordinator_mut()
+        .driver_mut()
         .register_process(
             source,
             nixe_runtime::ProcessRegistration {
@@ -244,18 +244,18 @@ fn process_id_of_an_exported_thread_survives_removal_of_its_process() {
             },
         )
         .unwrap();
-    let source = process.coordinator_mut().process(id).unwrap().clone();
+    let source = process.driver_mut().process(id).unwrap().clone();
     let parent = Arc::downgrade(&source);
     let handle = process
         .handles()
         .insert_object(nixe_runtime::HandleObject::from_arc(source.main_thread()))
         .unwrap();
     drop(source);
-    process.coordinator_mut().remove_process(id).unwrap();
+    process.driver_mut().remove_process(id).unwrap();
     assert!(parent.upgrade().is_some());
     process.main_thread().registers().write_w(x(1), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_abi_register(&process, 0), 0);
@@ -280,14 +280,14 @@ fn closing_the_self_handle_invalidates_its_number_but_preserves_duplicates_and_p
         svc(0x25),
         svc(0x0e),
     ]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let original = process.main_thread_handle();
     let duplicate = process.handles().duplicate(original).unwrap();
     process.main_thread().registers().write_w(x(1), original);
-    dispatch_scheduled_next(&mut process, &mut dispatcher);
+    dispatch_scheduled_next(&mut process, &dispatcher);
     assert_eq!(read_abi_register(&process, 0), 0);
     process.main_thread().registers().write_w(x(0), original);
-    dispatch_scheduled_next(&mut process, &mut dispatcher);
+    dispatch_scheduled_next(&mut process, &dispatcher);
     assert_eq!(read_abi_register(&process, 0), 0);
     assert!(process.handles().lookup(original).is_none());
     for (handle, expected) in [
@@ -301,7 +301,7 @@ fn closing_the_self_handle_invalidates_its_number_but_preserves_duplicates_and_p
                 .registers()
                 .write_w(x(register), handle);
             assert!(matches!(
-                dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+                dispatch_scheduled_next(&mut process, &dispatcher).1,
                 ExceptionHandlingResult::Resumed
             ));
             assert_eq!(read_abi_register(&process, 0), u64::from(expected.raw()));
@@ -309,7 +309,7 @@ fn closing_the_self_handle_invalidates_its_number_but_preserves_duplicates_and_p
         if handle == original {
             process.main_thread().registers().write_w(x(0), original);
             process.main_thread().registers().write_w(x(1), 20);
-            dispatch_scheduled_next(&mut process, &mut dispatcher);
+            dispatch_scheduled_next(&mut process, &dispatcher);
             assert_eq!(read_abi_register(&process, 0), u64::from(expected.raw()));
         }
     }
@@ -326,7 +326,7 @@ fn main_thread_retirement_allows_child_execution_and_clean_host_stop_or_shutdown
                 svc(0x10),
                 svc(0x0a),
             ]);
-            let mut dispatcher = support::dispatcher(&process);
+            let dispatcher = support::dispatcher(&process);
             let entry = instruction_address(&process);
             let main = process.main_thread_id();
             let handle = process.main_thread_handle();
@@ -334,38 +334,26 @@ fn main_thread_retirement_allows_child_execution_and_clean_host_stop_or_shutdown
             let process_id = process.scheduler_process_id();
             process.thread(child).unwrap().start().unwrap();
             process.main_thread().registers().write_w(x(0), handle);
-            dispatch_scheduled_next(&mut process, &mut dispatcher);
+            dispatch_scheduled_next(&mut process, &dispatcher);
             let main_object = process.main_thread();
-            assert!(
-                matches!(dispatch_scheduled_next(&mut process, &mut dispatcher),
-                (id, ExceptionHandlingResult::Terminated { .. }) if id == main)
-            );
+            assert!(matches!(dispatch_scheduled_next(&mut process, &dispatcher),
+                (id, ExceptionHandlingResult::Terminated { .. }) if id == main));
             let exit = main_object.exit().unwrap();
             drop(main_object);
-            assert!(
-                matches!(dispatch_scheduled_next(&mut process, &mut dispatcher),
-                (id, ExceptionHandlingResult::Resumed) if id == child)
-            );
+            assert!(matches!(dispatch_scheduled_next(&mut process, &dispatcher),
+                (id, ExceptionHandlingResult::Resumed) if id == child));
             assert_eq!(process.thread(main).is_none(), close_main);
             assert_eq!(
                 process.lifecycle(),
                 nixe_scheduler::ProcessLifecycle::Running
             );
             if shutdown {
-                process.coordinator_mut().shutdown().unwrap();
-                assert_eq!(
-                    process.coordinator_mut().resource_counts(),
-                    Default::default()
-                );
+                process.driver_mut().shutdown().unwrap();
+                assert_eq!(process.driver_mut().resource_counts(), Default::default());
             } else {
                 let retained_child = process.thread(child).unwrap();
                 let retained_main = process.thread(main);
-                assert!(
-                    process
-                        .coordinator_mut()
-                        .terminate_process(process_id)
-                        .unwrap()
-                );
+                assert!(process.driver_mut().terminate_process(process_id).unwrap());
                 assert_eq!(
                     process.lifecycle(),
                     nixe_scheduler::ProcessLifecycle::Exited
@@ -377,13 +365,8 @@ fn main_thread_retirement_allows_child_execution_and_clean_host_stop_or_shutdown
                 if !close_main {
                     assert_eq!(retained_main.unwrap().exit(), Some(exit));
                 }
-                assert!(
-                    !process
-                        .coordinator_mut()
-                        .terminate_process(process_id)
-                        .unwrap()
-                );
-                process.coordinator_mut().shutdown().unwrap();
+                assert!(!process.driver_mut().terminate_process(process_id).unwrap());
+                process.driver_mut().shutdown().unwrap();
             }
         }
     }
@@ -393,7 +376,7 @@ fn main_thread_retirement_allows_child_execution_and_clean_host_stop_or_shutdown
 fn last_started_thread_exit_ignores_created_and_retained_exited_children() {
     for close_created in [false, true] {
         let (_directory, mut process) = fixture_process(&[svc(0x0a)]);
-        let mut dispatcher = support::dispatcher(&process);
+        let dispatcher = support::dispatcher(&process);
         let main = process.main_thread_id();
         let entry = instruction_address(&process);
         let (created, handle) = super::mutex::add_thread(&mut process, entry, 30);
@@ -404,25 +387,21 @@ fn last_started_thread_exit_ignores_created_and_retained_exited_children() {
             drop(process.handles().close(handle).unwrap());
             drop(process.handles().close(copied).unwrap());
             drop(created_object);
-            process.coordinator_mut().drain_external_events().unwrap();
+            process.driver_mut().drain_external_events().unwrap();
             assert!(process.thread(created).is_none());
         } else {
             drop(created_object);
         }
         let (exited, _) = super::mutex::add_thread(&mut process, entry, 30);
         process.thread(exited).unwrap().start().unwrap();
-        assert!(
-            matches!(dispatch_scheduled_next(&mut process, &mut dispatcher),
-            (id, ExceptionHandlingResult::Terminated { .. }) if id == exited)
-        );
+        assert!(matches!(dispatch_scheduled_next(&mut process, &dispatcher),
+            (id, ExceptionHandlingResult::Terminated { .. }) if id == exited));
         assert_eq!(
             process.lifecycle(),
             nixe_scheduler::ProcessLifecycle::Running
         );
-        assert!(
-            matches!(dispatch_scheduled_next(&mut process, &mut dispatcher),
-            (id, ExceptionHandlingResult::Terminated { .. }) if id == main)
-        );
+        assert!(matches!(dispatch_scheduled_next(&mut process, &dispatcher),
+            (id, ExceptionHandlingResult::Terminated { .. }) if id == main));
         assert_eq!(
             process.lifecycle(),
             nixe_scheduler::ProcessLifecycle::Exited
@@ -435,7 +414,7 @@ fn last_started_thread_exit_ignores_created_and_retained_exited_children() {
             assert!(retained_created.as_ref().unwrap().is_signalled());
             assert_eq!(
                 process
-                    .coordinator_mut()
+                    .driver_mut()
                     .scheduler()
                     .thread(created)
                     .unwrap()
@@ -450,7 +429,7 @@ fn last_started_thread_exit_ignores_created_and_retained_exited_children() {
 fn started_waiting_or_paused_children_keep_the_process_alive() {
     for paused in [false, true] {
         let (_directory, mut process) = fixture_process(&[svc(0x0a), svc(0x0b), svc(0x0a)]);
-        let mut dispatcher = support::dispatcher(&process);
+        let dispatcher = support::dispatcher(&process);
         let main = process.main_thread_id();
         let entry = instruction_address(&process);
         let (child, _) = super::mutex::add_thread(&mut process, entry + 4, 30);
@@ -462,18 +441,16 @@ fn started_waiting_or_paused_children_keep_the_process_alive() {
         process.thread(child).unwrap().start().unwrap();
         if paused {
             process
-                .coordinator_mut()
+                .driver_mut()
                 .scheduler()
                 .set_activity(child, true)
                 .unwrap();
         } else {
-            assert!(
-                matches!(dispatch_scheduled_next(&mut process, &mut dispatcher),
-                (id, ExceptionHandlingResult::Suspended) if id == child)
-            );
+            assert!(matches!(dispatch_scheduled_next(&mut process, &dispatcher),
+                (id, ExceptionHandlingResult::Suspended) if id == child));
             assert_eq!(
                 process
-                    .coordinator_mut()
+                    .driver_mut()
                     .scheduler()
                     .thread(child)
                     .unwrap()
@@ -481,33 +458,27 @@ fn started_waiting_or_paused_children_keep_the_process_alive() {
                 nixe_scheduler::ThreadLifecycle::Waiting
             );
         }
-        assert!(
-            matches!(dispatch_scheduled_next(&mut process, &mut dispatcher),
-            (id, ExceptionHandlingResult::Terminated { .. }) if id == main)
-        );
+        assert!(matches!(dispatch_scheduled_next(&mut process, &dispatcher),
+            (id, ExceptionHandlingResult::Terminated { .. }) if id == main));
         assert_eq!(
             process.lifecycle(),
             nixe_scheduler::ProcessLifecycle::Running
         );
         if paused {
             process
-                .coordinator_mut()
+                .driver_mut()
                 .scheduler()
                 .set_activity(child, false)
                 .unwrap();
-            dispatch_scheduled_next(&mut process, &mut dispatcher);
+            dispatch_scheduled_next(&mut process, &dispatcher);
         }
         process
-            .coordinator_mut()
+            .driver_mut()
             .advance_virtual_time(1_000_000_000)
             .unwrap();
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
-        assert!(
-            matches!(dispatch_scheduled_next(&mut process, &mut dispatcher),
-            (id, ExceptionHandlingResult::Terminated { .. }) if id == child)
-        );
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
+        assert!(matches!(dispatch_scheduled_next(&mut process, &dispatcher),
+            (id, ExceptionHandlingResult::Terminated { .. }) if id == child));
         assert_eq!(
             process.lifecycle(),
             nixe_scheduler::ProcessLifecycle::Exited
@@ -520,7 +491,7 @@ fn exited_thread_handles_and_pending_operations_retain_one_canonical_object() {
     for retain_operation in [false, true] {
         let (_directory, mut process) =
             fixture_process(&[svc(0x16), svc(0x0c), svc(0x16), svc(0x10), svc(0x0a)]);
-        let mut dispatcher = support::dispatcher(&process);
+        let dispatcher = support::dispatcher(&process);
         let entry = instruction_address(&process);
         let (child, original) = super::mutex::add_thread(&mut process, entry + 16, 30);
         let copied = process.handles().duplicate(original).unwrap();
@@ -535,54 +506,38 @@ fn exited_thread_handles_and_pending_operations_retain_one_canonical_object() {
         process.main_thread().registers().write_w(x(0), copied);
         process.thread(child).unwrap().start().unwrap();
         assert!(
-            matches!(dispatch_scheduled_next(&mut process, &mut dispatcher), (id, ExceptionHandlingResult::Terminated { .. }) if id == child)
+            matches!(dispatch_scheduled_next(&mut process, &dispatcher), (id, ExceptionHandlingResult::Terminated { .. }) if id == child)
         );
         assert!(matches!(
-            dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+            dispatch_scheduled_next(&mut process, &dispatcher).1,
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(read_abi_register(&process, 0), 0);
-        assert!(
-            process
-                .coordinator_mut()
-                .scheduler()
-                .thread(child)
-                .is_some()
-        );
+        assert!(process.driver_mut().scheduler().thread(child).is_some());
         process.main_thread().registers().write_w(x(1), original);
         assert!(matches!(
-            dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+            dispatch_scheduled_next(&mut process, &dispatcher).1,
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(read_abi_register(&process, 0), 0);
         assert_eq!(read_abi_register(&process, 1), 30);
         process.main_thread().registers().write_w(x(0), original);
         assert!(matches!(
-            dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+            dispatch_scheduled_next(&mut process, &dispatcher).1,
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(read_abi_register(&process, 0), 0);
-        process.coordinator_mut().drain_external_events().unwrap();
+        process.driver_mut().drain_external_events().unwrap();
         assert_eq!(
-            process
-                .coordinator_mut()
-                .scheduler()
-                .thread(child)
-                .is_some(),
+            process.driver_mut().scheduler().thread(child).is_some(),
             retain_operation
         );
         if let Some(retained) = retained {
             assert!(retained.is_signalled());
             std::thread::spawn(move || drop(retained)).join().unwrap();
-            process.coordinator_mut().drain_external_events().unwrap();
+            process.driver_mut().drain_external_events().unwrap();
         }
-        assert!(
-            process
-                .coordinator_mut()
-                .scheduler()
-                .thread(child)
-                .is_none()
-        );
+        assert!(process.driver_mut().scheduler().thread(child).is_none());
         assert!(process.thread(child).is_none());
     }
 }
@@ -590,7 +545,7 @@ fn exited_thread_handles_and_pending_operations_retain_one_canonical_object() {
 #[test]
 fn closing_the_last_handle_finalizes_an_unstarted_thread() {
     let (_directory, mut process) = fixture_process(&[svc(0x16), svc(0x10)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let entry = instruction_address(&process);
     let (child, copied) = super::mutex::add_thread(&mut process, entry + 4, 30);
     let original = copied;
@@ -598,19 +553,13 @@ fn closing_the_last_handle_finalizes_an_unstarted_thread() {
     drop(process.handles().close(copied).unwrap());
     process.main_thread().registers().write_w(x(0), original);
     assert!(matches!(
-        dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+        dispatch_scheduled_next(&mut process, &dispatcher).1,
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_abi_register(&process, 0), 0);
-    process.coordinator_mut().drain_external_events().unwrap();
+    process.driver_mut().drain_external_events().unwrap();
     assert!(process.thread(child).is_none());
-    assert!(
-        process
-            .coordinator_mut()
-            .scheduler()
-            .thread(child)
-            .is_none()
-    );
+    assert!(process.driver_mut().scheduler().thread(child).is_none());
 }
 
 #[test]
@@ -626,7 +575,7 @@ fn native_priority_queries_follow_donation_and_base_priority_restoration() {
         svc(0x1a),
         svc(0x0a),
     ]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let owner = process.main_thread_id();
     let owner_handle = process.main_thread_handle();
     let mutex = process.main_thread().stack_bottom;
@@ -640,7 +589,7 @@ fn native_priority_queries_follow_donation_and_base_priority_restoration() {
     donor_state.write_w(x(2), tag);
     drop(donor_state);
     let query = |process: &mut ScheduledProcess,
-                 dispatcher: &mut HorizonSvcDispatcher,
+                 dispatcher: &std::sync::Arc<HorizonSvcDispatcher>,
                  expected| {
         process
             .main_thread()
@@ -652,37 +601,35 @@ fn native_priority_queries_follow_donation_and_base_priority_restoration() {
         assert_eq!(read_abi_register(process, 0), 0);
         assert_eq!(read_abi_register(process, 1), expected);
     };
-    query(&mut process, &mut dispatcher, 44);
+    query(&mut process, &dispatcher, 44);
     process.thread(donor).unwrap().start().unwrap();
     assert!(
-        matches!(dispatch_scheduled_next(&mut process, &mut dispatcher), (id, ExceptionHandlingResult::Suspended) if id == donor)
+        matches!(dispatch_scheduled_next(&mut process, &dispatcher), (id, ExceptionHandlingResult::Suspended) if id == donor)
     );
-    query(&mut process, &mut dispatcher, 30);
+    query(&mut process, &dispatcher, 30);
     process
         .scheduler()
         .set_priority(owner, 52, Some(owner))
         .unwrap();
-    query(&mut process, &mut dispatcher, 30);
+    query(&mut process, &dispatcher, 30);
     process.main_thread().registers().write_x(x(0), mutex.get());
     assert!(
-        matches!(dispatch_scheduled_next(&mut process, &mut dispatcher), (id, ExceptionHandlingResult::Resumed) if id == owner)
+        matches!(dispatch_scheduled_next(&mut process, &dispatcher), (id, ExceptionHandlingResult::Resumed) if id == owner)
     );
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     assert_eq!(process.thread_lifecycle(donor), ThreadLifecycle::Ready);
     assert!(
-        matches!(dispatch_scheduled_next(&mut process, &mut dispatcher), (id, ExceptionHandlingResult::Terminated { .. }) if id == donor)
+        matches!(dispatch_scheduled_next(&mut process, &dispatcher), (id, ExceptionHandlingResult::Terminated { .. }) if id == donor)
     );
-    query(&mut process, &mut dispatcher, 52);
+    query(&mut process, &dispatcher, 52);
     process
         .scheduler()
         .set_priority(owner, 44, Some(owner))
         .unwrap();
-    query(&mut process, &mut dispatcher, 44);
+    query(&mut process, &dispatcher, 44);
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .selection(VirtualCpuId::new(0))
             .unwrap()

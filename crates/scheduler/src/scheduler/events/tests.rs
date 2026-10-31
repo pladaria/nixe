@@ -185,6 +185,59 @@ fn an_auto_reset_host_claim_survives_clear_without_consuming_another_signal() {
     assert!(!event.is_signalled());
     kernel.stop_timers().unwrap();
 }
+
+#[test]
+fn manual_host_completions_survive_clear_and_a_later_broadcast() {
+    let kernel = fixed();
+    let (signal, event) = EventObject::create_pair(&kernel);
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut observers = Vec::new();
+    for id in 0..3 {
+        let waker = Waker::from(Arc::new(OrderedNotify {
+            kernel: Arc::downgrade(&kernel),
+            order: order.clone(),
+            id,
+        }));
+        let mut observer = Box::pin(event.wait_async());
+        assert!(
+            observer
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        observers.push(observer);
+    }
+    signal.signal();
+    event.clear();
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(observers[0].as_mut().poll(&mut context).is_ready());
+    drop(observers.remove(1));
+    assert!(!event.is_signalled());
+
+    let waker = Waker::from(Arc::new(OrderedNotify {
+        kernel: Arc::downgrade(&kernel),
+        order: order.clone(),
+        id: 3,
+    }));
+    let mut next = event.wait_async();
+    assert!(
+        Pin::new(&mut next)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    signal.signal();
+    event.clear();
+    assert_eq!(*order.lock().unwrap(), [0, 1, 2, 3]);
+    assert!(observers[1].as_mut().poll(&mut context).is_ready());
+    assert!(Pin::new(&mut next).poll(&mut context).is_ready());
+    assert!(
+        Pin::new(&mut event.wait_async())
+            .poll(&mut context)
+            .is_pending()
+    );
+    kernel.stop_timers().unwrap();
+}
+
 #[test]
 fn cancelling_or_exiting_unlinks_every_object_and_late_signals_cannot_reopen_the_generation() {
     for outcome in [WaitOutcome::Cancelled, WaitOutcome::Terminated] {
@@ -254,6 +307,45 @@ fn a_device_signal_notifies_an_idle_kernel_without_cpu_completion() {
 }
 
 #[test]
+fn deferred_batches_preserve_notification_order_until_the_owner_releases_them() {
+    let kernel = fixed();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut observers = Vec::new();
+    let mut notifications = EventNotifications::default();
+    for group in 0..2 {
+        let (signal, event) = EventObject::create_pair(&kernel);
+        for id in group * 2..group * 2 + 2 {
+            let waker = Waker::from(Arc::new(OrderedNotify {
+                kernel: Arc::downgrade(&kernel),
+                order: order.clone(),
+                id,
+            }));
+            let mut observer = Box::pin(event.wait_async());
+            assert!(
+                observer
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            observers.push(observer);
+        }
+        notifications.append(EventNotifications::default());
+        notifications.append(signal.publish_readiness(true));
+        assert!(order.lock().unwrap().is_empty());
+    }
+    notifications.notify();
+    assert_eq!(*order.lock().unwrap(), [0, 1, 2, 3]);
+    for observer in &mut observers {
+        assert!(
+            observer
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+    }
+}
+
+#[test]
 fn shutdown_resolves_untimed_waits_and_releases_the_events_retaining_the_kernel() {
     let kernel = fixed();
     let weak = Arc::downgrade(&kernel);
@@ -264,4 +356,97 @@ fn shutdown_resolves_untimed_waits_and_releases_the_events_retaining_the_kernel(
     assert_eq!(wait.outcome(), Some(WaitOutcome::Terminated));
     drop(kernel);
     assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn unregistering_a_blocked_thread_retires_its_wait_before_slot_reuse() {
+    let kernel = fixed();
+    let thread = caller(&kernel, 20);
+    let (signal, event) = EventObject::create_pair(&kernel);
+    let wait = pending(&kernel, thread, &[event], None);
+    kernel.unregister(thread).unwrap();
+    assert_eq!(wait.outcome(), Some(WaitOutcome::Terminated));
+    let replacement = caller(&kernel, 20);
+    signal.signal();
+    assert_eq!(kernel.thread(replacement).unwrap().active_wait, None);
+    kernel.stop_timers().unwrap();
+}
+
+#[test]
+fn termination_notifies_a_completed_wait_still_draining_an_accepted_effect() {
+    let kernel = fixed();
+    let thread = caller(&kernel, 20);
+    let (wait, effect) = kernel
+        .begin_ordered_wait(thread, OrderedWaitKind::AddressArbiter, 0x1000, true)
+        .unwrap();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let waker = Waker::from(Arc::new(OrderedNotify {
+        kernel: Arc::downgrade(&kernel),
+        order: order.clone(),
+        id: 1,
+    }));
+    let mut future = std::pin::pin!(wait.wait());
+    assert!(
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    assert!(kernel.resolve_wait(wait.token(), WaitOutcome::Ready));
+    assert!(order.lock().unwrap().is_empty());
+    kernel.terminate(thread, false).unwrap();
+    assert_eq!(*order.lock().unwrap(), [1]);
+    assert_eq!(
+        future.as_mut().poll(&mut Context::from_waker(&waker)),
+        Poll::Ready(WaitOutcome::Terminated)
+    );
+    assert_eq!(wait.outcome(), Some(WaitOutcome::Ready));
+    kernel.unregister(thread).unwrap();
+    drop(effect);
+    assert_eq!(*order.lock().unwrap(), [1]);
+    kernel.stop_timers().unwrap();
+}
+
+#[test]
+fn auto_reset_receipts_preserve_fifo_across_notified_and_pending_cancellation() {
+    let kernel = fixed();
+    let (signal, event) = EventObject::create_auto_reset_pair(&kernel);
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut futures = Vec::new();
+    for id in 0..6 {
+        let waker = Waker::from(Arc::new(OrderedNotify {
+            kernel: Arc::downgrade(&kernel),
+            order: order.clone(),
+            id,
+        }));
+        let mut future = Box::pin(event.wait_async());
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        futures.push(Some(future));
+    }
+    for _ in 0..3 {
+        signal.signal();
+    }
+    assert_eq!(*order.lock().unwrap(), [0, 1, 2]);
+    drop(futures[1].take());
+    assert_eq!(*order.lock().unwrap(), [0, 1, 2, 3]);
+    drop(futures[4].take());
+    signal.signal();
+    assert_eq!(*order.lock().unwrap(), [0, 1, 2, 3, 5]);
+    for index in [0, 2, 3, 5] {
+        let future = futures[index].as_mut().unwrap();
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+    }
+    drop(futures);
+    assert!(!event.is_signalled());
+    kernel.stop_timers().unwrap();
 }

@@ -1,7 +1,7 @@
 //! Memory behavior through the same process/context entry used by runtime.
 use crate::{JitProcess, JitRunRequest, ThreadState};
 use nixe_cpu::{
-    execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState},
+    execution::{ArchitecturalTimer, CpuExit, TimerSnapshot},
     platform::TargetPlatform,
     profile::ProcessCpuContext,
     state::a64::{A64GeneralRegister, A64Register},
@@ -89,10 +89,11 @@ fn run(process: &Arc<JitProcess>, state: &mut ThreadState) -> CpuExit {
             JitRunRequest {
                 state,
                 timer: &Timer,
-                events: &VcpuEventState::default(),
             },
         )
         .unwrap();
+    state.leave_core();
+    drop(thread);
     worker.finish().unwrap();
     report.stop
 }
@@ -195,12 +196,13 @@ fn device_simd_read_completes_within_the_original_native_instruction() {
         ));
         state
     });
-    let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(request.bytes(), 16);
-    let result = space
-        .machine()
-        .apply_resolved_access(request.ranges(), request.operation())
-        .unwrap();
+    let result = {
+        let (ranges, operation) = request.parts_mut();
+        space.machine().apply_resolved_access(ranges, operation)
+    }
+    .unwrap();
     request.finish(Ok(result));
     let state = execution.join().unwrap();
     assert_eq!(state.vector(0), Some(value));
@@ -229,7 +231,7 @@ fn pending_callback_allows_remapping_and_commits_its_original_physical_access_on
         ));
         state
     });
-    let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
     space
         .unmap(GuestVirtualAddress::new(DATA), 2 * PAGE_SIZE)
         .unwrap();
@@ -253,10 +255,11 @@ fn pending_callback_allows_remapping_and_commits_its_original_physical_access_on
         .unwrap()
         .into_ready()
         .unwrap();
-    let result = space
-        .machine()
-        .apply_resolved_access(request.ranges(), request.operation())
-        .unwrap();
+    let result = {
+        let (ranges, operation) = request.parts_mut();
+        space.machine().apply_resolved_access(ranges, operation)
+    }
+    .unwrap();
     request.finish(Ok(result));
     let state = execution.join().unwrap();
     assert_eq!(state.read_x(x(0)), 17);
@@ -282,7 +285,7 @@ fn pair_store_never_replays_its_prefix_while_a_later_callback_waits() {
         ));
         state
     });
-    let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(request.bytes(), 8);
     assert!(matches!(request.operation(), AccessOperation::Write(_)));
     assert_eq!(read(&space, ALIAS + PAGE_SIZE - 8, 8), 7);
@@ -315,10 +318,11 @@ fn pair_store_never_replays_its_prefix_while_a_later_callback_waits() {
         .unwrap()
         .into_ready()
         .unwrap();
-    let result = space
-        .machine()
-        .apply_resolved_access(request.ranges(), request.operation())
-        .unwrap();
+    let result = {
+        let (ranges, operation) = request.parts_mut();
+        space.machine().apply_resolved_access(ranges, operation)
+    }
+    .unwrap();
     request.finish(Ok(result));
     let state = execution.join().unwrap();
     assert_eq!(state.read_x(x(1)), first + 16);
@@ -329,10 +333,10 @@ fn pair_store_never_replays_its_prefix_while_a_later_callback_waits() {
             .machine()
             .apply_resolved_access(
                 &capture(&space, DATA + PAGE_SIZE, 8),
-                &AccessOperation::Read,
+                &mut AccessOperation::Read(Vec::new()),
             )
             .unwrap(),
-        nixe_memory::AccessResult::Read(Box::new(9u64.to_le_bytes()))
+        nixe_memory::AccessResult::Read(Vec::from(9u64.to_le_bytes()))
     );
     assert!(requests.try_recv().is_err());
 }
@@ -370,7 +374,6 @@ fn mixed_page_repeated_reads_reuse_coherency_without_caching_values() {
                     JitRunRequest {
                         state: &mut state,
                         timer: &Timer,
-                        events: &VcpuEventState::default(),
                     },
                 )
                 .unwrap();

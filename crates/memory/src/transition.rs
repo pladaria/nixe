@@ -582,9 +582,9 @@ mod tests {
         assert!(matches!(
             machine.apply_resolved_access(
                 &captured,
-                &crate::AccessOperation::Write(Box::new(9u32.to_le_bytes()))
+                &mut crate::AccessOperation::Write(Vec::from(9u32.to_le_bytes()))
             ),
-            Ok(crate::AccessResult::Written)
+            Ok(crate::AccessResult::Written(_))
         ));
         drop(captured);
         assert_eq!(machine.statistics().allocated_bytes, 0);

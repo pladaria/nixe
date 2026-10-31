@@ -42,9 +42,7 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
     hipc: &HipcRequest<'_>,
     caller_thread_id: u64,
     clock: &nixe_runtime::VirtualClock,
-    scheduling: &std::sync::Arc<crate::ipc_wire::operation::ServiceScheduling>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    let service = NvDrvService::new(session);
     let Some(command) = NvDrvCommand::decode(request.command_id) else {
         return Err(IpcWireError::UnsupportedNvDrv(
             crate::nvdrv::UnsupportedNvDrvOperation::ServiceCommand {
@@ -89,12 +87,13 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
             if size == 0 || size > 0x100 {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
+            process.reserve_payload(size).await?;
             let mut path = vec![0_u8; size];
             process.read(descriptor, 0, &mut path).await?;
-            let (fd, error) = match service.open(&path, process.process_id()) {
+            let (fd, error) = match session.open(&path, process.process_id()) {
                 Ok(fd) => (fd.raw(), crate::nvdrv::NV_SUCCESS),
-                Err(NvDrvServiceError::DriverResult(error)) => (0, error),
-                Err(NvDrvServiceError::Unsupported(operation)) => {
+                Err(crate::nvdrv::NvDrvCallError::GuestResult(error)) => (0, error),
+                Err(crate::nvdrv::NvDrvCallError::Unsupported(operation)) => {
                     return Err(IpcWireError::UnsupportedNvDrv(operation));
                 }
             };
@@ -131,6 +130,21 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
             if input_size > 0x1000 {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
+            let additional_input_size = buffers
+                .additional_input
+                .map(|descriptor| descriptor.size)
+                .map_or(Ok(0), usize::try_from)
+                .map_err(|_| IpcWireError::Malformed("nvdrv Ioctl2 input is too large"))?;
+            if additional_input_size > 0x1_0000 {
+                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
+            }
+            let output_size = buffers.output.map_or(0, |buffer| buffer.size)
+                + buffers.additional_output.map_or(0, |buffer| buffer.size);
+            let output_size = usize::try_from(output_size)
+                .map_err(|_| IpcWireError::Malformed("nvdrv ioctl output size overflows"))?;
+            process
+                .reserve_payload(input_size + additional_input_size + output_size)
+                .await?;
             let mut input = vec![0_u8; input_size];
             if buffers.input.is_some() {
                 process
@@ -142,23 +156,15 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
                 input.len(),
                 &input[..input.len().min(64)],
             );
-            let additional_input_size = buffers
-                .additional_input
-                .map(|descriptor| descriptor.size)
-                .map_or(Ok(0), usize::try_from)
-                .map_err(|_| IpcWireError::Malformed("nvdrv Ioctl2 input is too large"))?;
-            if additional_input_size > 0x1_0000 {
-                return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
-            }
             let mut additional_input = vec![0_u8; additional_input_size];
             if buffers.additional_input.is_some() {
                 process
                     .read(&process.send_buffers()[1], 0, &mut additional_input)
                     .await?;
             }
-            let response = loop {
-                let response = service
-                    .ioctl(crate::nvdrv::NvDrvIoctlRequest {
+            let mut response = loop {
+                let response = session
+                    .ioctl_outcome(crate::nvdrv::NvDrvIoctlRequest {
                         fd: NvDrvFileDescriptor::new(fd),
                         request: ioctl,
                         input: &input,
@@ -191,10 +197,22 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
                             .map_err(IpcWireError::UnsupportedNvDrv)?;
                     }
                     NvDrvIoctlOutcome::PendingSubmission(wait) => {
-                        scheduling.wait(wait.wake_event(), None).await?;
+                        crate::ipc_wire::operation::ServiceEvent::new(
+                            process.kernel(),
+                            wait.wake_event(),
+                            None,
+                            process.lifetime(),
+                        )
+                        .await?;
                     }
                     NvDrvIoctlOutcome::PendingSyncpointWait(wait) => {
-                        scheduling.wait(wait.wake_event(), wait.remaining()).await?;
+                        crate::ipc_wire::operation::ServiceEvent::new(
+                            process.kernel(),
+                            wait.wake_event(),
+                            wait.remaining(),
+                            process.lifetime(),
+                        )
+                        .await?;
                     }
                 }
             };
@@ -228,14 +246,18 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
                 );
             }
             if buffers.output.is_some() {
-                write_descriptor_bytes(process, &process.receive_buffers()[0], &response.output)
-                    .await?;
+                write_descriptor_bytes(
+                    process,
+                    &process.receive_buffers()[0],
+                    &mut response.output,
+                )
+                .await?;
             }
             if buffers.additional_output.is_some() {
                 write_descriptor_bytes(
                     process,
                     &process.receive_buffers()[1],
-                    &response.additional_output,
+                    &mut response.additional_output,
                 )
                 .await?;
             }
@@ -253,7 +275,15 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
             let Some(fd) = request_u32(request.data, 0) else {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             };
-            let error = service.close(NvDrvFileDescriptor::new(fd));
+            let mut close = session.close(NvDrvFileDescriptor::new(fd));
+            let error = std::future::poll_fn(|cx| {
+                if process.lifetime().check().is_err() {
+                    close.cancel();
+                }
+                std::future::Future::poll(std::pin::Pin::new(&mut close), cx)
+            })
+            .await
+            .map_err(IpcWireError::UnsupportedNvDrv)?;
             Ok((
                 encode_response(
                     request.token,
@@ -281,7 +311,7 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
             if u64::from(transfer_size) > transfer.size() || transfer_size == 0 {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
-            service.initialize(transfer_size);
+            session.initialize(transfer_size);
             Ok((
                 encode_response(
                     request.token,
@@ -309,7 +339,7 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
             {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
-            let (event, error) = service
+            let (event, error) = session
                 .query_event(NvDrvFileDescriptor::new(fd), event_id, process.process_id())
                 .map_err(IpcWireError::UnsupportedNvDrv)?;
             let handle = if let Some(event) = event {
@@ -359,7 +389,7 @@ pub(in crate::ipc_wire) async fn dispatch_nvdrv(
             {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
-            service.set_aruid(process.process_id(), applet_resource_user_id);
+            session.set_aruid(process.process_id(), applet_resource_user_id);
             Ok((
                 encode_response(request.token, HorizonIpcResult::SUCCESS, &[], None)?,
                 None,

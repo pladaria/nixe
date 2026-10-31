@@ -978,7 +978,7 @@ impl VulkanResidency {
             }
         }
         for range in pins {
-            self.access_memory(vec![range], nixe_memory::AccessOperation::Read)?;
+            self.access_memory(vec![range], nixe_memory::AccessOperation::Read(Vec::new()))?;
         }
         Ok(())
     }

@@ -1,9 +1,10 @@
 use super::*;
-use nixe_runtime::{HandleObject, ProcessRegistration, RuntimeCoordinator};
+use nixe_runtime::{HandleObject, ProcessRegistration};
 use nixe_scheduler::{
     IdealCore, MachineSchedulerProfile, PriorityRange, ProcessId, VirtualCpuDescriptor,
     VirtualCpuId,
 };
+use support::SvcTestDriver;
 
 #[test]
 fn special_core_mask_requests_use_the_process_default_or_preserve_the_locked_ideal() {
@@ -22,7 +23,7 @@ fn special_core_mask_requests_use_the_process_default_or_preserve_the_locked_ide
         let caller = process.main_thread_id();
         let handle = process.main_thread_handle();
         assert_eq!(process.initial_ideal_vcpu(), VirtualCpuId::new(0));
-        let scheduler = process.coordinator_mut().scheduler();
+        let scheduler = process.driver_mut().scheduler();
         let affinity = scheduler
             .profile()
             .core_set([VirtualCpuId::new(0), VirtualCpuId::new(1)])
@@ -42,9 +43,9 @@ fn special_core_mask_requests_use_the_process_default_or_preserve_the_locked_ide
             .registers()
             .write_x(x(1), request as i64 as u64);
         process.main_thread().registers().write_x(x(2), mask);
-        let mut dispatcher = fixed_time_dispatcher(&process);
+        let dispatcher = fixed_time_dispatcher(&process);
         assert!(matches!(
-            dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+            dispatch_scheduled_next(&mut process, &dispatcher).1,
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
@@ -52,7 +53,7 @@ fn special_core_mask_requests_use_the_process_default_or_preserve_the_locked_ide
             u64::from(expected.raw()),
             "ideal={request} mask={mask:#x}"
         );
-        let scheduler = process.coordinator_mut().scheduler();
+        let scheduler = process.driver_mut().scheduler();
         let info = scheduler.thread(caller).unwrap();
         assert_eq!(info.ideal_vcpu, ideal.map(VirtualCpuId::new));
         assert_eq!(
@@ -61,7 +62,7 @@ fn special_core_mask_requests_use_the_process_default_or_preserve_the_locked_ide
                 .fold(0u64, |bits, core| bits | 1 << core.get()),
             resulting_mask
         );
-        process.coordinator_mut().shutdown().unwrap();
+        process.driver_mut().shutdown().unwrap();
     }
 }
 
@@ -133,8 +134,8 @@ fn process(
     process
 }
 
-fn coordinator() -> RuntimeCoordinator {
-    RuntimeCoordinator::new(nixe_scheduler::SchedulerState::new(
+fn coordinator() -> SvcTestDriver {
+    SvcTestDriver::new(nixe_scheduler::SchedulerState::new(
         MachineSchedulerProfile::new(
             (0..2)
                 .map(|id| VirtualCpuDescriptor::new(VirtualCpuId::new(id), 0))
@@ -146,11 +147,7 @@ fn coordinator() -> RuntimeCoordinator {
     ))
 }
 
-fn register(
-    coordinator: &mut RuntimeCoordinator,
-    process: RunnableProcess,
-    priority: i32,
-) -> ProcessId {
+fn register(coordinator: &mut SvcTestDriver, process: RunnableProcess, priority: i32) -> ProcessId {
     let core = VirtualCpuId::new(0);
     let affinity = coordinator.scheduler().profile().core_set([core]).unwrap();
     coordinator
@@ -166,18 +163,18 @@ fn register(
 }
 
 fn dispatch(
-    coordinator: &mut RuntimeCoordinator,
-    dispatcher: &mut HorizonSvcDispatcher,
+    coordinator: &mut SvcTestDriver,
+    dispatcher: &std::sync::Arc<HorizonSvcDispatcher>,
     caller: ProcessId,
 ) -> u32 {
     let execution = coordinator
-        .run_next(Duration::from_secs(2))
+        .run_native(Duration::from_secs(2))
         .unwrap()
         .unwrap();
     assert_eq!(execution.lease.process, caller);
     assert!(matches!(
         dispatcher
-            .route_scheduled_supervisor_call(coordinator, execution.lease, &execution.report.stop)
+            .call_local(coordinator, execution.lease, &execution.report.stop)
             .unwrap(),
         ExceptionHandlingResult::Resumed
     ));
@@ -232,8 +229,8 @@ fn start_thread_uses_the_parent_of_the_retained_foreign_thread() {
         .insert_object(HandleObject::from_arc(child.clone()))
         .unwrap();
     write_abi_register(&caller_process, 0, u64::from(handle));
-    let mut dispatcher = support::dispatcher(&caller_process);
-    assert_eq!(dispatch(&mut coordinator, &mut dispatcher, caller), 0);
+    let dispatcher = support::dispatcher(&caller_process);
+    assert_eq!(dispatch(&mut coordinator, &dispatcher, caller), 0);
     let view = scheduler.thread(created.id).unwrap();
     assert_eq!(view.process, owner_id);
     assert_eq!(view.lifecycle, nixe_scheduler::ThreadLifecycle::Ready);
@@ -271,7 +268,7 @@ fn get_info_uses_the_referenced_process_core_and_priority_policy() {
         .handles()
         .insert_object(HandleObject::from_arc(target.clone()))
         .unwrap();
-    let mut dispatcher = support::dispatcher(&caller_process);
+    let dispatcher = support::dispatcher(&caller_process);
     for (kind, expected) in [
         (0, target.allowed_core_mask().unwrap()),
         (1, target.allowed_priority_mask().unwrap()),
@@ -279,7 +276,7 @@ fn get_info_uses_the_referenced_process_core_and_priority_policy() {
         for (index, value) in [(1, kind), (2, u64::from(handle)), (3, 0)] {
             write_abi_register(&caller_process, index, value);
         }
-        assert_eq!(dispatch(&mut coordinator, &mut dispatcher, caller), 0);
+        assert_eq!(dispatch(&mut coordinator, &dispatcher, caller), 0);
         assert_eq!(read_abi_register(&caller_process, 1), expected);
     }
 }
@@ -316,13 +313,13 @@ fn process_local_thread_operations_reject_valid_foreign_handles_without_side_eff
                 .insert_object(HandleObject::from_arc(object))
                 .unwrap();
             let output = caller_process.main_thread().stack_bottom;
-            write_guest_bytes(caller_process, output, &[0xaa; 0x320]);
+            write_guest_bytes(&caller_process, output, &[0xaa; 0x320]);
             caller_process
                 .main_thread()
                 .registers()
                 .write_w(x(1), handle);
-            let mut dispatcher = support::dispatcher(caller_process);
-            assert_eq!(dispatch(&mut coordinator, &mut dispatcher, caller), 0);
+            let dispatcher = support::dispatcher(&caller_process);
+            assert_eq!(dispatch(&mut coordinator, &dispatcher, caller), 0);
             if paused {
                 coordinator.scheduler().set_activity(target, true).unwrap();
             }
@@ -337,7 +334,7 @@ fn process_local_thread_operations_reject_valid_foreign_handles_without_side_eff
             }
             drop(state);
             assert_eq!(
-                dispatch(&mut coordinator, &mut dispatcher, caller),
+                dispatch(&mut coordinator, &dispatcher, caller),
                 HorizonKernelResult::INVALID_HANDLE.raw()
             );
             assert_eq!(
@@ -395,7 +392,7 @@ fn thread_updates_use_the_callers_npdm_in_both_transfer_directions() {
                 .handles()
                 .insert_object(HandleObject::from_arc(object))
                 .unwrap();
-            let mut dispatcher = support::dispatcher(caller_process);
+            let dispatcher = support::dispatcher(&caller_process);
             let state_thread = caller_process.main_thread();
             let mut state = state_thread.registers();
             state.write_w(x(0), handle);
@@ -412,7 +409,7 @@ fn thread_updates_use_the_callers_npdm_in_both_transfer_directions() {
                 HorizonKernelResult::SUCCESS
             };
             assert_eq!(
-                dispatch(&mut coordinator, &mut dispatcher, caller),
+                dispatch(&mut coordinator, &dispatcher, caller),
                 expected.raw()
             );
             let info = coordinator.scheduler().thread(target).unwrap();
@@ -453,7 +450,7 @@ fn caller_policy_rejection_precedes_target_handle_lookup() {
             44,
         );
         let process = coordinator.process(caller).unwrap();
-        let mut dispatcher = support::dispatcher(process);
+        let dispatcher = support::dispatcher(&process);
         let state_thread = process.main_thread();
         let mut state = state_thread.registers();
         state.write_w(x(0), 0xdead);
@@ -461,7 +458,7 @@ fn caller_policy_rejection_precedes_target_handle_lookup() {
         state.write_x(x(2), 2);
         drop(state);
         assert_eq!(
-            dispatch(&mut coordinator, &mut dispatcher, caller),
+            dispatch(&mut coordinator, &dispatcher, caller),
             if affinity_update {
                 HorizonKernelResult::INVALID_CORE_ID
             } else {

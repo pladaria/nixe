@@ -15,7 +15,7 @@ use nixe_cpu_direct_memory::NativeWorker;
 use nixe_memory::{AddressSpace, GuestVirtualAddress, MemoryError};
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock, Weak,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 pub struct Process {
@@ -23,7 +23,6 @@ pub struct Process {
     space: Arc<AddressSpace>,
     frequency: u32,
     stopped: AtomicBool,
-    active: AtomicUsize,
     controls: Mutex<Vec<CpuControl>>,
     waits: Mutex<Vec<Weak<Notification>>>,
     failure: OnceLock<Arc<MemoryError>>,
@@ -82,7 +81,7 @@ impl Process {
         timer_frequency: u64,
     ) -> Result<Arc<Self>, JitError> {
         if cpu.address_space_id() != space.identity() {
-            return Err(JitError(
+            return Err(JitError::Failure(
                 "CPU process belongs to another address space".into(),
             ));
         }
@@ -90,22 +89,24 @@ impl Process {
             .ok()
             .filter(|value| *value != 0)
             .ok_or_else(|| {
-                JitError("architectural timer frequency must fit a nonzero u32".into())
+                JitError::Failure("architectural timer frequency must fit a nonzero u32".into())
             })?;
         Ok(Arc::new(Self {
             cpu,
             space,
             frequency,
             stopped: AtomicBool::new(false),
-            active: AtomicUsize::new(0),
             controls: Mutex::new(Vec::new()),
             waits: Mutex::new(Vec::new()),
             failure: OnceLock::new(),
         }))
     }
+    pub const fn timer_frequency(&self) -> u64 {
+        self.frequency as u64
+    }
     pub fn create_thread(self: &Arc<Self>) -> Result<Thread, JitError> {
         if self.stopped.load(Ordering::Acquire) {
-            return Err(JitError("JIT process is stopping".into()));
+            return Err(JitError::Stopped);
         }
         let core = Core::new(
             Arc::clone(&self.space),
@@ -116,7 +117,7 @@ impl Process {
         )?;
         let mut controls = self.controls.lock().unwrap();
         if self.stopped.load(Ordering::Acquire) {
-            return Err(JitError("JIT process is stopping".into()));
+            return Err(JitError::Stopped);
         }
         controls.push(core.control());
         Ok(Thread {
@@ -130,7 +131,9 @@ impl Process {
         Arc::clone(self.failure.get().unwrap())
     }
     pub fn request_stop(&self) {
-        self.stopped.store(true, Ordering::Release);
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let controls = self.controls.lock().unwrap().clone();
         for control in controls {
             control.request_preemption();
@@ -145,14 +148,6 @@ impl Process {
         for wait in waits {
             wait.signal();
         }
-    }
-    pub fn try_shutdown(&self) -> Result<bool, MemoryError> {
-        self.request_stop();
-        if self.active.load(Ordering::Acquire) != 0 {
-            return Ok(false);
-        }
-        self.space.close()?;
-        Ok(true)
     }
     pub(crate) fn resolve_access(
         &self,
@@ -207,12 +202,6 @@ impl Process {
         }
     }
 }
-struct Active<'a>(&'a AtomicUsize);
-impl Drop for Active<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
 impl Thread {
     /// Kernel accesses on this core share native memory dependency cancellation.
     pub fn read_memory(
@@ -261,7 +250,7 @@ impl Thread {
                     .process
                     .resolve_access(Ok(nixe_memory::Access::Pending(pending)))?
                 {
-                    nixe_memory::AccessResult::Written => Ok(()),
+                    nixe_memory::AccessResult::Written(_) => Ok(()),
                     _ => unreachable!("scalar write completion is checked by memory"),
                 }
             }
@@ -276,14 +265,8 @@ impl Thread {
         worker: &mut NativeWorker,
         request: JitRunRequest<'_>,
     ) -> Result<ExecutionReport, CpuFault> {
-        let JitRunRequest {
-            state,
-            timer,
-            events,
-        } = request;
+        let JitRunRequest { state, timer } = request;
         let process = &self.process;
-        process.active.fetch_add(1, Ordering::AcqRel);
-        let _active = Active(&process.active);
         if !state.is_available() {
             state.discard();
             return Err(crate::unavailable_state_fault(
@@ -302,13 +285,6 @@ impl Thread {
             if process.stopped.load(Ordering::Acquire) {
                 state.discard();
                 return Err(process.stopped_fault());
-            }
-            let interrupts = events.take_pending_interrupts();
-            if interrupts != 0 {
-                return Ok(crate::report(
-                    CpuExit::PendingEvent { mask: interrupts },
-                    state,
-                ));
             }
             let boundary = match self.core.run(worker, timer, process) {
                 Ok(boundary) => boundary,

@@ -7,7 +7,7 @@ use crate::diagnostics::GuestLogSeverity;
 /// https://github.com/Atmosphere-NX/Atmosphere/blob/master/libraries/libmesosphere/source/kern_debug_log.cpp
 impl HorizonSvcDispatcher {
     pub(super) fn output_debug_string(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let address = GuestVirtualAddress::new(read_register(context.thread().state(), 0));
@@ -42,6 +42,8 @@ impl HorizonSvcDispatcher {
         };
         let machine = context.process().memory().account().machine().clone();
         let level = self
+            .resources
+            .system
             .diagnostics
             .guest_logs_level
             .resolve(GuestLogSeverity::Info)

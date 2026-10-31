@@ -29,6 +29,8 @@ nixe-scheduler.workspace = true
 nixe-video.workspace = true
 
 [dev-dependencies]
+nixe-cpu-jit.workspace = true
+nixe-cpu-direct-memory.workspace = true
 ash.workspace = true
 nixe-gpu-vulkan.workspace = true
 sha2.workspace = true

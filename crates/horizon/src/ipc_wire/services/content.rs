@@ -143,6 +143,19 @@ async fn dispatch_command(
         return unsupported_service_command(name, request.command_id);
     };
 
+    match &decoded {
+        crate::IpcRequest::ReadDirectory { max_entries } => {
+            // Admit both entry names and their fixed wire encoding before the
+            // directory cursor advances, rather than suspending after effects.
+            process
+                .reserve_payload(max_entries * super::fsp::abi::FS_DIRECTORY_ENTRY_SIZE * 2)
+                .await?;
+        }
+        crate::IpcRequest::ListIndexedAddOnContent { max_entries, .. } => {
+            process.reserve_payload(max_entries * 4).await?;
+        }
+        _ => {}
+    }
     let result = {
         let mounts = process.mounts();
         match &target {

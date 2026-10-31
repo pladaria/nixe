@@ -41,12 +41,12 @@ fn sm_registration_and_service_handles_work_across_tipc_and_cmif() {
                 svc(0x21),
                 svc(0x16),
             ]);
-            let mut dispatcher = support::dispatcher(&process);
+            let dispatcher = support::dispatcher(&process);
             let name = process.main_thread().stack_bottom;
             write_guest_bytes(&process, name, b"sm:\0");
             process.main_thread().registers().write_x(x(1), name.get());
             assert!(matches!(
-                dispatch_next(&mut process, &mut dispatcher),
+                dispatch_next(&mut process, &dispatcher),
                 ExceptionHandlingResult::Resumed
             ));
             let sm_handle = process.main_thread().registers().read_w(x(1));
@@ -56,7 +56,7 @@ fn sm_registration_and_service_handles_work_across_tipc_and_cmif() {
             write_guest_bytes(&process, tls, &get);
             process.main_thread().registers().write_w(x(0), sm_handle);
             assert!(matches!(
-                dispatch_next(&mut process, &mut dispatcher),
+                dispatch_next(&mut process, &dispatcher),
                 ExceptionHandlingResult::Resumed
             ));
             let result_offset = if tipc_get { 16 } else { 24 };
@@ -74,7 +74,7 @@ fn sm_registration_and_service_handles_work_across_tipc_and_cmif() {
             write_guest_bytes(&process, tls, &register);
             process.main_thread().registers().write_w(x(0), sm_handle);
             assert!(matches!(
-                dispatch_next(&mut process, &mut dispatcher),
+                dispatch_next(&mut process, &dispatcher),
                 ExceptionHandlingResult::Resumed
             ));
             assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
@@ -89,7 +89,7 @@ fn sm_registration_and_service_handles_work_across_tipc_and_cmif() {
             write_guest_bytes(&process, tls, &get);
             process.main_thread().registers().write_w(x(0), sm_handle);
             assert!(matches!(
-                dispatch_next(&mut process, &mut dispatcher),
+                dispatch_next(&mut process, &dispatcher),
                 ExceptionHandlingResult::Resumed
             ));
             assert_eq!(
@@ -100,7 +100,8 @@ fn sm_registration_and_service_handles_work_across_tipc_and_cmif() {
             assert!(matches!(
                 process
                     .handles()
-                    .lookup_as::<HorizonIpcObject>(service)
+                    .lookup_as::<crate::ServiceSession>(service)
+                    .map(|session| std::sync::Arc::new(session.object().clone()))
                     .as_deref(),
                 Some(HorizonIpcObject::SystemSettings(_))
             ));
@@ -127,14 +128,14 @@ fn sm_registration_and_service_handles_work_across_tipc_and_cmif() {
             write_guest_bytes(&process, tls, &close);
             process.main_thread().registers().write_w(x(0), sm_handle);
             assert!(matches!(
-                dispatch_next(&mut process, &mut dispatcher),
+                dispatch_next(&mut process, &dispatcher),
                 ExceptionHandlingResult::Resumed
             ));
             assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
             assert!(process.handles().lookup(sm_handle).is_some());
             process.main_thread().registers().write_w(x(0), sm_handle);
             assert!(matches!(
-                dispatch_next(&mut process, &mut dispatcher),
+                dispatch_next(&mut process, &dispatcher),
                 ExceptionHandlingResult::Resumed
             ));
             assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
@@ -147,12 +148,12 @@ fn sm_registration_and_service_handles_work_across_tipc_and_cmif() {
 #[test]
 fn tipc_register_client_requires_a_sent_pid() {
     let (_directory, mut process) = fixture_process(&[svc(0x1f), svc(0x21), svc(0x21)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
     process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     let handle = process.main_thread().registers().read_w(x(1));
@@ -164,7 +165,7 @@ fn tipc_register_client_requires_a_sent_pid() {
         write_guest_bytes(&process, tls, &request);
         process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(process.main_thread().registers().read_w(x(0)), 0);

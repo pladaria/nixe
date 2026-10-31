@@ -458,7 +458,10 @@ fn native_publication_reuses_protection_and_cpu_completion_rearms_cached_domains
     );
     assert!(!invalid_append);
     authority.complete_access(&machine, first_id).unwrap();
-    assert_eq!(first_write.wait().unwrap(), AccessResult::Written);
+    assert!(matches!(
+        first_write.wait().unwrap(),
+        AccessResult::Written(_)
+    ));
     assert_eq!(
         machine.tracking_statistics().protection_calls,
         first_protection
@@ -483,7 +486,10 @@ fn native_publication_reuses_protection_and_cpu_completion_rearms_cached_domains
     let second_id = authority.queue_access(receiver.recv().unwrap()).unwrap();
     assert!(authority.prepare_access(second_id).unwrap().is_empty());
     authority.complete_access(&machine, second_id).unwrap();
-    assert_eq!(second_write.wait().unwrap(), AccessResult::Written);
+    assert!(matches!(
+        second_write.wait().unwrap(),
+        AccessResult::Written(_)
+    ));
     assert_eq!(
         machine.tracking_statistics().protection_calls,
         first_protection
@@ -491,7 +497,7 @@ fn native_publication_reuses_protection_and_cpu_completion_rearms_cached_domains
     authority.complete_access(&machine, gap_id).unwrap();
     assert_eq!(
         gap_read.wait().unwrap(),
-        AccessResult::Read(Box::new([0; 4]))
+        AccessResult::Read(Vec::from([0; 4]))
     );
     assert_eq!(
         machine.tracking_statistics().protection_calls,
@@ -523,7 +529,7 @@ fn native_publication_reuses_protection_and_cpu_completion_rearms_cached_domains
     authority.complete_access(&machine, read_id).unwrap();
     assert_eq!(
         readback.wait().unwrap(),
-        AccessResult::Read(Box::new([9, 8, 7, 6]))
+        AccessResult::Read(Vec::from([9, 8, 7, 6]))
     );
     assert!(matches!(
         space.read_value(base, 4).unwrap(),
@@ -578,7 +584,7 @@ fn publication_invalidates_new_code_before_append_without_another_page_publicati
     authority.complete_access(&machine, id).unwrap();
     assert_eq!(
         code.wait().unwrap(),
-        AccessResult::Read(Box::new([1, 2, 3, 4]))
+        AccessResult::Read(Vec::from([1, 2, 3, 4]))
     );
     assert!(!observation.is_invalid());
     let protections = machine.tracking_statistics().protection_calls;
@@ -639,7 +645,10 @@ fn cancelling_the_last_exact_dependency_reopens_a_ram_only_page() {
         let overwrite_id = authority.queue_access(receiver.recv().unwrap()).unwrap();
         assert!(authority.prepare_access(overwrite_id).unwrap().is_empty());
         authority.complete_access(&machine, overwrite_id).unwrap();
-        assert_eq!(overwrite.wait().unwrap(), AccessResult::Written);
+        assert!(matches!(
+            overwrite.wait().unwrap(),
+            AccessResult::Written(_)
+        ));
         let before = machine.tracking_statistics().protection_calls;
         drop(gap);
         if cancel_before_completion {
@@ -729,7 +738,7 @@ fn one_effect_publishes_all_writers_once_and_rejects_a_conflicting_cpu_access_be
     let (request, result) = machine
         .prepare_device_access(
             vec![ranges[1].clone()],
-            nixe_memory::AccessOperation::Write(Box::new([9; 4])),
+            nixe_memory::AccessOperation::Write(Vec::from([9; 4])),
         )
         .unwrap();
     let id = authority.queue_access(request).unwrap();

@@ -276,11 +276,11 @@ fn ordered_bounds_and_reprioritization_preserve_process_key_and_fifo_order() {
                 let mut threads = Vec::new();
                 for _ in 0..24 {
                     let id = thread(&s, process, 20);
-                    s.edit(|state| {
-                        let index = state.slots.index(id)?;
-                        state.insert_ordered_wait(index, kind, address)
-                    })
-                    .unwrap();
+                    let lease = s.claim(VirtualCpuId::new(0)).unwrap().unwrap();
+                    assert_eq!(lease.thread, id);
+                    s.complete(lease, Completion::Waiting).unwrap();
+                    let (wait, _) = s.begin_ordered_wait(id, kind, address, false).unwrap();
+                    wait.commit();
                     threads.push(id);
                 }
                 rows.push((process, kind, address, threads));
@@ -296,15 +296,25 @@ fn ordered_bounds_and_reprioritization_preserve_process_key_and_fifo_order() {
         );
         s.set_priority(changed, 20, None).unwrap();
         threads.push(changed);
+        let (none, more) = s.claim_ordered_waiters(process, kind, address, 0, true);
+        assert!(none.is_empty());
+        assert!(more);
+        let (first, more) = s.claim_ordered_waiters(process, kind, address, 1, true);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, threads[0]);
+        assert!(more);
+        let (rest, more) = s.claim_ordered_waiters(process, kind, address, usize::MAX, true);
         assert_eq!(
-            s.ordered_waiters(process, kind, address, usize::MAX),
-            threads
+            rest.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            threads[1..]
         );
-        assert_eq!(s.ordered_waiters(process, kind, address, 1), threads[..1]);
-        assert!(s.ordered_waiters(process, kind, address, 0).is_empty());
+        assert!(!more);
         assert!(s.first_ordered_waiter(process, kind, 9).is_none());
-        for id in threads {
-            s.remove_waiter(id);
+        for (_, effect) in first.into_iter().chain(rest) {
+            let token = effect.registration().token();
+            assert!(s.resolve_wait(token, WaitOutcome::Ready));
+            drop(effect);
+            s.finish_wait(token).unwrap();
         }
         assert!(s.first_ordered_waiter(process, kind, address).is_none());
     }

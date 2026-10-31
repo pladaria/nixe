@@ -881,13 +881,13 @@ fn stage_memory_copy(
             error,
         }
     })?;
-    let AccessResult::Read(source_bytes) =
-        access(ranges, AccessOperation::Read).map_err(|error| {
-            MaxwellCanonicalExecutionError::MemoryCopyTransaction {
+    let AccessResult::Read(source_bytes) = access(ranges, AccessOperation::Read(Vec::new()))
+        .map_err(
+            |error| MaxwellCanonicalExecutionError::MemoryCopyTransaction {
                 source: operation.source(),
                 error,
-            }
-        })?
+            },
+        )?
     else {
         unreachable!("read operation returns bytes")
     };
@@ -903,7 +903,7 @@ fn stage_memory_copy(
                 }
             })?;
         let AccessResult::Read(mut bytes) =
-            access(ranges.clone(), AccessOperation::Read).map_err(|error| {
+            access(ranges.clone(), AccessOperation::Read(Vec::new())).map_err(|error| {
                 MaxwellCanonicalExecutionError::MemoryCopyTransaction {
                     source: operation.source(),
                     error,
@@ -926,7 +926,7 @@ fn stage_memory_copy(
                 error,
             }
         })?;
-        assert!(matches!(written, AccessResult::Written));
+        assert!(matches!(written, AccessResult::Written(_)));
         return Ok(());
     }
     let mut bytes = memory_copy_buffer(operation.destination_range_size(), operation.source())?;
@@ -1005,7 +1005,7 @@ fn write_memory_copy_subrange(
         .map_err(|error| MaxwellCanonicalExecutionError::MemoryCopyTransaction { source, error })?;
     let result = access(ranges, AccessOperation::Write(bytes.into()))
         .map_err(|error| MaxwellCanonicalExecutionError::MemoryCopyTransaction { source, error })?;
-    assert!(matches!(result, AccessResult::Written));
+    assert!(matches!(result, AccessResult::Written(_)));
     Ok(())
 }
 

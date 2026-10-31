@@ -1,6 +1,6 @@
 //! Fixed guest workloads for native execution comparisons.
 //! Reports wall time for a fixed amount of guest work.
-use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState};
+use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot};
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register};
@@ -114,7 +114,7 @@ fn main() {
     ];
     let mut states = [ThreadState::default(), ThreadState::default()];
     let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
-    let events = VcpuEventState::default();
+
     if workload == "invalidate-batch" {
         for address in [0x1000, 0x4000] {
             states[0].set_pc(address);
@@ -124,7 +124,6 @@ fn main() {
                     JitRunRequest {
                         state: &mut states[0],
                         timer: &Timer,
-                        events: &events,
                     },
                 )
                 .unwrap();
@@ -197,7 +196,6 @@ fn main() {
                     JitRunRequest {
                         state,
                         timer: &Timer,
-                        events: &events,
                     },
                 )
                 .unwrap();

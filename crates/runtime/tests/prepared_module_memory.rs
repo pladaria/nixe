@@ -355,7 +355,7 @@ fn failed_construction_releases_earlier_segments_and_cannot_change_another_proce
 #[test]
 fn a_loader_prepared_image_executes_on_the_canonical_native_process() {
     use nixe_cpu::{
-        execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState},
+        execution::{ArchitecturalTimer, CpuExit, TimerSnapshot},
         platform::TargetPlatform,
         profile::ProcessCpuContext,
         state::a64::{A64GeneralRegister, A64Register},
@@ -403,7 +403,6 @@ fn a_loader_prepared_image_executes_on_the_canonical_native_process() {
             JitRunRequest {
                 state: &mut state,
                 timer: &Timer,
-                events: &VcpuEventState::default(),
             },
         )
         .unwrap();
@@ -415,7 +414,7 @@ fn a_loader_prepared_image_executes_on_the_canonical_native_process() {
         state.read_x(A64Register::General(A64GeneralRegister::new(0).unwrap())),
         7
     );
-    assert!(process.try_shutdown().unwrap());
+    process.request_stop();
     memory.close().unwrap();
     assert_eq!(machine.statistics().allocated_bytes, 0);
 }

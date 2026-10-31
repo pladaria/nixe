@@ -49,10 +49,11 @@ pub use graphics::{
 pub use graphics_event::GraphicsEventSource;
 pub use hid::{HidInputError, HidSystem};
 pub use ipc::{
-    AddOnContentEntry, IpcRequest, IpcResponse, IpcResultCode, IpcService, MAX_IPC_LIST_ENTRIES,
-    MAX_IPC_PATH_BYTES, MAX_IPC_READ_BYTES,
+    IpcRequest, IpcResponse, IpcResultCode, IpcService, MAX_IPC_LIST_ENTRIES, MAX_IPC_PATH_BYTES,
+    MAX_IPC_READ_BYTES,
 };
 pub use ipc_result::HorizonIpcResult;
+pub use ipc_wire::ServiceSession;
 pub use ipc_wire::{HorizonIpcFault, UnsupportedServiceOperation};
 pub use nvdrv::{
     NvDrvDescriptorLifecycle, NvDrvDescriptorOwner, NvDrvDeviceDescriptor, NvDrvDeviceKind,
@@ -81,8 +82,8 @@ pub use svc::{
     decode_horizon_svc,
 };
 pub use svc_dispatch::{
-    CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonKernelResult,
-    HorizonScheduledDispatchError, HorizonSvcDispatcher, HorizonSvcFault, MAX_WAIT_HANDLES,
+    CURRENT_PROCESS_HANDLE, CURRENT_THREAD_HANDLE, HorizonKernelResult, HorizonSvcDispatcher,
+    HorizonSvcFault, MAX_WAIT_HANDLES,
 };
 
 #[cfg(test)]

@@ -30,15 +30,15 @@ fn exercise_renderer(revision: u32, work_size: u32) {
             Ok(Box::new(Device))
         }
     }
-    let events = process.coordinator_mut().event_sender();
-    let mut dispatcher = support::dispatcher(&process)
+    let events = process.driver_mut().event_sender();
+    let dispatcher = support::dispatcher(&process)
         .with_input_completions(events)
         .with_audio_backend(std::sync::Arc::new(Backend));
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"sm:\0");
     process.main_thread().registers().write_x(x(1), name.get());
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     let sm = process.main_thread().registers().read_w(x(1));
@@ -51,7 +51,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     write_guest_bytes(&process, tls, &register);
     process.main_thread().registers().write_w(x(0), sm);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     let mut request = [0; 256];
@@ -63,14 +63,15 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     write_guest_bytes(&process, tls, &request);
     process.main_thread().registers().write_w(x(0), sm);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     let manager = read_guest_u32(&process, tls.checked_add(12).unwrap());
     assert!(matches!(
         process
             .handles()
-            .lookup_as::<HorizonIpcObject>(manager)
+            .lookup_as::<crate::ServiceSession>(manager)
+            .map(|session| std::sync::Arc::new(session.object().clone()))
             .as_deref(),
         Some(HorizonIpcObject::AudioRendererManager(_))
     ));
@@ -101,7 +102,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
         write_guest_bytes(&process, tls, &request);
         process.main_thread().registers().write_w(x(0), manager);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
@@ -144,7 +145,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
         .write_x(x(2), u64::from(work_size));
     process.main_thread().registers().write_w(x(3), 0);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
@@ -189,7 +190,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
         put_u64(&mut request, 104, u64::from(size));
         write_guest_bytes(&process, tls, &request);
         process.main_thread().registers().write_w(x(0), manager);
-        let outcome = dispatch_next(&mut process, &mut dispatcher);
+        let outcome = dispatch_next(&mut process, &dispatcher);
         if handle == 0xdead {
             assert!(matches!(
                 outcome,
@@ -211,7 +212,8 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     assert!(matches!(
         process
             .handles()
-            .lookup_as::<HorizonIpcObject>(renderer)
+            .lookup_as::<crate::ServiceSession>(renderer)
+            .map(|session| std::sync::Arc::new(session.object().clone()))
             .as_deref(),
         Some(HorizonIpcObject::AudioRenderer(_))
     ));
@@ -240,7 +242,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
         write_guest_bytes(&process, tls, &request);
         process.main_thread().registers().write_w(x(0), renderer);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
@@ -255,7 +257,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
         write_guest_bytes(&process, tls, &request);
         process.main_thread().registers().write_w(x(0), renderer);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
@@ -267,7 +269,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     write_guest_bytes(&process, tls, &request);
     process.main_thread().registers().write_w(x(0), renderer);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     let event_handle = read_guest_u32(&process, tls.checked_add(12).unwrap());
@@ -327,7 +329,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
         write_guest_bytes(&process, tls, &request);
         process.main_thread().registers().write_w(x(0), renderer);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
@@ -369,7 +371,7 @@ fn exercise_renderer(revision: u32, work_size: u32) {
     write_guest_bytes(&process, tls, &request);
     process.main_thread().registers().write_w(x(0), renderer);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
@@ -382,16 +384,14 @@ fn exercise_renderer(revision: u32, work_size: u32) {
         put_u32(&mut request, 24, command);
         write_guest_bytes(&process, tls, &request);
         process.main_thread().registers().write_w(x(0), renderer);
-        let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+        let (thread, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
         assert!(matches!(
             handling,
             ExceptionHandlingResult::Resumed | ExceptionHandlingResult::Suspended
         ));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while process.thread_lifecycle(thread) == nixe_scheduler::ThreadLifecycle::Waiting {
-            dispatcher
-                .poll_memory_completions(process.coordinator_mut())
-                .unwrap();
+            dispatcher.drive_pending(process.driver_mut()).unwrap();
             assert!(
                 std::time::Instant::now() < deadline,
                 "audio command did not complete"

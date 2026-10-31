@@ -1,9 +1,7 @@
 //! Ownership and wakeups for suspended built-in service calls.
 use super::IpcWireError;
-use nixe_memory::{AllocationId, MachineId};
-use nixe_runtime::{EventFuture, HandleObject, ReadableEventObject};
+use nixe_runtime::{EventFuture, ReadableEventObject};
 use std::{
-    collections::{HashMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::{
@@ -17,6 +15,8 @@ use std::{
 const STARTED: u8 = 1;
 const OUTPUT: u8 = 2;
 const CANCELLED: u8 = 4;
+const SERVER: u8 = 8;
+const REPLIED: u8 = 16;
 
 // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_server_session.cpp#L1445-L1525
 /// Service effects finish before relinquishing their turn. A suspended response
@@ -28,7 +28,41 @@ pub(crate) struct CallLifetime {
 impl CallLifetime {
     /// Returns whether an already executing effect must still be drained.
     pub fn cancel(&self) -> bool {
-        self.state.fetch_or(CANCELLED, Ordering::AcqRel) & (STARTED | OUTPUT) == STARTED
+        let state = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                Some(if state & REPLIED == 0 {
+                    state | CANCELLED
+                } else {
+                    state
+                })
+            })
+            .unwrap();
+        state & SERVER != 0 || state & (STARTED | OUTPUT) == STARTED
+    }
+    /// The caller retains the server result until its terminal error is consumed.
+    pub fn delegate(&self) -> Result<(), IpcWireError> {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & CANCELLED == 0).then_some(state | SERVER)
+            })
+            .map(|_| ())
+            .map_err(|_| IpcWireError::Cancelled)
+    }
+    pub fn consume_reply(&self) {
+        self.state.fetch_and(!SERVER, Ordering::Release);
+    }
+    pub fn must_drain_effect(&self) -> bool {
+        self.state.load(Ordering::Acquire) & (STARTED | OUTPUT) == STARTED
+    }
+    /// Reply publication and cancellation have one atomic winner.
+    pub fn commit_reply(&self) -> Result<(), IpcWireError> {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & CANCELLED == 0).then_some(state | REPLIED)
+            })
+            .map(|_| ())
+            .map_err(|_| IpcWireError::Cancelled)
     }
     pub fn check(&self) -> Result<(), IpcWireError> {
         if self.state.load(Ordering::Acquire) & CANCELLED != 0 {
@@ -39,18 +73,17 @@ impl CallLifetime {
     }
     pub fn begin(&self) -> Result<(), IpcWireError> {
         self.state
-            .compare_exchange(0, STARTED, Ordering::AcqRel, Ordering::Acquire)
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & (STARTED | CANCELLED) == 0).then_some(state | STARTED)
+            })
             .map(|_| ())
             .map_err(|_| IpcWireError::Cancelled)
     }
     pub fn begin_output(&self) -> Result<(), IpcWireError> {
         self.state
-            .compare_exchange(
-                STARTED,
-                STARTED | OUTPUT,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & (STARTED | OUTPUT | CANCELLED) == STARTED).then_some(state | OUTPUT)
+            })
             .map(|_| ())
             .map_err(|_| IpcWireError::Cancelled)
     }
@@ -59,75 +92,93 @@ impl CallLifetime {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum ServiceKey {
-    Session(HandleObject),
-    Shared(MachineId, AllocationId),
-    Clock(MachineId, AllocationId, u8),
-}
-struct Waiter {
-    id: u64,
-    wake: Option<Waker>,
-}
-#[derive(Default)]
-struct Scheduling {
+/// Serializes publication into one shared-memory object across suspended writes.
+#[derive(Debug, Default)]
+pub(crate) struct Publication(Mutex<Publications>);
+#[derive(Debug, Default)]
+struct Publications {
     next: u64,
-    queues: HashMap<ServiceKey, VecDeque<Waiter>>,
+    turns: std::collections::BTreeMap<u64, Option<Waker>>,
 }
-impl Scheduling {
-    fn next(&mut self) -> Result<u64, IpcWireError> {
-        self.next = self.next.checked_add(1).ok_or(IpcWireError::Internal(
-            "service continuation identity exhausted",
-        ))?;
-        Ok(self.next)
-    }
-}
-pub(crate) struct ServiceScheduling {
-    state: Mutex<Scheduling>,
-    kernel: Arc<nixe_scheduler::SchedulerState>,
-}
-impl std::fmt::Debug for ServiceScheduling {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = self.state.lock().unwrap();
-        f.debug_struct("ServiceScheduling")
-            .field("owners", &state.queues.len())
-            .finish()
-    }
-}
-impl ServiceScheduling {
-    pub fn new(kernel: &Arc<nixe_scheduler::SchedulerState>) -> Self {
-        Self {
-            state: Mutex::default(),
-            kernel: kernel.clone(),
+impl Publication {
+    pub fn enter(self: &Arc<Self>) -> PublicationTurn {
+        let mut state = self.0.lock().unwrap();
+        state.next = state
+            .next
+            .checked_add(1)
+            .expect("publication identity exhausted");
+        let id = state.next;
+        state.turns.insert(id, None);
+        PublicationTurn {
+            owner: self.clone(),
+            id,
         }
     }
-    pub fn enter(self: &Arc<Self>, key: ServiceKey) -> Result<ServiceTurn, IpcWireError> {
-        let id = {
-            let mut state = self.state.lock().unwrap();
-            let id = state.next()?;
-            state
-                .queues
-                .entry(key.clone())
-                .or_default()
-                .push_back(Waiter { id, wake: None });
-            id
-        };
-        Ok(ServiceTurn {
-            scheduler: self.clone(),
-            key,
-            id,
-        })
+}
+pub(crate) struct PublicationTurn {
+    owner: Arc<Publication>,
+    id: u64,
+}
+impl Future for &PublicationTurn {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        let mut state = self.owner.0.lock().unwrap();
+        if state
+            .turns
+            .first_key_value()
+            .is_some_and(|(id, _)| *id == self.id)
+        {
+            return Poll::Ready(());
+        }
+        *state
+            .turns
+            .get_mut(&self.id)
+            .expect("registered publication") = Some(context.waker().clone());
+        Poll::Pending
     }
-    pub fn wait(
-        self: &Arc<Self>,
+}
+impl Drop for PublicationTurn {
+    fn drop(&mut self) {
+        let wake = {
+            let mut state = self.owner.0.lock().unwrap();
+            let head = state
+                .turns
+                .first_key_value()
+                .is_some_and(|(id, _)| *id == self.id);
+            state.turns.remove(&self.id);
+            if head {
+                state
+                    .turns
+                    .first_entry()
+                    .and_then(|mut entry| entry.get_mut().take())
+            } else {
+                None
+            }
+        };
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
+}
+
+pub(crate) struct ServiceEvent<'a> {
+    lifetime: &'a CallLifetime,
+    event: EventFuture,
+    deadline: Option<nixe_scheduler::Deadline>,
+}
+impl<'a> ServiceEvent<'a> {
+    pub fn new(
+        kernel: &Arc<nixe_scheduler::SchedulerState>,
         event: ReadableEventObject,
         timeout: Option<Duration>,
-    ) -> ServiceEvent {
-        ServiceEvent {
+        lifetime: &'a CallLifetime,
+    ) -> Self {
+        Self {
+            lifetime,
             event: event.wait_async(),
             deadline: timeout.map(|timeout| {
-                self.kernel.deadline(
-                    self.kernel
+                kernel.deadline(
+                    kernel
                         .clock()
                         .scheduler_time_ns()
                         .saturating_add(u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX)),
@@ -136,78 +187,13 @@ impl ServiceScheduling {
         }
     }
 }
-
-/// The request keeps this turn until its response has been written. A dropped
-/// queued request relinquishes its place without executing service effects.
-pub(crate) struct ServiceTurn {
-    scheduler: Arc<ServiceScheduling>,
-    key: ServiceKey,
-    id: u64,
-}
-impl Future for &ServiceTurn {
-    type Output = ();
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
-        let this = *self;
-        let old = {
-            let mut state = this.scheduler.state.lock().unwrap();
-            let queue = state
-                .queues
-                .get_mut(&this.key)
-                .expect("registered service turn");
-            if queue.front().is_some_and(|waiter| waiter.id == this.id) {
-                return Poll::Ready(());
-            }
-            let waiter = queue
-                .iter_mut()
-                .find(|waiter| waiter.id == this.id)
-                .expect("queued service turn");
-            waiter.wake.replace(context.waker().clone())
-        };
-        drop(old);
-        Poll::Pending
-    }
-}
-impl Drop for ServiceTurn {
-    fn drop(&mut self) {
-        let (removed, next, key) = {
-            let mut state = self.scheduler.state.lock().unwrap();
-            let queue = state
-                .queues
-                .get_mut(&self.key)
-                .expect("registered service turn");
-            let index = queue
-                .iter()
-                .position(|waiter| waiter.id == self.id)
-                .expect("registered service waiter");
-            let removed = queue.remove(index);
-            let next = if index == 0 {
-                queue.front_mut().and_then(|waiter| waiter.wake.take())
-            } else {
-                None
-            };
-            let key = if queue.is_empty() {
-                state.queues.remove_entry(&self.key)
-            } else {
-                None
-            };
-            (removed, next, key)
-        };
-        drop(removed);
-        drop(key);
-        if let Some(waker) = next {
-            waker.wake();
-        }
-    }
-}
-
-pub(crate) struct ServiceEvent {
-    event: EventFuture,
-    deadline: Option<nixe_scheduler::Deadline>,
-}
-impl Future for ServiceEvent {
+impl Future for ServiceEvent<'_> {
     type Output = Result<(), IpcWireError>;
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        // Client termination cancels passive waits without waiting for the device.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_server_session.cpp#L1430-L1443
+        this.lifetime.check()?;
         if Pin::new(&mut this.event).poll(context).is_ready() {
             return Poll::Ready(Ok(()));
         }
@@ -225,93 +211,74 @@ impl Future for ServiceEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::Wake;
-
+    #[test]
+    fn reply_publication_and_cancellation_have_one_winner() {
+        let cancelled = CallLifetime::default();
+        cancelled.begin().unwrap();
+        cancelled.cancel();
+        assert!(matches!(
+            cancelled.commit_reply(),
+            Err(IpcWireError::Cancelled)
+        ));
+        let replied = CallLifetime::default();
+        replied.begin().unwrap();
+        replied.commit_reply().unwrap();
+        replied.cancel();
+        assert!(replied.check().is_ok());
+    }
     #[derive(Default)]
-    struct Wakes(AtomicUsize);
-    impl Wake for Wakes {
+    struct Wakes(std::sync::atomic::AtomicUsize);
+    impl std::task::Wake for Wakes {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
-    fn ready(turn: &ServiceTurn, context: &mut Context<'_>) -> bool {
-        Pin::new(&mut &*turn).poll(context).is_ready()
-    }
-    fn key() -> ServiceKey {
-        ServiceKey::Session(HandleObject::new(nixe_runtime::EventObject::new(
-            &crate::test_memory::kernel(),
-        )))
-    }
-
-    #[test]
-    fn operations_keep_fifo_order_and_cancelled_head_wakes_the_next_request() {
-        let scheduler = Arc::new(ServiceScheduling::new(&crate::test_memory::kernel()));
-        let key = key();
-        let wakes = Arc::new(Wakes::default());
-        let waker = Waker::from(wakes.clone());
-        let mut context = Context::from_waker(&waker);
-        let first = scheduler.enter(key.clone()).unwrap();
-        let second = scheduler.enter(key.clone()).unwrap();
-        let cancelled = scheduler.enter(key.clone()).unwrap();
-        let last = scheduler.enter(key).unwrap();
-        assert!(ready(&first, &mut context));
-        assert!(!ready(&second, &mut context));
-        assert!(!ready(&cancelled, &mut context));
-        assert!(!ready(&last, &mut context));
-        drop(cancelled);
-        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
-        drop(first);
-        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
-        assert!(ready(&second, &mut context));
-        assert!(!ready(&last, &mut context));
-        drop(second);
-        assert_eq!(wakes.0.load(Ordering::Relaxed), 2);
-        assert!(ready(&last, &mut context));
-        drop(last);
-        assert!(scheduler.state.lock().unwrap().queues.is_empty());
-    }
-
-    #[test]
-    fn a_waiting_service_does_not_prevent_an_unrelated_owner_from_running() {
-        let scheduler = Arc::new(ServiceScheduling::new(&crate::test_memory::kernel()));
-        let first_key = key();
-        let _first = scheduler.enter(first_key.clone()).unwrap();
-        let blocked = scheduler.enter(first_key).unwrap();
-        let independent = scheduler.enter(key()).unwrap();
-        let mut context = Context::from_waker(Waker::noop());
-        assert!(!ready(&blocked, &mut context));
-        assert!(ready(&independent, &mut context));
-    }
-
     #[test]
     fn event_and_deadline_waits_release_their_registrations_on_completion_or_cancel() {
-        let scheduler = Arc::new(ServiceScheduling::new(&crate::test_memory::kernel()));
+        let kernel = crate::test_memory::kernel();
+        let lifetime = CallLifetime::default();
         let wakes = Arc::new(Wakes::default());
         let waker = Waker::from(wakes.clone());
         let mut context = Context::from_waker(&waker);
         let (writer, reader) =
             nixe_runtime::EventObject::create_pair(&crate::test_memory::kernel());
-        let mut wait = scheduler.wait(reader.clone(), Some(Duration::from_secs(60)));
+        let mut wait = ServiceEvent::new(
+            &kernel,
+            reader.clone(),
+            Some(Duration::from_secs(60)),
+            &lifetime,
+        );
         assert!(Pin::new(&mut wait).poll(&mut context).is_pending());
-        assert!(scheduler.kernel.deadline_count() != 0);
+        assert!(kernel.deadline_count() != 0);
         writer.signal();
         assert!(Pin::new(&mut wait).poll(&mut context).is_ready());
         drop(wait);
-        assert!(scheduler.kernel.deadline_count() == 0);
+        assert!(kernel.deadline_count() == 0);
         reader.clear();
-        let mut cancelled = scheduler.wait(reader.clone(), Some(Duration::from_secs(60)));
+        let cancelled_lifetime = CallLifetime::default();
+        let mut cancelled = ServiceEvent::new(
+            &kernel,
+            reader.clone(),
+            Some(Duration::from_secs(60)),
+            &cancelled_lifetime,
+        );
         assert!(Pin::new(&mut cancelled).poll(&mut context).is_pending());
+        cancelled_lifetime.cancel();
+        assert!(matches!(
+            Pin::new(&mut cancelled).poll(&mut context),
+            Poll::Ready(Err(IpcWireError::Cancelled))
+        ));
         drop(cancelled);
         let before = wakes.0.load(Ordering::Relaxed);
         writer.signal();
         assert_eq!(wakes.0.load(Ordering::Relaxed), before);
-        assert!(scheduler.kernel.deadline_count() == 0);
+        assert!(kernel.deadline_count() == 0);
         reader.clear();
-        let mut deadline = scheduler.wait(reader, Some(Duration::from_millis(1)));
+        let mut deadline =
+            ServiceEvent::new(&kernel, reader, Some(Duration::from_millis(1)), &lifetime);
         assert!(Pin::new(&mut deadline).poll(&mut context).is_pending());
-        scheduler.kernel.advance_time(2_000_000);
+        kernel.advance_time(2_000_000);
         assert!(Pin::new(&mut deadline).poll(&mut context).is_ready());
-        assert!(scheduler.kernel.deadline_count() == 0);
+        assert!(kernel.deadline_count() == 0);
     }
 }

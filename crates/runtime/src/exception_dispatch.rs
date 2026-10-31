@@ -111,9 +111,10 @@ pub enum ExceptionDispatchOutcome<F> {
     /// Platform policy must install its stable guest ABI result before
     /// returning this outcome. The typed diagnostic is retained for host-side
     /// reporting and is never copied into guest state by the generic runtime.
+    /// The platform selects the host log level for the retained diagnostic.
     /// Rejection always continues after the exception-raising instruction;
     /// operations that can retry must use [`Self::Suspend`] explicitly.
-    Reject { diagnostic: F },
+    Reject { diagnostic: F, level: log::Level },
     /// The selected runtime object requested deterministic termination.
     Terminate {
         scope: ExceptionTerminationScope,
@@ -122,6 +123,29 @@ pub enum ExceptionDispatchOutcome<F> {
     },
     /// Dispatch failed and guest execution must not continue.
     Fault(F),
+}
+
+impl<F> ExceptionDispatchOutcome<F> {
+    pub fn map_fault<G>(self, map: impl FnOnce(F) -> G) -> ExceptionDispatchOutcome<G> {
+        match self {
+            Self::Resume(resume) => ExceptionDispatchOutcome::Resume(resume),
+            Self::Suspend(resume) => ExceptionDispatchOutcome::Suspend(resume),
+            Self::Reject { diagnostic, level } => ExceptionDispatchOutcome::Reject {
+                diagnostic: map(diagnostic),
+                level,
+            },
+            Self::Terminate {
+                scope,
+                exit_code,
+                reason,
+            } => ExceptionDispatchOutcome::Terminate {
+                scope,
+                exit_code,
+                reason,
+            },
+            Self::Fault(fault) => ExceptionDispatchOutcome::Fault(map(fault)),
+        }
+    }
 }
 
 /// Observable lifecycle result after a dispatch outcome has been applied.
@@ -157,7 +181,7 @@ pub struct ExceptionThreadContext<'a> {
 }
 
 impl<'a> ExceptionThreadContext<'a> {
-    pub(crate) const fn new(
+    pub const fn new(
         id: GuestThreadId,
         vcpu: VirtualCpuId,
         object: &'a Arc<ThreadObject>,
@@ -212,19 +236,33 @@ pub struct ExceptionDispatchContext<'a> {
     source: LocationDescriptor,
     process: &'a Arc<crate::RunnableProcess>,
     thread: ExceptionThreadContext<'a>,
+    completions: &'a Arc<crate::KernelQueue>,
+    generation: u64,
 }
 
 impl<'a> ExceptionDispatchContext<'a> {
-    pub(crate) const fn new(
+    pub const fn new(
         source: LocationDescriptor,
         process: &'a Arc<crate::RunnableProcess>,
         thread: ExceptionThreadContext<'a>,
+        completions: &'a Arc<crate::KernelQueue>,
+        generation: u64,
     ) -> Self {
         Self {
             source,
             process,
             thread,
+            completions,
+            generation,
         }
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn completion_queue(&self) -> &Arc<crate::KernelQueue> {
+        self.completions
     }
 
     /// Original instruction location, retained across owned kernel phases.
@@ -248,53 +286,16 @@ impl<'a> ExceptionDispatchContext<'a> {
     }
 }
 
-/// Why a stopped process could not route a supervisor call.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ExceptionRouteError {
-    NotSupervisorCall,
-    UnknownThread(GuestThreadId),
-    ProcessNotSuspended {
-        lifecycle: nixe_scheduler::ThreadLifecycle,
-    },
-    SourceMismatch {
-        requested: LocationDescriptor,
-        current: LocationDescriptor,
-    },
-}
-
-impl std::fmt::Display for ExceptionRouteError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotSupervisorCall => {
-                formatter.write_str("execution stop is not a supervisor call")
-            }
-            Self::UnknownThread(id) => write!(formatter, "guest thread {id} does not exist"),
-            Self::ProcessNotSuspended { lifecycle } => {
-                write!(
-                    formatter,
-                    "cannot route exception while thread is {lifecycle:?}"
-                )
-            }
-            Self::SourceMismatch { requested, current } => write!(
-                formatter,
-                "exception source does not identify the current instruction: requested=[{requested}] current=[{current}]"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ExceptionRouteError {}
-
 /// Runtime-owned architectural exception router.
 ///
 /// The borrowed context and associated fault type keep process/thread services
 /// and platform error policy explicit. A CPU backend only constructs the
 /// request and applies the returned control decision.
-pub trait ExceptionDispatcher {
-    type Fault;
+pub trait ExceptionDispatcher: Send + Sync + 'static {
+    type Fault: std::error::Error + Send + Sync + 'static;
 
     fn dispatch(
-        &mut self,
+        self: &Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         request: ExceptionDispatchRequest,
     ) -> ExceptionDispatchOutcome<Self::Fault>;
@@ -325,13 +326,16 @@ mod tests {
     fn rejection_keeps_the_host_diagnostic_typed() {
         let rejected = ExceptionDispatchOutcome::Reject {
             diagnostic: "runtime service unavailable",
-        };
+            level: log::Level::Warn,
+        }
+        .map_fault(str::to_owned);
 
         assert!(matches!(
             rejected,
             ExceptionDispatchOutcome::Reject {
-                diagnostic: "runtime service unavailable",
-            }
+                diagnostic,
+                level: log::Level::Warn,
+            } if diagnostic == "runtime service unavailable"
         ));
     }
 

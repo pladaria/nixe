@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 impl HorizonSvcDispatcher {
     pub(super) fn set_thread_core_mask(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let handle = read_register(context.thread().state(), 0) as u32;
@@ -85,7 +85,7 @@ impl HorizonSvcDispatcher {
     }
 
     pub(super) fn sleep_thread(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         // https://switchbrew.org/w/index.php?title=SVC&oldid=14679#SleepThread
@@ -121,7 +121,7 @@ impl HorizonSvcDispatcher {
     }
 
     pub(super) fn set_thread_activity(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let handle = read_register(context.thread().state(), 0) as u32;
@@ -165,7 +165,7 @@ impl HorizonSvcDispatcher {
     }
 
     pub(super) fn get_thread_context(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         // Horizon A64 ThreadContext layout and size:
@@ -200,8 +200,6 @@ impl HorizonSvcDispatcher {
                     }
                     Ok(false) => {}
                 }
-                let source = context.source();
-                let vcpu = context.thread().vcpu();
                 dispatcher.start_owned_svc(context, Arc::default(), None, async move {
                     guard.wait_quiescent(None).await.map_err(|fault| {
                         HorizonSvcFault::Scheduling {
@@ -209,19 +207,15 @@ impl HorizonSvcDispatcher {
                             fault,
                         }
                     })?;
-                    Ok(SvcCompletion::kernel(
-                        source,
-                        vcpu,
-                        move |dispatcher, context| {
-                            dispatcher.write_thread_context(context, thread, guard, address)
-                        },
-                    ))
+                    Ok(SvcCompletion::kernel(move |dispatcher, context| {
+                        dispatcher.write_thread_context(context, thread, guard, address)
+                    }))
                 })
             },
         )
     }
     fn write_thread_context(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         thread: Arc<ThreadObject>,
         guard: ThreadPropertyGuard,
@@ -278,13 +272,13 @@ impl HorizonSvcDispatcher {
     }
 
     fn with_thread_property(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         handle: u32,
         local: bool,
         operation: &'static str,
         continuation: impl FnOnce(
-            &mut Self,
+            &std::sync::Arc<Self>,
             &mut ExceptionDispatchContext<'_>,
             Arc<ThreadObject>,
             ThreadPropertyGuard,
@@ -317,25 +311,19 @@ impl HorizonSvcDispatcher {
             Err(fault) => {
                 ExceptionDispatchOutcome::Fault(HorizonSvcFault::Scheduling { operation, fault })
             }
-            Ok(None) => {
-                let source = context.source();
-                let vcpu = context.thread().vcpu();
-                self.start_owned_svc(context, Arc::default(), None, async move {
-                    let guard = scheduler
-                        .lock_thread_property(caller, target)
-                        .await
-                        .map_err(|fault| HorizonSvcFault::Scheduling { operation, fault })?;
-                    Ok(SvcCompletion::kernel(
-                        source,
-                        vcpu,
-                        move |dispatcher, context| continuation(dispatcher, context, thread, guard),
-                    ))
-                })
-            }
+            Ok(None) => self.start_owned_svc(context, Arc::default(), None, async move {
+                let guard = scheduler
+                    .lock_thread_property(caller, target)
+                    .await
+                    .map_err(|fault| HorizonSvcFault::Scheduling { operation, fault })?;
+                Ok(SvcCompletion::kernel(move |dispatcher, context| {
+                    continuation(dispatcher, context, thread, guard)
+                }))
+            }),
         }
     }
     fn finish_property_change(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         thread: Arc<ThreadObject>,
         guard: ThreadPropertyGuard,
@@ -402,7 +390,7 @@ pub(super) fn cancel_synchronization(
 
 impl HorizonSvcDispatcher {
     pub(super) fn create_thread(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let core = read_register(context.thread().state(), 5) as u32 as i32;

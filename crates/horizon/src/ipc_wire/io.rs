@@ -9,7 +9,7 @@ use crate::HorizonIpcResult;
 pub(super) async fn write_descriptor_bytes(
     process: &Request,
     descriptor: &Buffer,
-    bytes: &[u8],
+    bytes: &mut Vec<u8>,
 ) -> Result<(), IpcWireError> {
     if u64::try_from(bytes.len())
         .ok()

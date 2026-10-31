@@ -114,7 +114,7 @@ pub(super) fn terminate(
 
 impl HorizonSvcDispatcher {
     pub(super) fn break_process(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let reason = read_register(context.thread().state(), 0);

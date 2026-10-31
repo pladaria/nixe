@@ -45,7 +45,7 @@ pub(in crate::ipc_wire) fn dispatch_performance_manager(
     };
     match command {
         PerformanceManagerCommand::OpenSession => match process
-            .return_handle(HorizonIpcObject::Performance(manager.open_session()))
+            .return_service(HorizonIpcObject::Performance(manager.open_session()))
         {
             Ok(handle) => {
                 log::debug!("apm opened performance session handle {handle:#x}");

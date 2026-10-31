@@ -73,26 +73,36 @@ pub(in crate::ipc_wire) async fn dispatch_play_report(
     if pointer.index != 0 {
         return reply(HorizonIpcResult::CMIF_INVALID_IN_HEADER);
     }
-    let mut parts = [Vec::new(), Vec::new()];
-    for (part, buffer) in parts
-        .iter_mut()
-        .zip([&process.send_buffers()[0], &process.send_statics()[0]])
-    {
-        let size = usize::try_from(buffer.size)
-            .map_err(|_| IpcWireError::Malformed("play report size overflows"))?;
-        part.try_reserve_exact(size)
-            .map_err(|_| IpcWireError::HostResourceExhausted("reading a play report"))?;
-        part.resize(size, 0);
-        process.read(buffer, 0, part).await?;
-    }
-    let path = session
-        .save(
+    let buffers = [&process.send_buffers()[0], &process.send_statics()[0]];
+    let buffer_size = buffers
+        .iter()
+        .map(|buffer| buffer.size)
+        .max()
+        .unwrap_or(0)
+        .min(1024 * 1024) as usize;
+    process.reserve_payload(buffer_size).await?;
+    let mut bytes = vec![0; buffer_size];
+    let (mut report, path) = session
+        .create(
             request.command_id,
             process.process_id(),
             &request.data[..inline],
-            [&parts[0], &parts[1]],
+            [buffers[0].size, buffers[1].size],
         )
-        .map_err(|e| IpcWireError::PlayReport(e.to_string().into()))?;
+        .map_err(|error| IpcWireError::PlayReport(error.to_string().into()))?;
+    for buffer in buffers {
+        let mut offset = 0;
+        while offset < buffer.size {
+            let count = (buffer.size - offset).min(buffer_size as u64) as usize;
+            bytes.resize(count, 0);
+            process.read(buffer, offset, &mut bytes).await?;
+            std::io::Write::write_all(&mut report, &bytes[..count])
+                .map_err(|error| IpcWireError::PlayReport(error.to_string().into()))?;
+            offset += count as u64;
+        }
+    }
+    std::io::Write::flush(&mut report)
+        .map_err(|error| IpcWireError::PlayReport(error.to_string().into()))?;
     log::debug!("saved play report {}", path.display());
     semantic_success(request.token, domain, &[], &[], &[], None)
 }

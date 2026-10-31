@@ -7,134 +7,124 @@ mod properties;
 
 #[test]
 fn interrupted_sdk_critical_section_runs_to_its_release_before_a_higher_priority_thread() {
-    let (_directory, mut process) = fixture_process(&[
-        0xd53bd060, // MRS x0, TPIDRRO_EL0
-        0x52800041, // MOV w1, #2 (nested preemption disable count)
-        0x79020001, // STRH w1, [x0, #0x100]
-        0xb9000041, // STR w1, [x2] (critical-section work pending)
-        0x79420401, // LDRH w1, [x0, #0x102] (deferred interrupt flag)
-        0x34ffffe1, // CBZ w1, previous instruction
-        0x7902001f, // STRH wzr, [x0, #0x100]
-        0xb900005f, // STR wzr, [x2] (work completed before unpin)
-        svc(0x36),
-        svc(0x10),
-        svc(0x0a),
-    ]);
-    let mut dispatcher = fixed_time_dispatcher(&process);
-    let main = process.main_thread_id();
-    let process_id = process.scheduler_process_id();
-    let entry = instruction_address(&process);
-    let tls = process.main_thread().tls_base;
-    let work = process.main_thread().stack_bottom;
-    process.main_thread().registers().write_x(x(2), work.get());
-    process
-        .scheduler()
-        .set_priority(
-            nixe_scheduler::GuestThreadId::new(main.get()),
-            52,
-            Some(main),
+    use nixe_runtime::{
+        ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatchRequest,
+        ExceptionDispatcher, ProcessRegistration, Runtime, ThreadCreateRequest,
+    };
+    use std::sync::{Arc, mpsc};
+    let (_directory, process) = fixture_runnable_with_builder(
+        &[
+            0xd53bd060, // MRS x0, TPIDRRO_EL0
+            0x52800041, // MOV w1, #2
+            0x79020001, // STRH w1, [x0, #0x100]
+            0xb9000041, // STR w1, [x2]
+            0x79420401, // LDRH w1, [x0, #0x102]
+            0x34ffffe1, // CBZ w1, previous instruction
+            0x7902001f, // STRH wzr, [x0, #0x100]
+            0xb900005f, // STR wzr, [x2]
+            svc(0x36),
+            svc(0x10),
+            svc(0x0a),
+        ],
+        ProcessBuildConfig::default(),
+        support::process_builder(),
+    );
+    let kernel = process.scheduler().clone();
+    let affinity = kernel.profile().core_set([VirtualCpuId::new(0)]).unwrap();
+    let mut runtime = Runtime::try_new(kernel.clone()).unwrap();
+    let id = runtime
+        .register_process(
+            process,
+            ProcessRegistration {
+                priority: 52,
+                ideal_vcpu: Some(VirtualCpuId::new(0)),
+                affinity,
+            },
         )
         .unwrap();
-    let (higher, _) = super::mutex::add_thread(&mut process, entry + 9 * 4, 51);
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        let execution = process
-            .coordinator_mut()
-            .run_next(Duration::from_millis(10))
-            .unwrap();
-        if let Some(execution) = execution {
-            assert!(matches!(
-                execution.report.stop,
-                nixe_runtime::ExecutionStop::Safepoint
-            ));
+    let process = runtime.process(id).unwrap();
+    let main = process.main_thread();
+    let entry = main.registers().pc();
+    let work = main.stack_bottom;
+    main.registers().write_x(x(2), work.get());
+    let child = support::ready(process.create_thread(ThreadCreateRequest {
+        entry: GuestVirtualAddress::new(entry + 9 * 4),
+        argument: 0,
+        fpcr: 0,
+        fpsr: 0,
+        stack_top: main.stack_top,
+        priority: 51,
+        ideal_vcpu: Some(VirtualCpuId::new(0)),
+        affinity,
+    }))
+    .unwrap();
+    let higher = process.thread(child.id).unwrap();
+    struct Observe {
+        horizon: Arc<HorizonSvcDispatcher>,
+        send: mpsc::Sender<(nixe_scheduler::GuestThreadId, u64, u64)>,
+    }
+    impl ExceptionDispatcher for Observe {
+        type Fault = HorizonSvcFault;
+        fn dispatch(
+            self: &Arc<Self>,
+            context: &mut ExceptionDispatchContext<'_>,
+            request: ExceptionDispatchRequest,
+        ) -> ExceptionDispatchOutcome<Self::Fault> {
+            let result = self.horizon.dispatch(context, request);
+            self.send
+                .send((
+                    context.thread().id(),
+                    request.syndrome().unwrap(),
+                    context.thread().state().read_x(x(0)),
+                ))
+                .unwrap();
+            result
         }
-        if read_guest_u32(&process, work) == 2 {
-            break;
-        }
+    }
+    let (send, receive) = mpsc::channel();
+    runtime
+        .start(Arc::new(Observe {
+            horizon: support::dispatcher(&process),
+            send,
+        }))
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while read_guest_u32(&process, work) != 2 {
         assert!(
             std::time::Instant::now() < deadline,
-            "native critical section did not start"
+            "critical section did not start"
         );
+        std::thread::yield_now();
     }
-    process.thread(higher).unwrap().start().unwrap();
-
-    let interrupted = process
-        .coordinator_mut()
-        .run_next(Duration::from_secs(2))
-        .unwrap()
-        .unwrap();
-    assert_eq!(interrupted.lease.thread, main);
-    assert!(matches!(
-        interrupted.report.stop,
-        nixe_runtime::ExecutionStop::Safepoint
-    ));
+    higher.start().unwrap();
     assert_eq!(
-        process
-            .coordinator_mut()
-            .scheduler()
-            .pinned_thread(process_id, VirtualCpuId::new(0))
-            .unwrap(),
-        Some(main)
+        receive.recv_timeout(Duration::from_secs(3)).unwrap(),
+        (main.id(), 0x36, main.tls_base.get())
     );
-    assert_eq!(
-        read_guest_u32(&process, tls.checked_add(0x100).unwrap()),
-        0x0001_0002
-    );
-    assert_eq!(
-        process
-            .coordinator_mut()
-            .scheduler()
-            .selection(VirtualCpuId::new(0))
-            .unwrap()
-            .thread,
-        Some(main)
-    );
-    assert_eq!(
-        process
-            .coordinator_mut()
-            .scheduler()
-            .thread(main)
-            .unwrap()
-            .effective_priority,
-        52
-    );
-
-    let (caller, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
-    assert_eq!(caller, main);
-    assert!(matches!(handling, ExceptionHandlingResult::Resumed));
-    assert_eq!(
-        read_abi_register(&process, 0),
-        tls.get(),
-        "void SVC preserves x0"
-    );
-    assert_eq!(read_guest_u32(&process, tls.checked_add(0x100).unwrap()), 0);
     assert_eq!(read_guest_u32(&process, work), 0);
     assert_eq!(
-        process
-            .coordinator_mut()
-            .scheduler()
-            .pinned_thread(process_id, VirtualCpuId::new(0))
-            .unwrap(),
-        None
+        read_guest_u32(&process, main.tls_base.checked_add(0x100).unwrap()),
+        0
     );
     assert_eq!(
-        process
-            .coordinator_mut()
-            .scheduler()
-            .selection(VirtualCpuId::new(0))
-            .unwrap()
-            .thread,
-        Some(higher)
+        receive.recv_timeout(Duration::from_secs(3)).unwrap().0,
+        higher.id()
     );
-    let (caller, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
-    assert_eq!(caller, higher);
-    assert!(matches!(handling, ExceptionHandlingResult::Resumed));
+    assert_eq!(
+        kernel.pinned_thread(id, VirtualCpuId::new(0)).unwrap(),
+        None
+    );
+    while process.lifecycle() != ProcessLifecycle::Exited {
+        assert!(std::time::Instant::now() < deadline);
+        runtime.wait_events(Duration::from_millis(50)).unwrap();
+    }
+    runtime.shutdown().unwrap();
 }
 
 #[test]
 fn synchronize_preemption_state_without_a_pin_preserves_tls_and_all_registers() {
     let (_directory, mut process) = fixture_process(&[svc(0x36)]);
-    let mut dispatcher = fixed_time_dispatcher(&process);
+    let dispatcher = fixed_time_dispatcher(&process);
     let tls = process.main_thread().tls_base;
     write_guest_bytes(
         &process,
@@ -148,7 +138,7 @@ fn synchronize_preemption_state_without_a_pin_preserves_tls_and_all_registers() 
             .write_x(x(i), 0x1234_5678_0000_0000 | u64::from(i));
     }
     let original = process.main_thread().registers().register_context();
-    let (_, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+    let (_, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
     assert!(matches!(handling, ExceptionHandlingResult::Resumed));
     let after = process.main_thread().registers().register_context();
     assert_eq!(after.x, original.x);
@@ -176,28 +166,28 @@ fn synchronization_does_not_clear_another_threads_pin_or_interrupt_flag() {
         &1u16.to_le_bytes(),
     );
     process
-        .coordinator_mut()
+        .driver_mut()
         .scheduler()
         .pin_thread(VirtualCpuId::new(0), peer)
         .unwrap();
     let affinity = process
-        .coordinator_mut()
+        .driver_mut()
         .scheduler()
         .profile()
         .core_set([VirtualCpuId::new(1)])
         .unwrap();
     process
-        .coordinator_mut()
+        .driver_mut()
         .scheduler()
         .migrate(main, IdealCore::Core(VirtualCpuId::new(1)), affinity)
         .unwrap();
-    let mut dispatcher = fixed_time_dispatcher(&process);
-    let (caller, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+    let dispatcher = fixed_time_dispatcher(&process);
+    let (caller, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
     assert_eq!(caller, main);
     assert!(matches!(handling, ExceptionHandlingResult::Resumed));
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .pinned_thread(process_id, VirtualCpuId::new(0))
             .unwrap(),
@@ -207,14 +197,10 @@ fn synchronization_does_not_clear_another_threads_pin_or_interrupt_flag() {
         read_guest_bytes(&process, peer_tls.checked_add(0x102).unwrap(), 2),
         [1, 0]
     );
-    process
-        .coordinator_mut()
-        .scheduler()
-        .unpin_thread(peer)
-        .unwrap();
+    process.driver_mut().scheduler().unpin_thread(peer).unwrap();
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .pinned_thread(process_id, VirtualCpuId::new(0))
             .unwrap(),
@@ -244,8 +230,8 @@ fn deferred_flag_clear_retains_the_pin_until_completion_and_preserves_void_regis
     }
     for succeeds in [true, false] {
         let (_directory, mut process) = fixture_process(&[svc(0x36)]);
-        let ingress = process.coordinator_mut().event_sender();
-        let mut dispatcher = support::dispatcher(&process).with_input_completions(ingress.clone());
+        let ingress = process.driver_mut().event_sender();
+        let dispatcher = support::dispatcher(&process).with_input_completions(ingress.clone());
         let main = process.main_thread_id();
         let process_id = process.scheduler_process_id();
         let flag = process.main_thread().tls_base.checked_add(0x102).unwrap();
@@ -254,8 +240,8 @@ fn deferred_flag_clear_retains_the_pin_until_completion_and_preserves_void_regis
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let execution = loop {
             if let Some(execution) = process
-                .coordinator_mut()
-                .run_next(Duration::from_millis(20))
+                .driver_mut()
+                .run_native(Duration::from_millis(20))
                 .unwrap()
                 && matches!(
                     execution.report.stop,
@@ -270,7 +256,7 @@ fn deferred_flag_clear_retains_the_pin_until_completion_and_preserves_void_regis
             );
         };
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .pin_thread(VirtualCpuId::new(0), main)
             .unwrap();
@@ -285,21 +271,21 @@ fn deferred_flag_clear_retains_the_pin_until_completion_and_preserves_void_regis
         machine.set_device_endpoint(&device);
         machine.publish_device_write(&ranges, || Ok(())).unwrap();
         let handling = dispatcher
-            .route_scheduled_supervisor_call(
-                process.coordinator_mut(),
+            .call_local(
+                process.driver_mut(),
                 execution.lease,
                 &execution.report.stop,
             )
             .unwrap();
         assert!(matches!(handling, ExceptionHandlingResult::Suspended));
-        let pending = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut pending = received.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(matches!(
             pending.operation(),
             nixe_memory::AccessOperation::Write(_)
         ));
         assert_eq!(
             process
-                .coordinator_mut()
+                .driver_mut()
                 .scheduler()
                 .pinned_thread(process_id, VirtualCpuId::new(0))
                 .unwrap(),
@@ -312,46 +298,47 @@ fn deferred_flag_clear_retains_the_pin_until_completion_and_preserves_void_regis
             .unwrap();
         assert!(
             process
-                .coordinator_mut()
-                .run_next(Duration::from_millis(20))
+                .driver_mut()
+                .run_native(Duration::from_millis(20))
                 .unwrap()
                 .is_none()
         );
         let completion = if succeeds {
-            machine
-                .apply_resolved_access(pending.ranges(), pending.operation())
-                .map_err(Arc::new)
+            {
+                let (ranges, operation) = pending.parts_mut();
+                machine.apply_resolved_access(ranges, operation)
+            }
+            .map_err(Arc::new)
         } else {
             Err(Arc::new(nixe_memory::MemoryError::Execution(
                 "flag clear failed".into(),
             )))
         };
         pending.finish(completion);
-        let result = dispatcher.poll_memory_completions(process.coordinator_mut());
+        let result = dispatcher.drive_pending(process.driver_mut());
         if succeeds {
             result.unwrap();
             assert_eq!(read_abi_register(&process, 0), 0x12345678);
             assert!(
-                matches!(machine.apply_resolved_access(&ranges, &nixe_memory::AccessOperation::Read).unwrap(), nixe_memory::AccessResult::Read(bytes) if bytes.as_ref() == [0, 0])
+                matches!(machine.apply_resolved_access(&ranges, &mut nixe_memory::AccessOperation::Read(Vec::new())).unwrap(), nixe_memory::AccessResult::Read(bytes) if bytes.as_ref() == [0, 0])
             );
         } else {
-            assert!(matches!(
-                result,
-                Err(HorizonSvcFault::MemoryAccess {
-                    immediate: 0x36,
-                    ..
-                })
-            ));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("flag clear failed")
+            );
         }
         assert_eq!(
             process
-                .coordinator_mut()
+                .driver_mut()
                 .scheduler()
                 .pinned_thread(process_id, VirtualCpuId::new(0))
                 .unwrap(),
             None
         );
-        assert!(!process.coordinator_mut().scheduler().has_active_leases());
+        assert!(!process.driver_mut().scheduler().has_active_leases());
     }
 }
 
@@ -369,21 +356,21 @@ fn thread_activity_and_affinity_wait_for_the_targets_real_unpin() {
             svc(0x36),
             svc(0x0a),
         ]);
-        let mut dispatcher = fixed_time_dispatcher(&process)
-            .with_input_completions(process.coordinator_mut().event_sender());
+        let dispatcher = fixed_time_dispatcher(&process)
+            .with_input_completions(process.driver_mut().event_sender());
         let main = process.main_thread_id();
         let entry = instruction_address(&process);
         let gate = process.main_thread().stack_bottom;
         let (target, handle) = super::mutex::add_thread(&mut process, entry + 12, 52);
         let core = VirtualCpuId::new(1);
         let affinity = process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .profile()
             .core_set([core])
             .unwrap();
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .migrate(main, IdealCore::Core(core), affinity)
             .unwrap();
@@ -400,7 +387,7 @@ fn thread_activity_and_affinity_wait_for_the_targets_real_unpin() {
             .write_x(x(2), gate.get());
         process.thread(target).unwrap().start().unwrap();
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .pin_thread(VirtualCpuId::new(0), target)
             .unwrap();
@@ -410,12 +397,12 @@ fn thread_activity_and_affinity_wait_for_the_targets_real_unpin() {
             .write_x(x(0), u64::from(handle));
         process.main_thread().registers().write_x(x(1), 1);
         process.main_thread().registers().write_x(x(2), 2);
-        let (caller, handling) = next_call(&mut process, &mut dispatcher);
+        let (caller, handling) = next_call(&mut process, &dispatcher);
         assert_eq!(caller, main);
         assert!(matches!(handling, ExceptionHandlingResult::Suspended));
         assert!(
             process
-                .coordinator_mut()
+                .driver_mut()
                 .scheduler()
                 .thread(main)
                 .unwrap()
@@ -424,7 +411,7 @@ fn thread_activity_and_affinity_wait_for_the_targets_real_unpin() {
         );
         assert_eq!(
             process
-                .coordinator_mut()
+                .driver_mut()
                 .scheduler()
                 .thread(target)
                 .unwrap()
@@ -432,21 +419,17 @@ fn thread_activity_and_affinity_wait_for_the_targets_real_unpin() {
             pause
         );
         write_guest_bytes(&process, gate, &1u32.to_le_bytes());
-        let (caller, handling) = next_call(&mut process, &mut dispatcher);
+        let (caller, handling) = next_call(&mut process, &dispatcher);
         assert_eq!(caller, target);
         assert!(matches!(handling, ExceptionHandlingResult::Resumed));
         assert_eq!(
             read_guest_u32(&process, target_tls.checked_add(0x100).unwrap()),
             0
         );
-        let view = process.coordinator_mut().scheduler().thread(main).unwrap();
+        let view = process.driver_mut().scheduler().thread(main).unwrap();
         assert!(view.active_wait.is_none());
         assert_eq!(view.lifecycle, nixe_scheduler::ThreadLifecycle::Ready);
-        let target_view = process
-            .coordinator_mut()
-            .scheduler()
-            .thread(target)
-            .unwrap();
+        let target_view = process.driver_mut().scheduler().thread(target).unwrap();
         if pause {
             assert_eq!(
                 target_view.lifecycle,
@@ -456,7 +439,7 @@ fn thread_activity_and_affinity_wait_for_the_targets_real_unpin() {
             assert_eq!(target_view.affinity, affinity);
         }
         assert_eq!(read_abi_register(&process, 0), 0);
-        let (caller, handling) = next_call(&mut process, &mut dispatcher);
+        let (caller, handling) = next_call(&mut process, &dispatcher);
         assert_eq!(caller, main);
         assert!(matches!(handling, ExceptionHandlingResult::Resumed));
     }
@@ -506,14 +489,14 @@ fn competing_thread_properties_serialize_through_unpin_and_publish_results_once(
             let (second, _) = super::mutex::add_thread(&mut process, entry + 60, 20);
             let core1 = VirtualCpuId::new(1);
             let affinity = process
-                .coordinator_mut()
+                .driver_mut()
                 .scheduler()
                 .profile()
                 .core_set([core1])
                 .unwrap();
             for thread in [main, second] {
                 process
-                    .coordinator_mut()
+                    .driver_mut()
                     .scheduler()
                     .migrate(thread, IdealCore::Core(core1), affinity)
                     .unwrap();
@@ -556,20 +539,20 @@ fn competing_thread_properties_serialize_through_unpin_and_publish_results_once(
             drop(second_state);
             process.thread(target).unwrap().start().unwrap();
             process
-                .coordinator_mut()
+                .driver_mut()
                 .scheduler()
                 .pin_thread(VirtualCpuId::new(0), target)
                 .unwrap();
-            let mut dispatcher = fixed_time_dispatcher(&process)
-                .with_input_completions(process.coordinator_mut().event_sender());
-            let (caller, handling) = next_call(&mut process, &mut dispatcher);
+            let dispatcher = fixed_time_dispatcher(&process)
+                .with_input_completions(process.driver_mut().event_sender());
+            let (caller, handling) = next_call(&mut process, &dispatcher);
             assert_eq!(caller, main);
             assert!(matches!(handling, ExceptionHandlingResult::Suspended));
             process.thread(second).unwrap().start().unwrap();
-            let (caller, handling) = next_call(&mut process, &mut dispatcher);
+            let (caller, handling) = next_call(&mut process, &dispatcher);
             assert_eq!(caller, second);
             assert!(matches!(handling, ExceptionHandlingResult::Suspended));
-            let scheduler = process.coordinator_mut().scheduler();
+            let scheduler = process.driver_mut().scheduler();
             for thread in [main, second] {
                 assert_eq!(
                     scheduler.thread(thread).unwrap().lifecycle,
@@ -598,32 +581,24 @@ fn competing_thread_properties_serialize_through_unpin_and_publish_results_once(
             drop(object);
             drop(process.handles().close(handle).unwrap());
             if stop {
-                process
-                    .coordinator_mut()
-                    .terminate_process(process_id)
-                    .unwrap();
-                dispatcher
-                    .poll_memory_completions(process.coordinator_mut())
-                    .unwrap();
+                process.driver_mut().terminate_process(process_id).unwrap();
+                dispatcher.drive_pending(process.driver_mut()).unwrap();
                 assert!(target_lifetime.upgrade().is_none());
                 assert_eq!(
-                    process
-                        .coordinator_mut()
-                        .scheduler()
-                        .priority_donation_count(),
+                    process.driver_mut().scheduler().priority_donation_count(),
                     0
                 );
-                process.coordinator_mut().shutdown().unwrap();
+                process.driver_mut().shutdown().unwrap();
                 continue;
             }
             write_guest_bytes(&process, gate, &1u32.to_le_bytes());
-            let (caller, handling) = next_call(&mut process, &mut dispatcher);
+            let (caller, handling) = next_call(&mut process, &dispatcher);
             assert_eq!(caller, target);
             assert!(matches!(handling, ExceptionHandlingResult::Resumed));
             for thread in [main, second] {
                 assert!(
                     process
-                        .coordinator_mut()
+                        .driver_mut()
                         .scheduler()
                         .thread(thread)
                         .unwrap()
@@ -633,7 +608,7 @@ fn competing_thread_properties_serialize_through_unpin_and_publish_results_once(
                 );
             }
             write_guest_bytes(&process, gate, &2u32.to_le_bytes());
-            let (caller, handling) = next_call(&mut process, &mut dispatcher);
+            let (caller, handling) = next_call(&mut process, &dispatcher);
             assert_eq!(caller, target);
             if operation == "terminated" {
                 assert!(matches!(
@@ -646,16 +621,14 @@ fn competing_thread_properties_serialize_through_unpin_and_publish_results_once(
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while [main, second].into_iter().any(|id| {
                 process
-                    .coordinator_mut()
+                    .driver_mut()
                     .scheduler()
                     .thread(id)
                     .unwrap()
                     .active_wait
                     .is_some()
             }) {
-                dispatcher
-                    .poll_memory_completions(process.coordinator_mut())
-                    .unwrap();
+                dispatcher.drive_pending(process.driver_mut()).unwrap();
                 assert!(
                     std::time::Instant::now() < deadline,
                     "property completion was lost"
@@ -665,7 +638,7 @@ fn competing_thread_properties_serialize_through_unpin_and_publish_results_once(
             assert_eq!(process.thread(second).unwrap().registers().read_x(x(0)), 0);
             assert_eq!(process.thread(main).unwrap().registers().pc(), entry + 4);
             assert_eq!(process.thread(second).unwrap().registers().pc(), entry + 64);
-            let scheduler = process.coordinator_mut().scheduler();
+            let scheduler = process.driver_mut().scheduler();
             assert_eq!(scheduler.thread(main).unwrap().effective_priority, 44);
             let target_info = scheduler.thread(target).unwrap();
             assert_eq!(target_info.paused, context_query);
@@ -689,26 +662,24 @@ fn competing_thread_properties_serialize_through_unpin_and_publish_results_once(
                     );
                 }
             }
-            process.coordinator_mut().shutdown().unwrap();
+            process.driver_mut().shutdown().unwrap();
         }
     }
 }
 
 fn next_call(
     process: &mut ScheduledProcess,
-    dispatcher: &mut HorizonSvcDispatcher,
+    dispatcher: &std::sync::Arc<HorizonSvcDispatcher>,
 ) -> (
     nixe_scheduler::GuestThreadId,
     ExceptionHandlingResult<HorizonSvcFault>,
 ) {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
         let execution = process
-            .coordinator_mut()
-            .run_next(Duration::from_millis(20))
+            .driver_mut()
+            .run_native(Duration::from_millis(20))
             .unwrap();
         if let Some(execution) = execution {
             if matches!(
@@ -716,15 +687,13 @@ fn next_call(
                 nixe_runtime::ExecutionStop::SupervisorCall { .. }
             ) {
                 let handling = dispatcher
-                    .route_scheduled_supervisor_call(
-                        process.coordinator_mut(),
+                    .call_local(
+                        process.driver_mut(),
                         execution.lease,
                         &execution.report.stop,
                     )
                     .unwrap();
-                dispatcher
-                    .poll_memory_completions(process.coordinator_mut())
-                    .unwrap();
+                dispatcher.drive_pending(process.driver_mut()).unwrap();
                 return (execution.lease.thread, handling);
             }
             assert!(matches!(

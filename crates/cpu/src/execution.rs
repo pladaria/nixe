@@ -2,34 +2,13 @@
 
 use core::fmt::{self, Display, Formatter};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::coverage::CoverageId;
 use crate::error::{InstructionFetchFault, UnallocatedEncoding};
 use crate::exception::ExceptionKind;
 use crate::location::{InstructionEncoding, LocationDescriptor};
 use crate::state::RegisterContext;
-
-macro_rules! identity {
-    ($name:ident) => {
-        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub struct $name(u64);
-
-        impl $name {
-            #[must_use]
-            pub const fn new(value: u64) -> Self {
-                Self(value)
-            }
-            #[must_use]
-            pub const fn get(self) -> u64 {
-                self.0
-            }
-        }
-    };
-}
-
-identity!(CpuProcessId);
-identity!(CpuThreadId);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TimerSnapshot {
@@ -39,24 +18,6 @@ pub struct TimerSnapshot {
 
 pub trait ArchitecturalTimer {
     fn snapshot(&self) -> TimerSnapshot;
-}
-
-#[derive(Clone, Default)]
-pub struct VcpuEventState {
-    pending_interrupts: Arc<AtomicU32>,
-}
-
-impl VcpuEventState {
-    pub fn post_interrupts(&self, mask: u32) {
-        if mask != 0 {
-            self.pending_interrupts.fetch_or(mask, Ordering::Release);
-        }
-    }
-
-    #[must_use]
-    pub fn take_pending_interrupts(&self) -> u32 {
-        self.pending_interrupts.swap(0, Ordering::AcqRel)
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,9 +35,6 @@ pub enum CpuExit {
         fault: InstructionFetchFault,
     },
     Safepoint,
-    PendingEvent {
-        mask: u32,
-    },
     ArchitecturalException {
         source: LocationDescriptor,
         kind: ExceptionKind,
@@ -85,12 +43,6 @@ pub enum CpuExit {
     SupervisorCall {
         source: LocationDescriptor,
         immediate: u32,
-    },
-    /// Runtime classification of a completed loader-stub SVC. CPU backends
-    /// report the ordinary SupervisorCall and do not recognize loader addresses.
-    LoaderReturn {
-        source: LocationDescriptor,
-        result_code: u64,
     },
 }
 
@@ -171,7 +123,6 @@ impl Display for CpuExit {
             }
             Self::FetchFault { fault } => write!(formatter, "fetch-fault {fault}"),
             Self::Safepoint => formatter.write_str("safepoint"),
-            Self::PendingEvent { mask } => write!(formatter, "pending-event mask=0x{mask:08x}"),
             Self::ArchitecturalException {
                 source,
                 kind,
@@ -183,13 +134,6 @@ impl Display for CpuExit {
             Self::SupervisorCall { source, immediate } => write!(
                 formatter,
                 "supervisor-call source=[{source}] immediate={immediate:?}"
-            ),
-            Self::LoaderReturn {
-                source,
-                result_code,
-            } => write!(
-                formatter,
-                "loader-return source=[{source}] result=0x{result_code:016x}"
             ),
         }
     }

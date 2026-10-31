@@ -264,20 +264,10 @@ impl ProcessBuilder {
         threads.insert(&main_thread, true).map_err(|error| {
             ProcessBuildError::new(ProcessBuildStage::ThreadInitialization, error)
         })?;
-        let cpu_process_id = execution::allocate_cpu_process_id().ok_or_else(|| {
-            ProcessBuildError::new(
-                ProcessBuildStage::CpuInitialization,
-                "CPU process identity exhausted",
-            )
-        })?;
-        let execution = execution::ProcessExecutionControl::new(
-            execution::ProcessExecutionConfiguration {
-                virtual_clock: self.kernel.clock().clone(),
-                timer_frequency: self.config.architectural_timer_frequency,
-                cpu,
-            },
-            std::sync::Arc::clone(memory.space()),
-            cpu_process_id,
+        let execution = nixe_cpu_jit::JitProcess::new(
+            cpu,
+            Arc::clone(memory.space()),
+            self.config.architectural_timer_frequency,
         )
         .map_err(|error| ProcessBuildError::new(ProcessBuildStage::CpuInitialization, error))?;
         let process = RunnableProcess {
@@ -311,7 +301,8 @@ impl ProcessBuilder {
             )),
             handles,
             address_waits: std::sync::Arc::default(),
-            execution: Mutex::new(execution),
+            execution,
+            native_cores: std::sync::atomic::AtomicU64::new(0),
         };
         Ok(process)
     }

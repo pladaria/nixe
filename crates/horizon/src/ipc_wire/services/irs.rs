@@ -6,7 +6,6 @@ pub(in crate::ipc_wire) async fn dispatch_irs(
     session: &IrsSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
-    scheduling: &std::sync::Arc<crate::ipc_wire::operation::ServiceScheduling>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     if request.command_id == 311 {
         // This identifies a camera slot; it does not require a connected camera.
@@ -57,7 +56,7 @@ pub(in crate::ipc_wire) async fn dispatch_irs(
         return semantic_success(request.token, false, &[], &[handle], &[], None);
     }
     let registered = session
-        .set_active(aruid, request.command_id != 303, scheduling)
+        .set_active(aruid, request.command_id != 303)
         .await
         .map_err(IpcWireError::SystemMemory)?;
     if !registered {

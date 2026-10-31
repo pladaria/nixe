@@ -54,13 +54,6 @@ pub enum ThreadStartError {
     Internal,
 }
 
-/// The current kernel wait owns its accepted resources and cancellation.
-/// Termination cancels it independently of the entry which stopped the thread.
-/// https://github.com/eden-emulator/mirror/blob/master/src/core/hle/kernel/k_thread.cpp
-pub trait ThreadWait: Send + Sync {
-    fn cancel(&self);
-}
-
 /// The canonical kernel thread retained by handles and active execution.
 /// Scheduling fields belong to the same generational ID in SchedulerState.
 pub struct ThreadObject {
@@ -72,7 +65,7 @@ pub struct ThreadObject {
     pub tls_base: GuestVirtualAddress,
     pub loader_return: Option<GuestVirtualAddress>,
     completion: EventObject,
-    wait: Mutex<Option<Weak<dyn ThreadWait>>>,
+    wait: Mutex<Option<Arc<dyn crate::ThreadWait>>>,
     // The process closes its handles/running references on termination; exported
     // threads retain their parent until final destruction.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_thread.cpp
@@ -234,25 +227,38 @@ impl ThreadObject {
     pub fn is_signalled(&self) -> bool {
         self.completion.is_signalled()
     }
-    pub(crate) fn signal(&self) {
+    pub fn signal(&self) {
         self.cancel_wait();
         self.completion.signal();
     }
-    pub fn set_wait(&self, wait: Weak<dyn ThreadWait>) {
+    pub fn set_wait(&self, wait: Arc<dyn crate::ThreadWait>) {
         let mut current = self.wait.lock().unwrap();
         assert!(current.is_none(), "one kernel wait per thread");
         *current = Some(wait);
     }
-    pub fn clear_wait(&self) {
-        self.wait.lock().unwrap().take();
+    pub fn pending_wait(&self) -> Option<Arc<dyn crate::ThreadWait>> {
+        self.wait.lock().unwrap().clone()
+    }
+    /// Retire this accepted call without removing a continuation installed by another core.
+    pub fn clear_wait(&self, expected: &Arc<dyn crate::ThreadWait>) -> bool {
+        let retired = {
+            let mut current = self.wait.lock().unwrap();
+            if !current
+                .as_ref()
+                .is_some_and(|wait| Arc::ptr_eq(wait, expected))
+            {
+                return false;
+            }
+            current.take()
+        };
+        drop(retired);
+        true
+    }
+    pub(crate) fn take_wait(&self) -> Option<Arc<dyn crate::ThreadWait>> {
+        self.wait.lock().unwrap().take()
     }
     pub(crate) fn cancel_wait(&self) {
-        let wait = self
-            .wait
-            .lock()
-            .unwrap()
-            .take()
-            .and_then(|wait| wait.upgrade());
+        let wait = self.wait.lock().unwrap().as_ref().cloned();
         if let Some(wait) = wait {
             wait.cancel();
         }
@@ -270,10 +276,10 @@ impl ThreadObject {
     pub fn registers(&self) -> ThreadRegisters<'_> {
         ThreadRegisters(self.registers.lock().unwrap())
     }
-    pub(crate) fn take_state(&self) -> Option<GuestCpuState> {
+    pub fn take_state(&self) -> Option<GuestCpuState> {
         self.registers.lock().unwrap().take()
     }
-    pub(crate) fn restore_state(&self, state: GuestCpuState) {
+    pub fn restore_state(&self, state: GuestCpuState) {
         assert!(
             self.registers.lock().unwrap().replace(state).is_none(),
             "one register owner"
@@ -287,15 +293,6 @@ impl ThreadObject {
             .as_ref()
             .filter(|state| state.is_available())
             .map(|state| state.snapshot())
-    }
-    pub(crate) fn materialize(&self, leave_core: bool) {
-        if let Some(state) = self.registers.lock().unwrap().as_mut() {
-            if leave_core {
-                state.leave_core();
-            } else {
-                state.materialize();
-            }
-        }
     }
 }
 impl Drop for ThreadObject {

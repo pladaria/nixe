@@ -18,8 +18,8 @@ pub(crate) fn connect_to_named_port(
     if name != b"sm:" {
         return NamedPortResult::NotFound;
     }
-    match process.handles().insert(HorizonIpcObject::ServiceManager(
-        ServiceManagerSession::new(),
+    match process.handles().insert(super::ServiceSession::new(
+        HorizonIpcObject::ServiceManager(ServiceManagerSession::new()),
     )) {
         Ok(handle) => NamedPortResult::Connected(handle),
         Err(_) => NamedPortResult::OutOfHandles,

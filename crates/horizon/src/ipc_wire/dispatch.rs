@@ -1,8 +1,5 @@
-//! Synchronous request orchestration after HIPC/CMIF decoding.
-//!
-//! The semantic service layer remains independent of guest wire layouts. This
-//! module validates the command buffer in the current thread's TLS and bridges
-//! decoded messages into the service manager and semantic service objects.
+//! Wire ABI dispatch on the owning service worker. Request resources were
+//! captured by acceptance; no CPU execution context is borrowed here.
 
 use super::message::{
     CmifRequest, DomainRequest, HipcRequest, TIPC_COMMAND_CLOSE, TIPC_COMMAND_REQUEST_BASE,
@@ -14,36 +11,15 @@ use super::services::fsp::object_name;
 use super::services::semantic_service_name;
 use super::{IpcWireError, UnsupportedServiceOperation};
 use crate::ipc_wire::request::Request;
+use crate::ipc_wire::resources::ServiceResources;
 
+use crate::HorizonIpcObject;
 use crate::object::{NetworkInterfaceObject, TimeObject};
-use crate::{
-    HidSystem, HorizonIpcObject, OperationMode, SettingsEnvironment, TimeEnvironment, VideoSystem,
-};
 
 #[cfg(test)]
 use crate::{IpcService, IpcSession, NvDrvSession, SystemSettingsSession};
 
 const CMIF_COMMAND_CLOSE: u16 = 2;
-
-#[derive(Clone)]
-pub(crate) struct HostSystems {
-    pub video: VideoSystem,
-    pub keyboard: Option<nixe_applets::keyboard::KeyboardHost>,
-    pub audio_backend: Option<std::sync::Arc<dyn nixe_audio::AudioBackend>>,
-    pub audio_renderers: crate::AudioRendererManagerSession,
-    pub opus: crate::OpusManagerSession,
-    pub hid: HidSystem,
-    pub shared_fonts: crate::SharedFontSession,
-    pub system_archives: std::sync::Arc<crate::SystemArchives>,
-    pub settings: SettingsEnvironment,
-    pub application_language: Option<crate::SystemLanguage>,
-    pub application_display_version: Option<[u8; 16]>,
-    pub user_account_switch_locked: Option<bool>,
-    pub save_data: Option<crate::SaveDataSystem>,
-    pub diagnostics: crate::HorizonDiagnostics,
-    pub caller_thread_id: u64,
-    pub scheduling: std::sync::Arc<super::operation::ServiceScheduling>,
-}
 
 impl HorizonIpcObject {
     fn is_domain(&self) -> bool {
@@ -86,7 +62,7 @@ impl HorizonIpcObject {
             Self::Performance(_) => "IPerformanceSession",
             Self::Applet(session) => domain_object
                 .and_then(|object_id| session.object(object_id))
-                .map_or("appletOE", services::applet_object_name),
+                .map_or("appletOE", |object| services::applet_object_name(&object)),
             Self::Account(session) => domain_object
                 .and_then(|object_id| session.object(object_id))
                 .map_or("acc:u0", |object| match object {
@@ -154,33 +130,24 @@ impl HorizonIpcObject {
     }
 }
 
-pub(crate) async fn send_sync_request_from_buffer(
+pub(crate) async fn execute_request(
     process: &mut Request,
     handle: u32,
-    initial_operation_mode: OperationMode,
-    time_environment: &TimeEnvironment,
-    host_systems: &HostSystems,
-    turn: super::operation::ServiceTurn,
+    resources: &ServiceResources,
+    hipc: &HipcRequest<'_>,
+    target: &HorizonIpcObject,
 ) -> Result<SyncRequestResult, IpcWireError> {
+    let initial_operation_mode = resources.system.operation_mode;
+    let time_environment = &resources.system.time;
     let _trace = nixe_memory::trace::span(
         "ipc_dispatch",
-        host_systems.caller_thread_id,
+        process.thread_id(),
         u64::from(handle),
         process.command_size() as u64,
     );
-    let Some(target) = process.target().downcast::<HorizonIpcObject>() else {
-        return Ok(SyncRequestResult::InvalidHandle);
-    };
-    let buffer = process.read_command().await?;
-    let hipc = HipcRequest::decode(&buffer).map_err(|error| IpcWireError::Malformed(error.0))?;
-    process.accept_descriptors(&hipc)?;
-    // Eden locks the shared service handler while handling a request. Keep
-    // the same order with an owned turn, releasing the host core on waits.
-    // https://git.eden-emu.dev/eden-emu/eden/src/branch/master/src/core/hle/service/service.cpp
-    (&turn).await;
     process.begin_service()?;
     if hipc.command_type >= TIPC_COMMAND_CLOSE {
-        let HorizonIpcObject::ServiceManager(manager) = target.as_ref() else {
+        let HorizonIpcObject::ServiceManager(manager) = target else {
             return Err(IpcWireError::UnsupportedService(
                 UnsupportedServiceOperation::CommandVariant {
                     service: "TIPC transport",
@@ -190,23 +157,23 @@ pub(crate) async fn send_sync_request_from_buffer(
             ));
         };
         if hipc.command_type == TIPC_COMMAND_CLOSE {
-            if hipc.data_word_bytes() != 0 || super::io::has_ipc_descriptors(&hipc) {
+            if hipc.data_word_bytes() != 0 || super::io::has_ipc_descriptors(hipc) {
                 return Err(IpcWireError::Malformed(
                     "TIPC session close contains payload or descriptors",
                 ));
             }
-            return Ok(SyncRequestResult::Success);
+            return Ok(SyncRequestResult::SessionClosed);
         }
         debug_assert!(hipc.command_type >= TIPC_COMMAND_REQUEST_BASE);
         let request =
-            TipcRequest::decode(&hipc).map_err(|error| IpcWireError::Malformed(error.0))?;
+            TipcRequest::decode(hipc).map_err(|error| IpcWireError::Malformed(error.0))?;
         let _command_trace = nixe_memory::trace::span(
             "ipc_tipc_dispatch",
-            host_systems.caller_thread_id,
+            process.thread_id(),
             u64::from(handle),
             u64::from(request.command_id),
         );
-        if super::io::has_ipc_descriptors_other_than_pid(&hipc) {
+        if super::io::has_ipc_descriptors_other_than_pid(hipc) {
             return Err(IpcWireError::Malformed(
                 "sm: TIPC request contains unexpected descriptors",
             ));
@@ -223,15 +190,13 @@ pub(crate) async fn send_sync_request_from_buffer(
             manager,
             services::ServiceManagerRequest::Tipc(request),
             hipc.pid.is_some(),
-            initial_operation_mode,
-            time_environment,
-            host_systems,
+            resources,
         )?;
-        process.write_response(&response).await?;
+        process.write_response(response).await?;
         process.publish_handles()?;
         return Ok(SyncRequestResult::Success);
     }
-    let request = CmifRequest::decode(&hipc, target.is_domain()).map_err(|error| {
+    let request = CmifRequest::decode(hipc, target.is_domain()).map_err(|error| {
         if error.0 == "unsupported HIPC command type for CMIF" {
             IpcWireError::UnsupportedService(UnsupportedServiceOperation::CommandVariant {
                 service: "CMIF transport",
@@ -246,7 +211,7 @@ pub(crate) async fn send_sync_request_from_buffer(
         log::log_enabled!(log::Level::Trace).then(|| target.diagnostic_name(&request));
     let _command_trace = nixe_memory::trace::span(
         "ipc_cmif_dispatch",
-        host_systems.caller_thread_id,
+        process.thread_id(),
         u64::from(handle),
         u64::from(request.command_id),
     );
@@ -283,37 +248,35 @@ pub(crate) async fn send_sync_request_from_buffer(
         // lifetimes must stay distinct: Nintendo SDK treats a failed
         // CloseHandle after this request as a fatal invariant violation.
         // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/include/switch/sf/service.h#L195-L209
-        return Ok(trace_completion(SyncRequestResult::Success));
+        return Ok(trace_completion(SyncRequestResult::SessionClosed));
     }
-    if super::control::dispatch_control(process, handle, &target, &request).await? {
+    if super::control::dispatch_control(process, handle, target, &request).await? {
         process.publish_handles()?;
         return Ok(trace_completion(SyncRequestResult::Success));
     }
-    let applet_exit_requested = match target.as_ref() {
+    let applet_exit_requested = match target {
         HorizonIpcObject::Applet(session) => {
-            services::applet_requests_self_exit(session, &request, &hipc)
+            services::applet_requests_self_exit(session, &request, hipc)
         }
         _ => false,
     };
-    let (response, created_handle) = match target.as_ref() {
+    let (response, created_handle) = match target {
         HorizonIpcObject::ServiceManager(manager) => services::dispatch_service_manager(
             process,
             manager,
             services::ServiceManagerRequest::Cmif(request),
             hipc.pid.is_some(),
-            initial_operation_mode,
-            time_environment,
-            host_systems,
+            resources,
         )?,
         HorizonIpcObject::SemanticService(service) => {
             dispatch_service(
                 process,
                 service,
                 request,
-                &hipc,
-                host_systems.diagnostics.file_system_access_log_mode(),
-                host_systems.save_data.as_ref(),
-                &host_systems.system_archives,
+                hipc,
+                resources.system.diagnostics.file_system_access_log_mode(),
+                resources.files.save_data.as_ref(),
+                &resources.files.archives,
             )
             .await?
         }
@@ -321,7 +284,7 @@ pub(crate) async fn send_sync_request_from_buffer(
             services::dispatch_system_settings(process, request, &hipc.receive_statics).await?
         }
         HorizonIpcObject::UserSettings(settings) => {
-            services::dispatch_user_settings(process, settings, request, &hipc).await?
+            services::dispatch_user_settings(process, settings, request, hipc).await?
         }
         HorizonIpcObject::PerformanceManager(manager) => services::dispatch_performance_manager(
             process,
@@ -333,51 +296,60 @@ pub(crate) async fn send_sync_request_from_buffer(
             services::dispatch_performance_session(session, request)?
         }
         HorizonIpcObject::Applet(applet) => {
-            services::dispatch_applet(process, applet, request, &hipc, host_systems).await?
+            services::dispatch_applet(
+                process,
+                applet,
+                request,
+                hipc,
+                &resources.system,
+                &resources.graphics.video,
+                resources.files.save_data.as_ref(),
+            )
+            .await?
         }
         HorizonIpcObject::Account(account) => {
             services::dispatch_account(
                 process,
                 account,
                 request,
-                &hipc,
-                host_systems.user_account_switch_locked,
+                hipc,
+                resources.system.user_account_switch_locked,
             )
             .await?
         }
         HorizonIpcObject::AccountProfile(profile) => {
-            services::dispatch_account_profile(*profile, request, &hipc, false)?
+            services::dispatch_account_profile(*profile, request, hipc, false)?
         }
         HorizonIpcObject::AccountManagerForApplication(manager) => {
             services::dispatch_account_manager_for_application(manager, request)?
         }
-        HorizonIpcObject::Bsd(session) => services::dispatch_bsd(process, session, request, &hipc)?,
-        HorizonIpcObject::Ssl(session) => services::dispatch_ssl(session, request, &hipc)?,
+        HorizonIpcObject::Bsd(session) => services::dispatch_bsd(process, session, request, hipc)?,
+        HorizonIpcObject::Ssl(session) => services::dispatch_ssl(session, request, hipc)?,
         HorizonIpcObject::Multimedia(session) => {
-            services::dispatch_multimedia(session, request, &hipc)?
+            services::dispatch_multimedia(session, request, hipc)?
         }
         HorizonIpcObject::AudioOutManager(session) => {
-            services::dispatch_audio_out_manager(process, session, request, &hipc).await?
+            services::dispatch_audio_out_manager(process, session, request, hipc).await?
         }
         HorizonIpcObject::OpusManager(session) => {
-            services::dispatch_opus_manager(process, session, request, &hipc).await?
+            services::dispatch_opus_manager(process, session, request, hipc).await?
         }
         HorizonIpcObject::PlayReport(session) => {
-            services::dispatch_play_report(process, session, request, &hipc).await?
+            services::dispatch_play_report(process, session, request, hipc).await?
         }
         HorizonIpcObject::OpusDecoder(session) => {
-            services::dispatch_opus_decoder(process, session, request, &hipc).await?
+            services::dispatch_opus_decoder(process, session, request, hipc).await?
         }
         HorizonIpcObject::AudioOut(session) => {
-            services::dispatch_audio_out(process, session, request, &hipc).await?
+            services::dispatch_audio_out(process, session, request, hipc).await?
         }
         HorizonIpcObject::AudioRendererManager(session) => {
             services::dispatch_audio_renderer_manager(
                 process,
                 session,
-                host_systems.audio_backend.as_ref(),
+                resources.audio.backend.as_ref(),
                 request,
-                &hipc,
+                hipc,
             )
             .await?
         }
@@ -385,49 +357,47 @@ pub(crate) async fn send_sync_request_from_buffer(
             services::dispatch_audio_renderer(
                 process,
                 session,
-                host_systems.audio_backend.as_ref(),
+                resources.audio.backend.as_ref(),
                 request,
-                &hipc,
+                hipc,
             )
             .await?
         }
         HorizonIpcObject::AudioDevice(session) => {
-            services::dispatch_audio_device(process, session, request, &hipc).await?
+            services::dispatch_audio_device(process, session, request, hipc).await?
         }
         HorizonIpcObject::Hid(hid) => {
-            services::dispatch_hid(process, hid, &host_systems.hid, request, &hipc).await?
+            services::dispatch_hid(process, hid, &resources.system.hid, request, hipc).await?
         }
         HorizonIpcObject::SharedFont(session) => {
-            services::dispatch_shared_font(process, session, request, &hipc)?
+            services::dispatch_shared_font(process, session, request, hipc)?
         }
         HorizonIpcObject::Irs(session) => {
-            services::dispatch_irs(process, session, request, &hipc, &host_systems.scheduling)
-                .await?
+            services::dispatch_irs(process, session, request, hipc).await?
         }
         HorizonIpcObject::HidAppletResource(resource) => {
             services::dispatch_hid_applet_resource(process, resource, request)?
         }
         HorizonIpcObject::HidActiveVibrationDeviceList(list) => {
-            services::dispatch_hid_active_vibration_device_list(list, request, &hipc)?
+            services::dispatch_hid_active_vibration_device_list(list, request, hipc)?
         }
         HorizonIpcObject::Time(time) => {
-            services::dispatch_time(process, time, request, &hipc, &host_systems.scheduling).await?
+            services::dispatch_time(process, time, request, hipc).await?
         }
         HorizonIpcObject::SystemClock(clock) => {
-            services::dispatch_system_clock(clock, request, &hipc, &host_systems.scheduling).await?
+            services::dispatch_system_clock(clock, request, hipc).await?
         }
         HorizonIpcObject::SteadyClock(clock) => services::dispatch_steady_clock(clock, request)?,
         HorizonIpcObject::TimeZone(timezone) => services::dispatch_timezone(timezone, request)?,
-        HorizonIpcObject::Vi(vi) => services::dispatch_vi(process, vi, request, &hipc).await?,
+        HorizonIpcObject::Vi(vi) => services::dispatch_vi(process, vi, request, hipc).await?,
         HorizonIpcObject::NvDrv(nvdrv) => {
             services::dispatch_nvdrv(
                 process,
                 nvdrv,
                 request,
-                &hipc,
-                host_systems.caller_thread_id,
+                hipc,
+                process.thread_id(),
                 time_environment.clock(),
-                &host_systems.scheduling,
             )
             .await?
         }
@@ -436,8 +406,8 @@ pub(crate) async fn send_sync_request_from_buffer(
                 process,
                 manager,
                 request,
-                &hipc,
-                host_systems.diagnostics.guest_logs_level,
+                hipc,
+                resources.system.diagnostics.guest_logs_level,
             )
             .await?
         }
@@ -446,31 +416,31 @@ pub(crate) async fn send_sync_request_from_buffer(
                 process,
                 logger,
                 request,
-                &hipc,
-                host_systems.diagnostics.guest_logs_level,
+                hipc,
+                resources.system.diagnostics.guest_logs_level,
             )
             .await?
         }
         HorizonIpcObject::ParentalControl(factory) => {
-            services::dispatch_parental_control(process, factory, request, &hipc)?
+            services::dispatch_parental_control(process, factory, request, hipc)?
         }
         HorizonIpcObject::ParentalControlService(service) => {
-            services::dispatch_parental_control_service(None, service, request, &hipc)?
+            services::dispatch_parental_control_service(None, service, request, hipc)?
         }
         HorizonIpcObject::NetworkInterface(manager) => {
-            services::dispatch_network_interface(process, manager, request, &hipc)?
+            services::dispatch_network_interface(process, manager, request, hipc)?
         }
         HorizonIpcObject::ErrorContextWriter(session) => {
-            services::dispatch_error_context_writer(session, request, &hipc)?
+            services::dispatch_error_context_writer(session, request, hipc)?
         }
         HorizonIpcObject::NetworkGeneralService(service) => {
-            services::dispatch_network_general_service(process, None, service, request, &hipc)?
+            services::dispatch_network_general_service(process, None, service, request, hipc)?
         }
         HorizonIpcObject::NetworkRequest(session) => {
-            services::dispatch_network_request(process, false, session, request, &hipc)?
+            services::dispatch_network_request(process, false, session, request, hipc)?
         }
         HorizonIpcObject::SemanticObject(object) => {
-            dispatch_plain_object(process, object, request, &hipc).await?
+            dispatch_plain_object(process, object, request, hipc).await?
         }
     };
     if let Some(service) = trace_service {
@@ -480,7 +450,7 @@ pub(crate) async fn send_sync_request_from_buffer(
             response.len(),
         );
     }
-    process.write_response(&response).await?;
+    process.write_response(response).await?;
     process.publish_handles()?;
     let outcome = if applet_exit_requested {
         SyncRequestResult::AppletExitRequested
@@ -493,7 +463,7 @@ pub(crate) async fn send_sync_request_from_buffer(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SyncRequestResult {
     Success,
-    InvalidHandle,
+    SessionClosed,
     AppletExitRequested,
 }
 

@@ -36,15 +36,7 @@ fn poll<F: Future + Unpin>(future: &mut F, waker: &Waker) -> Poll<F::Output> {
 fn kernel_call(s: &SchedulerState, caller: GuestThreadId, core: u32) {
     let lease = lease(s, core);
     assert_eq!(lease.thread, caller);
-    assert!(
-        s.complete(
-            lease,
-            Completion::KernelCall {
-                interrupt_handled: true
-            }
-        )
-        .unwrap()
-    );
+    s.complete(lease, Completion::Waiting).unwrap();
 }
 
 #[test]
@@ -248,22 +240,19 @@ fn a_registered_pin_wait_survives_native_boundaries_and_blocking_until_unpin() {
         let mut wait = Box::pin(guard.wait_quiescent(Some(allowed)));
         assert!(poll(&mut wait, &waker).is_pending());
         let token = s.register_wait(caller).unwrap().token();
-        s.complete(
-            target_lease,
-            Completion::KernelCall {
-                interrupt_handled: true,
-            },
-        )
-        .unwrap();
         assert!(!guard.is_quiescent(Some(allowed)).unwrap());
         assert!(poll(&mut wait, &waker).is_pending());
         if block {
             s.register_wait(target).unwrap().token();
+            s.complete(target_lease, Completion::Waiting).unwrap();
             assert!(poll(&mut wait, &waker).is_pending());
         }
         assert_eq!(notified.calls.load(Ordering::Relaxed), 0);
         assert_eq!(s.thread(caller).unwrap().active_wait, Some(token));
         s.unpin_thread(target).unwrap();
+        if !block {
+            s.complete(target_lease, Completion::Ready).unwrap();
+        }
         assert_eq!(notified.calls.load(Ordering::Relaxed), 1);
         assert!(matches!(poll(&mut wait, &waker), Poll::Ready(Ok(()))));
         assert_eq!(s.thread(caller).unwrap().active_wait, Some(token));

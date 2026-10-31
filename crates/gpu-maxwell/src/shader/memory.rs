@@ -283,11 +283,11 @@ mod tests {
         assert!(memory.code_generation() > code_generation);
         assert!(!first.is_current(space.memory()));
         let mut readbacks = 0;
-        let mut owner = |ranges: Vec<nixe_memory::AllocationRange>, operation| {
+        let mut owner = |ranges: Vec<nixe_memory::AllocationRange>, mut operation| {
             readbacks += 1;
             memory.write_resolved(&ranges, &[7; 4]).map_err(Arc::new)?;
             memory
-                .apply_resolved_access(&ranges, &operation)
+                .apply_resolved_access(&ranges, &mut operation)
                 .map_err(Arc::new)
         };
         let next = MaxwellShaderMemoryView::new(space.memory(), &mut cache, &mut owner)

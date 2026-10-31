@@ -2,7 +2,7 @@
 //! https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/LDXR--Load-Exclusive-Register-
 //! https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/STXR--Store-Exclusive-Register-
 
-use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState};
+use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot};
 use nixe_cpu::memory::MemoryAccessSize;
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
@@ -87,7 +87,6 @@ fn run(jit: &mut JitThread, state: &mut ThreadState) -> CpuExit {
                 JitRunRequest {
                     state,
                     timer: &Timer,
-                    events: &VcpuEventState::default(),
                 },
             )
             .unwrap()
@@ -335,8 +334,9 @@ fn native_release_acquire_publishes_the_prior_payload() {
         let mut workers = Vec::new();
         for consumer in [false, true] {
             let barrier = barrier.clone();
-            let mut jit = process.create_thread().unwrap();
+            let worker_process = process.clone();
             workers.push(std::thread::spawn(move || {
+                let mut jit = worker_process.create_thread().unwrap();
                 let mut state = state();
                 state.write_x(x(0), 1);
                 state.write_x(x(5), iteration);
@@ -404,8 +404,9 @@ fn competing_native_cores_make_progress_without_lost_updates() {
     ]);
     let mut workers = Vec::new();
     for _ in 0..2 {
-        let mut jit = process.create_thread().unwrap();
+        let worker_process = process.clone();
         workers.push(std::thread::spawn(move || {
+            let mut jit = worker_process.create_thread().unwrap();
             let mut state = state();
             state.write_x(x(0), 10_000);
             assert!(matches!(

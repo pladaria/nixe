@@ -26,11 +26,13 @@ fn modern_output_names_round_trip_volume_without_changing_the_legacy_port_list()
     for auto in [false, true] {
         let (_directory, mut process) = fixture_process_with_svcs(&[0x21; 16]);
         let backend = Arc::new(Backend(AtomicBool::new(true)));
-        let mut dispatcher = support::dispatcher(&process).with_audio_backend(backend);
+        let dispatcher = support::dispatcher(&process).with_audio_backend(backend);
         let manager = process
             .handles()
-            .insert(HorizonIpcObject::AudioRendererManager(
-                crate::AudioRendererManagerSession::new(process.scheduler()),
+            .insert(nixe_horizon::ServiceSession::new(
+                HorizonIpcObject::AudioRendererManager(crate::AudioRendererManagerSession::new(
+                    process.scheduler(),
+                )),
             ))
             .unwrap();
         let mut params = [0; 16];
@@ -39,7 +41,7 @@ fn modern_output_names_round_trip_volume_without_changing_the_legacy_port_list()
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 manager,
                 &command(4, &params, None, None, false, false)
             ),
@@ -49,7 +51,7 @@ fn modern_output_names_round_trip_volume_without_changing_the_legacy_port_list()
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 manager,
                 &command(4, &params, None, None, false, false)
             ),
@@ -64,7 +66,7 @@ fn modern_output_names_round_trip_volume_without_changing_the_legacy_port_list()
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 first,
                 &command(
                     if auto { 7 } else { 1 },
@@ -80,7 +82,7 @@ fn modern_output_names_round_trip_volume_without_changing_the_legacy_port_list()
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 second,
                 &command(
                     if auto { 8 } else { 2 },
@@ -97,7 +99,7 @@ fn modern_output_names_round_trip_volume_without_changing_the_legacy_port_list()
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 first,
                 &command(
                     if auto { 6 } else { 0 },
@@ -114,7 +116,7 @@ fn modern_output_names_round_trip_volume_without_changing_the_legacy_port_list()
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 first,
                 &command(14, &[], None, Some((output.get(), 768)), false, false)
             ),
@@ -131,7 +133,7 @@ fn modern_output_names_round_trip_volume_without_changing_the_legacy_port_list()
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 second,
                 &command(
                     if auto { 8 } else { 2 },
@@ -153,15 +155,19 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
     for auto in [false, true] {
         let (_dir, mut process) = fixture_process_with_svcs(&[0x21; 100]);
         let backend = Arc::new(Backend(AtomicBool::new(true)));
-        let mut dispatcher = support::dispatcher(&process).with_audio_backend(backend.clone());
+        let dispatcher = support::dispatcher(&process).with_audio_backend(backend.clone());
         let manager = nixe_horizon::AudioRendererManagerSession::new(process.scheduler());
         let manager_handle = process
             .handles()
-            .insert(HorizonIpcObject::AudioRendererManager(manager.clone()))
+            .insert(nixe_horizon::ServiceSession::new(
+                HorizonIpcObject::AudioRendererManager(manager.clone()),
+            ))
             .unwrap();
         let another_manager = process
             .handles()
-            .insert(HorizonIpcObject::AudioRendererManager(manager))
+            .insert(nixe_horizon::ServiceSession::new(
+                HorizonIpcObject::AudioRendererManager(manager),
+            ))
             .unwrap();
         let mut params = [0xa5; 16];
         params[..4].copy_from_slice(b"bad!");
@@ -169,7 +175,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 manager_handle,
                 &command(4, &params, None, None, false, false)
             ),
@@ -178,7 +184,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 manager_handle,
                 &command(4, &[], None, None, false, false)
             ),
@@ -188,7 +194,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 manager_handle,
                 &command(4, &params, None, None, false, false)
             ),
@@ -198,14 +204,15 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert!(matches!(
             process
                 .handles()
-                .lookup_as::<HorizonIpcObject>(device)
+                .lookup_as::<crate::ServiceSession>(device)
+                .map(|session| std::sync::Arc::new(session.object().clone()))
                 .as_deref(),
             Some(HorizonIpcObject::AudioDevice(_))
         ));
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 another_manager,
                 &command(2, &2_u64.to_le_bytes(), None, None, false, false)
             ),
@@ -231,7 +238,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
             assert_eq!(
                 call(
                     &mut process,
-                    &mut dispatcher,
+                    &dispatcher,
                     session,
                     &command(
                         if auto { 6 } else { 0 },
@@ -260,7 +267,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 device,
                 &command(
                     if auto { 6 } else { 0 },
@@ -277,7 +284,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 device,
                 &command(
                     if auto { 10 } else { 3 },
@@ -293,7 +300,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 device,
                 &command(
                     if auto { 10 } else { 3 },
@@ -310,7 +317,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 device,
                 &command(5, &[], None, None, false, false)
             ),
@@ -323,7 +330,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 device,
                 &command(
                     if auto { 7 } else { 1 },
@@ -339,7 +346,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 legacy_device,
                 &command(
                     if auto { 8 } else { 2 },
@@ -358,7 +365,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 device,
                 &command(
                     if auto { 7 } else { 1 },
@@ -374,7 +381,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 legacy_device,
                 &command(
                     if auto { 8 } else { 2 },
@@ -391,7 +398,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 device,
                 &command(
                     if auto { 7 } else { 1 },
@@ -407,7 +414,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 device,
                 &command(
                     if auto { 8 } else { 2 },
@@ -426,7 +433,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 legacy_device,
                 &command(
                     if auto { 8 } else { 2 },
@@ -443,7 +450,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 device,
                 &command(
                     if auto { 8 } else { 2 },
@@ -459,7 +466,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 device,
                 &command(4, &[], None, None, false, false)
             ),
@@ -477,7 +484,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
             assert_eq!(
                 call(
                     &mut process,
-                    &mut dispatcher,
+                    &dispatcher,
                     device,
                     &command(command_id, &[], None, None, false, false)
                 ),
@@ -496,7 +503,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 device,
                 &command(11, &[], None, None, false, false)
             ),
@@ -513,7 +520,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 device,
                 &command(14, &[], None, Some((output.get(), 768)), false, false)
             ),
@@ -527,7 +534,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 device,
                 &command(13, &[], None, Some((output.get(), 256)), false, false)
             ),
@@ -537,16 +544,13 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         // CMIF clones retain device state and notification identity.
         let mut clone_request = command(2, &[], None, None, false, false);
         put_u32(&mut clone_request, 0, 5);
-        assert_eq!(
-            call(&mut process, &mut dispatcher, device, &clone_request),
-            0
-        );
+        assert_eq!(call(&mut process, &dispatcher, device, &clone_request), 0);
         let cloned = handle(&process);
         process.handles().close(device).unwrap();
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 cloned,
                 &command(5, &[], None, None, false, false)
             ),
@@ -557,7 +561,7 @@ fn audio_device_ipc_shares_real_gains_filters_revisions_and_separates_notificati
         let request = command(5, &[], None, None, false, false);
         write_guest_bytes(&process, process.main_thread().tls_base, &request);
         process.main_thread().registers().write_w(x(0), cloned);
-        let failure = dispatch_next(&mut process, &mut dispatcher);
+        let failure = dispatch_next(&mut process, &dispatcher);
         assert!(matches!(failure, ExceptionHandlingResult::Fault(_)));
         assert!(format!("{failure:?}").contains("shut down"));
     }

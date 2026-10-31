@@ -1719,12 +1719,12 @@ fn effective_crop(crop: CropRect, width: u32, height: u32) -> CropRect {
     }
 }
 
-pub(crate) fn encode_native_window(binder_id: i32) -> [u8; 0x3c] {
+pub(crate) fn encode_native_window(binder_id: i32) -> Vec<u8> {
     // NativeWindow contains a complete flattened Binder handle and an object
     // offset table. Reading only the ID at payload offset 8 (as libnx does)
     // misses the fields required by Android Parcel::readStrongBinder.
     // https://switchbrew.org/wiki/Display_services#NativeWindow
-    let mut parcel = [0_u8; 0x3c];
+    let mut parcel = vec![0_u8; 0x3c];
     parcel[0..4].copy_from_slice(&0x28_u32.to_le_bytes());
     parcel[4..8].copy_from_slice(&16_u32.to_le_bytes());
     parcel[8..12].copy_from_slice(&4_u32.to_le_bytes());

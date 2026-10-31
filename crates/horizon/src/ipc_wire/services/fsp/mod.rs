@@ -117,20 +117,19 @@ mod tests {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
-    fn decode_request(command_id: u32) -> (HipcRequest<'static>, CmifRequest<'static>) {
+    fn decode_request(command_id: u32) -> HipcRequest<'static> {
         let command = Box::leak(Box::new([0_u8; COMMAND_BUFFER_SIZE]));
         put_u32(command, 0, 4);
         put_u32(command, 4, 8);
         put_u32(command, 16, 0x4943_4653);
         put_u32(command, 24, command_id);
-        let hipc = HipcRequest::decode(command).unwrap();
-        let request = CmifRequest::decode(&hipc, false).unwrap();
-        (hipc, request)
+        HipcRequest::decode(command).unwrap()
     }
 
     #[test]
     fn filesystem_proxy_decodes_the_sd_card_open_command() {
-        let (hipc, request) = decode_request(18);
+        let hipc = decode_request(18);
+        let request = CmifRequest::decode(&hipc, false).unwrap();
         assert_eq!(
             decode_root_request(&request, &hipc).unwrap(),
             Some(IpcRequest::OpenSdCardFileSystem)
@@ -139,7 +138,8 @@ mod tests {
 
     #[test]
     fn filesystem_proxy_decodes_global_access_log_mode_as_a_scalar_query() {
-        let (hipc, request) = decode_request(1005);
+        let hipc = decode_request(1005);
+        let request = CmifRequest::decode(&hipc, false).unwrap();
         assert_eq!(
             decode_root_request(&request, &hipc).unwrap(),
             Some(IpcRequest::GetGlobalAccessLogMode)
@@ -148,7 +148,8 @@ mod tests {
 
     #[test]
     fn filesystem_proxy_decodes_current_process_data_storage_open() {
-        let (hipc, request) = decode_request(200);
+        let hipc = decode_request(200);
+        let request = CmifRequest::decode(&hipc, false).unwrap();
         assert_eq!(
             decode_root_request(&request, &hipc).unwrap(),
             Some(IpcRequest::OpenPrimaryStorage)

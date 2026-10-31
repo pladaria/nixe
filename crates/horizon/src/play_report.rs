@@ -2,7 +2,7 @@
 //! https://github.com/eden-emulator/mirror/blob/master/src/core/reporter.cpp
 use std::{
     io::Write,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -33,13 +33,13 @@ impl PlayReportSession {
             .as_nanos() as u64;
         Ok(*ID.get_or_init(|| timestamp))
     }
-    pub(crate) fn save(
+    pub(crate) fn create(
         &self,
         command: u32,
         process: u64,
         inline: &[u8],
-        parts: [&[u8]; 2],
-    ) -> std::io::Result<PathBuf> {
+        sizes: [u64; 2],
+    ) -> std::io::Result<(std::fs::File, PathBuf)> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         std::fs::create_dir_all(self.directory.as_ref())?;
         let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -48,29 +48,17 @@ impl PlayReportSession {
             Self::system_session_id()?,
             std::process::id()
         ));
-        Self::write(&path, command, process, inline, parts)?;
-        Ok(path)
-    }
-    fn write(
-        path: &Path,
-        command: u32,
-        process: u64,
-        inline: &[u8],
-        parts: [&[u8]; 2],
-    ) -> std::io::Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(path)?;
+            .open(&path)?;
         file.write_all(b"NXPR0001")?;
         file.write_all(&command.to_le_bytes())?;
         file.write_all(&process.to_le_bytes())?;
-        for bytes in [inline, parts[0], parts[1]] {
-            file.write_all(&(bytes.len() as u64).to_le_bytes())?;
+        for size in [inline.len() as u64, sizes[0], sizes[1]] {
+            file.write_all(&size.to_le_bytes())?;
         }
-        for bytes in [inline, parts[0], parts[1]] {
-            file.write_all(bytes)?;
-        }
-        file.flush()
+        file.write_all(inline)?;
+        Ok((file, path))
     }
 }

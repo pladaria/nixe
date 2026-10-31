@@ -66,7 +66,7 @@ impl std::error::Error for AudioError {}
 
 /// A real device owns its stream until drop. Its callback consumes PCM through
 /// AudioFeed; neither service calls nor elapsed time complete submitted buffers.
-pub trait AudioDevice: Send {}
+pub trait AudioDevice: Send + Sync {}
 
 pub trait AudioBackend: Debug + Send + Sync {
     /// Application speaker layout supported by this backend. SDL may convert it

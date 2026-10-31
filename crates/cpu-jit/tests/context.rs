@@ -1,5 +1,5 @@
 //! Native process execution and complete architectural context ownership.
-use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot, VcpuEventState};
+use nixe_cpu::execution::{ArchitecturalTimer, CpuExit, TimerSnapshot};
 use nixe_cpu::platform::TargetPlatform;
 use nixe_cpu::profile::ProcessCpuContext;
 use nixe_cpu::state::a64::{A64GeneralRegister, A64Register, A64State};
@@ -19,7 +19,7 @@ impl ArchitecturalTimer for FixedTimer {
         }
     }
 }
-fn fixture(code: &[u32]) -> (Arc<AddressSpace>, JitThread) {
+fn process_fixture(code: &[u32]) -> (Arc<AddressSpace>, Arc<JitProcess>) {
     let machine = Machine::new(2 * PAGE_SIZE).unwrap();
     let account = machine.account(2 * PAGE_SIZE).unwrap();
     let executable = account.allocate(PAGE_SIZE).unwrap();
@@ -56,6 +56,10 @@ fn fixture(code: &[u32]) -> (Arc<AddressSpace>, JitThread) {
         19_200_000,
     )
     .unwrap();
+    (memory, process)
+}
+fn fixture(words: &[u32]) -> (Arc<AddressSpace>, JitThread) {
+    let (memory, process) = process_fixture(words);
     (memory, process.create_thread().unwrap())
 }
 fn x(index: u8) -> A64Register {
@@ -97,7 +101,6 @@ fn run(jit: &mut JitThread, state: &mut ThreadState) -> nixe_cpu::execution::Exe
         JitRunRequest {
             state,
             timer: &FixedTimer,
-            events: &VcpuEventState::default(),
         },
     )
     .unwrap()
@@ -160,27 +163,31 @@ fn data_observation_keeps_native_execution_running_until_preemption() {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
     // ADD X0,#1; STR X0,[X1]; B back to ADD. The guest publishes readiness.
-    let (memory, mut jit) = fixture(&[0x91000400, 0xf9000020, 0x17fffffe]);
+    let (memory, process) = process_fixture(&[0x91000400, 0xf9000020, 0x17fffffe]);
     let mut state: ThreadState = a64_state().into();
     state.write_x(x(1), 0x2008);
     let ranges = memory
         .capture(GuestVirtualAddress::new(0x2000), 4, MemoryPermissions::READ)
         .unwrap();
-    let control = jit.control();
+    let (ready, native_ready) = mpsc::channel();
     let (send, completed) = mpsc::channel();
     let worker = std::thread::spawn(move || {
+        let mut jit = process.create_thread().unwrap();
+        ready.send(jit.control()).unwrap();
         let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
         let report = jit.run_slice(
             &mut worker,
             JitRunRequest {
                 state: &mut state,
                 timer: &FixedTimer,
-                events: &VcpuEventState::default(),
             },
         );
+        state.leave_core();
+        drop(jit);
         send.send((report, state)).unwrap();
         worker.finish().unwrap();
     });
+    let control = native_ready.recv_timeout(Duration::from_secs(5)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while memory
         .read_value(GuestVirtualAddress::new(0x2008), 8)
@@ -234,10 +241,12 @@ fn data_observation_keeps_native_execution_running_until_preemption() {
 fn scheduler_interrupt_exits_direct_and_indirect_native_loops() {
     for branch in [0x17fffffe, 0xd61f0040] {
         // B -8 / BR X2.
-        let (memory, mut jit) = fixture(&[0x91000400, 0xf9000020, branch]);
-        let control = jit.control();
+        let (memory, process) = process_fixture(&[0x91000400, 0xf9000020, branch]);
+        let (ready, native_ready) = std::sync::mpsc::channel();
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
+            let mut jit = process.create_thread().unwrap();
+            ready.send(jit.control()).unwrap();
             let mut state: ThreadState = pattern(5).into();
             state.write_x(x(1), 0x2000);
             state.write_x(x(2), CODE.get());
@@ -249,13 +258,17 @@ fn scheduler_interrupt_exits_direct_and_indirect_native_loops() {
                     JitRunRequest {
                         state: &mut state,
                         timer: &FixedTimer,
-                        events: &VcpuEventState::default(),
                     },
                 )
                 .unwrap();
+            state.leave_core();
+            drop(jit);
             tx.send((report, state, expected)).unwrap();
             worker.finish().unwrap();
         });
+        let control = native_ready
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while memory
             .read_value(GuestVirtualAddress::new(0x2000), 8)
@@ -319,7 +332,6 @@ fn complete_context_survives_alternating_guests_and_migrating_between_cores() {
                 JitRunRequest {
                     state: &mut states[guest],
                     timer: &FixedTimer,
-                    events: &VcpuEventState::default(),
                 },
             )
             .unwrap();
@@ -339,7 +351,6 @@ fn failed_native_invocation_has_no_fabricated_context_and_cannot_resume() {
         JitRunRequest {
             state: &mut state,
             timer: &FixedTimer,
-            events: &VcpuEventState::default(),
         },
     )
     .unwrap();
@@ -350,7 +361,6 @@ fn failed_native_invocation_has_no_fabricated_context_and_cannot_resume() {
             JitRunRequest {
                 state: &mut state,
                 timer: &FixedTimer,
-                events: &VcpuEventState::default(),
             },
         )
         .unwrap_err();
@@ -363,7 +373,6 @@ fn failed_native_invocation_has_no_fabricated_context_and_cannot_resume() {
             JitRunRequest {
                 state: &mut state,
                 timer: &FixedTimer,
-                events: &VcpuEventState::default(),
             },
         )
         .unwrap_err();
@@ -377,7 +386,7 @@ fn ordinary_svc_keeps_complete_context_native_and_snapshots_are_owned() {
     let (_memory, mut jit) = fixture(&[0x91000400, 0xd4000001]); // ADD X0,#1; SVC
     let mut state: ThreadState = pattern(5).into();
     let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
-    let events = VcpuEventState::default();
+
     let mut retained = None;
     for turn in 0..24 {
         state.set_pc(CODE.get());
@@ -389,7 +398,6 @@ fn ordinary_svc_keeps_complete_context_native_and_snapshots_are_owned() {
                 JitRunRequest {
                     state: &mut state,
                     timer: &FixedTimer,
-                    events: &events,
                 },
             )
             .unwrap();
@@ -419,14 +427,13 @@ fn replacing_an_unexported_owner_is_rejected_without_corrupting_either_guest() {
     let mut first: ThreadState = pattern(5).into();
     let mut second: ThreadState = pattern(10).into();
     let mut worker = nixe_cpu_direct_memory::NativeWorker::default();
-    let events = VcpuEventState::default();
+
     let mut run = |state: &mut ThreadState| {
         jit.run_slice(
             &mut worker,
             JitRunRequest {
                 state,
                 timer: &FixedTimer,
-                events: &events,
             },
         )
     };
@@ -453,7 +460,6 @@ fn stopped_native_owner_retains_core_monitor_and_backing_until_materialized() {
         JitRunRequest {
             state: &mut state,
             timer: &FixedTimer,
-            events: &VcpuEventState::default(),
         },
     )
     .unwrap();

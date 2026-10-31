@@ -980,7 +980,7 @@ fn neighboring_cpu_pages_share_one_versioned_native_image_download() {
                 .memory()
                 .prepare_device_access(
                     backing.pin(offset, 64).unwrap(),
-                    nixe_memory::AccessOperation::Read,
+                    nixe_memory::AccessOperation::Read(Vec::new()),
                 )
                 .unwrap();
             cache.queue_device_access(request).unwrap();

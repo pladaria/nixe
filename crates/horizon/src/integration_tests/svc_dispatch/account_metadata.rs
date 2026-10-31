@@ -3,10 +3,12 @@ use super::*;
 #[test]
 fn user_registration_is_unavailable_and_validates_the_pid_placeholder() {
     let (_directory, mut process) = fixture_process(&[svc(0x21); 2]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let handle = process
         .handles()
-        .insert(HorizonIpcObject::Account(Default::default()))
+        .insert(nixe_horizon::ServiceSession::new(
+            HorizonIpcObject::Account(Default::default()),
+        ))
         .unwrap();
     let tls = process.main_thread().tls_base;
     let mut request = [0; 0x100];
@@ -20,7 +22,7 @@ fn user_registration_is_unavailable_and_validates_the_pid_placeholder() {
         write_guest_bytes(&process, tls, &request);
         process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
@@ -43,10 +45,12 @@ fn user_registration_is_unavailable_and_validates_the_pid_placeholder() {
 #[test]
 fn last_opened_user_returns_the_application_launch_uid() {
     let (_directory, mut process) = fixture_process(&[svc(0x21)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let handle = process
         .handles()
-        .insert(HorizonIpcObject::Account(Default::default()))
+        .insert(nixe_horizon::ServiceSession::new(
+            HorizonIpcObject::Account(Default::default()),
+        ))
         .unwrap();
     let tls = process.main_thread().tls_base;
     let mut request = [0; 0x100];
@@ -57,7 +61,7 @@ fn last_opened_user_returns_the_application_launch_uid() {
     write_guest_bytes(&process, tls, &request);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
@@ -72,10 +76,12 @@ fn last_opened_user_returns_the_application_launch_uid() {
 #[test]
 fn user_existence_distinguishes_the_local_uid_from_absent_users() {
     let (_directory, mut process) = fixture_process(&[svc(0x21); 3]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let handle = process
         .handles()
-        .insert(HorizonIpcObject::Account(Default::default()))
+        .insert(nixe_horizon::ServiceSession::new(
+            HorizonIpcObject::Account(Default::default()),
+        ))
         .unwrap();
     let tls = process.main_thread().tls_base;
     for uid in [1_u128, 2, 0] {
@@ -88,7 +94,7 @@ fn user_existence_distinguishes_the_local_uid_from_absent_users() {
         write_guest_bytes(&process, tls, &request);
         process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
@@ -103,10 +109,12 @@ fn user_existence_distinguishes_the_local_uid_from_absent_users() {
 fn account_switch_lock_uses_application_policy_instead_of_user_count() {
     for locked in [false, true] {
         let (_directory, mut process) = fixture_process(&[svc(0x21); 2]);
-        let mut dispatcher = support::dispatcher(&process).with_user_account_switch_lock(locked);
+        let dispatcher = support::dispatcher(&process).with_user_account_switch_lock(locked);
         let handle = process
             .handles()
-            .insert(HorizonIpcObject::Account(Default::default()))
+            .insert(nixe_horizon::ServiceSession::new(
+                HorizonIpcObject::Account(Default::default()),
+            ))
             .unwrap();
         let tls = process.main_thread().tls_base;
         let mut request = [0; 0x100];
@@ -117,7 +125,7 @@ fn account_switch_lock_uses_application_policy_instead_of_user_count() {
         write_guest_bytes(&process, tls, &request);
         process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
@@ -130,7 +138,7 @@ fn account_switch_lock_uses_application_policy_instead_of_user_count() {
         write_guest_bytes(&process, tls, &request);
         process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
@@ -140,10 +148,12 @@ fn account_switch_lock_uses_application_policy_instead_of_user_count() {
 #[test]
 fn application_info_v2_requires_a_pid_and_zero_placeholder() {
     let (_directory, mut process) = fixture_process(&[svc(0x21); 2]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let handle = process
         .handles()
-        .insert(HorizonIpcObject::Account(Default::default()))
+        .insert(nixe_horizon::ServiceSession::new(
+            HorizonIpcObject::Account(Default::default()),
+        ))
         .unwrap();
     let tls = process.main_thread().tls_base;
     let mut request = [0; 0x100];
@@ -155,7 +165,7 @@ fn application_info_v2_requires_a_pid_and_zero_placeholder() {
     write_guest_bytes(&process, tls, &request);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
@@ -164,7 +174,7 @@ fn application_info_v2_requires_a_pid_and_zero_placeholder() {
     write_guest_bytes(&process, tls, &request);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
@@ -176,10 +186,12 @@ fn application_info_v2_requires_a_pid_and_zero_placeholder() {
 #[test]
 fn account_pointer_budget_and_enumeration_agree_with_the_opened_profile() {
     let (_directory, mut process) = fixture_process(&[svc(0x21); 5]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let handle = process
         .handles()
-        .insert(HorizonIpcObject::Account(Default::default()))
+        .insert(nixe_horizon::ServiceSession::new(
+            HorizonIpcObject::Account(Default::default()),
+        ))
         .unwrap();
     let tls = process.main_thread().tls_base;
     let destination = process
@@ -195,7 +207,7 @@ fn account_pointer_budget_and_enumeration_agree_with_the_opened_profile() {
     write_guest_bytes(&process, tls, &query);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert!(read_guest_u32(&process, tls.checked_add(32).unwrap()) >= 128);
@@ -210,7 +222,7 @@ fn account_pointer_budget_and_enumeration_agree_with_the_opened_profile() {
         write_guest_bytes(&process, tls, &list);
         process.main_thread().registers().write_w(x(0), handle);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);
@@ -227,14 +239,15 @@ fn account_pointer_budget_and_enumeration_agree_with_the_opened_profile() {
     write_guest_bytes(&process, tls, &open);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     let profile = read_guest_u32(&process, tls.checked_add(12).unwrap());
     assert!(matches!(
         process
             .handles()
-            .lookup_as::<HorizonIpcObject>(profile)
+            .lookup_as::<crate::ServiceSession>(profile)
+            .map(|session| std::sync::Arc::new(session.object().clone()))
             .as_deref(),
         Some(HorizonIpcObject::AccountProfile(_))
     ));
@@ -246,7 +259,7 @@ fn account_pointer_budget_and_enumeration_agree_with_the_opened_profile() {
     write_guest_bytes(&process, tls, &get);
     process.main_thread().registers().write_w(x(0), profile);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, tls.checked_add(24).unwrap()), 0);

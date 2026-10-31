@@ -159,31 +159,36 @@ impl OpusManagerSession {
 }
 
 impl OpusState {
+    pub(crate) fn pcm_capacity(&self, capacity: usize) -> usize {
+        let channels = self.params.channels as usize;
+        let max_frames = self.params.sample_rate as usize / 1000
+            * if self.params.large_frames { 120 } else { 40 };
+        max_frames.min(capacity / (channels * 2)) * channels * 2
+    }
     pub(crate) fn decode(
         &self,
         packet: &[u8],
         capacity: usize,
         reset: bool,
-    ) -> Result<(Vec<i16>, u32, u64), HorizonIpcResult> {
+    ) -> Result<(Vec<u8>, u32, u64), HorizonIpcResult> {
         let channels = self.params.channels as usize;
-        let max_frames = self.params.sample_rate as usize / 1000
-            * if self.params.large_frames { 120 } else { 40 };
-        let frames = max_frames.min(capacity / (channels * 2));
+        let frames = self.pcm_capacity(capacity) / (channels * 2);
         if frames == 0 {
             return Err(BUFFER_TOO_SMALL);
         }
-        let mut pcm = vec![0_i16; frames * channels];
+        let mut pcm = vec![0_u8; frames * channels * 2];
+        let samples: &mut [i16] = bytemuck::cast_slice_mut(&mut pcm);
         let mut decoder = self.decoder.lock().unwrap();
         let start = Instant::now();
         let frames = decoder
-            .decode(packet, &mut pcm, reset)
+            .decode(packet, samples, reset)
             .map_err(codec_error)?;
         let elapsed = start.elapsed().as_micros() as u64;
-        pcm.truncate(frames * channels);
         // Guest PCM is little endian; this is a no-op on supported Linux hosts.
-        for sample in &mut pcm {
+        for sample in &mut samples[..frames * channels] {
             *sample = sample.to_le();
         }
+        pcm.truncate(frames * channels * 2);
         Ok((pcm, frames as u32, elapsed))
     }
 }
@@ -291,7 +296,7 @@ mod tests {
         let large = manager.open(parameters, work, 65536).unwrap();
         let (pcm, samples, _) = large.state.decode(&packet, 11520, true).unwrap();
         assert_eq!(samples, 5760);
-        assert_eq!(pcm.len(), 5760);
+        assert_eq!(pcm.len(), 11520);
         assert!(pcm.iter().all(|&sample| sample == 0));
         assert_eq!(
             large.state.decode(&[0xff], 11520, false).unwrap_err(),

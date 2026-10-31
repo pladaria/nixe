@@ -9,7 +9,6 @@ pub(super) use chrono_tz::OffsetComponents;
 pub(super) use nixe_memory::GuestVirtualAddress;
 pub(super) use nixe_runtime::TransferMemoryObject;
 
-pub(super) use crate::ipc_wire::HostSystems;
 pub(super) use crate::ipc_wire::buffer::{
     one_auto_select_input, one_auto_select_output, one_receive_buffer, one_send_buffer,
 };
@@ -22,12 +21,11 @@ pub(super) use crate::ipc_wire::message::{
     BufferDescriptor, CmifRequest, CmifResponse, DomainRequest, HipcRequest, ReceiveStatics,
     SendStaticDescriptor,
 };
+pub(super) use crate::ipc_wire::resources::ServiceResources;
 pub(super) use crate::ipc_wire::{
     IpcWireError, UnsupportedServiceOperation, unsupported_service_command,
 };
-pub(super) use crate::nvdrv::{
-    NvDrvFileDescriptor, NvDrvIoctlOutcome, NvDrvService, NvDrvServiceError,
-};
+pub(super) use crate::nvdrv::{NvDrvFileDescriptor, NvDrvIoctlOutcome};
 pub(super) use crate::object::{
     AccountObject, AppletLaunchParameterKind, AppletObject, AppletProxyKind,
     AppletStorageAccessError, CreateAppletStorageError, CreateLibraryAppletError, LibraryAppletId,
@@ -42,8 +40,8 @@ pub(super) use crate::{
     NvDrvSession, OperationMode, ParentalControlFactorySession, ParentalControlSession,
     PerformanceManagerSession, PerformanceSession, ServiceManagerSession, SslSession,
     SteadyClockSession, SystemClockKind, SystemClockSession, SystemLanguage, SystemSettingsSession,
-    TimeEnvironment, TimeServiceSession, TimeZoneServiceSession, UserSettingsSession, ViObjectKind,
-    ViServiceKind, ViSession, VideoSystem,
+    TimeServiceSession, TimeZoneServiceSession, UserSettingsSession, ViObjectKind, ViServiceKind,
+    ViSession, VideoSystem,
 };
 
 pub(super) use super::response::semantic_success;

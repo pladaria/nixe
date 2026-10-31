@@ -4,12 +4,11 @@ use super::*;
 fn applet_proxy_uses_the_copied_process_object_instead_of_the_handle_encoding() {
     for variant in 0..4 {
         let (_directory, mut process) = fixture_process(&[svc(0x21); 2]);
-        let mut dispatcher = support::dispatcher(&process);
+        let dispatcher = support::dispatcher(&process);
         let handle = process
             .handles()
-            .insert(HorizonIpcObject::Applet(crate::AppletSession::new(
-                process.scheduler(),
-                Default::default(),
+            .insert(nixe_horizon::ServiceSession::new(HorizonIpcObject::Applet(
+                crate::AppletSession::new(process.scheduler(), Default::default()),
             )))
             .unwrap();
         let owner = match variant {
@@ -34,7 +33,7 @@ fn applet_proxy_uses_the_copied_process_object_instead_of_the_handle_encoding() 
         write_guest_bytes(&process, tls, &bytes);
         write_abi_register(&process, 0, u64::from(handle));
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         let root = read_guest_u32(&process, tls.checked_add(32).unwrap());
@@ -50,7 +49,7 @@ fn applet_proxy_uses_the_copied_process_object_instead_of_the_handle_encoding() 
         write_guest_bytes(&process, tls, &bytes);
         write_abi_register(&process, 0, u64::from(handle));
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
@@ -71,12 +70,14 @@ fn applet_proxy_uses_the_copied_process_object_instead_of_the_handle_encoding() 
 fn driver_initialization_uses_the_copied_process_object_instead_of_the_handle_encoding() {
     for variant in 0..4 {
         let (_directory, mut process) = fixture_process(&[svc(0x15), svc(0x21)]);
-        let mut dispatcher = support::dispatcher(&process);
+        let dispatcher = support::dispatcher(&process);
         let handle = process
             .handles()
-            .insert(HorizonIpcObject::NvDrv(crate::NvDrvSession::new(
-                process.memory().account().machine().clone(),
-                process.scheduler(),
+            .insert(nixe_horizon::ServiceSession::new(HorizonIpcObject::NvDrv(
+                crate::NvDrvSession::new(
+                    process.memory().account().machine().clone(),
+                    process.scheduler(),
+                ),
             )))
             .unwrap();
         let owner = match variant {
@@ -112,7 +113,7 @@ fn driver_initialization_uses_the_copied_process_object_instead_of_the_handle_en
         write_abi_register(&process, 2, 4096);
         write_abi_register(&process, 3, 0);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(read_abi_register(&process, 0), 0);
@@ -130,7 +131,7 @@ fn driver_initialization_uses_the_copied_process_object_instead_of_the_handle_en
         write_guest_bytes(&process, tls, &bytes);
         write_abi_register(&process, 0, u64::from(handle));
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
@@ -177,11 +178,11 @@ fn native_hle_user_buffers_accept_receive_metadata_straddling_the_command_prefix
 
 fn firmware_receive_list(mode: u32, list_offset: usize, user_buffer: bool, data_words: u32) {
     let (_directory, mut process) = fixture_process(&[svc(if user_buffer { 0x22 } else { 0x21 })]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let session = process
         .handles()
-        .insert(HorizonIpcObject::SystemSettings(
-            crate::SystemSettingsSession::new(),
+        .insert(nixe_horizon::ServiceSession::new(
+            HorizonIpcObject::SystemSettings(crate::SystemSettingsSession::new()),
         ))
         .unwrap();
     let output = process.main_thread().stack_bottom;
@@ -219,7 +220,7 @@ fn firmware_receive_list(mode: u32, list_offset: usize, user_buffer: bool, data_
         write_abi_register(&process, 0, u64::from(session));
     }
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_abi_register(&process, 0), 0);
@@ -243,7 +244,7 @@ fn guest_ipc_injects_the_actual_sending_process_id_in_both_directions() {
             .unwrap() as u64
     };
     let (directory, mut process) = fixture_process(&[svc(0x21)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let path = directory.path().join("server.nro");
     fs::write(&path, synthetic_nro(&[svc(0x43); 2])).unwrap();
     let plan = Launcher::build(LauncherInput::new(path)).unwrap();
@@ -254,9 +255,9 @@ fn guest_ipc_injects_the_actual_sending_process_id_in_both_directions() {
         .main_thread()
         .registers()
         .set_pc(server.entry_module().entry_address() + 0x80);
-    let affinity = process.coordinator_mut().scheduler().profile().all_cores();
+    let affinity = process.driver_mut().scheduler().profile().all_cores();
     let server_id = process
-        .coordinator_mut()
+        .driver_mut()
         .register_process(
             server,
             nixe_runtime::ProcessRegistration {
@@ -266,11 +267,7 @@ fn guest_ipc_injects_the_actual_sending_process_id_in_both_directions() {
             },
         )
         .unwrap();
-    let server = process
-        .coordinator_mut()
-        .process(server_id)
-        .unwrap()
-        .clone();
+    let server = process.driver_mut().process(server_id).unwrap().clone();
     server
         .scheduler()
         .set_activity(server.main_thread_id(), true)
@@ -292,7 +289,7 @@ fn guest_ipc_injects_the_actual_sending_process_id_in_both_directions() {
     write_guest_bytes(&process, tls, &request);
     write_abi_register(&process, 0, u64::from(client_handle));
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Suspended
     ));
     process
@@ -309,7 +306,7 @@ fn guest_ipc_injects_the_actual_sending_process_id_in_both_directions() {
         .scheduler()
         .set_activity(server.main_thread_id(), false)
         .unwrap();
-    let (thread, outcome) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+    let (thread, outcome) = dispatch_scheduled_next(&mut process, &dispatcher);
     assert_eq!(thread, server.main_thread_id());
     assert!(matches!(outcome, ExceptionHandlingResult::Resumed));
     assert_eq!(read_abi_register(&server, 0), 0);
@@ -347,7 +344,7 @@ fn guest_ipc_injects_the_actual_sending_process_id_in_both_directions() {
     for (index, value) in [(1, 0), (2, 0), (3, u64::from(server_handle)), (4, 0)] {
         write_abi_register(&server, index, value);
     }
-    let (thread, outcome) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+    let (thread, outcome) = dispatch_scheduled_next(&mut process, &dispatcher);
     assert_eq!(thread, server.main_thread_id());
     assert!(matches!(outcome, ExceptionHandlingResult::Resumed));
     assert_eq!(
@@ -363,9 +360,7 @@ fn guest_ipc_injects_the_actual_sending_process_id_in_both_directions() {
         .scheduler()
         .set_activity(process.main_thread_id(), false)
         .unwrap();
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     assert_eq!(read_abi_register(&process, 0), 0);
     let reply_pid = read_pid(&process, tls);
     let returned_thread = read_guest_u32(&process, tls.checked_add(20).unwrap());
@@ -385,13 +380,13 @@ fn guest_ipc_injects_the_actual_sending_process_id_in_both_directions() {
         (request_pid, reply_pid),
         (process.process_id(), server.process_id())
     );
-    process.coordinator_mut().remove_process(server_id).unwrap();
+    process.driver_mut().remove_process(server_id).unwrap();
 }
 
 #[test]
 fn failed_guest_receive_returns_its_transfer_error_to_the_native_client() {
     let (_directory, mut process) = fixture_process(&[svc(0x21)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let handle = process.handles().insert(client).unwrap();
     let mut bytes = [0; 0x100];
@@ -399,16 +394,14 @@ fn failed_guest_receive_returns_its_transfer_error_to_the_native_client() {
     write_guest_bytes(&process, process.main_thread().tls_base, &bytes);
     write_abi_register(&process, 0, u64::from(handle));
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Suspended
     ));
     let receive = server.receive().unwrap();
     receive.fail(nixe_runtime::SessionError::TransferFailed(
         HorizonKernelResult::OUT_OF_HANDLES.raw(),
     ));
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     assert_eq!(
         read_abi_register(&process, 0),
         u64::from(HorizonKernelResult::OUT_OF_HANDLES.raw())
@@ -418,7 +411,7 @@ fn failed_guest_receive_returns_its_transfer_error_to_the_native_client() {
 #[test]
 fn failed_incoming_handle_transfer_completes_the_client_and_frees_the_session() {
     let (_directory, mut process) = fixture_process(&[svc(0x43); 2]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let handle = process.handles().insert(server.clone()).unwrap();
     let mut remaining = None;
@@ -459,7 +452,7 @@ fn failed_incoming_handle_transfer_completes_the_client_and_frees_the_session() 
         write_abi_register(&process, index, value);
     }
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
@@ -483,7 +476,7 @@ fn failed_incoming_handle_transfer_completes_the_client_and_frees_the_session() 
         write_abi_register(&process, index, value);
     }
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_abi_register(&process, 0), 0);
@@ -494,7 +487,7 @@ fn failed_incoming_handle_transfer_completes_the_client_and_frees_the_session() 
 fn native_user_buffer_transport_checks_the_captured_extent_against_receiver_capacity() {
     for words in [8, 300] {
         let (directory, mut process) = fixture_process(&[svc(0x22)]);
-        let mut dispatcher = support::dispatcher(&process);
+        let dispatcher = support::dispatcher(&process);
         let path = directory.path().join("server.nro");
         fs::write(&path, synthetic_nro(&[svc(0x43); 2])).unwrap();
         let plan = Launcher::build(LauncherInput::new(path)).unwrap();
@@ -505,9 +498,9 @@ fn native_user_buffer_transport_checks_the_captured_extent_against_receiver_capa
             .main_thread()
             .registers()
             .set_pc(server.entry_module().entry_address() + 0x80);
-        let affinity = process.coordinator_mut().scheduler().profile().all_cores();
+        let affinity = process.driver_mut().scheduler().profile().all_cores();
         let server_id = process
-            .coordinator_mut()
+            .driver_mut()
             .register_process(
                 server,
                 nixe_runtime::ProcessRegistration {
@@ -517,11 +510,7 @@ fn native_user_buffer_transport_checks_the_captured_extent_against_receiver_capa
                 },
             )
             .unwrap();
-        let server = process
-            .coordinator_mut()
-            .process(server_id)
-            .unwrap()
-            .clone();
+        let server = process.driver_mut().process(server_id).unwrap().clone();
         server
             .scheduler()
             .set_activity(server.main_thread_id(), true)
@@ -542,7 +531,7 @@ fn native_user_buffer_transport_checks_the_captured_extent_against_receiver_capa
             write_abi_register(&process, index, value);
         }
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Suspended
         ));
         process
@@ -560,7 +549,7 @@ fn native_user_buffer_transport_checks_the_captured_extent_against_receiver_capa
             .scheduler()
             .set_activity(server.main_thread_id(), false)
             .unwrap();
-        let (thread, outcome) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+        let (thread, outcome) = dispatch_scheduled_next(&mut process, &dispatcher);
         assert_eq!(thread, server.main_thread_id());
         assert!(matches!(outcome, ExceptionHandlingResult::Resumed));
         if words == 8 {
@@ -582,7 +571,7 @@ fn native_user_buffer_transport_checks_the_captured_extent_against_receiver_capa
             for (index, value) in [(1, 0), (2, 0), (3, u64::from(server_handle)), (4, 0)] {
                 write_abi_register(&server, index, value);
             }
-            let (thread, outcome) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+            let (thread, outcome) = dispatch_scheduled_next(&mut process, &dispatcher);
             assert_eq!(thread, server.main_thread_id());
             assert!(matches!(outcome, ExceptionHandlingResult::Resumed));
         } else {
@@ -600,9 +589,7 @@ fn native_user_buffer_transport_checks_the_captured_extent_against_receiver_capa
             .scheduler()
             .set_activity(process.main_thread_id(), false)
             .unwrap();
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
         let expected = if words == 8 {
             assert_eq!(
                 read_guest_u32(&process, buffer.checked_add(8).unwrap()),
@@ -623,7 +610,7 @@ fn native_user_buffer_transport_checks_the_captured_extent_against_receiver_capa
 #[test]
 fn a_light_session_reply_belongs_to_the_receiving_server_thread() {
     let (_directory, mut process) = fixture_process(&[svc(0x42); 3]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client) = SessionObject::create_light_pair(process.scheduler());
     let handle = process.handles().insert(server).unwrap();
     client
@@ -632,7 +619,7 @@ fn a_light_session_reply_belongs_to_the_receiving_server_thread() {
     write_abi_register(&process, 0, u64::from(handle));
     write_abi_register(&process, 1, 0);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     let main = process.main_thread_id();
@@ -652,7 +639,7 @@ fn a_light_session_reply_belongs_to_the_receiving_server_thread() {
     let child_thread = process.thread(child.id).unwrap();
     child_thread.registers().write_w(x(1), (1 << 31) | 8);
     child_thread.start().unwrap();
-    let (caller, outcome) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+    let (caller, outcome) = dispatch_scheduled_next(&mut process, &dispatcher);
     assert_eq!(caller, child.id);
     assert!(matches!(outcome, ExceptionHandlingResult::Resumed));
     assert_eq!(
@@ -671,7 +658,7 @@ fn a_light_session_reply_belongs_to_the_receiving_server_thread() {
     write_abi_register(&process, 0, u64::from(handle));
     write_abi_register(&process, 1, u64::from((1u32 << 31) | 10));
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     let Some(SessionMessage::Light(words)) =
@@ -686,13 +673,13 @@ fn a_light_session_reply_belongs_to_the_receiving_server_thread() {
 #[test]
 fn a_light_session_allows_only_one_waiting_server_thread() {
     let (_directory, mut process) = fixture_process(&[svc(0x42); 2]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client) = SessionObject::create_light_pair(process.scheduler());
     let handle = process.handles().insert(server).unwrap();
     write_abi_register(&process, 0, u64::from(handle));
     write_abi_register(&process, 1, 0);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Suspended
     ));
     let scheduler = process.scheduler().clone();
@@ -709,7 +696,7 @@ fn a_light_session_allows_only_one_waiting_server_thread() {
     .unwrap();
     let child_thread = process.thread(child.id).unwrap();
     child_thread.start().unwrap();
-    let (caller, outcome) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+    let (caller, outcome) = dispatch_scheduled_next(&mut process, &dispatcher);
     assert_eq!(caller, child.id);
     assert!(matches!(outcome, ExceptionHandlingResult::Resumed));
     assert_eq!(
@@ -720,7 +707,7 @@ fn a_light_session_allows_only_one_waiting_server_thread() {
     client
         .request(request_owner(991), SessionMessage::Light([11; 7]))
         .unwrap();
-    let (caller, outcome) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+    let (caller, outcome) = dispatch_scheduled_next(&mut process, &dispatcher);
     assert_eq!(caller, process.main_thread_id());
     assert!(matches!(outcome, ExceptionHandlingResult::Resumed));
     assert_eq!(read_abi_register(&process, 1), 11);
@@ -729,18 +716,18 @@ fn a_light_session_allows_only_one_waiting_server_thread() {
 #[test]
 fn light_receive_consumes_cancellation_only_when_it_needs_to_wait() {
     let (_directory, mut process) = fixture_process(&[svc(0x19), svc(0x42), svc(0x42)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, _client) = SessionObject::create_light_pair(process.scheduler());
     let handle = process.handles().insert(server).unwrap();
     write_abi_register(&process, 0, u64::from(CURRENT_THREAD_HANDLE));
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     write_abi_register(&process, 0, u64::from(handle));
     write_abi_register(&process, 1, 0);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
@@ -749,7 +736,7 @@ fn light_receive_consumes_cancellation_only_when_it_needs_to_wait() {
     );
     write_abi_register(&process, 0, u64::from(handle));
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Suspended
     ));
 }
@@ -757,7 +744,7 @@ fn light_receive_consumes_cancellation_only_when_it_needs_to_wait() {
 #[test]
 fn cancelling_a_waiting_light_server_releases_the_receive_for_another_thread() {
     let (_directory, mut process) = fixture_process(&[svc(0x19), svc(0x42)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client) = SessionObject::create_light_pair(process.scheduler());
     let handle = process.handles().insert(server).unwrap();
     let scheduler = process.scheduler().clone();
@@ -784,18 +771,16 @@ fn cancelling_a_waiting_light_server_releases_the_receive_for_another_thread() {
     let child_thread = process.thread(child.id).unwrap();
     write_abi_register(&process, 0, u64::from(child.handle));
     child_thread.start().unwrap();
-    let (caller, outcome) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+    let (caller, outcome) = dispatch_scheduled_next(&mut process, &dispatcher);
     assert_eq!(caller, child.id);
     assert!(matches!(outcome, ExceptionHandlingResult::Suspended));
-    let (caller, outcome) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+    let (caller, outcome) = dispatch_scheduled_next(&mut process, &dispatcher);
     assert_eq!(caller, process.main_thread_id());
     assert!(matches!(outcome, ExceptionHandlingResult::Resumed));
     client
         .request(request_owner(991), SessionMessage::Light([12; 7]))
         .unwrap();
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     assert_eq!(
         child_thread.registers().read_w(x(0)),
         HorizonKernelResult::CANCELLED.raw()
@@ -804,7 +789,7 @@ fn cancelling_a_waiting_light_server_releases_the_receive_for_another_thread() {
     write_abi_register(&process, 0, u64::from(handle));
     write_abi_register(&process, 1, 0);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_abi_register(&process, 0), 0);
@@ -814,7 +799,7 @@ fn cancelling_a_waiting_light_server_releases_the_receive_for_another_thread() {
 #[test]
 fn reply_and_receive_waits_for_a_busy_session_instead_of_rejecting_it() {
     let (_directory, mut process) = fixture_process(&[svc(0x43); 2]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let server_handle = process.handles().insert(server.clone()).unwrap();
     client
@@ -833,7 +818,7 @@ fn reply_and_receive_waits_for_a_busy_session_instead_of_rejecting_it() {
         write_abi_register(&process, index, value);
     }
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
@@ -849,7 +834,7 @@ fn reply_and_receive_waits_for_a_busy_session_instead_of_rejecting_it() {
         write_abi_register(&process, index, value);
     }
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_abi_register(&process, 0), 0);
@@ -872,17 +857,17 @@ fn reply_and_receive_waits_for_a_busy_session_instead_of_rejecting_it() {
 #[test]
 fn terminating_a_light_server_releases_its_pending_receive() {
     let (_directory, mut process) = fixture_process(&[svc(0x42)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, _client) = SessionObject::create_light_pair(process.scheduler());
     let handle = process.handles().insert(server.clone()).unwrap();
     write_abi_register(&process, 0, u64::from(handle));
     write_abi_register(&process, 1, 0);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Suspended
     ));
     let id = process.scheduler_process_id();
-    process.coordinator_mut().terminate_process(id).unwrap();
+    process.driver_mut().terminate_process(id).unwrap();
     assert_eq!(
         server.receive_light(request_owner(991)),
         Err(nixe_runtime::SessionError::NoRequest)
@@ -893,7 +878,7 @@ fn terminating_a_light_server_releases_its_pending_receive() {
 #[test]
 fn closing_a_delivered_ipc_handle_disconnects_its_peer_before_reply() {
     let (_directory, mut process) = fixture_process(&[svc(0x43), svc(0x16)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let server_handle = process.handles().insert(server.clone()).unwrap();
     let (transferred, peer) = SessionObject::create_pair(process.scheduler());
@@ -919,7 +904,7 @@ fn closing_a_delivered_ipc_handle_disconnects_its_peer_before_reply() {
         write_abi_register(&process, index, value);
     }
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_abi_register(&process, 0), 0);
@@ -935,7 +920,7 @@ fn closing_a_delivered_ipc_handle_disconnects_its_peer_before_reply() {
     );
     write_abi_register(&process, 0, u64::from(received));
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_abi_register(&process, 0), 0);
@@ -961,7 +946,7 @@ fn closing_a_delivered_ipc_handle_disconnects_its_peer_before_reply() {
 #[test]
 fn process_exit_closes_sessions_waiting_for_port_acceptance() {
     let (_directory, mut process) = fixture_process(&[svc(0x07)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client_port) =
         nixe_runtime::PortObject::create_pair(process.scheduler(), 1, false);
     process.handles().insert(server).unwrap();
@@ -971,7 +956,7 @@ fn process_exit_closes_sessions_waiting_for_port_acceptance() {
         .request(owner, SessionMessage::Buffer(vec![4]))
         .unwrap();
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Terminated { .. }
     ));
     assert_eq!(
@@ -983,13 +968,13 @@ fn process_exit_closes_sessions_waiting_for_port_acceptance() {
 #[test]
 fn connect_to_named_port_does_not_enqueue_a_session_when_the_handle_table_is_full() {
     let (_directory, mut process) = fixture_process(&[svc(0x71), svc(0x1f)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let name = process.main_thread().stack_bottom;
     write_guest_bytes(&process, name, b"audit:\0");
     write_abi_register(&process, 1, name.get());
     write_abi_register(&process, 2, 1);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_abi_register(&process, 0), 0);
@@ -1005,7 +990,7 @@ fn connect_to_named_port_does_not_enqueue_a_session_when_the_handle_table_is_ful
     write_abi_register(&process, 1, name.get());
 
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
@@ -1023,7 +1008,7 @@ fn connect_to_named_port_does_not_enqueue_a_session_when_the_handle_table_is_ful
 fn connect_to_port_does_not_enqueue_a_session_when_the_handle_table_is_full() {
     for light in [false, true] {
         let (_directory, mut process) = fixture_process(&[svc(0x72)]);
-        let mut dispatcher = support::dispatcher(&process);
+        let dispatcher = support::dispatcher(&process);
         let (server, client) = nixe_runtime::PortObject::create_pair(process.scheduler(), 1, light);
         let handle = process.handles().insert(client).unwrap();
         while process
@@ -1034,7 +1019,7 @@ fn connect_to_port_does_not_enqueue_a_session_when_the_handle_table_is_full() {
         write_abi_register(&process, 1, u64::from(handle));
 
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
@@ -1053,7 +1038,7 @@ fn connect_to_port_does_not_enqueue_a_session_when_the_handle_table_is_full() {
 fn accept_session_preserves_the_pending_client_when_the_handle_table_is_full() {
     for light in [false, true] {
         let (_directory, mut process) = fixture_process(&[svc(0x41); 2]);
-        let mut dispatcher = support::dispatcher(&process);
+        let dispatcher = support::dispatcher(&process);
         let (server, client_port) =
             nixe_runtime::PortObject::create_pair(process.scheduler(), 1, light);
         let client = client_port.connect().unwrap();
@@ -1077,7 +1062,7 @@ fn accept_session_preserves_the_pending_client_when_the_handle_table_is_full() {
         write_abi_register(&process, 1, u64::from(handle));
 
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(
@@ -1092,7 +1077,7 @@ fn accept_session_preserves_the_pending_client_when_the_handle_table_is_full() {
         process.handles().close(available.unwrap()).unwrap();
         write_abi_register(&process, 1, u64::from(handle));
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(read_abi_register(&process, 0), 0);
@@ -1116,11 +1101,11 @@ fn accept_session_preserves_the_pending_client_when_the_handle_table_is_full() {
 #[test]
 fn process_exit_closes_owned_session_endpoints() {
     let (_directory, mut process) = fixture_process(&[svc(0x07)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let handle = process.handles().insert(server).unwrap();
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Terminated { .. }
     ));
     let request = client.request(request_owner(999), SessionMessage::Buffer(vec![1]));
@@ -1134,7 +1119,7 @@ fn process_exit_closes_owned_session_endpoints() {
 #[test]
 fn created_thread_inherits_fpu_status_and_has_its_tls_handle() {
     let (_directory, mut process) = fixture_process(&[svc(0x08)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let entry = instruction_address(&process);
     let stack = process.main_thread().stack_top.get();
     let main = process.main_thread();
@@ -1152,7 +1137,7 @@ fn created_thread_inherits_fpu_status_and_has_its_tls_handle() {
             state.write_x(x(index), value);
         }
     }
-    dispatch_next(&mut process, &mut dispatcher);
+    dispatch_next(&mut process, &dispatcher);
     assert_eq!(read_abi_register(&process, 0), 0);
     let handle = read_abi_register(&process, 1) as u32;
     let child = process
@@ -1179,7 +1164,7 @@ fn created_thread_inherits_fpu_status_and_has_its_tls_handle() {
 #[test]
 fn create_thread_validates_only_the_abi_arguments() {
     let (_directory, mut process) = fixture_process(&[svc(0x08); 5]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let entry = instruction_address(&process);
     let stack = process.main_thread().stack_top.get();
     let mut mismatches = 0;
@@ -1224,7 +1209,7 @@ fn create_thread_validates_only_the_abi_arguments() {
                 state.write_x(x(index), value);
             }
         }
-        dispatch_next(&mut process, &mut dispatcher);
+        dispatch_next(&mut process, &dispatcher);
         let actual = read_abi_register(&process, 0);
         mismatches += usize::from(actual != u64::from(expected.raw()));
     }
@@ -1240,7 +1225,7 @@ fn create_thread_validates_only_the_abi_arguments() {
             state.write_x(x(index), value);
         }
     }
-    dispatch_next(&mut process, &mut dispatcher);
+    dispatch_next(&mut process, &dispatcher);
     let actual = read_abi_register(&process, 0);
     mismatches += usize::from(actual != u64::from(HorizonKernelResult::OUT_OF_HANDLES.raw()));
     assert_eq!(mismatches, 0);
@@ -1249,12 +1234,14 @@ fn create_thread_validates_only_the_abi_arguments() {
 #[test]
 fn hle_handles_follow_null_and_client_move_rules() {
     let (_directory, mut process) = fixture_process(&[svc(0x21); 2]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let manager = crate::ServiceManagerSession::new();
     manager.register_client();
     let session = process
         .handles()
-        .insert(HorizonIpcObject::ServiceManager(manager))
+        .insert(nixe_horizon::ServiceSession::new(
+            HorizonIpcObject::ServiceManager(manager),
+        ))
         .unwrap();
     let tls = process.main_thread().tls_base;
     let mut null = [0; 0x100];
@@ -1266,7 +1253,7 @@ fn hle_handles_follow_null_and_client_move_rules() {
     null[32..40].copy_from_slice(b"fsp-srv\0");
     write_guest_bytes(&process, tls, &null);
     process.main_thread().registers().write_w(x(0), session);
-    dispatch_next(&mut process, &mut dispatcher);
+    dispatch_next(&mut process, &dispatcher);
     let null_result = read_abi_register(&process, 0);
     let moved = process
         .handles()
@@ -1282,7 +1269,7 @@ fn hle_handles_follow_null_and_client_move_rules() {
     bad[32..40].copy_from_slice(b"fsp-srv\0");
     write_guest_bytes(&process, tls, &bad);
     process.main_thread().registers().write_w(x(0), session);
-    dispatch_next(&mut process, &mut dispatcher);
+    dispatch_next(&mut process, &dispatcher);
     let moved_live = process.handles().lookup(moved).is_some();
     let move_result = read_abi_register(&process, 0);
     assert_eq!(
@@ -1298,7 +1285,7 @@ fn hle_handles_follow_null_and_client_move_rules() {
 #[test]
 fn null_copy_is_accepted_by_the_guest_session_transport() {
     let (_directory, mut process) = fixture_process(&[svc(0x21)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let handle = process.handles().insert(client).unwrap();
     let mut bytes = [0; 0x100];
@@ -1308,7 +1295,7 @@ fn null_copy_is_accepted_by_the_guest_session_transport() {
     write_guest_bytes(&process, process.main_thread().tls_base, &bytes);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Suspended
     ));
     let mut receive = server.receive().unwrap();
@@ -1322,7 +1309,7 @@ fn null_copy_is_accepted_by_the_guest_session_transport() {
 #[test]
 fn guest_transport_rejects_client_move_handles() {
     let (_directory, mut process) = fixture_process(&[svc(0x21)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (_server, client) = SessionObject::create_pair(process.scheduler());
     let session = process.handles().insert(client).unwrap();
     let moved = process
@@ -1337,7 +1324,7 @@ fn guest_transport_rejects_client_move_handles() {
     put_u32(&mut bytes, 16, moved);
     write_guest_bytes(&process, process.main_thread().tls_base, &bytes);
     process.main_thread().registers().write_w(x(0), session);
-    dispatch_next(&mut process, &mut dispatcher);
+    dispatch_next(&mut process, &dispatcher);
     let present = process.handles().lookup(moved).is_some();
     assert_eq!(
         read_abi_register(&process, 0),
@@ -1349,7 +1336,7 @@ fn guest_transport_rejects_client_move_handles() {
 #[test]
 fn thread_context_checks_handle_and_state_before_memory() {
     let (_directory, mut process) = fixture_process(&[svc(0x33); 3]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let entry = instruction_address(&process);
     let (_, handle) = super::mutex::add_thread(&mut process, entry, 45);
     let mut mismatches = 0;
@@ -1364,7 +1351,7 @@ fn thread_context_checks_handle_and_state_before_memory() {
     ] {
         process.main_thread().registers().write_x(x(0), 0);
         process.main_thread().registers().write_w(x(1), handle);
-        dispatch_next(&mut process, &mut dispatcher);
+        dispatch_next(&mut process, &dispatcher);
         let actual = read_abi_register(&process, 0);
         mismatches += usize::from(actual != u64::from(expected.raw()));
     }
@@ -1374,7 +1361,7 @@ fn thread_context_checks_handle_and_state_before_memory() {
 #[test]
 fn host_stop_cancels_the_accepted_guest_session_request_without_polling() {
     let (_directory, mut process) = fixture_process(&[svc(0x21)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let handle = process.handles().insert(client.clone()).unwrap();
     let mut bytes = [0; 0x100];
@@ -1383,7 +1370,7 @@ fn host_stop_cancels_the_accepted_guest_session_request_without_polling() {
     write_guest_bytes(&process, process.main_thread().tls_base, &bytes);
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Suspended
     ));
     assert!(matches!(
@@ -1391,7 +1378,7 @@ fn host_stop_cancels_the_accepted_guest_session_request_without_polling() {
         Ok(None)
     ));
     let id = process.scheduler_process_id();
-    assert!(process.coordinator_mut().terminate_process(id).unwrap());
+    assert!(process.driver_mut().terminate_process(id).unwrap());
     assert_eq!(
         crate::integration_test_support::poll_session(&client, request_owner(1)),
         Err(nixe_runtime::SessionError::NoRequest)
@@ -1406,13 +1393,13 @@ fn host_stop_cancels_the_accepted_guest_session_request_without_polling() {
 #[test]
 fn light_client_request_retains_its_endpoint_after_the_source_handle_closes() {
     let (_directory, mut process) = fixture_process(&[svc(0x20)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client) = SessionObject::create_light_pair(process.scheduler());
     let handle = process.handles().insert(client).unwrap();
     process.main_thread().registers().write_w(x(0), handle);
     process.main_thread().registers().write_w(x(1), 17);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Suspended
     ));
     assert!(matches!(
@@ -1421,9 +1408,7 @@ fn light_client_request_retains_its_endpoint_after_the_source_handle_closes() {
     ));
     drop(process.handles().close(handle).unwrap());
     assert_eq!(server.reply_light(request_owner(2), [42; 7]), Ok(()));
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     assert_eq!(read_abi_register(&process, 0), 0);
     assert_eq!(read_abi_register(&process, 1), 42);
 }
@@ -1431,13 +1416,13 @@ fn light_client_request_retains_its_endpoint_after_the_source_handle_closes() {
 #[test]
 fn light_server_wait_retains_its_endpoint_after_the_source_handle_closes() {
     let (_directory, mut process) = fixture_process(&[svc(0x42)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client) = SessionObject::create_light_pair(process.scheduler());
     let handle = process.handles().insert(server).unwrap();
     process.main_thread().registers().write_w(x(0), handle);
     process.main_thread().registers().write_w(x(1), 0);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Suspended
     ));
     drop(process.handles().close(handle).unwrap());
@@ -1445,9 +1430,7 @@ fn light_server_wait_retains_its_endpoint_after_the_source_handle_closes() {
         client.request(request_owner(2), SessionMessage::Light([42; 7])),
         Ok(())
     );
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     assert_eq!(read_abi_register(&process, 0), 0);
     assert_eq!(read_abi_register(&process, 1), 42);
 }
@@ -1455,19 +1438,16 @@ fn light_server_wait_retains_its_endpoint_after_the_source_handle_closes() {
 #[test]
 fn host_stop_cancels_light_requests_even_while_another_handle_retains_the_endpoint() {
     let (_directory, mut process) = fixture_process(&[svc(0x20)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (_server, client) = SessionObject::create_light_pair(process.scheduler());
     let handle = process.handles().insert(client.clone()).unwrap();
     process.main_thread().registers().write_w(x(0), handle);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Suspended
     ));
     let process_id = process.scheduler_process_id();
-    process
-        .coordinator_mut()
-        .terminate_process(process_id)
-        .unwrap();
+    process.driver_mut().terminate_process(process_id).unwrap();
     assert_eq!(
         crate::integration_test_support::poll_session(&client, request_owner(1)),
         Err(nixe_runtime::SessionError::NoRequest)
@@ -1477,7 +1457,7 @@ fn host_stop_cancels_light_requests_even_while_another_handle_retains_the_endpoi
 #[test]
 fn reply_and_receive_finishes_the_reply_before_consuming_wait_cancellation() {
     let (_directory, mut process) = fixture_process(&[svc(0x19), svc(0x43)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let (server, client) = SessionObject::create_pair(process.scheduler());
     let server_handle = process.handles().insert(server.clone()).unwrap();
     let owner = request_owner(91);
@@ -1490,7 +1470,7 @@ fn reply_and_receive_finishes_the_reply_before_consuming_wait_cancellation() {
         .registers()
         .write_w(x(0), process.main_thread_handle());
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_abi_register(&process, 0), 0);
@@ -1511,7 +1491,7 @@ fn reply_and_receive_finishes_the_reply_before_consuming_wait_cancellation() {
         }
     }
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(

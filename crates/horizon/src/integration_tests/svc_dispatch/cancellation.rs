@@ -4,13 +4,13 @@ use nixe_scheduler::IdealCore;
 #[test]
 fn pending_cancellation_survives_polling_and_is_consumed_by_one_wait() {
     let (_directory, mut process) = fixture_process(&[svc(0x19), svc(0x18), svc(0x18), svc(0x18)]);
-    let mut dispatcher = fixed_time_dispatcher(&process);
+    let dispatcher = fixed_time_dispatcher(&process);
     process
         .main_thread()
         .registers()
         .write_w(x(0), CURRENT_THREAD_HANDLE);
     assert!(matches!(
-        dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+        dispatch_scheduled_next(&mut process, &dispatcher).1,
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
@@ -18,7 +18,7 @@ fn pending_cancellation_survives_polling_and_is_consumed_by_one_wait() {
     process.main_thread().registers().write_w(x(2), 0);
     process.main_thread().registers().write_x(x(3), 0);
     assert!(matches!(
-        dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+        dispatch_scheduled_next(&mut process, &dispatcher).1,
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
@@ -27,7 +27,7 @@ fn pending_cancellation_survives_polling_and_is_consumed_by_one_wait() {
     );
     process.main_thread().registers().write_x(x(3), u64::MAX);
     assert!(matches!(
-        dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+        dispatch_scheduled_next(&mut process, &dispatcher).1,
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(
@@ -36,7 +36,7 @@ fn pending_cancellation_survives_polling_and_is_consumed_by_one_wait() {
     );
     assert_eq!(process.main_thread().registers().read_w(x(1)), u32::MAX);
     assert!(matches!(
-        dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+        dispatch_scheduled_next(&mut process, &dispatcher).1,
         ExceptionHandlingResult::Suspended
     ));
 }
@@ -48,14 +48,14 @@ fn cancellation_wakes_another_waiting_thread_and_releases_its_deadline() {
     let stack_top = process.main_thread().stack_top;
     let core = nixe_scheduler::VirtualCpuId::new(0);
     let affinity = process
-        .coordinator_mut()
+        .driver_mut()
         .scheduler()
         .profile()
         .core_set([core])
         .unwrap();
     let main = process.main_thread_id();
     process
-        .coordinator_mut()
+        .driver_mut()
         .scheduler()
         .migrate(main, IdealCore::Core(core), affinity)
         .unwrap();
@@ -82,15 +82,15 @@ fn cancellation_wakes_another_waiting_thread_and_releases_its_deadline() {
         .unwrap()
         .start()
         .unwrap();
-    let mut dispatcher = fixed_time_dispatcher(&process);
+    let dispatcher = fixed_time_dispatcher(&process);
     {
-        let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+        let (thread, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
         assert_eq!(thread, child.id);
         assert!(matches!(handling, ExceptionHandlingResult::Suspended));
     };
     assert!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .thread(child.id)
             .unwrap()
@@ -102,12 +102,10 @@ fn cancellation_wakes_another_waiting_thread_and_releases_its_deadline() {
         .registers()
         .write_w(x(0), child.handle);
     assert!(matches!(
-        dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+        dispatch_scheduled_next(&mut process, &dispatcher).1,
         ExceptionHandlingResult::Resumed
     ));
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     assert_eq!(process.thread_lifecycle(child.id), ThreadLifecycle::Ready);
     assert_eq!(
         process.thread(child.id).unwrap().registers().read_w(x(0)),
@@ -115,7 +113,7 @@ fn cancellation_wakes_another_waiting_thread_and_releases_its_deadline() {
     );
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .advance_virtual_time(2_000_000)
             .unwrap(),
         0
@@ -125,13 +123,13 @@ fn cancellation_wakes_another_waiting_thread_and_releases_its_deadline() {
 #[test]
 fn cancellation_rejects_a_non_thread_handle() {
     let (_directory, mut process) = fixture_process(&[svc(0x19)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     process
         .main_thread()
         .registers()
         .write_w(x(0), CURRENT_PROCESS_HANDLE);
     assert!(matches!(
-        dispatch_next(&mut process, &mut dispatcher),
+        dispatch_next(&mut process, &dispatcher),
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(

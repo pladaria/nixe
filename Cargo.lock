@@ -1425,6 +1425,8 @@ dependencies = [
  "nixe-applets",
  "nixe-audio",
  "nixe-cpu",
+ "nixe-cpu-direct-memory",
+ "nixe-cpu-jit",
  "nixe-gpu",
  "nixe-gpu-maxwell",
  "nixe-gpu-vulkan",

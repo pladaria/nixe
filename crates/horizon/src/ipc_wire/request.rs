@@ -18,7 +18,6 @@ pub(crate) struct Buffer {
 }
 pub(crate) struct Request {
     thread: Arc<nixe_runtime::ThreadObject>,
-    target: HandleObject,
     process: Arc<nixe_runtime::RunnableProcess>,
     process_generation: u64,
     command: Buffer,
@@ -27,16 +26,18 @@ pub(crate) struct Request {
     copied: Vec<Option<HandleObject>>,
     returned: Vec<HandleReservation>,
     lifetime: Arc<super::operation::CallLifetime>,
+    payload_budget: Arc<super::payload::PayloadBudget>,
+    payload: std::sync::OnceLock<Arc<super::payload::PayloadPermit>>,
 }
 impl Request {
     pub fn new(
         context: &ExceptionDispatchContext<'_>,
-        target: HandleObject,
         address: GuestVirtualAddress,
         bytes: usize,
+        payload_budget: Arc<super::payload::PayloadBudget>,
     ) -> Result<Self, IpcWireError> {
         let process = context.process();
-        let process_generation = process.generation();
+        let process_generation = context.generation();
         let command = Self::capture(
             process,
             address.get(),
@@ -45,7 +46,6 @@ impl Request {
         )?;
         Ok(Self {
             thread: context.thread().object().clone(),
-            target,
             process: process.clone(),
             process_generation,
             command,
@@ -54,7 +54,23 @@ impl Request {
             copied: Vec::new(),
             returned: Vec::new(),
             lifetime: Arc::default(),
+            payload_budget,
+            payload: std::sync::OnceLock::new(),
         })
+    }
+    pub async fn reserve_payload(&self, size: usize) -> Result<(), IpcWireError> {
+        if size == 0 {
+            return Ok(());
+        }
+        if self.payload.get().is_some() {
+            return Err(IpcWireError::Internal(
+                "IPC payload must be admitted once before effects",
+            ));
+        }
+        let permit = self.payload_budget.reserve(size, &self.lifetime).await?;
+        self.payload
+            .set(Arc::new(permit))
+            .map_err(|_| IpcWireError::Internal("duplicate IPC payload admission"))
     }
     fn check_lifetime(&self) -> Result<(), IpcWireError> {
         if self.process_generation != self.process.generation() {
@@ -62,20 +78,20 @@ impl Request {
         }
         self.lifetime.check()
     }
-    pub fn lifetime(&self) -> Arc<super::operation::CallLifetime> {
-        self.lifetime.clone()
+    pub fn lifetime(&self) -> &Arc<super::operation::CallLifetime> {
+        &self.lifetime
     }
     pub fn begin_service(&self) -> Result<(), IpcWireError> {
         self.check_lifetime()?;
         self.lifetime.begin()
     }
-    pub fn target(&self) -> &HandleObject {
-        &self.target
-    }
     pub fn kernel(&self) -> &Arc<nixe_scheduler::SchedulerState> {
         self.process.scheduler()
     }
 
+    pub fn thread_id(&self) -> u64 {
+        self.thread.thread_id()
+    }
     pub fn process_id(&self) -> u64 {
         self.process.process_id()
     }
@@ -111,10 +127,10 @@ impl Request {
     /// Keep the normal HLE command prefix, then capture only declared data and
     /// receive entries outside it. Every read uses the accepted physical input.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/hle_ipc.cpp#L255-L267
-    pub async fn read_command(&self) -> Result<Vec<u8>, IpcWireError> {
+    pub async fn read_command(&self, mut bytes: Vec<u8>) -> Result<Vec<u8>, IpcWireError> {
         let capacity = self.command_size();
         let prefix = capacity.min(COMMAND_BUFFER_SIZE);
-        let mut bytes = Vec::new();
+        bytes.clear();
         bytes.try_reserve_exact(prefix).map_err(|_| {
             IpcWireError::HostResourceExhausted("allocating the IPC command buffer")
         })?;
@@ -146,12 +162,12 @@ impl Request {
             inline_end
         };
         if data_end > prefix {
-            self.read(&self.command, prefix as u64, &mut bytes[prefix..data_end])
+            self.read_inline(&self.command, prefix as u64, &mut bytes[prefix..data_end])
                 .await?;
         }
         let receive_start = receive.start.max(prefix).max(data_end);
         if receive_start < receive.end {
-            self.read(
+            self.read_inline(
                 &self.command,
                 receive_start as u64,
                 &mut bytes[receive_start..receive.end],
@@ -263,6 +279,12 @@ impl Request {
         self.returned.push(reservation);
         Ok(handle)
     }
+    pub fn return_service(
+        &mut self,
+        object: crate::HorizonIpcObject,
+    ) -> Result<u32, nixe_runtime::HandleError> {
+        self.return_handle(super::ServiceSession::new(object))
+    }
     pub fn return_handle<T: HandleValue>(
         &mut self,
         object: T,
@@ -271,58 +293,86 @@ impl Request {
     }
     pub fn publish_handles(&mut self) -> Result<(), IpcWireError> {
         self.check_lifetime()?;
+        self.lifetime.commit_reply()?;
         self.process
             .handles()
             .publish(&mut self.returned)
-            .map_err(|_| IpcWireError::Internal("reply handle publication was cancelled"))
+            .map_err(|error| {
+                if self.process_generation != self.process.generation() {
+                    IpcWireError::Cancelled
+                } else {
+                    IpcWireError::Handle(error)
+                }
+            })
     }
-    pub async fn write_response(&self, bytes: &[u8]) -> Result<(), IpcWireError> {
+    pub async fn write_response(&self, mut bytes: Vec<u8>) -> Result<(), IpcWireError> {
+        let _reply = nixe_memory::trace::span("ipc_reply", self.thread_id(), bytes.len() as u64, 0);
         if bytes.len() > self.command_size() {
             return Err(IpcWireError::Internal(
                 "encoded response exceeds its accepted command buffer",
             ));
         }
-        self.write(&self.command, 0, bytes).await
+        self.write(&self.command, 0, &mut bytes).await
     }
-    pub async fn read(
+    async fn read_inline(
         &self,
         buffer: &Buffer,
         offset: u64,
         output: &mut [u8],
     ) -> Result<(), IpcWireError> {
+        let mut bytes = vec![0; output.len()];
+        self.read(buffer, offset, &mut bytes).await?;
+        output.copy_from_slice(&bytes);
+        Ok(())
+    }
+    fn retain_payload(&self, pending: &nixe_memory::PendingAccess) {
+        if let Some(permit) = self.payload.get() {
+            pending.retain_owner(permit.clone());
+        }
+    }
+    pub async fn read(
+        &self,
+        buffer: &Buffer,
+        offset: u64,
+        output: &mut Vec<u8>,
+    ) -> Result<(), IpcWireError> {
         if output.is_empty() {
             return Ok(());
         }
         let bytes = output.len() as u64;
+        nixe_memory::trace::event("ipc_input_copy", self.thread_id(), bytes, buffer.address);
         let address = GuestVirtualAddress::new(buffer.address)
             .checked_add(offset)
             .ok_or(IpcWireError::Malformed("IPC input offset overflows"))?;
-        match self
+        let storage = std::mem::take(output);
+        let storage = match self
             .process
             .memory()
             .account()
             .machine()
-            .read_captured_into(&buffer.ranges, offset, output)
+            .read_captured_owned(&buffer.ranges, offset, storage)
             .map_err(|error| Self::memory_error(address, bytes, Arc::new(error)))?
         {
-            Access::Ready(()) => Ok(()),
-            Access::Pending(pending) => match pending
-                .await
-                .map_err(|error| Self::memory_error(address, bytes, error))?
-            {
-                AccessResult::Read(data) if data.len() == output.len() => {
-                    output.copy_from_slice(&data);
-                    Ok(())
+            Access::Ready(bytes) => bytes,
+            Access::Pending(pending) => {
+                self.retain_payload(&pending);
+                match pending
+                    .await
+                    .map_err(|error| Self::memory_error(address, bytes, error))?
+                {
+                    AccessResult::Read(data) => data,
+                    _ => return Err(IpcWireError::Internal("invalid owned IPC read completion")),
                 }
-                _ => Err(IpcWireError::Internal("invalid owned IPC read completion")),
-            },
-        }
+            }
+        };
+        *output = storage;
+        Ok(())
     }
     pub async fn write(
         &self,
         buffer: &Buffer,
         offset: u64,
-        bytes: &[u8],
+        bytes: &mut Vec<u8>,
     ) -> Result<(), IpcWireError> {
         self.check_lifetime()?;
         if bytes.is_empty() {
@@ -333,21 +383,28 @@ impl Request {
             .checked_add(offset)
             .ok_or(IpcWireError::Malformed("IPC output offset overflows"))?;
         self.lifetime.begin_output()?;
-        let result = match self.process.memory().account().machine().write_captured(
-            &buffer.ranges,
-            offset,
-            bytes,
-        ) {
+        let storage = std::mem::take(bytes);
+        let result = match self
+            .process
+            .memory()
+            .account()
+            .machine()
+            .write_captured_owned(&buffer.ranges, offset, storage)
+        {
             Err(error) => Err(Self::memory_error(address, count, Arc::new(error))),
-            Ok(Access::Ready(())) => Ok(()),
-            Ok(Access::Pending(pending)) => match pending.await {
-                Ok(AccessResult::Written) => Ok(()),
-                Ok(_) => Err(IpcWireError::Internal("invalid owned IPC write completion")),
-                Err(error) => Err(Self::memory_error(address, count, error)),
-            },
+            Ok(Access::Ready(storage)) => Ok(storage),
+            Ok(Access::Pending(pending)) => {
+                self.retain_payload(&pending);
+                match pending.await {
+                    Ok(AccessResult::Written(storage)) => Ok(storage),
+                    Ok(_) => Err(IpcWireError::Internal("invalid owned IPC write completion")),
+                    Err(error) => Err(Self::memory_error(address, count, error)),
+                }
+            }
         };
         self.lifetime.end_output();
-        result
+        *bytes = result?;
+        Ok(())
     }
     fn memory_error(
         address: GuestVirtualAddress,

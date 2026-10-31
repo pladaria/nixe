@@ -74,6 +74,7 @@ pub(in crate::ipc_wire) async fn dispatch_opus_manager(
         if usize::from(descriptor.size) != parameter_size {
             return opus_error(&request, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
         }
+        process.reserve_payload(parameter_size).await?;
         pointed.resize(parameter_size, 0);
         process
             .read(&process.send_statics()[0], 0, &mut pointed)
@@ -122,7 +123,7 @@ pub(in crate::ipc_wire) async fn dispatch_opus_manager(
         return semantic_success(request.token, true, &[], &[], &[id], None);
     }
     let handle = process
-        .return_handle(HorizonIpcObject::OpusDecoder(decoder))
+        .return_service(HorizonIpcObject::OpusDecoder(decoder))
         .map_err(IpcWireError::Handle)?;
     semantic_success(
         request.token,
@@ -203,15 +204,17 @@ async fn dispatch_decode(
     if input.size <= 8 {
         return opus_error(&request, INPUT_TOO_SMALL);
     }
-    let mut header = [0; 8];
+    let mut header = vec![0; 8];
     process.read(input, 0, &mut header).await?;
     let size = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
     if size > session.state.params.input_capacity() || size as u64 > input.size - 8 {
         return opus_error(&request, BUFFER_TOO_SMALL);
     }
+    let pcm_size = session.state.pcm_capacity(output.size as usize);
+    process.reserve_payload(size + pcm_size).await?;
     let mut packet = vec![0; size];
     process.read(input, 8, &mut packet).await?;
-    let (pcm, samples, time) =
+    let (mut pcm, samples, time) =
         match session
             .state
             .decode(&packet, output.size as usize, reset && request.data[0] != 0)
@@ -219,7 +222,7 @@ async fn dispatch_decode(
             Ok(decoded) => decoded,
             Err(result) => return opus_error(&request, result),
         };
-    write_descriptor_bytes(process, output, bytemuck::cast_slice(&pcm)).await?;
+    write_descriptor_bytes(process, output, &mut pcm).await?;
     let mut data = [0; 16];
     data[..4].copy_from_slice(&(size as u32 + 8).to_le_bytes());
     data[4..8].copy_from_slice(&samples.to_le_bytes());

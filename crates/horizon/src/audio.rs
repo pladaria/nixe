@@ -2,7 +2,7 @@
 
 use nixe_audio::{AudioBackend, AudioError, AudioOutput, PcmFormat};
 use nixe_runtime::{EventObject, ReadableEventObject};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct AudioOutManagerSession {
@@ -12,7 +12,7 @@ pub struct AudioOutManagerSession {
 
 #[derive(Clone, Debug)]
 pub struct AudioOutSession {
-    pub(crate) output: Arc<Mutex<AudioOutput>>,
+    pub(crate) output: Arc<AudioOutput>,
     pub(crate) event: ReadableEventObject,
     pub(crate) devices: Arc<crate::audio_device::AudioDeviceState>,
 }
@@ -37,7 +37,7 @@ impl AudioOutSession {
             }),
         )?;
         Ok(Self {
-            output: Arc::new(Mutex::new(output)),
+            output: Arc::new(output),
             event,
             devices,
         })

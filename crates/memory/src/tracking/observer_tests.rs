@@ -59,7 +59,7 @@ fn immutable_capture_promotes_resource_watch_to_native_store_protection() {
         machine
             .apply_resolved_access(
                 std::slice::from_ref(&range),
-                &AccessOperation::ReadObserved(snapshot.clone()),
+                &mut AccessOperation::ReadObserved(snapshot.clone()),
             )
             .unwrap();
         let core = space.register_core(std::sync::Arc::new(|| {}));

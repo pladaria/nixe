@@ -59,9 +59,9 @@ fn owned_shader_capture_rechecks_code_pages_and_reuses_equal_instructions() {
     };
     let mut compiler = Compiler::new().unwrap();
     let mut memory = MemoryCache::default();
-    let mut access = |ranges: Vec<AllocationRange>, operation| {
+    let mut access = |ranges: Vec<AllocationRange>, mut operation| {
         machine
-            .apply_resolved_access(&ranges, &operation)
+            .apply_resolved_access(&ranges, &mut operation)
             .map_err(Arc::new)
     };
     let captured = capture_program(

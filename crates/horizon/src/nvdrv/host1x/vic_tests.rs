@@ -109,7 +109,12 @@ fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
     registers[0x101] = 0x30;
     registers[0x1c8] = 0x100;
     Vic::default()
-        .execute(&registers, &mappings, None, &mut BTreeMap::new())
+        .execute(
+            &registers,
+            &mappings,
+            None,
+            &super::super::video::FrameQueue::default(),
+        )
         .unwrap();
     let mut result = vec![0; 8192];
     crate::test_memory::read(
@@ -134,7 +139,12 @@ fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
         .write_resolved(&[input.slice(0, config.len() as u64).unwrap()], &config)
         .unwrap();
     Vic::default()
-        .execute(&registers, &mappings, None, &mut BTreeMap::new())
+        .execute(
+            &registers,
+            &mappings,
+            None,
+            &super::super::video::FrameQueue::default(),
+        )
         .unwrap();
     let mut general = vec![0; result.len()];
     crate::test_memory::read(
@@ -170,7 +180,12 @@ fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
             .write_resolved(&[input.slice(0, config.len() as u64).unwrap()], &config)
             .unwrap();
         Vic::default()
-            .execute(&registers, &mappings, None, &mut BTreeMap::new())
+            .execute(
+                &registers,
+                &mappings,
+                None,
+                &super::super::video::FrameQueue::default(),
+            )
             .unwrap();
         for (is_chroma, surface, offset) in [(false, &output, 0xf000), (true, &chroma, 0x17000)] {
             let mut actual = vec![0; surface.length()];
@@ -203,7 +218,12 @@ fn nv12_conversion_uses_signed_guest_matrix_and_writes_the_actual_surface() {
         .unwrap();
     assert!(
         Vic::default()
-            .execute(&registers, &mappings, None, &mut BTreeMap::new())
+            .execute(
+                &registers,
+                &mappings,
+                None,
+                &super::super::video::FrameQueue::default()
+            )
             .unwrap_err()
             .contains("subpixel")
     );

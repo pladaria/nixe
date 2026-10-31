@@ -275,9 +275,9 @@ impl VulkanResidency {
     pub(crate) fn begin_access_memory(
         &mut self,
         ranges: Vec<nixe_memory::AllocationRange>,
-        operation: nixe_memory::AccessOperation,
+        mut operation: nixe_memory::AccessOperation,
     ) -> Result<nixe_gpu::OwnerAccess, VulkanError> {
-        if let Some(result) = self.memory.try_access_captured(&ranges, &operation)? {
+        if let Some(result) = self.memory.try_access_captured(&ranges, &mut operation)? {
             return Ok(nixe_gpu::OwnerAccess::Ready(result));
         }
         let (request, mut result) = self.memory.prepare_device_access(ranges, operation)?;

@@ -3,12 +3,13 @@
 pub use nixe_loader_executable::RelocationState;
 
 mod address_wait;
-mod coordinator;
 mod exception_dispatch;
 mod external_event;
 mod handle;
+mod kernel_operation;
 mod launch_plan;
 mod launcher;
+mod machine;
 pub mod memory;
 mod module_memory;
 mod process;
@@ -20,19 +21,14 @@ pub use address_wait::{
     AddressOperationGuard, AddressSignalTargets, AddressWaitCompletion, AddressWaitRegistry,
     ConditionAcquire, ConditionClaim, ConditionSignal, ConditionWait, MutexHandoff,
 };
-pub use coordinator::{
-    CoordinatorDrainReport, CoordinatorError, CoordinatorExecution, CoordinatorResourceCounts,
-    CoordinatorRouteError, ProcessRegistration, RuntimeCoordinator, WorkerFailure,
-};
 pub use exception_dispatch::{
     ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatchRequest,
-    ExceptionDispatcher, ExceptionHandlingResult, ExceptionResume, ExceptionRouteError,
-    ExceptionTerminationReason, ExceptionTerminationScope, ExceptionThreadContext,
-    GuestBreakPayload, MAX_GUEST_BREAK_PAYLOAD_BYTES,
+    ExceptionDispatcher, ExceptionHandlingResult, ExceptionResume, ExceptionTerminationReason,
+    ExceptionTerminationScope, ExceptionThreadContext, GuestBreakPayload,
+    MAX_GUEST_BREAK_PAYLOAD_BYTES,
 };
 pub use external_event::{
-    ExternalEvent, ExternalEventSendError, ExternalEventSender, ExternalEventSequence,
-    ExternalEventSource, SequencedExternalEvent,
+    ExternalEvent, ExternalEventSendError, ExternalEventSender, ExternalEventSource,
 };
 pub use handle::{
     EventFuture, EventObject, HandleError, HandleObject, HandleReservation, HandleTable,
@@ -47,16 +43,17 @@ pub use launch_plan::{
     PackagedIdentity, ReadOnlyMount,
 };
 pub use launcher::{LaunchError, LaunchStage, Launcher, LauncherInput};
+pub use machine::{ProcessRegistration, Runtime, RuntimeError};
 pub use module_memory::{InstallStage, ModuleInstallError, install_prepared_module};
 pub use nixe_scheduler::{ProcessLifecycle, ThreadLifecycle};
 pub use nixe_scheduler::{VirtualClock, VirtualClockMode};
 pub use process::{
     ExecutionReport, ExecutionStop, GuestStackFrame, ProcessAddressSpace, ProcessBuildConfig,
-    ProcessBuildError, ProcessBuildStage, ProcessBuilder, ProcessExecutionError, ProcessExit,
-    ProcessExitCause, ProcessMemoryAccounting, ProcessMemoryLayout, ProcessMemoryLayoutProfile,
+    ProcessBuildError, ProcessBuildStage, ProcessBuilder, ProcessExit, ProcessExitCause,
+    ProcessMemoryAccounting, ProcessMemoryLayout, ProcessMemoryLayoutProfile,
     ProcessTeardownFailure, ProcessTeardownReport, ProcessVirtualRegion, RunnableProcess,
     ThreadCreateError, ThreadCreateRequest, ThreadCreation, ThreadExit, ThreadObject,
-    ThreadRegisters, ThreadStartError, ThreadTable, ThreadTableError, ThreadWait,
+    ThreadRegisters, ThreadStartError, ThreadTable, ThreadTableError,
 };
 pub use process_mount::ProcessMountNamespace;
 
@@ -64,3 +61,5 @@ pub use process_mount::ProcessMountNamespace;
 pub use nixe_cpu_jit::ThreadState as GuestCpuState;
 
 use external_event::ExternalEventInbox;
+
+pub use kernel_operation::{DispatchFault, KernelQueue, ThreadWait, WaitCompletion};

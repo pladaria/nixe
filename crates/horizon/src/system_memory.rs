@@ -33,7 +33,7 @@ pub(crate) async fn write(
     match memory.write(offset, bytes).map_err(Arc::new)? {
         Access::Ready(()) => Ok(()),
         Access::Pending(pending) => match pending.await? {
-            AccessResult::Written => Ok(()),
+            AccessResult::Written(_) => Ok(()),
             _ => Err(Arc::new(MemoryError::Execution(
                 "invalid system-memory write completion".into(),
             ))),
@@ -49,7 +49,7 @@ pub(crate) async fn read(
     match memory.read(offset, bytes).map_err(Arc::new)? {
         Access::Ready(bytes) => Ok(bytes),
         Access::Pending(pending) => match pending.await? {
-            AccessResult::Read(data) if data.len() == bytes => Ok(data),
+            AccessResult::Read(data) if data.len() == bytes => Ok(data.into_boxed_slice()),
             _ => Err(Arc::new(MemoryError::Execution(
                 "invalid system-memory read completion".into(),
             ))),
@@ -57,62 +57,54 @@ pub(crate) async fn read(
     }
 }
 
-pub(crate) async fn read_transfer(
+pub(crate) async fn read_transfer_into(
     memory: &nixe_runtime::TransferMemoryObject,
     offset: u64,
-    bytes: usize,
-) -> Result<Vec<u8>, Arc<MemoryError>> {
-    if bytes == 0 {
-        return Ok(Vec::new());
-    }
-    if offset
-        .checked_add(bytes as u64)
-        .is_none_or(|end| end > memory.size())
-    {
-        return Err(Arc::new(MemoryError::Invalid(
-            "transfer read exceeds its accepted memory",
-        )));
-    }
-    let machine = memory.ranges()[0].allocation().machine();
-    let mut output = vec![0; bytes];
-    match machine
-        .read_captured_into(memory.ranges(), offset, &mut output)
+    output: &mut Vec<u8>,
+) -> Result<(), Arc<MemoryError>> {
+    let storage = std::mem::take(output);
+    let storage = match memory.ranges()[0]
+        .allocation()
+        .machine()
+        .read_captured_owned(memory.ranges(), offset, storage)
         .map_err(Arc::new)?
     {
-        Access::Ready(()) => {}
+        Access::Ready(storage) => storage,
         Access::Pending(pending) => match pending.await? {
-            AccessResult::Read(bytes) if bytes.len() == output.len() => {
-                output.copy_from_slice(&bytes)
-            }
+            AccessResult::Read(storage) => storage,
             _ => {
                 return Err(Arc::new(MemoryError::Execution(
                     "invalid transfer-memory read completion".into(),
                 )));
             }
         },
-    }
-    Ok(output)
+    };
+    *output = storage;
+    Ok(())
 }
 
 pub(crate) async fn write_transfer(
     memory: &nixe_runtime::TransferMemoryObject,
     offset: u64,
-    bytes: &[u8],
+    bytes: &mut Vec<u8>,
 ) -> Result<(), Arc<MemoryError>> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    let machine = memory.ranges()[0].allocation().machine();
-    match machine
-        .write_captured(memory.ranges(), offset, bytes)
+    let storage = std::mem::take(bytes);
+    let storage = match memory.ranges()[0]
+        .allocation()
+        .machine()
+        .write_captured_owned(memory.ranges(), offset, storage)
         .map_err(Arc::new)?
     {
-        Access::Ready(()) => Ok(()),
+        Access::Ready(storage) => storage,
         Access::Pending(pending) => match pending.await? {
-            AccessResult::Written => Ok(()),
-            _ => Err(Arc::new(MemoryError::Execution(
-                "invalid transfer-memory write completion".into(),
-            ))),
+            AccessResult::Written(storage) => storage,
+            _ => {
+                return Err(Arc::new(MemoryError::Execution(
+                    "invalid transfer-memory write completion".into(),
+                )));
+            }
         },
-    }
+    };
+    *bytes = storage;
+    Ok(())
 }

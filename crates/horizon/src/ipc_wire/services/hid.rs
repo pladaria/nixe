@@ -122,6 +122,9 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
             if !handles_size.is_multiple_of(4) || values_size != handles_size * 4 {
                 return cmif_error(request.token, HorizonIpcResult::SF_PRECONDITION_VIOLATION);
             }
+            process
+                .reserve_payload((handles_size + values_size) * 2)
+                .await?;
             let mut encoded_handles = vec![0; handles_size];
             let mut encoded_values = vec![0; values_size];
             if handles_size != 0 {
@@ -181,7 +184,7 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let handle = process
-                .return_handle(HorizonIpcObject::HidActiveVibrationDeviceList(
+                .return_service(HorizonIpcObject::HidActiveVibrationDeviceList(
                     HidActiveVibrationDeviceList::default(),
                 ))
                 .map_err(IpcWireError::Handle)?;
@@ -194,7 +197,7 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let handle = process
-                .return_handle(HorizonIpcObject::HidAppletResource(
+                .return_service(HorizonIpcObject::HidAppletResource(
                     session.create_applet_resource(),
                 ))
                 .map_err(IpcWireError::Handle)?;
@@ -282,6 +285,7 @@ pub(in crate::ipc_wire) async fn dispatch_hid(
             if size == 0 || !size.is_multiple_of(4) || size > 10 * 4 {
                 return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
+            process.reserve_payload(size).await?;
             let mut encoded_ids = vec![0; size];
             process
                 .read(&process.send_statics()[0], 0, &mut encoded_ids)

@@ -258,12 +258,12 @@ pub(crate) fn backing_allocation(
 pub(crate) fn cpu_read(cache: &mut VulkanResidency, range: &PhysicalMapping) -> Vec<u8> {
     let inputs = range.pin(0, range.bytes()).unwrap();
     let nixe_memory::AccessResult::Read(bytes) = cache
-        .access_memory(inputs, nixe_memory::AccessOperation::Read)
+        .access_memory(inputs, nixe_memory::AccessOperation::Read(Vec::new()))
         .unwrap()
     else {
         panic!("expected read")
     };
-    bytes.into_vec()
+    bytes
 }
 pub(super) fn buffer(cache: &mut VulkanResidency, range: Arc<PhysicalMapping>) -> BufferId {
     cache
@@ -438,7 +438,7 @@ pub(crate) fn cpu_write(
         vec![input],
         nixe_memory::AccessOperation::Write(bytes.into()),
     )?;
-    assert!(matches!(result, nixe_memory::AccessResult::Written));
+    assert!(matches!(result, nixe_memory::AccessResult::Written(_)));
     let memory = cache.memory().clone();
     cache.consume_cpu_writes(memory.collect_cpu_writes()?)?;
     Ok(())

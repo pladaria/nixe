@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
@@ -11,27 +11,8 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExternalEventSource {
     Timer,
-    Device,
-    GpuCompletion,
-    Display,
     Input,
-    Ipc,
     Worker,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ExternalEventSequence(u64);
-
-impl ExternalEventSequence {
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -39,16 +20,10 @@ pub enum ExternalEvent {
     HostStop,
     /// Suspends/resumes host emulation without changing guest thread activity.
     HostPause(bool),
-    /// Wakes the host coordinator without making a guest thread runnable.
+    /// Wakes the host supervisor without making a guest thread runnable.
     HostService(ExternalEventSource),
     /// The last reference to a canonical thread queued its actual finalization.
     ThreadRetirement,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SequencedExternalEvent {
-    pub sequence: ExternalEventSequence,
-    pub event: ExternalEvent,
 }
 
 #[derive(Debug)]
@@ -60,49 +35,15 @@ pub(crate) struct RetiredThread {
 
 #[derive(Debug)]
 struct EventPublication {
-    sender: SyncSender<CoordinatorEvent>,
-    next_sequence: Mutex<u64>,
-    pending: AtomicUsize,
-    capacity: usize,
+    sender: SyncSender<ExternalEvent>,
+    overflowed: AtomicBool,
     retired_threads: Mutex<VecDeque<RetiredThread>>,
     retirement_pending: AtomicBool,
-}
-
-impl EventPublication {
-    fn publish(&self, event: ExternalEvent) -> Result<(), ExternalEventSendError> {
-        let mut sequence = self
-            .next_sequence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.pending.load(Ordering::Acquire) >= self.capacity {
-            return Err(ExternalEventSendError::Full);
-        }
-        let next = sequence
-            .checked_add(1)
-            .ok_or(ExternalEventSendError::SequenceExhausted)?;
-        self.pending.fetch_add(1, Ordering::Relaxed);
-        if let Err(error) =
-            self.sender
-                .try_send(CoordinatorEvent::External(SequencedExternalEvent {
-                    sequence: ExternalEventSequence(*sequence),
-                    event,
-                }))
-        {
-            self.pending.fetch_sub(1, Ordering::Release);
-            return Err(match error {
-                TrySendError::Full(_) => ExternalEventSendError::Full,
-                TrySendError::Disconnected(_) => ExternalEventSendError::Closed,
-            });
-        }
-        *sequence = next;
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug)]
 pub struct ExternalEventSender {
     publication: Arc<EventPublication>,
-    overflowed: Arc<AtomicBool>,
 }
 
 impl ExternalEventSender {
@@ -128,10 +69,7 @@ impl ExternalEventSender {
             first
         };
         if first {
-            match self.submit(ExternalEvent::ThreadRetirement) {
-                Ok(()) | Err(ExternalEventSendError::Full | ExternalEventSendError::Closed) => {}
-                Err(_) => self.overflowed.store(true, Ordering::Release),
-            }
+            let _ = self.submit(ExternalEvent::ThreadRetirement);
             // Full ingress already guarantees a wake; the actual work remains
             // queued and is consumed on that ingress, rather than being lost.
         }
@@ -152,20 +90,21 @@ impl ExternalEventSender {
     }
 
     /// Coalescing is owned by the producer's mailbox. Overflow is reported by
-    /// the coordinator instead of silently losing a host service notification.
+    /// the supervisor instead of silently losing a host service notification.
     pub fn notify_host_service(&self, source: ExternalEventSource) {
-        if let Err(error) = self.submit(ExternalEvent::HostService(source))
-            && matches!(
-                error,
-                ExternalEventSendError::Full | ExternalEventSendError::SequenceExhausted
-            )
-        {
-            self.overflowed.store(true, Ordering::Release);
+        if let Err(ExternalEventSendError::Full) = self.submit(ExternalEvent::HostService(source)) {
+            self.publication.overflowed.store(true, Ordering::Release);
         }
     }
 
     pub fn submit(&self, event: ExternalEvent) -> Result<(), ExternalEventSendError> {
-        self.publication.publish(event)
+        self.publication
+            .sender
+            .try_send(event)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => ExternalEventSendError::Full,
+                TrySendError::Disconnected(_) => ExternalEventSendError::Closed,
+            })
     }
 }
 
@@ -178,41 +117,25 @@ impl std::task::Wake for ExternalEventSender {
     }
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "bounded ingress transfers CPU state inline without allocating each completion"
-)]
-pub(crate) enum CoordinatorEvent {
-    External(SequencedExternalEvent),
-    Completed(crate::coordinator::worker::WorkerResult),
-}
-
 pub(crate) struct ExternalEventInbox {
     pub(crate) sender: ExternalEventSender,
-    receiver: Receiver<CoordinatorEvent>,
+    receiver: Receiver<ExternalEvent>,
 }
 
 impl ExternalEventInbox {
-    pub fn bounded(capacity: usize, cpu_workers: usize) -> Result<Self, ExternalEventSendError> {
+    pub fn bounded(capacity: usize) -> Result<Self, ExternalEventSendError> {
         if capacity == 0 {
             return Err(ExternalEventSendError::ZeroCapacity);
         }
-        // A native completion must remain publishable when host ingress is full:
-        // synchronous core-install/retirement replies can depend on that worker.
-        // Leases limit CPU completions to one per core; host events have their
-        // own quota, retained while a drain temporarily defers their handling.
-        let (sender, receiver) = sync_channel(capacity + cpu_workers);
+        let (sender, receiver) = sync_channel(capacity);
         Ok(Self {
             sender: ExternalEventSender {
                 publication: Arc::new(EventPublication {
                     sender,
-                    next_sequence: Mutex::new(1),
-                    pending: AtomicUsize::new(0),
-                    capacity,
+                    overflowed: AtomicBool::new(false),
                     retired_threads: Mutex::default(),
                     retirement_pending: AtomicBool::new(false),
                 }),
-                overflowed: Arc::new(AtomicBool::new(false)),
             },
             receiver,
         })
@@ -223,21 +146,22 @@ impl ExternalEventInbox {
         self.sender.clone()
     }
 
-    pub(crate) fn worker_sender(&self) -> SyncSender<CoordinatorEvent> {
-        self.sender.publication.sender.clone()
-    }
-
-    pub(crate) fn consume_external(&self) {
-        self.sender
+    // Supervision reports lost notifications; teardown must still drain accepted work.
+    pub(crate) fn check_error(&self) -> Result<(), ExternalEventSendError> {
+        if self
+            .sender
             .publication
-            .pending
-            .fetch_sub(1, Ordering::Release);
+            .overflowed
+            .swap(false, Ordering::AcqRel)
+        {
+            Err(ExternalEventSendError::Full)
+        } else {
+            Ok(())
+        }
     }
 
-    pub(crate) fn try_recv(&self) -> Result<Option<CoordinatorEvent>, ExternalEventSendError> {
-        if self.sender.overflowed.swap(false, Ordering::AcqRel) {
-            return Err(ExternalEventSendError::Full);
-        }
+    pub(crate) fn try_recv(&self) -> Result<Option<ExternalEvent>, ExternalEventSendError> {
+        self.check_error()?;
         match self.receiver.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(TryRecvError::Empty) => Ok(None),
@@ -245,7 +169,7 @@ impl ExternalEventInbox {
         }
     }
 
-    pub(crate) fn recv(&self) -> Result<CoordinatorEvent, ExternalEventSendError> {
+    pub(crate) fn recv(&self) -> Result<ExternalEvent, ExternalEventSendError> {
         self.receiver
             .recv()
             .map_err(|_| ExternalEventSendError::Closed)
@@ -254,7 +178,7 @@ impl ExternalEventInbox {
     pub(crate) fn recv_timeout(
         &self,
         timeout: Duration,
-    ) -> Result<Option<CoordinatorEvent>, ExternalEventSendError> {
+    ) -> Result<Option<ExternalEvent>, ExternalEventSendError> {
         match self.receiver.recv_timeout(timeout) {
             Ok(event) => Ok(Some(event)),
             Err(RecvTimeoutError::Timeout) => Ok(None),
@@ -268,7 +192,6 @@ pub enum ExternalEventSendError {
     ZeroCapacity,
     Full,
     Closed,
-    SequenceExhausted,
 }
 
 impl Display for ExternalEventSendError {
@@ -286,7 +209,7 @@ mod tests {
         use super::*;
         use nixe_scheduler::{GuestThreadId, ProcessId};
         for full in [false, true] {
-            let inbox = ExternalEventInbox::bounded(1, 1).unwrap();
+            let inbox = ExternalEventInbox::bounded(1).unwrap();
             let sender = inbox.sender();
             if full {
                 sender
@@ -307,18 +230,17 @@ mod tests {
                     });
                 }
             });
-            let Some(CoordinatorEvent::External(event)) = inbox.try_recv().unwrap() else {
+            let Some(event) = inbox.try_recv().unwrap() else {
                 panic!("missing coalesced ingress");
             };
             assert_eq!(
-                event.event,
+                event,
                 if full {
                     ExternalEvent::HostService(ExternalEventSource::Input)
                 } else {
                     ExternalEvent::ThreadRetirement
                 }
             );
-            inbox.consume_external();
             assert!(inbox.try_recv().unwrap().is_none());
             let mut retired = std::collections::BTreeSet::new();
             while let Some(item) = sender.take_retired_thread() {
@@ -331,9 +253,10 @@ mod tests {
                 GuestThreadId::new(2049),
                 std::sync::Weak::new(),
             );
-            assert!(
-                matches!(inbox.try_recv().unwrap(), Some(CoordinatorEvent::External(event)) if event.event == ExternalEvent::ThreadRetirement)
-            );
+            assert!(matches!(
+                inbox.try_recv().unwrap(),
+                Some(ExternalEvent::ThreadRetirement)
+            ));
             assert_eq!(
                 sender
                     .take_retired_thread()
@@ -345,108 +268,41 @@ mod tests {
 
     use super::*;
 
-    fn external(
-        inbox: &ExternalEventInbox,
-        event: Option<CoordinatorEvent>,
-    ) -> Option<SequencedExternalEvent> {
-        event.map(|event| match event {
-            CoordinatorEvent::External(event) => {
-                inbox.consume_external();
-                event
-            }
-            CoordinatorEvent::Completed(_) => panic!("this fixture has no CPU workers"),
-        })
-    }
-
     #[test]
     fn host_service_overflow_is_reported_to_the_consumer() {
-        let inbox = ExternalEventInbox::bounded(1, 0).unwrap();
+        let inbox = ExternalEventInbox::bounded(1).unwrap();
         let sender = inbox.sender();
         sender.notify_host_service(ExternalEventSource::Input);
         sender.notify_host_service(ExternalEventSource::Input);
+        assert_eq!(inbox.try_recv(), Err(ExternalEventSendError::Full));
         assert_eq!(
-            inbox.try_recv().map(|event| external(&inbox, event)),
-            Err(ExternalEventSendError::Full)
-        );
-        assert_eq!(
-            inbox
-                .try_recv()
-                .map(|event| external(&inbox, event))
-                .unwrap()
-                .unwrap()
-                .event,
+            inbox.try_recv().unwrap().unwrap(),
             ExternalEvent::HostService(ExternalEventSource::Input)
         );
     }
 
     #[test]
     fn bounded_inbox_reports_backpressure_without_blocking() {
-        let inbox = ExternalEventInbox::bounded(1, 0).unwrap();
+        let inbox = ExternalEventInbox::bounded(1).unwrap();
         let sender = inbox.sender();
         sender.submit(ExternalEvent::HostStop).unwrap();
         assert_eq!(
             sender.submit(ExternalEvent::HostStop),
             Err(ExternalEventSendError::Full)
         );
-        assert_eq!(
-            inbox
-                .try_recv()
-                .map(|event| external(&inbox, event))
-                .unwrap()
-                .map(|event| event.event),
-            Some(ExternalEvent::HostStop)
-        );
-        assert_eq!(
-            inbox
-                .try_recv()
-                .map(|event| external(&inbox, event))
-                .unwrap(),
-            None
-        );
+        assert_eq!(inbox.try_recv().unwrap(), Some(ExternalEvent::HostStop));
+        assert_eq!(inbox.try_recv().unwrap(), None);
     }
 
     #[test]
     fn bounded_receive_distinguishes_a_host_deadline_from_an_external_event() {
-        let inbox = ExternalEventInbox::bounded(1, 0).unwrap();
-        assert_eq!(
-            inbox
-                .recv_timeout(Duration::ZERO)
-                .map(|event| external(&inbox, event))
-                .unwrap(),
-            None
-        );
+        let inbox = ExternalEventInbox::bounded(1).unwrap();
+        assert_eq!(inbox.recv_timeout(Duration::ZERO).unwrap(), None);
 
         inbox.sender().submit(ExternalEvent::HostStop).unwrap();
         assert_eq!(
-            inbox
-                .recv_timeout(Duration::from_secs(1))
-                .map(|event| external(&inbox, event))
-                .unwrap()
-                .map(|event| event.event),
+            inbox.recv_timeout(Duration::from_secs(1)).unwrap(),
             Some(ExternalEvent::HostStop)
         );
-    }
-    #[test]
-    fn concurrent_device_producers_are_published_in_one_monotonic_order() {
-        let inbox = ExternalEventInbox::bounded(512, 0).unwrap();
-        std::thread::scope(|scope| {
-            for source in [
-                ExternalEventSource::GpuCompletion,
-                ExternalEventSource::Display,
-                ExternalEventSource::Input,
-            ] {
-                let sender = inbox.sender();
-                scope.spawn(move || {
-                    for _ in 0..100 {
-                        sender.submit(ExternalEvent::HostService(source)).unwrap();
-                    }
-                });
-            }
-        });
-        for expected in 1..=300 {
-            let event = external(&inbox, inbox.try_recv().unwrap()).unwrap();
-            assert_eq!(event.sequence.get(), expected);
-        }
-        assert!(inbox.try_recv().unwrap().is_none());
     }
 }

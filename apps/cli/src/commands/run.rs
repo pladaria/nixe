@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,9 +18,8 @@ use nixe_input::{
 };
 use nixe_loader_title::{NacpLanguage, SupportedLanguages, UserAccountSwitchLock};
 use nixe_runtime::{
-    ExceptionHandlingResult, ExecutionStop, Launcher, LauncherInput, ProcessBuilder, ProcessExit,
-    ProcessExitCause, ProcessRegistration, ProcessTeardownReport, RunnableProcess,
-    RuntimeCoordinator, VirtualClock, VirtualClockMode,
+    Launcher, LauncherInput, ProcessBuilder, ProcessExit, ProcessExitCause, ProcessRegistration,
+    ProcessTeardownReport, RunnableProcess, Runtime, VirtualClock, VirtualClockMode,
 };
 use nixe_scheduler::ProcessId;
 use nixe_video_winit::{FrontendControl, WindowFrontend};
@@ -163,9 +161,8 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
     };
     let virtual_clock = VirtualClock::new(clock_mode);
     let kernel = nixe_scheduler::SchedulerState::new(scheduler_profile, virtual_clock.clone());
-    let coordinator =
-        RuntimeCoordinator::try_new(kernel.clone()).map_err(|error| error.to_string())?;
-    let external_events = coordinator.event_sender();
+    let runtime = Runtime::try_new(kernel.clone()).map_err(|error| error.to_string())?;
+    let external_events = runtime.event_sender();
     install_interrupt_handler(frontend_control.clone(), external_events.clone())?;
     frontend = frontend.map(|frontend| {
         let events = external_events.clone();
@@ -335,7 +332,7 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         f32::from(config.audio.volume) / 100.0,
     )
     .map_err(|error| error.to_string())?;
-    let input_events = coordinator.event_sender();
+    let input_events = runtime.event_sender();
     let input_owner = InputWorker::with_profiles(&sdl, gamepad_profiles, move || {
         input_events.notify_host_service(nixe_runtime::ExternalEventSource::Input);
     })
@@ -352,8 +349,8 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
     let audio_backend = audio.backend();
 
     let Some(frontend) = frontend else {
-        return finish_execution(execute_worker(
-            coordinator,
+        return finish_execution(supervise_process(
+            runtime,
             process,
             horizon_environment,
             video_system,
@@ -371,8 +368,8 @@ fn run_with_memory(arguments: Arguments, memory: nixe_memory::Machine) -> Result
         .name("nixe-guest".to_owned())
         .spawn(move || {
             let _completion = WorkerCompletion(worker_control);
-            execute_worker(
-                coordinator,
+            supervise_process(
+                runtime,
                 process,
                 horizon_environment,
                 video_system,
@@ -520,7 +517,7 @@ impl Drop for WorkerCompletion {
     }
 }
 
-struct WorkerResult {
+struct RunOutcome {
     execution: Result<ExecutionSummary, String>,
     teardown: Result<ProcessTeardownReport, String>,
     graphics_teardown: nixe_horizon::GraphicsTeardownReport,
@@ -547,66 +544,59 @@ struct HostInputReaders {
     vibration: nixe_input::VibrationOutput,
 }
 
-fn execute_worker(
-    mut coordinator: RuntimeCoordinator,
+fn supervise_process(
+    mut runtime: Runtime,
     process: RunnableProcess,
     horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
     mut host_input: HostInputReaders,
     audio_backend: Arc<nixe_audio::HostAudioBackend>,
     gpu_diagnostics: (CacheMonitor, FrameMetrics),
-) -> WorkerResult {
+) -> RunOutcome {
     let (mut gpu_caches, frame_metrics) = gpu_diagnostics;
     let registration = ProcessRegistration {
         priority: process.initial_thread_priority(),
         ideal_vcpu: Some(process.initial_ideal_vcpu()),
-        affinity: coordinator.scheduler().profile().all_cores(),
+        affinity: runtime.scheduler().profile().all_cores(),
     };
-    let process_id = coordinator
+    let process_id = runtime
         .register_process(process, registration)
         .expect("CLI process and verified Switch 1 scheduler profile are compatible");
     let execution_started = Instant::now();
     let execution_video = video_system.clone();
-    let mut scheduled = ScheduledProcess {
-        coordinator: &mut coordinator,
-        process_id,
-    };
     let mut execution = execute(
-        &mut scheduled,
+        &mut runtime,
+        process_id,
         horizon_environment,
         execution_video,
         &mut host_input,
         audio_backend,
-        &mut gpu_caches,
-        &frame_metrics,
+        (&mut gpu_caches, &frame_metrics),
     );
     log::debug!(
         "guest execution stopped after {:?}",
         execution_started.elapsed()
     );
-    if let Err(error) = coordinator.quiesce() {
+    if let Err(error) = runtime.quiesce() {
         execution = Err(match execution {
             Ok(_) => error.to_string(),
             Err(original) => format!("{original}; cannot quiesce CPU workers: {error}"),
         });
     }
     #[cfg(feature = "performance-counters")]
-    log::info!(
-        "kernel scheduler: {:?}",
-        coordinator.scheduler().statistics()
-    );
+    log::info!("kernel scheduler: {:?}", runtime.scheduler().statistics());
     #[cfg(feature = "performance-counters")]
     log::info!(
         "kernel timers: {:?}",
-        coordinator.scheduler().timing_statistics()
+        runtime.scheduler().timing_statistics()
     );
-    // Stop and join GPU work while its
-    // canonical memory transitions can still use the JIT coordinator. Removing
+    // Stop and join GPU work while its canonical memory transitions can still
+    // reach the native owners. Removing
     // the process closes native admission and would reject those transitions.
     let graphics_teardown = video_system.teardown();
-    let teardown = match coordinator.remove_process(process_id) {
+    let teardown = match runtime.remove_process(process_id) {
         Ok(report) => report,
-        Err(nixe_runtime::CoordinatorError::ProcessTeardown { failure, .. }) => {
+        Err(nixe_runtime::RuntimeError::ProcessTeardown { failure, .. }) => {
             let diagnostic = failure.to_string();
             execution = Err(match execution {
                 Ok(_) => diagnostic,
@@ -615,21 +605,27 @@ fn execute_worker(
             *failure.report
         }
         Err(error) => {
-            return WorkerResult {
+            return RunOutcome {
                 execution,
                 teardown: Err(format!("cannot remove process during teardown: {error}")),
                 graphics_teardown,
             };
         }
     };
-    WorkerResult {
+    if let Err(error) = runtime.shutdown() {
+        execution = Err(match execution {
+            Ok(_) => error.to_string(),
+            Err(original) => format!("{original}; runtime shutdown failed: {error}"),
+        });
+    }
+    RunOutcome {
         execution,
         teardown: Ok(teardown),
         graphics_teardown,
     }
 }
 
-fn finish_execution(result: WorkerResult) -> Result<(), String> {
+fn finish_execution(result: RunOutcome) -> Result<(), String> {
     let teardown = result
         .teardown
         .map_err(|diagnostic| match &result.execution {
@@ -659,7 +655,17 @@ fn finish_execution(result: WorkerResult) -> Result<(), String> {
         || "without an exit record".to_owned(),
         |exit| format!("{:?}", exit.cause),
     );
-    log::info!(
+    let level = if teardown
+        .exit
+        .as_ref()
+        .is_some_and(|exit| matches!(exit.cause, ProcessExitCause::GuestBreak { .. }))
+    {
+        log::Level::Error
+    } else {
+        log::Level::Info
+    };
+    log::log!(
+        level,
         "execution finished: SVC calls={}, rejected SVC kinds={}, cause={}, code={:#x}",
         summary.svc_calls,
         summary.rejected_svc_kinds,
@@ -677,22 +683,16 @@ struct ExecutionSummary {
     rejected_svc_kinds: usize,
 }
 
-struct ScheduledProcess<'a> {
-    coordinator: &'a mut RuntimeCoordinator,
-    process_id: ProcessId,
-}
-
 fn execute(
-    scheduled: &mut ScheduledProcess<'_>,
+    runtime: &mut Runtime,
+    process_id: ProcessId,
     horizon_environment: HorizonEnvironment,
     video_system: VideoSystem,
     host_input: &mut HostInputReaders,
     audio_backend: Arc<nixe_audio::HostAudioBackend>,
-    gpu_caches: &mut CacheMonitor,
-    frame_metrics: &FrameMetrics,
+    gpu_diagnostics: (&mut CacheMonitor, &FrameMetrics),
 ) -> Result<ExecutionSummary, String> {
-    let coordinator = &mut *scheduled.coordinator;
-    let process_id = scheduled.process_id;
+    let (gpu_caches, frame_metrics) = gpu_diagnostics;
     let mut dispatcher = HorizonSvcDispatcher::new_with_video_and_settings(
         horizon_environment.operation_mode,
         horizon_environment.time,
@@ -701,7 +701,7 @@ fn execute(
         horizon_environment.settings,
         video_system,
     )
-    .with_input_completions(coordinator.event_sender())
+    .with_input_completions(runtime.event_sender())
     .with_system_archives(horizon_environment.system_archives)
     .with_diagnostics(horizon_environment.diagnostics)
     .with_audio_backend(audio_backend.clone())
@@ -724,43 +724,38 @@ fn execute(
     if let Some(version) = horizon_environment.application_display_version {
         dispatcher = dispatcher.with_application_display_version(&version);
     }
-    let execution_started = coordinator.emulation_elapsed();
+    runtime
+        .start(dispatcher.clone())
+        .map_err(|error| error.to_string())?;
+    let execution_started = runtime.emulation_elapsed();
     let execution_rate_enabled = log::log_enabled!(log::Level::Info);
-    let mut execution_completions = 0_u64;
     let mut last_rate_completions = 0_u64;
     let mut last_rate_elapsed = Duration::ZERO;
-    let mut rejected = BTreeSet::new();
     let mut last_input_sample: Option<Instant> = None;
     let mut active_input = None;
     let mut input_observed = false;
     let mut active_buttons = EmulatedButtonState::default();
     loop {
-        coordinator
+        runtime
             .drain_external_events()
             .map_err(|error| error.to_string())?;
-        dispatcher
-            .poll_memory_completions(coordinator)
-            .map_err(|error| error.to_string())?;
-        if coordinator.host_stop_requested() {
+        if runtime.host_stop_requested() {
             log::info!("host stop received; stopping the guest process cleanly");
-            if !coordinator
+            runtime
                 .terminate_process(process_id)
-                .map_err(|error| error.to_string())?
-            {
-                return Err("host stop could not terminate the guest process cleanly".to_owned());
-            }
-            return Ok(execution_summary(&dispatcher, rejected.len()));
+                .map_err(|error| error.to_string())?;
+            return Ok(execution_summary(&dispatcher, runtime.rejected_svc_kinds()));
         }
-        if coordinator.host_paused() {
+        if runtime.host_paused() {
             audio_backend
                 .set_paused(true)
                 .map_err(|error| error.to_string())?;
             dispatcher.set_host_paused(true);
             log::info!("emulation paused");
-            coordinator
+            runtime
                 .wait_while_host_paused()
                 .map_err(|error| error.to_string())?;
-            if !coordinator.host_stop_requested() {
+            if !runtime.host_stop_requested() {
                 dispatcher.set_host_paused(false);
                 audio_backend
                     .set_paused(false)
@@ -770,7 +765,7 @@ fn execute(
             }
             continue;
         }
-        let elapsed = coordinator
+        let elapsed = runtime
             .emulation_elapsed()
             .saturating_sub(execution_started);
         dispatcher
@@ -833,22 +828,26 @@ fn execute(
             last_input_sample = Some(sample.captured_at);
         }
         let host_wait = host_service_wait_duration(
-            coordinator
+            runtime
                 .emulation_elapsed()
                 .saturating_sub(execution_started),
             dispatcher.next_video_deadline(),
         );
-        let Some(execution) = coordinator
-            .run_next(host_wait)
-            .map_err(|error| error.to_string())?
-        else {
-            continue;
-        };
-        let report = execution.report;
+        runtime
+            .wait_events(host_wait)
+            .map_err(|error| error.to_string())?;
+        if runtime
+            .process(process_id)
+            .is_some_and(|process| process.lifecycle() == nixe_scheduler::ProcessLifecycle::Exited)
+        {
+            return Ok(execution_summary(&dispatcher, runtime.rejected_svc_kinds()));
+        }
         if execution_rate_enabled {
-            execution_completions = execution_completions.wrapping_add(1);
-            if execution_completions.is_multiple_of(EXECUTION_RATE_COMPLETIONS) {
-                let elapsed = coordinator
+            let execution_completions = runtime.completions();
+            if execution_completions.wrapping_sub(last_rate_completions)
+                >= EXECUTION_RATE_COMPLETIONS
+            {
+                let elapsed = runtime
                     .emulation_elapsed()
                     .saturating_sub(execution_started);
                 let interval = elapsed.saturating_sub(last_rate_elapsed);
@@ -880,14 +879,14 @@ fn execute(
                         log::info!("frame timing: no completed frames");
                     }
                     if log::log_enabled!(log::Level::Trace)
-                        && let Some(process) = coordinator.process(process_id)
+                        && let Some(process) = runtime.process(process_id)
                     {
                         for (thread, object) in process.threads().iter() {
                             if let Some(cpu) = object.snapshot() {
                                 log::trace!(
                                     "guest thread snapshot: id={} scheduler={:?} registers=[{}]",
                                     thread.get(),
-                                    coordinator.scheduler().thread(thread),
+                                    runtime.scheduler().thread(thread),
                                     cpu.register_context(),
                                 );
                             }
@@ -897,42 +896,6 @@ fn execute(
                     last_rate_elapsed = elapsed;
                 }
             }
-        }
-
-        match &report.stop {
-            ExecutionStop::Safepoint | ExecutionStop::PendingEvent { .. } => {}
-            ExecutionStop::SupervisorCall { .. } => {
-                let handling = dispatcher
-                    .route_scheduled_supervisor_call(coordinator, execution.lease, &report.stop)
-                    .map_err(|error| error.to_string())?;
-
-                match handling {
-                    ExceptionHandlingResult::Resumed => {}
-                    ExceptionHandlingResult::Rejected(error) => {
-                        let diagnostic = error.to_string();
-                        if rejected.insert(diagnostic.clone()) {
-                            log::debug!("guest operation returned a Horizon error: {diagnostic}");
-                        }
-                    }
-                    ExceptionHandlingResult::Terminated { .. } => {
-                        // ExitThread can leave the rest of the process runnable.
-                        // Only the runtime's process lifecycle ends this launch.
-                        if coordinator.process(process_id).is_some_and(|process| {
-                            process.lifecycle() == nixe_scheduler::ProcessLifecycle::Exited
-                        }) {
-                            return Ok(execution_summary(&dispatcher, rejected.len()));
-                        }
-                    }
-                    ExceptionHandlingResult::Suspended => {}
-                    ExceptionHandlingResult::Fault(error) => {
-                        return Err(format!("Horizon SVC dispatch failed: {error}; {report}"));
-                    }
-                }
-            }
-            ExecutionStop::LoaderReturn { .. } => {
-                return Ok(execution_summary(&dispatcher, rejected.len()));
-            }
-            stop => return Err(execution_stop_error(stop, &report)),
         }
     }
 }
@@ -1090,41 +1053,13 @@ fn classify_exit(exit: Option<ProcessExit>) -> Result<(), String> {
 }
 
 fn execution_summary(
-    dispatcher: &HorizonSvcDispatcher,
+    dispatcher: &Arc<HorizonSvcDispatcher>,
     rejected_svc_kinds: usize,
 ) -> ExecutionSummary {
     ExecutionSummary {
         svc_calls: dispatcher.svc_calls(),
         rejected_svc_kinds,
     }
-}
-
-fn execution_stop_error(stop: &ExecutionStop, report: &nixe_runtime::ExecutionReport) -> String {
-    let reason = match stop {
-        ExecutionStop::UnsupportedSemantics {
-            source,
-            encoding,
-            disassembly,
-            coverage_id,
-        } => format!(
-            "CPU instruction semantics are not implemented: source=[{source}] encoding={encoding} instruction={disassembly} coverage={coverage_id}"
-        ),
-        ExecutionStop::UnallocatedEncoding { error } => {
-            format!("guest executed an unallocated instruction encoding: {error}")
-        }
-        ExecutionStop::FetchFault { fault } => {
-            format!("instruction fetch failed: {fault}")
-        }
-        ExecutionStop::ArchitecturalException {
-            source,
-            kind,
-            syndrome,
-        } => format!(
-            "unhandled architectural exception: source=[{source}] kind={kind:?} syndrome={syndrome:?}"
-        ),
-        _ => format!("unexpected execution stop: {stop}"),
-    };
-    format!("{reason}; diagnostic: {report}")
 }
 
 #[cfg(test)]
@@ -1181,7 +1116,7 @@ mod tests {
             Err("Dynarmic: invalid native state".to_owned()),
         ] {
             let failed = execution.is_err();
-            let error = finish_execution(WorkerResult {
+            let error = finish_execution(RunOutcome {
                 execution,
                 teardown: Err("cannot remove process during teardown: backend failure".into()),
                 graphics_teardown: Default::default(),

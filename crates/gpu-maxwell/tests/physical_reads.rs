@@ -96,14 +96,14 @@ fn device_read_owns_exact_inputs_and_releases_mapping_lock_before_entering_owner
     memory
         .read_resolved(&range, &mut bytes, &mut |inputs, operation| {
             calls += 1;
-            assert!(matches!(operation, AccessOperation::Read));
+            assert!(matches!(operation, AccessOperation::Read(_)));
             assert_eq!(inputs.iter().map(AllocationRange::bytes).sum::<u64>(), 19);
             // This would deadlock if the direct read held the mapping lock while
             // requesting coherence. The operation must retain the original RAM.
             space.unmap(mapping.offset()).unwrap();
             assert_eq!(machine.statistics().retained_bytes, 2 * PAGE_SIZE);
             machine.write_resolved(&inputs, &[0x33; 19]).unwrap();
-            Ok(AccessResult::Read(Box::new([0x33; 19])))
+            Ok(AccessResult::Read(Vec::from([0x33; 19])))
         })
         .unwrap();
     assert_eq!(calls, 1);

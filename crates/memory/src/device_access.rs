@@ -110,23 +110,23 @@ impl AtomicAccess {
     }
 }
 pub enum AccessOperation {
-    Read,
+    Read(Vec<u8>),
     /// Native CPU read with a reusable physical RAM-coherency observation.
     ReadNative,
     ReadCode(crate::Observation),
     /// Observed guest data consumed by the graphics owner, without ARM code tracking.
     ReadObserved(crate::Observation),
-    Write(Box<[u8]>),
+    Write(Vec<u8>),
     Atomic(AtomicAccess),
 }
 #[derive(Debug, Eq, PartialEq)]
 pub enum AccessResult {
-    Read(Box<[u8]>),
+    Read(Vec<u8>),
     NativeRead {
         bytes: Box<[u8]>,
         area: Option<NativeReadArea>,
     },
-    Written,
+    Written(Vec<u8>),
     Atomic {
         previous: u128,
         written: bool,
@@ -182,6 +182,7 @@ type Wake = Arc<dyn Fn() + Send + Sync>;
 struct CompletionState {
     result: Option<AccessResultValue>,
     wake: Option<Wake>,
+    retained: Option<Arc<dyn Send + Sync>>,
 }
 #[derive(Default)]
 struct Completion {
@@ -251,6 +252,10 @@ impl DeviceAccessRequest {
     pub fn operation(&self) -> &AccessOperation {
         &self.operation
     }
+    /// Borrow disjoint request fields while executing its owned operation.
+    pub fn parts_mut(&mut self) -> (&[AllocationRange], &mut AccessOperation) {
+        (&self.ranges, &mut self.operation)
+    }
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -263,7 +268,7 @@ impl DeviceAccessRequest {
         let result = result.and_then(|result| {
             let valid = match (&self.operation, &result) {
                 (
-                    AccessOperation::Read
+                    AccessOperation::Read(_)
                     | AccessOperation::ReadCode(_)
                     | AccessOperation::ReadObserved(_),
                     AccessResult::Read(bytes),
@@ -271,7 +276,9 @@ impl DeviceAccessRequest {
                 (AccessOperation::ReadNative, AccessResult::NativeRead { bytes, .. }) => {
                     bytes.len() == self.bytes
                 }
-                (AccessOperation::Write(_), AccessResult::Written) => true,
+                (AccessOperation::Write(_), AccessResult::Written(bytes)) => {
+                    bytes.len() == self.bytes
+                }
                 (AccessOperation::Atomic(access), AccessResult::Atomic { previous, written })
                     if matches!(
                         access.operation,
@@ -306,6 +313,11 @@ impl Drop for DeviceAccessRequest {
     }
 }
 impl PendingAccess {
+    /// Retain the external owner of transferred storage until both the device
+    /// request and its completion have retired, including caller cancellation.
+    pub fn retain_owner(&self, owner: Arc<dyn Send + Sync>) {
+        self.completion.state.lock().unwrap().retained = Some(owner);
+    }
     pub fn identity(&self) -> AccessRequestId {
         self.id
     }
@@ -531,13 +543,13 @@ mod tests {
         let machine = Machine::new(PAGE_SIZE).unwrap();
         let (_allocation, range) = range(&machine, 0, 1);
         assert!(matches!(
-            machine.request_device_access(vec![range.clone()], AccessOperation::Read),
+            machine.request_device_access(vec![range.clone()], AccessOperation::Read(Vec::new())),
             Err(MemoryError::Execution(_))
         ));
         let (endpoint, _receiver) = owner(&machine);
         drop(endpoint);
         assert!(matches!(
-            machine.request_device_access(vec![range], AccessOperation::Read),
+            machine.request_device_access(vec![range], AccessOperation::Read(Vec::new())),
             Err(MemoryError::Execution(_))
         ));
     }
@@ -547,7 +559,7 @@ mod tests {
         let (_endpoint, receiver) = owner(&machine);
         let (allocation, range) = range(&machine, 17, 3);
         let pending = machine
-            .request_device_access(vec![range], AccessOperation::Read)
+            .request_device_access(vec![range], AccessOperation::Read(Vec::new()))
             .unwrap();
         drop(allocation);
         assert_eq!(machine.statistics().retained_bytes, PAGE_SIZE);
@@ -555,11 +567,11 @@ mod tests {
         assert_eq!(request.bytes(), 3);
         assert_eq!(request.ranges()[0].offset(), 17);
         assert_eq!(pending.identity(), request.identity());
-        request.finish(Ok(AccessResult::Read(Box::new([1, 2, 3]))));
+        request.finish(Ok(AccessResult::Read(Vec::from([1, 2, 3]))));
         assert_eq!(machine.statistics().allocated_bytes, 0);
         assert_eq!(
             pending.wait().unwrap(),
-            AccessResult::Read(Box::new([1, 2, 3]))
+            AccessResult::Read(Vec::from([1, 2, 3]))
         );
     }
     #[test]
@@ -570,7 +582,7 @@ mod tests {
         let mut pending = machine
             .request_device_access(
                 vec![range.clone()],
-                AccessOperation::Write(Box::new([3, 4, 5, 6])),
+                AccessOperation::Write(Vec::from([3, 4, 5, 6])),
             )
             .unwrap();
         assert!(pending.poll().is_none());
@@ -579,11 +591,57 @@ mod tests {
             panic!("missing owned payload")
         };
         machine.write_resolved(request.ranges(), bytes).unwrap();
-        request.finish(Ok(AccessResult::Written));
-        assert_eq!(pending.wait().unwrap(), AccessResult::Written);
+        request.finish(Ok(AccessResult::Written(Vec::from([3, 4, 5, 6]))));
+        assert!(matches!(pending.wait().unwrap(), AccessResult::Written(_)));
         let mut bytes = [0; 4];
         machine.capture_stream(&[range], &mut bytes).unwrap();
         assert_eq!(bytes, [3, 4, 5, 6]);
+    }
+    #[test]
+    fn owned_captured_buffers_cross_the_device_dependency_without_a_snapshot() {
+        for write in [false, true] {
+            let machine = Machine::new(PAGE_SIZE).unwrap();
+            let (_endpoint, receiver) = owner(&machine);
+            let (_allocation, range) = range(&machine, 39, 4);
+            machine
+                .write_resolved(std::slice::from_ref(&range), &[3, 4, 5, 6])
+                .unwrap();
+            machine
+                .publish_device_write(std::slice::from_ref(&range), || Ok(()))
+                .unwrap();
+            let captured = crate::CapturedMemory::from(range);
+            let mut storage = Vec::with_capacity(4096);
+            storage.resize(4, 9);
+            let address = storage.as_ptr();
+            let access = if write {
+                machine.write_captured_owned(&captured, 0, storage)
+            } else {
+                machine.read_captured_owned(&captured, 0, storage)
+            }
+            .unwrap();
+            let Access::Pending(pending) = access else {
+                panic!("device-owned bytes must defer");
+            };
+            let mut request = next(&receiver);
+            match request.operation() {
+                AccessOperation::Read(bytes) | AccessOperation::Write(bytes) => {
+                    assert_eq!(bytes.as_ptr(), address)
+                }
+                _ => panic!("unexpected operation"),
+            }
+            let result = {
+                let (ranges, operation) = request.parts_mut();
+                machine.apply_resolved_access(ranges, operation)
+            }
+            .unwrap();
+            request.finish(Ok(result));
+            let storage = match pending.wait().unwrap() {
+                AccessResult::Read(bytes) | AccessResult::Written(bytes) => bytes,
+                _ => panic!("unexpected completion"),
+            };
+            assert_eq!(storage.as_ptr(), address);
+            assert_eq!(&*storage, if write { &[9; 4] } else { &[3, 4, 5, 6] });
+        }
     }
     #[test]
     fn completion_notifications_cover_both_registration_orders_and_run_unlocked() {
@@ -592,7 +650,7 @@ mod tests {
         let (_allocation, range) = range(&machine, 0, 1);
         for complete_first in [false, true] {
             let mut pending = machine
-                .request_device_access(vec![range.clone()], AccessOperation::Read)
+                .request_device_access(vec![range.clone()], AccessOperation::Read(Vec::new()))
                 .unwrap();
             let request = next(&receiver);
             let called = Arc::new(AtomicUsize::new(0));
@@ -603,16 +661,16 @@ mod tests {
                 seen.fetch_add(1, Ordering::Relaxed);
             });
             if complete_first {
-                request.finish(Ok(AccessResult::Read(Box::new([7]))));
+                request.finish(Ok(AccessResult::Read(Vec::from([7]))));
                 pending.set_waker(wake);
             } else {
                 pending.set_waker(wake);
-                request.finish(Ok(AccessResult::Read(Box::new([7]))));
+                request.finish(Ok(AccessResult::Read(Vec::from([7]))));
             }
             assert_eq!(called.load(Ordering::Relaxed), 1);
             assert_eq!(
                 pending.poll().unwrap().unwrap(),
-                AccessResult::Read(Box::new([7]))
+                AccessResult::Read(Vec::from([7]))
             );
         }
         struct ReplacedWake {
@@ -626,7 +684,7 @@ mod tests {
             }
         }
         let mut pending = machine
-            .request_device_access(vec![range], AccessOperation::Read)
+            .request_device_access(vec![range], AccessOperation::Read(Vec::new()))
             .unwrap();
         let dropped = Arc::new(AtomicUsize::new(0));
         let previous = ReplacedWake {
@@ -638,8 +696,8 @@ mod tests {
         }));
         pending.set_waker(Arc::new(|| {}));
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
-        next(&receiver).finish(Ok(AccessResult::Read(Box::new([8]))));
-        assert_eq!(pending.wait().unwrap(), AccessResult::Read(Box::new([8])));
+        next(&receiver).finish(Ok(AccessResult::Read(Vec::from([8]))));
+        assert_eq!(pending.wait().unwrap(), AccessResult::Read(Vec::from([8])));
     }
     #[test]
     fn cancellation_wakes_owner_and_retains_pending_native_input_until_retired() {
@@ -647,7 +705,7 @@ mod tests {
         let (_endpoint, receiver) = owner(&machine);
         let (allocation, range) = range(&machine, 0, 1);
         let pending = machine
-            .request_device_access(vec![range], AccessOperation::Read)
+            .request_device_access(vec![range], AccessOperation::Read(Vec::new()))
             .unwrap();
         let request = next(&receiver);
         let id = request.identity();
@@ -672,10 +730,10 @@ mod tests {
         let (_endpoint, receiver) = owner(&machine);
         let (_allocation, range) = range(&machine, 0, 1);
         let first = machine
-            .request_device_access(vec![range.clone()], AccessOperation::Read)
+            .request_device_access(vec![range.clone()], AccessOperation::Read(Vec::new()))
             .unwrap();
         let second = machine
-            .request_device_access(vec![range], AccessOperation::Write(Box::new([4])))
+            .request_device_access(vec![range], AccessOperation::Write(Vec::from([4])))
             .unwrap();
         let cause = Arc::new(MemoryError::Invalid("native submission B failed"));
         next(&receiver).finish(Err(Arc::clone(&cause)));
@@ -689,11 +747,11 @@ mod tests {
         let (_endpoint, receiver) = owner(&machine);
         let (_allocation, range) = range(&machine, 1, 3);
         for result in [
-            AccessResult::Read(vec![0; PAGE_SIZE as usize].into_boxed_slice()),
-            AccessResult::Written,
+            AccessResult::Read(vec![0; PAGE_SIZE as usize]),
+            AccessResult::Written(Vec::from([4])),
         ] {
             let pending = machine
-                .request_device_access(vec![range.clone()], AccessOperation::Read)
+                .request_device_access(vec![range.clone()], AccessOperation::Read(Vec::new()))
                 .unwrap();
             next(&receiver).finish(Ok(result));
             assert!(
@@ -705,7 +763,7 @@ mod tests {
             );
         }
         let pending = machine
-            .request_device_access(vec![range], AccessOperation::Read)
+            .request_device_access(vec![range], AccessOperation::Read(Vec::new()))
             .unwrap();
         drop(next(&receiver));
         assert!(
@@ -722,13 +780,13 @@ mod tests {
         let (_allocation, range) = range(&machine, 1, 4);
         assert!(
             machine
-                .request_device_access(vec![range.clone()], AccessOperation::Read)
+                .request_device_access(vec![range.clone()], AccessOperation::Read(Vec::new()))
                 .is_err()
         );
         let (endpoint, receiver) = owner(&machine);
         assert!(
             machine
-                .request_device_access(vec![range.clone()], AccessOperation::Write(Box::new([1])))
+                .request_device_access(vec![range.clone()], AccessOperation::Write(Vec::from([1])))
                 .is_err()
         );
         assert!(
@@ -749,14 +807,14 @@ mod tests {
         let foreign = Machine::new(PAGE_SIZE).unwrap();
         assert!(
             foreign
-                .request_device_access(vec![range.clone()], AccessOperation::Read)
+                .request_device_access(vec![range.clone()], AccessOperation::Read(Vec::new()))
                 .is_err()
         );
         assert!(receiver.try_recv().is_err());
         drop(endpoint);
         assert!(
             machine
-                .request_device_access(vec![range], AccessOperation::Read)
+                .request_device_access(vec![range], AccessOperation::Read(Vec::new()))
                 .is_err()
         );
     }
@@ -792,20 +850,22 @@ mod tests {
             .unwrap()
             .into_ready()
             .unwrap();
-        let request = next(&receiver);
+        let mut request = next(&receiver);
         assert_eq!(request.ranges()[0].allocation().identity(), first_id);
         assert_eq!(request.bytes(), 4);
         // The readback publishes the old producer's exact requested bytes.
         machine
             .write_resolved(request.ranges(), &88u32.to_le_bytes())
             .unwrap();
-        let result = machine
-            .apply_resolved_access(request.ranges(), request.operation())
-            .unwrap();
+        let result = {
+            let (ranges, operation) = request.parts_mut();
+            machine.apply_resolved_access(ranges, operation)
+        }
+        .unwrap();
         request.finish(Ok(result));
         assert_eq!(
             pending.wait().unwrap(),
-            AccessResult::Read(Box::new(88u32.to_le_bytes()))
+            AccessResult::Read(Vec::from(88u32.to_le_bytes()))
         );
         assert_eq!(space.read_value(base, 4).unwrap().into_ready().unwrap(), 99);
     }
@@ -848,16 +908,18 @@ mod tests {
         let mut before = [0; 4];
         machine.capture_stream(&device, &mut before).unwrap();
         assert_eq!(before, 5u32.to_le_bytes());
-        let request = next(&receiver);
+        let mut request = next(&receiver);
         assert_eq!(request.bytes(), 4);
-        let result = machine
-            .apply_resolved_access(request.ranges(), request.operation())
-            .unwrap();
+        let result = {
+            let (ranges, operation) = request.parts_mut();
+            machine.apply_resolved_access(ranges, operation)
+        }
+        .unwrap();
         // The owner retires the last device coverage before releasing this
         // write dependency. The CPU receives completion, never a write grant.
         machine.retire_device_pages(&device).unwrap();
         request.finish(Ok(result));
-        assert_eq!(pending.wait().unwrap(), AccessResult::Written);
+        assert!(matches!(pending.wait().unwrap(), AccessResult::Written(_)));
         assert_eq!(space.read_value(base, 4).unwrap().into_ready().unwrap(), 9);
     }
     #[test]
@@ -901,7 +963,7 @@ mod tests {
                     };
                     pending
                 };
-                let request = next(&receiver);
+                let mut request = next(&receiver);
                 assert_eq!(request.ranges().len(), 1);
                 assert_eq!(request.ranges()[0].offset(), offset);
                 assert_eq!(request.bytes(), 6);
@@ -921,17 +983,19 @@ mod tests {
                     assert!(matches!(receiver.recv().unwrap(), Message::Cancel(_)));
                     drop(request);
                 } else {
-                    let result = machine
-                        .apply_resolved_access(request.ranges(), request.operation())
-                        .unwrap();
+                    let result = {
+                        let (ranges, operation) = request.parts_mut();
+                        machine.apply_resolved_access(ranges, operation)
+                    }
+                    .unwrap();
                     machine.retire_device_pages(request.ranges()).unwrap();
                     request.finish(Ok(result));
                     assert_eq!(
                         pending.wait().unwrap(),
                         if write {
-                            AccessResult::Written
+                            AccessResult::Written(Vec::from([7; 6]))
                         } else {
-                            AccessResult::Read(Box::new([3; 6]))
+                            AccessResult::Read(Vec::from([3; 6]))
                         }
                     );
                 }
@@ -979,7 +1043,7 @@ mod tests {
             let Access::Pending(pending) = access else {
                 panic!("device page must defer")
             };
-            let request = next(&receiver);
+            let mut request = next(&receiver);
             assert_eq!(request.bytes(), 6);
             assert_eq!(request.ranges().len(), 2);
             assert_eq!(request.ranges()[0].offset(), offset);
@@ -994,17 +1058,19 @@ mod tests {
                 .capture_stream(request.ranges(), &mut bytes)
                 .unwrap();
             assert_eq!(bytes, [0x11; 6]);
-            let result = machine
-                .apply_resolved_access(request.ranges(), request.operation())
-                .unwrap();
+            let result = {
+                let (ranges, operation) = request.parts_mut();
+                machine.apply_resolved_access(ranges, operation)
+            }
+            .unwrap();
             machine.retire_device_pages(request.ranges()).unwrap();
             request.finish(Ok(result));
             assert_eq!(
                 pending.wait().unwrap(),
                 if write {
-                    AccessResult::Written
+                    AccessResult::Written(Vec::from([9; 6]))
                 } else {
-                    AccessResult::Read(Box::new([0x11; 6]))
+                    AccessResult::Read(Vec::from([0x11; 6]))
                 }
             );
             assert_eq!(machine.statistics().allocated_bytes, 0);
@@ -1047,18 +1113,20 @@ mod tests {
             panic!("device page must consult exact authority")
         };
         assert_eq!(destination, [0xaa; 3]);
-        let request = next(&receiver);
+        let mut request = next(&receiver);
         assert_eq!(request.ranges()[0].offset(), 17);
         assert_eq!(request.bytes(), 3);
         // No producer overlaps this exact demand. Owner-local RAM capture
         // completes it without a native tick or whole-page materialization.
-        let result = machine
-            .apply_resolved_access(request.ranges(), request.operation())
-            .unwrap();
+        let result = {
+            let (ranges, operation) = request.parts_mut();
+            machine.apply_resolved_access(ranges, operation)
+        }
+        .unwrap();
         request.finish(Ok(result));
         assert_eq!(
             pending.wait().unwrap(),
-            AccessResult::Read(Box::new([7, 8, 9]))
+            AccessResult::Read(Vec::from([7, 8, 9]))
         );
     }
 }

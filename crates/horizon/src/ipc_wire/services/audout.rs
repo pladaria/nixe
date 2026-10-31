@@ -80,9 +80,9 @@ pub(in crate::ipc_wire) async fn dispatch_audio_out_manager(
             let size = buffer.size as usize;
             let count = u32::from(size >= NAME_SIZE);
             if count != 0 {
-                let mut name = [0; NAME_SIZE];
+                let mut name = vec![0; NAME_SIZE];
                 name[..9].copy_from_slice(b"DeviceOut");
-                process.write(buffer, 0, &name).await?;
+                process.write(buffer, 0, &mut name).await?;
             }
             semantic_success(request.token, false, &count.to_le_bytes(), &[], &[], None)
         }
@@ -133,7 +133,7 @@ pub(in crate::ipc_wire) async fn dispatch_audio_out_manager(
             if name_size < NAME_SIZE || out_size < NAME_SIZE {
                 return cmif_error(request.token, HorizonIpcResult::AUDIO_INSUFFICIENT_BUFFER);
             }
-            let mut name = [0; NAME_SIZE];
+            let mut name = vec![0; NAME_SIZE];
             process.read(name_buffer, 0, &mut name).await?;
             let end = name.iter().position(|&v| v == 0).unwrap_or(NAME_SIZE);
             if end != 0 && &name[..end] != b"DeviceOut" {
@@ -144,12 +144,12 @@ pub(in crate::ipc_wire) async fn dispatch_audio_out_manager(
             };
             name.fill(0);
             name[..9].copy_from_slice(b"DeviceOut");
-            process.write(out_buffer, 0, &name).await?;
+            process.write(out_buffer, 0, &mut name).await?;
             let output =
                 AudioOutSession::open(process.kernel(), backend, format, session.devices.clone())
                     .map_err(audio_error)?;
             let handle = process
-                .return_handle(HorizonIpcObject::AudioOut(output))
+                .return_service(HorizonIpcObject::AudioOut(output))
                 .map_err(IpcWireError::Handle)?;
             let mut data = Vec::with_capacity(16);
             for value in [
@@ -210,73 +210,30 @@ pub(in crate::ipc_wire) async fn dispatch_audio_out(
             if !volume.is_finite() {
                 return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_ARGUMENT);
             }
-            session
-                .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .set_volume(volume)
-                .map_err(audio_error)?;
+            session.output.set_volume(volume).map_err(audio_error)?;
         }
-        13 => data.extend_from_slice(
-            &session
-                .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .volume()
-                .map_err(audio_error)?
-                .to_le_bytes(),
-        ),
+        13 => data.extend_from_slice(&session.output.volume().map_err(audio_error)?.to_le_bytes()),
         0 => data.extend_from_slice(
-            &u32::from(
-                !session
-                    .output
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .started()
-                    .map_err(audio_error)?,
-            )
-            .to_le_bytes(),
+            &u32::from(!session.output.started().map_err(audio_error)?).to_le_bytes(),
         ),
         1 => {
-            if session
-                .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .started()
-                .map_err(audio_error)?
-            {
+            if session.output.started().map_err(audio_error)? {
                 return cmif_error(request.token, HorizonIpcResult::AUDIO_OPERATION_FAILED);
             }
-            session
-                .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .start()
-                .map_err(audio_error)?;
+            session.output.start().map_err(audio_error)?;
         }
-        2 => session
-            .output
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .stop()
-            .map_err(audio_error)?,
+        2 => session.output.stop().map_err(audio_error)?,
         3 | 7 => {
-            if session
-                .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .owned_buffer_count()
-                .map_err(audio_error)?
-                >= BUFFER_LIMIT
-            {
-                return cmif_error(request.token, HorizonIpcResult::AUDIO_BUFFER_COUNT_REACHED);
-            }
+            // Only wire capture staging is temporary IPC payload. The decoded
+            // PCM allocation becomes stream backing retained through release.
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/audio_core/device/device_session.cpp#L92-L108
+            process.reserve_payload(40 + 4096).await?;
             let buffer = input(process, hipc, cmd == 7)?;
             let size = buffer.size as usize;
             if size < 40 {
                 return cmif_error(request.token, HorizonIpcResult::AUDIO_INSUFFICIENT_BUFFER);
             }
-            let mut descriptor = [0; 40];
+            let mut descriptor = vec![0; 40];
             process.read(buffer, 0, &mut descriptor).await?;
             // The descriptor's next pointer and offset are unused by AudioOut;
             // each submission supplies one buffer starting at samples.
@@ -287,14 +244,7 @@ pub(in crate::ipc_wire) async fn dispatch_audio_out(
             if length > capacity || samples.checked_add(length).is_none() {
                 return cmif_error(request.token, HorizonIpcResult::AUDIO_INVALID_ADDRESS_INFO);
             }
-            if !length.is_multiple_of(
-                session
-                    .output
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .format()
-                    .frame_bytes() as u64,
-            ) {
+            if !length.is_multiple_of(session.output.format().frame_bytes() as u64) {
                 return unsupported("IAudioOut", cmd, "partial PCM frames are not implemented");
             }
             let samples = process.capture_input(samples, length)?;
@@ -305,16 +255,15 @@ pub(in crate::ipc_wire) async fn dispatch_audio_out(
                 .map_err(|_| IpcWireError::HostResourceExhausted("copying submitted PCM"))?;
             // Read in bounded chunks; the host callback never touches process memory.
             // Ownership lasts until GetReleasedAudioOutBuffer returns the tag.
-            let mut bytes = [0; 4096];
+            let mut bytes = vec![0; 4096];
             // AudioOut and the renderer feed the same console device. Apply
             // its gain when queuing PCM, as the common Eden sink does for both:
             // https://github.com/eden-emulator/mirror/blob/master/src/audio_core/sink/sink_stream.cpp
             let volume = session.devices.volume(crate::audio_device::ACTIVE_DEVICE);
             for cursor in (0..length).step_by(bytes.len()) {
                 let count = bytes.len().min(length - cursor);
-                process
-                    .read(&samples, cursor as u64, &mut bytes[..count])
-                    .await?;
+                bytes.resize(count, 0);
+                process.read(&samples, cursor as u64, &mut bytes).await?;
                 pcm.extend(bytes[..count].chunks_exact(2).map(|s| {
                     let sample = i16::from_le_bytes([s[0], s[1]]);
                     if volume == 1.0 {
@@ -325,21 +274,17 @@ pub(in crate::ipc_wire) async fn dispatch_audio_out(
                     }
                 }));
             }
+            if session.output.owned_buffer_count().map_err(audio_error)? >= BUFFER_LIMIT {
+                return cmif_error(request.token, HorizonIpcResult::AUDIO_BUFFER_COUNT_REACHED);
+            }
             session
                 .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .append(request_u64(request.data, 0).unwrap(), pcm)
                 .map_err(audio_error)?;
         }
         4 => {
             // Copies refer to the same kernel event, including after handle closure.
-            session
-                .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .started()
-                .map_err(audio_error)?;
+            session.output.started().map_err(audio_error)?;
             let handle = process
                 .return_handle(session.event.clone())
                 .map_err(IpcWireError::Handle)?;
@@ -349,47 +294,33 @@ pub(in crate::ipc_wire) async fn dispatch_audio_out(
             let buffer = output(process, hipc, cmd == 8)?;
             let size = buffer.size as usize;
             let capacity = (size / 8).min(BUFFER_LIMIT);
-            let tags = session
-                .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .released(capacity)
-                .map_err(audio_error)?;
+            let tags = session.output.released(capacity).map_err(audio_error)?;
             // Unused tag entries are null, including an empty release list.
             // The SDK's single-buffer wrapper reads the first tag directly.
             // https://github.com/strato-emu/strato/blob/ae1566a48285816a87e81d4aeb40bd2f4e56e60b/app/src/main/cpp/skyline/services/audio/IAudioOut.cpp
-            let mut bytes = [0; BUFFER_LIMIT * 8];
+            let mut bytes = vec![0; BUFFER_LIMIT * 8];
             for (tag, entry) in tags.iter().zip(bytes.chunks_exact_mut(8)) {
                 entry.copy_from_slice(&tag.to_le_bytes());
             }
-            process.write(buffer, 0, &bytes[..capacity * 8]).await?;
+            bytes.truncate(capacity * 8);
+            process.write(buffer, 0, &mut bytes).await?;
             data.extend_from_slice(&(tags.len() as u32).to_le_bytes());
         }
         6 => data.extend_from_slice(
             &u32::from(
                 session
                     .output
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .contains(request_u64(request.data, 0).unwrap())
                     .map_err(audio_error)?,
             )
             .to_le_bytes(),
         ),
         9 => data.extend_from_slice(
-            &(session
-                .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .buffer_count()
-                .map_err(audio_error)? as u32)
-                .to_le_bytes(),
+            &(session.output.buffer_count().map_err(audio_error)? as u32).to_le_bytes(),
         ),
         10 => data.extend_from_slice(
             &session
                 .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .played_frames()
                 .map_err(audio_error)?
                 .to_le_bytes(),

@@ -30,7 +30,7 @@ impl Attachment {
         {
             Access::Ready(()) => Ok(()),
             Access::Pending(pending) => match memory.wait(pending)? {
-                AccessResult::Written => Ok(()),
+                AccessResult::Written(_) => Ok(()),
                 _ => Err("invalid DSP memory write completion".into()),
             },
         }

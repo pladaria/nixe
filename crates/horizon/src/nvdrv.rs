@@ -23,14 +23,13 @@ mod nvhost_ctrl;
 mod nvhost_ctrl_gpu;
 mod nvhost_gpu;
 mod nvmap;
-mod service;
 mod session;
 
 pub use device::{
     NvDrvDescriptorLifecycle, NvDrvDescriptorOwner, NvDrvDeviceDescriptor, NvDrvDeviceKind,
     NvDrvFileDescriptor, NvDrvPermissionProfile, NvDrvSessionId,
 };
-use diagnostics::NvDrvCallError;
+pub(crate) use diagnostics::NvDrvCallError;
 pub use diagnostics::{NvDrvErrorContext, NvDrvValidationReason, UnsupportedNvDrvOperation};
 pub(crate) use gpu_executor::PendingGpuSubmission;
 use gpu_executor::{GpuSubmissionAdmission, NvDrvGpuExecutor};
@@ -45,7 +44,6 @@ pub use nvmap::{
     NvMapObject, NvMapObjectId, NvMapPlaneMetadata, NvMapViewError,
 };
 use nvmap::{NvMapObjects, NvMapOwner, NvMapStateError};
-pub(crate) use service::{NvDrvService, NvDrvServiceError};
 
 pub(crate) const IOCTL_NVMAP_CREATE: u32 = 0xc008_0101;
 const IOCTL_NVMAP_FROM_ID: u32 = 0xc008_0103;
@@ -394,58 +392,55 @@ impl NvDrvSession {
         Ok(fd)
     }
 
-    pub(crate) fn close(&self, fd: NvDrvFileDescriptor) -> u32 {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.devices.remove(&fd).is_some() {
-            state.nvhost_control_gpu.remove(&fd);
-            if let Some(syncpoint) = state.host1x.close(fd) {
+    pub(crate) fn close(&self, fd: NvDrvFileDescriptor) -> host1x::Close {
+        let (pending, control) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.devices.remove(&fd).is_some() {
+                state.nvhost_control_gpu.remove(&fd);
+                let pending = state.host1x.close(fd);
+                let removed_address_space = state
+                    .gpu_address_spaces
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&fd);
+                if let Some(address_space) = removed_address_space {
+                    state
+                        .nvhost_gpu
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .unbind_address_space(address_space.id());
+                }
+                if let Some((channel, syncpoint)) = state
+                    .nvhost_gpu
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .close(fd)
+                {
+                    if let Some(backend) = &state.gpu_backend {
+                        backend.close_channel(channel);
+                    }
+                    if let Some(syncpoint) = syncpoint {
+                        state
+                            .nvhost_control
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .release_channel_syncpoint(syncpoint);
+                    }
+                }
                 state
                     .nvhost_control
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .release_channel_syncpoint(syncpoint);
+                    .close(fd);
+                (pending, state.nvhost_control.clone())
+            } else {
+                return host1x::Close::new(NV_BAD_PARAMETER, None, state.nvhost_control.clone());
             }
-            let removed_address_space = state
-                .gpu_address_spaces
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&fd);
-            if let Some(address_space) = removed_address_space {
-                state
-                    .nvhost_gpu
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .unbind_address_space(address_space.id());
-            }
-            if let Some((channel, syncpoint)) = state
-                .nvhost_gpu
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .close(fd)
-            {
-                if let Some(backend) = &state.gpu_backend {
-                    backend.close_channel(channel);
-                }
-                if let Some(syncpoint) = syncpoint {
-                    state
-                        .nvhost_control
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .release_channel_syncpoint(syncpoint);
-                }
-            }
-            state
-                .nvhost_control
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .close(fd);
-            NV_SUCCESS
-        } else {
-            NV_BAD_PARAMETER
-        }
+        };
+        host1x::Close::new(NV_SUCCESS, pending, control)
     }
 
     #[cfg(test)]
@@ -2624,7 +2619,7 @@ mod tests {
         }
         let mut expected_depth = vec![0; 32];
         expected_depth.extend(words(&[0x3f80_0000, 2, 1, 2, 1]));
-        session.close(fd);
+        crate::test_memory::run(session.close(fd)).unwrap();
         assert_eq!(
             session
                 .ioctl(other_fd, IOCTL_CTRL_GPU_ZBC_QUERY_TABLE, &query(2, 0))
@@ -2796,13 +2791,22 @@ mod tests {
             original_descriptor.owner().session(),
             session.connection_id()
         );
-        assert_eq!(clone.close(original_fd), NV_SUCCESS);
-        assert_eq!(session.close(original_fd), NV_BAD_PARAMETER);
+        assert_eq!(
+            crate::test_memory::run(clone.close(original_fd)).unwrap(),
+            NV_SUCCESS
+        );
+        assert_eq!(
+            crate::test_memory::run(session.close(original_fd)).unwrap(),
+            NV_BAD_PARAMETER
+        );
 
         let cloned_fd = clone.open(b"/dev/nvhost-ctrl-gpu", 7).unwrap();
         let cloned_descriptor = session.device_descriptor(cloned_fd).unwrap();
         assert_eq!(cloned_descriptor.owner().session(), clone.connection_id());
-        assert_eq!(session.close(cloned_fd), NV_SUCCESS);
+        assert_eq!(
+            crate::test_memory::run(session.close(cloned_fd)).unwrap(),
+            NV_SUCCESS
+        );
         assert!((clone.device_descriptor(cloned_fd)).is_none());
     }
 
@@ -2834,7 +2838,10 @@ mod tests {
             SWITCH_1_GM20B_PROFILE.id()
         );
 
-        assert_eq!(clone.close(first_fd), NV_SUCCESS);
+        assert_eq!(
+            crate::test_memory::run(clone.close(first_fd)).unwrap(),
+            NV_SUCCESS
+        );
         assert!((session.gpu_address_space(first_fd)).is_none());
         assert!((session.device_descriptor(first_fd)).is_none());
         assert_eq!(
@@ -2898,7 +2905,10 @@ mod tests {
             (vec![0; 8], NV_BAD_PARAMETER)
         );
         assert_eq!(session.gpu_channel(fd), before);
-        assert_eq!(session.close(fd), NV_SUCCESS);
+        assert_eq!(
+            crate::test_memory::run(session.close(fd)).unwrap(),
+            NV_SUCCESS
+        );
         assert_eq!(
             (clone.ioctl(fd, GET, &[])).unwrap(),
             (vec![], NV_BAD_PARAMETER)
@@ -3113,7 +3123,10 @@ mod tests {
             Some(channel_before_submission)
         );
 
-        assert_eq!(session.close(channel_fd), NV_SUCCESS);
+        assert_eq!(
+            crate::test_memory::run(session.close(channel_fd)).unwrap(),
+            NV_SUCCESS
+        );
         assert!((session.gpu_channel(channel_fd)).is_none());
 
         // Closing a channel releases its timeline identity without destroying
@@ -3134,7 +3147,10 @@ mod tests {
 
         // Conversely, closing the independently owned address space removes
         // the live binding instead of leaving a dangling or copied object.
-        assert_eq!(session.close(as_fd), NV_SUCCESS);
+        assert_eq!(
+            crate::test_memory::run(session.close(as_fd)).unwrap(),
+            NV_SUCCESS
+        );
         assert!((session.gpu_channel(replacement_fd).unwrap().address_space()).is_none());
     }
 
@@ -3430,7 +3446,10 @@ mod tests {
         assert_eq!(result, NV_SUCCESS);
         assert_eq!(input_u32(&read, 4).unwrap(), 0);
 
-        assert_eq!(session.close(channel_fd), NV_SUCCESS);
+        assert_eq!(
+            crate::test_memory::run(session.close(channel_fd)).unwrap(),
+            NV_SUCCESS
+        );
         {
             let state = session
                 .state
@@ -4280,7 +4299,10 @@ mod tests {
         assert_eq!(descriptor.owner().process_id(), 42);
         assert_eq!(descriptor.permission(), NvDrvPermissionProfile::Application);
         assert_eq!(descriptor.lifecycle(), NvDrvDescriptorLifecycle::Open);
-        assert_eq!(session.close(fd), NV_SUCCESS);
+        assert_eq!(
+            crate::test_memory::run(session.close(fd)).unwrap(),
+            NV_SUCCESS
+        );
         assert!((session.device_descriptor(fd)).is_none());
     }
 
@@ -4309,7 +4331,10 @@ mod tests {
             Ok(NvDrvIoctlOutcome::PendingSyncpointWait(wait)) if wait.remaining().is_none()
         ));
 
-        assert_eq!(session.close(fd), NV_SUCCESS);
+        assert_eq!(
+            crate::test_memory::run(session.close(fd)).unwrap(),
+            NV_SUCCESS
+        );
         assert!(matches!(
             session.query_event(fd, (1 << 28) | 3, 17),
             Ok((None, NV_BAD_PARAMETER))

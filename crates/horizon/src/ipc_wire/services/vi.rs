@@ -101,7 +101,7 @@ fn vi_child(
     video: &VideoSystem,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
     let handle = process
-        .return_handle(HorizonIpcObject::Vi(ViSession::new(kind, video.clone())))
+        .return_service(HorizonIpcObject::Vi(ViSession::new(kind, video.clone())))
         .map_err(IpcWireError::Handle)?;
     Ok((
         encode_response(token, HorizonIpcResult::SUCCESS, &[], Some(handle))?,
@@ -220,8 +220,8 @@ pub(in crate::ipc_wire) async fn dispatch_vi(
                             HorizonIpcResult::SF_PRECONDITION_VIOLATION,
                         );
                     };
-                    let native_window = crate::graphics::encode_native_window(layer.binder_id);
-                    write_descriptor_bytes(process, descriptor, &native_window).await?;
+                    let mut native_window = crate::graphics::encode_native_window(layer.binder_id);
+                    write_descriptor_bytes(process, descriptor, &mut native_window).await?;
                     Ok((
                         encode_response(
                             request.token,
@@ -243,8 +243,8 @@ pub(in crate::ipc_wire) async fn dispatch_vi(
                         );
                     };
                     let descriptor = one_receive_buffer(process, hipc)?;
-                    let native_window = crate::graphics::encode_native_window(layer.binder_id);
-                    write_descriptor_bytes(process, descriptor, &native_window).await?;
+                    let mut native_window = crate::graphics::encode_native_window(layer.binder_id);
+                    write_descriptor_bytes(process, descriptor, &mut native_window).await?;
                     let mut data = Vec::with_capacity(16);
                     data.extend_from_slice(&layer.id.to_le_bytes());
                     data.extend_from_slice(&(native_window.len() as u64).to_le_bytes());
@@ -414,8 +414,9 @@ pub(in crate::ipc_wire) async fn dispatch_vi(
                     };
                     if command == ManagerDisplayCommand::CreateStray {
                         let descriptor = one_receive_buffer(process, hipc)?;
-                        let native_window = crate::graphics::encode_native_window(layer.binder_id);
-                        write_descriptor_bytes(process, descriptor, &native_window).await?;
+                        let mut native_window =
+                            crate::graphics::encode_native_window(layer.binder_id);
+                        write_descriptor_bytes(process, descriptor, &mut native_window).await?;
                         let mut data = Vec::with_capacity(16);
                         data.extend_from_slice(&layer.id.to_le_bytes());
                         data.extend_from_slice(&(native_window.len() as u64).to_le_bytes());
@@ -484,9 +485,15 @@ async fn dispatch_binder_relay(
             let output = one_receive_buffer(process, hipc)?;
             let input_size = usize::try_from(input.size)
                 .map_err(|_| IpcWireError::Malformed("Binder input buffer is too large"))?;
+            if !(16..=crate::parcel::MAX_PARCEL_BYTES).contains(&input_size) {
+                return Err(IpcWireError::Malformed("Parcel has an invalid total size"));
+            }
+            process
+                .reserve_payload(input_size + crate::parcel::MAX_PARCEL_BYTES)
+                .await?;
             let mut encoded = vec![0_u8; input_size];
             process.read(input, 0, &mut encoded).await?;
-            let transaction =
+            let mut transaction =
                 video
                     .transact_binder(binder_id, code, &encoded)
                     .map_err(|error| match error {
@@ -511,7 +518,7 @@ async fn dispatch_binder_relay(
                     ""
                 }
             );
-            write_descriptor_bytes(process, output, &transaction.reply).await?;
+            write_descriptor_bytes(process, output, &mut transaction.reply).await?;
             if let Some(request) = transaction.queued {
                 video
                     .queue_graphic_buffer(binder_id, request)

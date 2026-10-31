@@ -132,12 +132,12 @@ impl std::future::Future for MessageRead {
 
 impl HorizonSvcDispatcher {
     pub(super) fn read_svc_message(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         immediate: u32,
         ranges: Vec<nixe_memory::AllocationRange>,
         continuation: impl FnOnce(
-            &mut Self,
+            &std::sync::Arc<Self>,
             &mut ExceptionDispatchContext<'_>,
             Result<Vec<u8>, HorizonKernelResult>,
         ) -> ExceptionDispatchOutcome<HorizonSvcFault>
@@ -174,13 +174,9 @@ impl HorizonSvcDispatcher {
             std::task::Poll::Ready(Ok(bytes)) => continuation(self, context, bytes),
             std::task::Poll::Ready(Err(fault)) => reject(context, fault),
             std::task::Poll::Pending => {
-                let source = context.source();
-                let vcpu = context.thread().vcpu();
                 self.start_owned_svc(context, std::sync::Arc::default(), None, async move {
                     let bytes = message.await?;
                     Ok(memory_wait::SvcCompletion::kernel(
-                        source,
-                        vcpu,
                         move |dispatcher, context| continuation(dispatcher, context, bytes),
                     ))
                 })
@@ -221,7 +217,7 @@ impl NamedPortOperation {
 
 impl HorizonSvcDispatcher {
     pub(super) fn connect_to_named_port(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let address = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
@@ -233,7 +229,7 @@ impl HorizonSvcDispatcher {
         )
     }
     pub(super) fn manage_named_port(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let address = GuestVirtualAddress::new(read_register(context.thread().state(), 1));
@@ -246,7 +242,7 @@ impl HorizonSvcDispatcher {
         )
     }
     fn read_named_port_name(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         address: GuestVirtualAddress,
         mut name: Vec<u8>,
@@ -280,7 +276,7 @@ impl HorizonSvcDispatcher {
         )
     }
     fn connect_named_port(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         name: Vec<u8>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
@@ -305,7 +301,7 @@ impl HorizonSvcDispatcher {
         }
     }
     fn manage_port(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         name: Vec<u8>,
         max_sessions: i32,
@@ -370,7 +366,7 @@ impl HorizonSvcDispatcher {
 
 impl HorizonSvcDispatcher {
     pub(super) fn send_sync_request(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let handle = read_register(context.thread().state(), 0) as u32;
@@ -379,7 +375,7 @@ impl HorizonSvcDispatcher {
     }
 
     pub(super) fn send_sync_request_with_user_buffer(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let address = read_register(context.thread().state(), 0);
@@ -412,7 +408,7 @@ impl HorizonSvcDispatcher {
     }
 
     fn start_hle_request(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         address: GuestVirtualAddress,
         size: usize,
@@ -423,54 +419,91 @@ impl HorizonSvcDispatcher {
             result(context, HorizonKernelResult::INVALID_HANDLE);
             return resume();
         };
-        if !target.is::<crate::HorizonIpcObject>() {
-            let Some(session) = target.into_arc::<SessionObject>() else {
-                result(context, HorizonKernelResult::INVALID_HANDLE);
-                return resume();
-            };
-            return self.start_session_request(context, address, size, session, immediate);
-        }
-        let key = crate::ipc_wire::operation::ServiceKey::Session(target.clone());
-        let turn = match self.service_scheduling.enter(key) {
-            Ok(turn) => turn,
+        let session = match target.downcast::<crate::ServiceSession>() {
+            Some(session) => session,
+            None => {
+                let Some(session) = target.into_arc::<SessionObject>() else {
+                    result(context, HorizonKernelResult::INVALID_HANDLE);
+                    return resume();
+                };
+                return self.start_session_request(context, address, size, session, immediate);
+            }
+        };
+        let servers = match self
+            .servers
+            .get_or_init(crate::ipc_wire::server::Servers::start)
+        {
+            Ok(servers) => servers,
+            Err(_) => {
+                return ipc_fault(
+                    immediate,
+                    IpcWireError::HostResourceExhausted("starting service workers"),
+                );
+            }
+        };
+        let queue = servers.queue(&session);
+        let mut request = match crate::ipc_wire::request::Request::new(
+            context,
+            address,
+            size,
+            session.payload_budget(&self.resources.payloads, context.process().process_id()),
+        ) {
+            Ok(request) => request,
             Err(error) => return ipc_fault(immediate, error),
         };
-        let mut request =
-            match crate::ipc_wire::request::Request::new(context, target, address, size) {
-                Ok(request) => request,
-                Err(error) => return ipc_fault(immediate, error),
-            };
-        let mode = self.initial_operation_mode;
-        let time = self.time_environment.clone();
-        let systems = crate::ipc_wire::HostSystems {
-            video: self.video_system.clone(),
-            keyboard: self.keyboard_host.clone(),
-            audio_backend: self.audio_backend.clone(),
-            audio_renderers: self.audio_renderers.clone(),
-            opus: self.opus.clone(),
-            hid: self.hid_system.clone(),
-            settings: self.settings_environment.clone(),
-            application_language: self.application_language,
-            application_display_version: self.application_display_version,
-            user_account_switch_locked: self.user_account_switch_locked,
-            save_data: self.save_data.clone(),
-            shared_fonts: self.shared_fonts.clone(),
-            system_archives: self.system_archives.clone(),
-            diagnostics: self.diagnostics,
-            caller_thread_id: context.thread().id().get(),
-            scheduling: self.service_scheduling.clone(),
+        let mut response = match session.reserve(queue, request.lifetime().clone()) {
+            Ok(response) => response,
+            Err(error) => return ipc_fault(immediate, error),
         };
-        let source = context.source();
-        let vcpu = context.thread().vcpu();
-        self.start_owned_svc(context, request.lifetime(), None, async move {
-            let result = crate::ipc_wire::send_sync_request_from_buffer(
-                &mut request,
-                handle,
-                mode,
-                &time,
-                &systems,
-                turn,
-            )
+        let resources = self.resources.clone();
+        self.start_owned_svc(context, request.lifetime().clone(), None, async move {
+            let result = async move {
+                let capture = nixe_memory::trace::span(
+                    "ipc_capture",
+                    request.thread_id(),
+                    u64::from(handle),
+                    std::sync::Arc::as_ptr(&session) as u64,
+                );
+                let preparation = {
+                    let prepare = async {
+                        let command = crate::ipc_wire::message::HipcRequest::owned(
+                            request.read_command(session.take_command()).await?,
+                        )
+                        .map_err(|error| IpcWireError::Malformed(error.0))?;
+                        request.accept_descriptors(&command)?;
+                        Ok::<_, IpcWireError>(command)
+                    };
+                    let mut prepare = std::pin::pin!(prepare);
+                    std::future::poll_fn(|cx| {
+                        use std::{future::Future, task::Poll};
+                        // Consume a completed capture failure before cancellation.
+                        if let Poll::Ready(prepared) = prepare.as_mut().poll(cx) {
+                            return Poll::Ready(Ok(prepared));
+                        }
+                        std::pin::Pin::new(&mut response).poll(cx).map(Err)
+                    })
+                    .await
+                };
+                let command = match preparation {
+                    Ok(command) => command?,
+                    Err(reply) => return reply,
+                };
+                drop(capture);
+                let owner = session.clone();
+                response.start(async move {
+                    let result = crate::ipc_wire::execute_request(
+                        &mut request,
+                        handle,
+                        &resources,
+                        &command,
+                        owner.object(),
+                    )
+                    .await;
+                    owner.recycle_command(command.into_bytes());
+                    result
+                })?;
+                response.await
+            }
             .await
             .map_err(|error| HorizonSvcFault::Ipc {
                 immediate,
@@ -479,11 +512,11 @@ impl HorizonSvcDispatcher {
             match result {
                 SyncRequestResult::Success => Ok(super::memory_wait::SvcCompletion::success(None)),
                 SyncRequestResult::AppletExitRequested => {
-                    Ok(super::memory_wait::SvcCompletion::ExitProcess { source, vcpu })
+                    Ok(super::memory_wait::SvcCompletion::ExitProcess)
                 }
-                SyncRequestResult::InvalidHandle => {
-                    Err(runtime_fault("accepted HLE target changed type"))
-                }
+                SyncRequestResult::SessionClosed => Err(runtime_fault(
+                    "service close result was not consumed by its server",
+                )),
             }
         })
     }
@@ -491,7 +524,7 @@ impl HorizonSvcDispatcher {
 
 impl HorizonSvcDispatcher {
     pub(super) fn send_sync_request_light(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let handle = read_register(context.thread().state(), 0) as u32;
@@ -528,7 +561,7 @@ impl HorizonSvcDispatcher {
     }
 
     fn start_session_request(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         address: GuestVirtualAddress,
         size: usize,
@@ -589,17 +622,13 @@ impl HorizonSvcDispatcher {
         )
     }
     fn poll_session_request(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         request: KernelSessionRequest,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
-        let source = context.source();
-        let vcpu = context.thread().vcpu();
         self.start_owned_svc(context, std::sync::Arc::default(), None, async move {
             let response = request.session.response(request.owner).await;
             Ok(memory_wait::SvcCompletion::kernel(
-                source,
-                vcpu,
                 move |dispatcher, context| match response {
                     Ok(response) => dispatcher.finish_session_response(context, request, response),
                     Err(error) => session_error(context, error),
@@ -609,7 +638,7 @@ impl HorizonSvcDispatcher {
     }
 
     fn finish_session_response(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         mut request: KernelSessionRequest,
         response: SessionMessage,
@@ -767,7 +796,7 @@ pub(super) fn materialize_message_handles(
 }
 impl HorizonSvcDispatcher {
     pub(super) fn write_received_message(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
         immediate: u32,
         ranges: Vec<nixe_memory::AllocationRange>,
@@ -818,7 +847,7 @@ impl HorizonSvcDispatcher {
                         .await
                         .map_err(|fault| HorizonSvcFault::MemoryAccess { immediate, fault })?
                     {
-                        nixe_memory::AccessResult::Written => {}
+                        nixe_memory::AccessResult::Written(_) => {}
                         _ => return Err(runtime_fault("received IPC write completion")),
                     }
                     handles

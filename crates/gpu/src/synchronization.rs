@@ -478,6 +478,21 @@ impl GuestTimeline {
         Ok(self.current_point())
     }
 
+    /// Publishes one executed increment of the oldest reservation. An in-stream
+    /// syncpoint wait can observe it before the command list's final increment.
+    pub fn increment_reserved(
+        &mut self,
+        owner: TimelineOwnerId,
+        reservation: &ReservedTimelinePoint,
+    ) -> Result<GuestTimelinePoint, TimelineAdvanceError> {
+        self.validate_advance(owner, reservation)?;
+        self.current_position += 1;
+        if self.current_position == reservation.logical_position {
+            self.reservations.pop_front();
+        }
+        Ok(self.current_point())
+    }
+
     /// Validates publication without changing guest-visible progress.
     ///
     /// Completion coordinators use this before applying memory visibility so
@@ -729,6 +744,38 @@ mod tests {
                 reservation: pending.reservation_id(),
             })
         );
+    }
+
+    #[test]
+    fn reserved_increments_publish_intermediate_values_without_overtaking_the_fifo() {
+        let mut timeline =
+            GuestTimeline::new(ID, INSTANCE, OWNER, GuestSyncpointValue::new(u32::MAX));
+        let first = timeline.reserve(OWNER, 2).unwrap();
+        let second = timeline.reserve(OWNER, 1).unwrap();
+        assert!(matches!(
+            timeline.increment_reserved(OWNER, &second),
+            Err(TimelineAdvanceError::OutOfOrder { .. })
+        ));
+        assert_eq!(
+            timeline
+                .increment_reserved(OWNER, &first)
+                .unwrap()
+                .value()
+                .get(),
+            0
+        );
+        assert_eq!(timeline.reservation_count(), 2);
+        assert!(!timeline.has_reached(first.point().value()));
+        assert_eq!(
+            timeline.increment_reserved(OWNER, &first).unwrap(),
+            first.point()
+        );
+        assert_eq!(timeline.reservation_count(), 1);
+        assert!(matches!(
+            timeline.increment_reserved(OWNER, &first),
+            Err(TimelineAdvanceError::UnknownReservation { .. })
+        ));
+        assert_eq!(timeline.advance(OWNER, &second).unwrap(), second.point());
     }
 
     #[test]

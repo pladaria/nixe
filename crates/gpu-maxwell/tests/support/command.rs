@@ -23,10 +23,10 @@ impl MaxwellCommandHost for Observer<'_> {
     fn access(
         &mut self,
         ranges: Vec<AllocationRange>,
-        operation: AccessOperation,
+        mut operation: AccessOperation,
     ) -> Result<AccessResult, Arc<MemoryError>> {
         self.memory
-            .apply_resolved_access(&ranges, &operation)
+            .apply_resolved_access(&ranges, &mut operation)
             .map_err(Arc::new)
     }
     fn control(&mut self) -> Result<(), MaxwellSubmissionExecutionError> {

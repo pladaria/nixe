@@ -48,6 +48,11 @@ impl State {
         profile: &MachineSchedulerProfile,
         current: Option<GuestThreadId>,
     ) -> Result<(), SchedulerError> {
+        if self.slots[waiter].stopping {
+            return Err(SchedulerError::ProcessTerminating(
+                self.slots[waiter].config.process,
+            ));
+        }
         let existing = self.find_held_lock(process, key, owner);
         if let Some(lock) = existing
             && self.slots[waiter].waiting_on == Some(Membership::Mutex(lock))
@@ -144,7 +149,15 @@ impl State {
         if self.closed {
             return Err(SchedulerError::KernelStopped);
         }
-        if self.slots[index].lifecycle != ThreadLifecycle::Waiting {
+        if self.slots[index].stopping {
+            return Err(SchedulerError::ProcessTerminating(
+                self.slots[index].config.process,
+            ));
+        }
+        if !matches!(
+            self.slots[index].lifecycle,
+            ThreadLifecycle::Running | ThreadLifecycle::Waiting
+        ) {
             return Err(self.invalid(index));
         }
         if self.slots[index].wait.is_some() {
@@ -158,6 +171,7 @@ impl State {
             thread: self.slots[index].id,
             generation: crate::WakeGeneration::new(self.wake_generation),
         };
+        self.slots[index].lifecycle = ThreadLifecycle::Waiting;
         self.remove_queued(index, profile);
         #[cfg(feature = "performance-counters")]
         {
@@ -532,6 +546,11 @@ impl SchedulerState {
         self.edit(|state| {
             let index = state.slots.index(thread)?;
             let owner = state.slots.index(owner)?;
+            if state.slots[index].stopping {
+                return Err(SchedulerError::ProcessTerminating(
+                    state.slots[index].config.process,
+                ));
+            }
             let wait = if let Some(wait) = &state.slots[index].wait {
                 wait.clone()
             } else {
@@ -550,6 +569,11 @@ impl SchedulerState {
     ) -> Result<(Arc<KernelWait>, Option<WaitEffect>), SchedulerError> {
         self.edit(|state| {
             let index = state.slots.index(thread)?;
+            if state.slots[index].stopping {
+                return Err(SchedulerError::ProcessTerminating(
+                    state.slots[index].config.process,
+                ));
+            }
             let wait = if let Some(wait) = &state.slots[index].wait {
                 wait.clone()
             } else {
@@ -578,28 +602,6 @@ impl SchedulerState {
                 state.slots[index].waiting_on == Some(Membership::Ordered(kind, address))
             })
             .map(|index| state.slots[index].id)
-    }
-    pub fn ordered_waiters(
-        &self,
-        process: ProcessId,
-        kind: OrderedWaitKind,
-        address: u64,
-        count: usize,
-    ) -> Vec<GuestThreadId> {
-        let state = self.state.lock().expect("scheduler lock poisoned");
-        let Some(process) = state.processes.get(&process) else {
-            return Vec::new();
-        };
-        std::iter::successors(
-            process.ordered[kind as usize].lower_bound(&state.slots, address),
-            |&index| WaitTree::next(&state.slots, index),
-        )
-        .take_while(|&index| {
-            state.slots[index].waiting_on == Some(Membership::Ordered(kind, address))
-        })
-        .take(count)
-        .map(|index| state.slots[index].id)
-        .collect()
     }
     pub fn claim_ordered_waiters(
         &self,

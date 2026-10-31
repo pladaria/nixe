@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub use crate::identity::LeaseGeneration;
 use crate::{
@@ -57,10 +57,6 @@ pub struct WakeToken {
 pub enum Completion {
     Ready,
     Waiting,
-    /// Kernel entry retains queue membership until an operation actually blocks.
-    KernelCall {
-        interrupt_handled: bool,
-    },
     Exited,
     Faulted,
 }
@@ -208,6 +204,8 @@ struct Thread {
     priority: i32,
     lifecycle: ThreadLifecycle,
     paused: bool,
+    stopping: bool,
+    process_links: Links,
     queued: bool,
     initialized: bool,
     active_core: Option<usize>,
@@ -239,7 +237,7 @@ impl Thread {
         self.wait.as_ref().map(|wait| wait.token())
     }
     fn suspended(&self) -> bool {
-        self.paused && self.pinned_core.is_none() && self.kernel_waiters == 0
+        self.stopping || (self.paused && self.pinned_core.is_none() && self.kernel_waiters == 0)
     }
 }
 
@@ -294,9 +292,9 @@ impl Slots {
         Ok(id)
     }
 
-    fn remove(&mut self, index: Index) {
+    fn remove(&mut self, index: Index) -> Thread {
         let slot = &mut self.entries[slot_index(index)];
-        slot.thread = None;
+        let retired = slot.thread.take().expect("live kernel thread");
         // Retire a generation-exhausted slot rather than accepting stale IDs.
         if let Some(generation) = slot.generation.checked_add(1) {
             slot.generation = generation;
@@ -304,6 +302,7 @@ impl Slots {
             self.free = Some(index);
         }
         self.len -= 1;
+        retired
     }
 }
 
@@ -337,6 +336,8 @@ struct Core {
 #[derive(Debug)]
 struct Process {
     generation: u64,
+    stopping: bool,
+    first_thread: Option<Index>,
     threads: usize,
     pinned: Box<[Option<Index>]>,
     ordered: [WaitTree; 2],
@@ -371,6 +372,7 @@ pub struct SchedulerState {
     state: Mutex<State>,
     clock: crate::VirtualClock,
     timers: timer::Timers,
+    core_wakers: OnceLock<Box<[std::task::Waker]>>,
 }
 
 impl SchedulerState {
@@ -380,6 +382,7 @@ impl SchedulerState {
             .map(|_| Core::default())
             .collect();
         Arc::new(Self {
+            core_wakers: OnceLock::new(),
             timers: timer::Timers::new(clock.clone(), profile.preemption_interval_ns().is_some()),
             clock: clock.clone(),
             profile,
@@ -437,11 +440,53 @@ impl SchedulerState {
         }
         let wakers = std::mem::take(&mut state.deferred_wakers);
         let timer_changed = std::mem::take(&mut state.timer_invalidated);
+        let cores = if self.core_wakers.get().is_some() {
+            std::mem::take(&mut state.wake_mask)
+        } else {
+            0
+        };
         drop(state);
+        if let Some(wakers) = self.core_wakers.get() {
+            for (descriptor, waker) in self.profile.vcpus().iter().zip(wakers) {
+                if cores & (1 << descriptor.id().get()) != 0 {
+                    waker.wake_by_ref();
+                }
+            }
+        }
         if timer_changed {
             self.timers.invalidate();
         }
         (result, wakers)
+    }
+
+    /// Each physical core receives its own rescheduling notification, unlocked.
+    pub fn bind_core_wakers(&self, wakers: Box<[std::task::Waker]>) {
+        assert_eq!(wakers.len(), self.profile.vcpus().len());
+        self.core_wakers
+            .set(wakers)
+            .expect("one physical-core owner");
+        self.edit(|_| Ok(()))
+            .expect("publish initial core selection");
+    }
+
+    /// Finish an inline wait after a kernel notification, retaining its register owner.
+    pub fn resume_kernel(&self, lease: Lease) -> Result<(), SchedulerError> {
+        let retired = self.edit(|state| {
+            let index = state.slots.index(lease.thread)?;
+            if state.slots[index].lease != Some(lease) {
+                return Err(SchedulerError::StaleLease(lease));
+            }
+            state.resolve_wait(index, WaitOutcome::Ready, &self.profile);
+            let wait = state.slots[index].wait.take();
+            let nodes = std::mem::take(&mut state.slots[index].wait_nodes);
+            state.slots[index].lifecycle = ThreadLifecycle::Running;
+            if !state.slots[index].suspended() && !state.slots[index].queued {
+                state.enqueue(index, &self.profile);
+            }
+            Ok((wait, nodes))
+        })?;
+        drop(retired);
+        Ok(())
     }
 
     fn core(&self, id: VirtualCpuId) -> Result<usize, SchedulerError> {
@@ -482,12 +527,21 @@ impl SchedulerState {
         self.edit(|state| {
             let process = config.process;
             let priority = config.base_priority;
+            if state
+                .processes
+                .get(&process)
+                .is_some_and(|owner| owner.stopping)
+            {
+                return Err(SchedulerError::ProcessTerminating(process));
+            }
             let id = state.slots.insert(Thread {
                 id: GuestThreadId::new(0),
                 config,
                 priority,
                 lifecycle: ThreadLifecycle::Created,
                 paused: false,
+                stopping: false,
+                process_links: Links::default(),
                 queued: false,
                 initialized: false,
                 active_core: None,
@@ -513,26 +567,32 @@ impl SchedulerState {
                 property_target: None,
                 kernel_waker: None,
             })?;
-            state
-                .processes
-                .entry(process)
-                .or_insert_with(|| Process {
-                    generation: 0,
-                    threads: 0,
-                    pinned: vec![None; state.cores.len()].into_boxed_slice(),
-                    ordered: Default::default(),
-                })
-                .threads += 1;
+            let index = state.slots.index(id)?;
+            let owner = state.processes.entry(process).or_insert_with(|| Process {
+                generation: 0,
+                stopping: false,
+                first_thread: None,
+                threads: 0,
+                pinned: vec![None; state.cores.len()].into_boxed_slice(),
+                ordered: Default::default(),
+            });
+            owner.threads += 1;
+            let previous = owner.first_thread.replace(index);
+            state.slots[index].process_links.next = previous;
+            if let Some(previous) = previous {
+                state.slots[previous].process_links.previous = Some(index);
+            }
             Ok(id)
         })
     }
 
     pub fn unregister(&self, id: GuestThreadId) -> Result<(), SchedulerError> {
-        self.edit(|state| {
+        let retired = self.edit(|state| {
             let index = state.slots.index(id)?;
             if state.slots[index].lease.is_some() {
                 return Err(SchedulerError::ThreadLeased(id));
             }
+            state.resolve_wait(index, WaitOutcome::Terminated, &self.profile);
             state.cancel_property(index, &self.profile, true);
             while let Some(owner) = state.slots[index].property_owner {
                 state.cancel_property(owner, &self.profile, true);
@@ -541,14 +601,26 @@ impl SchedulerState {
             state.detach_donations(index, &self.profile);
             state.unpin(index, &self.profile);
             let process = state.slots[index].config.process;
+            let links = state.slots[index].process_links;
+            if let Some(previous) = links.previous {
+                state.slots[previous].process_links.next = links.next;
+            }
+            if let Some(next) = links.next {
+                state.slots[next].process_links.previous = links.previous;
+            }
             let owner = state.processes.get_mut(&process).unwrap();
+            if links.previous.is_none() {
+                owner.first_thread = links.next;
+            }
             owner.threads -= 1;
-            state.slots.remove(index);
+            let retired = state.slots.remove(index);
             if state.processes[&process].threads == 0 {
                 state.processes.remove(&process);
             }
-            Ok(())
-        })
+            Ok(retired)
+        })?;
+        drop(retired);
+        Ok(())
     }
 
     pub fn thread(&self, id: GuestThreadId) -> Option<ScheduledThreadView> {
@@ -649,31 +721,20 @@ impl SchedulerState {
         })
     }
 
-    /// False keeps ownership until the core handles an interrupt racing an SVC.
-    pub fn complete(&self, lease: Lease, outcome: Completion) -> Result<bool, SchedulerError> {
+    /// Release the register owner only after its context has been saved locally.
+    pub fn complete(&self, lease: Lease, outcome: Completion) -> Result<(), SchedulerError> {
         let core = self.core(lease.vcpu)?;
         self.edit(|state| {
             let index = state.slots.index(lease.thread)?;
             if state.slots[index].lease != Some(lease) || state.cores[core].lease != Some(lease) {
                 return Err(SchedulerError::StaleLease(lease));
             }
-            // An SVC may beat its rescheduling interrupt out of native code.
-            // Keep its core/context owned until that core protects SDK TLS.
-            if matches!(
-                outcome,
-                Completion::KernelCall {
-                    interrupt_handled: false
-                }
-            ) && state.cores[core].selected != Some(index)
-            {
-                return Ok(false);
-            }
             state.cores[core].lease = None;
             state.slots[index].lease = None;
             state.slots[index].last_vcpu = Some(lease.vcpu);
             state.slots[index].lifecycle = match outcome {
                 Completion::Ready => ThreadLifecycle::Ready,
-                Completion::Waiting | Completion::KernelCall { .. } => ThreadLifecycle::Waiting,
+                Completion::Waiting => ThreadLifecycle::Waiting,
                 Completion::Exited => ThreadLifecycle::Exited,
                 Completion::Faulted => ThreadLifecycle::Faulted,
             };
@@ -702,7 +763,7 @@ impl SchedulerState {
             {
                 state.wake_mask |= 1 << self.profile.vcpus()[destination].id().get();
             }
-            Ok(true)
+            Ok(())
         })
     }
 
@@ -716,23 +777,6 @@ impl SchedulerState {
             .vcpus()
             .iter()
             .filter_map(|core| self.lease_for_vcpu(core.id()))
-    }
-
-    pub fn idle_vcpus(&self) -> impl ExactSizeIterator<Item = VirtualCpuId> + use<> {
-        let state = self.state.lock().expect("scheduler lock poisoned");
-        let bits =
-            state
-                .cores
-                .iter()
-                .zip(self.profile.vcpus())
-                .fold(0, |bits, (core, descriptor)| {
-                    bits | if core.lease.is_none() {
-                        1 << descriptor.id().get()
-                    } else {
-                        0
-                    }
-                });
-        CoreSet { bits }.iter()
     }
 
     pub fn has_active_leases(&self) -> bool {
@@ -790,15 +834,6 @@ impl SchedulerState {
         })
     }
 
-    /// Consume targeted notifications. Callers send native interrupts only after
-    /// this function has released the scheduling lock.
-    pub fn take_reschedule_requests(&self) -> CoreSet {
-        let mut state = self.state.lock().expect("scheduler lock poisoned");
-        CoreSet {
-            bits: std::mem::take(&mut state.wake_mask),
-        }
-    }
-
     // Keep cancellation and readiness under the same canonical scheduler lock.
     // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_thread.cpp#L784-L795
     pub fn cancel_synchronization(&self, id: GuestThreadId) -> Result<bool, SchedulerError> {
@@ -823,6 +858,11 @@ impl SchedulerState {
     ) -> Result<Arc<KernelWait>, SchedulerError> {
         self.edit(|state| {
             let index = state.slots.index(id)?;
+            if state.slots[index].stopping {
+                return Err(SchedulerError::ProcessTerminating(
+                    state.slots[index].config.process,
+                ));
+            }
             if let Some(wait) = &state.slots[index].wait {
                 return Ok(wait.clone());
             }
@@ -945,6 +985,29 @@ impl SchedulerState {
             state.update_suspension(index, &self.profile);
             Ok(())
         })
+    }
+
+    /// Close admission before waiting for physical register owners to leave.
+    /// Visit the process's actual thread list, without scanning other processes.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_process.cpp#L28-L56
+    pub fn request_process_termination(&self, process: ProcessId) -> bool {
+        self.edit(|state| {
+            let Some(owner) = state.processes.get_mut(&process) else {
+                return Ok(false);
+            };
+            if std::mem::replace(&mut owner.stopping, true) {
+                return Ok(false);
+            }
+            let mut node = owner.first_thread;
+            while let Some(index) = node {
+                node = state.slots[index].process_links.next;
+                state.slots[index].stopping = true;
+                state.remove_queued(index, &self.profile);
+                state.resolve_wait(index, WaitOutcome::Terminated, &self.profile);
+            }
+            Ok(true)
+        })
+        .expect("process admission closure")
     }
 
     pub fn terminate(&self, id: GuestThreadId, faulted: bool) -> Result<(), SchedulerError> {
@@ -1420,10 +1483,12 @@ impl SchedulerState {
     ) -> Result<(), SchedulerError> {
         self.edit(|state| {
             let index = state.slots.index(id)?;
-            if state.slots[index].lease.is_some() || !state.slots[index].queued {
+            if !state.slots[index].queued {
                 return Err(state.invalid(index));
             }
-            state.slots[index].lifecycle = ThreadLifecycle::Ready;
+            if state.slots[index].lease.is_none() {
+                state.slots[index].lifecycle = ThreadLifecycle::Ready;
+            }
             let process = state.slots[index].config.process;
             if state.slots[index].yield_generation == Some(state.processes[&process].generation) {
                 #[cfg(feature = "performance-counters")]
@@ -1532,6 +1597,7 @@ pub use waits::{LockHandoff, OrderedWaitKind};
 pub enum SchedulerError {
     ForeignSynchronizationObject,
     KernelStopped,
+    ProcessTerminating(ProcessId),
     UnknownThread(GuestThreadId),
     UnknownVirtualCpu(VirtualCpuId),
     InvalidPriority(i32),

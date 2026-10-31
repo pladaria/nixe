@@ -145,6 +145,25 @@ pub fn bktr_data_content(
     }
 }
 
+pub fn control_content(id: [u8; 16], add_on_base_id: u64) -> Content {
+    let mut nacp = vec![0; 0x4000];
+    nacp[..9].copy_from_slice(b"Synthetic");
+    put_u32(&mut nacp, 0x302c, 1);
+    put_u64(&mut nacp, 0x3070, add_on_base_id);
+    let mut section = romfs_section(build_romfs(&[("control.nacp", &nacp)]));
+    // Control discovery verifies IVFC, including zero padding of the fixture's
+    // single 1-MiB data block.
+    let mut block = section.bytes.clone();
+    block.resize(1 << 20, 0);
+    section.fs_header[0xc8..0xe8].copy_from_slice(&Sha256::digest(&block));
+    Content {
+        id,
+        content_type: 3,
+        id_offset: 0,
+        nca: build_nca(APPLICATION_ID, 2, vec![section]),
+    }
+}
+
 pub fn build_nsp(package: &Package) -> Vec<u8> {
     let meta = build_meta_nca(package);
     let meta_name = format!("{:032x}.cnmt.nca", package.title_id);

@@ -83,29 +83,22 @@ impl Core {
             )
         };
         if pointer.is_null() {
-            return Err(JitError(ffi::error()));
+            return Err(JitError::Failure(ffi::error()));
         }
+        let interrupt = Arc::new(crate::NativeInterrupt(std::sync::Mutex::new(Some(
+            pointer as usize,
+        ))));
         let handle = Arc::new(Native {
             pointer,
             space: Arc::clone(&space),
             context_owned: AtomicBool::new(false),
+            interrupt: interrupt.clone(),
+            #[cfg(debug_assertions)]
+            owner_thread: std::thread::current().id(),
         });
-        let weak = Arc::downgrade(&handle);
-        let context = space.register_core(Arc::new(move || {
-            if let Some(handle) = weak.upgrade() {
-                unsafe {
-                    ffi::nixe_dynarmic_halt(handle.pointer);
-                }
-            }
-        }));
-        let interrupt = Arc::downgrade(&handle);
-        let control = CpuControl::with_interrupt(Arc::new(move || {
-            if let Some(handle) = interrupt.upgrade() {
-                unsafe {
-                    ffi::nixe_dynarmic_halt(handle.pointer);
-                }
-            }
-        }));
+        let mapping_interrupt = interrupt.clone();
+        let context = space.register_core(Arc::new(move || mapping_interrupt.halt()));
+        let control = CpuControl::with_interrupt(Arc::new(move || interrupt.halt()));
         Ok(Self {
             handle,
             context,
@@ -461,7 +454,7 @@ unsafe extern "C" fn memory(
                 }
                 *context.read_area = area;
             }
-            Ok(AccessResult::Written) => {}
+            Ok(AccessResult::Written(_)) => {}
             Ok(AccessResult::Atomic { written, .. }) => unsafe {
                 *value = u64::from(written);
             },

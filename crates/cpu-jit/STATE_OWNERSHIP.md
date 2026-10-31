@@ -3,7 +3,7 @@
 Linux x86-64 is the validated host. The model follows stopped-core register access and full scheduler
 switch transfers in [Eden's interface](https://git.eden-emu.dev/eden-emu/eden/raw/commit/67bada77f8a43a90da2e94e89b8e7da73c256989/src/core/arm/dynarmic/arm_dynarmic_64.cpp)
 and [scheduler](https://git.eden-emu.dev/eden-emu/eden/raw/commit/67bada77f8a43a90da2e94e89b8e7da73c256989/src/core/hle/kernel/k_scheduler.cpp).
-Nixe retains coordinator service continuations instead of adopting host fibers.
+Nixe uses owned blocked-operation continuations instead of migrating native host stacks.
 
 ## Exclusive register authority
 
@@ -17,12 +17,12 @@ registers are authoritative in Dynarmic and bridge TLS storage. The reusable
 boxed save area is inaccessible while native/unavailable; its old bytes are not
 a current snapshot. No scalar overlay or duplicated authoritative context exists.
 
-`ThreadObject` owns the value between scheduler leases. Dispatch moves it
-into `VcpuExecutionState`; its register slot contains `None` until validated reconciliation.
-Only the holder may read/write registers. Worker native entry exclusively borrows
-that owner synchronously, so callbacks and other threads cannot obtain it while
-execution is active. After return, the coordinator can access the stopped native
-context through the returned owner. No additional register RPC is needed.
+`ThreadObject` owns saved state between executions. A physical core claims the
+thread under the kernel scheduler lock and moves its state into its resident
+execution context. The thread's register slot stays empty until that core saves
+and releases the context. Ordinary SVCs execute on that same core and access the
+stopped native registers directly, without exporting state or returning it to a
+supervisor. Native entry exclusively borrows that owner synchronously.
 
 `ThreadState` never exposes a raw native handle. A native owner retains its core,
 execution memory and local native monitor storage. Its atomic claim prevents another saved
@@ -40,11 +40,11 @@ to its host TID and is still used only by that worker's captured invocations.
 | Boundary | Required ownership and action |
 | --- | --- |
 | Creation | Initialize complete saved state, including SP, PC, TLS and entry arguments. |
-| Dispatch | Move the sole register owner into the request. Evict the old guest on that process/vCPU before dispatching a different guest. |
+| Selection | Claim the selected thread after the previous core saves and releases it. Move the sole register owner into the physical core. |
 | First entry or genuine replacement | Import complete saved state once through public bulk APIs; establish native ownership. |
 | Same guest after SVC or event boundary | Keep the complete context native. Re-enter without full import/export. |
 | Ordinary SVC | Read only needed registers through the stopped owner; write results directly to it. Runtime validates the SVC source and applies Next/Retry/At exactly once. No eager GPR/SIMD diagnostic snapshot is required. |
-| Blocking / wake-up | Install the continuation before suspension. A blocked native context remains readable through its owner until eviction, which saves it completely. Generation-checked completion writes target that current owner, whether saved or native. |
+| Blocking / wake-up | Install the owned continuation before suspension, save the complete context and release its core. Completion consumes the wait generation, installs results in saved state and makes the thread runnable once. |
 | Guest switch | Save the previous complete context before releasing its claim. Load the next guest on the worker. Every native entry clears local exclusives. |
 | Migration | Before either worker accepts a new lease, save the source context. Remove source residency bookkeeping. The destination imports the current saved value and clears local exclusives on entry. |
 | Full thread query / debugger | Reject Running, absent or unavailable state. Obtain an owned complete snapshot explicitly; native residency may continue. Horizon also enforces its paused-thread query requirement. |
@@ -55,10 +55,9 @@ to its host TID and is still used only by that worker's captured invocations.
 | MMIO memory instruction | Resolve each individual access synchronously inside its callback using the captured physical range. Waiting may release admission, but never snapshots or reconstructs the instruction. A later access cannot replay an earlier side effect. |
 | SVC failure / termination / loader return | Preserve the source and capture diagnostics at the actual consumer. Loader-return reports supply their compact context explicitly. |
 | Native C++ or fault-runtime failure | Discard register authority, stop the JIT process and report `CpuFault.context = None`. The old save area cannot be read or resumed, on any subsequent execution request. |
-| Lost/panicked worker or stale result | Do not associate unverified state with the expected lease. Discard the result and leave expected table state absent; fault the process. |
-| Dispatch rejection before execution | The returned request retains its known owner and can be restored without fabricating state. |
+| Lost/panicked worker | Cancel execution and pending calls. Destroy native contexts on their creating worker. Drain accepted effects without publishing stale results. Unavailable register authority remains unavailable. |
 | Concurrent process stop | Drain all leases. Successful late results can restore current authority; unsynchronized failures remain unavailable. |
-| Retirement / teardown | Halt and drain execution, synchronize invalidation and clear exclusives on workers, then materialize retained owners before releasing cores/backing. Box cold teardown snapshots so command size is not governed by a full context. |
+| Retirement / teardown | Halt and drain execution, synchronize invalidation and clear exclusives on workers, then materialize retained owners before releasing cores/backing. Capture cold diagnostics only when their consumer needs them. |
 
 Asynchronous control requests halt only. It must never read, materialize or write
 live registers. The metadata mutex and memory execution gate do not confer
@@ -69,16 +68,17 @@ Fatal unattributed native signals retain the existing terminal fault behavior.
 
 Sources: [dispatch](../runtime/src/process/dispatch.rs),
 [execution](../runtime/src/process/execution.rs),
-[worker](../runtime/src/coordinator/worker.rs),
+[physical core](../runtime/src/machine/core.rs),
 [exception handling](../runtime/src/process/exception.rs),
-[thread queries and migration](../runtime/src/coordinator/thread.rs),
+[thread ownership](../runtime/src/process/thread.rs),
 [fault runtime](../cpu-direct-memory/src/lib.rs).
 
 ## Native execution and memory policy
 
 Native execution uses the architectural wall clock with cycle counting disabled.
-The coordinator waits for CPU completions, host events or actual deadlines on a
-single ingress. Scheduler preemption and process stop interrupt native execution;
+Each physical core continues native execution and local SVCs autonomously. The
+supervisor receives only lifecycle, host-control and failure notifications.
+Scheduler preemption and process stop interrupt the targeted native core;
 there are no instruction quotas or synthetic per-block timeslices. User-mode
 wait, event and yield hints continue in native code.
 

@@ -35,21 +35,20 @@ fn report_request(
 fn play_report_protocols_persist_exact_payloads_for_plain_and_domain_sessions() {
     for domain in [false, true] {
         let (_directory, mut process) = fixture_process_with_svcs(&[0x21; 12]);
-        let mut dispatcher = support::dispatcher(&process);
+        let dispatcher = support::dispatcher(&process);
         let directory = tempfile::tempdir().unwrap();
         let session = crate::PlayReportSession::new(directory.path());
         let handle = process
             .handles()
-            .insert(HorizonIpcObject::PlayReport(session))
+            .insert(nixe_horizon::ServiceSession::new(
+                HorizonIpcObject::PlayReport(session),
+            ))
             .unwrap();
         let tls = process.main_thread().tls_base;
         if domain {
             let mut convert = audout::command(0, &[], None, None, false, false);
             put_u32(&mut convert, 0, 5);
-            assert_eq!(
-                audout::call(&mut process, &mut dispatcher, handle, &convert),
-                0
-            );
+            assert_eq!(audout::call(&mut process, &dispatcher, handle, &convert), 0);
             assert_eq!(read_guest_u32(&process, tls.checked_add(32).unwrap()), 1);
         }
         let mapped = process.main_thread().stack_bottom;
@@ -68,7 +67,7 @@ fn play_report_protocols_persist_exact_payloads_for_plain_and_domain_sessions() 
             write_guest_bytes(&process, tls, &request);
             process.main_thread().registers().write_w(x(0), handle);
             assert!(matches!(
-                dispatch_next(&mut process, &mut dispatcher),
+                dispatch_next(&mut process, &dispatcher),
                 ExceptionHandlingResult::Resumed
             ));
             assert_eq!(
@@ -122,7 +121,7 @@ fn play_report_session_id_is_stable_and_storage_failures_do_not_fabricate_succes
     let session = crate::PlayReportSession::new(&path);
     assert!(
         session
-            .save(10104, 1, &1_u64.to_le_bytes(), [b"event", b"data"])
+            .create(10104, 1, &1_u64.to_le_bytes(), [5, 4])
             .is_err()
     );
     assert_eq!(fs::read(&path).unwrap(), b"keep");

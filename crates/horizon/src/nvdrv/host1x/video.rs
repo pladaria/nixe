@@ -10,7 +10,7 @@ use nixe_memory::{
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 unsafe extern "C" {
     fn nixe_nvdec_create(codec: u32, uuid: *const u8) -> *mut c_void;
@@ -58,6 +58,60 @@ pub(super) struct Frame {
 }
 // Host1x owns each immutable AVFrame reference until VIC consumes it. Borrowed
 // plane slices cannot outlive that reference; only owned uploads cross threads.
+// SAFETY: this value owns an immutable AVFrame reference. FFmpeg buffer
+// references are thread-safe; no mutable plane access crosses the handoff.
+// https://ffmpeg.org/doxygen/trunk/group__lavu__buffer.html
+unsafe impl Send for Frame {}
+
+/// Decoders publish retained frames; VIC consumes them without borrowing a
+/// decoder or serializing different devices' command execution.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/host1x/host1x.h#L36-L96
+#[derive(Debug, Default)]
+pub(super) struct FrameQueue(
+    Mutex<BTreeMap<super::super::NvDrvFileDescriptor, VecDeque<(SurfaceIdentity, Frame)>>>,
+);
+impl FrameQueue {
+    fn open(&self, fd: super::super::NvDrvFileDescriptor) {
+        self.0.lock().unwrap().insert(fd, VecDeque::new());
+    }
+    pub(super) fn close(&self, fd: super::super::NvDrvFileDescriptor) {
+        let retired = self.0.lock().unwrap().remove(&fd);
+        drop(retired);
+    }
+    fn clear(&self, fd: super::super::NvDrvFileDescriptor) {
+        if let Some(frames) = self.0.lock().unwrap().get_mut(&fd) {
+            frames.clear();
+        }
+    }
+    fn push(&self, fd: super::super::NvDrvFileDescriptor, surface: SurfaceIdentity, frame: Frame) {
+        if let Some(frames) = self.0.lock().unwrap().get_mut(&fd) {
+            if frames.len() >= 100 {
+                frames.pop_front();
+            }
+            frames.push_back((surface, frame));
+        }
+    }
+    pub(super) fn pop(
+        &self,
+        fd: &mut Option<super::super::NvDrvFileDescriptor>,
+        surface: impl FnOnce() -> Result<SurfaceIdentity, String>,
+    ) -> Result<Option<Frame>, String> {
+        let mut queues = self.0.lock().unwrap();
+        if fd.is_some_and(|fd| !queues.contains_key(&fd)) {
+            *fd = None;
+        }
+        if fd.is_none() {
+            let surface = surface()?;
+            *fd = queues.iter().find_map(|(&fd, frames)| {
+                frames.iter().any(|(id, _)| *id == surface).then_some(fd)
+            });
+        }
+        Ok(fd
+            .and_then(|fd| queues.get_mut(&fd))
+            .and_then(VecDeque::pop_front)
+            .map(|(_, frame)| frame))
+    }
+}
 impl Drop for Frame {
     fn drop(&mut self) {
         unsafe { nixe_video_frame_free(self.raw) };
@@ -237,10 +291,10 @@ pub(super) fn read(mappings: &Mappings, address: u64, length: usize) -> Result<V
     let ranges = physical
         .pin(offset, length as u64)
         .map_err(|e| e.to_string())?;
-    let AccessResult::Read(bytes) = access(&ranges, AccessOperation::Read)? else {
+    let AccessResult::Read(bytes) = access(&ranges, AccessOperation::Read(Vec::new()))? else {
         unreachable!("read returns bytes")
     };
-    Ok(bytes.into_vec())
+    Ok(bytes)
 }
 /// Callers provide coalesced runs in storage order. One write names only
 /// modified bytes. Padding and masked components are not
@@ -269,8 +323,8 @@ pub(super) fn write_spans(
         return Ok(());
     }
     assert!(matches!(
-        access(&ranges, AccessOperation::Write(payload.into_boxed_slice()))?,
-        AccessResult::Written
+        access(&ranges, AccessOperation::Write(payload))?,
+        AccessResult::Written(_)
     ));
     Ok(())
 }
@@ -318,7 +372,8 @@ pub(super) struct NvDec {
     next_origin: u64,
     outputs: BTreeMap<u64, Output>,
     surfaces: BTreeMap<[SurfaceIdentity; 2], u64>,
-    frames: VecDeque<(SurfaceIdentity, Frame)>,
+    frames: Arc<FrameQueue>,
+    fd: super::super::NvDrvFileDescriptor,
 }
 impl Drop for NvDec {
     fn drop(&mut self) {
@@ -326,7 +381,12 @@ impl Drop for NvDec {
     }
 }
 impl NvDec {
-    pub(super) fn new(device: Option<[u8; 16]>) -> Self {
+    pub(super) fn new(
+        device: Option<[u8; 16]>,
+        frames: Arc<FrameQueue>,
+        fd: super::super::NvDrvFileDescriptor,
+    ) -> Self {
+        frames.open(fd);
         Self {
             decoder: std::ptr::null_mut(),
             codec: 0,
@@ -335,16 +395,9 @@ impl NvDec {
             next_origin: 1,
             outputs: BTreeMap::new(),
             surfaces: BTreeMap::new(),
-            frames: VecDeque::new(),
+            frames,
+            fd,
         }
-    }
-    pub(super) fn has_frame(&self, identity: SurfaceIdentity) -> bool {
-        self.frames.iter().any(|(surface, _)| *surface == identity)
-    }
-    pub(super) fn pop_frame(&mut self) -> Option<Frame> {
-        // The VIC channel identifies its decoder once. FFmpeg receive order
-        // already accounts for H.264 display reordering.
-        self.frames.pop_front().map(|(_, frame)| frame)
     }
     fn select_codec(&mut self, codec: u32) -> Result<(), String> {
         if self.codec == codec {
@@ -359,7 +412,7 @@ impl NvDec {
         self.h264_initialized = false;
         self.outputs.clear();
         self.surfaces.clear();
-        self.frames.clear();
+        self.frames.clear(self.fd);
         let name = if codec == 3 { "H.264" } else { "VP9" };
         let device = match self.device {
             Some(uuid) => match unsafe { nixe_video_hardware_supported(codec, uuid.as_ptr()) } {
@@ -594,11 +647,7 @@ impl NvDec {
             }
             // Presentation order is FFmpeg receive order, including H.264 B
             // pictures. Pin the frame, not a native image or a copy of guest RAM.
-            let limit = 100;
-            if self.frames.len() >= limit {
-                self.frames.pop_front();
-            }
-            self.frames.push_back((output.identity, frame));
+            self.frames.push(self.fd, output.identity, frame);
             log::trace!(
                 "NVDEC output: origin={decoded_origin} dimensions={decoded_width}x{decoded_height}"
             );
@@ -611,6 +660,92 @@ mod tests {
     use super::*;
     use crate::nvdrv::nvmap::{NvMapAllocationMetadata, NvMapCpuMapping, NvMapObjects, NvMapOwner};
     use nixe_memory::{AddressSpaceId, GuestVirtualAddress};
+
+    #[test]
+    fn a_pending_device_close_releases_the_client_lock_and_graphics_server() {
+        use crate::ipc_wire::{
+            IpcWireError, SyncRequestResult,
+            server::{Servers, ServiceSession},
+        };
+        use crate::nvdrv::{
+            NvDrvDescriptorOwner, NvDrvDeviceDescriptor, NvDrvDeviceKind, NvDrvFileDescriptor,
+            NvDrvPermissionProfile, NvDrvSession, NvDrvSessionId,
+        };
+        let kernel = crate::test_memory::kernel();
+        let driver = NvDrvSession::new(crate::test_memory::machine(), &kernel);
+        let fd = NvDrvFileDescriptor::new(3);
+        let descriptor = NvDrvDeviceDescriptor::open(
+            fd,
+            NvDrvDeviceKind::HostNvDec,
+            NvDrvDescriptorOwner::new(NvDrvSessionId::ROOT, 1),
+            NvDrvPermissionProfile::Application,
+        );
+        let frames = {
+            let mut state = driver.state.lock().unwrap();
+            state.devices.insert(fd, descriptor);
+            let point = state
+                .nvhost_control
+                .lock()
+                .unwrap()
+                .allocate_channel_syncpoint(descriptor, 0)
+                .unwrap();
+            state.host1x.open(fd, point.syncpoint());
+            let worker = Arc::new(
+                super::super::worker::Worker::new(
+                    state.nvhost_control.clone(),
+                    None,
+                    descriptor,
+                    state.host1x.frames.get_or_insert_with(Arc::default).clone(),
+                    state
+                        .host1x
+                        .failure
+                        .get_or_insert_with(Arc::default)
+                        .clone(),
+                )
+                .unwrap(),
+            );
+            state.host1x.channels.get_mut(&fd).unwrap().worker = Some(worker);
+            state.host1x.frames.as_ref().unwrap().clone()
+        };
+        // Hold the real device cleanup dependency, not the nvdrv client lock.
+        let held_frames = frames.0.lock().unwrap();
+        let servers = Servers::start().unwrap();
+        let session = Arc::new(ServiceSession::new(crate::HorizonIpcObject::NvDrv(
+            driver.clone(),
+        )));
+        let close = driver.close(fd);
+        let response = session
+            .reserve(servers.queue(&session), Arc::default())
+            .unwrap();
+        response
+            .start(async move {
+                assert_eq!(
+                    close.await.map_err(IpcWireError::UnsupportedNvDrv)?,
+                    crate::nvdrv::NV_SUCCESS
+                );
+                Ok(SyncRequestResult::Success)
+            })
+            .unwrap();
+        let other = Arc::new(ServiceSession::new(crate::HorizonIpcObject::NvDrv(
+            driver.clone(),
+        )));
+        let other_response = other
+            .reserve(servers.queue(&other), Arc::default())
+            .unwrap();
+        other_response
+            .start(async { Ok(SyncRequestResult::Success) })
+            .unwrap();
+        assert_eq!(
+            crate::test_memory::run(other_response).unwrap(),
+            SyncRequestResult::Success
+        );
+        assert!(driver.state.try_lock().is_ok());
+        drop(held_frames);
+        assert_eq!(
+            crate::test_memory::run(response).unwrap(),
+            SyncRequestResult::Success
+        );
+    }
 
     #[test]
     fn h264_reconstructed_headers_retain_frames_including_reordered_surfaces() {
@@ -679,8 +814,9 @@ mod tests {
         registers[0x102] = 0x14;
         registers[0x10c + 4] = 0x30;
         registers[0x11d + 4] = 0x60;
-        let mut decoder = NvDec::new(None);
         let fd = super::super::super::NvDrvFileDescriptor::new(7);
+        let frames = Arc::new(FrameQueue::default());
+        let mut decoder = NvDec::new(None, frames.clone(), fd);
         let mut vic = super::super::vic::Vic::default();
         // Repeated IDR also exercises header regeneration when the movie loops.
         for frame in [0, 1, 2, 0] {
@@ -697,7 +833,8 @@ mod tests {
             decoder.execute(&registers, &mappings).unwrap();
             assert!(decoder.outputs.is_empty());
             {
-                let frame = &decoder.frames.front().unwrap().1;
+                let queues = frames.0.lock().unwrap();
+                let frame = &queues[&fd].front().unwrap().1;
                 assert_eq!(frame.luma().as_ptr(), frame.planes[0]);
                 let planes = frame.linear_planes(frame.width, frame.height).unwrap();
                 assert!(planes[0].iter().all(|&v| v == 81));
@@ -756,15 +893,13 @@ mod tests {
             vic_registers[0x101] = 0x61;
             vic_registers[0x1c8] = 0xc0;
             vic_registers[0x1c9] = 0xd0;
-            let mut decoders = BTreeMap::from([(fd, decoder)]);
-            vic.execute(&vic_registers, &mappings, None, &mut decoders)
+            vic.execute(&vic_registers, &mappings, None, &frames)
                 .unwrap();
             // A repeated VIC execute has no new decoder frame and must retain
             // the previous picture instead of reading the unmaterialized input.
-            vic.execute(&vic_registers, &mappings, None, &mut decoders)
+            vic.execute(&vic_registers, &mappings, None, &frames)
                 .unwrap();
-            decoder = decoders.remove(&fd).unwrap();
-            assert!(decoder.frames.is_empty());
+            assert!(frames.0.lock().unwrap()[&fd].is_empty());
             let pitch = if nv12 { 32 } else { 80 };
             let mut pixels = vec![0; pitch * 16];
             crate::test_memory::read(
@@ -848,14 +983,22 @@ mod tests {
                 .unwrap();
             decoder.execute(&registers, &mappings).unwrap();
         }
-        let produced = decoder.frames.len();
+        let produced = frames.0.lock().unwrap()[&fd].len();
         assert!(produced >= 5);
         let expected = [48, 64, 80, 96, 112, 128, 144, 160];
         for &value in &expected[..produced] {
-            let frame = decoder.pop_frame().unwrap();
+            let frame = frames
+                .0
+                .lock()
+                .unwrap()
+                .get_mut(&fd)
+                .unwrap()
+                .pop_front()
+                .unwrap()
+                .1;
             assert_eq!(frame.luma()[0], value);
         }
-        assert!(decoder.frames.is_empty());
+        assert!(frames.0.lock().unwrap()[&fd].is_empty());
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub(in crate::ipc_wire) fn applet_requests_self_exit(
         && matches!(
             &request.domain,
             Some(DomainRequest::SendMessage { object_id, .. })
-                if session.object(*object_id) == Some(AppletObject::SelfController)
+                if matches!(session.object(*object_id), Some(AppletObject::SelfController))
         )
 }
 
@@ -26,12 +26,12 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
     session: &AppletSession,
     request: CmifRequest<'_>,
     hipc: &HipcRequest<'_>,
-    host_systems: &HostSystems,
+    system: &crate::ipc_wire::resources::SystemServices,
+    video_system: &VideoSystem,
+    save_data: Option<&crate::SaveDataSystem>,
 ) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
-    let video_system = &host_systems.video;
-    let application_language = host_systems.application_language;
-    let save_data = host_systems.save_data.as_ref();
-    let hid = &host_systems.hid;
+    let application_language = system.application_language;
+    let hid = &system.hid;
     // The startup order, command IDs, input PID/process handle, returned
     // objects, and scalar result layouts implemented below follow libnx:
     // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L112-L333
@@ -79,7 +79,7 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
             )
         });
     if !input_objects.is_empty() && !accepts_input_objects {
-        return unsupported_service_command(applet_object_name(object), request.command_id);
+        return unsupported_service_command(applet_object_name(&object), request.command_id);
     }
 
     match object {
@@ -106,7 +106,10 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
             // diverge after the shared controller interfaces.
             // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L155-L182
             let Some(command) = RootCommand::decode(request.command_id) else {
-                return unsupported_service_command(applet_object_name(object), request.command_id);
+                return unsupported_service_command(
+                    applet_object_name(&object),
+                    request.command_id,
+                );
             };
             let kind = command.proxy_kind();
             applet_child(
@@ -121,10 +124,14 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                 return applet_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
             }
             let Some(command) = ProxyCommand::decode(kind, request.command_id) else {
-                return unsupported_service_command(applet_object_name(object), request.command_id);
+                return unsupported_service_command(
+                    applet_object_name(&object),
+                    request.command_id,
+                );
             };
             let child = command.child(kind);
-            applet_child(session, request.token, child, applet_object_name(child))
+            let name = applet_object_name(&child);
+            applet_child(session, request.token, child, name)
         }
         AppletObject::CommonStateGetter => {
             let Some(command) = CommonStateGetterCommand::decode(request.command_id) else {
@@ -518,11 +525,6 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                                 "allocating a launch-parameter storage object ID",
                             ))
                         }
-                        Err(PopAppletLaunchParameterError::StorageIdExhausted) => {
-                            Err(IpcWireError::HostResourceExhausted(
-                                "allocating a launch-parameter storage backing ID",
-                            ))
-                        }
                         Err(PopAppletLaunchParameterError::NotDomain) => {
                             Err(IpcWireError::Internal(
                                 "launch parameter escaped its applet domain session",
@@ -616,7 +618,7 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                         );
                     }
-                    let version = host_systems.application_display_version.as_ref().ok_or(
+                    let version = system.application_display_version.as_ref().ok_or(
                         IpcWireError::UnsupportedService(
                             UnsupportedServiceOperation::CommandVariant {
                                 service: "IApplicationFunctions",
@@ -999,13 +1001,9 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                             config.text_check,
                             config.utf8
                         );
-                        let host =
-                            host_systems
-                                .keyboard
-                                .as_ref()
-                                .ok_or(IpcWireError::Malformed(
-                                    "software keyboard requires a host window",
-                                ))?;
+                        let host = system.keyboard.as_ref().ok_or(IpcWireError::Malformed(
+                            "software keyboard requires a host window",
+                        ))?;
                         session
                             .start_keyboard(object_id, config, host)
                             .map_err(IpcWireError::Malformed)?;
@@ -1107,20 +1105,15 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                 }
             }
         }
-        AppletObject::Storage { storage_id } => {
+        AppletObject::Storage(storage) => {
             let Some(StorageCommand::Open) = StorageCommand::decode(request.command_id) else {
                 return unsupported_service_command("IStorage", request.command_id);
             };
             if !request.data.is_empty() || has_ipc_descriptors(hipc) {
                 return unsupported_service_command("IStorage", request.command_id);
             }
-            let accessor_object_id = match session.open_storage_accessor(storage_id) {
+            let accessor_object_id = match session.open_storage_accessor(storage) {
                 Ok(object_id) => object_id,
-                Err(OpenAppletStorageAccessorError::StorageNotFound) => {
-                    return Err(IpcWireError::Internal(
-                        "live applet storage object lost its backing",
-                    ));
-                }
                 Err(OpenAppletStorageAccessorError::DomainCapacityExhausted) => {
                     return Err(IpcWireError::HostResourceExhausted(
                         "allocating an applet-storage accessor domain object",
@@ -1143,7 +1136,7 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                 None,
             ))
         }
-        AppletObject::StorageAccessor { storage_id } => {
+        AppletObject::StorageAccessor(storage) => {
             let Some(command) = StorageAccessorCommand::decode(request.command_id) else {
                 return unsupported_service_command("IStorageAccessor", request.command_id);
             };
@@ -1152,109 +1145,70 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
                     if !request.data.is_empty() || has_ipc_descriptors(hipc) {
                         return unsupported_service_command("IStorageAccessor", request.command_id);
                     }
-                    let Some(size) = session.storage_size(storage_id) else {
-                        return applet_error(
-                            request.token,
-                            HorizonIpcResult::CMIF_TARGET_NOT_FOUND,
-                        );
-                    };
-                    applet_data(request.token, &size.to_le_bytes())
+                    applet_data(request.token, &(storage.len() as u64).to_le_bytes())
                 }
                 // libnx selects pointer or map-alias buffers according to the
                 // transfer size and sends the byte offset as a signed 64-bit
                 // value. Negative offsets retain their bit pattern and therefore
                 // fail the checked storage range below:
                 // https://github.com/switchbrew/libnx/blob/dbcc1beafc6b47b5ffbeb8ba82463a7d45da40bb/nx/source/services/applet.c#L1830-L1879
-                StorageAccessorCommand::Write => {
+                command @ (StorageAccessorCommand::Write | StorageAccessorCommand::Read) => {
+                    let write = matches!(command, StorageAccessorCommand::Write);
+                    let unexpected_buffers = if write {
+                        !matches!(hipc.receive_statics, ReceiveStatics::None)
+                            || !hipc.receive_buffers.is_empty()
+                    } else {
+                        !hipc.send_statics.is_empty() || !hipc.send_buffers.is_empty()
+                    };
                     if request.data.len() < 8
                         || request.data[8..].iter().any(|byte| *byte != 0)
                         || hipc.pid.is_some()
                         || !hipc.copy_handles.is_empty()
                         || !hipc.move_handles.is_empty()
-                        || !matches!(hipc.receive_statics, ReceiveStatics::None)
-                        || !hipc.receive_buffers.is_empty()
                         || !hipc.exchange_buffers.is_empty()
+                        || unexpected_buffers
                     {
                         return applet_error(
                             request.token,
                             HorizonIpcResult::CMIF_INVALID_IN_HEADER,
                         );
                     }
-                    let buffer = one_auto_select_input(process, hipc)?;
-                    let size = buffer.size as usize;
-                    let mut bytes = vec![0; size];
-                    process.read(buffer, 0, &mut bytes).await?;
-                    let offset = request_u64(request.data, 0)
-                        .expect("validated IStorageAccessor::Write payload length");
-                    match session.write_storage(storage_id, offset, &bytes).await {
-                        Ok(()) => applet_data(request.token, &[]),
-                        Err(AppletStorageAccessError::NotFound) => {
-                            applet_error(request.token, HorizonIpcResult::CMIF_TARGET_NOT_FOUND)
-                        }
-                        Err(AppletStorageAccessError::ReadOnly) => {
-                            // Eden returns ResultUnknown for a read-only transfer storage.
-                            // https://github.com/eden-emulator/mirror/blob/67bada77f8a43a90da2e94e89b8e7da73c256989/src/core/hle/service/am/library_applet_storage.cpp
-                            applet_error(request.token, HorizonIpcResult::from_raw(u32::MAX))
-                        }
-                        Err(AppletStorageAccessError::Memory(error)) => {
-                            Err(IpcWireError::SystemMemory(error))
-                        }
-                        Err(AppletStorageAccessError::OutOfRange) => {
-                            Err(IpcWireError::UnsupportedService(
-                                UnsupportedServiceOperation::CommandVariant {
-                                    service: "IStorageAccessor",
-                                    command_id: 10,
-                                    detail: "out-of-range applet storage write",
-                                },
-                            ))
-                        }
+                    let buffer = if write {
+                        one_auto_select_input(process, hipc)?
+                    } else {
+                        one_auto_select_output(process, hipc)?
+                    };
+                    let size = usize::try_from(buffer.size).map_err(|_| {
+                        IpcWireError::Malformed("applet storage transfer size overflows")
+                    })?;
+                    let offset = request_u64(request.data, 0).expect("validated storage offset");
+                    if let Err(error) = storage.validate(offset, size, write) {
+                        return storage_access_error(request.token, error);
                     }
-                }
-                StorageAccessorCommand::Read => {
-                    if request.data.len() < 8
-                        || request.data[8..].iter().any(|byte| *byte != 0)
-                        || hipc.pid.is_some()
-                        || !hipc.copy_handles.is_empty()
-                        || !hipc.move_handles.is_empty()
-                        || !hipc.send_statics.is_empty()
-                        || !hipc.send_buffers.is_empty()
-                        || !hipc.exchange_buffers.is_empty()
-                    {
-                        return applet_error(
-                            request.token,
-                            HorizonIpcResult::CMIF_INVALID_IN_HEADER,
-                        );
+                    let capacity = size.min(1024 * 1024);
+                    process.reserve_payload(capacity).await?;
+                    let mut bytes = vec![0; capacity];
+                    let mut cursor = 0;
+                    while cursor < size {
+                        let count = (size - cursor).min(capacity);
+                        bytes.resize(count, 0);
+                        let chunk = &mut bytes;
+                        if write {
+                            process.read(buffer, cursor as u64, chunk).await?;
+                            if let Err(error) = storage.write(offset + cursor as u64, chunk).await {
+                                return storage_access_error(request.token, error);
+                            }
+                        } else {
+                            if let Err(error) =
+                                storage.read_into(offset + cursor as u64, chunk).await
+                            {
+                                return storage_access_error(request.token, error);
+                            }
+                            process.write(buffer, cursor as u64, chunk).await?;
+                        }
+                        cursor += count;
                     }
-                    let buffer = one_auto_select_output(process, hipc)?;
-                    let size = buffer.size as usize;
-                    let offset = request_u64(request.data, 0)
-                        .expect("validated IStorageAccessor::Read payload length");
-                    match session.read_storage(storage_id, offset, size).await {
-                        Ok(bytes) => {
-                            process.write(buffer, 0, &bytes).await?;
-                            applet_data(request.token, &[])
-                        }
-                        Err(AppletStorageAccessError::NotFound) => {
-                            applet_error(request.token, HorizonIpcResult::CMIF_TARGET_NOT_FOUND)
-                        }
-                        Err(AppletStorageAccessError::ReadOnly) => {
-                            // Eden returns ResultUnknown for a read-only transfer storage.
-                            // https://github.com/eden-emulator/mirror/blob/67bada77f8a43a90da2e94e89b8e7da73c256989/src/core/hle/service/am/library_applet_storage.cpp
-                            applet_error(request.token, HorizonIpcResult::from_raw(u32::MAX))
-                        }
-                        Err(AppletStorageAccessError::Memory(error)) => {
-                            Err(IpcWireError::SystemMemory(error))
-                        }
-                        Err(AppletStorageAccessError::OutOfRange) => {
-                            Err(IpcWireError::UnsupportedService(
-                                UnsupportedServiceOperation::CommandVariant {
-                                    service: "IStorageAccessor",
-                                    command_id: 11,
-                                    detail: "out-of-range applet storage read",
-                                },
-                            ))
-                        }
-                    }
+                    applet_data(request.token, &[])
                 }
             }
         }
@@ -1265,7 +1219,7 @@ pub(in crate::ipc_wire) async fn dispatch_applet(
         | AppletObject::AudioController
         | AppletObject::DisplayController
         | AppletObject::DebugFunctions => {
-            unsupported_service_command(applet_object_name(object), request.command_id)
+            unsupported_service_command(applet_object_name(&object), request.command_id)
         }
     }
 }
@@ -1307,10 +1261,10 @@ fn applet_request_bool(data: &[u8], hipc: &HipcRequest<'_>) -> Option<bool> {
     (!has_ipc_descriptors(hipc) && padding.iter().all(|byte| *byte == 0)).then_some(value != 0)
 }
 
-pub(in crate::ipc_wire) const fn applet_object_name(object: AppletObject) -> &'static str {
+pub(in crate::ipc_wire) fn applet_object_name(object: &AppletObject) -> &'static str {
     match object {
         AppletObject::Root => "IApplicationProxyService",
-        AppletObject::Proxy(kind) => applet_proxy_name(kind),
+        AppletObject::Proxy(kind) => applet_proxy_name(*kind),
         AppletObject::ApplicationFunctions => "IApplicationFunctions",
         AppletObject::HomeMenuFunctions => "IHomeMenuFunctions",
         AppletObject::GlobalStateController => "IGlobalStateController",
@@ -1324,8 +1278,8 @@ pub(in crate::ipc_wire) const fn applet_object_name(object: AppletObject) -> &'s
         AppletObject::DisplayController => "IDisplayController",
         AppletObject::DebugFunctions => "IDebugFunctions",
         AppletObject::LibraryAppletAccessor { .. } => "ILibraryAppletAccessor",
-        AppletObject::Storage { .. } => "IStorage",
-        AppletObject::StorageAccessor { .. } => "IStorageAccessor",
+        AppletObject::Storage(..) => "IStorage",
+        AppletObject::StorageAccessor(..) => "IStorageAccessor",
     }
 }
 
@@ -1333,6 +1287,23 @@ const fn applet_proxy_name(kind: AppletProxyKind) -> &'static str {
     match kind {
         AppletProxyKind::Application => "IApplicationProxy",
         AppletProxyKind::SystemApplet => "ISystemAppletProxy",
+    }
+}
+
+fn storage_access_error(
+    token: u32,
+    error: AppletStorageAccessError,
+) -> Result<(Vec<u8>, Option<u32>), IpcWireError> {
+    match error {
+        AppletStorageAccessError::ReadOnly => {
+            applet_error(token, HorizonIpcResult::from_raw(u32::MAX))
+        }
+        // AM module 128, description 503; range failures are guest results.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/am/am_results.h#L17
+        AppletStorageAccessError::OutOfRange => {
+            applet_error(token, HorizonIpcResult::from_raw((503 << 9) | 128))
+        }
+        AppletStorageAccessError::Memory(error) => Err(IpcWireError::SystemMemory(error)),
     }
 }
 
@@ -1367,16 +1338,16 @@ mod tests {
             Some(AppletProxyKind::SystemApplet)
         );
         assert!((RootCommand::decode(200)).is_none());
-        assert_eq!(
+        assert!(matches!(
             ProxyCommand::decode(AppletProxyKind::Application, 20)
                 .map(|command| command.child(AppletProxyKind::Application)),
             Some(AppletObject::ApplicationFunctions)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             ProxyCommand::decode(AppletProxyKind::SystemApplet, 20)
                 .map(|command| command.child(AppletProxyKind::SystemApplet)),
             Some(AppletObject::HomeMenuFunctions)
-        );
+        ));
         assert!((ProxyCommand::decode(AppletProxyKind::Application, 23)).is_none());
     }
 

@@ -62,12 +62,12 @@ fn opus_service_negotiates_opens_and_decodes_through_all_packet_abis() {
         let mut svcs = vec![0x1f, 0x21, 0x21, 0x21, 0x15];
         svcs.extend_from_slice(&[0x21; 32]);
         let (_directory, mut process) = fixture_process_with_svcs(&svcs);
-        let mut dispatcher = support::dispatcher(&process);
+        let dispatcher = support::dispatcher(&process);
         let base = process.main_thread().stack_bottom;
         write_guest_bytes(&process, base, b"sm:\0");
         process.main_thread().registers().write_x(x(1), base.get());
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         let sm = process.main_thread().registers().read_w(x(1));
@@ -76,11 +76,11 @@ fn opus_service_negotiates_opens_and_decodes_through_all_packet_abis() {
         put_u32(&mut register, 4, 10 | (1 << 31));
         put_u32(&mut register, 8, 1);
         put_u32(&mut register, 32, 0x4943_4653);
-        assert_eq!(call(&mut process, &mut dispatcher, sm, &register), 0);
+        assert_eq!(call(&mut process, &dispatcher, sm, &register), 0);
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 sm,
                 &command(1, b"hwopus\0\0", None, None, false, false)
             ),
@@ -112,7 +112,7 @@ fn opus_service_negotiates_opens_and_decodes_through_all_packet_abis() {
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 manager,
                 &manager_command(query, if multi { &[] } else { &params }, None, pointer)
             ),
@@ -142,7 +142,7 @@ fn opus_service_negotiates_opens_and_decodes_through_all_packet_abis() {
         process.main_thread().registers().write_x(x(2), work_size);
         process.main_thread().registers().write_w(x(3), 0);
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
@@ -152,7 +152,7 @@ fn opus_service_negotiates_opens_and_decodes_through_all_packet_abis() {
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 manager,
                 &manager_command(open, &opening, Some(transfer), pointer)
             ),
@@ -163,7 +163,7 @@ fn opus_service_negotiates_opens_and_decodes_through_all_packet_abis() {
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 manager,
                 &manager_command(open, &opening, Some(transfer), pointer)
             ),
@@ -186,7 +186,7 @@ fn opus_service_negotiates_opens_and_decodes_through_all_packet_abis() {
             assert_eq!(
                 call(
                     &mut process,
-                    &mut dispatcher,
+                    &dispatcher,
                     decoder,
                     &command(
                         decode,
@@ -233,7 +233,7 @@ fn opus_service_negotiates_opens_and_decodes_through_all_packet_abis() {
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 decoder,
                 &command(
                     if multi { 9 } else { 8 },
@@ -249,7 +249,7 @@ fn opus_service_negotiates_opens_and_decodes_through_all_packet_abis() {
         assert_eq!(
             call(
                 &mut process,
-                &mut dispatcher,
+                &dispatcher,
                 decoder,
                 &command(
                     if multi { 9 } else { 8 },
@@ -280,7 +280,7 @@ fn in_domain(mut bytes: [u8; 256], object: u32, scalar_bytes: usize) -> [u8; 256
 
 fn domain_call(
     process: &mut ScheduledProcess,
-    dispatcher: &mut HorizonSvcDispatcher,
+    dispatcher: &std::sync::Arc<HorizonSvcDispatcher>,
     handle: u32,
     bytes: &[u8; 256],
 ) -> u32 {
@@ -297,24 +297,23 @@ fn domain_call(
 #[test]
 fn opus_domain_owns_decoders_across_clones_and_closes_each_child_independently() {
     let (_directory, mut process) = fixture_process(&[svc(0x21); 16]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let manager = process
         .handles()
-        .insert(HorizonIpcObject::OpusManager(Default::default()))
+        .insert(nixe_horizon::ServiceSession::new(
+            HorizonIpcObject::OpusManager(Default::default()),
+        ))
         .unwrap();
     let tls = process.main_thread().tls_base;
     let mut control = command(0, &[], None, None, false, false);
     put_u32(&mut control, 0, 5);
-    assert_eq!(call(&mut process, &mut dispatcher, manager, &control), 0);
+    assert_eq!(call(&mut process, &dispatcher, manager, &control), 0);
     assert_eq!(data32(&process), 1);
     let mut params = [0; 16];
     put_u32(&mut params, 0, 48000);
     put_u32(&mut params, 4, 1);
     let query = in_domain(manager_command(5, &params, None, None), 1, 16);
-    assert_eq!(
-        domain_call(&mut process, &mut dispatcher, manager, &query),
-        0
-    );
+    assert_eq!(domain_call(&mut process, &dispatcher, manager, &query), 0);
     let work = read_guest_u32(&process, tls.checked_add(48).unwrap()).next_multiple_of(4096);
     let transfer = process
         .handles()
@@ -327,7 +326,7 @@ fn opus_domain_owns_decoders_across_clones_and_closes_each_child_independently()
     assert_eq!(
         domain_call(
             &mut process,
-            &mut dispatcher,
+            &dispatcher,
             manager,
             &in_domain(
                 manager_command(4, &opening, Some(transfer), None),
@@ -345,7 +344,7 @@ fn opus_domain_owns_decoders_across_clones_and_closes_each_child_independently()
     );
     process.handles().close(transfer).unwrap();
     put_u32(&mut control, 24, 2);
-    assert_eq!(call(&mut process, &mut dispatcher, manager, &control), 0);
+    assert_eq!(call(&mut process, &dispatcher, manager, &control), 0);
     let clone = handle(&process);
     assert_ne!(clone, manager);
     let input = process.main_thread().stack_bottom;
@@ -366,10 +365,7 @@ fn opus_domain_owns_decoders_across_clones_and_closes_each_child_independently()
         decoder,
         1,
     );
-    assert_eq!(
-        domain_call(&mut process, &mut dispatcher, clone, &decode),
-        0
-    );
+    assert_eq!(domain_call(&mut process, &dispatcher, clone, &decode), 0);
     assert_eq!(
         read_guest_u32(&process, tls.checked_add(48).unwrap()),
         packet.len() as u32
@@ -385,13 +381,10 @@ fn opus_domain_owns_decoders_across_clones_and_closes_each_child_independently()
     put_u32(&mut close, 4, 8);
     close[16] = 2;
     put_u32(&mut close, 20, decoder);
-    assert_eq!(domain_call(&mut process, &mut dispatcher, clone, &close), 0);
+    assert_eq!(domain_call(&mut process, &dispatcher, clone, &close), 0);
     assert_eq!(
-        domain_call(&mut process, &mut dispatcher, manager, &decode),
+        domain_call(&mut process, &dispatcher, manager, &decode),
         HorizonIpcResult::CMIF_TARGET_NOT_FOUND.raw()
     );
-    assert_eq!(
-        domain_call(&mut process, &mut dispatcher, manager, &query),
-        0
-    );
+    assert_eq!(domain_call(&mut process, &dispatcher, manager, &query), 0);
 }

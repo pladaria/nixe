@@ -10,7 +10,7 @@ use nixe_runtime::{
 
 use support::synthetic_packages::{
     APPLICATION_ID, FIRST_DLC_ID, MetaKind, PATCH_ID, Package, SECOND_DLC_ID, bktr_data_content,
-    build_nsp, build_romfs, build_xci, content_id, data_content, program_content,
+    build_nsp, build_romfs, build_xci, content_id, control_content, data_content, program_content,
     program_content_with_fs_permissions, program_content_without_services, public_data_content,
 };
 
@@ -63,8 +63,10 @@ fn effective_npdm_service_policy_denies_unlisted_runtime_services() {
     let permitted = support::process_builder().build(&permitted_plan).unwrap();
     let session = permitted
         .handles()
-        .insert(crate::HorizonIpcObject::SemanticService(
-            crate::IpcSession::new(IpcService::FileSystem),
+        .insert(nixe_horizon::ServiceSession::new(
+            crate::HorizonIpcObject::SemanticService(crate::IpcSession::new(
+                IpcService::FileSystem,
+            )),
         ))
         .unwrap();
     let transferred = process
@@ -73,7 +75,8 @@ fn effective_npdm_service_policy_denies_unlisted_runtime_services() {
         .unwrap();
     let object = process
         .handles()
-        .lookup_as::<crate::HorizonIpcObject>(transferred)
+        .lookup_as::<crate::ServiceSession>(transferred)
+        .map(|session| std::sync::Arc::new(session.object().clone()))
         .unwrap();
     let crate::HorizonIpcObject::SemanticService(session) = object.as_ref() else {
         panic!("transferred service")
@@ -207,47 +210,15 @@ fn public_add_ons_remain_visible_and_readable_without_content_owner_permissions(
         assert_eq!(policy.permissions().raw(), permissions);
         assert_eq!(process.mounts().add_ons().len(), 1);
 
-        let service = crate::IpcSession::new(IpcService::AddOnContent);
-        {
-            let IpcResponse::Size(value) = crate::ipc::dispatch_session(
-                process.scheduler(),
-                process.mounts(),
-                &service,
-                IpcRequest::GetAddOnContentCount,
-                crate::FileSystemAccessLogMode::None,
-            )
-            .unwrap() else {
-                panic!("response payload")
-            };
-            assert_eq!(value, 1);
-        };
-        let IpcResponse::AddOnContentEntries(entries) = crate::ipc::dispatch_session(
-            process.scheduler(),
-            process.mounts(),
-            &service,
-            IpcRequest::ListAddOnContent {
-                offset: 0,
-                max_entries: 1,
-            },
-            crate::FileSystemAccessLogMode::None,
-        )
-        .unwrap() else {
-            panic!("add-on metadata must remain visible")
-        };
-        assert_eq!(entries[0].title_id.get(), FIRST_DLC_ID);
-        let IpcResponse::Object(filesystem) = crate::ipc::dispatch_session(
-            process.scheduler(),
-            process.mounts(),
-            &service,
-            IpcRequest::OpenAddOnContent {
-                title_id: entries[0].title_id,
-                mount_index: 0,
-            },
-            crate::FileSystemAccessLogMode::None,
-        )
-        .unwrap() else {
-            panic!("PublicData must not require content-owner permission")
-        };
+        let add_on = process
+            .mounts()
+            .add_ons()
+            .iter()
+            .find(|add_on| add_on.title_id().get() == FIRST_DLC_ID)
+            .unwrap();
+        let filesystem = crate::SemanticIpcObject::ReadOnlyFileSystem(
+            crate::ReadOnlyFileSystem::new(add_on.mounts()[0].clone()),
+        );
         let IpcResponse::Object(file) = crate::ipc::dispatch_semantic_object(
             process.mounts(),
             &filesystem,
@@ -273,19 +244,13 @@ fn public_add_ons_remain_visible_and_readable_without_content_owner_permissions(
             };
             assert_eq!(value, b"public-content".to_vec());
         };
-        assert!(matches!(
-            crate::ipc::dispatch_session(
-                process.scheduler(),
-                process.mounts(),
-                &service,
-                IpcRequest::OpenAddOnContent {
-                    title_id: nixe_loader_title::TitleId::new(SECOND_DLC_ID),
-                    mount_index: 0
-                },
-                crate::FileSystemAccessLogMode::None
-            ),
-            Err(IpcResultCode::PATH_NOT_FOUND)
-        ));
+        assert!(
+            process
+                .mounts()
+                .add_ons()
+                .iter()
+                .all(|add_on| add_on.title_id().get() != SECOND_DLC_ID)
+        );
     }
 }
 
@@ -303,6 +268,7 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
         contents: vec![
             program_content(content_id(0x10), &[("main", 0x10)]),
             data_content(content_id(0x20), APPLICATION_ID, 1, base_romfs.clone()),
+            control_content(content_id(0x21), APPLICATION_ID + 0x1000),
         ],
     };
     let first_dlc_old = Package {
@@ -395,7 +361,10 @@ fn builds_complete_launch_plan_from_redistributable_nsp_xci_matrix() {
         plan.effective_policy().unwrap().handle_table_size(),
         Some(0x40)
     );
-    assert!(plan.control_metadata().is_none());
+    assert_eq!(
+        plan.control_metadata().unwrap().nacp.add_on_content_base_id,
+        APPLICATION_ID + 0x1000
+    );
     assert_eq!(
         plan.modules()
             .iter()
@@ -587,36 +556,33 @@ fn exercise_read_only_ipc(process: &nixe_runtime::RunnableProcess) {
     };
 
     let add_on_session = crate::IpcSession::new(IpcService::AddOnContent);
-    {
-        let IpcResponse::Size(value) = crate::ipc::dispatch_session(
-            &crate::test_memory::kernel(),
+    let entries = process.mounts().add_ons();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].title_id().get(), FIRST_DLC_ID);
+    assert_eq!(entries[0].version().raw(), 9);
+    assert_eq!(entries[0].mounts().len(), 1);
+    for (offset, limit, expected) in [(0, 10, vec![1u32, 2]), (1, 1, vec![2u32])] {
+        let IpcResponse::AddOnContentIndices(bytes) = crate::ipc::dispatch_session(
+            process.scheduler(),
             process.mounts(),
             &add_on_session,
-            IpcRequest::GetAddOnContentCount,
+            IpcRequest::ListIndexedAddOnContent {
+                offset,
+                max_entries: limit,
+            },
             crate::FileSystemAccessLogMode::None,
         )
         .unwrap() else {
-            panic!("response payload")
+            panic!("indexed list must return the outgoing index payload");
         };
-        assert_eq!(value, 2);
-    };
-    let IpcResponse::AddOnContentEntries(entries) = crate::ipc::dispatch_session(
-        &crate::test_memory::kernel(),
-        process.mounts(),
-        &add_on_session,
-        IpcRequest::ListAddOnContent {
-            offset: 0,
-            max_entries: 10,
-        },
-        crate::FileSystemAccessLogMode::None,
-    )
-    .unwrap() else {
-        panic!("add-on listing must return metadata entries");
-    };
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].title_id.get(), FIRST_DLC_ID);
-    assert_eq!(entries[0].version, 9);
-    assert_eq!(entries[0].mount_count, 1);
+        assert_eq!(
+            bytes,
+            expected
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+    }
     assert!(matches!(
         crate::ipc::dispatch_session(
             &crate::test_memory::kernel(),
@@ -641,19 +607,9 @@ fn exercise_read_only_ipc(process: &nixe_runtime::RunnableProcess) {
     };
     assert!(!add_on_event.is_signalled());
 
-    let IpcResponse::Object(add_on_filesystem) = crate::ipc::dispatch_session(
-        &crate::test_memory::kernel(),
-        process.mounts(),
-        &add_on_session,
-        IpcRequest::OpenAddOnContent {
-            title_id: entries[0].title_id,
-            mount_index: 0,
-        },
-        crate::FileSystemAccessLogMode::None,
-    )
-    .unwrap() else {
-        panic!("authorized add-on must return a filesystem handle");
-    };
+    let add_on_filesystem = crate::SemanticIpcObject::ReadOnlyFileSystem(
+        crate::ReadOnlyFileSystem::new(entries[0].mounts()[0].clone()),
+    );
     let IpcResponse::Object(revision) = crate::ipc::dispatch_semantic_object(
         process.mounts(),
         &add_on_filesystem,

@@ -112,26 +112,15 @@ impl VirtualClock {
     /// Freezes/resumes the shared process clock, excluding host pause duration.
     pub fn set_paused(&self, paused: bool) {
         let mut epoch = self.timer_epoch();
-        let mut state = self.state.pause.load(Ordering::Acquire);
-        loop {
-            if (state & PAUSED != 0) == paused {
-                return;
-            }
-            let next = pause_transition(state, self.host_elapsed_ns(), paused);
-            match self.state.pause.compare_exchange_weak(
-                state,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    *epoch = epoch.wrapping_add(1);
-                    self.state.timer_changed.notify_all();
-                    return;
-                }
-                Err(observed) => state = observed,
-            }
+        let state = self.state.pause.load(Ordering::Relaxed);
+        if (state & PAUSED != 0) == paused {
+            return;
         }
+        // The epoch mutex serializes writers; atomic publication is for readers.
+        let next = pause_transition(state, self.host_elapsed_ns(), paused);
+        self.state.pause.store(next, Ordering::Release);
+        *epoch = epoch.wrapping_add(1);
+        self.state.timer_changed.notify_all();
     }
 
     #[must_use]
@@ -165,11 +154,11 @@ impl VirtualClock {
         if self.is_paused() {
             return;
         }
-        let previous = self
-            .state
-            .scheduler_time_ns
-            .fetch_max(nanoseconds, Ordering::AcqRel);
+        let previous = self.state.scheduler_time_ns.load(Ordering::Relaxed);
         if previous < nanoseconds {
+            self.state
+                .scheduler_time_ns
+                .store(nanoseconds, Ordering::Release);
             *epoch = epoch.wrapping_add(1);
             self.state.timer_changed.notify_all();
         }
@@ -290,6 +279,37 @@ mod tests {
             }
         );
         assert_eq!(clock.elapsed(), Duration::ZERO);
+    }
+
+    #[test]
+    fn concurrent_diagnostic_advances_remain_monotonic_and_respect_pause() {
+        let clock = VirtualClock::new(VirtualClockMode::Fixed { unix_seconds: 0 });
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let clock = &clock;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for target in (worker..=1024).step_by(4) {
+                        clock.advance_scheduler_to(target);
+                        assert!(clock.scheduler_time_ns() >= target);
+                    }
+                });
+            }
+        });
+        assert_eq!(clock.elapsed(), Duration::from_nanos(1024));
+        clock.set_paused(true);
+        std::thread::scope(|scope| {
+            for target in 1025..=1028 {
+                let clock = &clock;
+                scope.spawn(move || clock.advance_scheduler_to(target));
+            }
+        });
+        assert_eq!(clock.elapsed(), Duration::from_nanos(1024));
+        clock.set_paused(false);
+        clock.advance_scheduler_to(2048);
+        assert_eq!(clock.elapsed(), Duration::from_nanos(2048));
     }
 
     #[test]

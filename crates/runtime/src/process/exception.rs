@@ -2,71 +2,7 @@ use super::*;
 
 const MAX_EXIT_STACK_FRAMES: usize = 32;
 impl RunnableProcess {
-    pub(crate) fn route_supervisor_call_for<D: ExceptionDispatcher>(
-        self: &Arc<Self>,
-        thread_id: nixe_scheduler::GuestThreadId,
-        vcpu: nixe_scheduler::VirtualCpuId,
-        stop: &ExecutionStop,
-        dispatcher: &mut D,
-    ) -> Result<(Arc<crate::ThreadObject>, ExceptionHandlingResult<D::Fault>), ExceptionRouteError>
-    {
-        let request = stop
-            .exception_dispatch_request()
-            .filter(|request| request.kind() == nixe_cpu::exception::ExceptionKind::SupervisorCall)
-            .ok_or(ExceptionRouteError::NotSupervisorCall)?;
-        let thread = self
-            .thread(thread_id)
-            .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-        let state = thread
-            .take_state()
-            .expect("stopped thread owns its registers");
-        let current = execution::current_location(self.cpu, &state);
-        if request.source() != current {
-            thread.restore_state(state);
-            return Err(ExceptionRouteError::SourceMismatch {
-                requested: request.source(),
-                current,
-            });
-        }
-        Ok(
-            self.dispatch_context(thread, vcpu, request.source(), state, |context| {
-                dispatcher.dispatch(context, request)
-            }),
-        )
-    }
-    pub(crate) fn resume_supervisor_call_for<F>(
-        self: &Arc<Self>,
-        thread_id: nixe_scheduler::GuestThreadId,
-        vcpu: nixe_scheduler::VirtualCpuId,
-        source: LocationDescriptor,
-        continuation: impl FnOnce(&mut ExceptionDispatchContext<'_>) -> ExceptionDispatchOutcome<F>,
-    ) -> Result<(Arc<crate::ThreadObject>, ExceptionHandlingResult<F>), ExceptionRouteError> {
-        let thread = self
-            .thread(thread_id)
-            .ok_or(ExceptionRouteError::UnknownThread(thread_id))?;
-        let state = thread
-            .take_state()
-            .expect("stopped thread owns its registers");
-        Ok(self.dispatch_context(thread, vcpu, source, state, continuation))
-    }
-    fn dispatch_context<F>(
-        self: &Arc<Self>,
-        thread: Arc<crate::ThreadObject>,
-        vcpu: nixe_scheduler::VirtualCpuId,
-        source: LocationDescriptor,
-        mut state: GuestCpuState,
-        operation: impl FnOnce(&mut ExceptionDispatchContext<'_>) -> ExceptionDispatchOutcome<F>,
-    ) -> (Arc<crate::ThreadObject>, ExceptionHandlingResult<F>) {
-        // Continuations intentionally retain the original SVC location after PC advancement.
-        let thread_context =
-            ExceptionThreadContext::new(thread.id(), vcpu, &thread, &mut state, thread.tls_base);
-        let mut context = ExceptionDispatchContext::new(source, self, thread_context);
-        let outcome = operation(&mut context);
-        let result = self.apply_supervisor_call_outcome(&thread, source, &mut state, outcome);
-        thread.restore_state(state);
-        (thread, result)
-    }
-    fn apply_supervisor_call_outcome<F>(
+    pub fn apply_supervisor_call_outcome<F>(
         &self,
         thread: &Arc<crate::ThreadObject>,
         source: LocationDescriptor,
@@ -82,7 +18,7 @@ impl RunnableProcess {
                 state.set_pc(supervisor_call_pc(source, continuation));
                 ExceptionHandlingResult::Suspended
             }
-            ExceptionDispatchOutcome::Reject { diagnostic } => {
+            ExceptionDispatchOutcome::Reject { diagnostic, .. } => {
                 state.set_pc(supervisor_call_pc(source, ExceptionResume::Next));
                 ExceptionHandlingResult::Rejected(diagnostic)
             }
@@ -140,9 +76,10 @@ impl RunnableProcess {
             }
             ExceptionDispatchOutcome::Fault(fault) => {
                 state.set_pc(source.pc.get());
-                if self.finish_thread(thread) {
-                    self.finish_process(nixe_scheduler::ProcessLifecycle::Faulted, None);
-                }
+                self.finish_thread(thread);
+                // Fatal dispatch failures stop the process; guest errors use Reject.
+                // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_process.cpp#L28-L84
+                self.finish_process(nixe_scheduler::ProcessLifecycle::Faulted, None);
                 ExceptionHandlingResult::Fault(fault)
             }
         }

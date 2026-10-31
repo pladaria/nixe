@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 
 use nixe_loader_executable::{EffectiveNpdmPolicy, FileSystemPermissions};
-use nixe_loader_title::TitleId;
 
 use crate::{AddOnContent, HomebrewIdentity, LaunchPlan, ReadOnlyMount};
 
@@ -58,13 +57,6 @@ impl ProcessMountNamespace {
     /// Returns the immutable authorization policy associated with these mounts.
     pub const fn effective_policy(&self) -> Option<&EffectiveNpdmPolicy> {
         self.policy.as_ref()
-    }
-
-    /// Looks up one application add-on without exposing unrelated installed content.
-    pub fn add_on(&self, title_id: TitleId) -> Option<&AddOnContent> {
-        self.add_ons
-            .iter()
-            .find(|add_on| add_on.title_id() == title_id)
     }
 
     /// Applies the effective NPDM service access-control list. Homebrew has no

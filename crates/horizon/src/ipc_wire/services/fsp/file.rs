@@ -34,10 +34,9 @@ pub(super) async fn decode(
             let descriptor = one_receive_buffer(process, hipc)?;
             let capacity = usize::try_from(descriptor.size)
                 .map_err(|_| IpcWireError::Malformed("file output buffer is too large"))?;
-            Ok(Some(IpcRequest::ReadFile {
-                offset,
-                size: requested.min(capacity).min(MAX_IPC_READ_BYTES),
-            }))
+            let size = requested.min(capacity).min(MAX_IPC_READ_BYTES);
+            process.reserve_payload(size).await?;
+            Ok(Some(IpcRequest::ReadFile { offset, size }))
         }
         // IFile::Write carries option/padding/offset/size and one map-alias
         // input buffer:
@@ -75,6 +74,7 @@ pub(super) async fn decode(
                     "file write size exceeds its input buffer",
                 ));
             }
+            process.reserve_payload(requested).await?;
             let mut data = vec![0; requested];
             process.read(descriptor, 0, &mut data).await?;
             Ok(Some(IpcRequest::WriteFile {

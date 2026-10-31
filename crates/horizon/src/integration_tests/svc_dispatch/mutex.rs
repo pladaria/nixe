@@ -7,7 +7,7 @@ const WAITERS: u32 = 1 << 30;
 #[test]
 fn a_native_condition_signal_keeps_its_donated_current_owner_ahead_of_an_equal_priority_peer() {
     let (_directory, mut process) = fixture_process(&[svc(0x1d), svc(0x10), svc(0x1c), svc(0x10)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let owner = process.main_thread_id();
     let owner_tag = process.main_thread_handle();
     let mutex = process.main_thread().stack_bottom;
@@ -27,14 +27,14 @@ fn a_native_condition_signal_keeps_its_donated_current_owner_ahead_of_an_equal_p
     process.main_thread().registers().write_w(x(1), 1);
     start(&mut process, waiter);
     assert!(
-        matches!(dispatch_scheduled_next(&mut process, &mut dispatcher), (thread, ExceptionHandlingResult::Suspended) if thread == waiter)
+        matches!(dispatch_scheduled_next(&mut process, &dispatcher), (thread, ExceptionHandlingResult::Suspended) if thread == waiter)
     );
     assert_eq!(read_guest_u32(&process, mutex), 0);
     // The signalling thread acquired the now-uncontended mutex in user code.
     write_guest_bytes(&process, mutex, &owner_tag.to_le_bytes());
     let execution = process
-        .coordinator_mut()
-        .run_next(Duration::from_secs(2))
+        .driver_mut()
+        .run_native(Duration::from_secs(2))
         .unwrap()
         .unwrap();
     assert_eq!(execution.lease.thread, owner);
@@ -48,7 +48,7 @@ fn a_native_condition_signal_keeps_its_donated_current_owner_ahead_of_an_equal_p
     start(&mut process, peer);
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .selection(VirtualCpuId::new(0))
             .unwrap()
@@ -57,15 +57,15 @@ fn a_native_condition_signal_keeps_its_donated_current_owner_ahead_of_an_equal_p
     );
     assert!(matches!(
         dispatcher
-            .route_scheduled_supervisor_call(
-                process.coordinator_mut(),
+            .call_local(
+                process.driver_mut(),
                 execution.lease,
                 &execution.report.stop
             )
             .unwrap(),
         ExceptionHandlingResult::Resumed
     ));
-    let scheduler = process.coordinator_mut().scheduler();
+    let scheduler = process.driver_mut().scheduler();
     assert_eq!(scheduler.thread(owner).unwrap().effective_priority, 30);
     assert_eq!(scheduler.thread(peer).unwrap().effective_priority, 30);
     assert_eq!(
@@ -84,7 +84,7 @@ fn a_native_mutex_wait_on_a_foreign_thread_is_cancelled_in_the_waiters_process()
         .main_thread()
         .registers()
         .write_x(x(0), 10_000_000_000);
-    let coordinator = process.coordinator_mut();
+    let coordinator = process.driver_mut();
     let core = VirtualCpuId::new(0);
     let affinity = coordinator.scheduler().profile().core_set([core]).unwrap();
     coordinator
@@ -133,14 +133,14 @@ fn a_native_mutex_wait_on_a_foreign_thread_is_cancelled_in_the_waiters_process()
         .unwrap()
         .address_waits()
         .clone();
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     for expected in [owner, foreign] {
-        let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+        let (thread, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
         assert_eq!(thread, expected);
         assert!(matches!(handling, ExceptionHandlingResult::Suspended));
         assert_eq!(
             process
-                .coordinator_mut()
+                .driver_mut()
                 .scheduler()
                 .thread(thread)
                 .unwrap()
@@ -149,15 +149,12 @@ fn a_native_mutex_wait_on_a_foreign_thread_is_cancelled_in_the_waiters_process()
         );
     }
     assert_eq!(
-        process
-            .coordinator_mut()
-            .scheduler()
-            .priority_donation_count(),
+        process.driver_mut().scheduler().priority_donation_count(),
         1
     );
     assert!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .terminate_process(owner_process)
             .unwrap()
     );
@@ -166,19 +163,14 @@ fn a_native_mutex_wait_on_a_foreign_thread_is_cancelled_in_the_waiters_process()
         Some(nixe_runtime::AddressWaitCompletion::InvalidOwner)
     );
     assert_eq!(
-        process
-            .coordinator_mut()
-            .scheduler()
-            .priority_donation_count(),
+        process.driver_mut().scheduler().priority_donation_count(),
         0
     );
-    process.coordinator_mut().drain_external_events().unwrap();
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    process.driver_mut().drain_external_events().unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .thread(foreign)
             .unwrap()
@@ -187,7 +179,7 @@ fn a_native_mutex_wait_on_a_foreign_thread_is_cancelled_in_the_waiters_process()
     );
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .process(other_process)
             .unwrap()
             .main_thread()
@@ -200,7 +192,7 @@ fn a_native_mutex_wait_on_a_foreign_thread_is_cancelled_in_the_waiters_process()
 #[test]
 fn original_owner_exit_during_handoff_keeps_the_selected_waiter_blocked_until_publication() {
     let (_directory, mut process) = fixture_process(&[svc(0x0a), svc(0x1a)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let owner = process.main_thread_id();
     let owner_tag = process.main_thread_handle();
     let mutex = process.main_thread().stack_bottom;
@@ -216,10 +208,8 @@ fn original_owner_exit_during_handoff_keeps_the_selected_waiter_blocked_until_pu
             tag,
         );
         start(&mut process, thread);
-        assert!(
-            matches!(dispatch_scheduled_next(&mut process, &mut dispatcher),
-            (id, ExceptionHandlingResult::Suspended) if id == thread)
-        );
+        assert!(matches!(dispatch_scheduled_next(&mut process, &dispatcher),
+            (id, ExceptionHandlingResult::Suspended) if id == thread));
     }
     let waits = process.address_waits().clone();
     let handoff = {
@@ -230,7 +220,7 @@ fn original_owner_exit_during_handoff_keeps_the_selected_waiter_blocked_until_pu
         handoff
     };
     assert!(
-        matches!(dispatch_scheduled_next(&mut process, &mut dispatcher), (thread, ExceptionHandlingResult::Terminated { .. }) if thread == owner)
+        matches!(dispatch_scheduled_next(&mut process, &dispatcher), (thread, ExceptionHandlingResult::Terminated { .. }) if thread == owner)
     );
     assert!(!waits.lock().completion(mutex.get(), first).is_some());
     assert!(!waits.lock().completion(mutex.get(), second).is_some());
@@ -254,14 +244,14 @@ pub(super) fn add_thread(
     // Arbitration order is a per-core contract. Keep these contenders on core
     // zero while using the same parallel coordinator as normal execution.
     let affinity = process
-        .coordinator_mut()
+        .driver_mut()
         .scheduler()
         .profile()
         .core_set([VirtualCpuId::new(0)])
         .unwrap();
     let main = process.main_thread_id();
     process
-        .coordinator_mut()
+        .driver_mut()
         .scheduler()
         .migrate(main, IdealCore::Core(VirtualCpuId::new(0)), affinity)
         .unwrap();
@@ -311,6 +301,146 @@ fn pending_mutex_acquisition_registers_before_unlock() {
     pending_release_and_acquisition(false, true);
 }
 
+#[test]
+fn terminating_a_pending_mutex_read_does_not_register_a_new_wait() {
+    use nixe_memory::{DeviceAccessEndpoint, MemoryPermissions};
+    use std::sync::{Arc, mpsc};
+
+    let (_directory, mut process) = fixture_process(&[svc(0x0b), svc(0x1a)]);
+    let dispatcher = support::dispatcher(&process);
+    let mutex = process.main_thread().stack_bottom;
+    let owner = process.main_thread_handle();
+    let entry = process.main_thread().registers().pc() + 4;
+    let (child, tag) = add_thread(&mut process, entry, 30);
+    lock_arguments(
+        &mut process.thread(child).unwrap().registers(),
+        owner,
+        mutex.get(),
+        tag,
+    );
+    write_guest_bytes(&process, mutex, &(owner | WAITERS).to_le_bytes());
+    let machine = process.memory().space().machine().clone();
+    let ranges = process
+        .memory()
+        .space()
+        .capture(mutex, 4, MemoryPermissions::READ_WRITE)
+        .unwrap();
+    let (send, receive) = mpsc::channel();
+    let device: Arc<dyn DeviceAccessEndpoint> = Arc::new(super::ipc_lifetime::Device(send));
+    machine.set_device_endpoint(&device);
+    machine.publish_device_write(&ranges, || Ok(())).unwrap();
+    start(&mut process, child);
+    assert!(
+        matches!(dispatch_scheduled_next(&mut process, &dispatcher), (thread, ExceptionHandlingResult::Suspended) if thread == child)
+    );
+    let mut read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    let id = process.scheduler_process_id();
+    assert!(process.driver_mut().terminate_process(id).unwrap());
+    assert!(read.is_cancelled());
+    let value = {
+        let (ranges, operation) = read.parts_mut();
+        machine.apply_resolved_access(ranges, operation)
+    }
+    .unwrap();
+    read.finish(Ok(value));
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
+    assert_eq!(process.address_waits().lock().waiter_count(), 0);
+    assert_eq!(process.scheduler().priority_donation_count(), 0);
+}
+
+#[test]
+fn terminating_a_queued_mutex_operation_does_not_start_its_word_effect() {
+    for immediate in [0x1b, 0x1c] {
+        let (_directory, mut process) = fixture_process(&[svc(immediate)]);
+        let dispatcher = support::dispatcher(&process);
+        let mutex = process.main_thread().stack_bottom;
+        let key = mutex.checked_add(4).unwrap();
+        let tag = process.main_thread_handle();
+        write_guest_bytes(&process, mutex, &tag.to_le_bytes());
+        process.main_thread().registers().write_x(x(0), mutex.get());
+        process.main_thread().registers().write_x(x(1), key.get());
+        process.main_thread().registers().write_w(x(2), tag);
+        process.main_thread().registers().write_x(x(3), u64::MAX);
+        let turn = support::ready(process.address_waits().address_operation(mutex.get()));
+        assert!(matches!(
+            dispatch_next(&mut process, &dispatcher),
+            ExceptionHandlingResult::Suspended
+        ));
+        let id = process.scheduler_process_id();
+        assert!(process.driver_mut().terminate_process(id).unwrap());
+        drop(turn);
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
+        assert_eq!(read_guest_u32(&process, mutex), tag);
+        assert_eq!(read_guest_u32(&process, key), 0);
+        assert_eq!(process.address_waits().lock().waiter_count(), 0);
+    }
+}
+
+#[test]
+fn terminating_an_address_compare_drains_its_accepted_update_without_registering() {
+    use nixe_memory::{DeviceAccessEndpoint, MemoryPermissions};
+    use std::sync::{Arc, mpsc};
+
+    for kind in 0..=2 {
+        let (_directory, mut process) = fixture_process(&[svc(0x34)]);
+        let dispatcher = support::dispatcher(&process);
+        let address = process.main_thread().stack_bottom;
+        let initial = u32::from(kind == 2);
+        write_guest_bytes(&process, address, &initial.to_le_bytes());
+        process
+            .main_thread()
+            .registers()
+            .write_x(x(0), address.get());
+        process.main_thread().registers().write_w(x(1), kind);
+        process.main_thread().registers().write_w(x(2), 1);
+        process.main_thread().registers().write_x(x(3), u64::MAX);
+        let machine = process.memory().space().machine().clone();
+        let ranges = process
+            .memory()
+            .space()
+            .capture(address, 4, MemoryPermissions::READ_WRITE)
+            .unwrap();
+        let (send, receive) = mpsc::channel();
+        let device: Arc<dyn DeviceAccessEndpoint> = Arc::new(super::ipc_lifetime::Device(send));
+        machine.set_device_endpoint(&device);
+        machine.publish_device_write(&ranges, || Ok(())).unwrap();
+        assert!(matches!(
+            dispatch_next(&mut process, &dispatcher),
+            ExceptionHandlingResult::Suspended
+        ));
+        let mut read = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        let id = process.scheduler_process_id();
+        assert!(process.driver_mut().terminate_process(id).unwrap());
+        assert_eq!(read.is_cancelled(), kind != 1);
+        let value = {
+            let (ranges, operation) = read.parts_mut();
+            machine.apply_resolved_access(ranges, operation)
+        }
+        .unwrap();
+        read.finish(Ok(value));
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
+        if kind == 1 {
+            let mut update = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(!update.is_cancelled());
+            let value = {
+                let (ranges, operation) = update.parts_mut();
+                machine.apply_resolved_access(ranges, operation)
+            }
+            .unwrap();
+            update.finish(Ok(value));
+            dispatcher.drive_pending(process.driver_mut()).unwrap();
+        }
+        assert!(receive.try_recv().is_err());
+        machine.retire_device_pages(&ranges).unwrap();
+        assert_eq!(
+            read_guest_u32(&process, address),
+            if kind == 1 { u32::MAX } else { initial }
+        );
+        assert_eq!(process.address_waits().lock().waiter_count(), 0);
+        assert_eq!(process.scheduler().deadline_count(), 0);
+    }
+}
+
 fn pending_release_and_acquisition(condition: bool, acquire_first: bool) {
     use nixe_memory::{DeviceAccessEndpoint, DeviceAccessRequest};
     use std::sync::{Arc, mpsc};
@@ -337,8 +467,8 @@ fn pending_release_and_acquisition(condition: bool, acquire_first: bool) {
         svc(0x1a),
         svc(0x0a),
     ]);
-    let ingress = process.coordinator_mut().event_sender();
-    let mut dispatcher = support::dispatcher(&process).with_input_completions(ingress);
+    let ingress = process.driver_mut().event_sender();
+    let dispatcher = support::dispatcher(&process).with_input_completions(ingress);
     let mutex = process.main_thread().stack_bottom;
     let key = mutex.checked_add(12).unwrap();
     let owner_object = process.main_thread().clone();
@@ -373,7 +503,7 @@ fn pending_release_and_acquisition(condition: bool, acquire_first: bool) {
     if acquire_first {
         start(&mut process, child);
     }
-    let (selected, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+    let (selected, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
     assert_eq!(
         selected,
         if acquire_first {
@@ -389,7 +519,7 @@ fn pending_release_and_acquisition(condition: bool, acquire_first: bool) {
     if acquire_first {
         assert!(matches!(
             first.operation(),
-            nixe_memory::AccessOperation::Read
+            nixe_memory::AccessOperation::Read(_)
         ));
     } else {
         assert!(matches!(
@@ -398,7 +528,7 @@ fn pending_release_and_acquisition(condition: bool, acquire_first: bool) {
         ));
         start(&mut process, child);
     }
-    let (selected, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+    let (selected, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
     assert_eq!(
         selected,
         if acquire_first {
@@ -408,10 +538,12 @@ fn pending_release_and_acquisition(condition: bool, acquire_first: bool) {
         }
     );
     assert!(matches!(handling, ExceptionHandlingResult::Suspended));
-    let finish = |request: DeviceAccessRequest| {
-        let result = machine
-            .apply_resolved_access(request.ranges(), request.operation())
-            .map_err(Arc::new);
+    let finish = |mut request: DeviceAccessRequest| {
+        let result = {
+            let (ranges, operation) = request.parts_mut();
+            machine.apply_resolved_access(ranges, operation)
+        }
+        .map_err(Arc::new);
         request.finish(result);
     };
     if !acquire_first {
@@ -419,21 +551,17 @@ fn pending_release_and_acquisition(condition: bool, acquire_first: bool) {
         while let Ok(request) = receive.try_recv() {
             finish(request);
         }
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
     }
     finish(first);
     for _ in 0..8 {
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
         while let Ok(request) = receive.try_recv() {
             finish(request);
         }
     }
     machine.retire_device_pages(&ranges).unwrap();
-    process.coordinator_mut().drain_external_events().unwrap();
+    process.driver_mut().drain_external_events().unwrap();
     assert_eq!(
         read_guest_u32(&process, mutex),
         if acquire_first { tag } else { 0 }
@@ -448,7 +576,7 @@ fn pending_release_and_acquisition(condition: bool, acquire_first: bool) {
     );
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .thread(child)
             .unwrap()
@@ -456,9 +584,7 @@ fn pending_release_and_acquisition(condition: bool, acquire_first: bool) {
         nixe_scheduler::ThreadLifecycle::Ready
     );
     if acquire_first {
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
         assert_eq!(process.thread_lifecycle(child), ThreadLifecycle::Ready);
     }
     assert_eq!(process.thread(child).unwrap().registers().read_w(x(0)), 0);
@@ -467,7 +593,7 @@ fn pending_release_and_acquisition(condition: bool, acquire_first: bool) {
 #[test]
 fn mutex_owner_change_returns_without_stealing_or_waiting_on_a_stale_handle() {
     let (_directory, mut process) = fixture_process(&[svc(0x1a), svc(0x1a), svc(0x1a)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let mutex = process.main_thread().stack_bottom;
     for word in [0, 0x1234, WAITERS | 0x5678] {
         write_guest_bytes(&process, mutex, &word.to_le_bytes());
@@ -478,7 +604,7 @@ fn mutex_owner_change_returns_without_stealing_or_waiting_on_a_stale_handle() {
             1,
         );
         assert!(matches!(
-            dispatch_next(&mut process, &mut dispatcher),
+            dispatch_next(&mut process, &dispatcher),
             ExceptionHandlingResult::Resumed
         ));
         assert_eq!(process.main_thread().registers().read_w(x(0)), 0);
@@ -491,7 +617,7 @@ fn mutex_owner_change_returns_without_stealing_or_waiting_on_a_stale_handle() {
 fn mutex_handoff_keeps_remaining_waiters_and_transfers_priority_before_waking() {
     let (_directory, mut process) =
         fixture_process(&[svc(0x1b), svc(0x0a), svc(0x1a), svc(0x1b), svc(0x0a)]);
-    let mut dispatcher = support::dispatcher(&process);
+    let dispatcher = support::dispatcher(&process);
     let mutex = process.main_thread().stack_bottom;
     let main = process.main_thread_id();
     let main_object = process.main_thread().clone();
@@ -512,7 +638,7 @@ fn mutex_handoff_keeps_remaining_waiters_and_transfers_priority_before_waking() 
         );
         start(&mut process, child);
         {
-            let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+            let (thread, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
             assert_eq!(thread, child);
             assert!(matches!(handling, ExceptionHandlingResult::Suspended));
         };
@@ -520,7 +646,7 @@ fn mutex_handoff_keeps_remaining_waiters_and_transfers_priority_before_waking() 
     }
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .thread(main)
             .unwrap()
@@ -529,7 +655,7 @@ fn mutex_handoff_keeps_remaining_waiters_and_transfers_priority_before_waking() 
     );
     process.main_thread().registers().write_x(x(0), mutex.get());
     {
-        let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+        let (thread, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
         assert_eq!(thread, main);
         assert!(matches!(handling, ExceptionHandlingResult::Resumed));
     };
@@ -552,7 +678,7 @@ fn mutex_handoff_keeps_remaining_waiters_and_transfers_priority_before_waking() 
     );
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .thread(main)
             .unwrap()
@@ -566,16 +692,14 @@ fn mutex_handoff_keeps_remaining_waiters_and_transfers_priority_before_waking() 
         .unwrap();
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .thread(next)
             .unwrap()
             .effective_priority,
         20
     );
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     assert_eq!(process.thread_lifecycle(next), ThreadLifecycle::Ready);
     assert_eq!(process.thread(next).unwrap().registers().read_w(x(0)), 0);
     assert_eq!(read_guest_u32(&process, mutex), next_tag | WAITERS);
@@ -584,22 +708,20 @@ fn mutex_handoff_keeps_remaining_waiters_and_transfers_priority_before_waking() 
         .unwrap()
         .registers()
         .write_x(x(0), mutex.get());
-    let (selected, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+    let (selected, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
     assert_eq!(selected, next);
     assert!(matches!(handling, ExceptionHandlingResult::Resumed));
     assert_eq!(read_guest_u32(&process, mutex), last_tag);
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .thread(next)
             .unwrap()
             .effective_priority,
         30
     );
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     assert_eq!(process.thread_lifecycle(last), ThreadLifecycle::Ready);
     assert_eq!(process.thread(last).unwrap().registers().read_w(x(0)), 0);
     process
@@ -608,7 +730,7 @@ fn mutex_handoff_keeps_remaining_waiters_and_transfers_priority_before_waking() 
         .registers()
         .write_x(x(0), mutex.get());
     {
-        let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+        let (thread, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
         assert_eq!(thread, last);
         assert!(matches!(handling, ExceptionHandlingResult::Resumed));
     };
@@ -620,7 +742,7 @@ fn mutex_handoff_keeps_remaining_waiters_and_transfers_priority_before_waking() 
 fn condition_signal_waits_for_the_held_mutex_and_preserves_the_original_deadline() {
     let (_directory, mut process) =
         fixture_process(&[svc(0x1d), svc(0x1b), svc(0x0a), svc(0x1c), svc(0x0a)]);
-    let mut dispatcher = fixed_time_dispatcher(&process);
+    let dispatcher = fixed_time_dispatcher(&process);
     let key = process.main_thread().stack_bottom;
     let mutex = key.checked_add(4).unwrap();
     let main = process.main_thread_id();
@@ -641,7 +763,7 @@ fn condition_signal_waits_for_the_held_mutex_and_preserves_the_original_deadline
     write_guest_bytes(&process, mutex, &tag.to_le_bytes());
     start(&mut process, child);
     {
-        let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+        let (thread, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
         assert_eq!(thread, child);
         assert!(matches!(handling, ExceptionHandlingResult::Suspended));
     };
@@ -651,7 +773,7 @@ fn condition_signal_waits_for_the_held_mutex_and_preserves_the_original_deadline
     process.main_thread().registers().write_x(x(0), key.get());
     process.main_thread().registers().write_x(x(1), 1);
     {
-        let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+        let (thread, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
         assert_eq!(thread, main);
         assert!(matches!(handling, ExceptionHandlingResult::Resumed));
     };
@@ -667,7 +789,7 @@ fn condition_signal_waits_for_the_held_mutex_and_preserves_the_original_deadline
     assert!(!process.address_waits().lock().contains(key.get(), child));
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .thread(main)
             .unwrap()
@@ -675,7 +797,7 @@ fn condition_signal_waits_for_the_held_mutex_and_preserves_the_original_deadline
         30
     );
     process
-        .coordinator_mut()
+        .driver_mut()
         .advance_virtual_time(1_000_000)
         .unwrap();
     assert_eq!(
@@ -683,12 +805,10 @@ fn condition_signal_waits_for_the_held_mutex_and_preserves_the_original_deadline
         nixe_scheduler::ThreadLifecycle::Waiting
     );
     process
-        .coordinator_mut()
+        .driver_mut()
         .advance_virtual_time(1_000_000)
         .unwrap();
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     assert_eq!(process.thread_lifecycle(child), ThreadLifecycle::Ready);
     assert_eq!(
         process.thread(child).unwrap().registers().read_w(x(0)),
@@ -698,7 +818,7 @@ fn condition_signal_waits_for_the_held_mutex_and_preserves_the_original_deadline
     assert_eq!(process.address_waits().lock().waiter_count(), 0);
     assert_eq!(
         process
-            .coordinator_mut()
+            .driver_mut()
             .scheduler()
             .thread(main)
             .unwrap()
@@ -710,7 +830,7 @@ fn condition_signal_waits_for_the_held_mutex_and_preserves_the_original_deadline
 #[test]
 fn condition_signal_claims_a_free_mutex_before_the_waiter_runs() {
     let (_directory, mut process) = fixture_process(&[svc(0x1d), svc(0x0a), svc(0x1c), svc(0x0a)]);
-    let mut dispatcher = fixed_time_dispatcher(&process);
+    let dispatcher = fixed_time_dispatcher(&process);
     let key = process.main_thread().stack_bottom;
     let mutex = key.checked_add(4).unwrap();
     let entry = process.main_thread().registers().pc() + 8;
@@ -725,14 +845,14 @@ fn condition_signal_claims_a_free_mutex_before_the_waiter_runs() {
     write_guest_bytes(&process, mutex, &tag.to_le_bytes());
     start(&mut process, child);
     {
-        let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+        let (thread, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
         assert_eq!(thread, child);
         assert!(matches!(handling, ExceptionHandlingResult::Suspended));
     };
     process.main_thread().registers().write_x(x(0), key.get());
     process.main_thread().registers().write_x(x(1), 1);
     assert!(matches!(
-        dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+        dispatch_scheduled_next(&mut process, &dispatcher).1,
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, mutex), tag);
@@ -744,9 +864,7 @@ fn condition_signal_claims_a_free_mutex_before_the_waiter_runs() {
             .completion(key.get(), child)
             .is_some()
     );
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     assert_eq!(process.thread_lifecycle(child), ThreadLifecycle::Ready);
     assert_eq!(process.thread(child).unwrap().registers().read_w(x(0)), 0);
     assert_eq!(read_guest_u32(&process, mutex), tag);
@@ -764,7 +882,7 @@ fn condition_signals_keep_the_key_set_until_all_waiters_reacquire_the_mutex() {
         svc(0x1b),
         svc(0x0a),
     ]);
-    let mut dispatcher = fixed_time_dispatcher(&process);
+    let dispatcher = fixed_time_dispatcher(&process);
     let key = process.main_thread().stack_bottom;
     let mutex = key.checked_add(4).unwrap();
     let main = process.main_thread_id();
@@ -787,7 +905,7 @@ fn condition_signals_keep_the_key_set_until_all_waiters_reacquire_the_mutex() {
         write_guest_bytes(&process, mutex, &tag.to_le_bytes());
         start(&mut process, child);
         {
-            let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+            let (thread, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
             assert_eq!(thread, child);
             assert!(matches!(handling, ExceptionHandlingResult::Suspended));
         };
@@ -798,7 +916,7 @@ fn condition_signals_keep_the_key_set_until_all_waiters_reacquire_the_mutex() {
         process.main_thread().registers().write_x(x(0), key.get());
         process.main_thread().registers().write_w(x(1), count);
         {
-            let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+            let (thread, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
             assert_eq!(thread, main);
             assert!(matches!(handling, ExceptionHandlingResult::Resumed));
         };
@@ -820,16 +938,14 @@ fn condition_signals_keep_the_key_set_until_all_waiters_reacquire_the_mutex() {
     }
     process.main_thread().registers().write_x(x(0), mutex.get());
     {
-        let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+        let (thread, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
         assert_eq!(thread, main);
         assert!(matches!(handling, ExceptionHandlingResult::Resumed));
     };
     assert_eq!(read_guest_u32(&process, mutex), children[1].1 | WAITERS);
     for (index, expected_word) in [(1, children[0].1), (0, 0)] {
         let (child, _) = children[index];
-        dispatcher
-            .poll_memory_completions(process.coordinator_mut())
-            .unwrap();
+        dispatcher.drive_pending(process.driver_mut()).unwrap();
         assert_eq!(process.thread_lifecycle(child), ThreadLifecycle::Ready);
         assert_eq!(process.thread(child).unwrap().registers().read_w(x(0)), 0);
         process
@@ -837,12 +953,12 @@ fn condition_signals_keep_the_key_set_until_all_waiters_reacquire_the_mutex() {
             .unwrap()
             .registers()
             .write_x(x(0), mutex.get());
-        let (selected, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+        let (selected, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
         assert_eq!(selected, child);
         assert!(matches!(handling, ExceptionHandlingResult::Resumed));
         assert_eq!(read_guest_u32(&process, mutex), expected_word);
         assert!(matches!(
-            dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+            dispatch_scheduled_next(&mut process, &dispatcher).1,
             ExceptionHandlingResult::Terminated { .. }
         ));
     }
@@ -852,7 +968,7 @@ fn condition_signals_keep_the_key_set_until_all_waiters_reacquire_the_mutex() {
 #[test]
 fn condition_signal_reports_an_invalid_mutex_owner_to_the_waiter() {
     let (_directory, mut process) = fixture_process(&[svc(0x1d), svc(0x0a), svc(0x1c), svc(0x0a)]);
-    let mut dispatcher = fixed_time_dispatcher(&process);
+    let dispatcher = fixed_time_dispatcher(&process);
     let key = process.main_thread().stack_bottom;
     let mutex = key.checked_add(4).unwrap();
     let entry = process.main_thread().registers().pc() + 8;
@@ -867,7 +983,7 @@ fn condition_signal_reports_an_invalid_mutex_owner_to_the_waiter() {
     write_guest_bytes(&process, mutex, &tag.to_le_bytes());
     start(&mut process, child);
     {
-        let (thread, handling) = dispatch_scheduled_next(&mut process, &mut dispatcher);
+        let (thread, handling) = dispatch_scheduled_next(&mut process, &dispatcher);
         assert_eq!(thread, child);
         assert!(matches!(handling, ExceptionHandlingResult::Suspended));
     };
@@ -875,13 +991,11 @@ fn condition_signal_reports_an_invalid_mutex_owner_to_the_waiter() {
     process.main_thread().registers().write_x(x(0), key.get());
     process.main_thread().registers().write_x(x(1), 1);
     assert!(matches!(
-        dispatch_scheduled_next(&mut process, &mut dispatcher).1,
+        dispatch_scheduled_next(&mut process, &dispatcher).1,
         ExceptionHandlingResult::Resumed
     ));
     assert_eq!(read_guest_u32(&process, mutex), 0xbad | WAITERS);
-    dispatcher
-        .poll_memory_completions(process.coordinator_mut())
-        .unwrap();
+    dispatcher.drive_pending(process.driver_mut()).unwrap();
     assert_eq!(process.thread_lifecycle(child), ThreadLifecycle::Ready);
     assert_eq!(
         process.thread(child).unwrap().registers().read_w(x(0)),

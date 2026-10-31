@@ -3,7 +3,7 @@
 use std::fmt::{Display, Formatter};
 
 const HEADER_SIZE: usize = 16;
-const MAX_PARCEL_BYTES: usize = 0x4000;
+pub(crate) const MAX_PARCEL_BYTES: usize = 0x4000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ParcelError {

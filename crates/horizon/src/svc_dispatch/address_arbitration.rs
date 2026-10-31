@@ -14,7 +14,7 @@ const KERNEL_ADDRESS_END: u64 = 0u64.wrapping_sub(0x20_0000);
 
 impl HorizonSvcDispatcher {
     pub(super) fn wait_for_address(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let address = read_register(context.thread().state(), 0);
@@ -41,10 +41,12 @@ impl HorizonSvcDispatcher {
         let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
         let running = lifetime.clone();
         self.start_owned_svc(context, lifetime, None, async move {
-            let turn = waits.address_operation(address, thread).await;
-            running
-                .begin()
-                .map_err(|_| runtime_fault("WaitForAddress cancelled before its word operation"))?;
+            let turn = waits.address_operation(address).await;
+            if kind == 1 {
+                running.begin().map_err(|_| {
+                    runtime_fault("WaitForAddress cancelled before its word operation")
+                })?;
+            }
             let compared: Result<bool, std::sync::Arc<nixe_memory::MemoryError>> = async {
                 let mut observed = word.read_owned().await?;
                 loop {
@@ -88,6 +90,15 @@ impl HorizonSvcDispatcher {
                     output1: None,
                 });
             }
+            // A cancelled accepted word update finishes, but cannot start a
+            // new wait after the caller has retired.
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_address_arbiter.cpp
+            if kind == 1 && running.check().is_err() {
+                return Ok(memory_wait::SvcCompletion::Return {
+                    code: HorizonKernelResult::CANCELLED,
+                    output1: None,
+                });
+            }
             let wait = {
                 let mut state = waits.lock();
                 state
@@ -118,7 +129,7 @@ impl HorizonSvcDispatcher {
     }
 
     pub(super) fn signal_to_address(
-        &mut self,
+        self: &std::sync::Arc<Self>,
         context: &mut ExceptionDispatchContext<'_>,
     ) -> ExceptionDispatchOutcome<HorizonSvcFault> {
         let address = read_register(context.thread().state(), 0);
@@ -138,13 +149,10 @@ impl HorizonSvcDispatcher {
             }
         };
         let waits = context.process().address_waits().clone();
-        let thread = context.thread().id();
-        let source = context.source();
-        let vcpu = context.thread().vcpu();
         let lifetime = std::sync::Arc::new(crate::ipc_wire::operation::CallLifetime::default());
         let running = lifetime.clone();
         self.start_owned_svc(context, lifetime, None, async move {
-            let turn = waits.address_operation(address, thread).await;
+            let turn = waits.address_operation(address).await;
             running.begin().map_err(|_| {
                 runtime_fault("SignalToAddress cancelled before its word operation")
             })?;
@@ -186,8 +194,6 @@ impl HorizonSvcDispatcher {
             };
             drop(turn);
             Ok(super::memory_wait::SvcCompletion::kernel(
-                source,
-                vcpu,
                 move |_, context| {
                     result(context, code);
                     resume()

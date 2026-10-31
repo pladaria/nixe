@@ -1,5 +1,6 @@
 //! Checked, bounded codecs for HIPC transport and CMIF/TIPC framing.
 
+use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 
 /// Size of the per-thread HIPC command buffer used by Horizon clients.
@@ -41,7 +42,7 @@ pub(crate) struct TipcRequest<'a> {
 }
 
 impl<'a> TipcRequest<'a> {
-    pub(crate) fn decode(hipc: &HipcRequest<'a>) -> Result<Self, MessageError> {
+    pub(crate) fn decode(hipc: &'a HipcRequest<'_>) -> Result<Self, MessageError> {
         let command_id = hipc
             .command_type
             .checked_sub(TIPC_COMMAND_REQUEST_BASE)
@@ -238,7 +239,7 @@ pub(crate) struct HipcRequest<'a> {
     pub(crate) receive_buffers: Vec<BufferDescriptor>,
     pub(crate) exchange_buffers: Vec<BufferDescriptor>,
     pub(crate) receive_statics: ReceiveStatics,
-    raw: &'a [u8],
+    raw: Cow<'a, [u8]>,
     data_offset: usize,
     data_end: usize,
 }
@@ -325,13 +326,48 @@ impl<'a> HipcRequest<'a> {
             receive_buffers,
             exchange_buffers,
             receive_statics,
-            raw,
+            raw: Cow::Borrowed(raw),
             data_offset: data_end - data_size,
             data_end,
         })
     }
 
-    fn aligned_data(&self) -> Result<&'a [u8], MessageError> {
+    pub(crate) fn owned(raw: Vec<u8>) -> Result<HipcRequest<'static>, MessageError> {
+        let HipcRequest {
+            command_type,
+            pid,
+            copy_handles,
+            move_handles,
+            send_statics,
+            send_buffers,
+            receive_buffers,
+            exchange_buffers,
+            receive_statics,
+            data_offset,
+            data_end,
+            ..
+        } = HipcRequest::decode(&raw)?;
+        Ok(HipcRequest {
+            command_type,
+            pid,
+            copy_handles,
+            move_handles,
+            send_statics,
+            send_buffers,
+            receive_buffers,
+            exchange_buffers,
+            receive_statics,
+            data_offset,
+            data_end,
+            raw: Cow::Owned(raw),
+        })
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.raw.into_owned()
+    }
+
+    fn aligned_data(&self) -> Result<&[u8], MessageError> {
         let start = align_up(self.data_offset, 16)?;
         self.raw
             .get(start..self.data_end)
@@ -368,7 +404,7 @@ pub(crate) struct CmifRequest<'a> {
 
 impl<'a> CmifRequest<'a> {
     /// Decodes the CMIF layer carried by a checked HIPC request.
-    pub(crate) fn decode(hipc: &HipcRequest<'a>, is_domain: bool) -> Result<Self, MessageError> {
+    pub(crate) fn decode(hipc: &'a HipcRequest<'_>, is_domain: bool) -> Result<Self, MessageError> {
         let command_type = hipc.command_type;
         if command_type == CMIF_COMMAND_CLOSE {
             // A domain session is still closed with the ordinary HIPC close

@@ -118,6 +118,7 @@ async fn read_path(process: &Request, hipc: &HipcRequest<'_>) -> Result<String, 
         ));
     }
 
+    process.reserve_payload(size).await?;
     let mut bytes = vec![0; size];
     process.read(descriptor, 0, &mut bytes).await?;
     let nul = bytes
@@ -126,6 +127,6 @@ async fn read_path(process: &Request, hipc: &HipcRequest<'_>) -> Result<String, 
         .ok_or(IpcWireError::Malformed(
             "filesystem path is not null terminated",
         ))?;
-    String::from_utf8(bytes[..nul].to_vec())
-        .map_err(|_| IpcWireError::Malformed("filesystem path is not UTF-8"))
+    bytes.truncate(nul);
+    String::from_utf8(bytes).map_err(|_| IpcWireError::Malformed("filesystem path is not UTF-8"))
 }

@@ -11,12 +11,10 @@ mod thread_local;
 
 pub use builder::ProcessBuilder;
 pub(crate) use builder::ThreadPolicy;
-#[cfg(test)]
-use builder::a64_register;
 use builder::{align_up, error, initialize_created_thread};
 pub use execution::{
-    ExecutionReport, ExecutionStop, GuestStackFrame, ProcessExecutionError, ProcessExit,
-    ProcessExitCause, ProcessTeardownFailure, ProcessTeardownReport, ThreadExit,
+    ExecutionReport, ExecutionStop, GuestStackFrame, ProcessExit, ProcessExitCause,
+    ProcessTeardownFailure, ProcessTeardownReport, ThreadExit,
 };
 pub use layout::{
     ProcessAddressSpace, ProcessBuildConfig, ProcessMemoryLayout, ProcessMemoryLayoutProfile,
@@ -25,7 +23,7 @@ pub use layout::{
 pub use memory_accounting::ProcessMemoryAccounting;
 pub use thread::{
     ThreadCreateError, ThreadCreateRequest, ThreadCreation, ThreadObject, ThreadRegisters,
-    ThreadStartError, ThreadTable, ThreadTableError, ThreadWait,
+    ThreadStartError, ThreadTable, ThreadTableError,
 };
 
 use std::error::Error;
@@ -46,9 +44,8 @@ use nixe_memory::GuestVirtualAddress;
 use nixe_memory::{MemoryPermissions, PAGE_SIZE};
 
 use crate::{
-    ExceptionDispatchContext, ExceptionDispatchOutcome, ExceptionDispatcher,
-    ExceptionHandlingResult, ExceptionResume, ExceptionRouteError, ExceptionTerminationReason,
-    ExceptionTerminationScope, ExceptionThreadContext, LaunchKind, LaunchModuleImage, LaunchPlan,
+    ExceptionDispatchOutcome, ExceptionHandlingResult, ExceptionResume, ExceptionTerminationReason,
+    ExceptionTerminationScope, LaunchKind, LaunchModuleImage, LaunchPlan,
 };
 
 const DEFAULT_IMAGE_BASE: u64 = 0x7100_0000;
@@ -87,7 +84,8 @@ pub struct RunnableProcess {
     handles: std::sync::Arc<crate::HandleTable>,
     address_waits: std::sync::Arc<crate::AddressWaitRegistry>,
     pub(crate) scheduler: std::sync::Arc<nixe_scheduler::SchedulerState>,
-    execution: Mutex<execution::ProcessExecutionControl>,
+    execution: Arc<nixe_cpu_jit::JitProcess>,
+    native_cores: std::sync::atomic::AtomicU64,
     pub(crate) events: std::sync::OnceLock<crate::ExternalEventSender>,
 }
 
@@ -268,7 +266,7 @@ impl RunnableProcess {
         };
         if let nixe_memory::Access::Pending(pending) = access {
             match pending.await.map_err(ThreadCreateError::Memory)? {
-                nixe_memory::AccessResult::Written => {}
+                nixe_memory::AccessResult::Written(_) => {}
                 _ => return Err(ThreadCreateError::Internal),
             }
         }
@@ -280,6 +278,9 @@ impl RunnableProcess {
                 affinity: request.affinity,
             })
             .map_err(|fault| match fault {
+                nixe_scheduler::SchedulerError::ProcessTerminating(_) => {
+                    ThreadCreateError::Terminating
+                }
                 nixe_scheduler::SchedulerError::ThreadIdExhausted => {
                     ThreadCreateError::IdentityExhausted
                 }
@@ -370,7 +371,7 @@ impl RunnableProcess {
         }
     }
 
-    pub(crate) fn terminate_thread_from_coordinator(
+    pub(crate) fn terminate_thread(
         &self,
         id: nixe_scheduler::GuestThreadId,
         exit_code: u64,
@@ -442,14 +443,6 @@ impl RunnableProcess {
         &self.handles
     }
 
-    /// The accepted continuation owns its mailbox; ingress only wakes the execution owner.
-    pub fn notify_kernel_completion(&self) {
-        self.events
-            .get()
-            .expect("executing process is registered")
-            .notify_host_service(crate::ExternalEventSource::Device);
-    }
-
     #[must_use]
     pub const fn address_waits(&self) -> &std::sync::Arc<crate::AddressWaitRegistry> {
         &self.address_waits
@@ -475,18 +468,14 @@ impl RunnableProcess {
             address_waiters_released: self.address_waits.lock().waiter_count(),
         };
         self.cancel_waits();
-        let execution = self.execution.lock().unwrap().shutdown();
+        self.execution.request_stop();
+        // Native owners have retired; the kernel owns address-space finalization.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/kernel/k_process.cpp#L129-L185
         self.thread_local.lock().unwrap().closed = true;
         let memory = self.memory.close();
         self.handles.close_all();
         self.threads.release_running();
         self.state.lock().unwrap().num_running_threads = 0;
-        if let Err(fault) = execution {
-            return Err(ProcessTeardownFailure {
-                report: Box::new(report),
-                fault: Box::new(fault),
-            });
-        }
         memory.map_err(|error| ProcessTeardownFailure {
             report: Box::new(report.clone()),
             fault: Box::new(nixe_cpu::execution::CpuFault {
@@ -498,19 +487,11 @@ impl RunnableProcess {
         })?;
         Ok(report)
     }
-
-    pub(crate) fn request_vcpu_safepoint(&self, vcpu: nixe_scheduler::VirtualCpuId) {
-        self.execution.lock().unwrap().request_vcpu_safepoint(vcpu);
-    }
-
-    pub(crate) fn request_execution_safepoint(&self) {
-        self.execution.lock().unwrap().request_safepoint();
-    }
 }
 
 impl Drop for RunnableProcess {
     fn drop(&mut self) {
-        let _ = self.execution.get_mut().unwrap().request_stop();
+        self.execution.request_stop();
         self.thread_local.lock().unwrap().closed = true;
         let _ = self.memory.close();
         self.handles.close_all();

@@ -632,7 +632,7 @@ impl MaxwellGpuMemory {
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<(), MaxwellGpuAccessError> {
         let nixe_memory::AccessResult::Read(bytes) =
-            access(ranges, nixe_memory::AccessOperation::Read)
+            access(ranges, nixe_memory::AccessOperation::Read(Vec::new()))
                 .map_err(MaxwellGpuAccessError::Backing)?
         else {
             unreachable!("read returns bytes")
