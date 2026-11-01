@@ -65,6 +65,22 @@ impl Default for FrameMetrics {
 
 impl FrameMetrics {
     pub fn publish(&self, mut sample: FrameTiming) {
+        // Export the already completed measurements for frame-only captures.
+        // Detailed command/address probes remain independent of these samples.
+        crate::trace::event(
+            "frame_timing",
+            sample.frame,
+            sample.cpu.as_nanos() as u64,
+            sample.total.map_or(u64::MAX, |time| time.as_nanos() as u64),
+        );
+        crate::trace::event(
+            "frame_gpu_timing",
+            sample.frame,
+            sample.gpu.map_or(u64::MAX, |time| time.as_nanos() as u64),
+            sample
+                .clock_error
+                .map_or(u64::MAX, |time| time.as_nanos() as u64),
+        );
         let mut history = self.0.lock().unwrap();
         history.published += 1;
         sample.sequence = history.published;

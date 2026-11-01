@@ -1,4 +1,4 @@
-//! Atomic resource resolution for immutable `MAXWELL_B` state snapshots.
+//! Persistent resource selection for the live `MAXWELL_B` register bank.
 //!
 //! Maxwell GPU virtual addresses and PTE kinds are interpreted here, while
 //! canonical storage and neutral resource views retain their own identities.
@@ -12,7 +12,7 @@ pub(crate) use compute::ComputeTextures;
 use std::{
     cell::Cell,
     fmt::{Display, Formatter},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use nixe_gpu::{
@@ -26,6 +26,7 @@ use nixe_memory::MemoryPermissions;
 use crate::address_space::MaxwellGpuReadBatch;
 use crate::engines::MaxwellShaderBufferSize;
 use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
 
 use crate::{
     MaxwellAllocationId, MaxwellGpuAccessError, MaxwellGpuMemory, MaxwellMappingId,
@@ -95,6 +96,7 @@ pub enum MaxwellThreeDResourceRole {
     SampledImage {
         texture: MaxwellThreeDTextureReference,
         dimension: MaxwellThreeDTextureDimension,
+        with_sampler: bool,
     },
     Sampler(MaxwellThreeDTextureReference),
     ColorTarget(u8),
@@ -207,7 +209,6 @@ impl MaxwellThreeDMappingReference {
 /// Buffer interpretation published only after complete snapshot validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDResolvedBuffer {
-    role: MaxwellThreeDResourceRole,
     access: MaxwellThreeDResourceAccess,
     description: BufferDescription,
     allocation_description: GpuAllocationDescription,
@@ -217,10 +218,6 @@ pub struct MaxwellThreeDResolvedBuffer {
 }
 
 impl MaxwellThreeDResolvedBuffer {
-    #[must_use]
-    pub const fn role(&self) -> MaxwellThreeDResourceRole {
-        self.role
-    }
     #[must_use]
     pub const fn access(&self) -> MaxwellThreeDResourceAccess {
         self.access
@@ -368,7 +365,6 @@ impl MaxwellThreeDPreservedImageLayout {
 /// Image interpretation published only after complete snapshot validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDResolvedImage {
-    role: MaxwellThreeDResourceRole,
     access: MaxwellThreeDResourceAccess,
     description: ImageDescription,
     allocation_description: GpuAllocationDescription,
@@ -380,10 +376,6 @@ pub struct MaxwellThreeDResolvedImage {
 }
 
 impl MaxwellThreeDResolvedImage {
-    #[must_use]
-    pub const fn role(&self) -> MaxwellThreeDResourceRole {
-        self.role
-    }
     #[must_use]
     pub const fn access(&self) -> MaxwellThreeDResourceAccess {
         self.access
@@ -422,87 +414,79 @@ impl MaxwellThreeDResolvedImage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaxwellThreeDResolvedResource {
-    Buffer(MaxwellThreeDResolvedBuffer),
-    Image(MaxwellThreeDResolvedImage),
+    Buffer {
+        role: MaxwellThreeDResourceRole,
+        view: Arc<MaxwellThreeDResolvedBuffer>,
+    },
+    Image {
+        role: MaxwellThreeDResourceRole,
+        view: Arc<MaxwellThreeDResolvedImage>,
+    },
 }
-
 impl MaxwellThreeDResolvedResource {
-    #[must_use]
     pub const fn role(&self) -> MaxwellThreeDResourceRole {
         match self {
-            Self::Buffer(value) => value.role,
-            Self::Image(value) => value.role,
+            Self::Buffer { role, .. } | Self::Image { role, .. } => *role,
         }
     }
-
     fn source(&self) -> &MaxwellResolvedRange {
         match self {
-            Self::Buffer(value) => &value.source,
-            Self::Image(value) => &value.source,
+            Self::Buffer { view, .. } => &view.source,
+            Self::Image { view, .. } => &view.source,
+        }
+    }
+    fn same_view(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Buffer { role: a, view: x }, Self::Buffer { role: b, view: y }) => {
+                a == b && Arc::ptr_eq(x, y)
+            }
+            (Self::Image { role: a, view: x }, Self::Image { role: b, view: y }) => {
+                a == b && Arc::ptr_eq(x, y)
+            }
+            _ => false,
         }
     }
 }
 
-/// Immutable consumed groups; unchanged groups share their resource records.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Current channel binding slots. Draws retain their actual native inputs;
+/// revision counters suffice to recognize an unchanged selection.
+#[derive(Clone, Debug, Default)]
 pub struct MaxwellThreeDResolvedResources {
-    resources: [Option<Arc<[Arc<MaxwellThreeDResolvedResource>]>>; 4],
-    samplers: Option<Arc<[MaxwellThreeDResolvedSampler]>>,
+    resources: [Vec<MaxwellThreeDResolvedResource>; 4],
+    samplers: Vec<MaxwellThreeDResolvedSampler>,
+    revisions: [u64; 4],
 }
+impl PartialEq for MaxwellThreeDResolvedResources {
+    fn eq(&self, other: &Self) -> bool {
+        self.resources == other.resources && self.samplers == other.samplers
+    }
+}
+impl Eq for MaxwellThreeDResolvedResources {}
 impl MaxwellThreeDResolvedResources {
     pub fn resources(&self) -> impl Iterator<Item = &MaxwellThreeDResolvedResource> {
-        self.resources
-            .iter()
-            .flatten()
-            .flat_map(|group| group.iter().map(Arc::as_ref))
+        self.resources.iter().flat_map(|g| g.iter())
     }
     pub fn resource(
         &self,
         role: MaxwellThreeDResourceRole,
     ) -> Option<&MaxwellThreeDResolvedResource> {
-        self.resource_arc(role).map(Arc::as_ref)
-    }
-    fn resource_arc(
-        &self,
-        role: MaxwellThreeDResourceRole,
-    ) -> Option<&Arc<MaxwellThreeDResolvedResource>> {
-        let group = self.resources[role.binding_group()].as_ref()?;
-        let index = group.binary_search_by_key(&role, |r| r.role()).ok()?;
-        Some(&group[index])
+        let group = &self.resources[role.binding_group()];
+        group
+            .binary_search_by_key(&role, |r| r.role())
+            .ok()
+            .map(|i| &group[i])
     }
     pub fn sampler(
         &self,
         role: MaxwellThreeDResourceRole,
     ) -> Option<&MaxwellThreeDResolvedSampler> {
-        let samplers = self.samplers.as_ref()?;
-        let index = samplers
-            .binary_search_by_key(&role, |sampler| sampler.role())
-            .ok()?;
-        Some(&samplers[index])
+        self.samplers
+            .binary_search_by_key(&role, |s| s.role())
+            .ok()
+            .map(|i| &self.samplers[i])
     }
-    pub(crate) fn same_resource(&self, other: &Self, role: MaxwellThreeDResourceRole) -> bool {
-        match (self.resource_arc(role), other.resource_arc(role)) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            (None, None) => true,
-            _ => false,
-        }
-    }
-    pub(crate) fn same_group(&self, other: &Self, group: usize) -> bool {
-        let resources = match (&self.resources[group], &other.resources[group]) {
-            (None, None) => true,
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        };
-        resources
-            && (group != 2
-                || match (&self.samplers, &other.samplers) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                    _ => false,
-                })
-    }
-    pub(crate) fn same_bindings(&self, other: &Self) -> bool {
-        (0..4).all(|group| self.same_group(other, group))
+    pub(crate) fn revisions(&self) -> [u64; 4] {
+        self.revisions
     }
     pub fn validate_mappings(
         &self,
@@ -522,6 +506,8 @@ impl MaxwellThreeDResolvedResources {
     }
 }
 
+type DescriptorReads = SmallVec<[MaxwellThreeDDescriptorRead; 4]>;
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_binding(
     state: &MaxwellThreeDState,
@@ -531,7 +517,7 @@ fn resolve_binding(
     storage_alignment: u64,
     retained_backings: &mut MaxwellThreeDRetainedBackingCache,
     access: &mut nixe_gpu::MemoryAccess<'_>,
-    sampled: bool,
+    captured: DescriptorReads,
 ) -> Result<RetainedBinding, MaxwellThreeDResourceError> {
     use MaxwellThreeDResourceRole as R;
     let sample_mode = state
@@ -543,6 +529,7 @@ fn resolve_binding(
             _ => None,
         });
     let mut builder = ResourceBuilder::new(address_space, sample_mode, retained_backings, access);
+    builder.captured = captured;
     let bindings = state.shader_bindings();
     let texture_cbuf = |texture: MaxwellThreeDTextureReference, slot: u8| {
         bindings.groups()[usize::from(texture.group)].constant_buffers()[usize::from(slot)]
@@ -602,8 +589,12 @@ fn resolve_binding(
                     .checked_add(count)
                     .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
                 let size = u64::from(end) * element_size;
+                // Eden bounds indexed fetches by the demanded draw size and the
+                // unsigned 32-bit address span. A zero reset limit may wrap past
+                // the start; absence of a write is not separate register state.
+                // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
                 if let Some(limit) = limit
-                    && size > inclusive_size(address, limit, role)?
+                    && size > u64::from(limit.get().wrapping_sub(address.get()) as u32)
                 {
                     return Err(MaxwellThreeDResourceError::ContradictoryState { role });
                 }
@@ -637,7 +628,11 @@ fn resolve_binding(
                 storage_alignment,
             )?;
         }
-        R::SampledImage { texture, dimension } => {
+        R::SampledImage {
+            texture,
+            dimension,
+            with_sampler,
+        } => {
             let handle = builder.texture_handle(
                 texture,
                 texture_cbuf(texture, texture.constant_buffer_slot),
@@ -651,13 +646,16 @@ fn resolve_binding(
                 bindings.texture_headers().maximum_index().value().copied(),
             )?;
             builder.sampled_texture(
-                bindings.maxwell_texture_headers().value().copied(),
                 bindings.sampler_binding().value().copied(),
                 texture,
                 handle,
                 dimension,
-                sampled,
+                with_sampler,
             )?;
+            if with_sampler {
+                builder.sampler_pool(&bindings)?;
+                builder.sampler(bindings.sampler_binding().value().copied(), texture, handle)?;
+            }
         }
         R::Sampler(texture) => {
             let handle = builder.texture_handle(
@@ -687,31 +685,40 @@ fn resolve_binding(
     let resource = builder
         .resources
         .into_iter()
-        .find(|resolved| resolved.role() == role)
-        .map(Arc::new);
+        .find(|resolved| resolved.role() == role);
     Ok(RetainedBinding {
         address_space: address_space.id(),
         state: state.resource_state_identity(role),
         size,
-        sampled,
         resource,
-        sampler: builder
-            .samplers
-            .into_iter()
-            .find(|sampler| sampler.role() == role),
-        descriptor_reads: builder.descriptor_reads.into_boxed_slice(),
-        mapping_generation: address_space.mapping_generation().get(),
+        sampler: builder.samplers.into_iter().find(|sampler| {
+            sampler.role()
+                == match role {
+                    R::SampledImage {
+                        texture,
+                        with_sampler: true,
+                        ..
+                    } => R::Sampler(texture),
+                    _ => role,
+                }
+        }),
+        descriptor_reads: builder.descriptor_reads,
+        mapping_generation: builder.mapping_generation,
     })
 }
 
 struct ResourceBuilder<'a, 'm> {
+    // Capture before translation; a later mapping revision cannot validate an
+    // interpretation which was already consumed under the earlier mappings.
+    mapping_generation: u64,
     address_space: &'a MaxwellGpuMemory,
     access: &'a mut nixe_gpu::MemoryAccess<'m>,
     retained_backings: &'a mut MaxwellThreeDRetainedBackingCache,
     sample_mode: Option<MaxwellThreeDSampleMode>,
-    resources: Vec<MaxwellThreeDResolvedResource>,
-    samplers: Vec<MaxwellThreeDResolvedSampler>,
-    descriptor_reads: Vec<MaxwellThreeDDescriptorRead>,
+    resources: SmallVec<[MaxwellThreeDResolvedResource; 2]>,
+    samplers: SmallVec<[MaxwellThreeDResolvedSampler; 1]>,
+    descriptor_reads: DescriptorReads,
+    captured: DescriptorReads,
     compute: bool,
 }
 
@@ -726,6 +733,23 @@ struct DescriptorTableEntry {
     bytes: [u8; 32],
     version: u64,
     read_epoch: u64,
+    resolved: Option<Box<ResolvedDescriptor>>,
+}
+
+#[derive(Debug)]
+enum ResolvedDescriptor {
+    Images {
+        space: crate::MaxwellAddressSpaceId,
+        generation: u64,
+        views: [Option<CachedImage>; 5],
+    },
+    Sampler(MaxwellThreeDResolvedSampler),
+}
+
+#[derive(Debug)]
+struct CachedImage {
+    view: Weak<MaxwellThreeDResolvedImage>,
+    slot: usize,
 }
 
 #[derive(Debug, Default)]
@@ -751,6 +775,74 @@ impl DescriptorTable {
             .epoch
             .checked_add(1)
             .expect("descriptor epoch exhausted");
+    }
+
+    // VisitImageView keeps an index result alongside the shared descriptor cache.
+    // Only changed descriptor contents or mappings need the semantic lookup again.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
+    fn image(
+        &self,
+        index: u32,
+        dimension: MaxwellThreeDTextureDimension,
+        space: &MaxwellGpuMemory,
+    ) -> Option<(Arc<MaxwellThreeDResolvedImage>, usize)> {
+        let ResolvedDescriptor::Images {
+            space: cached,
+            generation,
+            views,
+        } = self.entries[index as usize].as_ref()?.resolved.as_deref()?
+        else {
+            return None;
+        };
+        if *cached != space.id() || *generation != space.mapping_generation().get() {
+            return None;
+        }
+        let cached = views[dimension as usize].as_ref()?;
+        Some((cached.view.upgrade()?, cached.slot))
+    }
+
+    fn remember_image(
+        &mut self,
+        index: u32,
+        dimension: MaxwellThreeDTextureDimension,
+        space: &MaxwellGpuMemory,
+        image: &Arc<MaxwellThreeDResolvedImage>,
+        slot: usize,
+        generation: u64,
+    ) {
+        let entry = self.entries[index as usize].as_mut().expect("consumed TIC");
+        if !matches!(entry.resolved.as_deref(), Some(ResolvedDescriptor::Images { space: cached, generation: previous, .. }) if *cached == space.id() && *previous == generation)
+        {
+            entry.resolved = Some(Box::new(ResolvedDescriptor::Images {
+                space: space.id(),
+                generation,
+                views: Default::default(),
+            }));
+        }
+        let ResolvedDescriptor::Images { views, .. } = entry.resolved.as_deref_mut().unwrap()
+        else {
+            unreachable!()
+        };
+        // Index references must not retain physical pages after semantic-cache
+        // eviction. The slot only promotes that cache while it still names this view.
+        views[dimension as usize] = Some(CachedImage {
+            view: Arc::downgrade(image),
+            slot,
+        });
+    }
+
+    fn sampler(&self, index: u32) -> Option<MaxwellThreeDResolvedSampler> {
+        match self.entries[index as usize].as_ref()?.resolved.as_deref()? {
+            ResolvedDescriptor::Sampler(sampler) => Some(*sampler),
+            _ => None,
+        }
+    }
+
+    fn remember_sampler(&mut self, index: u32, sampler: MaxwellThreeDResolvedSampler) {
+        self.entries[index as usize]
+            .as_mut()
+            .expect("consumed TSC")
+            .resolved = Some(Box::new(ResolvedDescriptor::Sampler(sampler)));
     }
 
     fn read(
@@ -795,6 +887,7 @@ impl DescriptorTable {
                     bytes,
                     version: self.next_version,
                     read_epoch: self.epoch,
+                    resolved: None,
                 });
             } else {
                 entry.as_mut().unwrap().read_epoch = self.epoch;
@@ -812,7 +905,6 @@ enum MaxwellThreeDDescriptorRead {
         address: GpuVirtualAddress,
         size: u8,
         bytes: [u8; 32],
-        pointer_source: Option<MaxwellResolvedRange>,
     },
     Table {
         role: MaxwellThreeDResourceRole,
@@ -823,7 +915,7 @@ enum MaxwellThreeDDescriptorRead {
 }
 impl MaxwellThreeDDescriptorRead {
     fn refresh(
-        &self,
+        &mut self,
         space: &MaxwellGpuMemory,
         access: &mut nixe_gpu::MemoryAccess<'_>,
         tables: &mut [DescriptorTable; 2],
@@ -844,7 +936,9 @@ impl MaxwellThreeDDescriptorRead {
                         role: *role,
                         error,
                     })?;
-                Ok(current == *bytes)
+                let same = current == *bytes;
+                *bytes = current;
+                Ok(same)
             }
             Self::Table {
                 role,
@@ -865,24 +959,28 @@ struct RetainedBinding {
     address_space: crate::MaxwellAddressSpaceId,
     state: MaxwellThreeDResourceStateIdentity,
     size: Option<MaxwellShaderBufferSize>,
-    sampled: bool,
-    resource: Option<Arc<MaxwellThreeDResolvedResource>>,
+    resource: Option<MaxwellThreeDResolvedResource>,
     sampler: Option<MaxwellThreeDResolvedSampler>,
-    descriptor_reads: Box<[MaxwellThreeDDescriptorRead]>,
+    descriptor_reads: DescriptorReads,
     mapping_generation: u64,
 }
 
 #[derive(Debug)]
+struct BindingSlot {
+    role: MaxwellThreeDResourceRole,
+    size: Option<MaxwellShaderBufferSize>,
+    binding: Option<RetainedBinding>,
+    resource_index: Option<usize>,
+    sampler_index: Option<usize>,
+}
+#[derive(Debug, Default)]
 struct RetainedBindingGroup {
-    roles: Box<[MaxwellThreeDResourceRole]>,
-    sizes: Box<[(MaxwellThreeDResourceRole, MaxwellShaderBufferSize)]>,
-    bindings: Vec<RetainedBinding>,
-    state: MaxwellThreeDResourceGroupIdentity,
-    address_space: crate::MaxwellAddressSpaceId,
+    bindings: Vec<BindingSlot>,
+    state: Option<MaxwellThreeDResourceGroupIdentity>,
+    address_space: Option<crate::MaxwellAddressSpaceId>,
     mapping_generation: u64,
     has_descriptor_reads: bool,
-    resources: Option<Arc<[Arc<MaxwellThreeDResolvedResource>]>>,
-    samplers: Option<Arc<[MaxwellThreeDResolvedSampler]>>,
+    selection_dirty: bool,
 }
 
 impl MaxwellThreeDResourceRole {
@@ -929,7 +1027,7 @@ pub(crate) struct MaxwellThreeDResolvedResourceCache {
     storage_alignment: u64,
     blits: HashMap<ColorBlitKey, ColorBlitCacheEntry>,
     solid_images: HashMap<SolidImageKey, ColorBlitCacheEntry>,
-    groups: [Option<RetainedBindingGroup>; 4],
+    groups: [RetainedBindingGroup; 4],
     selected: MaxwellThreeDResolvedResources,
     retained_backings: MaxwellThreeDRetainedBackingCache,
     next_use: Cell<u64>,
@@ -1067,6 +1165,7 @@ impl MaxwellThreeDResolvedResourceCache {
                 _ => None,
             },
         )?;
+        let mapping_generation = builder.mapping_generation;
         let resources = Arc::new(builder.finish()?.0);
         if self.solid_images.len() >= limit && !self.solid_images.contains_key(&key) {
             let oldest = *self
@@ -1081,7 +1180,7 @@ impl MaxwellThreeDResolvedResourceCache {
             key,
             ColorBlitCacheEntry {
                 resources: Arc::clone(&resources),
-                mapping_generation: Cell::new(address_space.mapping_generation().get()),
+                mapping_generation: Cell::new(mapping_generation),
                 last_used: Cell::new(self.take_use()),
             },
         );
@@ -1218,6 +1317,7 @@ impl MaxwellThreeDResolvedResourceCache {
                 },
             )?;
         }
+        let mapping_generation = builder.mapping_generation;
         let resources = Arc::new(builder.finish()?.0);
         if self.blits.len() >= limit && !self.blits.contains_key(&key) {
             let oldest = *self
@@ -1232,232 +1332,222 @@ impl MaxwellThreeDResolvedResourceCache {
             key,
             ColorBlitCacheEntry {
                 resources: Arc::clone(&resources),
-                mapping_generation: Cell::new(address_space.mapping_generation().get()),
+                mapping_generation: Cell::new(mapping_generation),
                 last_used: Cell::new(self.take_use()),
             },
         );
         Ok(resources)
     }
+    /// Change the channel's active slots only when a program or fetch/target
+    /// selection changes. Draw consumption visits the existing slots directly.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
+    pub(crate) fn select(
+        &mut self,
+        roles: &[MaxwellThreeDResourceRole],
+        sizes: &[(MaxwellThreeDResourceRole, MaxwellShaderBufferSize)],
+    ) -> &mut Self {
+        debug_assert!(roles.is_sorted());
+        debug_assert!(sizes.is_sorted_by_key(|(role, _)| *role));
+        let mut remaining = roles;
+        for group in 0..4 {
+            let end = remaining.partition_point(|role| role.binding_group() == group);
+            let (roles, rest) = remaining.split_at(end);
+            remaining = rest;
+            let slots = &mut self.groups[group];
+            let size = |role| {
+                sizes
+                    .binary_search_by_key(&role, |(role, _)| *role)
+                    .ok()
+                    .map(|index| sizes[index].1)
+            };
+            if slots.bindings.len() == roles.len()
+                && slots
+                    .bindings
+                    .iter()
+                    .zip(roles)
+                    .all(|(slot, &role)| slot.role == role && slot.size == size(role))
+            {
+                continue;
+            }
+            let mut old = std::mem::take(&mut slots.bindings).into_iter().peekable();
+            slots.bindings = Vec::with_capacity(roles.len());
+            for &role in roles {
+                while old.peek().is_some_and(|slot| slot.role < role) {
+                    old.next();
+                }
+                let mut slot = if old.peek().is_some_and(|slot| slot.role == role) {
+                    old.next().unwrap()
+                } else {
+                    BindingSlot {
+                        role,
+                        size: None,
+                        binding: None,
+                        resource_index: None,
+                        sampler_index: None,
+                    }
+                };
+                slot.size = size(role);
+                slots.bindings.push(slot);
+            }
+            slots.selection_dirty = true;
+        }
+        self
+    }
+
     pub(crate) fn resolve(
         &mut self,
         state: &MaxwellThreeDState,
         address_space: &MaxwellGpuMemory,
-        required_roles: &[MaxwellThreeDResourceRole],
         limit: usize,
         access: &mut nixe_gpu::MemoryAccess<'_>,
     ) -> Result<&MaxwellThreeDResolvedResources, MaxwellThreeDResourceError> {
-        self.resolve_with_buffer_sizes(state, address_space, required_roles, &[], limit, access)
-    }
-    pub(crate) fn resolve_with_buffer_sizes(
-        &mut self,
-        state: &MaxwellThreeDState,
-        address_space: &MaxwellGpuMemory,
-        required_roles: &[MaxwellThreeDResourceRole],
-        buffer_sizes: &[(MaxwellThreeDResourceRole, MaxwellShaderBufferSize)],
-        limit: usize,
-        access: &mut nixe_gpu::MemoryAccess<'_>,
-    ) -> Result<&MaxwellThreeDResolvedResources, MaxwellThreeDResourceError> {
-        debug_assert!(required_roles.is_sorted());
-        debug_assert!(buffer_sizes.is_sorted_by_key(|(role, _)| *role));
         let mut batch = address_space.read_batch();
         self.retained_backings.set_view_limit(limit);
         for table in &mut self.retained_backings.descriptor_tables {
             table.next_epoch();
         }
-        let mut remaining = required_roles;
+        let generation = address_space.mapping_generation().get();
         for group in 0..4 {
-            let end = remaining.partition_point(|role| role.binding_group() == group);
-            let (selected_roles, rest) = remaining.split_at(end);
-            remaining = rest;
-            if selected_roles.is_empty() {
-                self.selected.resources[group] = None;
-                if group == 2 {
-                    self.selected.samplers = None;
-                }
+            let slots = &mut self.groups[group];
+            let same_state = slots.address_space == Some(address_space.id())
+                && slots.mapping_generation == generation
+                && slots
+                    .state
+                    .as_ref()
+                    .is_some_and(|identity| identity.matches(state, group));
+            if !slots.selection_dirty && same_state && !slots.has_descriptor_reads {
                 continue;
             }
-            let size_start = buffer_sizes.partition_point(|(role, _)| role.binding_group() < group);
-            let size_end = buffer_sizes.partition_point(|(role, _)| role.binding_group() <= group);
-            let selected_sizes = &buffer_sizes[size_start..size_end];
-            let generation = address_space.mapping_generation().get();
-            if let Some(retained) = &mut self.groups[group]
-                && retained.address_space == address_space.id()
-                && retained.roles.as_ref() == selected_roles
-                && retained.sizes.as_ref() == selected_sizes
-            {
-                let mut current = true;
-                if retained.mapping_generation != generation
-                    || !retained.state.matches(state, group)
+            let mut changed = slots.selection_dirty;
+            let mut rebuild = slots.selection_dirty;
+            let mut has_descriptor_reads = false;
+            for slot in &mut slots.bindings {
+                if !slots.selection_dirty
+                    && same_state
+                    && slot.binding.as_ref().is_some_and(|entry| {
+                        entry.size == slot.size && entry.descriptor_reads.is_empty()
+                    })
                 {
-                    for entry in &mut retained.bindings {
-                        if !entry.state.matches(state)
-                            || !Self::binding_memory_is_current(
-                                entry,
-                                address_space,
-                                access,
-                                &mut self.retained_backings.descriptor_tables,
-                                &mut batch,
-                            )?
-                        {
-                            current = false;
-                            break;
-                        }
-                    }
-                } else if retained.has_descriptor_reads {
-                    for entry in &retained.bindings {
-                        for read in &entry.descriptor_reads {
-                            if !read.refresh(
-                                address_space,
-                                access,
-                                &mut self.retained_backings.descriptor_tables,
-                                &mut batch,
-                            )? {
-                                current = false;
-                                break;
-                            }
-                        }
-                        if !current {
-                            break;
-                        }
-                    }
-                }
-                if current {
-                    retained.state = state.resource_group_identity(group);
-                    retained.mapping_generation = generation;
-                    if self.selected.resources[group]
-                        .as_ref()
-                        .zip(retained.resources.as_ref())
-                        .is_none_or(|(a, b)| !Arc::ptr_eq(a, b))
-                    {
-                        self.selected.resources[group] = retained.resources.clone();
-                    }
-                    if group == 2
-                        && self
-                            .selected
-                            .samplers
-                            .as_ref()
-                            .zip(retained.samplers.as_ref())
-                            .is_none_or(|(a, b)| !Arc::ptr_eq(a, b))
-                    {
-                        self.selected.samplers = retained.samplers.clone();
-                    }
                     continue;
                 }
-            }
-            // Current binding slots are owned by this channel and indexed in
-            // selected-role order. A changed group reuses only matching slots;
-            // native backing views have their own bounded cache below.
-            let mut prior = self.groups[group].take();
-            let mut changed = prior.as_ref().is_none_or(|old| {
-                old.roles.as_ref() != selected_roles || old.sizes.as_ref() != selected_sizes
-            });
-            let mut previous = prior.as_mut().map(|old| {
-                let roles = std::mem::take(&mut old.roles);
-                let bindings = std::mem::take(&mut old.bindings);
-                roles.into_vec().into_iter().zip(bindings).peekable()
-            });
-            let mut bindings = Vec::with_capacity(selected_roles.len());
-            let mut has_descriptor_reads = false;
-            for &role in selected_roles {
-                let size = buffer_sizes
-                    .binary_search_by_key(&role, |(r, _)| *r)
-                    .ok()
-                    .map(|index| buffer_sizes[index].1);
-                let sampled = matches!(role, MaxwellThreeDResourceRole::SampledImage { texture, .. } if required_roles.binary_search(&MaxwellThreeDResourceRole::Sampler(texture)).is_ok());
-                let old = if let Some(previous) = &mut previous {
-                    while previous
-                        .peek()
-                        .is_some_and(|(old_role, _)| *old_role < role)
-                    {
-                        previous.next();
-                    }
-                    if previous
-                        .peek()
-                        .is_some_and(|(old_role, _)| *old_role == role)
-                    {
-                        Some(previous.next().unwrap().1)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let entry = if let Some(mut entry) = old
-                    && entry.address_space == address_space.id()
-                    && entry.size == size
-                    && entry.sampled == sampled
-                    && entry.state.matches(state)
-                    && Self::binding_memory_is_current(
-                        &mut entry,
-                        address_space,
-                        access,
-                        &mut self.retained_backings.descriptor_tables,
-                        &mut batch,
-                    )? {
-                    entry
-                } else {
-                    changed = true;
-                    batch.release();
-                    resolve_binding(
-                        state,
-                        address_space,
-                        role,
-                        size,
-                        self.storage_alignment,
-                        &mut self.retained_backings,
-                        access,
-                        sampled,
-                    )?
-                };
+                let (updated, different) = Self::update_binding(
+                    slot.binding.as_mut(),
+                    state,
+                    address_space,
+                    slot.role,
+                    slot.size,
+                    self.storage_alignment,
+                    &mut self.retained_backings,
+                    access,
+                    &mut batch,
+                )?;
+                if let Some(updated) = updated {
+                    slot.binding = Some(updated);
+                }
+                let entry = slot.binding.as_ref().expect("selected slot is resolved");
                 has_descriptor_reads |= !entry.descriptor_reads.is_empty();
-                bindings.push(entry);
+                changed |= different;
+                if different {
+                    rebuild |= slot.resource_index.is_some() != entry.resource.is_some()
+                        || slot.sampler_index.is_some() != entry.sampler.is_some();
+                    if !rebuild {
+                        if let Some(index) = slot.resource_index {
+                            self.selected.resources[group][index] =
+                                entry.resource.as_ref().unwrap().clone();
+                        }
+                        if let Some(index) = slot.sampler_index {
+                            self.selected.samplers[index] = entry.sampler.unwrap();
+                        }
+                    }
+                }
             }
-            let (resources, samplers) = if changed {
-                let resources: Vec<_> = bindings
-                    .iter()
-                    .filter_map(|entry| entry.resource.as_ref().map(Arc::clone))
-                    .collect();
-                let samplers: Vec<_> = bindings.iter().filter_map(|entry| entry.sampler).collect();
-                (
-                    (!resources.is_empty()).then(|| resources.into()),
-                    (!samplers.is_empty()).then(|| samplers.into()),
-                )
-            } else {
-                let old = prior.as_mut().unwrap();
-                (old.resources.take(), old.samplers.take())
-            };
-            self.groups[group] = Some(RetainedBindingGroup {
-                roles: selected_roles.into(),
-                sizes: selected_sizes.into(),
-                bindings,
-                state: state.resource_group_identity(group),
-                address_space: address_space.id(),
-                mapping_generation: generation,
-                has_descriptor_reads,
-                resources,
-                samplers,
-            });
-            let retained = self.groups[group].as_ref().unwrap();
-            if self.selected.resources[group]
-                .as_ref()
-                .zip(retained.resources.as_ref())
-                .is_none_or(|(a, b)| !Arc::ptr_eq(a, b))
-            {
-                self.selected.resources[group] = retained.resources.clone();
+            slots.state = Some(state.resource_group_identity(group));
+            slots.address_space = Some(address_space.id());
+            slots.mapping_generation = generation;
+            slots.has_descriptor_reads = has_descriptor_reads;
+            if rebuild {
+                let selected = &mut self.selected.resources[group];
+                selected.clear();
+                if group == 2 {
+                    self.selected.samplers.clear();
+                }
+                for slot in &mut slots.bindings {
+                    let entry = slot.binding.as_ref().expect("selected slot is resolved");
+                    slot.resource_index = entry.resource.as_ref().map(|resource| {
+                        let index = selected.len();
+                        selected.push(resource.clone());
+                        index
+                    });
+                    slot.sampler_index = entry.sampler.map(|sampler| {
+                        let index = self.selected.samplers.len();
+                        self.selected.samplers.push(sampler);
+                        index
+                    });
+                }
             }
-            if group == 2
-                && self
-                    .selected
-                    .samplers
-                    .as_ref()
-                    .zip(retained.samplers.as_ref())
-                    .is_none_or(|(a, b)| !Arc::ptr_eq(a, b))
-            {
-                self.selected.samplers = retained.samplers.clone();
+            slots.selection_dirty = false;
+            if changed {
+                self.selected.revisions[group] = self.selected.revisions[group]
+                    .checked_add(1)
+                    .expect("binding revision exhausted");
             }
         }
         Ok(&self.selected)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_binding(
+        previous: Option<&mut RetainedBinding>,
+        state: &MaxwellThreeDState,
+        address_space: &MaxwellGpuMemory,
+        role: MaxwellThreeDResourceRole,
+        size: Option<MaxwellShaderBufferSize>,
+        alignment: u64,
+        backings: &mut MaxwellThreeDRetainedBackingCache,
+        access: &mut nixe_gpu::MemoryAccess<'_>,
+        batch: &mut MaxwellGpuReadBatch<'_>,
+    ) -> Result<(Option<RetainedBinding>, bool), MaxwellThreeDResourceError> {
+        let mut previous = previous;
+        let mut captured = DescriptorReads::new();
+        if let Some(entry) = &mut previous
+            && entry.address_space == address_space.id()
+            && entry.size == size
+            && entry.state.matches(state)
+        {
+            if Self::binding_memory_is_current(
+                entry,
+                address_space,
+                access,
+                &mut backings.descriptor_tables,
+                batch,
+            )? {
+                return Ok((None, false));
+            }
+            // These are the bytes consumed for this draw, not a cross-draw cache.
+            captured = std::mem::take(&mut entry.descriptor_reads);
+        }
+        batch.release();
+        let resolved = resolve_binding(
+            state,
+            address_space,
+            role,
+            size,
+            alignment,
+            backings,
+            access,
+            captured,
+        )?;
+        let changed = previous.as_ref().is_none_or(|old| {
+            old.sampler != resolved.sampler
+                || match (&old.resource, &resolved.resource) {
+                    (Some(a), Some(b)) => !a.same_view(b),
+                    (None, None) => false,
+                    _ => true,
+                }
+        });
+        Ok((Some(resolved), changed))
+    }
+
     fn binding_memory_is_current(
         entry: &mut RetainedBinding,
         address_space: &MaxwellGpuMemory,
@@ -1476,24 +1566,17 @@ impl MaxwellThreeDResolvedResourceCache {
                         !address_space.retained_mapping_is_current(segment.mapping())
                     })
                 })
-                || entry.descriptor_reads.iter().any(|read| {
-                    let MaxwellThreeDDescriptorRead::Direct { pointer_source, .. } = read else {
-                        return false;
-                    };
-                    pointer_source.as_ref().is_some_and(|source| {
-                        source
-                            .segments()
-                            .iter()
-                            .any(|s| !address_space.retained_mapping_is_current(s.mapping()))
-                    })
-                })
             {
+                entry.descriptor_reads.clear();
                 return Ok(false);
             }
             entry.mapping_generation = generation;
         }
-        for read in &entry.descriptor_reads {
-            if !read.refresh(address_space, access, tables, batch)? {
+        for index in 0..entry.descriptor_reads.len() {
+            if !entry.descriptor_reads[index].refresh(address_space, access, tables, batch)? {
+                // Only this prefix has been consumed. Reconstruction must read
+                // the remaining handle inputs, not use their previous bytes.
+                entry.descriptor_reads.truncate(index + 1);
                 return Ok(false);
             }
         }
@@ -1543,7 +1626,10 @@ enum ResolvedViewDefinition {
         address: MaxwellThreeDUnresolvedAddress,
         size: u64,
     },
-    Sampled([u8; 32]),
+    Sampled {
+        bytes: [u8; 32],
+        dimension: MaxwellThreeDTextureDimension,
+    },
     Attachment {
         address: MaxwellThreeDUnresolvedAddress,
         description: ImageDescription,
@@ -1560,14 +1646,40 @@ enum ResolvedViewDefinition {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ResolvedViewKey {
     address_space: crate::MaxwellAddressSpaceId,
-    role: MaxwellThreeDResourceRole,
+    permissions: u8,
     definition: ResolvedViewDefinition,
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedView {
+    Buffer(Arc<MaxwellThreeDResolvedBuffer>),
+    Image(Arc<MaxwellThreeDResolvedImage>),
+}
+impl ResolvedView {
+    fn bind(&self, role: MaxwellThreeDResourceRole) -> MaxwellThreeDResolvedResource {
+        match self {
+            Self::Buffer(view) => MaxwellThreeDResolvedResource::Buffer {
+                role,
+                view: Arc::clone(view),
+            },
+            Self::Image(view) => MaxwellThreeDResolvedResource::Image {
+                role,
+                view: Arc::clone(view),
+            },
+        }
+    }
+    fn source(&self) -> &MaxwellResolvedRange {
+        match self {
+            Self::Buffer(b) => &b.source,
+            Self::Image(i) => &i.source,
+        }
+    }
 }
 
 #[derive(Debug)]
 struct CachedResolvedView {
     key: ResolvedViewKey,
-    resource: MaxwellThreeDResolvedResource,
+    view: ResolvedView,
     mapping_generation: u64,
     referenced: bool,
 }
@@ -1646,7 +1758,7 @@ impl MaxwellThreeDRetainedBackingCache {
         &mut self,
         key: &ResolvedViewKey,
         address_space: &MaxwellGpuMemory,
-    ) -> Option<MaxwellThreeDResolvedResource> {
+    ) -> Option<ResolvedView> {
         let entry = &mut self.view_entries[*self.views.get(key)?];
         // Buffer interpretation is independent of its contents. Descriptor
         // readers and backend uploads observe the live canonical bytes; do not
@@ -1654,7 +1766,7 @@ impl MaxwellThreeDRetainedBackingCache {
         let generation = address_space.mapping_generation().get();
         if entry.mapping_generation != generation {
             if entry
-                .resource
+                .view
                 .source()
                 .segments()
                 .iter()
@@ -1665,7 +1777,7 @@ impl MaxwellThreeDRetainedBackingCache {
             entry.mapping_generation = generation;
         }
         entry.referenced = true;
-        Some(entry.resource.clone())
+        Some(entry.view.clone())
     }
 
     fn set_view_limit(&mut self, limit: usize) {
@@ -1690,15 +1802,18 @@ impl MaxwellThreeDRetainedBackingCache {
         &mut self,
         key: ResolvedViewKey,
         resource: MaxwellThreeDResolvedResource,
-        address_space: &MaxwellGpuMemory,
+        mapping_generation: u64,
     ) {
         if self.view_limit == 0 {
             return;
         }
         let entry = CachedResolvedView {
             key,
-            resource,
-            mapping_generation: address_space.mapping_generation().get(),
+            view: match resource {
+                MaxwellThreeDResolvedResource::Buffer { view, .. } => ResolvedView::Buffer(view),
+                MaxwellThreeDResolvedResource::Image { view, .. } => ResolvedView::Image(view),
+            },
+            mapping_generation,
             referenced: true,
         };
         if let Some(&index) = self.views.get(&key) {
@@ -1782,28 +1897,43 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         role: MaxwellThreeDResourceRole,
         address: GpuVirtualAddress,
         size: u8,
-        pointer_source: Option<MaxwellResolvedRange>,
     ) -> Result<[u8; 32], MaxwellThreeDResourceError> {
         let mut bytes = [0; 32];
-        self.address_space
-            .read_into(address, &mut bytes[..usize::from(size)], self.access)
-            .map_err(|error| MaxwellThreeDResourceError::Resolution { role, error })?;
+        let captured = self.captured.iter().find_map(|read| match read {
+            MaxwellThreeDDescriptorRead::Direct {
+                address: old,
+                size: count,
+                bytes,
+                ..
+            } if *old == address && *count == size => Some(*bytes),
+            _ => None,
+        });
+        if let Some(current) = captured {
+            bytes = current;
+        } else {
+            self.address_space
+                .read_into(address, &mut bytes[..usize::from(size)], self.access)
+                .map_err(|error| MaxwellThreeDResourceError::Resolution { role, error })?;
+        }
         self.descriptor_reads
             .push(MaxwellThreeDDescriptorRead::Direct {
                 role,
                 address,
                 size,
                 bytes,
-                pointer_source,
             });
         Ok(bytes)
     }
 
-    fn reuse_view(&mut self, key: &ResolvedViewKey) -> Result<bool, MaxwellThreeDResourceError> {
+    fn reuse_view(
+        &mut self,
+        key: &ResolvedViewKey,
+        role: MaxwellThreeDResourceRole,
+    ) -> Result<bool, MaxwellThreeDResourceError> {
         let Some(resource) = self.retained_backings.view(key, self.address_space) else {
             return Ok(false);
         };
-        self.resources.push(resource);
+        self.resources.push(resource.bind(role));
         Ok(true)
     }
 
@@ -1811,7 +1941,7 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         self.retained_backings.remember_view(
             key,
             self.resources.last().unwrap().clone(),
-            self.address_space,
+            self.mapping_generation,
         );
     }
 
@@ -1822,13 +1952,15 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         access: &'a mut nixe_gpu::MemoryAccess<'m>,
     ) -> Self {
         Self {
+            mapping_generation: address_space.mapping_generation().get(),
             address_space,
             access,
             retained_backings,
             sample_mode,
-            resources: Vec::new(),
-            samplers: Vec::new(),
-            descriptor_reads: Vec::new(),
+            resources: SmallVec::new(),
+            samplers: SmallVec::new(),
+            descriptor_reads: SmallVec::new(),
+            captured: SmallVec::new(),
             compute: false,
         }
     }
@@ -1921,10 +2053,10 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
     ) -> Result<(), MaxwellThreeDResourceError> {
         let key = ResolvedViewKey {
             address_space: self.address_space.id(),
-            role,
+            permissions: MemoryPermissions::READ.bits(),
             definition: ResolvedViewDefinition::Buffer { address, size },
         };
-        if self.reuse_view(&key)? {
+        if self.reuse_view(&key, role)? {
             return Ok(());
         }
         let source = self.resolve(address, size, MemoryPermissions::READ, role)?;
@@ -1935,17 +2067,17 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         let id = BufferId::new(resource_id(self.resources.len())?);
         let view = BufferView::new(id, description, 0, retained.backing)
             .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
-        self.resources.push(MaxwellThreeDResolvedResource::Buffer(
-            MaxwellThreeDResolvedBuffer {
-                role,
+        self.resources.push(MaxwellThreeDResolvedResource::Buffer {
+            role,
+            view: Arc::new(MaxwellThreeDResolvedBuffer {
                 access: MaxwellThreeDResourceAccess::Read,
                 description,
                 allocation_description,
                 view,
                 source,
                 mappings: retained.mappings,
-            },
-        ));
+            }),
+        });
         self.remember_last_view(key);
         Ok(())
     }
@@ -2001,18 +2133,13 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
                 address: pointer_address,
             });
         }
-        let source = self.resolve(
-            MaxwellThreeDUnresolvedAddress::new(
-                (pointer_address >> 32) as u8,
-                pointer_address as u32,
-            ),
-            descriptor_size,
-            MemoryPermissions::READ,
-            role,
-        )?;
-        let pointer_address = source.offset();
-        let bytes =
-            self.descriptor_read(role, pointer_address, descriptor_size as u8, Some(source))?;
+        let pointer_address = self.address_space.address(pointer_address).map_err(|_| {
+            MaxwellThreeDResourceError::AddressOutOfRange {
+                role,
+                address: pointer_address,
+            }
+        })?;
+        let bytes = self.descriptor_read(role, pointer_address, descriptor_size as u8)?;
         let target = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let target_size = match size {
             MaxwellShaderBufferSize::Proven(size) => size,
@@ -2148,23 +2275,15 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
 
     fn sampled_texture(
         &mut self,
-        maxwell_headers: Option<bool>,
         sampler_mode: Option<MaxwellThreeDSamplerBindingMode>,
         texture_reference: MaxwellThreeDTextureReference,
         raw_handle: u32,
         dimension: MaxwellThreeDTextureDimension,
         needs_sampler: bool,
     ) -> Result<(), MaxwellThreeDResourceError> {
-        // An unprogrammed selector retains the Maxwell class reset mode. Only
-        // an explicit false selects the legacy texture-header interpretation;
-        // the TIC decoder below independently requires a Maxwell v3 header.
-        // The public class definition confirms this is a one-bit selector:
-        // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L1210-L1213
-        if !uses_maxwell_texture_headers(maxwell_headers.as_ref()) {
-            return Err(MaxwellThreeDResourceError::UnsupportedTextureBindingMode {
-                descriptor: raw_handle,
-            });
-        }
+        // Decode the actual TIC header version, as the texture cache does. The
+        // legacy class selector must not reject a valid descriptor on its own.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/image_info.cpp
         // Maxwell resource handles use TIC in bits 0..20 and TSC in bits
         // 20..32 when the tables are independent. Via-header mode uses the
         // same raw index for both tables. Public corroborating definitions:
@@ -2184,7 +2303,65 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
             }
         };
         let tic = self.descriptor_bytes(MaxwellThreeDResourceRole::TextureHeaders, image_index)?;
-        self.sampled_image(texture_reference, dimension, image_index, tic)?;
+        let tables = if self.compute {
+            &mut self.retained_backings.compute_descriptor_tables
+        } else {
+            &mut self.retained_backings.descriptor_tables
+        };
+        if let Some((view, slot)) = tables[DescriptorTableKind::Image as usize].image(
+            image_index,
+            dimension,
+            self.address_space,
+        ) {
+            if let Some(entry) = self.retained_backings.view_entries.get_mut(slot)
+                && matches!(&entry.view, ResolvedView::Image(cached) if Arc::ptr_eq(cached, &view))
+            {
+                entry.referenced = true;
+            }
+            self.resources.push(MaxwellThreeDResolvedResource::Image {
+                role: MaxwellThreeDResourceRole::SampledImage {
+                    texture: texture_reference,
+                    dimension,
+                    with_sampler: needs_sampler,
+                },
+                view,
+            });
+            return Ok(());
+        }
+        self.sampled_image(
+            texture_reference,
+            dimension,
+            image_index,
+            tic,
+            needs_sampler,
+        )?;
+        let MaxwellThreeDResolvedResource::Image { view, .. } = self.resources.last().unwrap()
+        else {
+            unreachable!()
+        };
+        let key = ResolvedViewKey {
+            address_space: self.address_space.id(),
+            permissions: MemoryPermissions::READ.bits(),
+            definition: ResolvedViewDefinition::Sampled {
+                bytes: tic,
+                dimension,
+            },
+        };
+        if let Some(&slot) = self.retained_backings.views.get(&key) {
+            let tables = if self.compute {
+                &mut self.retained_backings.compute_descriptor_tables
+            } else {
+                &mut self.retained_backings.descriptor_tables
+            };
+            tables[DescriptorTableKind::Image as usize].remember_image(
+                image_index,
+                dimension,
+                self.address_space,
+                view,
+                slot,
+                self.mapping_generation,
+            );
+        }
         Ok(())
     }
     fn sampler(
@@ -2198,15 +2375,27 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         })?;
         let (_, sampler_index) = texture_descriptor_pair(mode, raw);
         let tsc = self.descriptor_bytes(MaxwellThreeDResourceRole::Samplers, sampler_index)?;
-        let mut sampler = if let Some(sampler) = self.retained_backings.samplers.get(&tsc) {
-            *sampler
+        let tables = if self.compute {
+            &mut self.retained_backings.compute_descriptor_tables
         } else {
-            let sampler = decode_sampler(texture_reference, sampler_index, tsc)?;
-            self.retained_backings.samplers.insert(
-                tsc,
-                sampler,
-                std::mem::size_of_val(&sampler) + 32,
-            );
+            &mut self.retained_backings.descriptor_tables
+        };
+        let table = &mut tables[DescriptorTableKind::Sampler as usize];
+        let mut sampler = if let Some(sampler) = table.sampler(sampler_index) {
+            sampler
+        } else {
+            let sampler = if let Some(sampler) = self.retained_backings.samplers.get(&tsc) {
+                *sampler
+            } else {
+                let sampler = decode_sampler(texture_reference, sampler_index, tsc)?;
+                self.retained_backings.samplers.insert(
+                    tsc,
+                    sampler,
+                    std::mem::size_of_val(&sampler) + 32,
+                );
+                sampler
+            };
+            table.remember_sampler(sampler_index, sampler);
             sampler
         };
         sampler.role = MaxwellThreeDResourceRole::Sampler(texture_reference);
@@ -2255,13 +2444,14 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         let address = base
             .checked_add(u64::from(byte_offset))
             .ok_or(MaxwellThreeDResourceError::ArithmeticOverflow { role })?;
-        let source = self.resolve(
-            MaxwellThreeDUnresolvedAddress::new((address >> 32) as u8, address as u32),
-            4,
-            MemoryPermissions::READ,
-            role,
-        )?;
-        let bytes = self.descriptor_read(role, source.offset(), 4, Some(source))?;
+        // Consume the handle directly, like Read<u32> on the command owner.
+        // Retained physical mappings belong to resources, not to these scalar inputs.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/texture_cache/texture_cache.h
+        let address = self
+            .address_space
+            .address(address)
+            .map_err(|_| MaxwellThreeDResourceError::AddressOutOfRange { role, address })?;
+        let bytes = self.descriptor_read(role, address, 4)?;
         Ok(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
     }
 
@@ -2271,6 +2461,7 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         required_dimension: MaxwellThreeDTextureDimension,
         descriptor_index: u32,
         bytes: [u8; 32],
+        with_sampler: bool,
     ) -> Result<(), MaxwellThreeDResourceError> {
         // Maxwell 2 TIC field placement follows deko3d's pinned public
         // descriptor definition, itself cross-referenced to envytools:
@@ -2279,13 +2470,17 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         let role = MaxwellThreeDResourceRole::SampledImage {
             texture: texture_reference,
             dimension: required_dimension,
+            with_sampler,
         };
         let key = ResolvedViewKey {
             address_space: self.address_space.id(),
-            role,
-            definition: ResolvedViewDefinition::Sampled(bytes),
+            permissions: MemoryPermissions::READ.bits(),
+            definition: ResolvedViewDefinition::Sampled {
+                bytes,
+                dimension: required_dimension,
+            },
         };
-        if self.reuse_view(&key)? {
+        if self.reuse_view(&key, role)? {
             return Ok(());
         }
         let format_word = words[0];
@@ -2609,9 +2804,9 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         }
         let view = ImageView::new(id, description, sample_swizzle, image_bindings)
             .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
-        self.resources.push(MaxwellThreeDResolvedResource::Image(
-            MaxwellThreeDResolvedImage {
-                role,
+        self.resources.push(MaxwellThreeDResolvedResource::Image {
+            role,
+            view: Arc::new(MaxwellThreeDResolvedImage {
                 access: MaxwellThreeDResourceAccess::Read,
                 description,
                 allocation_description,
@@ -2644,8 +2839,8 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
                 } else {
                     MaxwellThreeDGuestImageFormat::Texture(format_word)
                 },
-            },
-        ));
+            }),
+        });
         self.remember_last_view(key);
         Ok(())
     }
@@ -2835,7 +3030,12 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
     ) -> Result<(), MaxwellThreeDResourceError> {
         let key = ResolvedViewKey {
             address_space: self.address_space.id(),
-            role,
+            permissions: if role == MaxwellThreeDResourceRole::BlitSource {
+                MemoryPermissions::READ
+            } else {
+                MemoryPermissions::WRITE
+            }
+            .bits(),
             definition: ResolvedViewDefinition::Attachment {
                 address,
                 description,
@@ -2848,7 +3048,7 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
                 sample_mode: self.sample_mode,
             },
         };
-        if self.reuse_view(&key)? {
+        if self.reuse_view(&key, role)? {
             return Ok(());
         }
         let samples = match self
@@ -3080,9 +3280,9 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
             )],
         )
         .map_err(|_| MaxwellThreeDResourceError::InvalidNeutralView { role })?;
-        self.resources.push(MaxwellThreeDResolvedResource::Image(
-            MaxwellThreeDResolvedImage {
-                role,
+        self.resources.push(MaxwellThreeDResolvedResource::Image {
+            role,
+            view: Arc::new(MaxwellThreeDResolvedImage {
                 access: if role == MaxwellThreeDResourceRole::BlitSource {
                     MaxwellThreeDResourceAccess::Read
                 } else {
@@ -3099,8 +3299,8 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
                     compression_enabled,
                 },
                 guest_format,
-            },
-        ));
+            }),
+        });
         self.remember_last_view(key);
         Ok(())
     }
@@ -3142,7 +3342,7 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
     }
 
     fn finish(
-        self,
+        mut self,
     ) -> Result<
         (
             MaxwellThreeDResolvedResources,
@@ -3150,19 +3350,21 @@ impl<'a, 'm> ResourceBuilder<'a, 'm> {
         ),
         MaxwellThreeDResourceError,
     > {
-        let mut groups: [Vec<Arc<MaxwellThreeDResolvedResource>>; 4] = Default::default();
+        let mut groups: [Vec<MaxwellThreeDResolvedResource>; 4] = Default::default();
         for resource in self.resources {
-            groups[resource.role().binding_group()].push(Arc::new(resource));
+            groups[resource.role().binding_group()].push(resource);
         }
+        self.samplers.sort_unstable_by_key(|sampler| sampler.role());
         let result = MaxwellThreeDResolvedResources {
             resources: groups.map(|mut group| {
                 group.sort_unstable_by_key(|r| r.role());
-                (!group.is_empty()).then(|| group.into())
+                group
             }),
-            samplers: (!self.samplers.is_empty()).then(|| self.samplers.into()),
+            samplers: self.samplers.into_vec(),
+            revisions: [0; 4],
         };
         result.validate_mappings(self.address_space)?;
-        Ok((result, self.descriptor_reads.into_boxed_slice()))
+        Ok((result, self.descriptor_reads.into_vec().into_boxed_slice()))
     }
 }
 
@@ -3523,10 +3725,6 @@ const fn texture_descriptor_pair(
     }
 }
 
-fn uses_maxwell_texture_headers(selector: Option<&bool>) -> bool {
-    selector.copied().unwrap_or(true)
-}
-
 fn decode_sampler(
     texture_reference: MaxwellThreeDTextureReference,
     descriptor: u32,
@@ -3701,9 +3899,6 @@ pub enum MaxwellThreeDResourceError {
         texture_reference: MaxwellThreeDTextureReference,
         constant_buffer_size: u64,
     },
-    UnsupportedTextureBindingMode {
-        descriptor: u32,
-    },
     UnsupportedTextureDescriptor {
         descriptor: u32,
         field: &'static str,
@@ -3791,10 +3986,6 @@ impl Display for MaxwellThreeDResourceError {
                 formatter,
                 "Maxwell texture handle is outside its constant buffer: reference={texture_reference:?} constant-buffer-size={constant_buffer_size}"
             ),
-            Self::UnsupportedTextureBindingMode { descriptor } => write!(
-                formatter,
-                "Maxwell texture descriptor {descriptor} uses an unsupported texture/sampler binding mode"
-            ),
             Self::UnsupportedTextureDescriptor {
                 descriptor,
                 field,
@@ -3842,7 +4033,7 @@ mod tests {
         MaxwellThreeDPreservedImageLayout, MaxwellThreeDResourceError, MaxwellThreeDResourceRole,
         MaxwellThreeDRetainedBackingCache, MaxwellThreeDTextureDimension,
         decode_sampled_texture_format, decode_sampler, image_kind_matches, read_backing_bytes,
-        read_descriptor_bytes, texture_descriptor_pair, uses_maxwell_texture_headers,
+        read_descriptor_bytes, texture_descriptor_pair,
     };
 
     fn descriptor_bytes(words: [u32; 8]) -> [u8; 32] {
@@ -3910,9 +4101,11 @@ mod tests {
                 MaxwellThreeDTextureDimension::Three,
                 0,
                 descriptor_bytes(words),
+                false,
             )
             .unwrap();
-        let super::MaxwellThreeDResolvedResource::Image(image) = &builder.resources[0] else {
+        let super::MaxwellThreeDResolvedResource::Image { view: image, .. } = &builder.resources[0]
+        else {
             panic!("expected volume")
         };
         assert_eq!(
@@ -4323,13 +4516,6 @@ mod tests {
     }
 
     #[test]
-    fn texture_header_selector_uses_the_maxwell_reset_mode_until_programmed() {
-        assert!(uses_maxwell_texture_headers(None));
-        assert!(uses_maxwell_texture_headers(Some(&true)));
-        assert!(!uses_maxwell_texture_headers(Some(&false)));
-    }
-
-    #[test]
     fn paired_texture_handles_reject_invalid_slots_and_shifts() {
         use super::MaxwellThreeDTextureReference as T;
         assert!(T::expression(4, (1, 0, 32), None).is_none());
@@ -4610,9 +4796,12 @@ mod tests {
                     MaxwellThreeDTextureDimension::Two,
                     0,
                     descriptor_bytes(words),
+                    false,
                 )
                 .unwrap();
-            let super::MaxwellThreeDResolvedResource::Image(image) = &builder.resources[0] else {
+            let super::MaxwellThreeDResolvedResource::Image { view: image, .. } =
+                &builder.resources[0]
+            else {
                 panic!("expected sampled image")
             };
             assert_eq!(image.description.format(), format);
@@ -4820,9 +5009,12 @@ mod tests {
                     MaxwellThreeDTextureDimension::Two,
                     256,
                     descriptor_bytes(words),
+                    false,
                 )
                 .unwrap();
-            let super::MaxwellThreeDResolvedResource::Image(image) = &builder.resources[0] else {
+            let super::MaxwellThreeDResolvedResource::Image { view: image, .. } =
+                &builder.resources[0]
+            else {
                 panic!("expected sampled image");
             };
             assert_eq!(
@@ -4858,9 +5050,11 @@ mod tests {
                     MaxwellThreeDTextureDimension::Two,
                     374,
                     descriptor_bytes(rg_words),
+                    false,
                 )
                 .unwrap();
-            let super::MaxwellThreeDResolvedResource::Image(image) = &rg_builder.resources[0]
+            let super::MaxwellThreeDResolvedResource::Image { view: image, .. } =
+                &rg_builder.resources[0]
             else {
                 panic!("expected sampled RG8 image");
             };
@@ -4895,9 +5089,11 @@ mod tests {
                     MaxwellThreeDTextureDimension::Two,
                     361,
                     descriptor_bytes(mask_words),
+                    false,
                 )
                 .unwrap();
-            let super::MaxwellThreeDResolvedResource::Image(mask) = &mask_builder.resources[0]
+            let super::MaxwellThreeDResolvedResource::Image { view: mask, .. } =
+                &mask_builder.resources[0]
             else {
                 panic!("expected R8 mask");
             };
@@ -4927,10 +5123,12 @@ mod tests {
                     MaxwellThreeDTextureDimension::TwoArray,
                     257,
                     descriptor_bytes(mask_words),
+                    false,
                 )
                 .unwrap();
-            let super::MaxwellThreeDResolvedResource::Image(array_mask) =
-                &array_builder.resources[0]
+            let super::MaxwellThreeDResolvedResource::Image {
+                view: array_mask, ..
+            } = &array_builder.resources[0]
             else {
                 panic!("expected single-layer array view");
             };
@@ -4946,7 +5144,8 @@ mod tests {
                         super::MaxwellThreeDTextureReference::new(4, 0, 0),
                         MaxwellThreeDTextureDimension::Two,
                         256,
-                        descriptor_bytes(words)
+                        descriptor_bytes(words),
+                        false,
                     )
                     .is_err()
             );
@@ -5038,9 +5237,12 @@ mod tests {
                     MaxwellThreeDTextureDimension::TwoArray,
                     0,
                     descriptor_bytes(words),
+                    false,
                 )
                 .unwrap();
-            let super::MaxwellThreeDResolvedResource::Image(image) = &builder.resources[0] else {
+            let super::MaxwellThreeDResolvedResource::Image { view: image, .. } =
+                &builder.resources[0]
+            else {
                 panic!("expected depth image")
             };
             assert_eq!(image.description().format(), format);
@@ -5136,9 +5338,12 @@ mod tests {
                     },
                     0,
                     descriptor_bytes(words),
+                    false,
                 )
                 .unwrap();
-            let super::MaxwellThreeDResolvedResource::Image(image) = &builder.resources[0] else {
+            let super::MaxwellThreeDResolvedResource::Image { view: image, .. } =
+                &builder.resources[0]
+            else {
                 panic!("expected sampled image")
             };
             assert_eq!(image.description().mip_levels(), 8);
@@ -5236,9 +5441,11 @@ mod tests {
                 MaxwellThreeDTextureDimension::Two,
                 0,
                 descriptor_bytes(words),
+                false,
             )
             .unwrap();
-        let super::MaxwellThreeDResolvedResource::Image(image) = &builder.resources[0] else {
+        let super::MaxwellThreeDResolvedResource::Image { view: image, .. } = &builder.resources[0]
+        else {
             panic!("expected sampled image");
         };
         assert_eq!(
@@ -5269,9 +5476,12 @@ mod tests {
                 MaxwellThreeDTextureDimension::Two,
                 0,
                 descriptor_bytes(bc4_words),
+                false,
             )
             .unwrap();
-        let super::MaxwellThreeDResolvedResource::Image(bc4) = &bc4_builder.resources[0] else {
+        let super::MaxwellThreeDResolvedResource::Image { view: bc4, .. } =
+            &bc4_builder.resources[0]
+        else {
             panic!("expected BC4 sampled image");
         };
         assert_eq!(bc4.description().format(), nixe_gpu::ImageFormat::Bc4RUnorm);
@@ -5310,7 +5520,6 @@ mod tests {
             .unwrap();
         builder
             .sampled_texture(
-                None,
                 None,
                 reference,
                 handle,

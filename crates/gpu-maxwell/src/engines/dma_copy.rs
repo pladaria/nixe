@@ -7,9 +7,7 @@ use super::memory_copy::{
     MaxwellMemoryCopyRemap, required_range_size,
 };
 
-use super::{
-    AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation,
-};
+use super::{MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation};
 use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
 
 pub(super) const CLASS: GpuClassId = GpuClassId(0xb0b5);
@@ -204,7 +202,7 @@ methods!(
 pub(super) fn preflight(
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellDmaCopyState,
-) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
+) -> Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError> {
     let source = method.source();
     let declaration = METHODS
         .iter()
@@ -246,11 +244,7 @@ pub(super) fn preflight(
         None
     };
     candidate.apply(write);
-    Ok(AppliedMethod::new(
-        method,
-        *declaration.metadata,
-        operation.map(PendingEngineOperation::MemoryCopy),
-    ))
+    Ok(operation.map(PendingEngineOperation::MemoryCopy))
 }
 
 fn build_operation(

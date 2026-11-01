@@ -1418,6 +1418,14 @@ impl Machine {
             Ok(Some(bytes.into_boxed_slice()))
         })
     }
+    /// Coarse device coverage for retained physical bytes. A clear summary
+    /// proves RAM current; set bits still require exact owner resolution.
+    /// This does not grant admission to read or mutate the bytes.
+    #[inline]
+    pub fn has_device_pages(&self, extent: Extent) -> bool {
+        self.tracking().device.any(extent)
+    }
+
     /// Inspect weak cache metadata without acquiring a physical input lease.
     /// Actual capture/publication still retains the allocation independently.
     pub fn resource_pages_tracked(&self, extent: Extent) -> bool {

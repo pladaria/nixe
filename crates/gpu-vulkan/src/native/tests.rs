@@ -338,6 +338,10 @@ fn unknown_cpu_readback_leaves_recording_available_and_preserves_its_version() {
     consume(&mut execution, &batch)
         .and_then(|()| execution.submit(batch.frontend))
         .unwrap();
+    assert!(
+        execution.residency.buffer_visibility_work().is_none(),
+        "physical submission must not duplicate an exact CPU demand as a publication download"
+    );
     let submitted = execution.residency.device().scheduled_tick();
     execution.progress().unwrap();
     assert!(pending.poll().is_none());
@@ -517,7 +521,7 @@ fn completed_native_work_still_wakes_its_pending_logical_completion() {
 }
 
 #[test]
-fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_completion() {
+fn native_ordered_writes_publish_known_bytes_without_waiting_for_gpu_only_work() {
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {
         return;
     };
@@ -598,25 +602,6 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     execution.arm_completion_wakeup().unwrap();
     assert!(execution.poll_completion().unwrap().is_none());
 
-    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let signalled = Arc::clone(&released);
-    let signalling_owner = Arc::clone(&owner);
-    let (read_started, start_read) = std::sync::mpsc::channel();
-    let signal = std::thread::spawn(move || {
-        let accepted_without_wait = start_read.recv_timeout(Duration::from_secs(3)).is_ok();
-        std::thread::sleep(Duration::from_millis(50));
-        signalled.store(true, std::sync::atomic::Ordering::Release);
-        unsafe {
-            signalling_owner.device.signal_semaphore(
-                &vk::SemaphoreSignalInfo::default()
-                    .semaphore(semaphore)
-                    .value(1),
-            )
-        }
-        .unwrap();
-        accepted_without_wait
-    });
-
     // The GPU cannot complete the first batch yet. An unrelated subsequent
     // recording still succeeds; no completion wait is needed for these writes.
     let second = submission(2, 0x71);
@@ -635,8 +620,8 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         .unwrap();
     execution.queue_device_access(request).unwrap();
     assert!(
-        pending.poll().is_none(),
-        "an external CPU demand must leave recording available while the GPU is blocked"
+        pending.poll().is_some(),
+        "known CPU payloads do not depend on unrelated GPU-only work"
     );
     let independent = NativeWork {
         frontend: FrontendSubmissionId::new(90),
@@ -646,13 +631,7 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     consume(&mut execution, &independent)
         .and_then(|()| execution.submit(independent.frontend))
         .unwrap();
-    assert!(!released.load(std::sync::atomic::Ordering::Acquire));
-    read_started.send(()).unwrap();
     let bytes = cpu_read(&mut execution.residency, &whole);
-    assert!(
-        released.load(std::sync::atomic::Ordering::Acquire),
-        "known payload was published before its GPU dependency"
-    );
     assert_eq!(&bytes[..64], &[0x19; 64]);
     assert_eq!(&bytes[64..80], &[0x71; 16]);
     assert!(bytes[80..128].iter().all(|&b| b == 0x19));
@@ -661,12 +640,16 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
     assert_eq!(
         execution.residency.statistics().native_readback_bytes,
         0,
-        "known payload requires completion, not a redundant download"
+        "known payload must not perform a redundant download"
     );
-    assert!(
-        signal.join().unwrap(),
-        "recording serialized on the blocked producer"
-    );
+    unsafe {
+        owner.device.signal_semaphore(
+            &vk::SemaphoreSignalInfo::default()
+                .semaphore(semaphore)
+                .value(1),
+        )
+    }
+    .unwrap();
     wakeups
         .recv_timeout(Duration::from_secs(1))
         .expect("an idle owner must wake without another submission");
@@ -694,9 +677,8 @@ fn native_ordered_writes_record_ahead_and_publish_known_bytes_only_after_complet
         &cpu_read(&mut execution.residency, &whole)[64..80],
         &[0xa7; 16]
     );
-    // A host-authored release attaches to the existing real producer prefix.
-    // It must not invent an empty submission. A following literal release can
-    // share the same preceding producer ticket.
+    // Physical delivery still follows the real queue prefix. A CPU-authored
+    // release must not invent an empty native submission.
     let prefix = NativeWork {
         frontend: FrontendSubmissionId::new(3),
         command: NativeCommand::ReportMemory {
@@ -913,13 +895,13 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     // Dynamic-state support affects selection before shader/pipeline lookup.
     for dynamic in [false, true] {
         use std::hash::{Hash, Hasher};
-        let key = GraphicsKey::new(&state, dynamic);
+        let key = GraphicsKey::new(&state, dynamic).unwrap();
         let mut changed = (*state).clone();
         let p = Arc::make_mut(&mut changed.parameters);
         p.scissor.x = 1;
         p.blend_constants = [0.25; 4];
         p.render_area.width = 4;
-        let same = GraphicsKey::new(&changed, dynamic);
+        let same = GraphicsKey::new(&changed, dynamic).unwrap();
         assert!(key == same);
         let hash = |key: &GraphicsKey| {
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -928,9 +910,28 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         };
         assert_eq!(hash(&key), hash(&same));
         Arc::make_mut(&mut changed.parameters).cull = CullMode::Back;
-        assert_eq!(key == GraphicsKey::new(&changed, dynamic), dynamic);
+        assert_eq!(key == GraphicsKey::new(&changed, dynamic).unwrap(), dynamic);
         Arc::make_mut(&mut changed.parameters).vertices[0].stride += 4;
-        assert!(key != GraphicsKey::new(&changed, dynamic));
+        assert!(key != GraphicsKey::new(&changed, dynamic).unwrap());
+    }
+    // Scaled integer legalization can share a native fetch format while its
+    // shader interpretation differs. The static key must retain that distinction.
+    let mut formats = std::collections::HashSet::new();
+    for format in [
+        VertexFormat::Float32x3,
+        VertexFormat::Uint32x3,
+        VertexFormat::Uscaled {
+            width: VertexComponentWidth::Bits32,
+            components: VertexComponentCount::Three,
+        },
+        VertexFormat::Sscaled {
+            width: VertexComponentWidth::Bits32,
+            components: VertexComponentCount::Three,
+        },
+    ] {
+        let mut variant = (*state).clone();
+        Arc::make_mut(&mut variant.parameters).vertices[0].attributes[0].format = format;
+        assert!(formats.insert(GraphicsKey::new(&variant, true).unwrap()));
     }
     let draw = NativeCommand::Draw {
         state: Arc::clone(&state),
@@ -953,7 +954,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         };
 
         consume(&mut execution, &submission)
-            .and_then(|()| execution.submit(submission.frontend))
+            .and_then(|()| execution.signal_fence(submission.frontend))
             .unwrap();
         assert_eq!(
             finish_next(&mut execution).unwrap().unwrap().frontend(),
@@ -977,14 +978,13 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     assert_eq!(execution.statistics.prepared_draws, 1);
     assert_eq!(execution.statistics.draws, 32);
     assert_eq!(execution.statistics.warm_draws, 31);
-    let graphics_key = GraphicsKey::new(&state, execution.device_profile().dynamic_state.base);
-    let retained_push = match &execution.graphics[&graphics_key] {
-        Graphics::Ready {
-            parameters: Some((_, _, push)),
-            ..
-        } => Arc::clone(push),
-        _ => unreachable!(),
-    };
+    let retained_push = Arc::clone(
+        &execution.graphics_pipelines[execution.current_graphics.unwrap().0]
+            .parameters
+            .as_ref()
+            .unwrap()
+            .2,
+    );
     let bytes = cpu_read(&mut execution.residency, &backing);
     assert!(bytes.chunks_exact(4).all(|p| p == [0, 255, 0, 255]));
     assert_eq!(
@@ -992,17 +992,16 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         0,
         "vertices use retained buffers"
     );
-    // Acceptance of a read snapshot need not submit a command buffer. A
-    // following CPU write is uploaded after that read, with a native WAR edge.
+    // A logical fence need not submit GPU-only reads. A following CPU write
+    // is uploaded after that snapshot, with a native WAR edge.
     let prefix = NativeWork {
         frontend: FrontendSubmissionId::new(3),
         command: submission.command.clone(),
     };
 
     let first = consume(&mut execution, &prefix)
-        .and_then(|()| execution.submit(prefix.frontend))
+        .and_then(|()| execution.signal_fence(prefix.frontend))
         .unwrap();
-    assert!(execution.poll_completion().unwrap().is_none());
     assert_eq!(
         first.instance(),
         execution
@@ -1047,12 +1046,15 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
 
     let selections = execution.statistics.reused_vertex_selections;
     let second = consume(&mut execution, &final_segment)
-        .and_then(|()| execution.submit(final_segment.frontend))
+        .and_then(|()| execution.signal_fence(final_segment.frontend))
         .unwrap();
-    assert!(matches!(
-        &execution.graphics[&graphics_key],
-        Graphics::Ready { parameters: Some((_, _, push)), .. }
-            if !Arc::ptr_eq(push, &retained_push)
+    assert!(!Arc::ptr_eq(
+        &execution.graphics_pipelines[execution.current_graphics.unwrap().0]
+            .parameters
+            .as_ref()
+            .unwrap()
+            .2,
+        &retained_push
     ));
     assert!(execution.statistics.reused_vertex_selections > selections);
     assert_ne!(first, second);
@@ -1083,7 +1085,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
 
     let submitted = execution.residency.device().queue_usage().submitted_tick;
     let token = consume(&mut execution, &pending)
-        .and_then(|()| execution.submit(pending.frontend))
+        .and_then(|()| execution.signal_fence(pending.frontend))
         .unwrap();
     assert_eq!(
         execution.residency.device().queue_usage().submitted_tick,
@@ -1102,7 +1104,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     )
     .unwrap();
     let repeated = consume(&mut execution, &pending)
-        .and_then(|()| execution.submit(pending.frontend))
+        .and_then(|()| execution.signal_fence(pending.frontend))
         .unwrap();
     assert_eq!(
         execution.residency.device().queue_usage().submitted_tick,
@@ -1165,16 +1167,14 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
 
         sent.push(
             consume(&mut execution, &submission)
-                .and_then(|()| execution.submit(submission.frontend))
+                .and_then(|()| execution.signal_fence(submission.frontend))
                 .unwrap(),
         );
-        let Graphics::Ready {
-            parameters: Some((_, _, push)),
-            ..
-        } = &execution.graphics[&graphics_key]
-        else {
-            unreachable!()
-        };
+        let push = &execution.graphics_pipelines[execution.current_graphics.unwrap().0]
+            .parameters
+            .as_ref()
+            .unwrap()
+            .2;
         if index == 0 {
             retained_push = Some(Arc::clone(push));
         } else {
@@ -1287,7 +1287,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         crate::residency::tests::cpu_write(&mut execution.residency, &uniform, 0, bytes).unwrap();
         sent.push(
             consume(&mut execution, submission)
-                .and_then(|()| execution.submit(submission.frontend))
+                .and_then(|()| execution.signal_fence(submission.frontend))
                 .unwrap(),
         );
     }
@@ -1321,7 +1321,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     let repeated = &inputs[2].0;
     for _ in 0..12 {
         consume(&mut execution, repeated)
-            .and_then(|()| execution.submit(repeated.frontend))
+            .and_then(|()| execution.signal_fence(repeated.frontend))
             .unwrap();
         finish_next(&mut execution).unwrap().unwrap();
     }
@@ -1361,7 +1361,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     };
 
     consume(&mut execution, &submission)
-        .and_then(|()| execution.submit(submission.frontend))
+        .and_then(|()| execution.signal_fence(submission.frontend))
         .unwrap();
     let bytes = cpu_read(&mut execution.residency, &backing);
     assert!(
@@ -1376,10 +1376,11 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     for _ in 0..600 {
         consume(&mut execution, &submission).unwrap();
     }
-    let key = GraphicsKey::new(&uniform_draw, execution.device_profile().dynamic_state.base);
+    let key =
+        GraphicsKey::new(&uniform_draw, execution.device_profile().dynamic_state.base).unwrap();
     assert!(matches!(
         execution.graphics.get(&key),
-        Some(Graphics::Ready { .. })
+        Some(Graphics::Ready(_))
     ));
     let mut next_draw = (*uniform_draw).clone();
     next_draw.identity = PreparedStateId::new(5000, 1);
@@ -1438,7 +1439,7 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
         };
 
         consume(&mut execution, &submission)
-            .and_then(|()| execution.submit(submission.frontend))
+            .and_then(|()| execution.signal_fence(submission.frontend))
             .unwrap();
         retained.push((allocation, submission));
     }
@@ -1452,10 +1453,243 @@ fn native_owner_renders_exact_pixels_reuses_prepared_draws_and_resets_command_st
     render_area_preserves_undefined_padding(&mut execution, &state);
     window_depth_reconstructs_reads_and_clamps_exports(&mut execution, &state);
     contiguous_instances_preserve_vertex_inputs(&mut execution, &state, &backing);
+    pipeline_switches_retain_parameters_and_known_transitions(
+        &mut execution,
+        &state,
+        &uniform_draw,
+    );
+    attachment_clears_fold_into_loads_and_preserve_active_rendering(
+        &mut execution,
+        &state,
+        &backing,
+    );
     drop(pixels);
     execution.teardown().unwrap();
     drop(execution);
     monitor.check().unwrap();
+}
+
+fn attachment_clears_fold_into_loads_and_preserve_active_rendering(
+    execution: &mut NativeGpuExecution,
+    state: &Arc<GuestDrawState>,
+    backing: &PhysicalMapping,
+) {
+    let image = state.colors[0].clone();
+    let area = state.parameters.render_area;
+    execution.residency.device.end_rendering();
+    let clear = |color| NativeWork {
+        frontend: FrontendSubmissionId::new(9000),
+        command: NativeCommand::Clear {
+            image: image.clone(),
+            rectangle: area,
+            value: ClearValue::Color(color),
+        },
+    };
+    let scopes = execution.recording_statistics().rendering_scopes;
+    consume(execution, &clear([1., 0., 0., 1.])).unwrap();
+    consume(execution, &clear([0., 1., 0., 1.])).unwrap();
+    assert_eq!(execution.recording_statistics().rendering_scopes, scopes);
+    let mut draw = NativeWork {
+        frontend: FrontendSubmissionId::new(9001),
+        command: NativeCommand::Draw {
+            state: Arc::clone(state),
+            arguments: DrawArguments::NonIndexed {
+                first_vertex: 0,
+                vertex_count: 0,
+                first_instance: 0,
+                instance_count: 1,
+            },
+        },
+    };
+    consume(execution, &draw).unwrap();
+    assert_eq!(
+        execution.recording_statistics().rendering_scopes,
+        scopes + 1
+    );
+    assert!(
+        cpu_read(&mut execution.residency, backing)
+            .chunks_exact(4)
+            .all(|p| p == [0, 255, 0, 255])
+    );
+    if let NativeCommand::Draw {
+        arguments: DrawArguments::NonIndexed { vertex_count, .. },
+        ..
+    } = &mut draw.command
+    {
+        *vertex_count = 3;
+    }
+    consume(execution, &draw).unwrap();
+    let scopes = execution.recording_statistics().rendering_scopes;
+    let mut partial = clear([1., 0., 0., 1.]);
+    if let NativeCommand::Clear { rectangle, .. } = &mut partial.command {
+        rectangle.width /= 2;
+    }
+    consume(execution, &partial).unwrap();
+    assert_eq!(execution.recording_statistics().rendering_scopes, scopes);
+    let pixels = cpu_read(&mut execution.residency, backing);
+    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+        assert_eq!(
+            pixel,
+            if index % (area.width as usize) < area.width as usize / 2 {
+                &[255, 0, 0, 255]
+            } else {
+                &[0, 255, 0, 255]
+            }
+        );
+    }
+    consume(execution, &clear([0., 0., 1., 1.])).unwrap();
+    let pixels = cpu_read(&mut execution.residency, backing);
+    assert!(pixels.chunks_exact(4).all(|p| p == [0, 0, 255, 255]));
+
+    let scopes = execution.recording_statistics().rendering_scopes;
+    consume(execution, &clear([0., 1., 0., 1.])).unwrap();
+    consume(execution, &partial).unwrap();
+    assert_eq!(
+        execution.recording_statistics().rendering_scopes,
+        scopes + 1
+    );
+    for (index, pixel) in cpu_read(&mut execution.residency, backing)
+        .chunks_exact(4)
+        .enumerate()
+    {
+        assert_eq!(
+            pixel,
+            if index % (area.width as usize) < area.width as usize / 2 {
+                &[255, 0, 0, 255]
+            } else {
+                &[0, 255, 0, 255]
+            }
+        );
+    }
+
+    let (_depth_allocation, depth_backing) = backing_allocation(&execution.residency, 256, 256, 0);
+    let mut depth = image.clone();
+    depth.description = ImageDescription::new(
+        ImageDimension::Two,
+        ImageExtent::new(8, 8, 1).unwrap(),
+        ImageFormat::Depth32Float,
+        ImageKind::DepthStencil,
+        1,
+        1,
+        SampleCount::One,
+    )
+    .unwrap();
+    depth.planes = Arc::from([GuestImagePlane {
+        aspect: GuestImageAspect::Depth,
+        footprint: crate::residency::tests::plane_geometry(depth_backing.clone(), [8, 8], 32, 4),
+        ..depth.planes[0].clone()
+    }]);
+    let depth_clear = |value| NativeWork {
+        frontend: FrontendSubmissionId::new(9002),
+        command: NativeCommand::Clear {
+            image: depth.clone(),
+            rectangle: area,
+            value: ClearValue::Depth(value),
+        },
+    };
+    execution.residency.device.end_rendering();
+    let scopes = execution.recording_statistics().rendering_scopes;
+    consume(execution, &clear([1., 0., 0., 1.])).unwrap();
+    consume(execution, &depth_clear(0.375)).unwrap();
+    assert_eq!(execution.recording_statistics().rendering_scopes, scopes);
+    execution.residency.flush().unwrap();
+    // Compatible color/depth clears materialize in one rendering scope.
+    assert_eq!(
+        execution.recording_statistics().rendering_scopes,
+        scopes + 1
+    );
+    assert!(
+        cpu_read(&mut execution.residency, &depth_backing)
+            .chunks_exact(4)
+            .all(|pixel| f32::from_le_bytes(pixel.try_into().unwrap()) == 0.375)
+    );
+
+    let mut read_only = (**state).clone();
+    read_only.identity = PreparedStateId::new(9003, 1);
+    read_only.depth_stencil = Some(depth.clone());
+    let parameters = Arc::make_mut(&mut read_only.parameters);
+    parameters.identity = PreparedStateId::new(9004, 1);
+    parameters.depth_stencil_format = Some(ImageFormat::Depth32Float);
+    parameters.depth = DepthState::DISABLED;
+    let scopes = execution.recording_statistics().rendering_scopes;
+    consume(execution, &depth_clear(0.625)).unwrap();
+    consume(
+        execution,
+        &NativeWork {
+            frontend: FrontendSubmissionId::new(9005),
+            command: NativeCommand::Draw {
+                state: Arc::new(read_only),
+                arguments: DrawArguments::NonIndexed {
+                    first_vertex: 0,
+                    vertex_count: 0,
+                    first_instance: 0,
+                    instance_count: 1,
+                },
+            },
+        },
+    )
+    .unwrap();
+    // A read-only pass uses STORE_NONE, so its load cannot absorb this clear.
+    assert_eq!(
+        execution.recording_statistics().rendering_scopes,
+        scopes + 2
+    );
+    assert!(
+        cpu_read(&mut execution.residency, &depth_backing)
+            .chunks_exact(4)
+            .all(|pixel| f32::from_le_bytes(pixel.try_into().unwrap()) == 0.625)
+    );
+}
+
+fn pipeline_switches_retain_parameters_and_known_transitions(
+    execution: &mut NativeGpuExecution,
+    a: &Arc<GuestDrawState>,
+    b: &Arc<GuestDrawState>,
+) {
+    assert!(execution.graphics(a).unwrap());
+    let first = execution.current_graphics.unwrap().0;
+    let retained = Arc::clone(
+        &execution.graphics_pipelines[first]
+            .parameters
+            .as_ref()
+            .unwrap()
+            .2,
+    );
+    assert!(execution.graphics(b).unwrap());
+    let second = execution.current_graphics.unwrap().0;
+    assert_ne!(first, second);
+    assert!(execution.graphics(a).unwrap());
+    assert!(
+        execution.graphics_pipelines[first]
+            .transitions
+            .contains(&second)
+    );
+    assert!(
+        execution.graphics_pipelines[second]
+            .transitions
+            .contains(&first)
+    );
+    let transitions = [first, second].map(|i| execution.graphics_pipelines[i].transitions.len());
+    let pipelines = execution.graphics_pipelines.len();
+    for _ in 0..4 {
+        assert!(execution.graphics(b).unwrap());
+        assert_eq!(execution.current_graphics.unwrap().0, second);
+        assert!(execution.graphics(a).unwrap());
+        assert_eq!(execution.current_graphics.unwrap().0, first);
+        assert!(Arc::ptr_eq(
+            &retained,
+            &execution.graphics_pipelines[first]
+                .parameters
+                .as_ref()
+                .unwrap()
+                .2
+        ));
+    }
+    assert_eq!(execution.graphics_pipelines.len(), pipelines);
+    assert_eq!(
+        [first, second].map(|i| execution.graphics_pipelines[i].transitions.len()),
+        transitions
+    );
 }
 
 fn constant_blend_factors_follow_dynamic_constants(
@@ -1511,7 +1745,7 @@ fn constant_blend_factors_follow_dynamic_constants(
                 },
             };
             consume(execution, &work)
-                .and_then(|()| execution.submit(work.frontend))
+                .and_then(|()| execution.signal_fence(work.frontend))
                 .unwrap();
             for pixel in cpu_read(&mut execution.residency, output).chunks_exact(4) {
                 assert_eq!(
@@ -1627,7 +1861,7 @@ fn overlapping_graphics_buffers_preserve_shader_bindings(
         };
         for _ in 0..2 {
             consume(execution, &work).unwrap();
-            execution.submit(work.frontend).unwrap();
+            execution.signal_fence(work.frontend).unwrap();
             let bytes = cpu_read(&mut execution.residency, output);
             assert!(bytes.chunks_exact(4).all(|pixel| pixel == [0, 255, 0, 255]));
             finish_next(execution).unwrap().unwrap();
@@ -1661,7 +1895,6 @@ fn contiguous_instances_preserve_vertex_inputs(
     draw.identity = PreparedStateId::new(3001, 1);
     let parameters = Arc::make_mut(&mut draw.parameters);
     parameters.identity = PreparedStateId::new(3002, 1);
-    parameters.shader_state.base_instance = 3;
     parameters.vertices[0].attributes = Box::new([parameters.vertices[0].attributes[0]]);
     let mut layouts = parameters.vertices.to_vec();
     layouts.push(GuestVertexLayout {
@@ -1704,7 +1937,7 @@ fn contiguous_instances_preserve_vertex_inputs(
             };
 
             consume(execution, &submission)
-                .and_then(|()| execution.submit(submission.frontend))
+                .and_then(|()| execution.signal_fence(submission.frontend))
                 .unwrap();
         }
         let bytes = cpu_read(&mut execution.residency, backing);
@@ -1831,7 +2064,7 @@ fn window_depth_reconstructs_reads_and_clamps_exports(
         };
 
         consume(execution, &submission)
-            .and_then(|()| execution.submit(submission.frontend))
+            .and_then(|()| execution.signal_fence(submission.frontend))
             .unwrap();
         let guest_z: f32 = transform.map_or(0.625, |[scale, offset]| 0.625 * scale + offset);
         let expected_red = ((guest_z * 0.25 + 0.5) * 255.).round() as u8;
@@ -1920,7 +2153,7 @@ fn render_area_preserves_undefined_padding(
     let scopes = execution.recording_statistics().rendering_scopes;
     for submission in [&first, &second] {
         consume(execution, submission)
-            .and_then(|()| execution.submit(submission.frontend))
+            .and_then(|()| execution.signal_fence(submission.frontend))
             .unwrap();
     }
     assert_eq!(
@@ -2167,6 +2400,15 @@ fn captured_compute_dispatch_reuses_prepared_pipeline_without_old_ir() {
         4 * 1024 * 1024,
     )
     .unwrap();
+    let (_allocation, backing) = backing_allocation(&execution.residency, 4096, 4096, 0x19);
+    let buffer = execution
+        .residency
+        .buffer_for_deferred_import(backing.clone(), vk::BufferUsageFlags::TRANSFER_DST)
+        .unwrap();
+    execution
+        .residency
+        .write_buffer(buffer.buffer, buffer.offset, &[0x37; 16])
+        .unwrap();
     for value in 1..=2 {
         let batch = NativeWork {
             frontend: FrontendSubmissionId::new(value),
@@ -2176,10 +2418,30 @@ fn captured_compute_dispatch_reuses_prepared_pipeline_without_old_ir() {
             },
         };
 
-        consume(&mut execution, &batch)
-            .and_then(|()| execution.submit(batch.frontend))
-            .unwrap();
+        consume(&mut execution, &batch).unwrap();
+        let scheduled = execution.residency.device().scheduled_tick();
+        execution.end_command_list().unwrap();
+        let sealed = execution.residency.device().scheduled_tick();
+        assert!(
+            sealed > scheduled,
+            "a completed list seals its recorded dispatches"
+        );
+        execution.end_command_list().unwrap();
+        assert_eq!(execution.residency.device().scheduled_tick(), sealed);
+        assert!(
+            execution.completions.is_empty(),
+            "sealing does not create guest completions"
+        );
+        assert!(
+            execution.residency.buffer_visibility_work().is_none(),
+            "native submission does not commit unrequested CPU downloads"
+        );
+        execution.signal_fence(batch.frontend).unwrap();
         finish_next(&mut execution).unwrap().unwrap();
+        assert_eq!(
+            &cpu_read(&mut execution.residency, &backing)[..16],
+            &[0x37; 16]
+        );
     }
     assert_eq!(execution.statistics.dispatches, 2);
     assert_eq!(execution.computing.len(), 1);
@@ -2402,4 +2664,136 @@ fn observer_proven_gpu_completion_retires_resources_on_the_owner() {
     drop(observer);
     drop(device);
     validation.check().unwrap();
+}
+
+#[test]
+fn stream_fences_publish_their_cpu_visible_prefix_before_later_gpu_work() {
+    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
+        return;
+    };
+    let monitor = device.validation_monitor();
+    let owner = Arc::clone(&device.owner);
+    let mut execution = NativeGpuExecution::new(
+        nixe_memory::Machine::new(64 * 1024 * 1024).unwrap(),
+        device,
+        ShaderNamespace {
+            guest: *b"stream-fences!!!",
+            isa: 1,
+        },
+        CacheConfiguration::default(),
+        4 * 1024 * 1024,
+    )
+    .unwrap();
+    let (_first, first) = backing_allocation(&execution.residency, 4096, 4096, 0x19);
+    let (_later, later) = backing_allocation(&execution.residency, 4096, 4096, 0x29);
+    let first_buffer = execution
+        .residency
+        .buffer_for_deferred_import(first.clone(), vk::BufferUsageFlags::TRANSFER_DST)
+        .unwrap();
+    execution
+        .residency
+        .write_buffer(first_buffer.buffer, first_buffer.offset, &[0x37; 16])
+        .unwrap();
+    let frontend = FrontendSubmissionId::new(1);
+    let prefix = execution.signal_fence(frontend).unwrap();
+
+    let mut kind =
+        vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+    let gate = unsafe {
+        owner.device.create_semaphore(
+            &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+            None,
+        )
+    }
+    .unwrap();
+    execution.residency.order_device().unwrap();
+    execution.residency.device_mut().begin_recording().unwrap();
+    execution
+        .residency
+        .flush_with_sync(
+            &[vk::SemaphoreSubmitInfo::default()
+                .semaphore(gate)
+                .value(1)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)],
+            &[],
+        )
+        .unwrap();
+    let later_buffer = execution
+        .residency
+        .buffer_for_deferred_import(later.clone(), vk::BufferUsageFlags::TRANSFER_DST)
+        .unwrap();
+    execution
+        .residency
+        .write_buffer(later_buffer.buffer, later_buffer.offset, &[0x71; 16])
+        .unwrap();
+    // A known release payload must follow the real CPU-visible copies of its
+    // prefix, even when its buffer was visited before the native producer.
+    execution
+        .residency
+        .report_memory(first.pin(64, 16).unwrap(), 0, &Arc::from([0xa3; 16]), true)
+        .unwrap();
+    let suffix = execution.signal_fence(frontend).unwrap();
+    let reached = execution
+        .completion(Some(Duration::from_secs(5)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(reached.submission(), prefix);
+    assert!(
+        execution.poll_completion().unwrap().is_none(),
+        "the later GPU copy is still blocked"
+    );
+    assert_eq!(
+        cpu_read(&mut execution.residency, &first.slice(0, 16).unwrap()),
+        [0x37; 16]
+    );
+    let (request, mut release) = execution
+        .residency
+        .memory()
+        .prepare_device_access(
+            first.pin(64, 16).unwrap(),
+            nixe_memory::AccessOperation::Read(Vec::new()),
+        )
+        .unwrap();
+    execution.queue_device_access(request).unwrap();
+    assert!(
+        release.poll().is_none(),
+        "the release payload must follow its CPU-visible GPU copies"
+    );
+    unsafe {
+        owner
+            .device
+            .signal_semaphore(&vk::SemaphoreSignalInfo::default().semaphore(gate).value(1))
+    }
+    .unwrap();
+    let reached = execution
+        .completion(Some(Duration::from_secs(5)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(reached.submission(), suffix);
+    assert_eq!(
+        &cpu_read(&mut execution.residency, &later)[..16],
+        &[0x71; 16]
+    );
+    assert_eq!(
+        &cpu_read(&mut execution.residency, &first)[64..80],
+        &[0xa3; 16]
+    );
+    execution.progress().unwrap();
+    assert!(release.poll().is_some_and(
+        |result| matches!(result, Ok(nixe_memory::AccessResult::Read(bytes)) if bytes == [0xa3; 16])
+    ));
+    // No native CPU copies remain; a logical fence need not wait on GPU-only
+    // work and must not manufacture a new native submission.
+    let tick = execution.residency.device().submitted_tick();
+    let stub = execution.signal_fence(frontend).unwrap();
+    assert_eq!(execution.residency.device().submitted_tick(), tick);
+    assert_eq!(
+        execution.poll_completion().unwrap().unwrap().submission(),
+        stub
+    );
+    drop(execution);
+    unsafe {
+        owner.device.destroy_semaphore(gate, None);
+    }
+    monitor.check().unwrap();
 }

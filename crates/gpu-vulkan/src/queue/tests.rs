@@ -10,6 +10,52 @@ mod gate {
 use gate::Gate;
 
 #[test]
+fn consuming_an_incomplete_readback_never_submits_or_waits() {
+    let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let ticket = device.enqueue_buffer_readback(&[0x37; 64]).unwrap();
+    let work = ticket.work();
+    assert!(device.completed_readback(ticket).is_err());
+    assert_eq!(device.scheduled_tick(), 0);
+    assert_eq!(device.completed_tick(), 0);
+    assert_eq!(device.queue_usage().retained_readbacks, 0);
+    device.flush().unwrap();
+    device.wait_for_work(work, Duration::MAX).unwrap();
+    drop(device);
+    validation.check().unwrap();
+}
+
+#[test]
+fn mapped_readback_owns_staging_through_reuse_and_shutdown() {
+    let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
+        return;
+    };
+    let validation = device.validation_monitor();
+    let ticket = device.enqueue_buffer_readback(&[0x37; 64]).unwrap();
+    device.flush().unwrap();
+    device.wait_for_work(ticket.work(), Duration::MAX).unwrap();
+    let mapped = device.completed_readback(ticket).unwrap();
+    for byte in 0..16 {
+        let next = device.enqueue_buffer_readback(&[byte; 64]).unwrap();
+        device.flush().unwrap();
+        device.wait_for_work(next.work(), Duration::MAX).unwrap();
+        assert_eq!(
+            device.completed_readback(next).unwrap().as_ref(),
+            [byte; 64]
+        );
+        assert_eq!(mapped.as_ref(), [0x37; 64]);
+        assert_eq!(device.queue_usage().retained_readbacks, 1);
+    }
+    device.shutdown().unwrap();
+    drop(device);
+    assert_eq!(mapped.as_ref(), [0x37; 64]);
+    drop(mapped);
+    validation.check().unwrap();
+}
+
+#[test]
 #[ignore = "Explicit diagnostic: delays the native submit thread to measure zero-time polling"]
 fn profile_zero_timeout_submission_acknowledgement() {
     let Some(mut device) = support::device_for_test(crate::ApiPreference::Auto) else {
@@ -35,7 +81,12 @@ fn profile_zero_timeout_submission_acknowledgement() {
         );
     });
     assert!(device.wait_for_work(ticket.work(), Duration::MAX).unwrap());
-    assert_eq!(device.readback(ticket).unwrap(), [13; 64]);
+    device.flush().unwrap();
+    device.wait_for_work(ticket.work(), Duration::MAX).unwrap();
+    assert_eq!(
+        device.completed_readback(ticket).unwrap().as_ref(),
+        [13; 64]
+    );
     drop(device);
     validation.check().unwrap();
 }
@@ -168,11 +219,21 @@ fn exercise_reuse(api: crate::ApiPreference) {
     let last = device.preceding_work().unwrap();
     assert!(device.wait_for_work(last, Duration::from_secs(5)).unwrap());
     for (byte, read) in pending {
-        assert_eq!(device.readback(read).unwrap(), [byte; 128]);
+        device.flush().unwrap();
+        device.wait_for_work(read.work(), Duration::MAX).unwrap();
+        assert_eq!(
+            device.completed_readback(read).unwrap().as_ref(),
+            [byte; 128]
+        );
     }
     let read = device.enqueue_buffer_readback(&[0x37; 128]).unwrap();
     device.flush().unwrap();
-    assert_eq!(device.readback(read).unwrap(), [0x37; 128]);
+    device.flush().unwrap();
+    device.wait_for_work(read.work(), Duration::MAX).unwrap();
+    assert_eq!(
+        device.completed_readback(read).unwrap().as_ref(),
+        [0x37; 128]
+    );
     drop(device);
     validation.check().unwrap();
 }
@@ -206,7 +267,7 @@ fn shutdown_drains_accepted_work_and_cancels_unsubmitted_work() {
     device.shutdown().unwrap();
     assert_eq!(device.queue_usage().submitted_tick, submitted.tick());
     assert_eq!(device.queue_usage().completed_tick, submitted.tick());
-    assert!(device.readback(cancelled).is_err());
+    assert!(device.completed_readback(cancelled).is_err());
     assert!(device.discard_readback(accepted).is_err());
     assert_eq!(device.queue_usage().retained_readbacks, 0);
     drop(device);
@@ -335,7 +396,12 @@ fn full_chunks_record_without_submitting() {
         );
     });
     for (value, read) in reads {
-        assert_eq!(device.readback(read).unwrap(), [value; 16]);
+        device.flush().unwrap();
+        device.wait_for_work(read.work(), Duration::MAX).unwrap();
+        assert_eq!(
+            device.completed_readback(read).unwrap().as_ref(),
+            [value; 16]
+        );
     }
     drop(device);
     validation.check().unwrap();
@@ -359,7 +425,12 @@ fn recording_chunk_fullness_does_not_seal_a_native_batch() {
             .all(|(_, ticket)| ticket.work() == reads[0].1.work())
     );
     for (value, ticket) in reads {
-        assert_eq!(device.readback(ticket).unwrap(), [value; 16]);
+        device.flush().unwrap();
+        device.wait_for_work(ticket.work(), Duration::MAX).unwrap();
+        assert_eq!(
+            device.completed_readback(ticket).unwrap().as_ref(),
+            [value; 16]
+        );
     }
     drop(device);
     validation.check().unwrap();
@@ -422,7 +493,12 @@ fn deferred_cpu_readbacks_do_not_pin_completed_command_contexts() {
     assert_eq!(device.queue_usage().retained_readbacks, pending.len());
     assert_eq!(device.queue_usage().command_slots, 2);
     for (byte, read) in pending {
-        assert_eq!(device.readback(read).unwrap(), [byte; 64]);
+        device.flush().unwrap();
+        device.wait_for_work(read.work(), Duration::MAX).unwrap();
+        assert_eq!(
+            device.completed_readback(read).unwrap().as_ref(),
+            [byte; 64]
+        );
     }
     assert_eq!(device.queue_usage().retained_readbacks, 0);
     drop(device);

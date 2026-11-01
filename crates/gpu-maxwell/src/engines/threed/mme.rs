@@ -11,38 +11,7 @@ use nixe_gpu::GpuMethodId;
 
 use crate::MaxwellMethodSource;
 
-use super::{MaxwellThreeDRegister, state::verified_raw_register_reset};
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ShadowRegisters {
-    values: Box<[u32]>,
-    valid: [u64; 64],
-}
-
-impl Default for ShadowRegisters {
-    fn default() -> Self {
-        Self {
-            values: vec![0; 4096].into_boxed_slice(),
-            valid: [0; 64],
-        }
-    }
-}
-
-impl ShadowRegisters {
-    fn raw(&self, method: GpuMethodId) -> Option<u32> {
-        let index = (method.0 / 4) as usize;
-        (method.0.is_multiple_of(4)
-            && index < self.values.len()
-            && self.valid[index / 64] & (1 << (index % 64)) != 0)
-            .then(|| self.values[index])
-    }
-
-    fn write(&mut self, method: GpuMethodId, value: u32) {
-        let index = (method.0 / 4) as usize;
-        self.values[index] = value;
-        self.valid[index / 64] |= 1 << (index % 64);
-    }
-}
+use super::{MaxwellThreeDRegister, state::MaxwellThreeDRawRegisterFile as ShadowRegisters};
 
 /// Number of indexed MME shadow scratch registers exposed by `MAXWELL_B`.
 ///
@@ -116,29 +85,6 @@ impl MaxwellThreeDMmeShadowRamControl {
 
     const fn tracks(self) -> bool {
         matches!(self, Self::MethodTrack | Self::MethodTrackWithFilter)
-    }
-}
-
-/// Why one shadow-RAM transition cannot be represented faithfully.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum MaxwellThreeDMmeShadowRamError {
-    ReplayRegisterUnavailable { method_dword: u16 },
-}
-
-/// Index of one `SET_MME_SHADOW_SCRATCH(i)` register.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[repr(transparent)]
-pub struct MaxwellThreeDMmeShadowScratchIndex(u8);
-
-impl MaxwellThreeDMmeShadowScratchIndex {
-    #[must_use]
-    pub const fn new(raw: u8) -> Self {
-        Self(raw)
-    }
-
-    #[must_use]
-    pub const fn raw(self) -> u8 {
-        self.0
     }
 }
 
@@ -881,7 +827,6 @@ pub struct MaxwellThreeDMmeState {
     shadow_ram_control: MaxwellThreeDRegister<MaxwellThreeDMmeShadowRamControl>,
     mutable_method_control: MaxwellThreeDRegister<MaxwellThreeDMutableMethodControl>,
     shadow_registers: ShadowRegisters,
-    shadow_scratch: BTreeMap<u8, MaxwellThreeDRegister<u32>>,
 }
 
 impl Default for MaxwellThreeDMmeState {
@@ -909,7 +854,6 @@ impl Default for MaxwellThreeDMmeState {
             ),
             mutable_method_control: MaxwellThreeDRegister::default(),
             shadow_registers: ShadowRegisters::default(),
-            shadow_scratch: BTreeMap::new(),
         }
     }
 }
@@ -984,16 +928,23 @@ impl MaxwellThreeDMmeState {
         &self.mutable_method_control
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(in crate::engines) fn shadow_value(&self, method: GpuMethodId) -> Option<u32> {
         self.shadow_registers.raw(method)
     }
 
+    #[inline]
+    pub(super) fn shadow_word(&self, method: GpuMethodId) -> u32 {
+        self.shadow_registers.word(method)
+    }
+
+    #[inline]
     pub(super) fn resolve_shadow_argument(
         &self,
         method: GpuMethodId,
         submitted_argument: u32,
-    ) -> Result<u32, MaxwellThreeDMmeShadowRamError> {
+    ) -> u32 {
         // SET_MME_SHADOW_RAM_CONTROL consumes its non-shadowed argument so the
         // command stream can always leave replay mode. This agrees with the
         // source-preserving split used by yuzu's Maxwell frontend:
@@ -1002,13 +953,9 @@ impl MaxwellThreeDMmeState {
             || self.shadow_ram_control.value()
                 != Some(&MaxwellThreeDMmeShadowRamControl::MethodReplay)
         {
-            return Ok(submitted_argument);
+            return submitted_argument;
         }
-        self.shadow_value(method)
-            .or_else(|| verified_raw_register_reset(method))
-            .ok_or(MaxwellThreeDMmeShadowRamError::ReplayRegisterUnavailable {
-                method_dword: (method.0 / 4) as u16,
-            })
+        self.shadow_registers.word(method)
     }
 
     pub(super) fn track_shadow_register(
@@ -1030,19 +977,6 @@ impl MaxwellThreeDMmeState {
 
     pub(super) fn write_shadow_register(&mut self, method: GpuMethodId, argument: u32) {
         self.shadow_registers.write(method, argument);
-    }
-
-    #[must_use]
-    pub fn shadow_scratch(
-        &self,
-        index: MaxwellThreeDMmeShadowScratchIndex,
-    ) -> Option<&MaxwellThreeDRegister<u32>> {
-        self.shadow_scratch.get(&index.raw())
-    }
-
-    #[must_use]
-    pub fn shadow_scratch_count(&self) -> usize {
-        self.shadow_scratch.len()
     }
 
     pub(super) fn apply(&mut self, write: MaxwellThreeDMmeStateWrite) {
@@ -1117,14 +1051,6 @@ impl MaxwellThreeDMmeState {
             MaxwellThreeDMmeStateWrite::MutableMethodControl { value, source: _ } => {
                 self.mutable_method_control = MaxwellThreeDRegister::decoded(value.raw(), value);
             }
-            MaxwellThreeDMmeStateWrite::ShadowScratch {
-                index,
-                value,
-                source: _,
-            } => {
-                self.shadow_scratch
-                    .insert(index.raw(), MaxwellThreeDRegister::decoded(value, value));
-            }
         }
     }
 }
@@ -1156,11 +1082,6 @@ pub enum MaxwellThreeDMmeStateWrite {
     },
     MutableMethodControl {
         value: MaxwellThreeDMutableMethodControl,
-        source: MaxwellMethodSource,
-    },
-    ShadowScratch {
-        index: MaxwellThreeDMmeShadowScratchIndex,
-        value: u32,
         source: MaxwellMethodSource,
     },
 }

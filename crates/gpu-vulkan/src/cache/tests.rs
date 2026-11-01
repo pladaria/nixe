@@ -414,11 +414,11 @@ fn dynamic_offsets_reuse_one_set_and_preserve_bounds_and_gpu_leases() {
     drop(resources);
     assert!(device.wait_for_work(work, Duration::from_secs(10)).unwrap());
     assert_eq!(
-        unsafe { buffer.read_range(4, 4) }.unwrap(),
+        unsafe { buffer.completed_bytes(4, 4) }.unwrap(),
         24u32.to_le_bytes()
     );
     assert_eq!(
-        unsafe { buffer.read_range(alignment + 4, 4) }.unwrap(),
+        unsafe { buffer.completed_bytes(alignment + 4, 4) }.unwrap(),
         36u32.to_le_bytes()
     );
     drop(buffer);
@@ -1044,7 +1044,7 @@ fn prepared_captures_recycle_native_sets_and_rebind_old_data_after_completion() 
             .unwrap();
         dispatch(&mut device, &record);
         assert_eq!(
-            unsafe { buffer.read_range(i * alignment + 4, 4) }.unwrap(),
+            unsafe { buffer.completed_bytes(i * alignment + 4, 4) }.unwrap(),
             (i as u32 + 7).to_le_bytes()
         );
         captures.push(record);
@@ -1060,7 +1060,7 @@ fn prepared_captures_recycle_native_sets_and_rebind_old_data_after_completion() 
     }
     dispatch(&mut device, &captures[0]);
     assert_eq!(
-        unsafe { buffer.read_range(4, 4) }.unwrap(),
+        unsafe { buffer.completed_bytes(4, 4) }.unwrap(),
         108u32.to_le_bytes(),
         "an old capture must restore its own data after the native set was recycled"
     );

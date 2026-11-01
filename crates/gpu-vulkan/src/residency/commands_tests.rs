@@ -281,6 +281,7 @@ fn image_alias_invalidation_preserves_unrelated_buffer_pages() {
     let validation = cache.device.validation_monitor();
     let (_allocation_3, backing) = backing_allocation(&cache, 3 * 4096, 4096, 0x19);
     let alias = buffer(&mut cache, backing.clone());
+    cache.ensure_buffer(alias).unwrap();
     let (description, planes) = color_image();
     for offset in [0, 8192] {
         let image = cache
@@ -304,34 +305,22 @@ fn image_alias_invalidation_preserves_unrelated_buffer_pages() {
             )
             .unwrap();
     }
-    assert!(
-        cache
-            .buffer(alias)
-            .unwrap()
-            .contents
-            .device
-            .iter()
-            .any(ResourceObservation::is_invalid)
-    );
     let copied = cache.statistics().gpu_copied_bytes;
     let uploaded = cache.statistics().cpu_uploaded_bytes;
     // The middle page consumes neither image. Their writes must stay pending
-    // until their own ranges are requested, even after the observation resets.
+    // until their own ranges are requested. The synchronized middle page stays valid.
     assert_eq!(cache.read_buffer(alias, 4096, 32).unwrap(), [0x19; 32]);
     assert_eq!(cache.statistics().gpu_copied_bytes, copied);
-    assert_eq!(cache.statistics().cpu_uploaded_bytes - uploaded, 4096);
+    assert_eq!(cache.statistics().cpu_uploaded_bytes - uploaded, 0);
+    assert_eq!(cache.read_buffer(alias, 4096, 32).unwrap(), [0x19; 32]);
+    assert_eq!(cache.statistics().cpu_uploaded_bytes - uploaded, 0);
     let first = cache.read_buffer(alias, 0, 4096).unwrap();
     assert!(cache.statistics().gpu_copied_bytes > copied);
-    assert!(
-        cache
-            .buffer(alias)
-            .unwrap()
-            .invalid
-            .iter()
-            .any(|&(start, bytes)| start <= 8192 && start + bytes > 8192)
-    );
+    let copied_first = cache.statistics().gpu_copied_bytes;
     assert_eq!(cache.read_buffer(alias, 0, 4096).unwrap(), first);
+    assert_eq!(cache.statistics().gpu_copied_bytes, copied_first);
     let bytes = cache.read_buffer(alias, 0, 3 * 4096).unwrap();
+    assert!(cache.statistics().gpu_copied_bytes > copied_first);
     assert_eq!(&bytes[4096..8192], &[0x19; 4096]);
     for offset in [0, 8192] {
         for y in 0..6 {

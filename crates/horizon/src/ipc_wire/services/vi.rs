@@ -293,11 +293,9 @@ pub(in crate::ipc_wire) async fn dispatch_vi(
                     let Some(display_id) = request_u64(request.data, 0) else {
                         return cmif_error(request.token, HorizonIpcResult::CMIF_INVALID_IN_HEADER);
                     };
-                    let Some(event) = video.vsync_event(display_id) else {
-                        return cmif_error(
-                            request.token,
-                            HorizonIpcResult::SF_PRECONDITION_VIOLATION,
-                        );
+                    let event = match session.vsync_event(display_id) {
+                        Ok(event) => event,
+                        Err(result) => return cmif_error(request.token, result),
                     };
                     let handle = process.return_handle(event).map_err(IpcWireError::Handle)?;
                     Ok((

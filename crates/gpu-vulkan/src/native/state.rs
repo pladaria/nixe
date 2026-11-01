@@ -285,7 +285,6 @@ pub(super) fn guest_runtime(
         },
     };
     let mut runtime = GraphicsRuntimeState {
-        base_instance: Some(draw.shader_state.base_instance),
         vertex_input_types: [A::Disabled; 32],
         input_topology: match draw.topology {
             T::Points => I::Points,
@@ -408,26 +407,14 @@ pub(super) fn guest_push(
                     put(offset, 1f32.to_bits())?;
                 }
             }
-            H::TessellationLevelsPushConstants {
-                offset,
-                required_levels,
-            } => {
+            H::TessellationLevelsPushConstants { offset, .. } => {
                 let control = draw.and_then(|draw| draw.tessellation).map(|t| t.control);
-                let Some(nixe_gpu::TessellationControl::DefaultLevels {
-                    outer,
-                    inner,
-                    defined,
-                }) = control
+                let Some(nixe_gpu::TessellationControl::DefaultLevels { outer, inner }) = control
                 else {
                     return Err(VulkanError::InvalidResource(
-                        "default tessellation control requires programmed levels",
+                        "default tessellation control requires its level parameters",
                     ));
                 };
-                if defined & required_levels != required_levels {
-                    return Err(VulkanError::InvalidResource(
-                        "required default tessellation levels were not programmed",
-                    ));
-                }
                 for (lane, value) in outer.into_iter().chain(inner).enumerate() {
                     put(offset + lane as u32 * 4, value)?;
                 }

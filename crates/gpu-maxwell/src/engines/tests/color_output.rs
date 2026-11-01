@@ -15,12 +15,12 @@ fn color_mask_selector_starts_with_independent_masks_in_live_and_shadow_state() 
 
     program_three_d(&mut channel, 0x124, 3);
     let dispatch = dispatch_method(&mut channel, 0x0f90 / 4, u32::MAX).unwrap();
-    assert_eq!(dispatch.methods()[0].method().source().argument(), 0);
+    assert_eq!(dispatch.methods()[0].source().argument(), 0);
     program_three_d(&mut channel, 0x124, 0);
     program_three_d(&mut channel, 0x0f90, 1);
     program_three_d(&mut channel, 0x124, 3);
     let dispatch = dispatch_method(&mut channel, 0x0f90 / 4, 0).unwrap();
-    assert_eq!(dispatch.methods()[0].method().source().argument(), 1);
+    assert_eq!(dispatch.methods()[0].source().argument(), 1);
 }
 
 #[test]

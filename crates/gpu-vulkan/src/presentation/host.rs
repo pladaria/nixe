@@ -272,7 +272,9 @@ impl Host {
             .is_some_and(|(ticket, _)| ticket.work().tick() <= cache.device().completed_tick())
         {
             let (ticket, _) = capture.pending.pop_front().unwrap();
-            capture.bytes.extend(cache.device_mut().readback(ticket)?);
+            capture
+                .bytes
+                .extend_from_slice(&cache.device_mut().completed_readback(ticket)?);
         }
         while capture.next_row < capture.extent[1] && capture.pending.len() < 2 {
             let rows = (1024 * 1024 / (capture.extent[0] as usize * 4))

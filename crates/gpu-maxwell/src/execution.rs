@@ -145,6 +145,9 @@ impl std::error::Error for MaxwellSubmissionExecutionError {}
 /// The command owner consumes native effects and memory in the same ordered domain.
 /// Implemented directly by the GPU owner, which also services control/wakeup work.
 pub trait MaxwellCommandHost {
+    fn signal_syncpoint(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<(), MaxwellSubmissionExecutionError>>;
     fn emit(
         &mut self,
         work: NativeWork,
@@ -551,6 +554,7 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellCommandEffects<'a, L,
                             observed: self.completion_signal_count,
                         });
                     }
+                    self.host.signal_syncpoint().await?;
                 }
                 let drains_prior_work = matches!(
                     plan,
@@ -810,7 +814,10 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellCommandEffects<'a, L,
         self.cache.borrow_mut().recycle_mme_scratch(parameters);
     }
 
-    pub(crate) fn finish(self) -> Result<(), MaxwellSubmissionExecutionError> {
+    pub(crate) async fn finish(
+        mut self,
+        driver_wait_for_idle: bool,
+    ) -> Result<(), MaxwellSubmissionExecutionError> {
         if let Some(completion) = self.completion {
             let expected = completion
                 .increments()
@@ -831,7 +838,14 @@ impl<'a, L: MaxwellFrontend, H: MaxwellCommandHost> MaxwellCommandEffects<'a, L,
                 });
             }
         }
-
+        // The driver appends WFI unless suppressed, then two distinct increments.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
+        if driver_wait_for_idle {
+            self.command(NativeCommand::WaitForIdle).await?;
+        }
+        for _ in 0..self.driver_completion_increments {
+            self.host.signal_syncpoint().await?;
+        }
         Ok(())
     }
 }

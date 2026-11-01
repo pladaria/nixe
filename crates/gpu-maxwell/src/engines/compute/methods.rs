@@ -10,7 +10,7 @@ use super::{
     MaxwellComputeSpaVersion, MaxwellComputeState, MaxwellComputeStateWrite,
 };
 use crate::engines::{
-    AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation,
+    MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation,
 };
 use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
 
@@ -134,7 +134,7 @@ methods!(
 pub(super) fn preflight(
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellComputeState,
-) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
+) -> Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError> {
     let source = method.source();
     let declaration = METHODS
         .iter()
@@ -163,13 +163,9 @@ pub(super) fn preflight(
                 "SCHEDULE requires SEND_PCAS_A",
             )
         })?;
-        return Ok(AppliedMethod::new(
-            method,
-            *declaration.metadata,
-            Some(PendingEngineOperation::ComputeLaunch(
-                super::MaxwellComputeLaunch::new(address, raw & 1 != 0, source),
-            )),
-        ));
+        return Ok(Some(PendingEngineOperation::ComputeLaunch(
+            super::MaxwellComputeLaunch::new(address, raw & 1 != 0, source),
+        )));
     }
     let trigger = match declaration.action {
         MethodAction::WaitForIdle => {
@@ -208,11 +204,9 @@ pub(super) fn preflight(
         _ => None,
     };
     if let Some(trigger) = trigger {
-        return Ok(AppliedMethod::new(
-            method,
-            *declaration.metadata,
-            Some(PendingEngineOperation::ComputeSynchronization(trigger)),
-        ));
+        return Ok(Some(PendingEngineOperation::ComputeSynchronization(
+            trigger,
+        )));
     }
     if matches!(declaration.action, MethodAction::InlineToMemoryData) {
         let pending = candidate.inline_to_memory().pending().ok_or_else(|| {
@@ -248,11 +242,7 @@ pub(super) fn preflight(
             source,
         );
         candidate.apply(write);
-        return Ok(AppliedMethod::new(
-            method,
-            *declaration.metadata,
-            Some(PendingEngineOperation::ComputeInlineToMemory(upload)),
-        ));
+        return Ok(Some(PendingEngineOperation::ComputeInlineToMemory(upload)));
     }
     let write = match declaration.action {
         MethodAction::AddressUpper => MaxwellComputeStateWrite::AddressUpper {
@@ -442,7 +432,7 @@ pub(super) fn preflight(
         }
     };
     candidate.apply(write);
-    Ok(AppliedMethod::new(method, *declaration.metadata, None))
+    Ok(None)
 }
 
 fn invalid_encoding(
@@ -490,7 +480,7 @@ pub(in crate::engines) fn data_words(
         next_offset: pending.next_offset() + count as u32 * 4,
         source: last,
     });
-    let Some(PendingEngineOperation::ComputeInlineToMemory(upload)) = applied.operation else {
+    let Some(PendingEngineOperation::ComputeInlineToMemory(upload)) = applied else {
         unreachable!()
     };
     Ok((upload, count))

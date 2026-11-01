@@ -1,8 +1,8 @@
 //! Typed, source-preserving `MAXWELL_B` register state.
 //!
 //! Register writes remain separate from their later draw-time interpretation.
-//! In particular, an undocumented hardware reset must stay `Unset`: zero is
-//! not a reset value unless a pinned public source establishes that fact.
+//! The live and shadow banks share initialized class state. Typed views decode
+//! those words when consumed, without tracking whether the guest wrote them.
 
 use std::sync::Arc;
 
@@ -17,14 +17,12 @@ use super::output::{
 
 use super::{
     MAXWELL_COLOR_TARGET_COUNT, MAXWELL_PIPELINE_SHADER_COUNT, MaxwellThreeDColorReductionState,
-    MaxwellThreeDCoverageState, MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconState,
-    MaxwellThreeDFixedFunctionState, MaxwellThreeDInlineToMemoryState,
-    MaxwellThreeDInlineToMemoryStateWrite, MaxwellThreeDLineState,
-    MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState, MaxwellThreeDMmeStateWrite,
-    MaxwellThreeDRenderEnableState, MaxwellThreeDRenderTargetState,
+    MaxwellThreeDCoverageState, MaxwellThreeDFixedFunctionState, MaxwellThreeDInlineToMemoryState,
+    MaxwellThreeDInlineToMemoryStateWrite, MaxwellThreeDLineState, MaxwellThreeDMmeState,
+    MaxwellThreeDMmeStateWrite, MaxwellThreeDRenderEnableState, MaxwellThreeDRenderTargetState,
     MaxwellThreeDReportSemaphoreState, MaxwellThreeDResourceRole, MaxwellThreeDShaderBindingState,
-    MaxwellThreeDShaderBindingWrite, MaxwellThreeDShaderExecutionState,
-    MaxwellThreeDVertexInputState, MaxwellThreeDVertexInputWrite,
+    MaxwellThreeDShaderExecutionState, MaxwellThreeDVertexInputState,
+    MaxwellThreeDVertexInputWrite,
     render_targets::{
         MAXWELL_THREE_D_COLOR_COMPRESSION_BASE_METHOD, MAXWELL_THREE_D_COLOR_COMPRESSION_RESET,
         MAXWELL_THREE_D_COLOR_COMPRESSION_STRIDE, MAXWELL_THREE_D_COLOR_TARGET_BASE_METHOD,
@@ -75,16 +73,16 @@ pub(super) const MAXWELL_THREE_D_WINDOW_ORIGIN_RESET: u32 = 0;
 
 /// Returns a raw class-register reset verified by pinned public sources.
 ///
-/// The live and MME shadow register files share this lookup so replay starts
-/// from the same architectural state. Registers absent from this set remain
-/// unknown rather than being silently fabricated as zero.
+/// The live and MME shadow banks share these explicit reset overrides on top
+/// of their zero-initialized register storage, as in Maxwell3D initialization.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
 pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u32> {
     match method.0 {
         // GM20B method initialization explicitly clears scratch words 0..127.
         // Table SHA-256: 6372e2f6f547d7bd086beb066ce46ac379795f95c38eeeedd9e13c7b32515b24.
         // Each entry encodes (method_dword << 16) | class, followed by value;
         // B197 entries 0x0d00..0x0d7f are all zero. The upper half is not
-        // covered by this table and remains unknown until programmed.
+        // covered by this table and retains the register bank's zero baseline.
         // https://gitlab.com/kernel-firmware/linux-firmware/-/blob/main/WHENCE
         // https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/nouveau/nvkm/engine/gr/gk20a.c#L110-L149
         // The same GM20B table disables sparse depth (B197 dword 0x482).
@@ -134,7 +132,7 @@ pub(super) const fn verified_raw_register_reset(method: GpuMethodId) -> Option<u
         // raster/test selectors
         // selectors at 0x22f0, 0x2450, 0x21e0, 0x2758, 0x25b0, 0x21e8,
         // 0x2408, 0x2400, 0x25b8, 0x25d8, 0x2690, 0x25e0, 0x25f8,
-        // 0x2678 and 0x2770. Unknown methods still have no reset.
+        // 0x2678 and 0x2770. Other methods retain their initialized baseline.
         0x0210 | 0x0744 | 0x0dc8 | 0x0dd0 | 0x0e00 | 0x0f1c | 0x0f40 | 0x0fb4 | 0x0ff4 | 0x0ff8
         | 0x1148 | 0x11f8 | 0x1224 | 0x12cc | 0x12ec | 0x1380 | 0x1534 | 0x153c | 0x15d0
         | 0x1944 | 0x19bc | 0x19c4 => Some(0),
@@ -237,7 +235,7 @@ impl<T> MaxwellThreeDRegister<T> {
         self.raw
     }
 
-    /// Typed value, available only when the register has a valid origin.
+    /// Typed value, available when the stored encoding is supported.
     #[must_use]
     pub const fn value(&self) -> Option<&T> {
         self.value.as_ref()
@@ -269,25 +267,68 @@ impl<T> MaxwellThreeDRegister<T> {
     }
 }
 
+// The 0xe00 class words end where macro call/data methods begin.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.h
+const CLASS_REGISTER_WORDS: usize = 0xe00;
+
 /// The fixed class register file keeps consumed raw words dense.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct MaxwellThreeDRawRegisterFile {
     values: Box<[u32]>,
-    valid: [u64; 64],
 }
 
 impl Default for MaxwellThreeDRawRegisterFile {
     fn default() -> Self {
-        let mut registers = Self {
-            values: vec![0; 0x1000].into_boxed_slice(),
-            valid: [0; 64],
-        };
-        for index in 0..4096 {
-            if let Some(value) = verified_raw_register_reset(GpuMethodId(index * 4)) {
-                registers.set_reset(GpuMethodId(index * 4), value);
+        let mut values = vec![0; CLASS_REGISTER_WORDS].into_boxed_slice();
+        // Maxwell3D initializes both banks identically. Keep renderer-required
+        // defaults in the bank itself, then apply the documented GM20B resets.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
+        for (method, value) in [
+            (0x037c, 1),
+            (0x0fac, 1),
+            (0x15b8, 1),
+            (0x1518, 1.0_f32.to_bits()),
+            (0x13b0, 1.0_f32.to_bits()),
+            (0x13b4, 1.0_f32.to_bits()),
+            (0x130c, 0x207),
+            (0x1594, 1),
+            (0x0f58, u32::MAX),
+            (0x0f5c, u32::MAX),
+            (0x1398, u32::MAX),
+            (0x139c, u32::MAX),
+            (0x1340, 1),
+            (0x1344, 2),
+            (0x1348, 1),
+            (0x134c, 1),
+            (0x1350, 2),
+            (0x1358, 1),
+        ] {
+            values[method / 4] = value;
+        }
+        for viewport in 0..16 {
+            values[(0x0a18 + viewport * 0x20) / 4] = 0x6420;
+            values[(0x0c0c + viewport * 0x10) / 4] = 1.0_f32.to_bits();
+        }
+        for attribute in 0..32 {
+            values[0x1160 / 4 + attribute] = 1 << 6;
+        }
+        for target in 0..8 {
+            values[0x1a00 / 4 + target] = 0x1111;
+            for (offset, value) in [(4, 1), (8, 2), (12, 1), (16, 1), (20, 2), (24, 1)] {
+                values[(0x1e00 + target * 0x20 + offset) / 4] = value;
             }
         }
-        registers
+        for base in [0x1384, 0x1598] {
+            for (offset, value) in [(0, 1), (4, 1), (8, 1), (12, 0x207)] {
+                values[(base + offset) / 4] = value;
+            }
+        }
+        for (index, value) in values.iter_mut().enumerate() {
+            if let Some(reset) = verified_raw_register_reset(GpuMethodId(index as u32 * 4)) {
+                *value = reset;
+            }
+        }
+        Self { values }
     }
 }
 
@@ -296,9 +337,13 @@ impl MaxwellThreeDRawRegisterFile {
         if !method.0.is_multiple_of(4) {
             return None;
         }
-        let index = (method.0 / 4) as usize;
-        (index < self.values.len() && self.valid[index / 64] & (1 << (index % 64)) != 0)
-            .then(|| self.values[index])
+        self.values.get((method.0 / 4) as usize).copied()
+    }
+
+    #[inline]
+    pub(super) fn word(&self, method: GpuMethodId) -> u32 {
+        debug_assert!(method.0.is_multiple_of(4));
+        self.values[(method.0 / 4) as usize]
     }
 
     #[inline]
@@ -307,21 +352,15 @@ impl MaxwellThreeDRawRegisterFile {
         method: u32,
         decode: impl FnOnce(u32) -> Option<T>,
     ) -> MaxwellThreeDRegister<T> {
-        let raw = self.raw(GpuMethodId(method));
-        let value = raw.and_then(decode);
-        MaxwellThreeDRegister { raw, value }
-    }
-
-    fn set_reset(&mut self, method: GpuMethodId, value: u32) {
-        let index = (method.0 / 4) as usize;
-        self.values[index] = value;
-        self.valid[index / 64] |= 1 << (index % 64);
+        let raw = self.word(GpuMethodId(method));
+        MaxwellThreeDRegister {
+            raw: Some(raw),
+            value: decode(raw),
+        }
     }
 
     pub(super) fn write(&mut self, method: GpuMethodId, value: u32) {
-        let index = (method.0 / 4) as usize;
-        self.values[index] = value;
-        self.valid[index / 64] |= 1 << (index % 64);
+        self.values[(method.0 / 4) as usize] = value;
     }
 }
 
@@ -803,12 +842,11 @@ pub struct MaxwellThreeDState {
     dirty_vertices: u32,
     dirty_colors: u8,
     inline_index: Option<Arc<[u8]>>,
-    // Revisions are local to one register-file lifetime. Retain a namespace
-    // across snapshots so shared caches cannot confuse two channels whose
-    // independent revision counters happen to have the same numeric value.
-    cache_scope: Arc<()>,
+    // Renderer preparation and revisions belong to the same channel lifetime.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/control/channel_state_cache.h
     draw_state_revision: u64,
     draw_parameters_revision: u64,
+    resource_selection_revision: u64,
     color_target_revisions: [u64; 8],
     depth_target_revision: u64,
     vertex_slots: [u64; 32],
@@ -823,7 +861,6 @@ pub struct MaxwellThreeDState {
     shader_revision: u64,
     primitive_sequence: super::vertex::MaxwellThreeDPrimitiveSequence,
     shader_resources: super::bindings::MaxwellThreeDShaderResources,
-    falcon: Box<MaxwellThreeDFalconState>,
     inline_transfer: Option<super::inline_to_memory::PendingTransfer>,
 }
 
@@ -831,48 +868,42 @@ pub struct MaxwellThreeDState {
 ///
 /// State domains unrelated to resource resolution deliberately do not advance
 /// the retained revisions or invalidate this identity.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct MaxwellThreeDResourceStateIdentity {
-    scope: Arc<()>,
     role: MaxwellThreeDResourceRole,
     revision: u64,
     constant_buffers: [Option<(u8, u8, u64)>; 2],
     sample_mode: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct MaxwellThreeDResourceGroupIdentity {
-    scope: Arc<()>,
     revision: u64,
 }
 
 impl MaxwellThreeDResourceGroupIdentity {
     pub(crate) fn matches(&self, state: &MaxwellThreeDState, group: usize) -> bool {
-        Arc::ptr_eq(&self.scope, &state.cache_scope)
-            && self.revision == state.resource_group_revisions[group]
+        self.revision == state.resource_group_revisions[group]
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct MaxwellThreeDShaderStateIdentity {
-    scope: Arc<()>,
     revision: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct MaxwellThreeDDrawStateIdentity {
-    scope: Arc<()>,
     revision: u64,
     parameters_revision: u64,
 }
 
 impl MaxwellThreeDDrawStateIdentity {
     pub(crate) fn matches_parameters(&self, state: &MaxwellThreeDState) -> bool {
-        Arc::ptr_eq(&self.scope, &state.cache_scope)
-            && self.parameters_revision == state.draw_parameters_revision
+        self.parameters_revision == state.draw_parameters_revision
     }
     pub(crate) fn matches(&self, state: &MaxwellThreeDState) -> bool {
-        Arc::ptr_eq(&self.scope, &state.cache_scope) && self.revision == state.draw_state_revision
+        self.revision == state.draw_state_revision
     }
 }
 
@@ -886,14 +917,13 @@ pub(in crate::engines) enum GeneratedPrimitive {
 
 impl MaxwellThreeDShaderStateIdentity {
     pub(crate) fn matches_code(&self, state: &MaxwellThreeDState) -> bool {
-        Arc::ptr_eq(&self.scope, &state.cache_scope) && self.revision == state.shader_revision
+        self.revision == state.shader_revision
     }
 }
 
 impl MaxwellThreeDResourceStateIdentity {
     pub(crate) fn matches(&self, state: &MaxwellThreeDState) -> bool {
-        Arc::ptr_eq(&self.scope, &state.cache_scope)
-            && self.revision == state.binding_revision(self.role)
+        self.revision == state.binding_revision(self.role)
             && self
                 .constant_buffers
                 .iter()
@@ -1056,7 +1086,7 @@ impl MaxwellThreeDFrontendState {
     }
 
     pub(super) fn write_register(&mut self, method: GpuMethodId, argument: u32) {
-        if self.operation.registers.raw(method) == Some(argument) {
+        if self.operation.registers.word(method) == argument {
             return;
         }
         self.operation.registers.write(method, argument);
@@ -1093,6 +1123,9 @@ impl MaxwellThreeDFrontendState {
         }
         if domains & D::PARAMETERS != 0 {
             advance_revision(&mut state.draw_parameters_revision);
+        }
+        if domains & D::SELECTION != 0 {
+            advance_revision(&mut state.resource_selection_revision);
         }
         if domains & D::SHADERS != 0 {
             advance_revision(&mut state.shader_revision);
@@ -1143,7 +1176,6 @@ impl MaxwellThreeDState {
     }
     pub(crate) fn draw_state_identity(&self) -> MaxwellThreeDDrawStateIdentity {
         MaxwellThreeDDrawStateIdentity {
-            scope: Arc::clone(&self.cache_scope),
             revision: self.draw_state_revision,
             parameters_revision: self.draw_parameters_revision,
         }
@@ -1159,6 +1191,9 @@ impl MaxwellThreeDState {
             }
             R::ColorTarget(slot) => self.color_target_revisions[slot as usize],
             R::DepthStencilTarget => self.depth_target_revision,
+            R::SampledImage {
+                with_sampler: true, ..
+            } => self.resource_group_revisions[2],
             R::SampledImage { .. } | R::TextureHeaders => self.texture_header_revision,
             R::Sampler(_) | R::Samplers => self.sampler_revision,
             R::BlitSource | R::BlitDestination => 0,
@@ -1186,7 +1221,6 @@ impl MaxwellThreeDState {
             _ => [None; 2],
         };
         MaxwellThreeDResourceStateIdentity {
-            scope: Arc::clone(&self.cache_scope),
             role,
             revision: self.binding_revision(role),
             constant_buffers,
@@ -1195,19 +1229,21 @@ impl MaxwellThreeDState {
         }
     }
 
+    pub(crate) fn resource_selection_revision(&self) -> u64 {
+        self.resource_selection_revision
+    }
+
     pub(crate) fn resource_group_identity(
         &self,
         group: usize,
     ) -> MaxwellThreeDResourceGroupIdentity {
         MaxwellThreeDResourceGroupIdentity {
-            scope: Arc::clone(&self.cache_scope),
             revision: self.resource_group_revisions[group],
         }
     }
 
     pub(crate) fn shader_state_identity(&self) -> MaxwellThreeDShaderStateIdentity {
         MaxwellThreeDShaderStateIdentity {
-            scope: Arc::clone(&self.cache_scope),
             revision: self.shader_revision,
         }
     }
@@ -1298,11 +1334,6 @@ impl MaxwellThreeDState {
     }
 
     #[must_use]
-    pub fn falcon(&self) -> &MaxwellThreeDFalconState {
-        self.falcon.as_ref()
-    }
-
-    #[must_use]
     pub fn inline_to_memory(&self) -> MaxwellThreeDInlineToMemoryState<'_> {
         MaxwellThreeDInlineToMemoryState {
             registers: &self.registers,
@@ -1390,39 +1421,27 @@ impl MaxwellThreeDFrontendState {
                 }
             },
             MaxwellThreeDStateWrite::VertexInput(write) => self.apply_primitive(write),
-            MaxwellThreeDStateWrite::ShaderBinding(write) => {
-                if let MaxwellThreeDShaderBindingWrite::BindConstantBuffer {
-                    group,
-                    slot,
-                    enabled,
-                    address,
-                    size,
-                    ..
-                } = write
-                {
-                    let previous = self.operation.shader_bindings().groups()[group as usize]
-                        .constant_buffers()[slot as usize];
-                    if previous.is_none_or(|p| {
-                        p.enabled() != enabled || p.address() != address || p.size() != size
-                    }) {
-                        advance_revision(
-                            &mut self.operation.constant_slots[group as usize][slot as usize],
-                        );
-                        advance_revision(&mut self.operation.constant_buffer_revision);
-                        advance_revision(&mut self.operation.resource_group_revisions[1]);
-                        advance_revision(&mut self.operation.resource_group_revisions[2]);
-                    }
+            MaxwellThreeDStateWrite::BindConstantBuffer {
+                group,
+                slot,
+                binding,
+            } => {
+                let previous = self.operation.shader_bindings().groups()[group as usize]
+                    .constant_buffers()[slot as usize];
+                if previous.is_none_or(|p| {
+                    p.enabled() != binding.enabled()
+                        || p.address() != binding.address()
+                        || p.size() != binding.size()
+                }) {
+                    advance_revision(
+                        &mut self.operation.constant_slots[group as usize][slot as usize],
+                    );
+                    advance_revision(&mut self.operation.constant_buffer_revision);
+                    advance_revision(&mut self.operation.resource_group_revisions[1]);
+                    advance_revision(&mut self.operation.resource_group_revisions[2]);
                 }
-                self.operation.shader_resources.apply(write);
-            }
-            MaxwellThreeDStateWrite::FalconMaskedRegister(write) => {
-                self.operation.falcon.apply(write);
-                self.mme.apply(MaxwellThreeDMmeStateWrite::ShadowScratch {
-                    index: MaxwellThreeDMmeShadowScratchIndex::new(0),
-                    value: 1,
-                    source: write.source(),
-                });
-                self.operation.registers.write(GpuMethodId(0x3400), 1);
+                self.operation.shader_resources.groups[group as usize].constant_buffers
+                    [slot as usize] = Some(binding);
             }
             MaxwellThreeDStateWrite::Mme(write) => self.mme.apply(write),
         }
@@ -1440,8 +1459,11 @@ fn advance_revision(revision: &mut u64) {
 pub enum MaxwellThreeDStateWrite {
     InlineToMemory(MaxwellThreeDInlineToMemoryStateWrite),
     VertexInput(MaxwellThreeDVertexInputWrite),
-    ShaderBinding(MaxwellThreeDShaderBindingWrite),
-    FalconMaskedRegister(MaxwellThreeDFalconMaskedRegisterWrite),
+    BindConstantBuffer {
+        group: u8,
+        slot: u8,
+        binding: super::MaxwellThreeDConstantBufferBinding,
+    },
     Mme(MaxwellThreeDMmeStateWrite),
 }
 
@@ -1468,7 +1490,7 @@ mod tests {
                     Some(expected)
                 );
             }
-            assert!((0..3).all(|axis| viewport.scale(axis).value().is_none()));
+            assert!((0..3).all(|axis| viewport.scale(axis).raw() == Some(0)));
         }
     }
 }

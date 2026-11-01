@@ -359,7 +359,9 @@ impl VulkanResidency {
         self.check_buffer_range(id, offset, size)?;
         let ticket = self.download_buffer(id, offset, size)?;
         self.flush()?;
-        let bytes = self.device.readback(ticket)?;
+        self.device
+            .wait_for_work(ticket.work(), std::time::Duration::MAX)?;
+        let bytes = self.device.completed_readback(ticket)?.to_vec();
         self.statistics.native_readback_bytes += size;
         Ok(bytes)
     }

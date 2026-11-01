@@ -338,18 +338,27 @@ impl Barriers {
     }
 }
 impl VulkanResidency {
-    /// Guest WFI and ordered completion writes are device dependencies. Queue
-    /// submission order alone would not establish availability/visibility.
-    /// https://docs.vulkan.org/guide/latest/synchronization_examples.html
+    /// WFI orders shader and transfer execution, excluding pixel operations.
+    /// The adjacent SetEvent/WaitEvents used by Eden has empty access scopes;
+    /// a single synchronization2 execution barrier expresses the same dependency.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp#L853-L879
+    /// https://docs.vulkan.org/spec/latest/chapters/synchronization.html#synchronization-execution-dependencies
     pub(crate) fn order_device(&mut self) -> Result<(), VulkanError> {
+        self.realize_deferred_clears()?;
+        let mut stages = vk::PipelineStageFlags2::DRAW_INDIRECT
+            | vk::PipelineStageFlags2::VERTEX_INPUT
+            | vk::PipelineStageFlags2::PRE_RASTERIZATION_SHADERS
+            | vk::PipelineStageFlags2::FRAGMENT_SHADER
+            | vk::PipelineStageFlags2::COMPUTE_SHADER
+            | vk::PipelineStageFlags2::ALL_TRANSFER;
+        if self.device.profile().transform_feedback {
+            stages |= vk::PipelineStageFlags2::TRANSFORM_FEEDBACK_EXT;
+        }
         self.barriers.memory_dependency(Dependency {
-            source: AccessScope::new(
-                vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::MEMORY_WRITE,
-            ),
+            source: AccessScope::new(stages, vk::AccessFlags2::NONE),
             destination: AccessScope::new(
                 vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+                vk::AccessFlags2::NONE,
             ),
         });
         if self.device.submission.recording.is_some() {
@@ -416,6 +425,17 @@ impl VulkanResidency {
         scope: AccessScope,
         conventional: vk::ImageLayout,
     ) -> Result<(vk::Image, vk::ImageLayout), VulkanError> {
+        if !scope.access.intersects(
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        ) && self.deferred_clears.iter().any(|clear| {
+            clear.image == id
+                || self
+                    .authority
+                    .resources_may_overlap(Resource::Image(clear.image), Resource::Image(id))
+        }) {
+            self.realize_deferred_clears()?;
+        }
         self.image(id)?;
         if scope
             .access

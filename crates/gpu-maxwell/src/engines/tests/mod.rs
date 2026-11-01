@@ -10,7 +10,7 @@ use super::*;
 
 mod bindings;
 mod bulk;
-use bindings::{fixture_bindings, fixture_roles};
+use bindings::fixture_roles;
 mod collector;
 mod compute_launch;
 use collector::*;
@@ -281,7 +281,6 @@ pub(crate) fn program_three_d(
     dispatch_method(channel, method / 4, argument)
         .unwrap()
         .methods()[0]
-        .method()
         .source()
 }
 

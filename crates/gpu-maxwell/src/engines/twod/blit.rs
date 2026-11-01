@@ -1,14 +1,11 @@
 //! Source-preserving 2D surfaces and the pixels-from-memory launch boundary.
 use super::{
-    CLASS, MaxwellTwoDClipEnable, MaxwellTwoDColorKeyEnable, MaxwellTwoDOperation,
-    MaxwellTwoDRegister, MaxwellTwoDRenderEnableMode, MaxwellTwoDState,
+    MaxwellTwoDClipEnable, MaxwellTwoDColorKeyEnable, MaxwellTwoDOperation, MaxwellTwoDRegister,
+    MaxwellTwoDRenderEnableMode, MaxwellTwoDState,
 };
-use crate::engines::{
-    AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation,
-};
+use crate::engines::{MaxwellEngineDispatchError, PendingEngineOperation};
 use crate::engines::{MaxwellMemoryCopyLayout, MaxwellMemoryCopyOperation};
 use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
-use nixe_gpu::GpuMethodId;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MaxwellTwoDBlitState {
@@ -466,7 +463,7 @@ impl MaxwellTwoDBlitState {
 pub(super) fn apply(
     method: MaxwellMethodDispatch,
     state: &mut MaxwellTwoDState,
-) -> Option<Result<AppliedMethod, MaxwellEngineDispatchError>> {
+) -> Option<Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError>> {
     let source = method.source();
     let address = source.method().0;
     // https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/twod/cl902d.h
@@ -559,9 +556,5 @@ pub(super) fn apply(
     } else {
         None
     };
-    Some(Ok(AppliedMethod::new(
-        method,
-        MaxwellEngineMethodMetadata::new(CLASS, "FERMI_TWOD_A", GpuMethodId(address), name),
-        operation,
-    )))
+    Some(Ok(operation))
 }

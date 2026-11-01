@@ -44,14 +44,7 @@ pub struct TessellationMode {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TessellationControl {
     Shader,
-    DefaultLevels {
-        outer: [u32; 4],
-        inner: [u32; 2],
-        /// Bits 0..3 identify programmed outer lanes; 4..5 identify inner
-        /// lanes. Unset lanes are padding, never a guest-visible zero default.
-        /// TES may read levels not consumed by the fixed-function domain.
-        defined: u8,
-    },
+    DefaultLevels { outer: [u32; 4], inner: [u32; 2] },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

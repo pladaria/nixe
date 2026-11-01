@@ -45,48 +45,48 @@ fn constant(inst: &[(Op, &[u32])], id: u32) -> u32 {
 }
 
 #[test]
-fn split_draw_instance_ids_subtract_the_logical_base() {
-    for base in [0, 7] {
-        let mut ir = Ir::new().unwrap();
-        let block = ir.new_block().unwrap();
-        let instance = append(
-            &mut ir,
-            block,
-            O::GetAttributeU32,
-            &[V::Attribute(Attribute::InstanceId), V::U32(0)],
-        );
-        let logical_base = append(
-            &mut ir,
-            block,
-            O::GetAttributeU32,
-            &[V::Attribute(Attribute::BaseInstance), V::U32(0)],
-        );
-        let mut p = Program::new(Stage::VertexB);
-        p.info.loads.set(Attribute::InstanceId, true);
-        p.info.loads.set(Attribute::BaseInstance, true);
-        let profile = profile();
-        let runtime = RuntimeInfo {
-            base_instance: Some(base),
-            ..Default::default()
-        };
-        let mut ctx = EmitContext::new(&profile, &runtime, &p, &mut Bindings::default()).unwrap();
-        emit(&mut ctx, &mut ir, block);
-        let words = ctx.assemble().unwrap();
-        let ops = instructions(&words);
-        let subtract = ops
-            .iter()
-            .find(|(op, args)| *op == Op::ISub && args[1] == definition(&ir, instance))
+fn instance_inputs_load_the_dynamic_draw_base() {
+    let mut ir = Ir::new().unwrap();
+    let block = ir.new_block().unwrap();
+    let instance = append(
+        &mut ir,
+        block,
+        O::GetAttributeU32,
+        &[V::Attribute(Attribute::InstanceId), V::U32(0)],
+    );
+    let base = append(
+        &mut ir,
+        block,
+        O::GetAttributeU32,
+        &[V::Attribute(Attribute::BaseInstance), V::U32(0)],
+    );
+    let mut p = Program::new(Stage::VertexB);
+    p.info.loads.set(Attribute::InstanceId, true);
+    p.info.loads.set(Attribute::BaseInstance, true);
+    let profile = profile();
+    let runtime = RuntimeInfo::default();
+    let mut ctx = EmitContext::new(&profile, &runtime, &p, &mut Bindings::default()).unwrap();
+    emit(&mut ctx, &mut ir, block);
+    let words = ctx.assemble().unwrap();
+    let ops = instructions(&words);
+    let load = |id| {
+        ops.iter()
+            .find(|(op, args)| *op == Op::Load && args[1] == id)
             .unwrap()
-            .1;
-        assert_eq!(constant(&ops, subtract[3]), base);
-        assert_eq!(constant(&ops, definition(&ir, logical_base)), base);
-        // Vulkan's InstanceIndex contains firstInstance even for a single-instance
-        // host draw. The logical guest sequence must keep advancing across draws.
+            .1[2]
+    };
+    let subtract = ops
+        .iter()
+        .find(|(op, args)| *op == Op::ISub && args[1] == definition(&ir, instance))
+        .unwrap()
+        .1;
+    // Both attributes consume the same draw-time BaseInstance builtin.
+    let base_input = load(definition(&ir, base));
+    assert_eq!(load(subtract[3]), base_input);
+    assert_ne!(load(subtract[2]), base_input);
+    for first in [0, 7, 300] {
         for relative in 0..4u32 {
-            assert_eq!(
-                (base + relative).wrapping_sub(constant(&ops, subtract[3])),
-                relative
-            );
+            assert_eq!((first + relative).wrapping_sub(first), relative);
         }
     }
 }

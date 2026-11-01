@@ -30,33 +30,24 @@ impl ComputeTextures {
         {
             return Ok(false);
         }
-        if self.mapping_generation != space.mapping_generation().get() {
+        let generation = space.mapping_generation().get();
+        if self.mapping_generation != generation {
             if self.resources.resources().any(|r| {
                 r.source()
                     .segments()
                     .iter()
                     .any(|s| !space.retained_mapping_is_current(s.mapping()))
-            }) || self.reads.iter().any(|read| {
-                let MaxwellThreeDDescriptorRead::Direct { pointer_source, .. } = read else {
-                    return false;
-                };
-                pointer_source.as_ref().is_some_and(|source| {
-                    source
-                        .segments()
-                        .iter()
-                        .any(|s| !space.retained_mapping_is_current(s.mapping()))
-                })
             }) {
                 return Ok(false);
             }
-            self.mapping_generation = space.mapping_generation().get();
+            self.mapping_generation = generation;
         }
         let tables = &mut cache.retained_backings.compute_descriptor_tables;
         for table in tables.iter_mut() {
             table.next_epoch();
         }
         let mut batch = space.read_batch();
-        for read in &self.reads {
+        for read in &mut self.reads {
             if !read.refresh(space, access, tables, &mut batch)? {
                 return Ok(false);
             }
@@ -180,6 +171,7 @@ impl MaxwellThreeDResolvedResourceCache {
                 let role = MaxwellThreeDResourceRole::SampledImage {
                     texture: reference,
                     dimension,
+                    with_sampler: true,
                 };
                 bindings.push((
                     nixe_gpu::shader_module::guest_resource(
@@ -220,9 +212,10 @@ impl MaxwellThreeDResolvedResourceCache {
                     .secondary
                     .and_then(|(slot, _, _)| launch.constant_buffer(slot).ok()),
             )?;
-            builder.sampled_texture(Some(true), Some(mode), reference, handle, dimension, true)?;
+            builder.sampled_texture(Some(mode), reference, handle, dimension, true)?;
             builder.sampler(Some(mode), reference, handle)?;
         }
+        let mapping_generation = builder.mapping_generation;
         let (resources, reads) = builder.finish()?;
         bindings.sort_unstable_by_key(|(id, _)| *id);
         Ok(Some(ComputeTextures {
@@ -231,7 +224,7 @@ impl MaxwellThreeDResolvedResourceCache {
             reads,
             pools: [launch.texture_pool, launch.sampler_pool],
             address_space: space.id(),
-            mapping_generation: space.mapping_generation().get(),
+            mapping_generation,
         }))
     }
 }

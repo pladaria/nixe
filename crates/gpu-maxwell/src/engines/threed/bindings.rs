@@ -220,10 +220,10 @@ impl MaxwellThreeDInlineConstantBufferUpload {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDConstantBufferBinding {
-    enabled: bool,
-    address: Option<MaxwellThreeDUnresolvedAddress>,
-    size: Option<u32>,
-    source: MaxwellMethodSource,
+    pub(super) enabled: bool,
+    pub(super) address: Option<MaxwellThreeDUnresolvedAddress>,
+    pub(super) size: Option<u32>,
+    pub(super) source: MaxwellMethodSource,
 }
 
 impl MaxwellThreeDConstantBufferBinding {
@@ -247,7 +247,7 @@ impl MaxwellThreeDConstantBufferBinding {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellThreeDBindGroupState {
-    constant_buffers:
+    pub(super) constant_buffers:
         [Option<MaxwellThreeDConstantBufferBinding>; MAXWELL_CONSTANT_BUFFER_SLOT_COUNT],
 }
 
@@ -305,42 +305,12 @@ impl MaxwellThreeDDescriptorPoolState<'_> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct MaxwellThreeDShaderResources {
-    groups: Box<[MaxwellThreeDBindGroupState; MAXWELL_BIND_GROUP_COUNT]>,
-    constant_buffer_offset: Option<u32>,
+    pub(super) groups: Box<[MaxwellThreeDBindGroupState; MAXWELL_BIND_GROUP_COUNT]>,
 }
 impl Default for MaxwellThreeDShaderResources {
     fn default() -> Self {
         Self {
             groups: Box::new(std::array::from_fn(|_| Default::default())),
-            constant_buffer_offset: None,
-        }
-    }
-}
-impl MaxwellThreeDShaderResources {
-    pub(super) fn apply(&mut self, write: MaxwellThreeDShaderBindingWrite) {
-        match write {
-            MaxwellThreeDShaderBindingWrite::ConstantBufferLoadOffset { value, .. } => {
-                self.constant_buffer_offset = Some(u32::from(value));
-            }
-            MaxwellThreeDShaderBindingWrite::ConstantBufferLoadData { next_offset, .. } => {
-                self.constant_buffer_offset = Some(next_offset);
-            }
-            MaxwellThreeDShaderBindingWrite::BindConstantBuffer {
-                group,
-                slot,
-                enabled,
-                address,
-                size,
-                source,
-            } => {
-                self.groups[group as usize].constant_buffers[slot as usize] =
-                    Some(MaxwellThreeDConstantBufferBinding {
-                        enabled,
-                        address,
-                        size,
-                        source,
-                    });
-            }
         }
     }
 }
@@ -406,11 +376,6 @@ impl<'a> MaxwellThreeDShaderBindingState<'a> {
         })
     }
     #[must_use]
-    pub fn maxwell_texture_headers(&self) -> MaxwellThreeDRegister<bool> {
-        self.registers
-            .read(0x0f10, |raw| (raw <= 1).then_some(raw != 0))
-    }
-    #[must_use]
     pub fn bindless_texture_constant_buffer_slot(&self) -> MaxwellThreeDRegister<u8> {
         self.registers
             .read(0x2608, |raw| (raw <= 31).then_some(raw as u8))
@@ -430,8 +395,8 @@ impl<'a> MaxwellThreeDShaderBindingState<'a> {
             .any(|i| self.pipeline(i).enabled().value() == Some(&true))
     }
     #[must_use]
-    pub fn constant_buffer_offset(&self) -> Option<u32> {
-        self.resources.constant_buffer_offset
+    pub fn constant_buffer_offset(&self) -> u32 {
+        self.registers.word(nixe_gpu::GpuMethodId(0x238c))
     }
 
     #[must_use]
@@ -452,24 +417,4 @@ impl<'a> MaxwellThreeDShaderBindingState<'a> {
         }
         visible
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaxwellThreeDShaderBindingWrite {
-    ConstantBufferLoadOffset {
-        value: u16,
-        source: MaxwellMethodSource,
-    },
-    ConstantBufferLoadData {
-        next_offset: u32,
-        source: MaxwellMethodSource,
-    },
-    BindConstantBuffer {
-        group: u8,
-        slot: u8,
-        enabled: bool,
-        address: Option<MaxwellThreeDUnresolvedAddress>,
-        size: Option<u32>,
-        source: MaxwellMethodSource,
-    },
 }

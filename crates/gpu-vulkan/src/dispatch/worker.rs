@@ -980,7 +980,7 @@ mod tests {
         gate.signal();
         assert!(device.wait_for_work(work, Duration::from_secs(10)).unwrap());
         assert_eq!(
-            unsafe { buffer.read_range(4, 4) }.unwrap(),
+            unsafe { buffer.completed_bytes(4, 4) }.unwrap(),
             7u32.to_le_bytes()
         );
         drop(gate);

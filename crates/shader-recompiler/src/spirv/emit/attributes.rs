@@ -49,13 +49,12 @@ impl EmitContext<'_> {
             A::PrimitiveId => self.objects.primitive_id,
             A::Layer => self.objects.layer,
             A::InstanceId if self.profile.support_vertex_instance_id => self.objects.instance_id,
+            // Vulkan includes firstInstance in InstanceIndex. Like the reference
+            // backend, consume BaseInstance at draw time, without specialization.
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
             A::InstanceId => {
                 let index = self.op(Op::Load, self.types.u32[0], &[self.objects.instance_index])?;
-                let base = if let Some(base) = self.runtime.base_instance {
-                    self.const_u32(base)?
-                } else {
-                    self.op(Op::Load, self.types.u32[0], &[self.objects.base_instance])?
-                };
+                let base = self.op(Op::Load, self.types.u32[0], &[self.objects.base_instance])?;
                 return self.op(Op::ISub, self.types.u32[0], &[index, base]);
             }
             A::VertexId => {
@@ -65,12 +64,7 @@ impl EmitContext<'_> {
                     self.objects.vertex_index
                 }
             }
-            A::BaseInstance => {
-                if let Some(base) = self.runtime.base_instance {
-                    return self.const_u32(base);
-                }
-                self.objects.base_instance
-            }
+            A::BaseInstance => self.objects.base_instance,
             A::BaseVertex => self.objects.base_vertex,
             A::DrawID => self.objects.draw_index,
             _ => {

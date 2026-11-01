@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use nixe_gpu::{
@@ -25,30 +25,50 @@ const DEFAULT_HEIGHT: u32 = 720;
 
 /// VI refresh event, kept type-distinct from queue and GPU events even though
 /// all three currently use runtime kernel-event primitives.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ViVsyncEvent {
+    video: Weak<Mutex<VideoState>>,
     source: GraphicsEventSource,
     writable: WritableEventObject,
     readable: ReadableEventObject,
 }
 
 impl ViVsyncEvent {
-    fn new(kernel: &Arc<nixe_scheduler::SchedulerState>, display_id: u64) -> Self {
-        let (writable, readable) = EventObject::create_pair(kernel);
-        Self {
+    fn new(video: &VideoSystem, display_id: u64) -> Arc<Self> {
+        let (writable, readable) = EventObject::create_pair(&video.kernel);
+        let event = Arc::new(Self {
+            video: Arc::downgrade(&video.state),
             source: GraphicsEventSource::ViVsync { display_id },
             writable,
             readable,
-        }
-    }
-
-    fn signal(&self) {
-        self.writable.signal();
+        });
+        video
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .vsync_events
+            .insert(Arc::as_ptr(&event) as usize, event.writable.clone());
+        event
     }
 
     fn readable(&self) -> ReadableEventObject {
         debug_assert!(matches!(self.source, GraphicsEventSource::ViVsync { .. }));
         self.readable.clone()
+    }
+}
+
+// Register and unlink per application-display client, as VI does in Eden.
+// The registry retains only the writable kernel handle, never the client.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/vi/application_display_service.cpp
+impl Drop for ViVsyncEvent {
+    fn drop(&mut self) {
+        if let Some(video) = self.video.upgrade() {
+            video
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .vsync_events
+                .remove(&(self as *const Self as usize));
+        }
     }
 }
 
@@ -129,7 +149,13 @@ pub enum ViObjectKind {
 pub struct ViSession {
     kind: ViObjectKind,
     video: VideoSystem,
-    opened_layers: Arc<Mutex<BTreeSet<u64>>>,
+    client: Arc<Mutex<ViClient>>,
+}
+
+#[derive(Debug, Default)]
+struct ViClient {
+    opened_layers: BTreeSet<u64>,
+    vsync_event: Option<Arc<ViVsyncEvent>>,
 }
 
 impl ViSession {
@@ -137,7 +163,7 @@ impl ViSession {
         Self {
             kind,
             video,
-            opened_layers: Arc::new(Mutex::new(BTreeSet::new())),
+            client: Arc::default(),
         }
     }
 
@@ -149,11 +175,31 @@ impl ViSession {
         &self.video
     }
 
+    pub(crate) fn vsync_event(
+        &self,
+        display_id: u64,
+    ) -> Result<ReadableEventObject, crate::HorizonIpcResult> {
+        VideoSystem::display_resolution(display_id)
+            .ok_or(crate::HorizonIpcResult::SF_PRECONDITION_VIOLATION)?;
+        let mut client = self
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if client.vsync_event.is_some() {
+            return Err(crate::HorizonIpcResult::VI_PERMISSION_DENIED);
+        }
+        let event = ViVsyncEvent::new(&self.video, display_id);
+        let readable = event.readable();
+        client.vsync_event = Some(event);
+        Ok(readable)
+    }
+
     pub(crate) fn open_layer(&self, layer_id: u64) -> Option<LayerState> {
         let layer = self.video.layer(layer_id)?;
-        self.opened_layers
+        self.client
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .opened_layers
             .insert(layer_id)
             .then_some(layer)
     }
@@ -164,9 +210,10 @@ impl ViSession {
     // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/core/hle/service/vi/container.cpp
     pub(crate) fn close_layer(&self, layer_id: u64) -> bool {
         if !self
-            .opened_layers
+            .client
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .opened_layers
             .remove(&layer_id)
         {
             return false;
@@ -205,7 +252,7 @@ struct VideoState {
     next_layer_id: u64,
     layers: BTreeMap<u64, LayerState>,
     queues: BTreeMap<i32, BufferQueue>,
-    vsync_event: ViVsyncEvent,
+    vsync_events: BTreeMap<usize, WritableEventObject>,
     display_clock: DisplayClock,
     presenter: Option<FrameMailbox>,
     nvdrv: NvDrvSession,
@@ -295,7 +342,7 @@ impl VideoSystem {
                 next_layer_id: 1,
                 layers: BTreeMap::new(),
                 queues: BTreeMap::new(),
-                vsync_event: ViVsyncEvent::new(kernel, DEFAULT_DISPLAY_ID),
+                vsync_events: BTreeMap::new(),
                 display_clock: DisplayClock::new(60)
                     .expect("the fixed Switch display refresh is non-zero"),
                 presenter,
@@ -490,17 +537,6 @@ impl VideoSystem {
         true
     }
 
-    pub(crate) fn vsync_event(&self, display_id: u64) -> Option<ReadableEventObject> {
-        Self::display_resolution(display_id)?;
-        Some(
-            self.state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .vsync_event
-                .readable(),
-        )
-    }
-
     pub(crate) fn binder_event(&self, binder_id: i32) -> Option<ReadableEventObject> {
         self.state
             .lock()
@@ -679,9 +715,6 @@ impl VideoSystem {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.drain_released_slots(&mut state);
         let ticks = state.display_clock.advance(elapsed);
-        if ticks.crossed != 0 {
-            state.vsync_event.signal();
-        }
         if ticks.crossed == 0
             && !state
                 .pending_frames
@@ -826,6 +859,11 @@ impl VideoSystem {
                 );
             }
         }
+        if ticks.crossed != 0 {
+            for event in state.vsync_events.values() {
+                event.signal();
+            }
+        }
         Ok(ticks.crossed)
     }
 }
@@ -929,6 +967,7 @@ pub(crate) struct QueuedBufferRequest {
 #[derive(Clone, Debug)]
 struct BufferSlot {
     ownership: SlotOwnership,
+    frame_number: u64,
     buffer: GraphicBuffer,
     // RequestBuffer must return the complete registered descriptor, including
     // native-handle fields not consumed by the presentation path.
@@ -941,6 +980,7 @@ struct BufferSlot {
 struct BufferQueue {
     connected_api: Option<i32>,
     override_max_buffer_count: i32,
+    frame_counter: u64,
     weak_references: i64,
     strong_references: i64,
     slots: BTreeMap<i32, BufferSlot>,
@@ -1000,6 +1040,7 @@ impl BufferQueue {
         Self {
             connected_api: None,
             override_max_buffer_count: 0,
+            frame_counter: 0,
             weak_references: 0,
             strong_references: 0,
             slots: BTreeMap::new(),
@@ -1077,9 +1118,16 @@ impl BufferQueue {
                 let _format = reader.read_i32()?;
                 let _usage = reader.read_u32()?;
                 let max_count = self.max_buffer_count();
-                let free = self.slots.iter_mut().find(|(index, slot)| {
-                    **index < max_count && slot.ownership == SlotOwnership::Free
-                });
+                // Reuse the least recently queued free slot, preserving the
+                // producer's buffer rotation rather than favoring low indices.
+                // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/nvnflinger/buffer_queue_producer.cpp#L126-L176
+                let free = self
+                    .slots
+                    .iter_mut()
+                    .filter(|(index, slot)| {
+                        **index < max_count && slot.ownership == SlotOwnership::Free
+                    })
+                    .min_by_key(|(_, slot)| slot.frame_number);
                 if let Some((&slot_index, slot)) = free {
                     slot.ownership = SlotOwnership::Dequeued;
                     writer.write_i32(slot_index);
@@ -1133,6 +1181,7 @@ impl BufferQueue {
                     ));
                 }
                 slot.release_fences = fences;
+                slot.frame_number = 0;
                 slot.ownership = SlotOwnership::Free;
                 self.update_availability();
             }
@@ -1182,6 +1231,7 @@ impl BufferQueue {
                 if status == 0 {
                     self.connected_api = None;
                     self.override_max_buffer_count = 0;
+                    self.frame_counter = 0;
                     self.next_acquire_sequence = 0;
                     self.blocked_this_advance = false;
                     self.slots.clear();
@@ -1211,6 +1261,7 @@ impl BufferQueue {
                         slot_index,
                         BufferSlot {
                             ownership: SlotOwnership::Free,
+                            frame_number: 0,
                             buffer,
                             flattened_buffer: flattened.into(),
                             presentation_source: None,
@@ -1317,6 +1368,8 @@ impl BufferQueue {
         if presentation_source.is_some() {
             slot.presentation_source = presentation_source;
         }
+        self.frame_counter += 1;
+        slot.frame_number = self.frame_counter;
         slot.ownership = SlotOwnership::Queued;
         true
     }
@@ -1766,6 +1819,46 @@ mod tests {
         assert_eq!(video.next_display_deadline(), first * 2);
     }
 
+    #[test]
+    fn display_clients_have_independent_events_and_unregister_on_last_close() {
+        let video = VideoSystem::new(
+            Machine::new(64 * 1024 * 1024).unwrap(),
+            &crate::test_memory::kernel(),
+        );
+        let first = ViSession::new(ViObjectKind::ApplicationDisplay, video.clone());
+        let duplicate = first.clone();
+        let second = ViSession::new(ViObjectKind::ApplicationDisplay, video.clone());
+        let a = first.vsync_event(DEFAULT_DISPLAY_ID).unwrap();
+        assert_eq!(
+            duplicate.vsync_event(DEFAULT_DISPLAY_ID).unwrap_err(),
+            crate::HorizonIpcResult::VI_PERMISSION_DENIED
+        );
+        assert!(!a.is_signalled());
+        video.advance(video.next_display_deadline()).unwrap();
+        assert!(a.is_signalled());
+        let b = second.vsync_event(DEFAULT_DISPLAY_ID).unwrap();
+        assert!(
+            !b.is_signalled(),
+            "a new client must not inherit an earlier tick"
+        );
+        a.clear();
+        drop(first);
+        video.advance(video.next_display_deadline()).unwrap();
+        assert!(a.is_signalled());
+        assert!(b.is_signalled());
+        a.clear();
+        b.clear();
+        drop(duplicate);
+        video.advance(video.next_display_deadline()).unwrap();
+        assert!(
+            !a.is_signalled(),
+            "the closed client must no longer receive ticks"
+        );
+        assert!(b.is_signalled());
+        drop(second);
+        assert!(video.state.lock().unwrap().vsync_events.is_empty());
+    }
+
     fn rgba_pitch_buffer(nvmap_id: u32) -> GraphicBuffer {
         GraphicBuffer {
             nvmap_id,
@@ -1902,6 +1995,15 @@ mod tests {
     }
 
     impl nixe_gpu::GpuExecution for ResidentTestRuntime {
+        fn end_command_list(&mut self) -> Result<(), nixe_gpu::BackendRuntimeError> {
+            Ok(())
+        }
+        fn signal_fence(
+            &mut self,
+            _: nixe_gpu::FrontendSubmissionId,
+        ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
+            unreachable!("presentation fixture emits no syncpoint")
+        }
         type Commands = nixe_gpu::native::NativeWork;
         type ImageRequest = nixe_gpu::native::NativePresentationImage;
         fn flush(&mut self) -> Result<(), nixe_gpu::BackendRuntimeError> {
@@ -2430,6 +2532,7 @@ mod tests {
         let mut queue = BufferQueue::new(&crate::test_memory::kernel(), 4);
         let slot = BufferSlot {
             ownership: SlotOwnership::Free,
+            frame_number: 0,
             buffer: GraphicBuffer {
                 nvmap_id: 1,
                 stride_pixels: 1,
@@ -2506,6 +2609,21 @@ mod tests {
         cancel(&mut queue, 1);
         assert_eq!(set_count(&mut queue, 0), 0);
         assert_eq!(queue.max_buffer_count(), 2);
+
+        assert_eq!(set_count(&mut queue, 3), 0);
+        for index in [2, 1, 0] {
+            queue.slots.get_mut(&index).unwrap().ownership = SlotOwnership::Queueing;
+            assert!(queue.commit_queue(index, None));
+            assert!(queue.release(index));
+        }
+        for index in [2, 1, 0] {
+            assert_eq!(dequeue(&mut queue), (index, 0));
+        }
+        // Cancelled buffers are eligible immediately, ahead of queued history.
+        cancel(&mut queue, 0);
+        cancel(&mut queue, 2);
+        assert_eq!(dequeue(&mut queue), (0, 0));
+        assert_eq!(dequeue(&mut queue), (2, 0));
     }
 
     #[test]
@@ -2631,6 +2749,7 @@ mod tests {
             2,
             BufferSlot {
                 ownership: SlotOwnership::Queueing,
+                frame_number: 0,
                 buffer,
                 flattened_buffer: Box::default(),
                 presentation_source: None,
@@ -2659,6 +2778,7 @@ mod tests {
                 0,
                 BufferSlot {
                     ownership: SlotOwnership::Queueing,
+                    frame_number: 0,
                     buffer: buffer.clone(),
                     flattened_buffer: Box::default(),
                     presentation_source: None,
@@ -2729,6 +2849,7 @@ mod tests {
                 slot,
                 BufferSlot {
                     ownership: SlotOwnership::Queueing,
+                    frame_number: 0,
                     buffer: buffer.clone(),
                     flattened_buffer: Box::default(),
                     presentation_source: None,
@@ -2852,6 +2973,7 @@ mod tests {
                 0,
                 BufferSlot {
                     ownership: SlotOwnership::Queueing,
+                    frame_number: 0,
                     buffer: buffer.clone(),
                     flattened_buffer: Box::default(),
                     presentation_source: None,
@@ -2944,6 +3066,7 @@ mod tests {
                     slot,
                     BufferSlot {
                         ownership: SlotOwnership::Queueing,
+                        frame_number: 0,
                         buffer: buffer.clone(),
                         flattened_buffer: Box::default(),
                         presentation_source: None,
@@ -3016,6 +3139,7 @@ mod tests {
                 0,
                 BufferSlot {
                     ownership: SlotOwnership::Queueing,
+                    frame_number: 0,
                     buffer: buffer.clone(),
                     flattened_buffer: Box::default(),
                     presentation_source: None,

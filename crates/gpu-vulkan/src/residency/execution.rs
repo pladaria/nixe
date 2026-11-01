@@ -99,6 +99,7 @@ pub(super) enum Use {
 /// Prepared guest state retains resources, not native descriptor sets. Sets
 /// belong to native layout banks and recycle after their actual GPU use retires.
 pub struct PreparedProgram {
+    binding_revision: u64,
     pub(super) pipeline: Arc<NativePipeline>,
     // Explicit host bindings are owned by the host texture cache.
     record: Option<Arc<BindingRecord>>,
@@ -145,6 +146,7 @@ impl VulkanResidency {
         let dynamic_offsets = vec![0; pipeline.layout.dynamic_bindings.len()].into_boxed_slice();
         self.prepare_graphics(
             PreparedProgram {
+                binding_revision: self.binding_revision,
                 pipeline,
                 dynamic_offsets,
                 record: Some(record),
@@ -185,7 +187,7 @@ impl VulkanResidency {
         slot.feedback_aspects = Some(aspects);
     }
     pub(crate) fn program_current(&self, program: &PreparedProgram) -> bool {
-        self.bindings_current(&program.bindings)
+        program.binding_revision == self.binding_revision
     }
     pub(crate) fn bindings_current(&self, bindings: &[Binding]) -> bool {
         bindings.iter().all(|binding| match binding {
@@ -460,6 +462,7 @@ impl VulkanResidency {
             })
             .collect();
         Ok(PreparedProgram {
+            binding_revision: self.binding_revision,
             pipeline,
             record: None,
             bindings: bindings.to_vec().into_boxed_slice(),
@@ -544,8 +547,7 @@ impl VulkanResidency {
                         ..
                     } = binding
                 {
-                    *native = self.aligned_uniform_copy(*buffer, *source, *range)?;
-                    *offset = 0;
+                    (*native, *offset) = self.aligned_uniform_copy(*buffer, *source, *range)?;
                 }
             }
         }

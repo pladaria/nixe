@@ -41,10 +41,9 @@ pub(super) async fn stream_packet<E>(
         || if cb {
             // Decoded packet methods are monotonic; endpoint bounds prove the
             // entire CB aperture without reconstructing each word's provenance.
-            data.first().unwrap().method().0 < 0x2390 || data.last().unwrap().method().0 > 0x23fc
+            data.method_at(0).0 < 0x2390 || data.method_at(data.len() - 1).0 > 0x23fc
         } else {
-            data.first().unwrap().method() != first.method()
-                || data.last().unwrap().method() != first.method()
+            data.method_at(0) != first.method() || data.method_at(data.len() - 1) != first.method()
         }
     {
         return Ok(false);
@@ -77,7 +76,7 @@ pub(super) async fn stream_packet<E>(
             if first.method().0 == 0x238c {
                 threed::preflight(
                     profile,
-                    MaxwellMethodDispatch::class_method(
+                    &mut MaxwellMethodDispatch::class_method(
                         MaxwellMethodSource::decoded(first, subchannel),
                         class,
                     ),
@@ -99,7 +98,7 @@ pub(super) async fn stream_packet<E>(
             if count < data.len() {
                 threed::preflight(
                     profile,
-                    MaxwellMethodDispatch::class_method(
+                    &mut MaxwellMethodDispatch::class_method(
                         MaxwellMethodSource::decoded(data.get(count).unwrap(), subchannel),
                         class,
                     ),

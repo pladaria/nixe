@@ -1026,29 +1026,17 @@ impl NvDrvSession {
     /// fences. Unknown syncpoints remain distinct from unreached points.
     #[must_use]
     pub(crate) fn guest_timeline_point_reached(&self, point: GuestTimelinePoint) -> Option<bool> {
-        let (control, backend) = {
-            let state = self
+        let control = Arc::clone(
+            &self
                 .state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (
-                Arc::clone(&state.nvhost_control),
-                state.gpu_backend.as_ref().cloned(),
-            )
-        };
-        let reached = control
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .nvhost_control,
+        );
+        control
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .point_reached(point);
-        if reached == Some(false)
-            && let Some(backend) = backend
-        {
-            // BufferQueue polling is itself a demand for guest timeline
-            // progress. The next compositor sample observes the completion;
-            // no periodic backend wakeup is required.
-            let _ = backend.request_progress();
-        }
-        reached
+            .guest_point_reached(point)
     }
 
     /// Validates a BufferQueue dependency without demanding host completion.
@@ -1066,7 +1054,7 @@ impl NvDrvSession {
         control
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .point_reached(point)
+            .guest_point_reached(point)
             .is_some()
     }
 

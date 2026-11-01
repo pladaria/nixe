@@ -70,6 +70,7 @@ struct Resource<R> {
     aliases: Vec<R>,
     overlaps: FxHashSet<R>,
     modification: u64,
+    buffer_invalidations: Option<BTreeMap<u64, u64>>,
     footprints: Vec<Arc<Footprint>>,
     registrations: Vec<IntervalKey>,
     writers: Vec<WriterId>,
@@ -276,6 +277,7 @@ impl<R: Copy + Eq + Hash> Authority<R> {
                 aliases: aliases.clone(),
                 overlaps: overlaps.clone(),
                 modification: 0,
+                buffer_invalidations: None,
                 footprints,
                 registrations,
                 writers: Vec::new(),
@@ -397,6 +399,70 @@ impl<R: Copy + Eq + Hash> Authority<R> {
             );
         }
         resources
+    }
+    /// Native buffers retain dirty intervals, independently of their consumers.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/memory_tracker_base.h
+    pub fn track_buffer_changes(&mut self, resource: R) {
+        self.resources
+            .get_mut(&resource)
+            .expect("registered buffer")
+            .buffer_invalidations = Some(BTreeMap::new());
+    }
+    pub fn drain_buffer_changes(&mut self, resource: R, invalid: &mut Vec<(u64, u64)>) {
+        let changes = self
+            .resources
+            .get_mut(&resource)
+            .expect("registered buffer")
+            .buffer_invalidations
+            .as_mut()
+            .expect("tracked buffer");
+        invalid.extend(changes.iter().map(|(&begin, &end)| (begin, end - begin)));
+        changes.clear();
+    }
+    fn invalidate_native_buffers(&mut self, resource: R, footprint: &Footprint) {
+        let bounds = footprint.bounds();
+        let index = &self.index;
+        let resources = &mut self.resources;
+        let spans = footprint.mapping().spans();
+        let first = spans.partition_point(|span| span.logical + span.bytes <= bounds.start);
+        for span in spans[first..]
+            .iter()
+            .take_while(|span| span.logical < bounds.end)
+        {
+            let begin = span.logical.max(bounds.start);
+            let end = (span.logical + span.bytes).min(bounds.end);
+            if begin >= end {
+                continue;
+            }
+            let start = span.start.get() + begin - span.logical;
+            let stop = span.start.get() + end - span.logical;
+            index.overlapping(start, stop, |indexed| {
+                let Indexed::Resource(candidate) = indexed else {
+                    return;
+                };
+                if candidate.resource == resource && footprint.mapping().is_injective() {
+                    return;
+                }
+                let entry = resources.get_mut(&candidate.resource).unwrap();
+                let Some(changes) = &mut entry.buffer_invalidations else {
+                    return;
+                };
+                let target = &entry.footprints[candidate.footprint];
+                let target_span = &target.mapping().spans()[candidate.span];
+                if span.allocation != target_span.allocation {
+                    return;
+                }
+                let lo = start.max(target_span.start.get());
+                let hi = stop.min(target_span.start.get() + target_span.bytes);
+                if lo < hi {
+                    merge_native_interval(
+                        changes,
+                        target_span.logical + lo - target_span.start.get(),
+                        target_span.logical + hi - target_span.start.get(),
+                    );
+                }
+            });
+        }
     }
     pub fn create_writer(
         &mut self,
@@ -523,6 +589,8 @@ impl<R: Copy + Eq + Hash> Authority<R> {
         }
         writer.consumers_prune_at = 16;
         let sequence = writer.sequence;
+        let footprint = Arc::clone(&writer.footprint);
+        self.invalidate_native_buffers(resource, &footprint);
         self.resources.get_mut(&resource).unwrap().modification = sequence.get();
         if first_publication {
             let entry = self.resources.get_mut(&resource).unwrap();
@@ -1490,6 +1558,22 @@ fn add_interval(intervals: &mut PhysicalIntervals, added: PhysicalInterval) {
         intervals.remove(&(allocation, begin));
     }
     intervals.insert((allocation, start), end);
+}
+fn merge_native_interval(ranges: &mut BTreeMap<u64, u64>, mut begin: u64, mut end: u64) {
+    if let Some((&start, &stop)) = ranges.range(..=begin).next_back()
+        && stop >= begin
+    {
+        if stop >= end {
+            return;
+        }
+        begin = start;
+        end = end.max(stop);
+    }
+    while let Some((&start, &stop)) = ranges.range(begin..=end).next() {
+        end = end.max(stop);
+        ranges.remove(&start);
+    }
+    ranges.insert(begin, end);
 }
 fn overlapping_intervals(
     intervals: &PhysicalIntervals,

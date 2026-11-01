@@ -227,11 +227,11 @@ fn raster_sample(
     let gpu = (ticks[1].wrapping_sub(ticks[0]) & mask) as f64
         * device.profile().limits.timestamp_period as f64
         / draws as f64;
-    let pixels = unsafe { buffer.read_range(0, buffer.size()) }.unwrap();
+    let pixels = unsafe { buffer.completed_bytes(0, buffer.size()) }.unwrap();
     unsafe {
         owner.device.destroy_query_pool(query, None);
     }
-    (cpu, gpu, pixels)
+    (cpu, gpu, pixels.to_vec())
 }
 fn rss_kib() -> u64 {
     std::fs::read_to_string("/proc/self/status")

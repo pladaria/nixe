@@ -37,14 +37,14 @@ impl VulkanResidency {
         }) || self
             .buffer_downloads
             .back()
-            .is_some_and(|job| job.work().tick() > scheduled)
+            .is_some_and(|job| job.work().is_some_and(|work| work.tick() > scheduled))
             && self.authority.access_requests().any(|id| {
                 let request = self.authority.access_request(id).expect("pending access");
                 !matches!(request.operation(), nixe_memory::AccessOperation::Write(_))
-                    && self
-                        .buffer_downloads
-                        .iter()
-                        .any(|job| job.work().tick() > scheduled && job.overlaps(request.ranges()))
+                    && self.buffer_downloads.iter().any(|job| {
+                        job.work().is_some_and(|work| work.tick() > scheduled)
+                            && job.overlaps(request.ranges())
+                    })
             })
     }
 
@@ -65,8 +65,8 @@ impl VulkanResidency {
             })
             .chain(
                 self.buffer_downloads
-                    .front()
-                    .map(|job| job.work().tick())
+                    .iter()
+                    .find_map(|job| job.work().map(WorkTicket::tick))
                     .filter(|&tick| tick > completed),
             )
             .min()
@@ -83,7 +83,7 @@ impl VulkanResidency {
                 .is_some_and(|t| t.ticket.work().tick() <= completed)
             {
                 let transfer = job.transfers.pop_front().expect("completed transfer");
-                let data = self.device.readback(transfer.ticket)?;
+                let data = self.device.completed_readback(transfer.ticket)?;
                 self.statistics.native_readback_bytes += transfer.bytes;
                 for copy in transfer.copies {
                     job.bytes[copy.destination..copy.destination + copy.length]
@@ -178,6 +178,7 @@ impl VulkanResidency {
         &mut self,
         request: DeviceAccessRequest,
     ) -> Result<(), VulkanError> {
+        self.realize_deferred_clears()?;
         self.authority.queue_access(request)?;
         self.progress_device_accesses()
     }

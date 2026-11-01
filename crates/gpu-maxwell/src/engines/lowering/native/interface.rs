@@ -126,7 +126,11 @@ impl ShaderInterface {
                         })?;
                     bindings.insert(
                         resource(&ResourceSource::Texture(d.clone()), index as u32, element)?,
-                        MaxwellThreeDResourceRole::SampledImage { texture, dimension },
+                        MaxwellThreeDResourceRole::SampledImage {
+                            texture,
+                            dimension,
+                            with_sampler: true,
+                        },
                     );
                     bindings.insert(
                         nixe_gpu::shader_module::guest_sampler(stage, index as u32, element)
@@ -144,7 +148,11 @@ impl ShaderInterface {
                 ));
             }
         }
-        let mut roles: Vec<_> = bindings.values().copied().collect();
+        let mut roles: Vec<_> = bindings
+            .values()
+            .copied()
+            .filter(|role| !matches!(role, MaxwellThreeDResourceRole::Sampler(_)))
+            .collect();
         roles.sort_unstable();
         roles.dedup();
         Ok(Self {

@@ -9,6 +9,9 @@ impl VulkanResidency {
         rect: vk::Rect2D,
         value: vk::ClearValue,
     ) -> Result<WorkTicket, VulkanError> {
+        if let Some(work) = self.clear_attachment(id, plane, rect, value)? {
+            return Ok(work);
+        }
         let p = self.checked_image_rect(id, plane, rect)?;
         if rect == transfers::full_rect(p)
             && !(self.image(id)?.description.image_type == vk::ImageType::TYPE_3D

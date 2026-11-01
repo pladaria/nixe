@@ -337,11 +337,11 @@ impl AllocatedBuffer {
         }
         Ok(result)
     }
-    pub(crate) unsafe fn read_range(
+    pub(crate) unsafe fn completed_bytes(
         &self,
         offset: u64,
         length: u64,
-    ) -> Result<Vec<u8>, VulkanError> {
+    ) -> Result<&[u8], VulkanError> {
         self.check_range(offset, length)?;
         let length_host = usize::try_from(length)
             .map_err(|_| VulkanError::InvalidResource("readback cannot fit host address space"))?;
@@ -364,8 +364,7 @@ impl AllocatedBuffer {
         }
         Ok(unsafe {
             std::slice::from_raw_parts(ptr.as_ptr().cast::<u8>().add(offset_host), length_host)
-        }
-        .to_vec())
+        })
     }
     fn check_range(&self, offset: u64, length: u64) -> Result<(), VulkanError> {
         if length == 0 || offset.checked_add(length).is_none_or(|end| end > self.size) {

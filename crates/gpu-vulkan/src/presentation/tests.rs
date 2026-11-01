@@ -86,7 +86,15 @@ fn read_in_layout(
         );
     }
     cache.flush().unwrap();
-    cache.device_mut().readback(ticket).unwrap()
+    cache
+        .device_mut()
+        .wait_for_work(ticket.work(), std::time::Duration::MAX)
+        .unwrap();
+    cache
+        .device_mut()
+        .completed_readback(ticket)
+        .unwrap()
+        .to_vec()
 }
 #[test]
 fn fragmented_cpu_scanout_refreshes_dirty_pages_and_preserves_old_snapshots() {

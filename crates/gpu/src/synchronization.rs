@@ -315,6 +315,8 @@ pub struct GuestTimeline {
     owner: TimelineOwnerId,
     initial_value: GuestSyncpointValue,
     current_position: u64,
+    guest_position: u64,
+    guest_reservation: u64,
     reserved_position: u64,
     next_reservation: u64,
     reservations: VecDeque<ReservedTimelinePoint>,
@@ -335,6 +337,8 @@ impl GuestTimeline {
             owner,
             initial_value,
             current_position: 0,
+            guest_position: 0,
+            guest_reservation: 1,
             reserved_position: 0,
             next_reservation: 1,
             reservations: VecDeque::new(),
@@ -359,10 +363,24 @@ impl GuestTimeline {
         self.owner
     }
 
-    /// Returns the currently completed guest-visible point.
+    /// Returns the point whose preceding CPU-visible effects are published.
     #[must_use]
     pub fn current_point(&self) -> GuestTimelinePoint {
         self.point_at(self.current_position)
+    }
+
+    /// Returns the point consumed by the command processor, independently of
+    /// CPU publication. Composition and GPU dependencies use this counter.
+    /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/fence_manager.h#L104-L108
+    #[must_use]
+    pub fn guest_point(&self) -> GuestTimelinePoint {
+        self.point_at(self.guest_position)
+    }
+
+    /// Samples command-processor progress without waiting for CPU readbacks.
+    #[must_use]
+    pub fn guest_has_reached(&self, threshold: GuestSyncpointValue) -> bool {
+        self.guest_point().value().has_reached(threshold)
     }
 
     /// Returns the latest reserved point, or the current point when idle.
@@ -408,7 +426,9 @@ impl GuestTimeline {
         let reservation = self
             .reserve(owner, 1)
             .map_err(TimelineIncrementError::Reservation)?;
-        self.advance(owner, &reservation)
+        self.consume_increment(owner, &reservation)
+            .map_err(TimelineIncrementError::Advance)?;
+        self.increment_reserved(owner, &reservation)
             .map_err(TimelineIncrementError::Advance)
     }
 
@@ -462,20 +482,33 @@ impl GuestTimeline {
         Ok(point)
     }
 
-    /// Advances through the oldest complete reservation.
-    ///
-    /// This method only enforces neutral timeline ordering and ownership. The
-    /// GPU completion owner calls it only after host completion and required
-    /// visibility transitions.
-    pub fn advance(
+    /// Consumes one in-stream increment without publishing CPU progress. The
+    /// reservation ID is a constant-time cursor even when CPU completions lag
+    /// behind several command lists; no second reservation queue is needed.
+    pub fn consume_increment(
         &mut self,
         owner: TimelineOwnerId,
-        completed: &ReservedTimelinePoint,
+        reservation: &ReservedTimelinePoint,
     ) -> Result<GuestTimelinePoint, TimelineAdvanceError> {
-        self.validate_advance(owner, completed)?;
-        self.current_position = completed.logical_position;
-        self.reservations.pop_front();
-        Ok(self.current_point())
+        self.validate_identity(owner, reservation)?;
+        if reservation.reservation < self.guest_reservation
+            || reservation.reservation >= self.next_reservation
+        {
+            return Err(TimelineAdvanceError::UnknownReservation {
+                reservation: reservation.reservation,
+            });
+        }
+        if reservation.reservation != self.guest_reservation {
+            return Err(TimelineAdvanceError::OutOfOrder {
+                expected: self.guest_reservation,
+                observed: reservation.reservation,
+            });
+        }
+        self.guest_position += 1;
+        if self.guest_position == reservation.logical_position {
+            self.guest_reservation += 1;
+        }
+        Ok(self.guest_point())
     }
 
     /// Publishes one executed increment of the oldest reservation. An in-stream
@@ -486,6 +519,7 @@ impl GuestTimeline {
         reservation: &ReservedTimelinePoint,
     ) -> Result<GuestTimelinePoint, TimelineAdvanceError> {
         self.validate_advance(owner, reservation)?;
+        debug_assert!(self.current_position < self.guest_position);
         self.current_position += 1;
         if self.current_position == reservation.logical_position {
             self.reservations.pop_front();
@@ -493,11 +527,7 @@ impl GuestTimeline {
         Ok(self.current_point())
     }
 
-    /// Validates publication without changing guest-visible progress.
-    ///
-    /// Completion coordinators use this before applying memory visibility so
-    /// a stale or mismatched timeline cannot partially publish device writes.
-    pub fn validate_advance(
+    fn validate_identity(
         &self,
         owner: TimelineOwnerId,
         completed: &ReservedTimelinePoint,
@@ -523,6 +553,15 @@ impl GuestTimeline {
             }));
         }
 
+        Ok(())
+    }
+
+    fn validate_advance(
+        &self,
+        owner: TimelineOwnerId,
+        completed: &ReservedTimelinePoint,
+    ) -> Result<(), TimelineAdvanceError> {
+        self.validate_identity(owner, completed)?;
         let Some(next) = self.reservations.front() else {
             return Err(TimelineAdvanceError::UnknownReservation {
                 reservation: completed.reservation,
@@ -756,6 +795,7 @@ mod tests {
             timeline.increment_reserved(OWNER, &second),
             Err(TimelineAdvanceError::OutOfOrder { .. })
         ));
+        timeline.consume_increment(OWNER, &first).unwrap();
         assert_eq!(
             timeline
                 .increment_reserved(OWNER, &first)
@@ -766,6 +806,7 @@ mod tests {
         );
         assert_eq!(timeline.reservation_count(), 2);
         assert!(!timeline.has_reached(first.point().value()));
+        timeline.consume_increment(OWNER, &first).unwrap();
         assert_eq!(
             timeline.increment_reserved(OWNER, &first).unwrap(),
             first.point()
@@ -775,7 +816,39 @@ mod tests {
             timeline.increment_reserved(OWNER, &first),
             Err(TimelineAdvanceError::UnknownReservation { .. })
         ));
-        assert_eq!(timeline.advance(OWNER, &second).unwrap(), second.point());
+        timeline.consume_increment(OWNER, &second).unwrap();
+        assert_eq!(
+            timeline.increment_reserved(OWNER, &second).unwrap(),
+            second.point()
+        );
+    }
+
+    #[test]
+    fn command_progress_can_run_ahead_of_cpu_publication_across_rollover() {
+        let mut timeline =
+            GuestTimeline::new(ID, INSTANCE, OWNER, GuestSyncpointValue::new(u32::MAX - 1));
+        let a = timeline.reserve(OWNER, 2).unwrap();
+        let b = timeline.reserve(OWNER, 1).unwrap();
+        assert!(matches!(
+            timeline.consume_increment(OWNER, &b),
+            Err(TimelineAdvanceError::OutOfOrder { .. })
+        ));
+        for reservation in [&a, &a, &b] {
+            timeline.consume_increment(OWNER, reservation).unwrap();
+        }
+        assert_eq!(timeline.guest_point(), b.point());
+        assert!(timeline.guest_has_reached(b.point().value()));
+        assert!(!timeline.has_reached(a.point().value()));
+        assert!(matches!(
+            timeline.consume_increment(OWNER, &a),
+            Err(TimelineAdvanceError::UnknownReservation { .. })
+        ));
+        assert_eq!(timeline.reservation_count(), 2);
+        for reservation in [&a, &a, &b] {
+            timeline.increment_reserved(OWNER, reservation).unwrap();
+        }
+        assert_eq!(timeline.current_point(), timeline.guest_point());
+        assert_eq!(timeline.reservation_count(), 0);
     }
 
     #[test]
@@ -794,8 +867,16 @@ mod tests {
         assert_eq!(timeline.latest_reserved_point(), second.point());
         assert_eq!(timeline.outstanding_increments(), 3);
 
-        assert_eq!(timeline.advance(OWNER, &first), Ok(first.point()));
-        assert_eq!(timeline.advance(OWNER, &second), Ok(second.point()));
+        timeline.consume_increment(OWNER, &first).unwrap();
+        assert_eq!(
+            timeline.increment_reserved(OWNER, &first),
+            Ok(first.point())
+        );
+        for _ in 0..second.increments() {
+            timeline.consume_increment(OWNER, &second).unwrap();
+            timeline.increment_reserved(OWNER, &second).unwrap();
+        }
+        assert_eq!(timeline.current_point(), second.point());
         assert_eq!(timeline.outstanding_increments(), 0);
         assert_eq!(timeline.reservation_count(), 0);
     }
@@ -815,15 +896,19 @@ mod tests {
         let first = timeline.reserve(OWNER, 1).unwrap();
         let second = timeline.reserve(OWNER, 1).unwrap();
         assert_eq!(
-            timeline.advance(OWNER, &second),
+            timeline.increment_reserved(OWNER, &second),
             Err(TimelineAdvanceError::OutOfOrder {
                 expected: first.reservation_id(),
                 observed: second.reservation_id(),
             })
         );
-        assert_eq!(timeline.advance(OWNER, &first), Ok(first.point()));
+        timeline.consume_increment(OWNER, &first).unwrap();
         assert_eq!(
-            timeline.advance(OWNER, &first),
+            timeline.increment_reserved(OWNER, &first),
+            Ok(first.point())
+        );
+        assert_eq!(
+            timeline.increment_reserved(OWNER, &first),
             Err(TimelineAdvanceError::UnknownReservation {
                 reservation: first.reservation_id(),
             })
@@ -881,12 +966,15 @@ mod tests {
         let current = replacement.reserve(OWNER, 1).unwrap();
 
         assert_eq!(
-            replacement.advance(OWNER, &stale),
+            replacement.consume_increment(OWNER, &stale),
             Err(TimelineAdvanceError::WrongInstance {
                 expected: replacement_instance,
                 observed: INSTANCE,
             })
         );
-        assert_eq!(replacement.advance(OWNER, &current), Ok(current.point()));
+        assert_eq!(
+            replacement.consume_increment(OWNER, &current),
+            Ok(current.point())
+        );
     }
 }

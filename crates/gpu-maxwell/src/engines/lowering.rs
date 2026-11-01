@@ -78,24 +78,24 @@ impl MaxwellThreeDOperationTrigger {
     pub(crate) fn append_resource_roles(
         self,
         state: &MaxwellThreeDState,
-        roles: &mut Vec<MaxwellThreeDResourceRole>,
+        roles: &mut impl Extend<MaxwellThreeDResourceRole>,
     ) {
         match self {
             Self::ClearSurface { .. } => {
                 if let Some(surface) = state.render_targets().clear().last_surface().value() {
                     if surface.color_mask() != 0 {
-                        roles.push(MaxwellThreeDResourceRole::ColorTarget(
+                        roles.extend([MaxwellThreeDResourceRole::ColorTarget(
                             surface.color_target(),
-                        ));
+                        )]);
                     }
                     if surface.depth() || surface.stencil() {
-                        roles.push(MaxwellThreeDResourceRole::DepthStencilTarget);
+                        roles.extend([MaxwellThreeDResourceRole::DepthStencilTarget]);
                     }
                 }
             }
             Self::DrawVertexArray { .. } | Self::DrawIndexBuffer { .. } => {
                 if self.is_indexed() && state.inline_index().is_none() {
-                    roles.push(MaxwellThreeDResourceRole::IndexBuffer);
+                    roles.extend([MaxwellThreeDResourceRole::IndexBuffer]);
                 }
                 roles.extend(
                     consumed_vertex_streams(state).map(MaxwellThreeDResourceRole::VertexStream),
@@ -110,7 +110,7 @@ impl MaxwellThreeDOperationTrigger {
                     );
                 }
                 if draw_depth_stencil_resource_required(state) {
-                    roles.push(MaxwellThreeDResourceRole::DepthStencilTarget);
+                    roles.extend([MaxwellThreeDResourceRole::DepthStencilTarget]);
                 }
             }
         }
@@ -1186,7 +1186,7 @@ fn resolved_buffer(
         .resource(index)
         .ok_or(MaxwellLoweringError::MissingResolvedResource { role: index })?
     {
-        MaxwellThreeDResolvedResource::Buffer(value) => Ok(value),
+        MaxwellThreeDResolvedResource::Buffer { view: value, .. } => Ok(value),
         _ => Err(MaxwellLoweringError::ResolvedResourceKindMismatch),
     }
 }
@@ -1199,7 +1199,7 @@ fn resolved_image(
         .resource(index)
         .ok_or(MaxwellLoweringError::MissingResolvedResource { role: index })?
     {
-        MaxwellThreeDResolvedResource::Image(value) => Ok(value),
+        MaxwellThreeDResolvedResource::Image { view: value, .. } => Ok(value),
         _ => Err(MaxwellLoweringError::ResolvedResourceKindMismatch),
     }
 }
@@ -2168,10 +2168,12 @@ mod tests {
             }
         );
         program_three_d(&mut channel, 0x0e00, 1);
-        assert!(matches!(
-            super::draw_scissor_region(channel.three_d(), 64, 32),
-            Err(MaxwellLoweringError::IncompleteDraw(_))
-        ));
+        assert_eq!(
+            super::draw_scissor_region(channel.three_d(), 64, 32)
+                .unwrap()
+                .width,
+            0
+        );
         program_three_d(&mut channel, 0x0e04, (50 << 16) | 12);
         program_three_d(&mut channel, 0x0e08, (23 << 16) | 2);
         assert_eq!(

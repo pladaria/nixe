@@ -206,7 +206,9 @@ pub fn event(name: &'static str, a: u64, b: u64, c: u64) {
     if FRAMES_ONLY.load(Ordering::Relaxed)
         && !matches!(
             name,
-            "host_present"
+            "frame_timing"
+                | "frame_gpu_timing"
+                | "host_present"
                 | "clock_sync"
                 | "mme_upload"
                 | "mme_start"

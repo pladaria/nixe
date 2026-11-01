@@ -794,7 +794,7 @@ mod native_tests {
                     let MaxwellThreeDResourceRole::SampledImage { .. } = role else {
                         return None;
                     };
-                    let Some(MaxwellThreeDResolvedResource::Image(image)) =
+                    let Some(MaxwellThreeDResolvedResource::Image { view: image, .. }) =
                         textures.resources.resource(*role)
                     else {
                         panic!("sampled image expected")

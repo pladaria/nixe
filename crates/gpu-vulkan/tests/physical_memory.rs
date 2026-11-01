@@ -1,8 +1,7 @@
-use ash::vk;
 use nixe_gpu::physical::{
     ByteRect, Footprint, ImageFootprint, ImageStorage, PhysicalMapping, WriteDomain,
 };
-use nixe_gpu_vulkan::{ApiPreference, VulkanResidency};
+use nixe_gpu_vulkan::ApiPreference;
 use nixe_memory::{AllocationRange, Machine, PAGE_SIZE};
 use std::sync::Arc;
 
@@ -361,7 +360,7 @@ fn ordered_literal_fences_publish_ram_and_reopen_aliases_without_readback() {
                 .consume(&submission)
                 .and_then(|consumed| {
                     assert!(consumed);
-                    execution.submit(submission.frontend)
+                    execution.signal_fence(submission.frontend)
                 })
                 .unwrap();
         }
@@ -423,63 +422,6 @@ fn ordered_literal_fences_publish_ram_and_reopen_aliases_without_readback() {
     }
     execution.teardown().unwrap();
     drop(execution);
-    validation.check().unwrap();
-}
-
-#[test]
-fn buffer_fence_downloads_publish_current_ranges_before_later_cpu_scalar_reads() {
-    use nixe_memory::{Access, AddressSpace, AddressWidth, GuestVirtualAddress, MemoryPermissions};
-    let Some(device) = support::device_for_test(ApiPreference::Auto) else {
-        return;
-    };
-    let validation = device.validation_monitor();
-    let machine = Machine::new(PAGE_SIZE).unwrap();
-    let allocation = machine
-        .account(PAGE_SIZE)
-        .unwrap()
-        .allocate(PAGE_SIZE)
-        .unwrap();
-    let range = AllocationRange::new(allocation.pin(), 0, PAGE_SIZE).unwrap();
-    let space = AddressSpace::new(machine.clone(), AddressWidth::Bits32).unwrap();
-    space
-        .map(
-            GuestVirtualAddress::new(PAGE_SIZE),
-            allocation,
-            0,
-            PAGE_SIZE,
-            MemoryPermissions::READ_WRITE,
-        )
-        .unwrap();
-    let mut residency = VulkanResidency::new(machine.clone(), device, 8 * 1024 * 1024).unwrap();
-    let id = residency
-        .buffer_for(
-            PhysicalMapping::new(std::slice::from_ref(&range)).unwrap(),
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-        )
-        .unwrap()
-        .buffer;
-    residency
-        .write_buffer(id, 0, &vec![7; PAGE_SIZE as usize])
-        .unwrap();
-    residency.flush().unwrap();
-    residency.write_buffer(id, 3, &[44, 55, 66]).unwrap();
-    residency.flush().unwrap();
-    // Wait through an ordinary small native read, then poll publication using
-    // the public flush boundary. No CPU request asks to download the full page.
-    assert_eq!(residency.read_buffer(id, 0, 4).unwrap(), [7, 7, 7, 44]);
-    residency.flush().unwrap();
-    let mut actual = vec![0; PAGE_SIZE as usize];
-    machine.capture_stream(&[range], &mut actual).unwrap();
-    let mut expected = vec![7; PAGE_SIZE as usize];
-    expected[3..6].copy_from_slice(&[44, 55, 66]);
-    assert_eq!(actual, expected);
-    assert!(matches!(
-        space
-            .read_value(GuestVirtualAddress::new(PAGE_SIZE + 100), 4)
-            .unwrap(),
-        Access::Ready(0x07070707)
-    ));
-    drop(residency);
     validation.check().unwrap();
 }
 

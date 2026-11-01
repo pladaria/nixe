@@ -149,6 +149,87 @@ fn equal_constant_buffer_offset_restarts_upload_and_shadow_replay_remains_execut
 }
 
 #[test]
+fn constant_uploads_advance_the_register_read_by_mme_and_keep_shadow_values() {
+    let mut channel = three_d_channel();
+    for (method, value) in [(0x2380, 65536), (0x2384, 0), (0x2388, 0x4000)] {
+        program_three_d(&mut channel, method, value);
+    }
+    // The reset position is already usable; no "offset programmed" flag exists.
+    let data = non_incrementing_packet_on_subchannel(0, 0x2390 / 4, &[7, 8]);
+    let (writes, _, result) = transfer(&mut channel, &data, false);
+    result.unwrap();
+    assert_eq!(writes, vec![(0x4000, 7), (0x4004, 8)]);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x238c)),
+        Some(8)
+    );
+    assert_eq!(
+        channel.three_d().shader_bindings().constant_buffer_offset(),
+        8
+    );
+
+    let read_offset = 5 | (1 << 4) | (2 << 8) | ((0x238c / 4) << 14);
+    let set_scratch_method = 1 | (2 << 4) | ((0x3400 / 4) << 14);
+    let send_read_value_and_exit = (4 << 4) | (2 << 11) | (1 << 7);
+    load_mme_program(
+        &mut channel,
+        8,
+        &[
+            read_offset,
+            set_scratch_method,
+            send_read_value_and_exit,
+            0x11,
+        ],
+    );
+    dispatch_method(&mut channel, 0x3840 / 4, 0).unwrap();
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x3400)),
+        Some(8)
+    );
+
+    // Incrementing the internal position to the end must not truncate to u16.
+    program_three_d(&mut channel, 0x238c, 65532);
+    let data = non_incrementing_packet_on_subchannel(0, 0x2390 / 4, &[9, 10]);
+    let (writes, _, result) = transfer(&mut channel, &data, false);
+    assert!(
+        matches!(result, Err(MaxwellEngineDispatchError::InvalidMethodEncoding { source, .. }) if source.argument() == 10)
+    );
+    assert_eq!(writes, vec![(0x13ffc, 9)]);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x238c)),
+        Some(65536)
+    );
+    program_three_d(&mut channel, 0x124, 3);
+    program_three_d(&mut channel, 0x238c, 0);
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x238c)),
+        Some(65532)
+    );
+}
+
+#[test]
+fn executed_method_values_remain_visible_to_mme_register_reads() {
+    let mut channel = three_d_channel();
+    for (method, argument) in [(0x100, 0x1234), (0x021c, 0x1011), (0x0f78, 0x71)] {
+        dispatch_method(&mut channel, method / 4, argument).unwrap();
+        assert_eq!(
+            channel
+                .three_d_mut()
+                .raw_register_value(GpuMethodId(method)),
+            Some(argument)
+        );
+    }
+}
+
+#[test]
 fn embedded_and_compute_uploads_preserve_partial_transfers_and_completion() {
     for (subchannel, class) in [
         (0, SWITCH_1_GM20B_PROFILE.classes().three_d()),
@@ -317,13 +398,12 @@ fn inline_restart_requires_real_state_and_retains_a_normalized_immutable_stream(
         &non_incrementing_packet_on_subchannel(0, 0x15e8 / 4, &[1, 0xff, 2]),
     )
     .unwrap();
-    assert!(matches!(
-        dispatch_method(&mut channel, 0x1614 / 4, 0),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-            method_name: "INLINE_INDEX",
-            ..
-        })
-    ));
+    assert_eq!(
+        channel
+            .three_d_mut()
+            .raw_register_value(GpuMethodId(0x1648)),
+        Some(0)
+    );
     program_three_d(&mut channel, 0x1648, 0xff);
     let operation = dispatch_method(&mut channel, 0x1614 / 4, 0).unwrap();
     let bytes = operation.operations()[0]

@@ -132,7 +132,12 @@ pub async fn stream_maxwell_frontend<L: MaxwellFrontend, H: crate::MaxwellComman
                 .as_nanos() as u64,
         );
     }
-    effects.finish().map_err(execution_error)?;
+    effects
+        .finish(
+            submission.decoded().mode().fence_get() && !submission.decoded().mode().suppress_wfi(),
+        )
+        .await
+        .map_err(execution_error)?;
     // Every completed list services waiting control requests, including lists
     // containing only passive register programming.
     host.control().map_err(execution_error)

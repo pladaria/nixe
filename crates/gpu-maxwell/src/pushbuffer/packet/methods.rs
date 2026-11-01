@@ -65,7 +65,6 @@ impl<'a> MaxwellMethodSpan<'a> {
             SpanData::Fixture(packet) => packet.methods[index].argument,
         }
     }
-    #[cfg(test)]
     pub(crate) fn mode(self) -> MaxwellMethodPacketMode {
         if self.mode == MaxwellMethodPacketMode::IncrementOnce && self.begin > 0 {
             MaxwellMethodPacketMode::NonIncrementing

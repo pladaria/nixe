@@ -8,9 +8,8 @@ use super::{
     blit::{BlitSurface, BlitSurfaceLayout},
     *,
 };
-use crate::engines::{AppliedMethod, MaxwellEngineMethodMetadata, PendingEngineOperation};
+use crate::engines::PendingEngineOperation;
 use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
-use nixe_gpu::GpuMethodId;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct SolidState {
@@ -118,7 +117,7 @@ fn launch(
 pub(super) fn apply(
     method: MaxwellMethodDispatch,
     state: &mut MaxwellTwoDState,
-) -> Option<Result<AppliedMethod, MaxwellEngineDispatchError>> {
+) -> Option<Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError>> {
     let source = method.source();
     let address = source.method().0;
     if matches!(address, 0x0604 | 0x060c) && state.solid.mode.value() != Some(&4) {
@@ -127,40 +126,18 @@ pub(super) fn apply(
             "only solid RECT primitives are implemented",
         )));
     }
-    let (register, name, mask) = match address {
-        0x02b8 => (
-            &mut state.solid.zeta,
-            "SET_DST_COLOR_RENDER_TO_ZETA_SURFACE",
-            1,
-        ),
-        0x02e8 => (
-            &mut state.solid.pattern_format,
-            "SET_MONOCHROME_PATTERN_COLOR_FORMAT",
-            0xff,
-        ),
+    let (register, mask) = match address {
+        0x02b8 => (&mut state.solid.zeta, 1),
+        0x02e8 => (&mut state.solid.pattern_format, 0xff),
         0x0540..=0x054c if address & 3 == 0 => (
             &mut state.solid.color[((address - 0x0540) / 4) as usize],
-            "SET_RENDER_SOLID_PRIM_COLOR",
             u32::MAX,
         ),
-        0x0588 => (
-            &mut state.solid.color[0],
-            "SET_RENDER_SOLID_PRIM_COLOR",
-            u32::MAX,
-        ),
-        0x0580 => (&mut state.solid.mode, "RENDER_SOLID_PRIM_MODE", 7),
-        0x0584 => (
-            &mut state.solid.format,
-            "SET_RENDER_SOLID_PRIM_COLOR_FORMAT",
-            0xff,
-        ),
+        0x0588 => (&mut state.solid.color[0], u32::MAX),
+        0x0580 => (&mut state.solid.mode, 7),
+        0x0584 => (&mut state.solid.format, 0xff),
         0x0600..=0x060c if address & 3 == 0 => (
             &mut state.solid.points[((address - 0x0600) / 4) as usize],
-            if address & 4 == 0 {
-                "RENDER_SOLID_PRIM_POINT_SET_X"
-            } else {
-                "RENDER_SOLID_PRIM_POINT_Y"
-            },
             u32::MAX,
         ),
         _ => return None,
@@ -177,9 +154,5 @@ pub(super) fn apply(
     } else {
         None
     };
-    Some(Ok(AppliedMethod::new(
-        method,
-        MaxwellEngineMethodMetadata::new(CLASS, "FERMI_TWOD_A", GpuMethodId(address), name),
-        operation,
-    )))
+    Some(Ok(operation))
 }

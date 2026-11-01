@@ -90,13 +90,6 @@ struct Contents {
     last_use: Option<WorkTicket>,
     touched: u64,
 }
-impl Contents {
-    fn observations_current(&self) -> bool {
-        self.device
-            .iter()
-            .all(|observation| !observation.is_invalid())
-    }
-}
 struct KnownBufferBytes {
     offset: u64,
     bytes: Arc<[u8]>,
@@ -106,8 +99,8 @@ struct KnownBufferBytes {
 struct BufferEntry {
     invalid: Vec<(u64, u64)>,
     /// Immutable host-authored payload, valid until another native producer.
-    /// CPU publication still waits for the actual producing ticket, including
-    /// when the physical buffer has never been consumed by the GPU.
+    /// CPU publication follows the committed CPU-copy prefix independently
+    /// from GPU-only resource use and its physical queue tick.
     known: Vec<KnownBufferBytes>,
     growth: u32,
     binding_valid: bool,
@@ -277,11 +270,23 @@ pub struct ResidencyStatistics {
 }
 /// Concrete single-owner storage, selected once at startup. No generic backend
 /// handle registry, virtual resource dispatch or guest-ISA branch in its hot path.
+#[derive(Clone, Copy)]
+struct DeferredClear {
+    image: ImageId,
+    plane: ImagePlane,
+    plane_index: usize,
+    value: vk::ClearValue,
+}
+// Native storage deletion dirties the binding selections, independently of
+// content/coherency changes. Eden also dirties bindings after buffer deletion.
+// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/buffer_cache/buffer_cache.h
 pub struct VulkanResidency {
+    deferred_clears: smallvec::SmallVec<[DeferredClear; 10]>,
     pub(crate) device: VulkanDevice,
     instance: BackendInstanceId,
     buffers: Vec<Slot<BufferEntry>>,
     free_buffers: Vec<usize>,
+    binding_revision: u64,
     epoch: u64,
     lru_head: Option<Resource>,
     lru_tail: Option<Resource>,
@@ -299,7 +304,7 @@ pub struct VulkanResidency {
     statistics: ResidencyStatistics,
     image_readbacks: readback::ImageReadbacks,
     cpu_readbacks: rustc_hash::FxHashMap<nixe_memory::AccessRequestId, cpu_readback::CpuReadback>,
-    buffer_writes: rustc_hash::FxHashMap<BufferId, Vec<(u64, u64)>>,
+    buffer_writes: rustc_hash::FxHashMap<BufferId, std::collections::BTreeMap<u64, u64>>,
     buffer_downloads: std::collections::VecDeque<buffer_download::Download>,
     barriers: sync::Barriers,
     decoder: nixe_gpu::texture_decode::BlockDecoder,
@@ -331,6 +336,7 @@ impl VulkanResidency {
         &mut self,
         extents: &[(nixe_memory::AllocationId, nixe_memory::Extent)],
     ) -> Result<(), VulkanError> {
+        self.realize_clears_overlapping(extents.iter().map(|(_, extent)| *extent))?;
         // RAM is already updated under the original mapping guard. Exact native
         // coverage changes now; dirty-page cache invalidation is consumed at the
         // next resource access, just like the cached-write accumulator.
@@ -361,6 +367,13 @@ impl VulkanResidency {
         ranges: &[nixe_memory::AllocationRange],
     ) -> Result<(), VulkanError> {
         let modified = self.memory.take_cpu_modified_pages();
+        self.realize_clears_overlapping(
+            modified.iter().copied().chain(
+                ranges
+                    .iter()
+                    .flat_map(nixe_memory::AllocationRange::physical_extents),
+            ),
+        )?;
         let buffers = &mut self.buffers;
         let images = &mut self.images;
         let mut failure = None;
@@ -436,11 +449,13 @@ impl VulkanResidency {
         });
         let descriptors = crate::cache::DescriptorCache::new(&device);
         let mut cache = Self {
+            deferred_clears: smallvec::SmallVec::new(),
             device,
             descriptors,
             instance,
             buffers: Vec::new(),
             free_buffers: Vec::new(),
+            binding_revision: 1,
             epoch: 0,
             lru_head: None,
             lru_tail: None,
@@ -589,10 +604,18 @@ impl VulkanResidency {
         }
         Ok(self.budget.reserve(bytes))
     }
+    fn invalidate_bindings(&mut self) {
+        self.binding_revision = self
+            .binding_revision
+            .checked_add(1)
+            .expect("native binding revision exhausted");
+    }
     fn retire_entry(&mut self, resource: Resource) -> Result<(), VulkanError> {
+        self.invalidate_bindings();
         self.unlink_lru(resource);
         match resource {
             Resource::Buffer(id) => {
+                self.buffer_writes.remove(&id);
                 let entry = self.buffers[id.slot].entry.take().expect("candidate");
                 if self.buffers[id.slot].generation < u32::MAX {
                     self.free_buffers.push(id.slot);
@@ -629,10 +652,12 @@ impl VulkanResidency {
         allocation: nixe_memory::AllocationId,
         extents: &[nixe_memory::Extent],
     ) -> Result<(), VulkanError> {
+        self.realize_clears_overlapping(extents.iter().copied())?;
         let resources = self
             .authority
             .retire_physical_ranges(machine, allocation, extents)?;
         for resource in resources {
+            self.invalidate_bindings();
             if self.authority.mapping(resource, 0).is_none() {
                 self.retire_entry(resource)?;
             } else {
@@ -763,6 +788,7 @@ impl VulkanResidency {
             ));
         };
         self.check_buffer_range(id, offset, bytes)?;
+        self.consume_buffer_changes(id)?;
         // Whole literal overwrites can discard their pending upload. Partial
         // overwrites first preserve the untouched bytes in native storage.
         let partial = self.buffer(id)?.known.iter().any(|literal| {
@@ -862,10 +888,7 @@ impl VulkanResidency {
         let entry = self.buffers[id.slot].entry.as_mut().expect("buffer");
         entry.validate_interval(offset, bytes);
         entry.contents.last_use = Some(work);
-        self.buffer_writes
-            .entry(id)
-            .or_default()
-            .push((offset, bytes));
+        self.mark_buffer_write(id, offset, bytes);
         Ok(())
     }
     pub fn write_buffer(
@@ -926,6 +949,7 @@ impl VulkanResidency {
         Ok(())
     }
     pub fn flush(&mut self) -> Result<Option<WorkTicket>, VulkanError> {
+        self.realize_deferred_clears()?;
         self.flush_with_sync(&[], &[])
     }
     pub(crate) fn flush_with_sync(
@@ -933,7 +957,6 @@ impl VulkanResidency {
         waits: &[vk::SemaphoreSubmitInfo<'_>],
         signals: &[vk::SemaphoreSubmitInfo<'_>],
     ) -> Result<Option<WorkTicket>, VulkanError> {
-        self.commit_buffer_downloads()?;
         self.progress_readbacks()?;
         if self.device.submission.recording.is_some() {
             self.barriers.emit(&mut self.device);

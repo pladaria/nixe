@@ -98,6 +98,7 @@ impl VulkanResidency {
     /// it after recording; native references retire on the actual use ticket.
     pub fn release_attachment(&mut self, id: AttachmentId) -> Result<(), VulkanError> {
         self.attachment(id)?;
+        self.invalidate_bindings();
         let entry = self.attachments[id.slot].entry.take().unwrap();
         if self.attachments[id.slot].generation < u32::MAX {
             self.free_attachments.push(id.slot);

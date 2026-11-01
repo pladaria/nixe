@@ -4,7 +4,6 @@ mod bindings;
 mod color_reduction;
 mod coverage;
 pub(super) mod draw;
-mod falcon;
 mod inline_to_memory;
 mod line;
 mod mme;
@@ -28,8 +27,7 @@ pub use bindings::{
     MaxwellThreeDConstantBufferBinding, MaxwellThreeDConstantBufferSelectorState,
     MaxwellThreeDDescriptorPoolState, MaxwellThreeDInlineConstantBufferUpload,
     MaxwellThreeDPipelineBindingState, MaxwellThreeDProgramRegionState,
-    MaxwellThreeDSamplerBindingMode, MaxwellThreeDShaderBindingState,
-    MaxwellThreeDShaderBindingWrite, MaxwellThreeDTessellationLod,
+    MaxwellThreeDSamplerBindingMode, MaxwellThreeDShaderBindingState, MaxwellThreeDTessellationLod,
 };
 pub use color_reduction::{
     MaxwellThreeDColorReductionFp16Threshold, MaxwellThreeDColorReductionSrgb8Threshold,
@@ -48,10 +46,6 @@ pub use coverage::{
     MaxwellThreeDTirMode, MaxwellThreeDTirModulationComponentSelect,
     MaxwellThreeDTirModulationFunction,
 };
-pub use falcon::{
-    MaxwellThreeDFalconError, MaxwellThreeDFalconMaskedRegisterWrite, MaxwellThreeDFalconRegister,
-    MaxwellThreeDFalconRegisterAddress, MaxwellThreeDFalconState,
-};
 pub use inline_to_memory::{
     MaxwellThreeDInlineToMemoryCompletion, MaxwellThreeDInlineToMemoryLaunch,
     MaxwellThreeDInlineToMemoryLayout, MaxwellThreeDInlineToMemoryState,
@@ -67,9 +61,8 @@ pub use mme::{
     MAXWELL_THREE_D_MME_EMITTED_METHOD_LIMIT, MAXWELL_THREE_D_MME_EXECUTION_INSTRUCTION_LIMIT,
     MAXWELL_THREE_D_MME_SHADOW_SCRATCH_COUNT, MaxwellThreeDMmeExecutionError,
     MaxwellThreeDMmeInstruction, MaxwellThreeDMmeLoadError, MaxwellThreeDMmeRam,
-    MaxwellThreeDMmeRamAddress, MaxwellThreeDMmeShadowRamControl, MaxwellThreeDMmeShadowRamError,
-    MaxwellThreeDMmeShadowScratchIndex, MaxwellThreeDMmeState, MaxwellThreeDMmeStateWrite,
-    MaxwellThreeDMutableMethodControl,
+    MaxwellThreeDMmeRamAddress, MaxwellThreeDMmeShadowRamControl, MaxwellThreeDMmeState,
+    MaxwellThreeDMmeStateWrite, MaxwellThreeDMutableMethodControl,
 };
 pub use operations::{
     MaxwellThreeDDecompressSurface, MaxwellThreeDFlushPendingWrites,
@@ -166,9 +159,8 @@ use nixe_gpu::{GpuClassId, GpuMethodId};
 use mme::{MaxwellThreeDMmeHost, MaxwellThreeDMmeRunError};
 
 use super::{
-    AppliedMethod, MaxwellEngineCapability, MaxwellEngineDispatchError,
-    MaxwellEngineMethodMetadata, MaxwellInlineToMemoryUpload, MaxwellShaderCacheInvalidation,
-    PendingEngineOperation,
+    MaxwellEngineCapability, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata,
+    MaxwellInlineToMemoryUpload, MaxwellShaderCacheInvalidation, PendingEngineOperation,
 };
 use crate::{
     MaxwellAamVersion, MaxwellAamVersionRange, MaxwellGpuProfile, MaxwellMethodDispatch,
@@ -177,77 +169,6 @@ use crate::{
 
 pub(super) const CLASS: GpuClassId = GpuClassId(0xb197);
 const CLASS_NAME: &str = "MAXWELL_B";
-
-#[derive(Clone, Copy)]
-enum PendingOperation {
-    Notification {
-        address: u64,
-        source: crate::MaxwellMethodSource,
-    },
-    ThreeD(MaxwellThreeDOperationTrigger),
-    RenderCondition(crate::MaxwellMethodSource),
-    Synchronization(MaxwellThreeDSynchronizationTrigger),
-    InlineToMemory(MaxwellInlineToMemoryUpload),
-    InlineConstantBuffer(MaxwellThreeDInlineConstantBufferUpload),
-}
-
-struct PreparedMethod {
-    metadata: MaxwellEngineMethodMetadata,
-    operation: Option<PendingOperation>,
-    writes_state: bool,
-}
-
-impl PreparedMethod {
-    const fn new(
-        metadata: MaxwellEngineMethodMetadata,
-        operation: Option<PendingOperation>,
-        writes_state: bool,
-    ) -> Self {
-        Self {
-            metadata,
-            operation,
-            writes_state,
-        }
-    }
-}
-
-const fn no_operation() -> (Option<PendingOperation>, bool) {
-    (None, false)
-}
-
-const fn state_write() -> (Option<PendingOperation>, bool) {
-    (None, true)
-}
-
-const fn three_d_operation(
-    trigger: MaxwellThreeDOperationTrigger,
-) -> (Option<PendingOperation>, bool) {
-    (Some(PendingOperation::ThreeD(trigger)), false)
-}
-
-const fn state_operation(
-    trigger: MaxwellThreeDOperationTrigger,
-) -> (Option<PendingOperation>, bool) {
-    (Some(PendingOperation::ThreeD(trigger)), true)
-}
-
-const fn synchronization_operation(
-    trigger: MaxwellThreeDSynchronizationTrigger,
-) -> (Option<PendingOperation>, bool) {
-    (Some(PendingOperation::Synchronization(trigger)), false)
-}
-
-const fn state_inline_to_memory(
-    upload: MaxwellInlineToMemoryUpload,
-) -> (Option<PendingOperation>, bool) {
-    (Some(PendingOperation::InlineToMemory(upload)), true)
-}
-
-const fn state_inline_constant_buffer(
-    upload: MaxwellThreeDInlineConstantBufferUpload,
-) -> (Option<PendingOperation>, bool) {
-    (Some(PendingOperation::InlineConstantBuffer(upload)), true)
-}
 
 #[derive(Clone, Copy)]
 enum MethodAction {
@@ -402,8 +323,7 @@ macro_rules! methods {
 }
 
 // Class, method, field, and enum values are pinned to NVIDIA's generated
-// public MAXWELL_B header. That header does not publish register reset values,
-// so state begins explicitly unset rather than assuming zero.
+// public MAXWELL_B header. Register-bank initialization is defined in state.rs.
 // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h
 methods!(
     NO_OPERATION => (0x0100, "NO_OPERATION", u32::MAX, MethodAction::NoOperation),
@@ -1212,15 +1132,12 @@ where
 
     fn read_register(&self, method_dword: u16) -> Result<u32, Self::Error> {
         let method = GpuMethodId(u32::from(method_dword) * 4);
-        self.candidate
-            .raw_register_value(method)
-            .or_else(|| state::verified_raw_register_reset(method))
-            .ok_or_else(|| {
-                MaxwellThreeDMmePreflightError::dispatch(MaxwellEngineDispatchError::MmeExecution {
-                    source: self.source,
-                    error: MaxwellThreeDMmeExecutionError::RegisterReadUnavailable { method_dword },
-                })
+        self.candidate.raw_register_value(method).ok_or_else(|| {
+            MaxwellThreeDMmePreflightError::dispatch(MaxwellEngineDispatchError::MmeExecution {
+                source: self.source,
+                error: MaxwellThreeDMmeExecutionError::RegisterReadUnavailable { method_dword },
             })
+        })
     }
 
     fn emit_register(&mut self, method_dword: u16, argument: u32) -> Result<bool, Self::Error> {
@@ -1231,9 +1148,11 @@ where
         if !is_plain_method(method) {
             return Ok(false);
         }
-        let source = self.source.emitted_by_mme(method, argument);
-        write_plain_source(source, self.candidate)
-            .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
+        let origin = &self.source;
+        write_plain_register(method, argument, self.candidate, || {
+            origin.emitted_by_mme(method, argument)
+        })
+        .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
         Ok(true)
     }
 
@@ -1252,7 +1171,7 @@ where
             .await
             .map_err(MaxwellThreeDMmePreflightError::Consumer)?;
         if is_plain_method(method) {
-            write_plain_source(source, self.candidate)
+            write_plain_register(method, argument, self.candidate, || source)
                 .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
             return Ok(());
         }
@@ -1260,9 +1179,9 @@ where
         // MME sends use the same method path, including shadow tracking/replay,
         // as pushbuffer writes. The interpreter and JIT both call CallMethod:
         // https://github.com/eden-emulator/mirror/blob/67bada77f8a43a90da2e94e89b8e7da73c256989/src/video_core/macro.cpp#L664-L666
-        let prepared = preflight_with_shadow(self.profile, &mut dispatch, self.candidate)
+        let prepared = preflight(self.profile, &mut dispatch, self.candidate)
             .map_err(MaxwellThreeDMmePreflightError::dispatch)?;
-        if let Some(operation) = lower_pending_operation(prepared.operation, self.candidate) {
+        if let Some(operation) = prepared {
             draw::operation(self.candidate, operation, self.consume)
                 .await
                 .map_err(MaxwellThreeDMmePreflightError::Consumer)?;
@@ -1275,53 +1194,11 @@ where
 #[inline]
 pub(super) fn preflight(
     profile: &MaxwellGpuProfile,
-    mut method: MaxwellMethodDispatch,
-    candidate: &mut MaxwellThreeDFrontendState,
-) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
-    let prepared = preflight_with_shadow(profile, &mut method, candidate)?;
-    let operation = lower_pending_operation(prepared.operation, candidate);
-    Ok(AppliedMethod::new(method, prepared.metadata, operation))
-}
-
-fn lower_pending_operation(
-    operation: Option<PendingOperation>,
-    _state: &MaxwellThreeDFrontendState,
-) -> Option<PendingEngineOperation> {
-    operation.map(|operation| match operation {
-        PendingOperation::Notification { address, source } => {
-            PendingEngineOperation::Notification { address, source }
-        }
-        PendingOperation::ThreeD(trigger) => PendingEngineOperation::ThreeD(trigger),
-        PendingOperation::RenderCondition(source) => {
-            PendingEngineOperation::ThreeDRenderCondition(source)
-        }
-        PendingOperation::Synchronization(trigger) => {
-            PendingEngineOperation::ThreeDSynchronization(trigger)
-        }
-        PendingOperation::InlineToMemory(upload) => PendingEngineOperation::InlineToMemory(upload),
-        PendingOperation::InlineConstantBuffer(upload) => {
-            PendingEngineOperation::ThreeDInlineConstantBuffer(upload)
-        }
-    })
-}
-
-#[inline]
-fn preflight_with_shadow(
-    profile: &MaxwellGpuProfile,
     method: &mut MaxwellMethodDispatch,
     candidate: &mut MaxwellThreeDFrontendState,
-) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
+) -> Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError> {
     if write_plain_method(method, candidate)? {
-        return Ok(PreparedMethod::new(
-            MaxwellEngineMethodMetadata::new(
-                CLASS,
-                CLASS_NAME,
-                method.source().method(),
-                "STATE_REGISTER",
-            ),
-            None,
-            true,
-        ));
+        return Ok(None);
     }
     let source = method.source();
     if is_mme_aperture(source.method()) {
@@ -1333,21 +1210,21 @@ fn preflight_with_shadow(
     let shadow_control = candidate.mme().shadow_ram_control().value().copied();
     let effective_argument = candidate
         .mme()
-        .resolve_shadow_argument(source.method(), source.argument())
-        .map_err(|error| MaxwellEngineDispatchError::MmeShadowRam { source, error })?;
+        .resolve_shadow_argument(source.method(), source.argument());
 
     method.set_effective_argument(effective_argument);
     let effective_source = method.source();
     let prepared = preflight_register(profile, effective_source, candidate)?;
-    if prepared.writes_state {
-        candidate.record_raw_register(effective_source);
-    }
+    // Every executed method updates its live register, including triggers. MME
+    // reads this same bank; effects are not a second register-storage policy.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
+    candidate.record_raw_register(effective_source);
     candidate.mme_mut().track_shadow_register(
         shadow_control,
         effective_source.method(),
         effective_source.argument(),
     );
-    if matches!(prepared.operation, Some(PendingOperation::ThreeD(_))) {
+    if matches!(prepared, Some(PendingEngineOperation::ThreeD(_))) {
         candidate.flush_dirty();
     }
     Ok(prepared)
@@ -1363,49 +1240,49 @@ pub(super) fn write_plain_method(
     if !registers::passive(method.source().method()) {
         return Ok(false);
     }
-    let argument = write_plain_source(method.source(), candidate)?;
+    let source = method.source();
+    let argument = write_plain_register(source.method(), source.argument(), candidate, || source)?;
     method.set_effective_argument(argument);
     Ok(true)
 }
 
 #[inline]
-pub(super) fn write_plain_source(
-    source: crate::MaxwellMethodSource,
+fn write_plain_register(
+    method: GpuMethodId,
+    submitted_argument: u32,
     candidate: &mut MaxwellThreeDFrontendState,
+    source: impl FnOnce() -> crate::MaxwellMethodSource,
 ) -> Result<u32, MaxwellEngineDispatchError> {
-    debug_assert!(registers::passive(source.method()));
+    debug_assert!(registers::passive(method));
     let control = candidate.mme().shadow_ram_control().value().copied();
     let argument = candidate
         .mme()
-        .resolve_shadow_argument(source.method(), source.argument())
-        .map_err(|error| MaxwellEngineDispatchError::MmeShadowRam { source, error })?;
-    let effective_source = source.emitted_by_mme(source.method(), argument);
+        .resolve_shadow_argument(method, submitted_argument);
     if candidate.pending_notification.is_some()
-        && let Some(declaration) = METHODS_BY_DWORD[(source.method().0 / 4) as usize]
+        && let Some(declaration) = METHODS_BY_DWORD[(method.0 / 4) as usize]
     {
         return Err(invalid_encoding(
-            effective_source,
+            source().emitted_by_mme(method, argument),
             declaration.metadata.method_name(),
             "pending notification requires completion of a method other than NO_OPERATION",
         ));
     }
-    candidate.write_register(source.method(), argument);
-    candidate.mme_mut().track_shadow_register(
-        control,
-        effective_source.method(),
-        effective_source.argument(),
-    );
+    candidate.write_register(method, argument);
+    candidate
+        .mme_mut()
+        .track_shadow_register(control, method, argument);
     Ok(argument)
 }
 
 pub(super) fn write_plain_span(
-    subchannel: crate::MaxwellPushbufferSubchannel,
+    #[cfg(test)] subchannel: crate::MaxwellPushbufferSubchannel,
     words: crate::MaxwellMethodSpan<'_>,
     candidate: &mut MaxwellThreeDFrontendState,
     #[cfg(test)] mut observe: impl FnMut(crate::MaxwellMethodSource, u32),
 ) -> Result<usize, MaxwellEngineDispatchError> {
     match candidate.mme().shadow_ram_control().value().copied() {
         Some(MaxwellThreeDMmeShadowRamControl::MethodReplay) => write_plain_words::<true, false>(
+            #[cfg(test)]
             subchannel,
             words,
             candidate,
@@ -1416,6 +1293,7 @@ pub(super) fn write_plain_span(
             MaxwellThreeDMmeShadowRamControl::MethodTrack
             | MaxwellThreeDMmeShadowRamControl::MethodTrackWithFilter,
         ) => write_plain_words::<false, true>(
+            #[cfg(test)]
             subchannel,
             words,
             candidate,
@@ -1423,6 +1301,7 @@ pub(super) fn write_plain_span(
             &mut observe,
         ),
         _ => write_plain_words::<false, false>(
+            #[cfg(test)]
             subchannel,
             words,
             candidate,
@@ -1433,31 +1312,27 @@ pub(super) fn write_plain_span(
 }
 
 fn write_plain_words<const REPLAY: bool, const TRACK: bool>(
-    subchannel: crate::MaxwellPushbufferSubchannel,
+    #[cfg(test)] subchannel: crate::MaxwellPushbufferSubchannel,
     words: crate::MaxwellMethodSpan<'_>,
     candidate: &mut MaxwellThreeDFrontendState,
     #[cfg(test)] observe: &mut impl FnMut(crate::MaxwellMethodSource, u32),
 ) -> Result<usize, MaxwellEngineDispatchError> {
+    // Normalize the packet's address evolution once. Increment-once tails
+    // become constant methods, including tails continued in a later GPFIFO entry.
+    let first = words.method_at(0).0;
+    let (stride, maximum_step) = match words.mode() {
+        crate::MaxwellMethodPacketMode::Incrementing => (4, u32::MAX),
+        crate::MaxwellMethodPacketMode::IncrementOnce => (4, 1),
+        _ => (0, 0),
+    };
     let mut consumed = 0;
     for index in 0..words.len() {
-        let method = words.method_at(index);
+        let method = GpuMethodId(first + (index as u32).min(maximum_step) * stride);
         if !registers::passive(method) {
             break;
         }
         let argument = if REPLAY {
-            candidate
-                .mme()
-                .shadow_value(method)
-                .or_else(|| state::verified_raw_register_reset(method))
-                .ok_or_else(|| MaxwellEngineDispatchError::MmeShadowRam {
-                    source: crate::MaxwellMethodSource::decoded(
-                        words.get(index).unwrap(),
-                        subchannel,
-                    ),
-                    error: MaxwellThreeDMmeShadowRamError::ReplayRegisterUnavailable {
-                        method_dword: (method.0 / 4) as u16,
-                    },
-                })?
+            candidate.mme().shadow_word(method)
         } else {
             words.argument_at(index)
         };
@@ -1513,98 +1388,81 @@ enum RegisterFamily {
     VertexAndBinding,
 }
 
-const REGISTER_FAMILIES: [RegisterFamily; 4096] = {
-    let mut families = [RegisterFamily::Other; 4096];
-    let mut index = 0;
-    while index < families.len() {
-        let method = index as u32 * 4;
-        families[index] = match method {
-            0x180..=0x1b4 => RegisterFamily::InlineToMemory,
-            0x114 | 0x118 | 0x11c | 0x120 | 0x3400..=0x37fc => RegisterFamily::Mme,
-            0x238c..=0x23fc => RegisterFamily::ConstantBuffer,
-            0x1120..=0x112c
-            | 0x1160..=0x11dc
-            | 0x1880..=0x18fc
-            | 0x1c00..=0x1dfc
-            | 0x1f00..=0x1ffc
-            | 0x0320..=0x0338
-            | 0x0374
-            | 0x0f84
-            | 0x0f88
-            | 0x02d0
-            | 0x0dcc
-            | 0x0de8
-            | 0x0d74
-            | 0x1118
-            | 0x1434
-            | 0x1438
-            | 0x1610
-            | 0x1614
-            | 0x1618
-            | 0x1644
-            | 0x1648
-            | 0x164c
-            | 0x17c8
-            | 0x17cc
-            | 0x17d0
-            | 0x17d4
-            | 0x17d8
-            | 0x17dc
-            | 0x1948
-            | 0x1970
-            | 0x0310
-            | 0x1608
-            | 0x160c
-            | 0x0f10
-            | 0x1234
-            | 0x155c
-            | 0x1560
-            | 0x1564
-            | 0x1574
-            | 0x1578
-            | 0x157c
-            | 0x2380
-            | 0x2384
-            | 0x2388
-            | 0x2608 => RegisterFamily::VertexAndBinding,
-            0x2000..=0x217c if matches!((method - 0x2000) % 0x40, 0 | 4 | 12 | 16) => {
-                RegisterFamily::VertexAndBinding
-            }
-            0x1240..=0x125c => RegisterFamily::VertexAndBinding,
-            0x2400..=0x24fc if (method - 0x2400) % 0x20 == 0x10 => RegisterFamily::VertexAndBinding,
-            _ => RegisterFamily::Other,
-        };
-        index += 1;
+const fn classify_family(method: u32) -> RegisterFamily {
+    match method {
+        0x180..=0x1b4 => RegisterFamily::InlineToMemory,
+        0x114 | 0x118 | 0x11c | 0x120 | 0x3400..=0x37fc => RegisterFamily::Mme,
+        0x2390..=0x23fc => RegisterFamily::ConstantBuffer,
+        0x1120..=0x112c
+        | 0x1160..=0x11dc
+        | 0x1880..=0x18fc
+        | 0x1c00..=0x1dfc
+        | 0x1f00..=0x1ffc
+        | 0x0320..=0x0338
+        | 0x0374
+        | 0x0f84
+        | 0x0f88
+        | 0x02d0
+        | 0x0dcc
+        | 0x0de8
+        | 0x0d74
+        | 0x1118
+        | 0x1434
+        | 0x1438
+        | 0x1610
+        | 0x1614
+        | 0x1618
+        | 0x1644
+        | 0x1648
+        | 0x164c
+        | 0x17c8
+        | 0x17cc
+        | 0x17d0
+        | 0x17d4
+        | 0x17d8
+        | 0x17dc
+        | 0x1948
+        | 0x1970
+        | 0x0310
+        | 0x1608
+        | 0x160c
+        | 0x0f10
+        | 0x1234
+        | 0x155c
+        | 0x1560
+        | 0x1564
+        | 0x1574
+        | 0x1578
+        | 0x157c
+        | 0x2380
+        | 0x2384
+        | 0x2388
+        | 0x2608 => RegisterFamily::VertexAndBinding,
+        0x2000..=0x217c if matches!((method - 0x2000) % 0x40, 0 | 4 | 12 | 16) => {
+            RegisterFamily::VertexAndBinding
+        }
+        0x1240..=0x125c => RegisterFamily::VertexAndBinding,
+        0x2400..=0x24fc if (method - 0x2400) % 0x20 == 0x10 => RegisterFamily::VertexAndBinding,
+        _ => RegisterFamily::Other,
     }
-    families
-};
+}
 
 #[inline]
 fn register_family(method: u32) -> RegisterFamily {
-    if method & 3 != 0 {
-        return RegisterFamily::Other;
-    }
-    REGISTER_FAMILIES
-        .get((method / 4) as usize)
-        .copied()
-        .unwrap_or(RegisterFamily::Other)
+    registers::info(GpuMethodId(method)).map_or(RegisterFamily::Other, |info| info.family)
 }
 
 fn preflight_register(
     profile: &MaxwellGpuProfile,
     source: crate::MaxwellMethodSource,
     candidate: &mut MaxwellThreeDFrontendState,
-) -> Result<PreparedMethod, MaxwellEngineDispatchError> {
+) -> Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError> {
     // NVIDIA's packed inline ports append low lanes first. END consumes the
     // complete stream, as in the independently reviewed public draw managers:
     // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/video_core/engines/draw_manager.cpp
     if matches!(source.method().0, 0x1300 | 0x15e8 | 0x15ec) {
         candidate.append_inline_indices(source)?;
-        return Ok(PreparedMethod::new(
-            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), "INLINE_INDEX"),
-            None,
-            true,
-        ));
+        return Ok(None);
     }
     if source.method().0 == 0x1618 && candidate.has_inline_indices() {
         return Err(invalid_encoding(
@@ -1623,56 +1481,43 @@ fn preflight_register(
     if source.method().0 == 0x1614 && candidate.has_inline_indices() {
         checked_bool(source, "END")?;
         let index_count = candidate.publish_inline_indices(source)?;
-        return Ok(PreparedMethod::new(
-            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), "END"),
-            Some(PendingOperation::ThreeD(
-                MaxwellThreeDOperationTrigger::DrawIndexBuffer {
-                    source,
-                    index_count,
-                },
-            )),
-            true,
-        ));
+        return Ok(Some(PendingEngineOperation::ThreeD(
+            MaxwellThreeDOperationTrigger::DrawIndexBuffer {
+                source,
+                index_count,
+            },
+        )));
     }
     let family = register_family(source.method().0);
     if family == RegisterFamily::InlineToMemory
-        && let Some((write, method_name, upload)) =
+        && let Some((write, upload)) =
             inline_to_memory::preflight(source, &candidate.operation_state().inline_to_memory())?
     {
         candidate.apply(write);
-        let metadata =
-            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        let (operation, writes_state) = upload.map_or(state_write(), state_inline_to_memory);
-        return Ok(PreparedMethod::new(metadata, operation, writes_state));
+        let operation = upload.map(PendingEngineOperation::InlineToMemory);
+        return Ok(operation);
     }
     if family == RegisterFamily::Mme
-        && let Some((write, method_name)) = preflight_mme_state(source, candidate)?
+        && let Some(write) = preflight_mme_state(source, candidate)?
     {
         candidate.apply(write);
-        let metadata =
-            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        return Ok(PreparedMethod::new(metadata, None, true));
+        return Ok(None);
     }
-    if family == RegisterFamily::ConstantBuffer
-        && let Some((write, method_name, upload)) =
-            preflight_constant_buffer_load(source, candidate)?
-    {
-        candidate.apply(write);
-        let metadata =
-            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        let (operation, writes_state) = upload.map_or(state_write(), state_inline_constant_buffer);
-        return Ok(PreparedMethod::new(metadata, operation, writes_state));
+    if family == RegisterFamily::ConstantBuffer {
+        let upload = preflight_constant_buffer_load(source, candidate)?;
+        candidate.write_register(GpuMethodId(0x238c), upload.offset() + 4);
+        return Ok(Some(PendingEngineOperation::ThreeDInlineConstantBuffer(
+            upload,
+        )));
     }
     if family == RegisterFamily::VertexAndBinding
-        && let Some((write, method_name)) = preflight_vertex_and_binding_state(source, candidate)?
+        && let Some(write) = preflight_vertex_and_binding_state(source, candidate)?
     {
         candidate.apply(write);
-        let metadata =
-            MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), method_name);
-        return Ok(PreparedMethod::new(metadata, None, true));
+        return Ok(None);
     }
-    if let Some(prepared) = preflight_clear(source)? {
-        return Ok(prepared);
+    if source.method().0 == 0x19d0 {
+        return preflight_clear(source);
     }
     let Some(declaration) = (source.method().0 & 3 == 0)
         .then(|| METHODS_BY_DWORD.get((source.method().0 / 4) as usize))
@@ -1705,7 +1550,7 @@ fn preflight_register(
             "pending notification requires completion of a method other than NO_OPERATION",
         ));
     }
-    let (operation, writes_state) = match declaration.action {
+    let operation = match declaration.action {
         MethodAction::NotifyAddress
         | MethodAction::Delay
         | MethodAction::VpcPerfKnob
@@ -1788,25 +1633,19 @@ fn preflight_register(
         | MethodAction::ZPassPixelCountEnable
         | MethodAction::ZCullCriterion
         | MethodAction::ZCullEnable
-        | MethodAction::ZCullBounds => unreachable!("passive method entered execution dispatch"),
-        MethodAction::RenderEnableMode | MethodAction::RenderEnableOverride => {
-            let valid = match declaration.action {
-                MethodAction::RenderEnableMode => {
-                    MaxwellThreeDRenderEnableMode::parse(source.argument()).is_some()
-                }
-                MethodAction::RenderEnableOverride => {
-                    MaxwellThreeDRenderEnableOverride::parse(source.argument()).is_some()
-                }
-                _ => unreachable!(),
-            };
-            if !valid {
+        | MethodAction::ZCullBounds
+        | MethodAction::RenderEnableOverride => {
+            unreachable!("passive method entered execution dispatch")
+        }
+        MethodAction::RenderEnableMode => {
+            if MaxwellThreeDRenderEnableMode::parse(source.argument()).is_none() {
                 return Err(MaxwellEngineDispatchError::InvalidMethodValue {
                     source,
                     metadata: declaration.metadata,
                     defined_mask: declaration.defined_mask,
                 });
             }
-            (Some(PendingOperation::RenderCondition(source)), true)
+            Some(PendingEngineOperation::ThreeDRenderCondition(source))
         }
         MethodAction::Notify => {
             if source.argument() != 0 {
@@ -1833,16 +1672,13 @@ fn preflight_register(
             }
             candidate.pending_notification =
                 Some(((u64::from(high) << 32) | u64::from(low), source));
-            state_write()
+            None
         }
         MethodAction::NoOperation => {
             if let Some((address, source)) = candidate.pending_notification.take() {
-                (
-                    Some(PendingOperation::Notification { address, source }),
-                    false,
-                )
+                Some(PendingEngineOperation::Notification { address, source })
             } else {
-                no_operation()
+                None
             }
         }
         MethodAction::DiscardRenderTarget => {
@@ -1856,7 +1692,7 @@ fn preflight_register(
             // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/gpu_3d_base.cpp#L514-L530
             // Discard/invalidation permits retained contents, not a required
             // replacement value: https://registry.khronos.org/OpenGL/specs/gl/glspec43.core.pdf section 17.4.4.
-            no_operation()
+            None
         }
         MethodAction::ClearReportValue => {
             // Type 2 resets the hierarchical Z-cull statistics. We do not
@@ -1871,7 +1707,7 @@ fn preflight_register(
                     reason: "resetting non-Z-cull performance counters is not implemented",
                 });
             }
-            no_operation()
+            None
         }
         MethodAction::ZCullMaintenance => {
             // These commands maintain only Maxwell's hierarchical Z-cull
@@ -1882,7 +1718,7 @@ fn preflight_register(
             // deko3d clears conservatively (0x19) after changing targets.
             // https://github.com/NVIDIA/open-gpu-doc/blob/9fdf5c4062007929d9f4e6cbad9c9771fe61b880/classes/3d/clb197.h#L2091-L2108
             // https://github.com/devkitPro/deko3d/blob/350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db/source/maxwell/clear_buffers.mme#L26-L37
-            no_operation()
+            None
         }
         MethodAction::DecompressSurface => {
             let request = MaxwellThreeDDecompressSurface::parse(source.argument()).ok_or(
@@ -1892,28 +1728,25 @@ fn preflight_register(
                     defined_mask: declaration.defined_mask,
                 },
             )?;
-            synchronization_operation(MaxwellThreeDSynchronizationTrigger::DecompressSurface {
-                request,
-                source,
-            })
+            Some(PendingEngineOperation::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationTrigger::DecompressSurface { request, source },
+            ))
         }
-        MethodAction::WaitForIdle => {
-            synchronization_operation(MaxwellThreeDSynchronizationTrigger::WaitForIdle {
+        MethodAction::WaitForIdle => Some(PendingEngineOperation::ThreeDSynchronization(
+            MaxwellThreeDSynchronizationTrigger::WaitForIdle {
                 value: source.argument(),
                 source,
-            })
-        }
-        MethodAction::PixelShaderBarrier => {
-            synchronization_operation(MaxwellThreeDSynchronizationTrigger::PixelShaderBarrier {
+            },
+        )),
+        MethodAction::PixelShaderBarrier => Some(PendingEngineOperation::ThreeDSynchronization(
+            MaxwellThreeDSynchronizationTrigger::PixelShaderBarrier {
                 system_memory_barrier: source.argument() & 1 != 0,
                 source,
-            })
-        }
-        MethodAction::TiledCacheBarrier => {
-            synchronization_operation(MaxwellThreeDSynchronizationTrigger::TiledCacheBarrier {
-                source,
-            })
-        }
+            },
+        )),
+        MethodAction::TiledCacheBarrier => Some(PendingEngineOperation::ThreeDSynchronization(
+            MaxwellThreeDSynchronizationTrigger::TiledCacheBarrier { source },
+        )),
         MethodAction::MmeShadowRamControl => {
             let value = MaxwellThreeDMmeShadowRamControl::parse(source.argument()).ok_or(
                 MaxwellEngineDispatchError::InvalidMethodValue {
@@ -1928,7 +1761,7 @@ fn preflight_register(
                     source,
                 });
             candidate.apply(write);
-            state_write()
+            None
         }
         MethodAction::MutableMethodControl => {
             let value = MaxwellThreeDMutableMethodControl::parse(source.argument()).ok_or(
@@ -1944,34 +1777,14 @@ fn preflight_register(
                     source,
                 });
             candidate.apply(write);
-            state_write()
+            None
         }
         MethodAction::FalconFirmwareCall4 => {
-            let address = MaxwellThreeDFalconRegisterAddress::try_new(source.argument()).ok_or(
-                MaxwellEngineDispatchError::FalconFirmware {
-                    source,
-                    error: MaxwellThreeDFalconError::UnalignedRegisterAddress {
-                        address: source.argument(),
-                    },
-                },
-            )?;
-            let firmware_argument = |index| {
-                candidate
-                    .mme()
-                    .shadow_scratch(MaxwellThreeDMmeShadowScratchIndex::new(index))
-                    .and_then(MaxwellThreeDRegister::raw)
-                    .ok_or(MaxwellEngineDispatchError::FalconFirmware {
-                        source,
-                        error: MaxwellThreeDFalconError::MissingFirmwareArgument { index },
-                    })
-            };
-            let value = firmware_argument(1)?;
-            let mask = firmware_argument(2)?;
-            let write = MaxwellThreeDStateWrite::FalconMaskedRegister(
-                MaxwellThreeDFalconMaskedRegisterWrite::new(address, value, mask, source),
-            );
-            candidate.apply(write);
-            state_write()
+            // These internal hardware writes do not configure the emulated
+            // rasterizer. The guest-visible result is scratch[0] completion.
+            // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/engines/maxwell_3d.cpp
+            candidate.write_register(GpuMethodId(0x3400), 1);
+            None
         }
         MethodAction::TiledCacheFlush => {
             let mode = MaxwellThreeDTiledCacheFlushMode::parse(source.argument()).ok_or(
@@ -1981,10 +1794,9 @@ fn preflight_register(
                     defined_mask: declaration.defined_mask,
                 },
             )?;
-            synchronization_operation(MaxwellThreeDSynchronizationTrigger::TiledCacheFlush {
-                mode,
-                source,
-            })
+            Some(PendingEngineOperation::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationTrigger::TiledCacheFlush { mode, source },
+            ))
         }
         MethodAction::CheckSphVersion => {
             let requested = MaxwellShaderProgramHeaderVersionRange::new(
@@ -2008,7 +1820,7 @@ fn preflight_register(
                     },
                 );
             }
-            no_operation()
+            None
         }
         MethodAction::CheckAamVersion => {
             let requested = MaxwellAamVersionRange::new(
@@ -2030,7 +1842,7 @@ fn preflight_register(
                     supported,
                 });
             }
-            no_operation()
+            None
         }
         MethodAction::ReportSemaphoreTrigger => {
             let control = MaxwellThreeDReportSemaphoreControl::parse(source.argument())
@@ -2041,10 +1853,9 @@ fn preflight_register(
                         "control contains an unallocated enum value",
                     )
                 })?;
-            synchronization_operation(MaxwellThreeDSynchronizationTrigger::ReportSemaphore {
-                control,
-                source,
-            })
+            Some(PendingEngineOperation::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationTrigger::ReportSemaphore { control, source },
+            ))
         }
         MethodAction::InvalidateShaderCachesNoWfi => {
             let caches = MaxwellShaderCacheInvalidation::new(
@@ -2052,9 +1863,9 @@ fn preflight_register(
                 source.argument() & (1 << 4) != 0,
                 source.argument() & (1 << 12) != 0,
             );
-            synchronization_operation(
+            Some(PendingEngineOperation::ThreeDSynchronization(
                 MaxwellThreeDSynchronizationTrigger::InvalidateShaderCachesNoWfi { caches, source },
-            )
+            ))
         }
         MethodAction::InvalidateShaderCaches => {
             let caches = MaxwellShaderCacheInvalidation::new(
@@ -2067,9 +1878,9 @@ fn preflight_register(
                 source.argument() & (1 << 1) != 0,
                 source.argument() & (1 << 2) != 0,
             );
-            synchronization_operation(
+            Some(PendingEngineOperation::ThreeDSynchronization(
                 MaxwellThreeDSynchronizationTrigger::InvalidateShaderCaches { request, source },
-            )
+            ))
         }
         MethodAction::InvalidateTextureCacheNoWfi(target) => {
             let request = MaxwellThreeDTextureCacheInvalidation::new(
@@ -2081,12 +1892,12 @@ fn preflight_register(
                 },
                 (source.argument() >> 4) & 0x003f_ffff,
             );
-            synchronization_operation(
+            Some(PendingEngineOperation::ThreeDSynchronization(
                 MaxwellThreeDSynchronizationTrigger::InvalidateTextureCacheNoWfi {
                     request,
                     source,
                 },
-            )
+            ))
         }
         MethodAction::InvalidateTextureCache(target) => {
             let request = MaxwellThreeDTextureCacheInvalidation::new(
@@ -2098,16 +1909,15 @@ fn preflight_register(
                 },
                 (source.argument() >> 4) & 0x003f_ffff,
             );
-            synchronization_operation(
+            Some(PendingEngineOperation::ThreeDSynchronization(
                 MaxwellThreeDSynchronizationTrigger::InvalidateTextureCache { request, source },
-            )
+            ))
         }
         MethodAction::FlushPendingWrites => {
             let request = MaxwellThreeDFlushPendingWrites::new(source.argument() != 0);
-            synchronization_operation(MaxwellThreeDSynchronizationTrigger::FlushPendingWrites {
-                request,
-                source,
-            })
+            Some(PendingEngineOperation::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationTrigger::FlushPendingWrites { request, source },
+            ))
         }
         MethodAction::IncrementSyncpoint => {
             let request = MaxwellThreeDSyncpointIncrement::new(
@@ -2119,10 +1929,9 @@ fn preflight_register(
                     MaxwellThreeDSyncpointCondition::RopWritesDone
                 },
             );
-            synchronization_operation(MaxwellThreeDSynchronizationTrigger::IncrementSyncpoint {
-                request,
-                source,
-            })
+            Some(PendingEngineOperation::ThreeDSynchronization(
+                MaxwellThreeDSynchronizationTrigger::IncrementSyncpoint { request, source },
+            ))
         }
         MethodAction::DrawVertexArray => {
             if source.argument() == 0 {
@@ -2132,10 +1941,12 @@ fn preflight_register(
                     "vertex count is zero",
                 ));
             }
-            three_d_operation(MaxwellThreeDOperationTrigger::DrawVertexArray {
-                source,
-                vertex_count: source.argument(),
-            })
+            Some(PendingEngineOperation::ThreeD(
+                MaxwellThreeDOperationTrigger::DrawVertexArray {
+                    source,
+                    vertex_count: source.argument(),
+                },
+            ))
         }
         MethodAction::DrawIndexBuffer => {
             if source.argument() == 0 {
@@ -2145,10 +1956,12 @@ fn preflight_register(
                     "index count is zero",
                 ));
             }
-            state_operation(MaxwellThreeDOperationTrigger::DrawIndexBuffer {
-                source,
-                index_count: source.argument(),
-            })
+            Some(PendingEngineOperation::ThreeD(
+                MaxwellThreeDOperationTrigger::DrawIndexBuffer {
+                    source,
+                    index_count: source.argument(),
+                },
+            ))
         }
         MethodAction::Missing(capability) => {
             return Err(MaxwellEngineDispatchError::MissingCapability {
@@ -2158,37 +1971,19 @@ fn preflight_register(
             });
         }
     };
-    Ok(PreparedMethod::new(
-        *declaration.metadata,
-        operation,
-        writes_state,
-    ))
+    Ok(operation)
 }
 
 fn preflight_mme_state(
     source: crate::MaxwellMethodSource,
     candidate: &MaxwellThreeDFrontendState,
-) -> Result<Option<(MaxwellThreeDStateWrite, &'static str)>, MaxwellEngineDispatchError> {
+) -> Result<Option<MaxwellThreeDStateWrite>, MaxwellEngineDispatchError> {
     let mme = candidate.mme();
-    if (0x3400..0x3800).contains(&source.method().0) {
-        let index = ((source.method().0 - 0x3400) / 4) as u8;
-        return Ok(Some((
-            MaxwellThreeDStateWrite::Mme(MaxwellThreeDMmeStateWrite::ShadowScratch {
-                index: MaxwellThreeDMmeShadowScratchIndex::new(index),
-                value: source.argument(),
-                source,
-            }),
-            "SET_MME_SHADOW_SCRATCH",
-        )));
-    }
-    let (write, method_name) = match source.method().0 {
-        0x0114 => (
-            MaxwellThreeDMmeStateWrite::InstructionPointer {
-                value: MaxwellThreeDMmeRamAddress::new(source.argument()),
-                source,
-            },
-            "LOAD_MME_INSTRUCTION_RAM_POINTER",
-        ),
+    let write = match source.method().0 {
+        0x0114 => MaxwellThreeDMmeStateWrite::InstructionPointer {
+            value: MaxwellThreeDMmeRamAddress::new(source.argument()),
+            source,
+        },
         0x0118 => {
             let address =
                 mme.next_instruction_address()
@@ -2215,22 +2010,16 @@ fn preflight_mme_state(
                     },
                 });
             }
-            (
-                MaxwellThreeDMmeStateWrite::Instruction {
-                    address,
-                    value: MaxwellThreeDMmeInstruction::new(source.argument()),
-                    source,
-                },
-                "LOAD_MME_INSTRUCTION_RAM",
-            )
-        }
-        0x011c => (
-            MaxwellThreeDMmeStateWrite::StartAddressPointer {
-                value: MaxwellThreeDMmeRamAddress::new(source.argument()),
+            MaxwellThreeDMmeStateWrite::Instruction {
+                address,
+                value: MaxwellThreeDMmeInstruction::new(source.argument()),
                 source,
-            },
-            "LOAD_MME_START_ADDRESS_RAM_POINTER",
-        ),
+            }
+        }
+        0x011c => MaxwellThreeDMmeStateWrite::StartAddressPointer {
+            value: MaxwellThreeDMmeRamAddress::new(source.argument()),
+            source,
+        },
         0x0120 => {
             let index =
                 mme.next_start_address_index()
@@ -2257,126 +2046,85 @@ fn preflight_mme_state(
                     },
                 });
             }
-            (
-                MaxwellThreeDMmeStateWrite::StartAddress {
-                    index,
-                    address: MaxwellThreeDMmeRamAddress::new(source.argument()),
-                    source,
-                },
-                "LOAD_MME_START_ADDRESS_RAM",
-            )
+            MaxwellThreeDMmeStateWrite::StartAddress {
+                index,
+                address: MaxwellThreeDMmeRamAddress::new(source.argument()),
+                source,
+            }
         }
         _ => return Ok(None),
     };
-    Ok(Some((MaxwellThreeDStateWrite::Mme(write), method_name)))
+    Ok(Some(MaxwellThreeDStateWrite::Mme(write)))
 }
-
-type PreflightConstantBufferLoad = (
-    MaxwellThreeDStateWrite,
-    &'static str,
-    Option<MaxwellThreeDInlineConstantBufferUpload>,
-);
 
 fn preflight_constant_buffer_load(
     source: crate::MaxwellMethodSource,
     candidate: &MaxwellThreeDFrontendState,
-) -> Result<Option<PreflightConstantBufferLoad>, MaxwellEngineDispatchError> {
-    use MaxwellThreeDShaderBindingWrite as B;
-
+) -> Result<MaxwellThreeDInlineConstantBufferUpload, MaxwellEngineDispatchError> {
     let raw = source.argument();
-    match source.method().0 {
-        0x238c if raw <= u32::from(u16::MAX) => Ok(Some((
-            MaxwellThreeDStateWrite::ShaderBinding(B::ConstantBufferLoadOffset {
-                value: raw as u16,
-                source,
-            }),
-            "LOAD_CONSTANT_BUFFER_OFFSET",
-            None,
-        ))),
-        0x238c => Err(invalid_encoding(
-            source,
-            "LOAD_CONSTANT_BUFFER_OFFSET",
-            "offset exceeds the verified 16-bit field",
-        )),
-        method if (0x2390..0x2400).contains(&method) && method.is_multiple_of(4) => {
-            if candidate
-                .operation_state()
-                .render_enable()
-                .conditional_load_constant_buffer()
-                .value()
-                == Some(&MaxwellThreeDConditionalLoadConstantBuffer::Enabled)
-            {
-                return Err(
-                    MaxwellEngineDispatchError::UnsupportedConditionalConstantBufferLoad { source },
-                );
-            }
-            let bindings = candidate.operation_state().shader_bindings();
-            let selector = bindings.selector();
-            let address = selector.address().ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "LOAD_CONSTANT_BUFFER",
-                    "data load requires a complete selector address",
-                )
-            })?;
-            let size = *selector.size().value().ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "LOAD_CONSTANT_BUFFER",
-                    "data load requires a selector size",
-                )
-            })?;
-            let offset = bindings.constant_buffer_offset().ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "LOAD_CONSTANT_BUFFER",
-                    "data load requires LOAD_CONSTANT_BUFFER_OFFSET",
-                )
-            })?;
-            let next_offset = offset.checked_add(4).ok_or_else(|| {
-                invalid_encoding(
-                    source,
-                    "LOAD_CONSTANT_BUFFER",
-                    "inline upload offset overflows",
-                )
-            })?;
-            if next_offset > size {
-                return Err(invalid_encoding(
-                    source,
-                    "LOAD_CONSTANT_BUFFER",
-                    "inline upload exceeds the selected constant-buffer size",
-                ));
-            }
-            if address
-                .get()
-                .checked_add(u64::from(next_offset))
-                .is_none_or(|end| end > (1_u64 << 40))
-            {
-                return Err(invalid_encoding(
-                    source,
-                    "LOAD_CONSTANT_BUFFER",
-                    "inline upload GPU range overflows",
-                ));
-            }
-            let upload = MaxwellThreeDInlineConstantBufferUpload::new(address, offset, raw, source);
-            Ok(Some((
-                MaxwellThreeDStateWrite::ShaderBinding(B::ConstantBufferLoadData {
-                    next_offset,
-                    source,
-                }),
-                "LOAD_CONSTANT_BUFFER",
-                Some(upload),
-            )))
-        }
-        _ => Ok(None),
+    debug_assert!((0x2390..0x2400).contains(&source.method().0));
+    if candidate
+        .operation_state()
+        .render_enable()
+        .conditional_load_constant_buffer()
+        .value()
+        == Some(&MaxwellThreeDConditionalLoadConstantBuffer::Enabled)
+    {
+        return Err(
+            MaxwellEngineDispatchError::UnsupportedConditionalConstantBufferLoad { source },
+        );
     }
+    let bindings = candidate.operation_state().shader_bindings();
+    let selector = bindings.selector();
+    let address = selector.address().ok_or_else(|| {
+        invalid_encoding(
+            source,
+            "LOAD_CONSTANT_BUFFER",
+            "data load requires a complete selector address",
+        )
+    })?;
+    let size = *selector.size().value().ok_or_else(|| {
+        invalid_encoding(
+            source,
+            "LOAD_CONSTANT_BUFFER",
+            "data load requires a selector size",
+        )
+    })?;
+    let offset = bindings.constant_buffer_offset();
+    let next_offset = offset.checked_add(4).ok_or_else(|| {
+        invalid_encoding(
+            source,
+            "LOAD_CONSTANT_BUFFER",
+            "inline upload offset overflows",
+        )
+    })?;
+    if next_offset > size {
+        return Err(invalid_encoding(
+            source,
+            "LOAD_CONSTANT_BUFFER",
+            "inline upload exceeds the selected constant-buffer size",
+        ));
+    }
+    if address
+        .get()
+        .checked_add(u64::from(next_offset))
+        .is_none_or(|end| end > (1_u64 << 40))
+    {
+        return Err(invalid_encoding(
+            source,
+            "LOAD_CONSTANT_BUFFER",
+            "inline upload GPU range overflows",
+        ));
+    }
+    Ok(MaxwellThreeDInlineConstantBufferUpload::new(
+        address, offset, raw, source,
+    ))
 }
 
 fn preflight_vertex_and_binding_state(
     source: crate::MaxwellMethodSource,
     candidate: &MaxwellThreeDFrontendState,
-) -> Result<Option<(MaxwellThreeDStateWrite, &'static str)>, MaxwellEngineDispatchError> {
-    use MaxwellThreeDShaderBindingWrite as B;
+) -> Result<Option<MaxwellThreeDStateWrite>, MaxwellEngineDispatchError> {
     use MaxwellThreeDVertexInputWrite as V;
     let method = source.method().0;
     let raw = source.argument();
@@ -2423,35 +2171,28 @@ fn preflight_vertex_and_binding_state(
         } else {
             (None, None)
         };
-        return Ok(Some((
-            MaxwellThreeDStateWrite::ShaderBinding(B::BindConstantBuffer {
-                group,
-                slot,
+        return Ok(Some(MaxwellThreeDStateWrite::BindConstantBuffer {
+            group,
+            slot,
+            binding: MaxwellThreeDConstantBufferBinding {
                 enabled,
                 address,
                 size,
                 source,
-            }),
-            "BIND_GROUP_CONSTANT_BUFFER",
-        )));
+            },
+        }));
     }
     Ok(match method {
-        0x1614 => Some((
-            MaxwellThreeDStateWrite::VertexInput(V::End {
-                value: checked_bool(source, "END")?,
-                source,
-            }),
-            "END",
-        )),
-        0x1618 => Some((
-            MaxwellThreeDStateWrite::VertexInput(V::Begin {
-                value: MaxwellThreeDBegin::parse(raw).ok_or_else(|| {
-                    invalid_encoding(source, "BEGIN", "invalid topology or begin modifier")
-                })?,
-                source,
-            }),
-            "BEGIN",
-        )),
+        0x1614 => Some(MaxwellThreeDStateWrite::VertexInput(V::End {
+            value: checked_bool(source, "END")?,
+            source,
+        })),
+        0x1618 => Some(MaxwellThreeDStateWrite::VertexInput(V::Begin {
+            value: MaxwellThreeDBegin::parse(raw).ok_or_else(|| {
+                invalid_encoding(source, "BEGIN", "invalid topology or begin modifier")
+            })?,
+            source,
+        })),
         _ => None,
     })
 }
@@ -2489,10 +2230,7 @@ fn rectangle(raw: u32) -> Option<MaxwellThreeDRectangle> {
 
 fn preflight_clear(
     source: crate::MaxwellMethodSource,
-) -> Result<Option<PreparedMethod>, MaxwellEngineDispatchError> {
-    if source.method().0 != 0x19d0 {
-        return Ok(None);
-    }
+) -> Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError> {
     let value = MaxwellThreeDClearSurface::parse(source.argument()).ok_or_else(|| {
         invalid_encoding(
             source,
@@ -2500,14 +2238,12 @@ fn preflight_clear(
             "invalid target, layer, or reserved bits",
         )
     })?;
-    let (operation, writes_state) = if value.depth() || value.stencil() || value.color_mask() != 0 {
-        state_operation(MaxwellThreeDOperationTrigger::ClearSurface { source })
+    let operation = if value.depth() || value.stencil() || value.color_mask() != 0 {
+        Some(PendingEngineOperation::ThreeD(
+            MaxwellThreeDOperationTrigger::ClearSurface { source },
+        ))
     } else {
-        state_write()
+        None
     };
-    Ok(Some(PreparedMethod::new(
-        MaxwellEngineMethodMetadata::new(CLASS, CLASS_NAME, source.method(), "CLEAR_SURFACE"),
-        operation,
-        writes_state,
-    )))
+    Ok(operation)
 }

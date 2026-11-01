@@ -44,15 +44,19 @@ enum Graphics {
         state: Arc<GuestDrawState>,
         graphics: GraphicsState,
     },
-    Ready {
-        pipeline: Arc<NativePipeline>,
-        parameters: Option<(
-            PreparedStateId,
-            crate::residency::execution::PreparedGraphicsState,
-            Arc<[u8]>,
-        )>,
-    },
+    Ready(usize),
 }
+struct GraphicsPipeline {
+    key: GraphicsKey,
+    transitions: Vec<usize>,
+    pipeline: Arc<NativePipeline>,
+    parameters: Option<(
+        PreparedStateId,
+        crate::residency::execution::PreparedGraphicsState,
+        Arc<[u8]>,
+    )>,
+}
+
 enum Computing {
     Shader {
         pending: Pending<ShaderArtifact>,
@@ -82,6 +86,10 @@ pub struct NativeGpuExecution {
     samplers: SamplerCache,
     drawings: HashMap<PreparedStateId, Drawing>,
     graphics: HashMap<GraphicsKey, Graphics>,
+    // Stable owner indices provide direct current-pipeline access while each
+    // entry retains its converted dynamic state across pipeline switches.
+    graphics_pipelines: Vec<GraphicsPipeline>,
+    current_graphics: Option<(usize, PreparedStateId)>,
     targets: Option<images::Targets>,
     vertex_buffers: Vec<Option<(GuestVertexBuffer, VertexBuffer)>>,
     index_buffer: Option<(
@@ -193,6 +201,8 @@ impl NativeGpuExecution {
             samplers,
             drawings: HashMap::default(),
             graphics: HashMap::default(),
+            graphics_pipelines: Vec::new(),
+            current_graphics: None,
             targets: None,
             vertex_buffers: Vec::new(),
             index_buffer: None,
@@ -252,27 +262,64 @@ impl NativeGpuExecution {
         )
     }
 
-    fn graphics(&mut self, state: &Arc<GuestDrawState>) -> Result<bool, VulkanError> {
-        let id = GraphicsKey::new(state, self.device_profile().dynamic_state.base);
-        if !self.graphics.contains_key(&id) {
-            let graphics = state::graphics(&state.parameters)?;
-            let pending = match self.request_shader(&state.program, Some(state)) {
-                Ok(p) => p,
-                Err(CompileError::Backpressure | CompileError::Budget) => return Ok(false),
-                Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
-            };
-            self.graphics.insert(
-                id.clone(),
-                Graphics::Shader {
-                    pending,
-                    state: Arc::clone(state),
-                    graphics,
-                },
-            );
+    fn select_graphics(&mut self, index: usize, parameters: PreparedStateId) {
+        if let Some((previous, _)) = self.current_graphics {
+            self.graphics_pipelines[previous].transitions.push(index);
         }
-        let ready = match self.graphics.get_mut(&id).unwrap() {
-            Graphics::Ready { .. } => return Ok(true),
-            Graphics::Shader { pending, .. } => pending.poll(),
+        self.current_graphics = Some((index, parameters));
+    }
+    fn graphics(&mut self, state: &Arc<GuestDrawState>) -> Result<bool, VulkanError> {
+        if let Some((index, parameters)) = self.current_graphics
+            && self.graphics_pipelines[index]
+                .key
+                .matches_source(state, parameters)
+        {
+            return Ok(true);
+        }
+        let id = GraphicsKey::new(state, self.device_profile().dynamic_state.base)?;
+        // Try the current pipeline and its known transitions before the map.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+        if let Some((index, _)) = self.current_graphics {
+            let pipeline = &self.graphics_pipelines[index];
+            let next = if pipeline.key == id {
+                Some(index)
+            } else {
+                pipeline
+                    .transitions
+                    .iter()
+                    .copied()
+                    .find(|&next| self.graphics_pipelines[next].key == id)
+            };
+            if let Some(next) = next {
+                self.current_graphics = Some((next, state.parameters.identity));
+                return Ok(true);
+            }
+        }
+        let ready = match self.graphics.get_mut(&id) {
+            Some(Graphics::Ready(index)) => {
+                let index = *index;
+                self.select_graphics(index, state.parameters.identity);
+                return Ok(true);
+            }
+            Some(Graphics::Shader { pending, .. }) => pending.poll(),
+            None => {
+                let graphics = state::graphics(&state.parameters)?;
+                let pending = match self.request_shader(&state.program, Some(state)) {
+                    Ok(p) => p,
+                    Err(CompileError::Backpressure | CompileError::Budget) => return Ok(false),
+                    Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
+                };
+                let ready = pending.poll();
+                self.graphics.insert(
+                    id.clone(),
+                    Graphics::Shader {
+                        pending,
+                        state: Arc::clone(state),
+                        graphics,
+                    },
+                );
+                ready
+            }
         };
         let Some(ready) = ready else { return Ok(false) };
         let ready = ready.map_err(|e| VulkanError::Compilation(e.to_string().into()))?;
@@ -369,13 +416,15 @@ impl NativeGpuExecution {
                     Err(e) => return Err(VulkanError::Compilation(e.to_string().into())),
                 };
                 self.statistics.prepared_graphics += 1;
-                self.graphics.insert(
-                    id,
-                    Graphics::Ready {
-                        pipeline,
-                        parameters: None,
-                    },
-                );
+                let index = self.graphics_pipelines.len();
+                self.graphics.insert(id.clone(), Graphics::Ready(index));
+                self.graphics_pipelines.push(GraphicsPipeline {
+                    key: id,
+                    transitions: Vec::new(),
+                    pipeline,
+                    parameters: None,
+                });
+                self.select_graphics(index, state.parameters.identity);
                 Ok(true)
             }
             _ => unreachable!("only shader preparation can be pending"),
@@ -400,21 +449,16 @@ impl NativeGpuExecution {
             }
         }
         self.drawings.remove(&id);
-        let graphics_key = GraphicsKey::new(source, self.device_profile().dynamic_state.base);
-        let already_prepared = matches!(
-            self.graphics.get(&graphics_key),
-            Some(Graphics::Ready { .. })
-        );
+        let prepared_graphics = self.statistics.prepared_graphics;
         if !self.graphics(source)? {
             return Ok(false);
         }
-        let Graphics::Ready {
+        let already_prepared = self.statistics.prepared_graphics == prepared_graphics;
+        let GraphicsPipeline {
             pipeline,
             parameters: retained_parameters,
-        } = self.graphics.get_mut(&graphics_key).unwrap()
-        else {
-            unreachable!()
-        };
+            ..
+        } = &mut self.graphics_pipelines[self.current_graphics.unwrap().0];
         let pipeline = Arc::clone(pipeline);
         // Buffer/descriptor changes do not change viewport, scissor or pipeline
         // state. Like dirty-state updates, convert only changed draw parameters.
@@ -702,6 +746,12 @@ impl NativeGpuExecution {
         }
     }
     fn command(&mut self, command: &NativeCommand) -> Result<bool, VulkanError> {
+        if !matches!(
+            command,
+            NativeCommand::Clear { .. } | NativeCommand::Draw { .. } | NativeCommand::Sequence(_)
+        ) {
+            self.residency.realize_deferred_clears()?;
+        }
         if matches!(
             command,
             NativeCommand::ConvertNv12 { .. }
@@ -907,6 +957,24 @@ impl NativeGpuExecution {
         self.statistics.submits = self.residency.device().submitted_tick();
         Ok(true)
     }
+    fn enqueue_completion(
+        &mut self,
+        frontend: FrontendSubmissionId,
+        work: Option<WorkTicket>,
+    ) -> BackendSubmissionToken {
+        let token = BackendSubmissionToken::new(
+            self.residency.device().submission_instance(),
+            self.next,
+            1,
+        );
+        self.next += 1;
+        self.completions.push_back(Completion {
+            frontend,
+            token,
+            work,
+        });
+        token
+    }
     fn completion(
         &mut self,
         timeout: Option<Duration>,
@@ -1019,6 +1087,15 @@ impl GpuExecution for NativeGpuExecution {
         // no remaining native point, there is no future timeline event to arm.
         Ok(())
     }
+    fn end_command_list(&mut self) -> Result<(), BackendRuntimeError> {
+        // DmaPusher::DispatchCalls seals outstanding draws through FlushCommands;
+        // it does not wait for their native completion.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.cpp
+        if self.draw_counter != 0 {
+            self.flush()?;
+        }
+        Ok(())
+    }
     fn consume(&mut self, batch: &Self::Commands) -> Result<bool, BackendRuntimeError> {
         // Retire released frontend states only after the prepared set grows. Warm
         // effects neither age pipelines nor repeatedly scan unchanged caches.
@@ -1037,23 +1114,23 @@ impl GpuExecution for NativeGpuExecution {
         &mut self,
         frontend: FrontendSubmissionId,
     ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
+        self.flush()?;
+        let work = self.residency.device().preceding_work();
+        Ok(self.enqueue_completion(frontend, work))
+    }
+    fn signal_fence(
+        &mut self,
+        frontend: FrontendSubmissionId,
+    ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
+        // A GPU fence publishes only its preceding CPU-visible writes. Native
+        // image/buffer lifetime continues to follow the queue's physical ticks.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/fence_manager.h
         self.residency.commit_buffer_downloads().map_err(runtime)?;
+        let work = self.residency.buffer_visibility_work();
         if self.residency.buffer_publications_pending() {
             self.flush()?;
         }
-        let work = self.residency.device().preceding_work();
-        let token = BackendSubmissionToken::new(
-            self.residency.device().submission_instance(),
-            self.next,
-            1,
-        );
-        self.next += 1;
-        self.completions.push_back(Completion {
-            frontend,
-            token,
-            work,
-        });
-        Ok(token)
+        Ok(self.enqueue_completion(frontend, work))
     }
     fn poll_completion(
         &mut self,

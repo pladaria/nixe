@@ -704,7 +704,6 @@ record!(TransformFeedbackVarying {
 });
 
 record!(RuntimeInfo {
-    base_instance,
     generic_input_types,
     previous_stage_stores,
     previous_stage_legacy_stores_mapping,
@@ -741,7 +740,6 @@ record!(CompilerSettings {
 });
 
 record!(GraphicsRuntimeState {
-    base_instance,
     vertex_input_types,
     input_topology,
     point_size,

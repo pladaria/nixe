@@ -5,7 +5,7 @@ use super::*;
 /// Test observation of validated methods and owned operation snapshots.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxwellEnginePacketDispatch {
-    pub(super) methods: Box<[MaxwellEngineMethodDispatch]>,
+    pub(super) methods: Box<[MaxwellMethodDispatch]>,
     ordered_operations: Box<[MaxwellEngineOperation]>,
 }
 
@@ -53,7 +53,7 @@ impl MaxwellThreeDTriggeredOperation {
 
 impl MaxwellEnginePacketDispatch {
     #[must_use]
-    pub fn methods(&self) -> &[MaxwellEngineMethodDispatch] {
+    pub fn methods(&self) -> &[MaxwellMethodDispatch] {
         &self.methods
     }
 

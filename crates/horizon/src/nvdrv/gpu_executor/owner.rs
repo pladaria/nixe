@@ -8,21 +8,22 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-struct GpuWork {
+#[derive(Clone)]
+struct SyncpointEffect {
     descriptor: NvDrvDeviceDescriptor,
     request: u32,
     frontend: FrontendSubmissionId,
-    reservation: Option<ReservedTimelinePoint>,
+    reservation: ReservedTimelinePoint,
     control: Arc<Mutex<NvHostControl>>,
 }
-struct PendingWork {
-    token: BackendSubmissionToken,
-    work: GpuWork,
-}
-struct PendingConversion {
+struct PendingCompletion {
     token: BackendSubmissionToken,
     frontend: FrontendSubmissionId,
-    reply: mpsc::SyncSender<Result<(), Box<str>>>,
+    action: CompletionAction,
+}
+enum CompletionAction {
+    Syncpoint(SyncpointEffect),
+    Conversion(mpsc::SyncSender<Result<(), Box<str>>>),
 }
 
 pub(super) fn run<L, E>(
@@ -85,8 +86,7 @@ struct Owner<
     >,
     blocked_effects: usize,
     recheck: bool,
-    pending: VecDeque<PendingWork>,
-    conversions: VecDeque<PendingConversion>,
+    pending: VecDeque<PendingCompletion>,
 }
 impl<'a, L, E> Owner<'a, L, E>
 where
@@ -113,7 +113,6 @@ where
             blocked_effects: 0,
             recheck: false,
             pending: VecDeque::new(),
-            conversions: VecDeque::new(),
         }
     }
     fn failure(
@@ -129,45 +128,53 @@ where
         }
     }
     fn poll(&mut self) -> Result<(), GpuExecutorFailure> {
+        if let Some(runtime) = self.backend.borrow_mut().as_mut() {
+            runtime
+                .progress()
+                .map_err(|error| self.runtime_failure(FrontendSubmissionId::new(0), error))?;
+        }
+        self.poll_completions()
+    }
+    fn poll_completions(&mut self) -> Result<(), GpuExecutorFailure> {
         let mut backend = self.backend.borrow_mut();
         let Some(runtime) = backend.as_mut() else {
             return Ok(());
         };
-        runtime
-            .progress()
-            .map_err(|error| self.runtime_failure(FrontendSubmissionId::new(0), error))?;
         while let Some(completion) = runtime
             .poll_completion()
             .map_err(|error| self.failure(FrontendSubmissionId::new(0), error.to_string()))?
         {
-            if let Some(index) = self
-                .conversions
-                .iter()
-                .position(|pending| pending.token == completion.submission())
+            let pending = self.pending.pop_front().ok_or_else(|| {
+                self.failure(completion.frontend(), "GPU completed an unknown fence")
+            })?;
+            if pending.token != completion.submission() || pending.frontend != completion.frontend()
             {
-                let pending = self.conversions.remove(index).unwrap();
-                if pending.frontend != completion.frontend() {
-                    return Err(self.failure(
-                        completion.frontend(),
-                        "conversion completion has a different frontend",
-                    ));
+                return Err(self.failure(
+                    completion.frontend(),
+                    "GPU fence completion is out of order",
+                ));
+            }
+            match pending.action {
+                CompletionAction::Syncpoint(effect) => {
+                    effect
+                        .control
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .publish_channel_increment(
+                            effect.descriptor,
+                            effect.request,
+                            &effect.reservation,
+                        )
+                        .map_err(|error| {
+                            self.failure(
+                                effect.frontend,
+                                format!("syncpoint publication failed: {error:?}"),
+                            )
+                        })?;
                 }
-                let _ = pending.reply.send(Ok(()));
-            } else {
-                let index = self
-                    .pending
-                    .iter()
-                    .position(|pending| pending.token == completion.submission())
-                    .ok_or_else(|| {
-                        self.failure(completion.frontend(), "GPU completed an unknown delivery")
-                    })?;
-                let pending = self.pending.remove(index).unwrap();
-                if pending.work.frontend != completion.frontend() {
-                    return Err(
-                        self.failure(completion.frontend(), "completion has a different frontend")
-                    );
+                CompletionAction::Conversion(reply) => {
+                    let _ = reply.send(Ok(()));
                 }
-                publish_completion(pending.work)?;
             }
         }
         Ok(())
@@ -368,6 +375,7 @@ where
         let mut host = CommandHost {
             owner: Rc::clone(&owner),
             clock: Default::default(),
+            syncpoint: None,
         };
         let conversion = match message {
             GpuMessage::Submission(queued) => return Self::submission(owner, queued).await,
@@ -447,18 +455,15 @@ where
                 .unwrap()
                 .submit(id)
                 .map_err(|error| owner.borrow().failure(id, error.to_string()))?;
-            // Host1x awaits this operation's completion before publishing its
-            // output fence; this is an actual dependency, not a wake registration.
-            owner.borrow_mut().flush_progress()?;
             Ok((id, token))
         }
         .await;
         match result {
             Ok((frontend, token)) => {
-                owner.borrow_mut().conversions.push_back(PendingConversion {
+                owner.borrow_mut().pending.push_back(PendingCompletion {
                     token,
                     frontend,
-                    reply,
+                    action: CompletionAction::Conversion(reply),
                 });
                 Ok(())
             }
@@ -493,13 +498,13 @@ where
         let mut host = CommandHost {
             owner: Rc::clone(&owner),
             clock: clock.clone(),
-        };
-        let work = GpuWork {
-            descriptor,
-            request,
-            frontend: id,
-            reservation,
-            control,
+            syncpoint: reservation.map(|reservation| SyncpointEffect {
+                descriptor,
+                request,
+                frontend: id,
+                reservation,
+                control,
+            }),
         };
         let (mut sources, mut context, frontend) = {
             let mut state = owner.borrow_mut();
@@ -547,23 +552,21 @@ where
                 }),
             )),
         })?;
+        if let Some(backend) = state.backend.borrow_mut().as_mut() {
+            backend
+                .end_command_list()
+                .map_err(|error| state.runtime_failure(id, error))?;
+        }
         drop(permit);
-        let token = state
-            .backend
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .submit(id)
-            .map_err(|error| state.failure(id, error.to_string()))?;
-        state.pending.push_back(PendingWork { token, work });
         nixe_memory::trace::event("gpu_command_end", id.get(), channel.id().get(), 0);
         Ok(())
     }
     fn cancel(&mut self, cause: &Arc<MemoryError>) {
-        for pending in self.conversions.drain(..) {
-            let _ = pending.reply.send(Err("GPU owner is shutting down".into()));
+        for pending in self.pending.drain(..) {
+            if let CompletionAction::Conversion(reply) = pending.action {
+                let _ = reply.send(Err("GPU owner is shutting down".into()));
+            }
         }
-        self.pending.clear();
         let deferred = self.deferred.drain(..).chain(self.receiver.try_iter());
         for message in deferred {
             match message {
@@ -579,22 +582,6 @@ where
         }
     }
 }
-fn publish_completion(work: GpuWork) -> Result<(), GpuExecutorFailure> {
-    let id = work.frontend;
-    if let Some(reservation) = work.reservation {
-        work.control
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .complete_channel_submission(work.descriptor, work.request, &reservation)
-            .map_err(|error| GpuExecutorFailure {
-                memory_cause: None,
-                frontend: id,
-                boundary: None,
-                detail: format!("guest completion publication failed: {error:?}").into(),
-            })?;
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests;
@@ -609,6 +596,7 @@ struct CommandHost<
 > {
     owner: Rc<RefCell<Owner<'a, L, E>>>,
     clock: nixe_runtime::VirtualClock,
+    syncpoint: Option<SyncpointEffect>,
 }
 impl<
     L: MaxwellFrontend,
@@ -670,6 +658,50 @@ impl<
         >,
 > nixe_gpu_maxwell::MaxwellCommandHost for CommandHost<'_, L, E>
 {
+    async fn signal_syncpoint(
+        &mut self,
+    ) -> Result<(), nixe_gpu_maxwell::MaxwellSubmissionExecutionError> {
+        let effect = self
+            .syncpoint
+            .as_ref()
+            .ok_or_else(|| {
+                nixe_gpu_maxwell::MaxwellSubmissionExecutionError::Native(
+                    "syncpoint has no channel reservation".into(),
+                )
+            })?
+            .clone();
+        // Command consumption releases guest/GPU dependencies immediately.
+        // CPU events advance only after signal_fence publishes prior downloads.
+        // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/fence_manager.h#L104-L108
+        effect
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .consume_channel_increment(effect.descriptor, effect.request, &effect.reservation)
+            .map_err(|error| {
+                nixe_gpu_maxwell::MaxwellSubmissionExecutionError::Native(
+                    format!("syncpoint consumption failed: {error:?}").into(),
+                )
+            })?;
+        let mut owner = self.owner.borrow_mut();
+        let token = owner
+            .backend
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .signal_fence(effect.frontend)
+            .map_err(|error| {
+                nixe_gpu_maxwell::MaxwellSubmissionExecutionError::Native(error.to_string().into())
+            })?;
+        owner.pending.push_back(PendingCompletion {
+            token,
+            frontend: effect.frontend,
+            action: CompletionAction::Syncpoint(effect),
+        });
+        owner.poll_completions().map_err(|error| {
+            nixe_gpu_maxwell::MaxwellSubmissionExecutionError::Native(error.to_string().into())
+        })
+    }
     async fn emit(
         &mut self,
         work: nixe_gpu::native::NativeWork,
@@ -726,14 +758,11 @@ impl<
         let result = (|| {
             loop {
                 let mut owner = self.owner.borrow_mut();
-                owner
-                    .poll()
-                    .and_then(|()| owner.flush_progress())
-                    .map_err(|error| {
-                        error
-                            .memory_cause
-                            .unwrap_or_else(|| Arc::new(MemoryError::Execution(error.detail)))
-                    })?;
+                owner.poll().map_err(|error| {
+                    error
+                        .memory_cause
+                        .unwrap_or_else(|| Arc::new(MemoryError::Execution(error.detail)))
+                })?;
                 if let Some(result) = pending.poll() {
                     return result;
                 }
@@ -742,6 +771,14 @@ impl<
                         "GPU owner stopped during memory access".into(),
                     )));
                 }
+                if owner.budget.take_progress_request() {
+                    owner
+                        .flush_progress()
+                        .map_err(|error| Arc::new(MemoryError::Execution(error.detail)))?;
+                }
+                owner
+                    .arm_progress()
+                    .map_err(|error| Arc::new(MemoryError::Execution(error.detail)))?;
                 match owner.receiver.recv() {
                     Ok(message) => owner
                         .service_control(message)

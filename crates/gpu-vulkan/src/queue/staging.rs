@@ -28,6 +28,14 @@ impl std::fmt::Debug for Slice {
             .finish_non_exhaustive()
     }
 }
+impl Slice {
+    pub(crate) fn release_readback(&self) {
+        let Source::Pooled(entry) = &self.source else {
+            unreachable!("readback owns download staging")
+        };
+        entry.deferred.store(false, Ordering::Relaxed);
+    }
+}
 struct Entry {
     buffer: Arc<AllocatedBuffer>,
     tick: AtomicU64,
@@ -172,6 +180,7 @@ impl StagingPool {
         let (usage, location, label) = if upload {
             (
                 vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST
                     | vk::BufferUsageFlags::VERTEX_BUFFER
                     | vk::BufferUsageFlags::INDEX_BUFFER
                     | vk::BufferUsageFlags::STORAGE_BUFFER
@@ -257,12 +266,6 @@ impl StagingPool {
             .filter(|entry| entry.deferred.load(Ordering::Relaxed))
             .count()
     }
-    pub fn release_readback(&mut self, slice: &Slice) {
-        let Source::Pooled(entry) = &slice.source else {
-            unreachable!("readback owns download staging")
-        };
-        entry.deferred.store(false, Ordering::Relaxed);
-    }
     pub fn tick_frame(&mut self, completed: u64) {
         self.delete_level = (self.delete_level + 1) % 64;
         for cache in [
@@ -327,7 +330,7 @@ mod tests {
             if i == 127 {
                 live = Some(slice);
             } else {
-                pool.release_readback(&slice);
+                slice.release_readback();
             }
         }
         let live = live.unwrap();
@@ -340,7 +343,7 @@ mod tests {
         assert_eq!(pool.retained_readbacks(), 1);
         assert!(pool.valid_readback(&live, 1));
         assert!(Arc::ptr_eq(pool.buffer(&live), &native));
-        pool.release_readback(&live);
+        live.release_readback();
         drop(live);
         drop(native);
         for _ in 0..64 {
@@ -349,7 +352,7 @@ mod tests {
         assert!(pool.downloads[level].entries.is_empty());
         let next = pool.reserve(256, 4, false, 2, 1).unwrap();
         assert_eq!(pool.downloads[level].entries.len(), 1);
-        pool.release_readback(&next);
+        next.release_readback();
         drop(next);
         drop(pool);
         drop(device);

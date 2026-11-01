@@ -244,8 +244,6 @@ pub struct TransformFeedbackVarying {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeInfo {
-    /// Logical instance base when a renderer splits one guest draw into host draws.
-    pub base_instance: Option<u32>,
     pub generic_input_types: [AttributeType; 32],
     pub previous_stage_stores: VaryingState,
     pub previous_stage_legacy_stores_mapping: BTreeMap<Attribute, Attribute>,
@@ -270,7 +268,6 @@ pub struct RuntimeInfo {
 impl Default for RuntimeInfo {
     fn default() -> Self {
         Self {
-            base_instance: None,
             generic_input_types: [AttributeType::Float; 32],
             previous_stage_stores: VaryingState::default(),
             previous_stage_legacy_stores_mapping: BTreeMap::new(),

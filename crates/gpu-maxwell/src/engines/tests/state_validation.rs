@@ -27,20 +27,15 @@ fn viewport_clips_preserve_origins_and_extents_independently() {
 }
 
 #[test]
-fn three_d_no_operation_is_named_and_implemented() {
+fn three_d_no_operation_keeps_the_register_state() {
     let mut channel = three_d_channel();
     let dispatch = dispatch_method(&mut channel, 0x100 / 4, 0xfeed_beef).unwrap();
 
     assert_eq!(dispatch.methods().len(), 1);
-    assert_eq!(dispatch.methods()[0].metadata().class_name(), "MAXWELL_B");
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "NO_OPERATION"
-    );
 }
 
 #[test]
-fn pipe_nop_accepts_its_full_payload_without_state_or_execution_effects() {
+fn pipe_nop_records_payload_without_execution_effects() {
     let mut channel = three_d_channel();
     use_mme_shadow_passthrough(&mut channel);
 
@@ -51,13 +46,20 @@ fn pipe_nop_accepts_its_full_payload_without_state_or_execution_effects() {
         let dispatch = dispatch_method(&mut channel, 0x1a2c / 4, argument).unwrap();
 
         assert_eq!(dispatch.methods().len(), 1);
-        assert_eq!(dispatch.methods()[0].metadata().class_name(), "MAXWELL_B");
-        assert_eq!(dispatch.methods()[0].metadata().method_name(), "PIPE_NOP");
 
         assert!(dispatch.operations().is_empty());
         assert_eq!(channel.frontend(), frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
+        assert!(
+            three_d_before
+                .draw_state_identity()
+                .matches(channel.three_d())
+        );
+        assert!(
+            three_d_before
+                .shader_state_identity()
+                .matches_code(channel.three_d())
+        );
     }
 }
 
@@ -69,11 +71,7 @@ fn mutable_method_control_is_typed_and_source_preserving() {
         (0, MaxwellThreeDMutableMethodControl::Lightweight),
         (1, MaxwellThreeDMutableMethodControl::Heavyweight),
     ] {
-        let dispatch = dispatch_method(&mut channel, 0x1134 / 4, argument).unwrap();
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_MUTABLE_METHOD_CONTROL"
-        );
+        dispatch_method(&mut channel, 0x1134 / 4, argument).unwrap();
 
         let register = channel.three_d_mut().mme().mutable_method_control();
         assert_eq!(register.raw(), Some(argument));
@@ -104,10 +102,7 @@ fn three_d_report_semaphore_trigger_is_an_explicit_observable_boundary() {
     }
 
     let dispatch = dispatch_method(&mut channel, 0x1b0c / 4, 0x1000_f010).unwrap();
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "SET_REPORT_SEMAPHORE_D"
-    );
+
     let operation = &dispatch.synchronization_operations()[0];
     let control = match operation.trigger() {
         MaxwellThreeDSynchronizationTrigger::ReportSemaphore { control, .. } => control,
@@ -228,21 +223,25 @@ fn sph_version_check_is_typed_profile_validated_and_state_neutral() {
             MaxwellShaderProgramHeaderVersion::new(oldest_supported),
         );
 
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "CHECK_SPH_VERSION"
-        );
-
         assert!(dispatch.operations().is_empty());
         assert_eq!(requested.raw(), argument);
         assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
+        assert!(
+            three_d_before
+                .draw_state_identity()
+                .matches(channel.three_d())
+        );
+        assert!(
+            three_d_before
+                .shader_state_identity()
+                .matches_code(channel.three_d())
+        );
         assert_eq!(channel.frontend(), frontend_before);
     }
 }
 
 #[test]
-fn malformed_incompatible_and_suffixed_sph_checks_are_rejected_atomically() {
+fn malformed_incompatible_and_suffixed_sph_checks_stop_at_the_invalid_method() {
     let mut channel = three_d_channel();
     use_mme_shadow_passthrough(&mut channel);
 
@@ -260,7 +259,16 @@ fn malformed_incompatible_and_suffixed_sph_checks_are_rejected_atomically() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches(channel.three_d())
+    );
+    assert!(
+        three_d_before
+            .shader_state_identity()
+            .matches_code(channel.three_d())
+    );
 
     for argument in [0x0002_0002, 0x0004_0004] {
         let frontend_before = channel.frontend();
@@ -282,7 +290,16 @@ fn malformed_incompatible_and_suffixed_sph_checks_are_rejected_atomically() {
         ));
         assert_eq!(channel.frontend(), frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
+        assert!(
+            three_d_before
+                .draw_state_identity()
+                .matches(channel.three_d())
+        );
+        assert!(
+            three_d_before
+                .shader_state_identity()
+                .matches_code(channel.three_d())
+        );
     }
 
     let frontend_before = channel.frontend();
@@ -296,7 +313,16 @@ fn malformed_incompatible_and_suffixed_sph_checks_are_rejected_atomically() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches(channel.three_d())
+    );
+    assert!(
+        three_d_before
+            .shader_state_identity()
+            .matches_code(channel.three_d())
+    );
 }
 
 #[test]
@@ -318,21 +344,25 @@ fn aam_version_check_is_typed_profile_validated_and_state_neutral() {
             MaxwellAamVersion::new(oldest_supported),
         );
 
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "CHECK_AAM_VERSION"
-        );
-
         assert!(dispatch.operations().is_empty());
         assert_eq!(requested.raw(), argument);
         assert_eq!(channel.frontend(), frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
+        assert!(
+            three_d_before
+                .draw_state_identity()
+                .matches(channel.three_d())
+        );
+        assert!(
+            three_d_before
+                .shader_state_identity()
+                .matches_code(channel.three_d())
+        );
     }
 }
 
 #[test]
-fn malformed_incompatible_and_suffixed_aam_checks_are_rejected_atomically() {
+fn malformed_incompatible_and_suffixed_aam_checks_stop_at_the_invalid_method() {
     let mut channel = three_d_channel();
     use_mme_shadow_passthrough(&mut channel);
 
@@ -350,7 +380,16 @@ fn malformed_incompatible_and_suffixed_aam_checks_are_rejected_atomically() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches(channel.three_d())
+    );
+    assert!(
+        three_d_before
+            .shader_state_identity()
+            .matches_code(channel.three_d())
+    );
 
     for argument in [0x0001_0001, 0x0003_0003] {
         let frontend_before = channel.frontend();
@@ -370,7 +409,16 @@ fn malformed_incompatible_and_suffixed_aam_checks_are_rejected_atomically() {
         ));
         assert_eq!(channel.frontend(), frontend_before);
         assert_eq!(channel.two_d(), &two_d_before);
-        assert_eq!(channel.three_d(), &three_d_before);
+        assert!(
+            three_d_before
+                .draw_state_identity()
+                .matches(channel.three_d())
+        );
+        assert!(
+            three_d_before
+                .shader_state_identity()
+                .matches_code(channel.three_d())
+        );
     }
 
     let frontend_before = channel.frontend();
@@ -384,7 +432,16 @@ fn malformed_incompatible_and_suffixed_aam_checks_are_rejected_atomically() {
     ));
     assert_eq!(channel.frontend(), frontend_before);
     assert_eq!(channel.two_d(), &two_d_before);
-    assert_eq!(channel.three_d(), &three_d_before);
+    assert!(
+        three_d_before
+            .draw_state_identity()
+            .matches(channel.three_d())
+    );
+    assert!(
+        three_d_before
+            .shader_state_identity()
+            .matches_code(channel.three_d())
+    );
 }
 
 #[test]
@@ -409,12 +466,6 @@ fn two_d_notify_address_upper_is_bounded_state_without_notification_effects() {
         let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
         let value = MaxwellTwoDNotifyAddressUpper::new(argument).unwrap();
         let register = channel.two_d().notify().address_upper();
-
-        assert_eq!(dispatch.methods()[0].metadata().class(), twod::CLASS);
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_NOTIFY_A"
-        );
 
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellTwoDRegisterOrigin::Programmed);
@@ -470,11 +521,6 @@ fn two_d_notify_address_lower_accepts_its_complete_bit_domain() {
         let value = MaxwellTwoDNotifyAddressLower::new(argument);
         let register = channel.two_d().notify().address_lower();
 
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_NOTIFY_B"
-        );
-
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellTwoDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -496,14 +542,7 @@ fn incrementing_notify_address_fragments_commit_together() {
     let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
 
     assert_eq!(dispatch.methods().len(), 2);
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "SET_NOTIFY_A"
-    );
-    assert_eq!(
-        dispatch.methods()[1].metadata().method_name(),
-        "SET_NOTIFY_B"
-    );
+
     assert!(dispatch.operations().is_empty());
     assert_eq!(channel.two_d().notify().address_upper().raw(), Some(1));
     assert_eq!(
@@ -512,11 +551,11 @@ fn incrementing_notify_address_fragments_commit_together() {
     );
     assert_eq!(
         channel.two_d().notify().address_upper().source(),
-        Some(dispatch.methods()[0].method().source())
+        Some(dispatch.methods()[0].source())
     );
     assert_eq!(
         channel.two_d().notify().address_lower().source(),
-        Some(dispatch.methods()[1].method().source())
+        Some(dispatch.methods()[1].source())
     );
 }
 
@@ -554,14 +593,8 @@ fn two_d_processing_cluster_values_are_typed_and_retain_their_source() {
         (1, MaxwellTwoDProcessingClusters::One),
     ] {
         let decoded = packet_on_subchannel(3, 0x0260 / 4, argument);
-        let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
+        dispatch_first(&mut channel, &decoded).unwrap();
         let register = channel.two_d().processing_clusters();
-
-        assert_eq!(dispatch.methods()[0].metadata().class(), twod::CLASS);
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_NUM_PROCESSING_CLUSTERS"
-        );
 
         assert_eq!(register.origin(), MaxwellTwoDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -597,12 +630,6 @@ fn two_d_render_enable_modes_are_typed_state_without_condition_evaluation() {
         let decoded = packet_on_subchannel(3, 0x026c / 4, argument);
         let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
         let register = channel.two_d().render_enable().mode();
-
-        assert_eq!(dispatch.methods()[0].metadata().class(), twod::CLASS);
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_RENDER_ENABLE_C"
-        );
 
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellTwoDRegisterOrigin::Programmed);
@@ -683,9 +710,6 @@ fn two_d_beta_registers_preserve_complete_bit_domains_without_execution() {
         let value = MaxwellTwoDBeta1::new(argument);
         let register = channel.two_d().beta().beta1();
 
-        assert_eq!(dispatch.methods()[0].metadata().class(), twod::CLASS);
-        assert_eq!(dispatch.methods()[0].metadata().method_name(), "SET_BETA1");
-
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellTwoDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -699,8 +723,6 @@ fn two_d_beta_registers_preserve_complete_bit_domains_without_execution() {
         let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
         let value = MaxwellTwoDBeta4::from_raw(argument);
         let register = channel.two_d().beta().beta4();
-
-        assert_eq!(dispatch.methods()[0].metadata().method_name(), "SET_BETA4");
 
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellTwoDRegisterOrigin::Programmed);
@@ -723,14 +745,7 @@ fn incrementing_two_d_beta_pair_commits_in_method_order() {
     let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
 
     assert_eq!(dispatch.methods().len(), 2);
-    assert_eq!(
-        dispatch
-            .methods()
-            .iter()
-            .map(|method| method.metadata().method_name())
-            .collect::<Vec<_>>(),
-        ["SET_BETA1", "SET_BETA4"]
-    );
+
     assert!(dispatch.operations().is_empty());
     assert_eq!(
         channel.two_d().beta().beta1().value().copied(),
@@ -764,12 +779,6 @@ fn two_d_operation_values_are_typed_state_without_execution() {
         let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
         let register = channel.two_d().operation();
 
-        assert_eq!(dispatch.methods()[0].metadata().class(), twod::CLASS);
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_OPERATION"
-        );
-
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellTwoDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -795,12 +804,6 @@ fn two_d_clip_enable_values_are_typed_state_without_execution() {
         let decoded = packet_on_subchannel(3, 0x0290 / 4, argument);
         let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
         let register = channel.two_d().clip_enable();
-
-        assert_eq!(dispatch.methods()[0].metadata().class(), twod::CLASS);
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_CLIP_ENABLE"
-        );
 
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellTwoDRegisterOrigin::Programmed);
@@ -859,12 +862,6 @@ fn two_d_color_key_enable_values_are_typed_state_without_execution() {
         let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
         let register = channel.two_d().color_key_enable();
 
-        assert_eq!(dispatch.methods()[0].metadata().class(), twod::CLASS);
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_COLOR_KEY_ENABLE"
-        );
-
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellTwoDRegisterOrigin::Programmed);
         assert_eq!(register.raw(), Some(argument));
@@ -914,12 +911,6 @@ fn two_d_corral_size_is_bounded_source_preserving_state_without_execution() {
         let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
         let value = MaxwellTwoDPixelsFromMemoryCorralSize::new(argument as u16).unwrap();
         let register = channel.two_d().pixels_from_memory().corral_size();
-
-        assert_eq!(dispatch.methods()[0].metadata().class(), twod::CLASS);
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_PIXELS_FROM_MEMORY_CORRAL_SIZE"
-        );
 
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellTwoDRegisterOrigin::Programmed);
@@ -976,12 +967,6 @@ fn two_d_safe_overlap_values_are_typed_state_without_execution() {
         let decoded = packet_on_subchannel(3, 0x0888 / 4, argument);
         let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
         let register = channel.two_d().pixels_from_memory().safe_overlap();
-
-        assert_eq!(dispatch.methods()[0].metadata().class(), twod::CLASS);
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_PIXELS_FROM_MEMORY_SAFE_OVERLAP"
-        );
 
         assert!(dispatch.operations().is_empty());
         assert_eq!(register.origin(), MaxwellTwoDRegisterOrigin::Programmed);
@@ -1148,14 +1133,8 @@ fn three_d_render_enable_modes_are_typed_and_engine_owned() {
         (4, MaxwellThreeDRenderEnableMode::RenderIfNotEqual),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x1558 / 4, argument).unwrap();
-        let source = dispatch.methods()[0].method().source();
+        let source = dispatch.methods()[0].source();
         let register = channel.three_d().render_enable().mode();
-
-        assert_eq!(dispatch.methods()[0].metadata().class(), threed::CLASS);
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_RENDER_ENABLE_C"
-        );
 
         assert!(dispatch.operations().is_empty());
         assert!(

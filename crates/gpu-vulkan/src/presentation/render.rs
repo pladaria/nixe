@@ -653,6 +653,7 @@ impl ScreenRenderer {
         cache.device_mut().submission.slots[slot]
             .vertex_bindings
             .clear();
+        cache.device_mut().submission.slots[slot].current_vertices = None;
         cache.device_mut().submission.slots[slot].index_binding = None;
         draw_result?;
         self.free_textures(ui);

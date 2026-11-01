@@ -1,4 +1,5 @@
 use super::*;
+mod clear;
 #[derive(Clone, Copy, Debug)]
 pub struct VertexBuffer {
     pub binding: u32,
@@ -91,6 +92,7 @@ struct Attachment {
 }
 #[derive(Clone)]
 pub struct PreparedTargets {
+    binding_revision: u64,
     area: vk::Rect2D,
     colors: Box<[Option<Attachment>]>,
     depth: Option<Attachment>,
@@ -152,7 +154,8 @@ fn read_only_attachment(a: &Attachment, state: &GraphicsState) -> bool {
 }
 
 pub struct PreparedDraw {
-    native_vertices: Box<[(vk::Buffer, u64)]>,
+    binding_revision: u64,
+    native_vertices: Arc<[(u32, vk::Buffer, u64)]>,
     native_index: Option<(vk::Buffer, u64, vk::IndexType)>,
     batchable: bool,
     graphics: PreparedGraphics,
@@ -175,25 +178,11 @@ impl PreparedDraw {
 }
 impl VulkanResidency {
     pub(crate) fn draw_current(&self, draw: &PreparedDraw) -> bool {
-        self.program_current(&draw.graphics.program)
-            && self.targets_current(&draw.targets)
-            && draw
-                .vertices
-                .iter()
-                .all(|vertex| self.buffer_binding_current(vertex.buffer))
-            && draw
-                .index
-                .as_ref()
-                .is_none_or(|index| self.buffer_binding_current(index.buffer))
+        draw.binding_revision == self.binding_revision
     }
 
     pub(crate) fn targets_current(&self, targets: &PreparedTargets) -> bool {
-        targets
-            .attachments()
-            .all(|attachment| match attachment.description.source {
-                AttachmentSource::Canonical { image, .. } => self.image_binding_current(image),
-                AttachmentSource::ResidentOnly(id) => self.attachment(id).is_ok(),
-            })
+        targets.binding_revision == self.binding_revision
     }
     fn rendering_matches(&self, targets: &Arc<PreparedTargets>) -> bool {
         self.device
@@ -249,6 +238,7 @@ impl VulkanResidency {
         let native_depth = depth.as_ref().map(native);
         let native_stencil = stencil.as_ref().map(native);
         Ok(Arc::new(PreparedTargets {
+            binding_revision: self.binding_revision,
             area,
             colors,
             depth,
@@ -411,6 +401,19 @@ impl VulkanResidency {
         vertices: Box<[VertexBuffer]>,
         index: Option<IndexBuffer>,
     ) -> Result<PreparedDraw, VulkanError> {
+        if !self.program_current(&graphics.program)
+            || !self.targets_current(&targets)
+            || vertices
+                .iter()
+                .any(|vertex| !self.buffer_binding_current(vertex.buffer))
+            || index
+                .as_ref()
+                .is_some_and(|index| !self.buffer_binding_current(index.buffer))
+        {
+            return Err(VulkanError::InvalidResource(
+                "draw selects retired native bindings",
+            ));
+        }
         let state = &graphics.parameters.state;
         if state.colors.len() != targets.colors.len()
             || state
@@ -607,7 +610,7 @@ impl VulkanResidency {
             .iter()
             .map(|v| {
                 self.buffer(v.buffer)
-                    .map(|entry| (entry.native.handle, v.offset))
+                    .map(|entry| (v.binding, entry.native.handle, v.offset))
             })
             .collect::<Result<_, _>>()?;
         let native_index = index
@@ -618,6 +621,7 @@ impl VulkanResidency {
             })
             .transpose()?;
         Ok(PreparedDraw {
+            binding_revision: self.binding_revision,
             native_vertices,
             native_index,
             batchable,
@@ -673,6 +677,9 @@ impl VulkanResidency {
         draw: Draw,
         push: &[u8],
     ) -> Result<WorkTicket, VulkanError> {
+        if !self.deferred_clears.is_empty() && !self.clear_matches_targets(&prepared.targets) {
+            self.realize_deferred_clears()?;
+        }
         if !prepared.can_group() || !self.rendering_matches(&prepared.targets) {
             self.device.end_rendering();
         }
@@ -929,6 +936,7 @@ impl VulkanResidency {
             self.descriptor_offsets = offsets;
         }
         let index_binding = prepared.native_index;
+        let clears = std::mem::take(&mut self.deferred_clears);
         self.publish_effect(&writers, |device| {
             let index = device.submission.recording.unwrap();
             let slot = &mut device.submission.slots[index];
@@ -943,12 +951,28 @@ impl VulkanResidency {
             let raw = &mut device.dispatch;
             unsafe {
                 if !empty {
-                    for (v, &value) in prepared.vertices.iter().zip(&prepared.native_vertices) {
-                        if slot.vertex_bindings.get(&v.binding) != Some(&value) {
-                            device.submission.statistics.vertex_binds += 1;
-                            raw.cmd_bind_vertex_buffers(v.binding, &[value.0], &[value.1]);
-                            slot.vertex_bindings.insert(v.binding, value);
+                    // Unchanged channel slots reach recording as the same owned
+                    // selection. Keep that selection alive while it is bound;
+                    // changed selections update only their concrete vertex slots.
+                    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+                    if !slot
+                        .current_vertices
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &prepared.native_vertices))
+                    {
+                        for &(binding, buffer, offset) in prepared.native_vertices.iter() {
+                            let index = binding as usize;
+                            if slot.vertex_bindings.len() <= index {
+                                slot.vertex_bindings.resize(index + 1, None);
+                            }
+                            let value = (buffer, offset);
+                            if slot.vertex_bindings[index] != Some(value) {
+                                device.submission.statistics.vertex_binds += 1;
+                                raw.cmd_bind_vertex_buffers(binding, &[buffer], &[offset]);
+                                slot.vertex_bindings[index] = Some(value);
+                            }
                         }
+                        slot.current_vertices = Some(Arc::clone(&prepared.native_vertices));
                     }
                     if let Some(value) = inline_binding
                         .as_ref()
@@ -963,14 +987,48 @@ impl VulkanResidency {
                 }
                 if !continuing {
                     let targets = &prepared.targets;
+                    let mut colors = smallvec::SmallVec::<[_; 8]>::new();
+                    let mut depth = targets.native_depth;
+                    let mut stencil = targets.native_stencil;
+                    if !clears.is_empty() {
+                        colors.extend_from_slice(&targets.native_colors);
+                        let apply =
+                            |a: &Attachment, native: &mut vk::RenderingAttachmentInfo<'_>| {
+                                if let Some(clear) = clears.iter().find(|clear| {
+                                    a.description.source
+                                        == AttachmentSource::Canonical {
+                                            image: clear.image,
+                                            plane: clear.plane_index,
+                                        }
+                                }) {
+                                    native.load_op = vk::AttachmentLoadOp::CLEAR;
+                                    native.clear_value = clear.value;
+                                }
+                            };
+                        for (a, n) in targets.colors.iter().zip(colors.iter_mut()) {
+                            if let Some(a) = a {
+                                apply(a, n);
+                            }
+                        }
+                        if let Some((a, n)) = targets.depth.as_ref().zip(depth.as_mut()) {
+                            apply(a, n);
+                        }
+                        if let Some((a, n)) = targets.stencil.as_ref().zip(stencil.as_mut()) {
+                            apply(a, n);
+                        }
+                    }
                     let mut info = vk::RenderingInfo::default()
                         .render_area(targets.area)
                         .layer_count(1)
-                        .color_attachments(&targets.native_colors);
-                    if let Some(depth) = &targets.native_depth {
+                        .color_attachments(if clears.is_empty() {
+                            &targets.native_colors
+                        } else {
+                            &colors
+                        });
+                    if let Some(depth) = &depth {
                         info = info.depth_attachment(depth);
                     }
-                    if let Some(stencil) = &targets.native_stencil {
+                    if let Some(stencil) = &stencil {
                         info = info.stencil_attachment(stencil);
                     }
                     // No render-pass object, framebuffer cache, HAL encoder or backend segment.

@@ -37,7 +37,9 @@ pub use profile::{
     ApiPath, ApiPreference, DeviceProfile, DynamicStateSupport, FloatControls, PortabilitySupport,
     SubgroupSupport, SwapchainMaintenance,
 };
-pub use queue::{QueueUsage, ReadbackTicket, RecordingStatistics, WorkStatus, WorkTicket};
+pub use queue::{
+    CompletedReadback, QueueUsage, ReadbackTicket, RecordingStatistics, WorkStatus, WorkTicket,
+};
 pub use validation::{ValidationMode, ValidationMonitor};
 
 pub use residency::execution::{

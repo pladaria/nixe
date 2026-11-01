@@ -4,7 +4,6 @@ use crate::{RuntimeInfo, ir::Program, profile::TransformFeedbackVarying, types::
 /// and attribute types have already been converted from device register formats.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GraphicsRuntimeState {
-    pub base_instance: Option<u32>,
     pub vertex_input_types: [AttributeType; 32],
     pub input_topology: InputTopology,
     pub point_size: f32,
@@ -27,7 +26,6 @@ pub struct GraphicsRuntimeState {
 impl Default for GraphicsRuntimeState {
     fn default() -> Self {
         Self {
-            base_instance: None,
             vertex_input_types: [AttributeType::Float; 32],
             input_topology: InputTopology::Points,
             point_size: 1.0,
@@ -80,7 +78,6 @@ pub fn make_runtime_info(
     };
     match program.stage {
         Stage::VertexB => {
-            info.base_instance = state.base_instance;
             if !has_guest_geometry {
                 if state.input_topology == InputTopology::Points {
                     info.fixed_state_point_size = Some(state.point_size);

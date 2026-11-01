@@ -58,7 +58,7 @@ impl PreparedStateId {
 /// Access descriptions express guest effects in operation order. Canonical CPU
 /// visibility is coordinated by nixe-memory; host hazards, queue ticks and
 /// Vulkan barriers belong to the renderer. Poll reports ordered completion
-/// only after host work and required canonical ownership transitions finish.
+/// once the requested prefix and its canonical ownership transitions finish.
 pub trait GpuExecution: Send + 'static {
     type Commands: Send + 'static;
     type ImageRequest: Send + 'static;
@@ -81,6 +81,9 @@ pub trait GpuExecution: Send + 'static {
     }
     /// Seal pending native work for a real dependency, explicit flush or shutdown.
     fn flush(&mut self) -> Result<(), BackendRuntimeError>;
+    /// Seal draw/dispatch work at a command-list boundary without waiting for
+    /// device completion or publishing a guest syncpoint.
+    fn end_command_list(&mut self) -> Result<(), BackendRuntimeError>;
     fn device_uuid(&self) -> Option<[u8; 16]> {
         None
     }
@@ -88,9 +91,16 @@ pub trait GpuExecution: Send + 'static {
     /// no guest effect has executed, and the caller may retry after a wake.
     /// True means resources were consumed and native work was recorded once.
     fn consume(&mut self, command: &Self::Commands) -> Result<bool, BackendRuntimeError>;
-    /// Register this delivery's ordered completion on the current native tick.
-    /// This does not force an otherwise unnecessary native submission.
+    /// Submit the current prefix and register its physical native completion.
+    /// Used when the consumer requires the actual device result.
     fn submit(
+        &mut self,
+        frontend: crate::FrontendSubmissionId,
+    ) -> Result<BackendSubmissionToken, BackendRuntimeError>;
+    /// Fence the CPU-visible effects recorded before this point in the stream.
+    /// GPU-only work and native object retirement retain their physical ticks;
+    /// they do not delay a fence with no outstanding CPU publication.
+    fn signal_fence(
         &mut self,
         frontend: crate::FrontendSubmissionId,
     ) -> Result<BackendSubmissionToken, BackendRuntimeError>;
@@ -156,10 +166,19 @@ impl GpuExecution for std::convert::Infallible {
     fn flush(&mut self) -> Result<(), BackendRuntimeError> {
         match *self {}
     }
+    fn end_command_list(&mut self) -> Result<(), BackendRuntimeError> {
+        match *self {}
+    }
     fn consume(&mut self, _batch: &Self::Commands) -> Result<bool, BackendRuntimeError> {
         match *self {}
     }
     fn submit(
+        &mut self,
+        _frontend: crate::FrontendSubmissionId,
+    ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
+        match *self {}
+    }
+    fn signal_fence(
         &mut self,
         _frontend: crate::FrontendSubmissionId,
     ) -> Result<BackendSubmissionToken, BackendRuntimeError> {

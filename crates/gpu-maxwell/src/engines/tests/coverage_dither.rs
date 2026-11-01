@@ -3,13 +3,13 @@ use super::*;
 #[test]
 fn alpha_to_coverage_dither_is_typed_validated_and_source_preserving() {
     let mut channel = three_d_channel();
-    assert!(
+    assert_eq!(
         channel
             .three_d()
             .coverage()
             .alpha_to_coverage_dither()
-            .value()
-            .is_none()
+            .value(),
+        Some(&MaxwellThreeDAlphaToCoverageDither::Pixels1x1)
     );
     for (raw, expected) in [
         (0, MaxwellThreeDAlphaToCoverageDither::Pixels1x1),
@@ -20,10 +20,7 @@ fn alpha_to_coverage_dither_is_typed_validated_and_source_preserving() {
         ),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x12e0 / 4, raw).unwrap();
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "STATE_REGISTER"
-        );
+
         assert!(dispatch.operations().is_empty());
         let register = channel.three_d().coverage().alpha_to_coverage_dither();
         assert_eq!(register.value(), Some(&expected));
@@ -74,12 +71,12 @@ fn dither_shadow_replay_and_new_channel_do_not_leak_state() {
             .as_ref(),
         Some(&1)
     );
-    assert!(
+    assert_eq!(
         three_d_channel()
             .three_d()
             .coverage()
             .alpha_to_coverage_dither()
-            .value()
-            .is_none()
+            .value(),
+        Some(&MaxwellThreeDAlphaToCoverageDither::Pixels1x1)
     );
 }

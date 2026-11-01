@@ -161,8 +161,8 @@ pub(super) fn planes(
                         ),
                     )
                     .map_err(|error| compilation(format!(
-                        "image {:?} mip={} layer={} layout={:?} extent={columns}x{rows}: {error}",
-                        image.role(), binding.subresources().mip_level,
+                        "image mip={} layer={} layout={:?} extent={columns}x{rows}: {error}",
+                        binding.subresources().mip_level,
                         binding.subresources().base_layer + layer, binding.layout(),
                     )))?,
                     row_pitch: u64::from(columns) * u64::from(bytes),

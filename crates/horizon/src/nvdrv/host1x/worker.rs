@@ -234,7 +234,7 @@ fn wait(
         match control
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .point_reached(point)
+            .host_point_reached(point)
         {
             Some(true) => return Ok(true),
             Some(false) => {}
@@ -359,10 +359,14 @@ impl Channel {
                                 point.point().syncpoint().get() == argument & 0xff && remaining != 0
                             })
                             .ok_or("submission contains an unreserved syncpoint increment")?;
-                        control
+                        let mut control = control
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .increment_channel_submission(descriptor, job.request, completion)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        control
+                            .consume_channel_increment(descriptor, job.request, completion)
+                            .map_err(|error| format!("{error:?}"))?;
+                        control
+                            .publish_channel_increment(descriptor, job.request, completion)
                             .map_err(|error| format!("{error:?}"))?;
                         remaining -= 1;
                     }
@@ -471,7 +475,10 @@ mod tests {
                 timeout: 0,
             })
             .unwrap();
-        assert_eq!(control.lock().unwrap().point_reached(point), Some(false));
+        assert_eq!(
+            control.lock().unwrap().host_point_reached(point),
+            Some(false)
+        );
         // Closing another device must not join this channel's unresolved wait.
         let other = Worker::new(
             control.clone(),
@@ -483,14 +490,21 @@ mod tests {
         .unwrap();
         crate::test_memory::run(other.begin_close());
         other.join().unwrap();
-        assert_eq!(control.lock().unwrap().point_reached(point), Some(false));
-        control
-            .lock()
-            .unwrap()
-            .complete_channel_submission(producer, 0, &dependency)
-            .unwrap();
+        assert_eq!(
+            control.lock().unwrap().host_point_reached(point),
+            Some(false)
+        );
+        for _ in 0..dependency.increments() {
+            let mut control = control.lock().unwrap();
+            control
+                .consume_channel_increment(producer, 0, &dependency)
+                .unwrap();
+            control
+                .publish_channel_increment(producer, 0, &dependency)
+                .unwrap();
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
-        while control.lock().unwrap().point_reached(point) == Some(false) {
+        while control.lock().unwrap().host_point_reached(point) == Some(false) {
             worker.require_healthy().unwrap();
             assert!(
                 Instant::now() < deadline,
@@ -499,7 +513,10 @@ mod tests {
             std::thread::yield_now();
         }
         worker.require_healthy().unwrap();
-        assert_eq!(control.lock().unwrap().point_reached(point), Some(true));
+        assert_eq!(
+            control.lock().unwrap().host_point_reached(point),
+            Some(true)
+        );
         let reservation = control
             .lock()
             .unwrap()
@@ -538,7 +555,10 @@ mod tests {
                 .to_string()
                 .contains("unmapped Host1x")
         );
-        assert_eq!(control.lock().unwrap().point_reached(failed), Some(false));
+        assert_eq!(
+            control.lock().unwrap().host_point_reached(failed),
+            Some(false)
+        );
     }
     use crate::nvdrv::nvmap::{NvMapAllocationMetadata, NvMapCpuMapping, NvMapObjects, NvMapOwner};
     use nixe_memory::{
@@ -661,7 +681,7 @@ mod tests {
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while control.lock().unwrap().point_reached(point) == Some(false) {
+        while control.lock().unwrap().host_point_reached(point) == Some(false) {
             worker.require_healthy().unwrap();
             assert!(
                 Instant::now() < deadline,
@@ -672,7 +692,10 @@ mod tests {
         worker.require_healthy().unwrap();
         worker.stop();
         worker.join().unwrap();
-        assert_eq!(control.lock().unwrap().point_reached(point), Some(true));
+        assert_eq!(
+            control.lock().unwrap().host_point_reached(point),
+            Some(true)
+        );
     }
     #[test]
     fn stopping_a_passive_wait_preserves_prior_increments_without_a_failure() {
@@ -716,7 +739,7 @@ mod tests {
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while control.lock().unwrap().point_reached(point) == Some(false) {
+        while control.lock().unwrap().host_point_reached(point) == Some(false) {
             worker.require_healthy().unwrap();
             assert!(
                 Instant::now() < deadline,
@@ -728,7 +751,10 @@ mod tests {
         worker.join().unwrap();
         worker.require_healthy().unwrap();
         assert_eq!(
-            control.lock().unwrap().point_reached(dependency.point()),
+            control
+                .lock()
+                .unwrap()
+                .host_point_reached(dependency.point()),
             Some(false)
         );
     }

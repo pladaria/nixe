@@ -2,9 +2,7 @@
 
 use nixe_gpu::{GpuClassId, GpuMethodId};
 
-use super::{
-    AppliedMethod, MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation,
-};
+use super::{MaxwellEngineDispatchError, MaxwellEngineMethodMetadata, PendingEngineOperation};
 use crate::{MaxwellMethodDispatch, MaxwellMethodSource};
 
 pub(super) const CLASS: GpuClassId = GpuClassId(0xa140);
@@ -555,7 +553,7 @@ methods!(
 pub(super) fn preflight(
     method: MaxwellMethodDispatch,
     candidate: &mut MaxwellInlineToMemoryState,
-) -> Result<AppliedMethod, MaxwellEngineDispatchError> {
+) -> Result<Option<PendingEngineOperation>, MaxwellEngineDispatchError> {
     let source = method.source();
     let declaration = METHODS
         .iter()
@@ -611,11 +609,7 @@ pub(super) fn preflight(
             source,
         };
         candidate.apply(write);
-        return Ok(AppliedMethod::new(
-            method,
-            *declaration.metadata,
-            Some(PendingEngineOperation::InlineToMemory(upload)),
-        ));
+        return Ok(Some(PendingEngineOperation::InlineToMemory(upload)));
     }
 
     let write = match declaration.action {
@@ -804,7 +798,7 @@ pub(super) fn preflight(
         MethodAction::Data => unreachable!("LOAD_INLINE_DATA returns before state decoding"),
     };
     candidate.apply(write);
-    Ok(AppliedMethod::new(method, *declaration.metadata, None))
+    Ok(None)
 }
 
 fn invalid_encoding(
@@ -850,7 +844,7 @@ pub(super) fn data_words(
         next_offset: pending.next_offset + count as u32 * 4,
         source: last,
     });
-    let Some(PendingEngineOperation::InlineToMemory(upload)) = applied.operation else {
+    let Some(PendingEngineOperation::InlineToMemory(upload)) = applied else {
         unreachable!()
     };
     Ok((upload, count))

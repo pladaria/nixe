@@ -53,6 +53,33 @@ impl ReadbackTicket {
     }
 }
 
+impl Drop for ReadbackTicket {
+    fn drop(&mut self) {
+        self.slice.release_readback();
+    }
+}
+/// Mapped bytes from completed GPU work. Owning the reservation prevents staging
+/// recycling through consumption, cancellation, early returns and unwinding.
+/// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+pub struct CompletedReadback {
+    _ticket: ReadbackTicket,
+    pointer: std::ptr::NonNull<u8>,
+    length: usize,
+}
+impl std::ops::Deref for CompletedReadback {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // The ticket owns the atom-isolated mapped allocation. Its GPU writes
+        // completed before construction and no subsequent producer can reuse it.
+        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.length) }
+    }
+}
+impl AsRef<[u8]> for CompletedReadback {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
 #[derive(Debug)]
 pub struct QueueUsage {
     pub scheduled_tick: u64,
@@ -97,7 +124,8 @@ pub(crate) struct Slot {
     pub descriptors: crate::residency::probe_commands::Descriptors,
     pub bound_compute: usize,
     pub bound_graphics: usize,
-    pub vertex_bindings: rustc_hash::FxHashMap<u32, (vk::Buffer, u64)>,
+    pub vertex_bindings: Vec<Option<(vk::Buffer, u64)>>,
+    pub current_vertices: Option<Arc<[(u32, vk::Buffer, u64)]>>,
     pub index_binding: Option<(vk::Buffer, u64, vk::IndexType)>,
     pub push_layout: vk::PipelineLayout,
     pub push_stages: vk::ShaderStageFlags,
@@ -138,7 +166,8 @@ impl Slot {
             descriptors: crate::residency::probe_commands::Descriptors::new(),
             bound_compute: 0,
             bound_graphics: 0,
-            vertex_bindings: rustc_hash::FxHashMap::default(),
+            vertex_bindings: Vec::new(),
+            current_vertices: None,
             index_binding: None,
             push_layout: vk::PipelineLayout::null(),
             push_stages: vk::ShaderStageFlags::empty(),
@@ -489,6 +518,7 @@ impl QueueState {
         slot.bound_compute = 0;
         slot.bound_graphics = 0;
         slot.vertex_bindings.clear();
+        slot.current_vertices = None;
         slot.index_binding = None;
         slot.push_layout = vk::PipelineLayout::null();
         slot.push_stages = vk::ShaderStageFlags::empty();
@@ -888,28 +918,35 @@ impl VulkanDevice {
     pub fn queue_usage(&self) -> QueueUsage {
         self.submission.usage()
     }
-    /// Read exactly the reserved bytes after completion; unconsumed readbacks
-    /// retain their allocation after GPU completion. No unread range can recycle.
-    pub fn readback(&mut self, ticket: ReadbackTicket) -> Result<Vec<u8>, VulkanError> {
+    /// Consume only completed work. The owner must explicitly flush and wait or
+    /// poll beforehand; publishing these bytes never submits or waits for work.
+    pub fn completed_readback(
+        &mut self,
+        ticket: ReadbackTicket,
+    ) -> Result<CompletedReadback, VulkanError> {
         self.validate_readback(&ticket)?;
-        if ticket.work.tick > self.submission.scheduled {
-            self.flush()?;
+        if ticket.work.tick > self.submission.completed {
+            return Err(VulkanError::InvalidResource(
+                "readback work has not completed",
+            ));
         }
-        self.wait_for_work(ticket.work, Duration::MAX)?;
-        let slice = ticket.slice;
-        let result = unsafe {
+        let bytes = unsafe {
             self.submission
                 .staging
-                .buffer(&slice)
-                .read_range(slice.offset, slice.size)
+                .buffer(&ticket.slice)
+                .completed_bytes(ticket.slice.offset, ticket.slice.size)?
         };
-        self.submission.staging.release_readback(&slice);
-        self.submission.reclaim(self.submission.completed);
-        result
+        let pointer = std::ptr::NonNull::new(bytes.as_ptr().cast_mut()).expect("mapped readback");
+        let length = bytes.len();
+        Ok(CompletedReadback {
+            _ticket: ticket,
+            pointer,
+            length,
+        })
     }
     pub fn discard_readback(&mut self, ticket: ReadbackTicket) -> Result<(), VulkanError> {
         self.validate_readback(&ticket)?;
-        self.submission.staging.release_readback(&ticket.slice);
+        drop(ticket);
         self.submission.reclaim(self.submission.completed);
         Ok(())
     }

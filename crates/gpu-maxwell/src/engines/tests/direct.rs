@@ -58,6 +58,11 @@ fn repeated_condition_commands_flush_prior_instances_and_execute_in_order() {
         Ok::<_, Infallible>(())
     };
     for (method, value) in [
+        // The bank's initial mode is false, but the retained execution decision
+        // stays enabled until a mode command. Overrides alone must not disable
+        // initialization clears or manufacture a condition operation.
+        (0x1944, 1),
+        (0x1944, 0),
         (0x1558, 1),
         (0x1618, 4),
         (0xd78, 3),
@@ -78,10 +83,7 @@ fn repeated_condition_commands_flush_prior_instances_and_execute_in_order() {
         .unwrap_or_else(|_| panic!("dispatch"));
     }
     crate::test_memory::ready(finish_maxwell_engine_stream(&mut channel, &mut consume)).unwrap();
-    assert_eq!(
-        observed,
-        [(0x1558, 1), (1, 1), (0x1558, 1), (0x1558, 1), (0x1944, 2)]
-    );
+    assert_eq!(observed, [(0x1558, 1), (1, 1), (0x1558, 1), (0x1558, 1)]);
 }
 
 #[test]

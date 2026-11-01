@@ -178,11 +178,7 @@ const LAUNCH_DMA: u32 = 0x01b0;
 const LOAD_INLINE_DATA: u32 = 0x01b4;
 
 type PreflightResult = Result<
-    Option<(
-        MaxwellThreeDStateWrite,
-        &'static str,
-        Option<MaxwellInlineToMemoryUpload>,
-    )>,
+    Option<(MaxwellThreeDStateWrite, Option<MaxwellInlineToMemoryUpload>)>,
     MaxwellEngineDispatchError,
 >;
 
@@ -277,11 +273,7 @@ fn preflight_launch(
         byte_length,
         source,
     };
-    Ok(Some((
-        MaxwellThreeDStateWrite::InlineToMemory(write),
-        "LAUNCH_DMA",
-        None,
-    )))
+    Ok(Some((MaxwellThreeDStateWrite::InlineToMemory(write), None)))
 }
 
 fn preflight_data(
@@ -310,7 +302,6 @@ fn preflight_data(
     );
     Ok(Some((
         MaxwellThreeDStateWrite::InlineToMemory(write),
-        "LOAD_INLINE_DATA",
         Some(upload),
     )))
 }

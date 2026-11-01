@@ -6,6 +6,7 @@ impl VulkanResidency {
         source: &nixe_gpu::native::NativePresentationImage,
         format: vk::Format,
     ) -> Result<ImageId, VulkanError> {
+        self.realize_deferred_clears()?;
         self.invalidate_cpu_resources(&[])?;
         let [plane] = source.planes.as_ref() else {
             return Err(VulkanError::InvalidResource(

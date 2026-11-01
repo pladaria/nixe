@@ -44,6 +44,8 @@ impl HorizonIpcResult {
     pub(crate) const SM_NOT_REGISTERED: Self = Self::new(MODULE_SM, 7);
     pub(crate) const SM_NOT_ALLOWED: Self = Self::new(MODULE_SM, 8);
 
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/core/hle/service/vi/vi_results.h
+    pub const VI_PERMISSION_DENIED: Self = Self::new(114, 5);
     pub const CMIF_NOT_SUPPORTED: Self = Self::new(MODULE_SF, 1);
     pub const SF_PRECONDITION_VIOLATION: Self = Self::new(MODULE_SF, 3);
     // https://github.com/eden-emulator/mirror/blob/d16735f5b618942136d6ab53466e3be0a382c30a/src/hid_core/hid_result.h

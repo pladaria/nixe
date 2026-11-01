@@ -175,7 +175,9 @@ impl VulkanDevice {
             self.dispatch.begin_rendering(&info);
             self.dispatch.end_rendering();
         }
-        self.readback(ticket)
+        self.flush()?;
+        self.wait_for_work(ticket.work(), std::time::Duration::MAX)?;
+        Ok(self.completed_readback(ticket)?.to_vec())
     }
     pub fn image_round_trip(
         &mut self,
@@ -185,7 +187,9 @@ impl VulkanDevice {
         mode: AllocationMode,
     ) -> Result<Vec<u8>, VulkanError> {
         let ticket = self.enqueue_image_readback(width, height, bytes, mode)?;
-        self.readback(ticket)
+        self.flush()?;
+        self.wait_for_work(ticket.work(), std::time::Duration::MAX)?;
+        Ok(self.completed_readback(ticket)?.to_vec())
     }
 }
 pub(crate) fn host_read_barrier(

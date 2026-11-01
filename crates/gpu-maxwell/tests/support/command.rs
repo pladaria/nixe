@@ -9,6 +9,9 @@ pub struct Observer<'a> {
     pub controls: usize,
 }
 impl MaxwellCommandHost for Observer<'_> {
+    async fn signal_syncpoint(&mut self) -> Result<(), MaxwellSubmissionExecutionError> {
+        Ok(())
+    }
     async fn emit(&mut self, work: NativeWork) -> Result<(), MaxwellSubmissionExecutionError> {
         (self.consume)(work);
         Ok(())

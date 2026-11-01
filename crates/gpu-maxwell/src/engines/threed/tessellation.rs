@@ -127,37 +127,17 @@ pub(in crate::engines) fn draw_state(
     let control = if enabled(Stage::TessellationInit) {
         TessellationControl::Shader
     } else {
-        // Only domain-consumed levels require programming. Unused array lanes are
-        // canonical padding, not substituted guest levels. Retain all programmed
-        // bits, including negative zero, infinities and NaN payloads.
-        let used = match mode.domain {
-            Domain::Isolines => [true, true, false, false, false, false],
-            Domain::Triangles => [true, true, true, false, true, false],
-            Domain::Quads => [true; 6],
-        };
-        let mut levels = [0; 6];
-        let mut defined = 0;
-        for (i, lane) in levels.iter_mut().enumerate() {
-            match bindings
+        // The architectural register bank supplies all six levels from reset.
+        // Keep their exact bits, including zeros, infinities and NaN payloads.
+        let levels: [u32; 6] = std::array::from_fn(|i| {
+            *bindings
                 .tessellation_lod(MaxwellThreeDTessellationLod::from_index(i as u8))
                 .value()
-            {
-                Some(bits) => {
-                    *lane = *bits;
-                    defined |= 1 << i;
-                }
-                None if used[i] => {
-                    return Err(Error::IncompleteDraw(
-                        "default tessellation level consumed without a control shader",
-                    ));
-                }
-                None => {}
-            }
-        }
+                .expect("tessellation levels retain raw register bits")
+        });
         TessellationControl::DefaultLevels {
             outer: levels[..4].try_into().unwrap(),
             inner: levels[4..].try_into().unwrap(),
-            defined,
         }
     };
     Ok(Some(TessellationState {

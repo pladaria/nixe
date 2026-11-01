@@ -46,6 +46,15 @@ impl QueueFixture {
     }
 }
 impl GpuExecution for QueueFixture {
+    fn end_command_list(&mut self) -> Result<(), nixe_gpu::BackendRuntimeError> {
+        self.flush()
+    }
+    fn signal_fence(
+        &mut self,
+        frontend: FrontendSubmissionId,
+    ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
+        self.submit(frontend)
+    }
     type Commands = nixe_gpu::native::NativeWork;
     type ImageRequest = nixe_gpu::native::NativePresentationImage;
     fn flush(&mut self) -> Result<(), BackendRuntimeError> {
@@ -182,10 +191,6 @@ impl GpuExecution for QueueFixture {
 
 #[test]
 fn owned_memory_access_waits_until_the_current_effect_is_consumed() {
-    use super::super::super::super::{
-        NvDrvDescriptorOwner, NvDrvDeviceKind, NvDrvFileDescriptor, NvDrvPermissionProfile,
-        NvDrvSessionId,
-    };
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {
         return;
     };
@@ -224,22 +229,9 @@ fn owned_memory_access_waits_until_the_current_effect_is_consumed() {
         &budget,
         nixe_gpu_maxwell::MaxwellNativeFrontend::new(Default::default()),
     )));
-    let work = GpuWork {
-        descriptor: NvDrvDeviceDescriptor::open(
-            NvDrvFileDescriptor::new(1),
-            NvDrvDeviceKind::HostGpu,
-            NvDrvDescriptorOwner::new(NvDrvSessionId::ROOT, 1),
-            NvDrvPermissionProfile::Application,
-        ),
-        request: 0xc018_481b,
-        frontend: FrontendSubmissionId::new(1),
-        reservation: None,
-        control: Arc::new(Mutex::new(
-            NvHostControl::new(&crate::test_memory::kernel()),
-        )),
-    };
+    let frontend = FrontendSubmissionId::new(1);
     let command = nixe_gpu::native::NativeWork {
-        frontend: work.frontend,
+        frontend,
         command: nixe_gpu::native::NativeCommand::Ordering(
             CacheMaintenanceOperation::InvalidateDeviceReadCaches,
         ),
@@ -271,6 +263,7 @@ fn owned_memory_access_waits_until_the_current_effect_is_consumed() {
         CommandHost {
             owner: Rc::clone(&owner),
             clock: Default::default(),
+            syncpoint: None,
         }
         .emit_work(&command),
     )
@@ -290,6 +283,7 @@ fn owned_memory_access_waits_until_the_current_effect_is_consumed() {
         CommandHost {
             owner: Rc::clone(&owner),
             clock: Default::default(),
+            syncpoint: None,
         }
         .emit_work(&command),
     )
@@ -301,13 +295,15 @@ fn owned_memory_access_waits_until_the_current_effect_is_consumed() {
         .borrow_mut()
         .as_mut()
         .unwrap()
-        .submit(work.frontend)
+        .submit(frontend)
         .unwrap();
     drop(permit);
-    owner
-        .borrow_mut()
-        .pending
-        .push_back(PendingWork { token, work });
+    let (reply, _delivered) = mpsc::sync_channel(1);
+    owner.borrow_mut().pending.push_back(PendingCompletion {
+        token,
+        frontend,
+        action: CompletionAction::Conversion(reply),
+    });
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while !owner.borrow().pending.is_empty() {
         owner.borrow_mut().poll().unwrap();
@@ -603,6 +599,15 @@ struct ControlledPreparation {
     recorded: mpsc::Sender<FrontendSubmissionId>,
 }
 impl GpuExecution for ControlledPreparation {
+    fn end_command_list(&mut self) -> Result<(), nixe_gpu::BackendRuntimeError> {
+        Ok(())
+    }
+    fn signal_fence(
+        &mut self,
+        _: FrontendSubmissionId,
+    ) -> Result<BackendSubmissionToken, BackendRuntimeError> {
+        unreachable!("preparation fixture has no syncpoint")
+    }
     type Commands = nixe_gpu::native::NativeWork;
     type ImageRequest = nixe_gpu::native::NativePresentationImage;
     fn flush(&mut self) -> Result<(), BackendRuntimeError> {
@@ -802,10 +807,6 @@ fn stopping_with_suspended_channels_releases_admission_without_emitting_effects(
 
 #[test]
 fn idle_owner_publishes_explicit_fences_without_new_commands() {
-    use super::super::super::super::{
-        NvDrvDescriptorOwner, NvDrvDeviceKind, NvDrvFileDescriptor, NvDrvPermissionProfile,
-        NvDrvSessionId,
-    };
     use nixe_gpu::native::{NativeCommand, NativeWork};
     use nixe_gpu_vulkan::{NativeGpuExecution, cache::CacheConfiguration};
     let Some(device) = support::device_for_test(ApiPreference::Auto) else {
@@ -817,7 +818,6 @@ fn idle_owner_publishes_explicit_fences_without_new_commands() {
     let target = AllocationRange::new(allocation.pin(), 0, 4096).unwrap();
     let budget = Arc::new(GpuWorkBudget::new(&crate::test_memory::kernel()));
     let (sender, receiver) = mpsc::channel();
-    let (completed, observed) = mpsc::channel();
     let wake = sender.clone();
     let mut native = NativeGpuExecution::new(
         memory,
@@ -832,7 +832,6 @@ fn idle_owner_publishes_explicit_fences_without_new_commands() {
     .unwrap();
     native
         .bind_host_wakeup(Arc::new(move || {
-            let _ = completed.send(());
             let _ = wake.send(GpuMessage::Wake);
         }))
         .unwrap();
@@ -855,26 +854,19 @@ fn idle_owner_publishes_explicit_fences_without_new_commands() {
         &budget,
         nixe_gpu_maxwell::MaxwellNativeFrontend::new(Default::default()),
     )));
-    owner.borrow_mut().pending.push_back(PendingWork {
+    let (conversion, conversion_completed) = mpsc::sync_channel(1);
+    owner.borrow_mut().pending.push_back(PendingCompletion {
         token,
-        work: GpuWork {
-            descriptor: NvDrvDeviceDescriptor::open(
-                NvDrvFileDescriptor::new(1),
-                NvDrvDeviceKind::HostGpu,
-                NvDrvDescriptorOwner::new(NvDrvSessionId::ROOT, 1),
-                NvDrvPermissionProfile::Application,
-            ),
-            request: 0xc018_481b,
-            frontend: work.frontend,
-            reservation: None,
-            control: Arc::new(Mutex::new(
-                NvHostControl::new(&crate::test_memory::kernel()),
-            )),
-        },
+        frontend: FrontendSubmissionId::new(1),
+        action: CompletionAction::Conversion(conversion),
     });
+
     let stopping = Arc::clone(&budget);
     let watchdog = thread::spawn(move || {
-        let notified = observed.recv_timeout(Duration::from_secs(3)).is_ok();
+        let notified = matches!(
+            conversion_completed.recv_timeout(Duration::from_secs(3)),
+            Ok(Ok(()))
+        );
         stopping.stop();
         let _ = sender.send(GpuMessage::Wake);
         notified
@@ -882,7 +874,7 @@ fn idle_owner_publishes_explicit_fences_without_new_commands() {
     Owner::drive(&owner).unwrap();
     assert!(
         watchdog.join().unwrap(),
-        "idle work needs a deadline, not another command or CPU request"
+        "an idle owner must deliver completion without another command or CPU request"
     );
     backend.borrow_mut().as_mut().unwrap().teardown().unwrap();
     drop(owner);

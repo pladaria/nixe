@@ -44,31 +44,6 @@ const CONTROL_SET_SUBDEVICE_MASK: u16 = 1;
 const CONTROL_STORE_SUBDEVICE_MASK: u16 = 2;
 const CONTROL_USE_SUBDEVICE_MASK: u16 = 3;
 
-#[derive(Clone, Copy)]
-struct MethodEncoding {
-    opcode: u8,
-    mode: MaxwellMethodPacketMode,
-}
-
-const METHOD_ENCODINGS: [MethodEncoding; 4] = [
-    MethodEncoding {
-        opcode: OPCODE_INCREMENTING,
-        mode: MaxwellMethodPacketMode::Incrementing,
-    },
-    MethodEncoding {
-        opcode: OPCODE_NON_INCREMENTING,
-        mode: MaxwellMethodPacketMode::NonIncrementing,
-    },
-    MethodEncoding {
-        opcode: OPCODE_IMMEDIATE,
-        mode: MaxwellMethodPacketMode::Immediate,
-    },
-    MethodEncoding {
-        opcode: OPCODE_INCREMENT_ONCE,
-        mode: MaxwellMethodPacketMode::IncrementOnce,
-    },
-];
-
 /// One command word paired with its exact source location.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaxwellPushbufferWord {
@@ -417,17 +392,21 @@ fn decode_header(
     if opcode == OPCODE_END_SEGMENT {
         return Ok(Header::Control(MaxwellPushbufferControl::EndSegment));
     }
-    let Some(encoding) = METHOD_ENCODINGS
-        .iter()
-        .find(|encoding| encoding.opcode == opcode)
-    else {
-        return Err(MaxwellPushbufferDecodeError::UnknownEncoding {
-            source: at(),
-            word,
-            secondary_opcode: opcode,
-        });
+    // Decode the hardware mode directly, as DmaPusher::ProcessCommands does.
+    // https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/dma_pusher.cpp
+    let mode = match opcode {
+        OPCODE_INCREMENTING => MaxwellMethodPacketMode::Incrementing,
+        OPCODE_NON_INCREMENTING => MaxwellMethodPacketMode::NonIncrementing,
+        OPCODE_IMMEDIATE => MaxwellMethodPacketMode::Immediate,
+        OPCODE_INCREMENT_ONCE => MaxwellMethodPacketMode::IncrementOnce,
+        _ => {
+            return Err(MaxwellPushbufferDecodeError::UnknownEncoding {
+                source: at(),
+                word,
+                secondary_opcode: opcode,
+            });
+        }
     };
-    let mode = encoding.mode;
     let encoded = ((word >> COUNT_SHIFT) & COUNT_MASK) as u16;
     let count = if mode == MaxwellMethodPacketMode::Immediate {
         1

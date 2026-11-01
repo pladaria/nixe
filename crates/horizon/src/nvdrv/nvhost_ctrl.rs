@@ -320,14 +320,43 @@ impl NvHostControl {
         point: GuestTimelinePoint,
     ) -> Result<bool, NvDrvCallError> {
         let id = parse_syncpoint(point.syncpoint().get())?;
-        Ok(self.timeline(descriptor, id)?.has_reached(point.value()))
+        Ok(self
+            .timeline(descriptor, id)?
+            .guest_has_reached(point.value()))
     }
 
-    /// Samples a BufferQueue fence without creating or advancing a timeline.
-    pub(super) fn point_reached(&self, point: GuestTimelinePoint) -> Option<bool> {
+    /// Samples a CPU/Host1x fence after its required memory publications.
+    pub(super) fn host_point_reached(&self, point: GuestTimelinePoint) -> Option<bool> {
         self.timelines
             .get(&point.syncpoint())
             .map(|timeline| timeline.has_reached(point.value()))
+    }
+
+    /// GPU and composition dependencies observe command consumption, not the
+    /// delayed CPU-visible publication counter used by nvdrv events.
+    pub(super) fn guest_point_reached(&self, point: GuestTimelinePoint) -> Option<bool> {
+        self.timelines
+            .get(&point.syncpoint())
+            .map(|timeline| timeline.guest_has_reached(point.value()))
+    }
+
+    pub(super) fn consume_channel_increment(
+        &mut self,
+        descriptor: NvDrvDeviceDescriptor,
+        request: u32,
+        reservation: &ReservedTimelinePoint,
+    ) -> Result<GuestTimelinePoint, NvDrvCallError> {
+        self.timeline_mut(descriptor, reservation.point().syncpoint())?
+            .consume_increment(timeline_owner(descriptor), reservation)
+            .map_err(|_| {
+                NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::Ioctl {
+                    context: context(
+                        descriptor,
+                        request,
+                        NvDrvValidationReason::TimelineOrderingUnavailable,
+                    ),
+                })
+            })
     }
 
     #[cfg(test)]
@@ -388,10 +417,10 @@ impl NvHostControl {
         Ok(self.timeline(descriptor, id)?.latest_reserved_point())
     }
 
-    /// Host1x publishes each consumed THI increment after preceding engine
-    /// execution and canonical writes, preserving waits inside a command list.
+    /// Publish one consumed increment after its preceding CPU-visible effects,
+    /// preserving intermediate waits inside both GPU and Host1x command lists.
     /// https://github.com/eden-emulator/mirror/blob/de7e6e01d43e8cf2ec193d74fa053b0d7949955f/src/video_core/cdma_pusher.cpp#L106-L113
-    pub(super) fn increment_channel_submission(
+    pub(super) fn publish_channel_increment(
         &mut self,
         descriptor: NvDrvDeviceDescriptor,
         request: u32,
@@ -400,32 +429,6 @@ impl NvHostControl {
         let point = self
             .timeline_mut(descriptor, completion.point().syncpoint())?
             .increment_reserved(timeline_owner(descriptor), completion)
-            .map_err(|_| {
-                NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::Ioctl {
-                    context: context(
-                        descriptor,
-                        request,
-                        NvDrvValidationReason::TimelineOrderingUnavailable,
-                    ),
-                })
-            })?;
-        self.signal_reached(point.syncpoint(), point.value());
-        Ok(point)
-    }
-
-    /// Publishes backend-complete work after host execution and canonical
-    /// visibility have already succeeded on the GPU owner thread.
-    pub(super) fn complete_channel_submission(
-        &mut self,
-        descriptor: NvDrvDeviceDescriptor,
-        request: u32,
-        completion: &ReservedTimelinePoint,
-    ) -> Result<GuestTimelinePoint, NvDrvCallError> {
-        let owner = timeline_owner(descriptor);
-        let id = completion.point().syncpoint();
-        let point = self
-            .timeline_mut(descriptor, id)?
-            .advance(owner, completion)
             .map_err(|_| {
                 NvDrvCallError::Unsupported(UnsupportedNvDrvOperation::Ioctl {
                     context: context(
@@ -984,9 +987,14 @@ mod tests {
         let reservation = control
             .reserve_channel_submission(descriptor(), IOCTL_SYNCPT_INCREMENT, id, 80)
             .unwrap();
-        control
-            .complete_channel_submission(descriptor(), IOCTL_SYNCPT_INCREMENT, &reservation)
-            .unwrap();
+        for _ in 0..reservation.increments() {
+            control
+                .consume_channel_increment(descriptor(), IOCTL_SYNCPT_INCREMENT, &reservation)
+                .unwrap();
+            control
+                .publish_channel_increment(descriptor(), IOCTL_SYNCPT_INCREMENT, &reservation)
+                .unwrap();
+        }
 
         control.release_channel_syncpoint(id);
         assert!(!control.channel_syncpoints.contains_key(&id));
@@ -1015,6 +1023,103 @@ mod tests {
         );
         assert_ne!(control.timelines[&id].instance(), first_instance);
         assert_eq!(control.timelines[&id].outstanding_increments(), 0);
+    }
+
+    #[test]
+    fn intermediate_channel_points_wake_without_finishing_the_reservation() {
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
+        control.open(FD);
+        let id = control
+            .allocate_channel_syncpoint(descriptor(), IOCTL_SYNCPT_INCREMENT)
+            .unwrap()
+            .syncpoint();
+        let reservation = control
+            .reserve_channel_submission(descriptor(), IOCTL_SYNCPT_INCREMENT, id, 5)
+            .unwrap();
+        let NvHostCtrlIoctlOutcome::Pending(wait) = control
+            .ioctl(
+                descriptor(),
+                IOCTL_SYNCPT_WAIT,
+                &words(&[id.get(), 2, u32::MAX]),
+            )
+            .unwrap()
+        else {
+            panic!("the intermediate point has not been reached");
+        };
+        control
+            .consume_channel_increment(descriptor(), IOCTL_SYNCPT_INCREMENT, &reservation)
+            .unwrap();
+        control
+            .publish_channel_increment(descriptor(), IOCTL_SYNCPT_INCREMENT, &reservation)
+            .unwrap();
+        assert!(!wait.wake_event().is_signalled());
+        control
+            .consume_channel_increment(descriptor(), IOCTL_SYNCPT_INCREMENT, &reservation)
+            .unwrap();
+        control
+            .publish_channel_increment(descriptor(), IOCTL_SYNCPT_INCREMENT, &reservation)
+            .unwrap();
+        assert!(wait.wake_event().is_signalled());
+        assert_eq!(control.timelines[&id].current_point().value().get(), 2);
+        assert_eq!(control.timelines[&id].outstanding_increments(), 3);
+    }
+
+    #[test]
+    fn guest_dependencies_advance_without_signalling_cpu_events() {
+        let mut control = NvHostControl::new(&crate::test_memory::kernel());
+        control.open(FD);
+        let id = control
+            .allocate_channel_syncpoint(descriptor(), 0)
+            .unwrap()
+            .syncpoint();
+        let first = control
+            .reserve_channel_submission(descriptor(), 0, id, 2)
+            .unwrap();
+        let second = control
+            .reserve_channel_submission(descriptor(), 0, id, 1)
+            .unwrap();
+        let NvHostCtrlIoctlOutcome::Pending(wait) = control
+            .ioctl(
+                descriptor(),
+                IOCTL_SYNCPT_WAIT,
+                &words(&[id.get(), 1, u32::MAX]),
+            )
+            .unwrap()
+        else {
+            panic!("CPU progress is still pending")
+        };
+        for reservation in [&first, &first, &second] {
+            control
+                .consume_channel_increment(descriptor(), 0, reservation)
+                .unwrap();
+        }
+        assert_eq!(control.guest_point_reached(second.point()), Some(true));
+        assert!(
+            control
+                .submission_dependency_reached(descriptor(), second.point())
+                .unwrap()
+        );
+        assert_eq!(control.host_point_reached(first.point()), Some(false));
+        assert!(!wait.wake_event().is_signalled());
+        let NvHostCtrlIoctlOutcome::Complete(read) = control
+            .ioctl(descriptor(), IOCTL_SYNCPT_READ, &words(&[id.get(), 0]))
+            .unwrap()
+        else {
+            panic!("counter reads do not wait")
+        };
+        assert_eq!(input_u32(&read, 4).unwrap(), 0);
+        control
+            .publish_channel_increment(descriptor(), 0, &first)
+            .unwrap();
+        assert!(wait.wake_event().is_signalled());
+        assert_eq!(control.host_point_reached(first.point()), Some(false));
+        control
+            .publish_channel_increment(descriptor(), 0, &first)
+            .unwrap();
+        control
+            .publish_channel_increment(descriptor(), 0, &second)
+            .unwrap();
+        assert_eq!(control.host_point_reached(second.point()), Some(true));
     }
 
     #[test]
@@ -1276,18 +1381,33 @@ mod tests {
         let backend_control = control.clone();
         let completed = reservation.point();
         let published = std::thread::spawn(move || {
-            backend_control
-                .lock()
-                .unwrap()
-                .complete_channel_submission(descriptor(), IOCTL_SYNCPT_INCREMENT, &reservation)
-                .unwrap()
+            let mut control = backend_control.lock().unwrap();
+            let mut point = None;
+            for _ in 0..reservation.increments() {
+                control
+                    .consume_channel_increment(descriptor(), IOCTL_SYNCPT_INCREMENT, &reservation)
+                    .unwrap();
+                point = Some(
+                    control
+                        .publish_channel_increment(
+                            descriptor(),
+                            IOCTL_SYNCPT_INCREMENT,
+                            &reservation,
+                        )
+                        .unwrap(),
+                );
+            }
+            point.unwrap()
         })
         .join()
         .unwrap();
 
         assert!(wait.wake_event().is_signalled());
         assert_eq!(published, completed);
-        assert_eq!(control.lock().unwrap().point_reached(completed), Some(true));
+        assert_eq!(
+            control.lock().unwrap().host_point_reached(completed),
+            Some(true)
+        );
     }
 
     #[test]

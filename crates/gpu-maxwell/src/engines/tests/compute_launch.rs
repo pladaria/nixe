@@ -12,10 +12,7 @@ fn pcas_address_is_shifted_without_truncation_and_does_not_launch_work() {
     ] {
         let dispatch =
             dispatch_first(&mut channel, &packet_on_subchannel(1, 0x02b4 / 4, raw)).unwrap();
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SEND_PCAS_A"
-        );
+
         assert!(dispatch.ordered_operations().is_empty());
         let register = channel.compute().qmd_address();
         assert_eq!(register.raw(), Some(raw));

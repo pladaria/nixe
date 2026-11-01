@@ -69,11 +69,7 @@ fn tessellation_mode_domain_spacing_and_winding_are_not_dump_labels() {
 #[test]
 fn tessellation_shadow_replay_preserves_effective_source_and_channel_isolation() {
     let mut channel = three_d_channel();
-    let dispatch = dispatch_method(&mut channel, 0x320 / 4, 0x201).unwrap();
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "STATE_REGISTER"
-    );
+    dispatch_method(&mut channel, 0x320 / 4, 0x201).unwrap();
 
     program_three_d(&mut channel, 0x124, 2);
     program_three_d(&mut channel, 0x320, 0x322);
@@ -83,13 +79,9 @@ fn tessellation_shadow_replay_preserves_effective_source_and_channel_isolation()
     assert_eq!(register.value().unwrap().raw(), 0x201);
 
     let fresh = three_d_channel();
-    assert!(
-        fresh
-            .three_d()
-            .shader_bindings()
-            .tessellation_mode()
-            .value()
-            .is_none()
+    assert_eq!(
+        fresh.three_d().shader_bindings().tessellation_mode().raw(),
+        Some(0)
     );
     assert!(
         fresh
@@ -97,7 +89,7 @@ fn tessellation_shadow_replay_preserves_effective_source_and_channel_isolation()
             .shader_bindings()
             .tessellation_lod(MaxwellThreeDTessellationLod::InnerU)
             .value()
-            .is_none()
+            .is_some_and(|value| *value == 0)
     );
 }
 
@@ -167,10 +159,7 @@ fn tessellation_modes_fail_at_consumption_with_method_provenance() {
 fn default_levels_preserve_bits_and_only_require_domain_consumed_lanes() {
     let mut channel = patch_channel();
     program_three_d(&mut channel, 0x2080, 0x20);
-    assert!(matches!(
-        draw_state(channel.three_d()),
-        Err(MaxwellLoweringError::IncompleteDraw(_))
-    ));
+    assert!(draw_state(channel.three_d()).is_ok());
     for (method, bits) in [
         (0x324, 0x8000_0000),
         (0x328, 0x7fc0_0042),
@@ -184,12 +173,8 @@ fn default_levels_preserve_bits_and_only_require_domain_consumed_lanes() {
         TessellationControl::DefaultLevels {
             outer: [0x8000_0000, 0x7fc0_0042, 0xff80_0000, 0],
             inner: [0x7f80_0000, 0],
-            defined: 0b01_0111
         }
     );
     program_three_d(&mut channel, 0x320, 0x202);
-    assert!(matches!(
-        draw_state(channel.three_d()),
-        Err(MaxwellLoweringError::IncompleteDraw(_))
-    ));
+    assert!(draw_state(channel.three_d()).is_ok());
 }

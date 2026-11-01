@@ -233,9 +233,10 @@ fn four_sample_targets_reject_single_sample_kinds_and_short_storage() {
             src.offset().get(),
             Some(u32::from(kind != 0xfe)),
         );
-        let result = fixture_bindings(
+        let result = fixture_roles(
             channel.three_d(),
             address_space.memory(),
+            &[MaxwellThreeDResourceRole::ColorTarget(0)],
             &mut crate::test_memory::access(address_space.memory().machine()),
         );
         if kind == 0xe0 {
@@ -248,9 +249,10 @@ fn four_sample_targets_reject_single_sample_kinds_and_short_storage() {
         }
         program_three_d(&mut channel, 0x081c, 512);
         assert!(matches!(
-            fixture_bindings(
+            fixture_roles(
                 channel.three_d(),
                 address_space.memory(),
+                &[MaxwellThreeDResourceRole::ColorTarget(0)],
                 &mut crate::test_memory::access(address_space.memory().machine())
             ),
             Err(MaxwellThreeDResourceError::ContradictoryState { .. })

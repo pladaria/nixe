@@ -174,7 +174,6 @@ impl Hash for GuestDrawState {
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct GuestShaderState {
-    pub base_instance: u32,
     pub point_size_bits: Option<u32>,
     pub y_negate: bool,
     pub force_early_z: bool,

@@ -112,12 +112,13 @@ fn non_indexed_resource_scope_ignores_unrelated_partial_index_shadow_state() {
     let address_space = resource_address_space();
 
     assert!(matches!(
-        fixture_bindings(
+        fixture_roles(
             channel.three_d(),
             address_space.memory(),
+            &[MaxwellThreeDResourceRole::IndexBuffer],
             &mut crate::test_memory::access(address_space.memory().machine())
         ),
-        Err(MaxwellThreeDResourceError::IncompleteState {
+        Err(MaxwellThreeDResourceError::ContradictoryState {
             role: MaxwellThreeDResourceRole::IndexBuffer,
         })
     ));
@@ -140,7 +141,7 @@ fn non_indexed_resource_scope_ignores_unrelated_partial_index_shadow_state() {
             &[MaxwellThreeDResourceRole::IndexBuffer],
             &mut crate::test_memory::access(address_space.memory().machine())
         ),
-        Err(MaxwellThreeDResourceError::IncompleteState {
+        Err(MaxwellThreeDResourceError::ContradictoryState {
             role: MaxwellThreeDResourceRole::IndexBuffer,
         })
     ));
@@ -154,9 +155,10 @@ fn operation_resource_scope_ignores_only_unconsumed_partial_color_targets() {
     let address_space = resource_address_space();
 
     assert!(matches!(
-        fixture_bindings(
+        fixture_roles(
             channel.three_d(),
             address_space.memory(),
+            &[MaxwellThreeDResourceRole::ColorTarget(0)],
             &mut crate::test_memory::access(address_space.memory().machine())
         ),
         Err(MaxwellThreeDResourceError::IncompleteState {
@@ -265,7 +267,8 @@ fn rgba16_float_targets_preserve_texel_width_and_reject_incompatible_kinds() {
             continue;
         }
         let resources = result.unwrap();
-        let MaxwellThreeDResolvedResource::Image(image) = resources.resources().next().unwrap()
+        let MaxwellThreeDResolvedResource::Image { view: image, .. } =
+            resources.resources().next().unwrap()
         else {
             panic!("image expected")
         };
@@ -367,8 +370,8 @@ fn captured_deko_basic_color_target_accepts_its_matching_c32_pte_kind() {
     let image = resources
         .resources()
         .find_map(|resource| match resource {
-            MaxwellThreeDResolvedResource::Image(image) => Some(image),
-            MaxwellThreeDResolvedResource::Buffer(_) => None,
+            MaxwellThreeDResolvedResource::Image { view: image, .. } => Some(image),
+            MaxwellThreeDResolvedResource::Buffer { .. } => None,
         })
         .expect("captured color target must resolve as an image");
 
@@ -402,17 +405,18 @@ fn three_d_depth_layer_selects_one_array_subresource() {
         program_three_d(&mut channel, method, argument);
     }
 
-    let resolved = fixture_bindings(
+    let resolved = fixture_roles(
         channel.three_d(),
         address_space.memory(),
+        &[MaxwellThreeDResourceRole::DepthStencilTarget],
         &mut crate::test_memory::access(address_space.memory().machine()),
     )
     .unwrap();
     let depth = resolved
         .resources()
         .find_map(|resource| match resource {
-            MaxwellThreeDResolvedResource::Image(image)
-                if image.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
+            MaxwellThreeDResolvedResource::Image { view: image, .. }
+                if resource.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
             {
                 Some(image)
             }
@@ -439,9 +443,10 @@ fn three_d_depth_layer_selects_one_array_subresource() {
 
     program_three_d(&mut channel, 0x179c, 2);
     assert!(matches!(
-        fixture_bindings(
+        fixture_roles(
             channel.three_d(),
             address_space.memory(),
+            &[MaxwellThreeDResourceRole::DepthStencilTarget],
             &mut crate::test_memory::access(address_space.memory().machine())
         ),
         Err(MaxwellThreeDResourceError::ContradictoryState {
@@ -452,9 +457,10 @@ fn three_d_depth_layer_selects_one_array_subresource() {
     program_three_d(&mut channel, 0x1230, 0x0001_0002);
     program_three_d(&mut channel, 0x179c, 1);
     assert!(matches!(
-        fixture_bindings(
+        fixture_roles(
             channel.three_d(),
             address_space.memory(),
+            &[MaxwellThreeDResourceRole::DepthStencilTarget],
             &mut crate::test_memory::access(address_space.memory().machine())
         ),
         Err(MaxwellThreeDResourceError::ContradictoryState {
@@ -464,17 +470,18 @@ fn three_d_depth_layer_selects_one_array_subresource() {
     program_three_d(&mut channel, 0x179c, 0);
     for raw in [1, 0x10000, 0x10001, 0x10002, 0x1ffff] {
         program_three_d(&mut channel, 0x1230, raw);
-        let resolved = fixture_bindings(
+        let resolved = fixture_roles(
             channel.three_d(),
             address_space.memory(),
+            &[MaxwellThreeDResourceRole::DepthStencilTarget],
             &mut crate::test_memory::access(address_space.memory().machine()),
         )
         .unwrap();
         let depth = resolved
             .resources()
             .find_map(|resource| match resource {
-                MaxwellThreeDResolvedResource::Image(image)
-                    if image.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
+                MaxwellThreeDResolvedResource::Image { view: image, .. }
+                    if resource.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
                 {
                     Some(image)
                 }
@@ -491,9 +498,10 @@ fn three_d_depth_layer_selects_one_array_subresource() {
     }
     program_three_d(&mut channel, 0x1230, 0);
     assert!(matches!(
-        fixture_bindings(
+        fixture_roles(
             channel.three_d(),
             address_space.memory(),
+            &[MaxwellThreeDResourceRole::DepthStencilTarget],
             &mut crate::test_memory::access(address_space.memory().machine())
         ),
         Err(MaxwellThreeDResourceError::ContradictoryState {
@@ -531,17 +539,18 @@ fn three_d_stencil8_z24_preserves_guest_packing_with_neutral_depth_stencil_seman
         program_three_d(&mut channel, method, argument);
     }
 
-    let resolved = fixture_bindings(
+    let resolved = fixture_roles(
         channel.three_d(),
         address_space.memory(),
+        &[MaxwellThreeDResourceRole::DepthStencilTarget],
         &mut crate::test_memory::access(address_space.memory().machine()),
     )
     .unwrap();
     let depth = resolved
         .resources()
         .find_map(|resource| match resource {
-            MaxwellThreeDResolvedResource::Image(image)
-                if image.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
+            MaxwellThreeDResolvedResource::Image { view: image, .. }
+                if resource.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
             {
                 Some(image)
             }
@@ -559,17 +568,18 @@ fn three_d_stencil8_z24_preserves_guest_packing_with_neutral_depth_stencil_seman
     assert_eq!(depth.source().size(), 0x8000);
 
     program_three_d(&mut channel, 0x0fe8, 0x14);
-    let resolved = fixture_bindings(
+    let resolved = fixture_roles(
         channel.three_d(),
         address_space.memory(),
+        &[MaxwellThreeDResourceRole::DepthStencilTarget],
         &mut crate::test_memory::access(address_space.memory().machine()),
     )
     .unwrap();
     let depth = resolved
         .resources()
         .find_map(|resource| match resource {
-            MaxwellThreeDResolvedResource::Image(image)
-                if image.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
+            MaxwellThreeDResolvedResource::Image { view: image, .. }
+                if resource.role() == MaxwellThreeDResourceRole::DepthStencilTarget =>
             {
                 Some(image)
             }
@@ -620,9 +630,10 @@ fn compressed_depth_kinds_preserve_format_and_reject_other_packing_msaa_and_colo
                 if let Some(compression) = compression {
                     program_three_d(&mut channel, 0x19cc, compression);
                 }
-                let result = fixture_bindings(
+                let result = fixture_roles(
                     channel.three_d(),
                     address_space.memory(),
+                    &[MaxwellThreeDResourceRole::DepthStencilTarget],
                     &mut crate::test_memory::access(address_space.memory().machine()),
                 );
                 if kind == expected_kind || (kind == 0xfe && compression != Some(1)) {
@@ -630,8 +641,8 @@ fn compressed_depth_kinds_preserve_format_and_reject_other_packing_msaa_and_colo
                     let depth = resolved
                         .resources()
                         .find_map(|resource| match resource {
-                            MaxwellThreeDResolvedResource::Image(image)
-                                if image.role()
+                            MaxwellThreeDResolvedResource::Image { view: image, .. }
+                                if resource.role()
                                     == MaxwellThreeDResourceRole::DepthStencilTarget =>
                             {
                                 Some(image)
@@ -669,14 +680,7 @@ fn three_d_surface_clip_pair_preserves_sources_and_origin_extent() {
         dispatch_incrementing(&mut channel, 0x0ff4 / 4, &[0x0500_0000, 0x02d0_0000]).unwrap();
 
     assert_eq!(dispatch.methods().len(), 2);
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "STATE_REGISTER"
-    );
-    assert_eq!(
-        dispatch.methods()[1].metadata().method_name(),
-        "STATE_REGISTER"
-    );
+
     let state = channel.three_d().fixed_function();
     let horizontal = state.surface_clip_horizontal();
     let vertical = state.surface_clip_vertical();
@@ -698,11 +702,8 @@ fn standalone_inline_to_memory_pitch_upload_tracks_state_words_and_ordered_effec
         0x0180 / 4,
         &[8, 1, (address >> 32) as u32, address as u32, 8],
     );
-    let setup_dispatch = dispatch_first(&mut channel, &setup).unwrap();
-    assert_eq!(
-        setup_dispatch.methods()[2].metadata().method_name(),
-        "OFFSET_OUT_UPPER"
-    );
+    dispatch_first(&mut channel, &setup).unwrap();
+
     assert_eq!(channel.inline_to_memory().address_upper().value(), Some(&4));
     assert_eq!(channel.inline_to_memory().pitch().value(), Some(&8));
 
@@ -782,23 +783,15 @@ fn constant_buffer_inline_load_tracks_typed_cursor_and_upload_effects() {
     let dispatch =
         dispatch_incrementing(&mut channel, 0x238c / 4, &[0, 0x1122_3344, 0x5566_7788]).unwrap();
     assert_eq!(dispatch.methods().len(), 3);
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "STATE_REGISTER"
-    );
+
     assert_eq!(
         channel.three_d().shader_bindings().constant_buffer_offset(),
-        Some(8)
+        8
     );
-
-    for index in 0..2 {
-        let method = dispatch.methods()[index + 1];
-        assert_eq!(method.metadata().method_name(), "STATE_REGISTER");
-    }
 }
 
 #[test]
-fn constant_buffer_inline_load_validates_fields_sequence_bounds_and_atomicity() {
+fn constant_buffer_inline_load_validates_consumed_ranges_and_preserves_applied_prefix() {
     let mut channel = three_d_channel();
 
     let before = channel.three_d().clone();
@@ -812,15 +805,13 @@ fn constant_buffer_inline_load_validates_fields_sequence_bounds_and_atomicity() 
     ));
     assert_eq!(channel.three_d(), &before);
 
-    let invalid_offset = packet(0x238c / 4, 0x1_0000);
-    assert!(matches!(
-        dispatch_first(&mut channel, &invalid_offset),
-        Err(MaxwellEngineDispatchError::InvalidMethodEncoding {
-            method_name: "LOAD_CONSTANT_BUFFER_OFFSET",
-            ..
-        })
-    ));
-    assert_eq!(channel.three_d(), &before);
+    // Ordinary selectors are raw state, validated when a transfer consumes
+    // them. They do not maintain a second optional cursor.
+    program_three_d(&mut channel, 0x238c, 0x1_0000);
+    assert_eq!(
+        channel.three_d().shader_bindings().constant_buffer_offset(),
+        0x1_0000
+    );
 
     for (method, argument) in [(0x2380, 4), (0x2384, 0), (0x2388, 0x1000)] {
         program_three_d(&mut channel, method, argument);
@@ -864,7 +855,7 @@ fn conditional_constant_buffer_inline_load_is_an_explicit_host_boundary() {
     program_three_d(&mut channel, 0x2390, 0xfeed_beef);
     assert_eq!(
         channel.three_d().shader_bindings().constant_buffer_offset(),
-        Some(4)
+        4
     );
 }
 
@@ -910,17 +901,26 @@ fn resource_snapshot_resolves_buffers_aliases_and_content_generations() {
     }
 
     crate::test_memory::write(&allocation, 0, &[0x5a]).unwrap();
-    let resolved = fixture_bindings(
+    let resolved = fixture_roles(
         channel.three_d(),
         address_space.memory(),
+        &[
+            MaxwellThreeDResourceRole::VertexStream(0),
+            MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 },
+        ],
         &mut crate::test_memory::access(address_space.memory().machine()),
     )
     .unwrap();
     assert_eq!(resolved.resources().count(), 2);
-    let MaxwellThreeDResolvedResource::Buffer(vertex) = resolved.resources().next().unwrap() else {
+    let MaxwellThreeDResolvedResource::Buffer { view: vertex, .. } =
+        resolved.resources().next().unwrap()
+    else {
         panic!("vertex stream must resolve as a buffer");
     };
-    assert_eq!(vertex.role(), MaxwellThreeDResourceRole::VertexStream(0));
+    assert_eq!(
+        resolved.resources().next().unwrap().role(),
+        MaxwellThreeDResourceRole::VertexStream(0)
+    );
     assert_eq!(vertex.view().size(), 0x100);
     assert_eq!(
         vertex.view().backing().mapping().spans()[0].allocation,
@@ -958,14 +958,17 @@ fn resource_snapshot_preserves_block_linear_targets_and_tracks_dirty_images() {
         program_three_d(&mut channel, method, argument);
     }
 
-    let resolved = fixture_bindings(
+    let resolved = fixture_roles(
         channel.three_d(),
         address_space.memory(),
+        &[MaxwellThreeDResourceRole::ColorTarget(0)],
         &mut crate::test_memory::access(address_space.memory().machine()),
     )
     .unwrap();
     assert_eq!(resolved.resources().count(), 1);
-    let MaxwellThreeDResolvedResource::Image(image) = resolved.resources().next().unwrap() else {
+    let MaxwellThreeDResolvedResource::Image { view: image, .. } =
+        resolved.resources().next().unwrap()
+    else {
         panic!("color target must resolve as an image");
     };
     assert_eq!(
@@ -1006,9 +1009,10 @@ fn resource_resolution_ignores_unused_descriptor_memory_and_rejects_consumed_ima
     }
     let state = state_channel.three_d().clone();
 
-    let resolved = fixture_bindings(
+    let resolved = fixture_roles(
         &state,
         address_space.memory(),
+        &[MaxwellThreeDResourceRole::VertexStream(0)],
         &mut crate::test_memory::access(address_space.memory().machine()),
     )
     .unwrap();
@@ -1037,9 +1041,10 @@ fn resource_resolution_ignores_unused_descriptor_memory_and_rejects_consumed_ima
         program_three_d(&mut image_channel, method, argument);
     }
     assert!(matches!(
-        fixture_bindings(
+        fixture_roles(
             image_channel.three_d(),
             address_space.memory(),
+            &[MaxwellThreeDResourceRole::ColorTarget(0)],
             &mut crate::test_memory::access(address_space.memory().machine())
         ),
         Err(MaxwellThreeDResourceError::UnsupportedKind {
@@ -1090,10 +1095,8 @@ fn ct_mrt_enable_is_typed_source_preserving_and_atomic() {
         (1, MaxwellThreeDSeparateFragmentData::Enabled),
     ] {
         let dispatch = dispatch_method(&mut channel, 0x0fac / 4, argument).unwrap();
-        let method = dispatch.methods()[0];
-        let register = channel.three_d().render_targets().separate_fragment_data();
 
-        assert_eq!(method.metadata().method_name(), "STATE_REGISTER");
+        let register = channel.three_d().render_targets().separate_fragment_data();
 
         assert!(dispatch.operations().is_empty());
         assert_eq!(expected.raw(), argument);
@@ -1110,11 +1113,7 @@ fn compute_shader_memory_state_is_typed_source_preserving_and_atomic() {
     let two_d_before = channel.two_d().clone();
 
     let upper = packet_on_subchannel(1, 0x0790 / 4, 4);
-    let dispatch = dispatch_first(&mut channel, &upper).unwrap();
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "SET_SHADER_LOCAL_MEMORY_A"
-    );
+    dispatch_first(&mut channel, &upper).unwrap();
 
     let memory = channel.compute().shader_local_memory();
     assert_eq!(memory.address(), None);
@@ -1158,13 +1157,9 @@ fn compute_shader_memory_state_is_typed_source_preserving_and_atomic() {
         assert!(allocation.max_sm_count().source().is_some());
     }
 
-    for (method, argument, name) in [
-        (0x077c, 0xff00_0000, "SET_SHADER_LOCAL_MEMORY_WINDOW"),
-        (0x0214, 0xfe00_0000, "SET_SHADER_SHARED_MEMORY_WINDOW"),
-    ] {
+    for (method, argument) in [(0x077c, 0xff00_0000), (0x0214, 0xfe00_0000)] {
         let decoded = packet_on_subchannel(1, method / 4, argument);
-        let dispatch = dispatch_first(&mut channel, &decoded).unwrap();
-        assert_eq!(dispatch.methods()[0].metadata().method_name(), name);
+        dispatch_first(&mut channel, &decoded).unwrap();
     }
     let memory = channel.compute().shader_local_memory();
     assert_eq!(memory.local_window_base().value(), Some(&0xff00_0000));
@@ -1221,10 +1216,7 @@ fn compute_shader_exceptions_preserve_configuration_without_emitting_work() {
     for raw in [0, 1, 0] {
         let packet = packet_on_subchannel(1, 0x1528 / 4, raw);
         let dispatch = dispatch_first(&mut channel, &packet).unwrap();
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "SET_SHADER_EXCEPTIONS"
-        );
+
         assert!(dispatch.ordered_operations().is_empty());
         let register = channel.compute().shader_exceptions_enable();
         assert_eq!(register.origin(), MaxwellComputeRegisterOrigin::Programmed);
@@ -1267,11 +1259,7 @@ fn compute_program_state_is_typed_source_preserving_and_atomic() {
     let mut channel = compute_channel();
 
     let lower = packet_on_subchannel(1, 0x160c / 4, 0x0123_4000);
-    let dispatch = dispatch_first(&mut channel, &lower).unwrap();
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "SET_PROGRAM_REGION_B"
-    );
+    dispatch_first(&mut channel, &lower).unwrap();
 
     assert_eq!(channel.compute().program().region_address(), None);
 
@@ -1296,11 +1284,8 @@ fn compute_program_state_is_typed_source_preserving_and_atomic() {
     assert!(program.region_address_lower().source().is_some());
 
     let spa = packet_on_subchannel(1, 0x0310 / 4, 0x0400);
-    let dispatch = dispatch_first(&mut channel, &spa).unwrap();
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "SET_SPA_VERSION"
-    );
+    dispatch_first(&mut channel, &spa).unwrap();
+
     let version = *channel.compute().program().spa_version().value().unwrap();
     assert_eq!(version.major(), 4);
     assert_eq!(version.minor(), 0);
@@ -1347,11 +1332,7 @@ fn compute_descriptor_pools_are_typed_source_preserving_and_atomic() {
     assert_eq!(channel.compute().texture_headers().address(), None);
 
     let header_upper = packet_on_subchannel(1, 0x1574 / 4, 4);
-    let dispatch = dispatch_first(&mut channel, &header_upper).unwrap();
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "SET_TEX_HEADER_POOL_A"
-    );
+    dispatch_first(&mut channel, &header_upper).unwrap();
 
     let header_maximum = packet_on_subchannel(1, 0x157c / 4, 0x003f_ffff);
     dispatch_first(&mut channel, &header_maximum).unwrap();
@@ -1369,10 +1350,7 @@ fn compute_descriptor_pools_are_typed_source_preserving_and_atomic() {
     let sampler = incrementing_packet_on_subchannel(1, 0x155c / 4, &[4, 0x0411_0000, 0x000f_ffff]);
     let dispatch = dispatch_first(&mut channel, &sampler).unwrap();
     assert_eq!(dispatch.methods().len(), 3);
-    assert_eq!(
-        dispatch.methods()[2].metadata().method_name(),
-        "SET_TEX_SAMPLER_POOL_C"
-    );
+
     let samplers = channel.compute().samplers();
     assert_eq!(
         samplers.address(),
@@ -1429,10 +1407,6 @@ fn compute_bindless_texture_slot_is_typed_source_preserving_and_atomic() {
     let slots = non_incrementing_packet_on_subchannel(1, 0x2608 / 4, &[0, 7]);
     let dispatch = dispatch_first(&mut channel, &slots).unwrap();
     assert_eq!(dispatch.methods().len(), 2);
-    assert_eq!(
-        dispatch.methods()[1].metadata().method_name(),
-        "SET_BINDLESS_TEXTURE"
-    );
 
     let slot = channel.compute().bindless_texture_constant_buffer_slot();
     assert_eq!(slot.value().unwrap().get(), 7);
@@ -1566,12 +1540,7 @@ fn compute_inline_to_memory_pitch_upload_is_typed_ordered_and_atomic() {
     let dispatch = dispatch_first(&mut channel, &launch).unwrap();
 
     assert_eq!(dispatch.methods().len(), 17);
-    assert_eq!(dispatch.methods()[0].metadata().method_name(), "LAUNCH_DMA");
 
-    for index in 0..data.len() {
-        let method = dispatch.methods()[index + 1];
-        assert_eq!(method.metadata().method_name(), "LOAD_INLINE_DATA");
-    }
     let inline = channel.compute().inline_to_memory();
     assert_eq!(inline.address().unwrap().get(), 0x082b_30c0);
     assert_eq!(inline.line_length().value(), Some(&0x40));
@@ -1632,10 +1601,7 @@ fn compute_shader_cache_invalidation_is_typed_ordered_and_atomic() {
     let dispatch = dispatch_first(&mut channel, &invalidations).unwrap();
     assert_eq!(dispatch.methods().len(), 2);
     assert_eq!(dispatch.compute_operations().len(), 2);
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "INVALIDATE_SHADER_CACHES_NO_WFI"
-    );
+
     for (index, expected) in [
         MaxwellComputeShaderCacheInvalidation::new(false, false, true),
         MaxwellComputeShaderCacheInvalidation::new(true, true, true),
@@ -1678,10 +1644,7 @@ fn compute_shader_cache_invalidation_with_wfi_preserves_selectors_and_rejects_un
     for raw in [0, 1, 0x10, 0x1000, 0x1011] {
         let dispatch =
             dispatch_first(&mut channel, &packet_on_subchannel(1, 0x021c / 4, raw)).unwrap();
-        assert_eq!(
-            dispatch.methods()[0].metadata().method_name(),
-            "INVALIDATE_SHADER_CACHES"
-        );
+
         let operation = dispatch.compute_operations()[0];
         assert_eq!(channel.compute(), &before);
         assert_eq!(operation.source().argument(), raw);
@@ -1732,10 +1695,6 @@ fn compute_cwd_reference_counter_bank_is_typed_source_preserving_and_atomic() {
     assert_eq!(
         dispatch.methods().len(),
         MAXWELL_COMPUTE_CWD_REF_COUNTER_COUNT
-    );
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "SET_CWD_REF_COUNTER"
     );
 
     let bank = channel.compute().cwd_reference_counters();
@@ -1803,11 +1762,6 @@ fn compute_wait_for_idle_is_an_ordered_neutral_operation() {
     assert_eq!(dispatch.compute_operations().len(), 2);
     assert!(dispatch.operations().is_empty());
     for (index, value) in [0, 0xfeed_beef].into_iter().enumerate() {
-        assert_eq!(
-            dispatch.methods()[index].metadata().method_name(),
-            "WAIT_FOR_IDLE"
-        );
-
         let operation = dispatch.compute_operations()[index];
         assert!(matches!(
             operation,
@@ -1866,10 +1820,15 @@ fn render_target_discard_is_a_validated_non_destructive_hint() {
             let dispatch = dispatch_method(&mut channel, 0x0f78 / 4, raw).unwrap();
             assert!(dispatch.ordered_operations().is_empty());
             let method = dispatch.methods()[0];
-            assert_eq!(method.metadata().method_name(), "DISCARD_RENDER_TARGET");
-            assert_eq!(method.method().source().argument(), raw);
-            assert_eq!(method.method().source().method(), GpuMethodId(0x0f78));
-            assert_eq!(channel, before);
+
+            assert_eq!(method.source().argument(), raw);
+            assert_eq!(method.source().method(), GpuMethodId(0x0f78));
+            assert!(
+                before
+                    .three_d()
+                    .draw_state_identity()
+                    .matches(channel.three_d())
+            );
             assert!(draw.matches(channel.three_d()));
             assert!(shaders.matches_code(channel.three_d()));
             assert!(resources.matches(channel.three_d()));
@@ -1883,7 +1842,12 @@ fn render_target_discard_is_a_validated_non_destructive_hint() {
                 ..
             })
         ));
-        assert_eq!(channel, before);
+        assert!(
+            before
+                .three_d()
+                .draw_state_identity()
+                .matches(channel.three_d())
+        );
     }
 }
 
@@ -1895,15 +1859,17 @@ fn tiled_cache_barrier_preserves_source_and_draw_state() {
     let dispatch = dispatch_method(&mut channel, 0x0f7c / 4, 0).unwrap();
     assert!(dispatch.operations().is_empty());
     assert_eq!(dispatch.synchronization_operations().len(), 1);
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "TILED_CACHE_BARRIER"
-    );
+
     let operation = &dispatch.synchronization_operations()[0];
     assert!(matches!(operation.trigger(),
         MaxwellThreeDSynchronizationTrigger::TiledCacheBarrier { source }
             if source.method() == GpuMethodId(0x0f7c) && source.argument() == 0));
-    assert_eq!(operation.state(), before.three_d());
+    assert!(
+        before
+            .three_d()
+            .draw_state_identity()
+            .matches(operation.state())
+    );
     for pending in [false, true] {
         assert_eq!(
             lower_maxwell_three_d_synchronization(operation, None, pending),
@@ -1934,15 +1900,17 @@ fn pixel_shader_barriers_preserve_source_and_do_not_mutate_draw_state() {
     assert_eq!(dispatch.synchronization_operations().len(), 2);
     for (index, operation) in dispatch.synchronization_operations().iter().enumerate() {
         let expected = index != 0;
-        assert_eq!(
-            dispatch.methods()[index].metadata().method_name(),
-            "PIXEL_SHADER_BARRIER"
-        );
+
         assert!(matches!(operation.trigger(),
             MaxwellThreeDSynchronizationTrigger::PixelShaderBarrier { system_memory_barrier, source }
             if system_memory_barrier == expected && source.argument() == index as u32
                 && source.method() == GpuMethodId(0x0de0)));
-        assert_eq!(operation.state(), before.three_d());
+        assert!(
+            before
+                .three_d()
+                .draw_state_identity()
+                .matches(operation.state())
+        );
         for pending in [false, true] {
             assert_eq!(
                 lower_maxwell_three_d_synchronization(operation, None, pending),
@@ -1952,14 +1920,24 @@ fn pixel_shader_barriers_preserve_source_and_do_not_mutate_draw_state() {
             );
         }
     }
-    assert_eq!(channel, before);
+    assert!(
+        before
+            .three_d()
+            .draw_state_identity()
+            .matches(channel.three_d())
+    );
     for raw in [2, 3, 0x8000_0000, u32::MAX] {
         assert!(
             matches!(dispatch_first(&mut channel, &packet(0x0de0 / 4, raw)),
             Err(MaxwellEngineDispatchError::InvalidMethodValue { defined_mask: 1, source, .. })
                 if source.argument() == raw)
         );
-        assert_eq!(channel, before);
+        assert!(
+            before
+                .three_d()
+                .draw_state_identity()
+                .matches(channel.three_d())
+        );
     }
 }
 
@@ -1978,11 +1956,6 @@ fn three_d_wait_for_idle_is_an_ordered_neutral_operation() {
     assert_eq!(dispatch.synchronization_operations().len(), 2);
     assert!(dispatch.operations().is_empty());
     for (index, value) in [0, 0xfeed_beef].into_iter().enumerate() {
-        assert_eq!(
-            dispatch.methods()[index].metadata().method_name(),
-            "WAIT_FOR_IDLE"
-        );
-
         let operation = &dispatch.synchronization_operations()[index];
         assert!(matches!(
             operation.trigger(),
@@ -1991,7 +1964,16 @@ fn three_d_wait_for_idle_is_an_ordered_neutral_operation() {
                 source,
             } if actual == value && source.argument() == value
         ));
-        assert_eq!(operation.state(), &three_d_before);
+        assert!(
+            three_d_before
+                .draw_state_identity()
+                .matches(operation.state())
+        );
+        assert!(
+            three_d_before
+                .draw_state_identity()
+                .matches_parameters(operation.state())
+        );
         assert_eq!(
             lower_maxwell_three_d_synchronization(operation, None, false),
             Ok(MaxwellThreeDSynchronizationPlan::WaitForIdle {
@@ -2028,10 +2010,7 @@ fn decompress_surface_is_ordered_for_reset_or_programmed_uncompressed_targets() 
 
     let decoded = packet(0x02e0 / 4, (0x1234 << 4) | 5);
     let dispatch = dispatch_first(&mut uncompressed, &decoded).unwrap();
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "DECOMPRESS_SURFACE"
-    );
+
     assert!(dispatch.operations().is_empty());
     let operation = &dispatch.synchronization_operations()[0];
     let request = match operation.trigger() {
@@ -2121,10 +2100,6 @@ fn three_d_flush_and_syncpoint_increment_are_ordered_completion_operations() {
     assert_eq!(flush_dispatch.synchronization_operations().len(), 2);
     assert!(flush_dispatch.operations().is_empty());
     for (index, expected) in [false, true].into_iter().enumerate() {
-        assert_eq!(
-            flush_dispatch.methods()[index].metadata().method_name(),
-            "FLUSH_PENDING_WRITES"
-        );
         let operation = &flush_dispatch.synchronization_operations()[index];
         assert!(matches!(
             operation.trigger(),
@@ -2133,7 +2108,16 @@ fn three_d_flush_and_syncpoint_increment_are_ordered_completion_operations() {
                     && source.argument() == u32::from(expected)
                     && source.method() == GpuMethodId(0x1144)
         ));
-        assert_eq!(operation.state(), &three_d_before);
+        assert!(
+            three_d_before
+                .draw_state_identity()
+                .matches(operation.state())
+        );
+        assert!(
+            three_d_before
+                .draw_state_identity()
+                .matches_parameters(operation.state())
+        );
         assert_eq!(
             lower_maxwell_three_d_synchronization(operation, None, false),
             Ok(MaxwellThreeDSynchronizationPlan::FlushPendingWrites {
@@ -2246,10 +2230,6 @@ fn tiled_cache_flush_decodes_allocated_modes_and_lowers_only_verified_flush() {
     .into_iter()
     .enumerate()
     {
-        assert_eq!(
-            dispatch.methods()[index].metadata().method_name(),
-            "TILED_CACHE_FLUSH"
-        );
         let operation = &dispatch.synchronization_operations()[index];
         assert!(matches!(
             operation.trigger(),
@@ -2260,7 +2240,16 @@ fn tiled_cache_flush_decodes_allocated_modes_and_lowers_only_verified_flush() {
                 && source.argument() == mode.raw()
                 && source.method() == GpuMethodId(0x0f80)
         ));
-        assert_eq!(operation.state(), &three_d_before);
+        assert!(
+            three_d_before
+                .draw_state_identity()
+                .matches(operation.state())
+        );
+        assert!(
+            three_d_before
+                .draw_state_identity()
+                .matches_parameters(operation.state())
+        );
     }
 
     assert_eq!(
@@ -2301,22 +2290,19 @@ fn three_d_texture_cache_invalidation_family_preserves_target_and_scope_without_
     use_mme_shadow_passthrough(&mut channel);
     let three_d_before = channel.three_d().clone();
     let tag = 0x002a_55aa;
-    for (method, name, target, maintenance) in [
+    for (method, target, maintenance) in [
         (
             0x1288,
-            "INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI",
             MaxwellThreeDTextureCacheTarget::Data,
             nixe_gpu::CacheMaintenanceOperation::InvalidateTextureReadCaches,
         ),
         (
             0x1424,
-            "INVALIDATE_SAMPLER_CACHE_NO_WFI",
             MaxwellThreeDTextureCacheTarget::Sampler,
             nixe_gpu::CacheMaintenanceOperation::InvalidateSamplerCaches,
         ),
         (
             0x1428,
-            "INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI",
             MaxwellThreeDTextureCacheTarget::Header,
             nixe_gpu::CacheMaintenanceOperation::InvalidateTextureHeaderCaches,
         ),
@@ -2333,7 +2319,6 @@ fn three_d_texture_cache_invalidation_family_preserves_target_and_scope_without_
         .into_iter()
         .enumerate()
         {
-            assert_eq!(dispatch.methods()[index].metadata().method_name(), name);
             let operation = &dispatch.synchronization_operations()[index];
             let expected_tag = if index == 0 { 0 } else { tag };
             assert!(matches!(
@@ -2346,7 +2331,16 @@ fn three_d_texture_cache_invalidation_family_preserves_target_and_scope_without_
                     && request.tag() == expected_tag
                     && source.method() == GpuMethodId(method)
             ));
-            assert_eq!(operation.state(), &three_d_before);
+            assert!(
+                three_d_before
+                    .draw_state_identity()
+                    .matches(operation.state())
+            );
+            assert!(
+                three_d_before
+                    .draw_state_identity()
+                    .matches_parameters(operation.state())
+            );
             assert_eq!(
                 lower_maxwell_three_d_synchronization(operation, None, false),
                 Ok(
@@ -2372,7 +2366,18 @@ fn three_d_texture_cache_invalidation_family_preserves_target_and_scope_without_
                 ..
             }) if source.argument() == 1 << 1
         ));
-        assert_eq!(channel, before);
+        assert!(
+            before
+                .three_d()
+                .draw_state_identity()
+                .matches(channel.three_d())
+        );
+        assert_eq!(
+            channel
+                .three_d_mut()
+                .raw_register_value(GpuMethodId(method)),
+            Some(0)
+        );
     }
     assert!(
         three_d_before
@@ -2392,28 +2397,24 @@ fn three_d_waiting_texture_cache_invalidation_family_drains_prior_work() {
     use_mme_shadow_passthrough(&mut channel);
     let three_d_before = channel.three_d().clone();
     let tag = 0x0012_3456;
-    for (method, name, target, maintenance) in [
+    for (method, target, maintenance) in [
         (
             0x1330,
-            "INVALIDATE_SAMPLER_CACHE",
             MaxwellThreeDTextureCacheTarget::Sampler,
             nixe_gpu::CacheMaintenanceOperation::InvalidateSamplerCaches,
         ),
         (
             0x1334,
-            "INVALIDATE_TEXTURE_HEADER_CACHE",
             MaxwellThreeDTextureCacheTarget::Header,
             nixe_gpu::CacheMaintenanceOperation::InvalidateTextureHeaderCaches,
         ),
         (
             0x1338,
-            "INVALIDATE_TEXTURE_DATA_CACHE",
             MaxwellThreeDTextureCacheTarget::Data,
             nixe_gpu::CacheMaintenanceOperation::InvalidateTextureReadCaches,
         ),
         (
             0x0f74,
-            "INVALIDATE_TEXTURE_DATA_CACHE_TILED",
             MaxwellThreeDTextureCacheTarget::Data,
             nixe_gpu::CacheMaintenanceOperation::InvalidateTextureReadCaches,
         ),
@@ -2429,7 +2430,6 @@ fn three_d_waiting_texture_cache_invalidation_family_drains_prior_work() {
         .into_iter()
         .enumerate()
         {
-            assert_eq!(dispatch.methods()[index].metadata().method_name(), name);
             let operation = &dispatch.synchronization_operations()[index];
             let expected_tag = if index == 0 { 0 } else { tag };
             assert!(matches!(
@@ -2442,7 +2442,16 @@ fn three_d_waiting_texture_cache_invalidation_family_drains_prior_work() {
                     && request.tag() == expected_tag
                     && source.method() == GpuMethodId(method)
             ));
-            assert_eq!(operation.state(), &three_d_before);
+            assert!(
+                three_d_before
+                    .draw_state_identity()
+                    .matches(operation.state())
+            );
+            assert!(
+                three_d_before
+                    .draw_state_identity()
+                    .matches_parameters(operation.state())
+            );
             assert_eq!(
                 lower_maxwell_three_d_synchronization(operation, None, true),
                 Ok(MaxwellThreeDSynchronizationPlan::InvalidateTextureCache {
@@ -2491,10 +2500,6 @@ fn three_d_shader_cache_invalidation_covers_every_selector_combination_atomicall
 
     assert_eq!(dispatch.synchronization_operations().len(), arguments.len());
     for (index, argument) in arguments.into_iter().enumerate() {
-        assert_eq!(
-            dispatch.methods()[index].metadata().method_name(),
-            "INVALIDATE_SHADER_CACHES_NO_WFI"
-        );
         let expected = MaxwellShaderCacheInvalidation::new(
             argument & 1 != 0,
             argument & 0x10 != 0,
@@ -2555,10 +2560,6 @@ fn ordered_three_d_shader_cache_invalidation_preserves_controls_and_prior_work()
     let state_before = channel.three_d().clone();
     let dispatch = dispatch_method(&mut channel, 0x021c / 4, 0x1011).unwrap();
 
-    assert_eq!(
-        dispatch.methods()[0].metadata().method_name(),
-        "INVALIDATE_SHADER_CACHES"
-    );
     let operation = &dispatch.synchronization_operations()[0];
     let (request, source) = match operation.trigger() {
         MaxwellThreeDSynchronizationTrigger::InvalidateShaderCaches { request, source } => {
@@ -2573,7 +2574,11 @@ fn ordered_three_d_shader_cache_invalidation_preserves_controls_and_prior_work()
     assert!(!request.flush_data());
     assert_eq!(source.method(), GpuMethodId(0x021c));
     assert_eq!(source.argument(), 0x1011);
-    assert_eq!(operation.state(), &state_before);
+    assert!(
+        state_before
+            .draw_state_identity()
+            .matches(operation.state())
+    );
     assert!(
         state_before
             .draw_state_identity()
@@ -2745,7 +2750,7 @@ fn standalone_inline_upload_addresses_block_linear_rows_and_nonzero_origins() {
         let registers = dispatch_first(&mut channel, &geometry).unwrap();
         assert_eq!(
             channel.inline_to_memory().origin_y().source(),
-            Some(registers.methods()[6].method().source())
+            Some(registers.methods()[6].source())
         );
         dispatch_first(&mut channel, &packet_on_subchannel(2, 0x1b0 / 4, 0x1000)).unwrap();
         let data: Vec<u32> = (0..line_length * line_count / 4).collect();
@@ -2839,7 +2844,8 @@ fn explicit_srgb_surface_format_survives_legacy_srgb_write_state() {
                 &mut crate::test_memory::access(address_space.memory().machine()),
             )
             .unwrap();
-            let MaxwellThreeDResolvedResource::Image(image) = resources.resources().next().unwrap()
+            let MaxwellThreeDResolvedResource::Image { view: image, .. } =
+                resources.resources().next().unwrap()
             else {
                 panic!("expected attachment")
             };
@@ -2875,11 +2881,10 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
     let role = MaxwellThreeDResourceRole::ConstantBuffer { group: 0, slot: 0 };
     let mut cache = super::super::threed::MaxwellThreeDResolvedResourceCache::default();
     let first = cache
-        .resolve_with_buffer_sizes(
+        .select(&[role], &[(role, MaxwellShaderBufferSize::Proven(0x40))])
+        .resolve(
             channel.three_d(),
             space.memory(),
-            &[role],
-            &[(role, MaxwellShaderBufferSize::Proven(0x40))],
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
@@ -2887,33 +2892,32 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
         .clone();
     for (iteration, end) in [0x40_u64, 0x80, 0x40].into_iter().enumerate() {
         let resolved = cache
-            .resolve_with_buffer_sizes(
+            .select(&[role], &[(role, MaxwellShaderBufferSize::Proven(end))])
+            .resolve(
                 channel.three_d(),
                 space.memory(),
-                &[role],
-                &[(role, MaxwellShaderBufferSize::Proven(end))],
                 8,
                 &mut crate::test_memory::access(space.memory().machine()),
             )
             .unwrap()
             .clone();
         assert_eq!(resolved.resources().count(), 1);
-        let Some(MaxwellThreeDResolvedResource::Buffer(buffer)) = resolved.resources().next()
+        let Some(MaxwellThreeDResolvedResource::Buffer { view: buffer, .. }) =
+            resolved.resources().next()
         else {
             panic!("expected one constant buffer")
         };
         assert_eq!(buffer.view().size(), end);
         if iteration == 0 {
-            assert!(first.same_bindings(&resolved));
+            assert!((first == resolved));
         }
     }
     assert!(
         cache
-            .resolve_with_buffer_sizes(
+            .select(&[role], &[(role, MaxwellShaderBufferSize::Declared)])
+            .resolve(
                 channel.three_d(),
                 space.memory(),
-                &[role],
-                &[(role, MaxwellShaderBufferSize::Declared)],
                 8,
                 &mut crate::test_memory::access(space.memory().machine())
             )
@@ -2922,11 +2926,10 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
     );
     assert!(
         cache
-            .resolve_with_buffer_sizes(
+            .select(&[role], &[(role, MaxwellShaderBufferSize::Proven(0x1004))])
+            .resolve(
                 channel.three_d(),
                 space.memory(),
-                &[role],
-                &[(role, MaxwellShaderBufferSize::Proven(0x1004))],
                 8,
                 &mut crate::test_memory::access(space.memory().machine())
             )
@@ -2935,10 +2938,10 @@ fn constant_buffer_import_uses_shader_extent_and_cache_tracks_extent_changes() {
     );
     assert!(
         cache
+            .select(&[role], &[])
             .resolve(
                 channel.three_d(),
                 space.memory(),
-                &[role],
                 8,
                 &mut crate::test_memory::access(space.memory().machine())
             )
@@ -2980,31 +2983,30 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
     let sizes = [(role, MaxwellShaderBufferSize::Declared)];
     let mut cache = super::super::threed::MaxwellThreeDResolvedResourceCache::default();
     let first = cache
-        .resolve_with_buffer_sizes(
+        .select(&[role], &sizes)
+        .resolve(
             channel.three_d(),
             space.memory(),
-            &[role],
-            &sizes,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
         .unwrap()
         .clone();
     let repeated = cache
-        .resolve_with_buffer_sizes(
+        .select(&[role], &sizes)
+        .resolve(
             channel.three_d(),
             space.memory(),
-            &[role],
-            &sizes,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
         .unwrap()
         .clone();
-    assert!(first.same_bindings(&repeated));
+    assert!((first == repeated));
     let buffer = |resources: &MaxwellThreeDResolvedResources| {
         assert_eq!(resources.resources().count(), 1);
-        let Some(MaxwellThreeDResolvedResource::Buffer(buffer)) = resources.resources().next()
+        let Some(MaxwellThreeDResolvedResource::Buffer { view: buffer, .. }) =
+            resources.resources().next()
         else {
             panic!("expected one storage buffer")
         };
@@ -3015,29 +3017,27 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
     // so the already prepared bindings remain reusable.
     crate::test_memory::write(&cb, 0x800, &[7]).unwrap();
     let refreshed = cache
-        .resolve_with_buffer_sizes(
+        .select(&[role], &sizes)
+        .resolve(
             channel.three_d(),
             space.memory(),
-            &[role],
-            &sizes,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
         .unwrap()
         .clone();
-    assert!(first.same_bindings(&refreshed));
+    assert!((first == refreshed));
     let clean = cache
-        .resolve_with_buffer_sizes(
+        .select(&[role], &sizes)
+        .resolve(
             channel.three_d(),
             space.memory(),
-            &[role],
-            &sizes,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
         .unwrap()
         .clone();
-    assert!(first.same_bindings(&clean));
+    assert!((first == clean));
     crate::test_memory::write(
         &cb,
         0x110,
@@ -3045,11 +3045,10 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
     )
     .unwrap();
     let changed = cache
-        .resolve_with_buffer_sizes(
+        .select(&[role], &sizes)
+        .resolve(
             channel.three_d(),
             space.memory(),
-            &[role],
-            &sizes,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
@@ -3059,11 +3058,10 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
     assert_eq!(buffer(&first), (data_mapping.offset().get(), 128));
     crate::test_memory::write(&cb, 0x110, &descriptor(data_mapping.offset().get(), 128)).unwrap();
     let restored = cache
-        .resolve_with_buffer_sizes(
+        .select(&[role], &sizes)
+        .resolve(
             channel.three_d(),
             space.memory(),
-            &[role],
-            &sizes,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
@@ -3071,11 +3069,10 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
         .clone();
     assert_eq!(buffer(&restored), (data_mapping.offset().get(), 128));
     let bounded = cache
-        .resolve_with_buffer_sizes(
+        .select(&[role], &[(role, MaxwellShaderBufferSize::Proven(4))])
+        .resolve(
             channel.three_d(),
             space.memory(),
-            &[role],
-            &[(role, MaxwellShaderBufferSize::Proven(4))],
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
@@ -3085,22 +3082,20 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
     crate::test_memory::write(&cb, 0x118, &0_u32.to_le_bytes()).unwrap();
     assert!(
         cache
-            .resolve_with_buffer_sizes(
+            .select(&[role], &sizes)
+            .resolve(
                 channel.three_d(),
                 space.memory(),
-                &[role],
-                &sizes,
                 8,
                 &mut crate::test_memory::access(space.memory().machine())
             )
             .is_err()
     );
     let before_remap = cache
-        .resolve_with_buffer_sizes(
+        .select(&[role], &[(role, MaxwellShaderBufferSize::Proven(4))])
+        .resolve(
             channel.three_d(),
             space.memory(),
-            &[role],
-            &[(role, MaxwellShaderBufferSize::Proven(4))],
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
@@ -3134,27 +3129,25 @@ fn graphics_storage_descriptor_tracks_pointer_size_committed_writes_and_remappin
         })
         .unwrap();
     let remapped_bounded = cache
-        .resolve_with_buffer_sizes(
+        .select(&[role], &[(role, MaxwellShaderBufferSize::Proven(4))])
+        .resolve(
             channel.three_d(),
             space.memory(),
-            &[role],
-            &[(role, MaxwellShaderBufferSize::Proven(4))],
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )
         .unwrap()
         .clone();
-    assert!(!before_remap.same_bindings(&remapped_bounded));
+    assert!(!(before_remap == remapped_bounded));
     assert_eq!(
         buffer(&remapped_bounded),
         (data_mapping.offset().get() + 128, 4)
     );
     let remapped = cache
-        .resolve_with_buffer_sizes(
+        .select(&[role], &sizes)
+        .resolve(
             channel.three_d(),
             space.memory(),
-            &[role],
-            &sizes,
             8,
             &mut crate::test_memory::access(space.memory().machine()),
         )

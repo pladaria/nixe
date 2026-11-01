@@ -405,7 +405,7 @@ fn user_and_driver_completion_counts_are_exact_and_consumption_never_signals() {
             actual + if driver { 2 } else { 0 } == expected
         );
         if actual <= expected {
-            assert_eq!(effects, 1);
+            assert_eq!(effects, 1 + usize::from(driver && result.is_ok()));
         }
         if let Err(error) = result {
             let detail = error.to_string();
@@ -467,6 +467,9 @@ fn command_control_latency() {
         count: u64,
     }
     impl MaxwellCommandHost for ClockedControl {
+        async fn signal_syncpoint(&mut self) -> Result<(), MaxwellSubmissionExecutionError> {
+            panic!("NOP stream has no syncpoint")
+        }
         async fn emit(
             &mut self,
             _: nixe_gpu::native::NativeWork,
@@ -737,5 +740,146 @@ fn dma_tiling_and_untile_preserve_padding_and_complete_in_canonical_memory() {
             expected[y * 96..y * 96 + 67].copy_from_slice(&source[y * 96..y * 96 + 67]);
         }
         assert_eq!(actual, expected, "block-height={block}");
+    }
+}
+
+#[test]
+fn syncpoint_callbacks_keep_their_position_before_later_methods_and_driver_suffix() {
+    use nixe_gpu::{
+        GuestSyncpointId, GuestSyncpointValue, GuestTimeline, TimelineInstanceId, TimelineOwnerId,
+    };
+    use nixe_gpu_maxwell::{
+        MaxwellCommandHost, MaxwellSubmissionExecutionError, stream_maxwell_frontend,
+    };
+    use std::cell::RefCell;
+    let owner = TimelineOwnerId::new(7);
+    let mut timeline = GuestTimeline::new(
+        GuestSyncpointId::new(1),
+        TimelineInstanceId::new(1),
+        owner,
+        GuestSyncpointValue::new(0),
+    );
+    let mut fixture =
+        Fixture::with_completion(4 | 2, Some(timeline.reserve(owner, 4).unwrap()), |_| {
+            let mut words = Vec::new();
+            packet(
+                &mut words,
+                0,
+                &[SWITCH_1_GM20B_PROFILE.classes().three_d().0],
+            );
+            packet(&mut words, 0x2c8, &[1]);
+            packet(&mut words, 0x78, &[0]);
+            packet(&mut words, 0x2c8, &[1]);
+            vec![words]
+        });
+    struct OrderedHost<'a> {
+        events: &'a RefCell<Vec<&'static str>>,
+    }
+    impl MaxwellCommandHost for OrderedHost<'_> {
+        async fn signal_syncpoint(&mut self) -> Result<(), MaxwellSubmissionExecutionError> {
+            self.events.borrow_mut().push("syncpoint");
+            Ok(())
+        }
+        async fn emit(
+            &mut self,
+            _: nixe_gpu::native::NativeWork,
+        ) -> Result<(), MaxwellSubmissionExecutionError> {
+            self.events.borrow_mut().push("method");
+            Ok(())
+        }
+        fn access(
+            &mut self,
+            _: Vec<nixe_memory::AllocationRange>,
+            _: nixe_memory::AccessOperation,
+        ) -> Result<nixe_memory::AccessResult, std::sync::Arc<nixe_memory::MemoryError>> {
+            unreachable!()
+        }
+        unsafe fn memory_written(
+            &mut self,
+            _: nixe_memory::MachineId,
+            _: &[(nixe_memory::AllocationId, nixe_memory::Extent)],
+        ) -> Result<(), std::sync::Arc<nixe_memory::MemoryError>> {
+            unreachable!()
+        }
+        fn control(&mut self) -> Result<(), MaxwellSubmissionExecutionError> {
+            Ok(())
+        }
+        fn timestamp(&self) -> u64 {
+            0
+        }
+    }
+    let events = RefCell::new(Vec::new());
+    let mut host = OrderedHost { events: &events };
+    command::ready(stream_maxwell_frontend(
+        &fixture.dispatch,
+        &mut fixture.channel,
+        fixture.space.memory(),
+        &fixture.frontend,
+        &mut fixture.scratch,
+        &mut host,
+    ))
+    .unwrap();
+    assert_eq!(
+        *events.borrow(),
+        [
+            "syncpoint",
+            "method",
+            "syncpoint",
+            "method",
+            "syncpoint",
+            "syncpoint"
+        ]
+    );
+}
+
+#[test]
+#[ignore = "opt-in production command-stream CPU measurement"]
+#[cfg(target_os = "linux")]
+fn register_stream_throughput() {
+    let iterations = std::env::var("NIXE_COMMAND_BENCH_ITERS")
+        .ok()
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(2_000);
+    for method in [0x2380, 0x3400] {
+        for count in [64, 8191] {
+            let mut fixture = Fixture::new(|_| {
+                let mut words = Vec::new();
+                packet(
+                    &mut words,
+                    0,
+                    &[SWITCH_1_GM20B_PROFILE.classes().three_d().0],
+                );
+                words.push(header(3, method, count));
+                words.extend(0..count);
+                vec![words]
+            });
+            for _ in 0..100 {
+                fixture
+                    .run(&mut |_| panic!("passive writes have no effect"))
+                    .unwrap();
+            }
+            let cpu_ns = || {
+                std::fs::read_to_string("/proc/thread-self/schedstat")
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            };
+            let before = cpu_ns();
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                fixture
+                    .run(&mut |_| panic!("passive writes have no effect"))
+                    .unwrap();
+            }
+            let cpu = cpu_ns() - before;
+            println!(
+                "register_method={method:#x} register_words={count} iterations={iterations} cpu_ns_per_word={:.3} elapsed_ms={:.3}",
+                cpu as f64 / (iterations * count as usize) as f64,
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
     }
 }

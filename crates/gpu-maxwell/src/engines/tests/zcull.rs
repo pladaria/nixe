@@ -28,7 +28,11 @@ fn zcull_maintenance_never_clears_the_attachment_or_invalidates_prepared_draws()
         for &value in values {
             let dispatch = dispatch_method(&mut channel, method / 4, value).unwrap();
             assert!(dispatch.ordered_operations().is_empty());
-            assert_eq!(channel.three_d().render_targets(), before.render_targets());
+            assert!(
+                before
+                    .resource_state_identity(MaxwellThreeDResourceRole::DepthStencilTarget)
+                    .matches(channel.three_d())
+            );
             assert!(draw.matches(channel.three_d()));
         }
     }
@@ -56,7 +60,11 @@ fn mme_can_clear_zcull_conservatively_without_emitting_an_attachment_clear() {
     let draw = before.draw_state_identity();
     let dispatch = dispatch_method(&mut channel, 0x3840 / 4, 0x19).unwrap();
     assert!(dispatch.ordered_operations().is_empty());
-    assert_eq!(channel.three_d().render_targets(), before.render_targets());
+    assert!(
+        before
+            .resource_state_identity(MaxwellThreeDResourceRole::DepthStencilTarget)
+            .matches(channel.three_d())
+    );
     assert!(draw.matches(channel.three_d()));
 }
 
